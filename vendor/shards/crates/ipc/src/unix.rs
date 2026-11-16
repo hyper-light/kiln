@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::{Identity, MAX_FDS, MAX_PAYLOAD};
+use crate::{Identity, Judge, MAX_FDS, MAX_PAYLOAD};
 
 /// The signals `docker run` forwards to the container with `--sig-proxy`, its default:
 /// every one but SIGCHLD, SIGPIPE, SIGURG and those the daemon cannot name (docker/cli
@@ -377,11 +377,6 @@ pub fn send(sock: &UnixStream, kind: u8, payload: &[u8], fds: &[BorrowedFd<'_>])
     send_with(sock, kind, payload, fds, None)
 }
 
-/// When a judged wait ([`send_judged`], [`recv_judged`]) next asks its judge, and whether it
-/// goes on: asked as the wait begins and each time the time it named passes with the socket
-/// not ready; `Ok(None)` waits on the socket's readiness alone, an error ends the wait with it.
-pub type Judge<'a> = dyn FnMut() -> io::Result<Option<Instant>> + 'a;
-
 /// [`send`], judged (runs-11 `TAKE_TIMEOUT`): written as room comes, by sendmsg(2) and send(2)
 /// with `MSG_DONTWAIT`, which leave the socket's own mode and timeouts to its other users, and
 /// waiting for room in poll(2) until the time `judge` names, where it is asked again. Never a
@@ -418,17 +413,21 @@ pub fn recv_judged(sock: &UnixStream, judge: &mut Judge<'_>) -> io::Result<Optio
 }
 
 /// Waits in poll(2) until `fd` has one of `events`, its end or an error, or `due` passes (none:
-/// as long as that takes): whether it came. A wait a signal cut short is made again.
+/// as long as that takes): whether it came. Each wait looks at `fd` at least once, a `due`
+/// already past with a poll of 0 ms: readiness is the wait's word, and its judge, asked where
+/// none came, judges its party by what it ran meanwhile. A wait that asked its judge without
+/// looking refused an idle VM whose socket had room all along, as the judge's own first
+/// reading of the VM outlasted W* (batch 26 at 1f71dea19: a daemon's stop SIGTERM refused
+/// `Stalled` 50 to 90 µs in, SO_NWRITE 0 before and after, and its run SIGKILLed at its grace's
+/// end; 9 in 72 stops, six at once, on an M4 Max). A wait a signal cut short is made again.
 fn await_events(fd: BorrowedFd<'_>, events: libc::c_short, due: Option<Instant>) -> io::Result<bool> {
     loop {
         let ms = match due {
             None => -1,
+            // Rounded up, so that a poll that times out ends at or past `due`: one of 0 ms only
+            // where `due` has passed.
             Some(due) => {
                 let left = due.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Ok(false);
-                }
-                // Rounded up: a wait of 0 ms would return at once, and spin.
                 libc::c_int::try_from(left.as_micros().div_ceil(1000)).unwrap_or(libc::c_int::MAX)
             }
         };
@@ -440,6 +439,7 @@ fn await_events(fd: BorrowedFd<'_>, events: libc::c_short, due: Option<Instant>)
         // SAFETY: poll(2) on one valid pollfd.
         match unsafe { libc::poll(&mut pfd, 1, ms) } {
             n if n > 0 => return Ok(true),
+            0 if due.is_some_and(|due| Instant::now() >= due) => return Ok(false),
             0 => {}
             _ => {
                 let e = io::Error::last_os_error();
@@ -1683,10 +1683,12 @@ impl Child {
     /// its kqueue's `NOTE_EXIT` on macOS (posted by `proc_exit` after `fdt_invalidate`; a
     /// pipe it held was seen ending up to microseconds after it, PM M583). Never a pipe's
     /// end, which any process holding a write end of it, one a spawn elsewhere let inherit
-    /// it, holds back. Each round signals the group, lists the processes in it that have not
-    /// exited and waits on each one's exit, until a round lists none: a process made as a
-    /// round signalled is signalled by the next. Never timed (D215): every wait is on a
-    /// process SIGKILL has begun to end. Called before the child is reaped, its pid, the
+    /// it, holds back. Each round lists the processes in it that have not exited (on macOS,
+    /// one exiting is listed until it is a zombie: [`member`]), watches each one's exit,
+    /// signals the group and waits on each watch, until a round lists none: a process made as
+    /// a round signalled is signalled by the next, and one exiting before a round's look, on
+    /// macOS past where a watch can be set, is looked at by the next. Never timed (D215):
+    /// every wait is on a process SIGKILL has begun to end. Called before the child is reaped, its pid, the
     /// group's ID, no other process's or group's while it holds the lock that reaping takes;
     /// a reaped child's group is gone or another's, and is left be.
     pub fn end_group(&self) -> io::Result<()> {
@@ -1700,32 +1702,61 @@ impl Child {
             return Err(io::Error::other("the spawner that made it has gone"));
         }
         loop {
-            // SAFETY: kill(2) of the group our unreaped child leads, as `kill_group`'s.
-            let signalled = if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            };
-            // A group of exited processes alone has none to signal: Linux says ESRCH, XNU
-            // EPERM. One that lists a running process it could not signal is refused.
             let members = group_members(self.pid)?;
             if members.is_empty() {
                 return Ok(());
             }
-            signalled?;
-            for pid in members {
-                // Its end watched first, then seen still the group's and running: a pid freed
-                // and taken by another process meanwhile is not waited on, and one that ends
-                // after the look is the one watched.
-                let Some(end) = exit_watch(pid)? else {
-                    continue;
-                };
-                if member(pid, self.pid) {
-                    await_any(&[end.as_fd()])?;
+            // Each watched before the round signals it: XNU lets no watch be set on a process
+            // whose exit has begun (`proc_prepareexit` hides it from `proc_find`, which
+            // `filt_procattach` asks), so one signalled first could be waited on by nothing.
+            // Its end watched, then seen still the group's: a pid freed and taken by another
+            // process meanwhile is not waited on. One already exiting has no watch, and the
+            // next round looks at it again.
+            let mut ends = Vec::with_capacity(members.len());
+            for (pid, _) in members {
+                if let Some(end) = exit_watch(pid)?
+                    && member(pid, self.pid).is_some()
+                {
+                    ends.push(end);
                 }
+            }
+            // SAFETY: kill(2) of the group our unreaped child leads, as `kill_group`'s.
+            if unsafe { libc::kill(-self.pid, libc::SIGKILL) } != 0 {
+                let e = io::Error::last_os_error();
+                // A group with no process left to signal: Linux says ESRCH, XNU EPERM, as it
+                // says of one it may not signal. XNU's killpg passes over its zombies and the
+                // processes whose exit has begun (`killpg1`'s filter; `pgrp_iterate`'s
+                // `proc_find`, refused from `proc_prepareexit` on; xnu-12377.1.9 kern_sig.c,
+                // kern_proc.c), which [`member`] lists until they are zombies: those are
+                // ending, and the next round looks at them again. Only a process still
+                // running that it could not signal is refused.
+                if group_members(self.pid)?
+                    .iter()
+                    .any(|&(_, standing)| standing == Standing::Running)
+                {
+                    return Err(e);
+                }
+            }
+            for end in &ends {
+                await_any(&[end.as_fd()])?;
+            }
+            // Nothing to wait on: each listed process was already exiting, past where a watch
+            // can be set, and no OS word comes of its becoming a zombie but the look again.
+            if ends.is_empty() {
+                std::thread::yield_now();
             }
         }
     }
+}
+
+/// How a process of a group that has not exited stands ([`member`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Standing {
+    /// Its exit not begun: a signal reaches it.
+    Running,
+    /// Its exit begun, not yet a zombie (Linux `PF_EXITING`, XNU `P_LEXIT`): XNU's killpg
+    /// passes over it once `proc_prepareexit` has marked it, and it ends of itself.
+    Exiting,
 }
 
 /// A descriptor readable once process `pid` has ended: a kqueue of its `EVFILT_PROC`
@@ -1787,10 +1818,11 @@ pub(crate) fn exit_watch(pid: libc::pid_t) -> io::Result<Option<OwnedFd>> {
     }
 }
 
-/// The processes of group `pgid` that have not exited: on Linux each of `/proc`'s whose
-/// `stat` says so ([`member`]); one that cannot be read (gone meanwhile) is not one.
+/// The processes of group `pgid` that have not exited, and how each stands: on Linux each of
+/// `/proc`'s whose `stat` says so ([`member`]); one that cannot be read (gone meanwhile) is
+/// not one.
 #[cfg(target_os = "linux")]
-fn group_members(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+fn group_members(pgid: libc::pid_t) -> io::Result<Vec<(libc::pid_t, Standing)>> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
         let Some(pid) = entry
@@ -1799,18 +1831,19 @@ fn group_members(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
         else {
             continue;
         };
-        if member(pid, pgid) {
-            found.push(pid);
+        if let Some(standing) = member(pid, pgid) {
+            found.push((pid, standing));
         }
     }
     Ok(found)
 }
 
-/// The processes of group `pgid` that have not exited: on macOS those proc_listpids(3)
-/// lists by group (`PROC_PGRP_ONLY`, sys/proc_info.h), asked again with twice the room
-/// while its answer fills all it was given, each then seen a member ([`member`]).
+/// The processes of group `pgid` that have not exited, and how each stands: on macOS those
+/// proc_listpids(3) lists by group (`PROC_PGRP_ONLY`, sys/proc_info.h), asked again with
+/// twice the room while its answer fills all it was given, each then seen a member
+/// ([`member`]).
 #[cfg(not(target_os = "linux"))]
-fn group_members(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+fn group_members(pgid: libc::pid_t) -> io::Result<Vec<(libc::pid_t, Standing)>> {
     /// sys/proc_info.h's `PROC_PGRP_ONLY`.
     const PROC_PGRP_ONLY: u32 = 2;
     let group = u32::try_from(pgid).map_err(io::Error::other)?;
@@ -1826,8 +1859,11 @@ fn group_members(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
         let filled = usize::try_from(n).map_err(|_| io::Error::last_os_error())? / size_of::<libc::pid_t>();
         if filled < room {
             pids.truncate(filled);
-            pids.retain(|&pid| pid > 0 && member(pid, pgid));
-            return Ok(pids);
+            return Ok(pids
+                .into_iter()
+                .filter(|&pid| pid > 0)
+                .filter_map(|pid| member(pid, pgid).map(|standing| (pid, standing)))
+                .collect());
         }
         room = room
             .checked_mul(2)
@@ -1835,38 +1871,72 @@ fn group_members(pgid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
     }
 }
 
-/// Whether process `pid` is in group `pgid` and has not exited: on Linux its
-/// `/proc/<pid>/stat`, after the last ')', its state (field 3) neither `Z` nor `X` and its
-/// group (field 5) `pgid` (proc(5)).
+/// How process `pid` stands where it is in group `pgid` and has not exited, `None` where
+/// not: on Linux its `/proc/<pid>/stat`, after the last ')', its state (field 3) neither `Z`
+/// nor `X`, its group (field 5) `pgid`, and its flags (field 9) `PF_EXITING` once its exit
+/// has begun (proc(5); include/linux/sched.h).
 #[cfg(target_os = "linux")]
-fn member(pid: libc::pid_t, pgid: libc::pid_t) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        let mut fields = stat
-            .rfind(')')
-            .and_then(|i| stat.get(i.saturating_add(1)..))
-            .unwrap_or_default()
-            .split_ascii_whitespace();
-        let state = fields.next();
-        let group = fields.nth(1).and_then(|g| g.parse::<libc::pid_t>().ok());
-        !matches!(state, None | Some("Z" | "X")) && group == Some(pgid)
+fn member(pid: libc::pid_t, pgid: libc::pid_t) -> Option<Standing> {
+    /// include/linux/sched.h's `PF_EXITING`: set by `exit_signals` as `do_exit` begins.
+    const PF_EXITING: u32 = 0x4;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat
+        .rfind(')')
+        .and_then(|i| stat.get(i.saturating_add(1)..))
+        .unwrap_or_default()
+        .split_ascii_whitespace();
+    let state = fields.next();
+    let group = fields.nth(1).and_then(|g| g.parse::<libc::pid_t>().ok());
+    let flags = fields.nth(3).and_then(|f| f.parse::<u32>().ok());
+    if matches!(state, None | Some("Z" | "X")) || group != Some(pgid) {
+        return None;
+    }
+    Some(if flags.is_some_and(|f| f & PF_EXITING != 0) {
+        Standing::Exiting
+    } else {
+        Standing::Running
     })
 }
 
-/// Whether process `pid` is in group `pgid` and has not exited: on macOS its
-/// `proc_bsdinfo` (proc_pidinfo(3), `PROC_PIDTBSDINFO`) names that group and no zombie. Not
+/// How process `pid` stands where it is in group `pgid` and has not exited, `None` where
+/// not: on macOS its `proc_bsdinfo` (proc_pidinfo(3), `PROC_PIDTBSDINFO`) names that group
+/// and no zombie, and `PROC_FLAG_INEXIT` once its exit has begun (`P_LEXIT`, set by
+/// `exit1_internal` before `proc_prepareexit`; xnu-12377.1.9 kern_exit.c, proc_info.c). Not
 /// its rusage's exit ([`exited`]): XNU sets that as `proc_exit` begins, before it closes the
 /// process's descriptors (`fdt_invalidate`) and posts `NOTE_EXIT`, which is what is waited on.
+/// Asked with a nonzero `arg`, which has XNU look among exiting processes too
+/// (`proc_find_zombref`): from `proc_prepareexit` on, `proc_find` finds none, and asked with
+/// none, an exiting process with its files still open read as gone, its group's end told
+/// before it became a zombie that waitid(2) sees (xnu-12377.1.9 `proc_pidinfo_internal`'s
+/// `findzomb`, `proc_prepareexit`'s `P_REF_DEAD`; 1 of 8 whole-lib runs on an M4 Max).
 #[cfg(not(target_os = "linux"))]
-fn member(pid: libc::pid_t, pgid: libc::pid_t) -> bool {
+fn member(pid: libc::pid_t, pgid: libc::pid_t) -> Option<Standing> {
+    /// Any nonzero `arg` has `PROC_PIDTBSDINFO` look among exiting processes.
+    const EXITING_TOO: u64 = 1;
+    /// sys/proc_info.h's `PROC_FLAG_INEXIT`: "process is working its way in exit()".
+    const PROC_FLAG_INEXIT: u32 = 4;
     // SAFETY: a proc_bsdinfo, plain data, for proc_pidinfo to fill.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let Ok(size) = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()) else {
-        return false;
-    };
+    let size = libc::c_int::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
     // SAFETY: proc_pidinfo(3) of `pid` into a proc_bsdinfo of ours, `size` long, as
     // PROC_PIDTBSDINFO names.
-    let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-    n == size && u32::try_from(pgid).is_ok_and(|g| info.pbi_pgid == g) && info.pbi_status != libc::SZOMB
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            EXITING_TOO,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if n != size || !u32::try_from(pgid).is_ok_and(|g| info.pbi_pgid == g) || info.pbi_status == libc::SZOMB {
+        return None;
+    }
+    Some(if info.pbi_flags & PROC_FLAG_INEXIT != 0 {
+        Standing::Exiting
+    } else {
+        Standing::Running
+    })
 }
 
 /// Whether this process's child `pid` has ended, waiting for it to if `wait`: its status
@@ -2259,6 +2329,32 @@ pub(crate) mod tests {
         let mut judge = judge_every(std::time::Duration::from_millis(10), &asked, Some(3));
         let e = super::send_judged(&ours, 7, &payload, &[], &mut judge).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+    }
+
+    /// Do send, judged, to a socket with room, and receive, judged, from one with a message
+    /// waiting, each with a judge whose first due has passed as it answers (its first reading
+    /// of its party outlasting W*) and that refuses at its next ask. Expect: both go, the judge
+    /// asked once. Red before: a wait whose due had passed asked its judge without looking at
+    /// the socket, and the judge refused a party that had nothing to do (batch 26, a daemon's
+    /// stop SIGTERM refused `Stalled` with its VM's socket empty).
+    #[test]
+    fn a_judged_wait_looks_before_its_judge_is_asked_again() {
+        let past = || {
+            let asked = std::sync::atomic::AtomicUsize::new(0);
+            move || {
+                if asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "judged stalled",
+                    ));
+                }
+                Ok(Some(std::time::Instant::now()))
+            }
+        };
+        let (ours, theirs) = super::UnixStream::pair().unwrap();
+        super::send_judged(&ours, 4, &15u32.to_be_bytes(), &[], &mut past()).unwrap();
+        let m = super::recv_judged(&theirs, &mut past()).unwrap().unwrap();
+        assert_eq!((m.kind, m.payload.as_slice()), (4, &15u32.to_be_bytes()[..]));
     }
 
     /// A judged receive waits for its message past its judge's dues while its judge says go on,
@@ -2948,6 +3044,89 @@ pub(crate) mod tests {
         );
         assert!(child.has_ended());
         assert_eq!(child.wait().unwrap(), 128 + libc::SIGKILL);
+    }
+
+    /// Do start a child of a group of its own that starts `dd` with a 512 MiB buffer, which
+    /// its reads of /dev/zero fill, and exits, unreaped; kill `dd`, and once it is seen
+    /// exiting (its address space's teardown the span), end the group. Expect: `end_group`
+    /// returns Ok once `dd` has exited. Red on macOS where a group of a zombie and processes
+    /// exiting alone, which XNU's killpg passes over and answers EPERM, was refused as a
+    /// process that could not be signalled (batch 26, api_image.rs's stop mid-boot:
+    /// `Os { what: "the stopped run's processes", kind: PermissionDenied }`).
+    #[test]
+    fn a_groups_end_follows_a_process_already_exiting_to_its_end() {
+        /// dd's `bs`.
+        const BUFFER: u64 = 512 << 20;
+        let mut exiting_seen = 0;
+        for _ in 0..20 {
+            let (read, write) = io::pipe().unwrap();
+            let child = spawn(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".as_ref(),
+                    "dd if=/dev/zero of=/dev/null bs=536870912 3>&- 2>/dev/null & echo $! >&3".as_ref(),
+                ],
+                &[(write.as_fd(), 3)],
+                true,
+            )
+            .unwrap();
+            drop(write);
+            let mut said = String::new();
+            (&read).read_to_string(&mut said).unwrap();
+            let dd: libc::pid_t = said.trim().parse().unwrap();
+            while !child.has_ended() {
+                std::thread::yield_now();
+            }
+            // Its buffer filled, its exit's teardown long.
+            while member(dd, child.pid).is_some() && resident(dd) < BUFFER {
+                std::thread::yield_now();
+            }
+            // SAFETY: kill(2) of the dd this test started, which its group still holds.
+            assert_eq!(unsafe { libc::kill(dd, libc::SIGKILL) }, 0);
+            let seen = loop {
+                match member(dd, child.pid) {
+                    Some(Standing::Exiting) => break true,
+                    Some(Standing::Running) => std::thread::yield_now(),
+                    None => break false,
+                }
+            };
+            child.end_group().unwrap();
+            assert_eq!(
+                member(dd, child.pid),
+                None,
+                "end_group returned while dd had not exited"
+            );
+            assert_eq!(child.wait().unwrap(), 0);
+            if seen {
+                exiting_seen += 1;
+            }
+        }
+        assert!(
+            exiting_seen > 0,
+            "dd was never seen exiting: the case was not made"
+        );
+    }
+
+    /// The bytes of process `pid` resident: its rusage's (macOS), its statm's (Linux).
+    fn resident(pid: libc::pid_t) -> u64 {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: sysconf(3) of the page size.
+            let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            std::fs::read_to_string(format!("/proc/{pid}/statm"))
+                .ok()
+                .and_then(|m| m.split_ascii_whitespace().nth(1)?.parse::<u64>().ok())
+                .map_or(0, |pages| pages * page)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: a rusage_info_v4, plain data, for proc_pid_rusage(2) to fill.
+            let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+            // SAFETY: proc_pid_rusage(2) of `pid` into a rusage_info_v4 of ours, as its
+            // flavor names.
+            let r = unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, (&raw mut info).cast()) };
+            if r == 0 { info.ri_resident_size } else { 0 }
+        }
     }
 
     #[test]

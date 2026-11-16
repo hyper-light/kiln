@@ -16,6 +16,7 @@ interface Wire {
   meta?: { features?: string[]; [key: string]: unknown };
   state?: Record<string, unknown>;
   events?: unknown[];
+  part?: boolean;
   c?: { type?: string; text?: string; count?: number; reply_to?: string; attachments?: { name: string; file_id?: string }[] };
 }
 interface Entry {
@@ -158,6 +159,8 @@ async function setup(page: Page, hold = new Set<string>()) {
         for (const line of text.split("\n").filter(Boolean)) {
           const frame = JSON.parse(line) as Wire;
           diagnostic.types.push(frame.t ?? "unknown");
+          // The events given here are the snapshot whole, and nothing after its end is let through: no rest follows it.
+          if (frame.t === "history") delete frame.part;
           if (frame.info) frame.info = { ...frame.info, name: NAMES[id], status: "idle" };
           if (frame.meta) frame.meta = { ...frame.meta, features: [...new Set([...(frame.meta.features ?? []), "attachments"])] };
           if (frame.state) frame.state = { ...frame.state, name: NAMES[id], status: "idle", tasks: [], queue: [], approvals: [], turn_started: null };

@@ -19,7 +19,7 @@ use crate::spec::Options;
 use crate::terminal::RawTerminal;
 use shards_ipc::device::Refusal;
 
-const RUN_USAGE: &str = "usage: shards run vm --kernel PATH [--initrd PATH | --init PATH] [--cmdline STR] [--cpus N] [--memory MIB] [--memory-max MIB] [--disk PATH[:ro]]... [--share DIR[:ro]]... [--pmem PATH]... [--layer PATH] [--vsock PATH] [--nested] [--gpu | --gpu-probe] [--gpu-device ID]...] [--host-managed] [--reporting] [--pci-test | --pci-tests SS.F,...] [--pci-slots N [--pci-slots-iommu]] [--vfio NAME|NODE]... [--vfio-iommu NAME|NODE]... [--no-console [--console-said N]] [--snapshot-dir DIR [--snapshot-then stop|resume]]
+const RUN_USAGE: &str = "usage: shards run vm --kernel PATH [--initrd PATH | --init PATH] [--cmdline STR] [--cpus N] [--memory MIB] [--memory-max MIB] [--disk PATH[:ro]]... [--share DIR[:ro]]... [--pmem PATH]... [--layer PATH] [--vsock PATH] [--nested] [--gpu | --gpu-probe] [--gpu-device ID]...] [--host-managed] [--reporting] [--pci-test | --pci-tests SS.F,...] [--pci-slots N [--pci-slots-iommu] [--component-window MIB]] [--vfio NAME|NODE]... [--vfio-iommu NAME|NODE]... [--no-console [--console-said N]] [--snapshot-dir DIR [--snapshot-then stop|resume]]
        shards run vm --kernel PATH --init SHARDS-INIT --rootfs IMAGE [OPTIONS] [WORKLOAD OPTIONS] -- COMMAND [ARG...]
        shards run vm --kernel PATH --init SHARDS-INIT --rootfs IMAGE --snapshot-dir DIR [OPTIONS]
   --share: the host directory DIR, as virtio-fs tag shards0, shards1, ... in order;
@@ -69,6 +69,9 @@ const RUN_USAGE: &str = "usage: shards run vm --kernel PATH [--initrd PATH | --i
   --pci-slots: N places on its PCI bus kept free for disks, shared directories and host
                functions plugged into it as it runs, which its guest finds as its init
                rescans the bus. A snapshot keeps them, empty.
+  --component-window: MIB of guest addresses past its DAX windows where a component's
+                      image plugged into one of its slots as a read-only pmem function is
+                      mapped (D270). Needs --pci-slots. A snapshot keeps it, empty.
   --pci-slots-iommu: the slots behind the guest's own IOMMU (virtio-iommu), each
                      translated while a function is plugged there: what a host's
                      function plugged in as it runs needs for the guest's own VFIO to
@@ -618,6 +621,13 @@ fn parse_run(args: impl Iterator<Item = OsString>) -> Result<Run, String> {
                     .map_err(|e| format!("--pci-slots: {e}"))?
             }
             "--pci-slots-iommu" => cfg.pci_slots_iommu = true,
+            // A components' window of this many MiB (D270), its slots' pmem functions mapped
+            // in it.
+            "--component-window" => {
+                cfg.component_window_mib = text(value("--component-window")?)?
+                    .parse()
+                    .map_err(|e| format!("--component-window: {e}"))?
+            }
             // The CPU baseline its guest is told (D176 part 6), as its home keeps it.
             "--cpu-baseline" => {
                 cfg.cpu_baseline = shards_vmm::arch::cpu::decode(&text(value("--cpu-baseline")?)?)?
@@ -653,6 +663,9 @@ fn parse_run(args: impl Iterator<Item = OsString>) -> Result<Run, String> {
         if cfg.vfio.iter().any(|f| !f.iommu) && (memory_max.is_some() || cfg.reporting) {
             return Err("--vfio with --memory-max or --reporting: the device's DMA reaches all of guest RAM through mappings the host holds pinned, which neither may take away; behind the guest's IOMMU (--vfio-iommu) it reaches what the guest maps alone".into());
         }
+    }
+    if cfg.component_window_mib > 0 && cfg.pci_slots == 0 {
+        return Err("--component-window without --pci-slots: no slots to plug a component into".into());
     }
     if cfg.pci_slots_iommu {
         if cfg.pci_slots == 0 {
@@ -1029,6 +1042,17 @@ pub fn device(payload: &[u8], fds: Vec<shards_ipc::fd::OwnedFd>) -> Result<Strin
             slot.attach(stream).map_err(Refusal::Host)?;
             Ok(placed(&handle.plug_share(tag, slot)?))
         }
+        device::PMEM => {
+            let file = fds
+                .into_iter()
+                .next()
+                .ok_or_else(|| asked("a component of no file"))?;
+            let plugged = handle.plug_pmem(std::fs::File::from(file))?;
+            let (gpa, len) = plugged
+                .region
+                .ok_or_else(|| Refusal::Host("a component's function plugged with no region".into()))?;
+            Ok(format!("{} {gpa} {len}", placed(&plugged)))
+        }
         device::UNPLUG => {
             let &devfn = rest.first().ok_or_else(|| asked("an unplug of no place"))?;
             handle.unplug(devfn)?;
@@ -1137,7 +1161,7 @@ fn serve_rates(
                 Ok((milli, period_ns)) => answer(&Answer::Held { milli, period_ns }),
                 Err(why) => answer(&Answer::Refused(&why)),
             },
-            Asked::Use => use_answer(guest_times, || {
+            Asked::Use => use_answer(guest_times, charged, || {
                 shards_vmm::platform::process_usage(std::process::id())
             }),
         };
@@ -1151,20 +1175,34 @@ fn serve_rates(
     }
 }
 
-/// What this machine's vCPUs have run of its guest, read by `guest`, then what this process
-/// has used of its host, read by `host` (D260): the later read holds the earlier, as an image
-/// run's stats read them (D241), so that the process's CPU time less its vCPUs' is its VMM's
-/// own and never less than none past the clocks' steps.
+/// What this machine's vCPUs have run of its guest, read by `guest`, whether its OS charges
+/// that to their threads, read by `charged` after it (D265), then what this process has used
+/// of its host, read by `host` (D260): the later read holds the earlier, as an image run's
+/// stats read them (D241), so that the process's CPU time less its vCPUs' is its VMM's own
+/// and never less than none past the clocks' steps. Where its hypervisor runs its vCPUs apart
+/// from their threads, their guest time is added to its OS's count; told apart with no guest
+/// time read, its count stands, its charge unknown.
 fn use_answer(
     guest: impl FnOnce() -> Result<shards_vmm::vm::GuestTimes, String>,
+    charged: impl FnOnce() -> shards_vmm::vm::Charged,
     host: impl FnOnce() -> std::io::Result<shards_vmm::platform::Usage>,
 ) -> String {
+    use shards_vmm::vm::Charged;
     let guest = guest();
+    let charged = charged();
     let host = host()
-        .map(|u| shards_abi::guest_time::HostUse {
-            cpu_ns: u.cpu_ns,
-            resident_bytes: u.resident,
-            footprint_bytes: u.footprint,
+        .map(|u| {
+            let (cpu_ns, charged) = match (charged, &guest) {
+                (Charged::Apart, Ok(times)) => (u.cpu_ns.saturating_add(times.total_ns()), Charged::Apart),
+                (Charged::Apart, Err(_)) => (u.cpu_ns, Charged::Unknown),
+                (charged, _) => (u.cpu_ns, charged),
+            };
+            shards_abi::guest_time::HostUse {
+                cpu_ns,
+                resident_bytes: u.resident,
+                footprint_bytes: u.footprint,
+                charged,
+            }
         })
         .map_err(|e| format!("its VM process: {e}"));
     shards_abi::rate::used(
@@ -1176,7 +1214,9 @@ fn use_answer(
 /// What this machine used in all (D260's final use), as a use's answer says it: its vCPUs'
 /// whole guest time, read by `guest` once they have stopped, then this process's own use.
 fn final_use_of(guest: impl FnOnce() -> Result<shards_vmm::vm::GuestTimes, String>) -> String {
-    use_answer(guest, || shards_vmm::platform::process_usage(std::process::id()))
+    use_answer(guest, charged, || {
+        shards_vmm::platform::process_usage(std::process::id())
+    })
 }
 
 /// Tells a managed VM's keeper its final use, `used` (final_use.rs, D260): its length, a u32,
@@ -1215,6 +1255,14 @@ pub(crate) fn rate_answer(
 /// What each of this VM's vCPUs has run of its guest, by index, read now, and what those it
 /// no longer has ran (`GUEST_TIME`), beside which this process's own CPU time is its total's
 /// less theirs.
+/// Whether this process's OS charges its vCPUs' guest time to their threads, as their spans
+/// have told it (D265): unknown before the microVM has started.
+fn charged() -> shards_vmm::vm::Charged {
+    RUNNING
+        .get()
+        .map_or(shards_vmm::vm::Charged::Unknown, |r| r.charged())
+}
+
 pub fn guest_times() -> Result<shards_vmm::vm::GuestTimes, String> {
     Ok(RUNNING.get().ok_or("the microVM has not started")?.guest_times())
 }
@@ -1584,24 +1632,32 @@ fn forward_stdin(handle: vm::Handle) {
         .name("console-in".into())
         .spawn(move || {
             let mut stdin = std::io::stdin().lock();
-            // As much as the console's receiver takes at once: the rest waits in stdin.
-            let mut buf = [0u8; shards_vmm::devices::serial::INPUT_AT_ONCE];
+            // As much as a buffer the guest posts takes: the rest waits in stdin.
+            let mut buf = [0u8; shards_vmm::devices::virtio::console::INPUT_AT_ONCE];
+            let mut typed = Vec::with_capacity(buf.len());
             let mut escape = false;
             loop {
                 let n = match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => return,
                     Ok(n) => n,
                 };
+                // What was read goes to the guest at once, its escapes taken out: one
+                // buffer of the guest's for as much as it holds, not one for each byte.
+                typed.clear();
                 for &b in buf.iter().take(n) {
                     match (escape, b) {
-                        (true, b'x') => return handle.stop(),
-                        (true, 0x01) => handle.console_input(&[0x01]), // Ctrl-A Ctrl-A sends one
-                        (true, other) => handle.console_input(&[0x01, other]),
+                        (true, b'x') => {
+                            handle.console_input(&typed);
+                            return handle.stop();
+                        }
+                        (true, 0x01) => typed.push(0x01), // Ctrl-A Ctrl-A sends one
+                        (true, other) => typed.extend([0x01, other]),
                         (false, 0x01) => {}
-                        (false, other) => handle.console_input(&[other]),
+                        (false, other) => typed.push(other),
                     }
                     escape = !escape && b == 0x01;
                 }
+                handle.console_input(&typed);
             }
         });
     if let Err(e) = spawned {
@@ -2187,7 +2243,13 @@ fn serve_workload(
                         };
                         (
                             (
-                                workload::serve(Some((&listener, signals)), request, to_guest, timing, &guest_abi),
+                                workload::serve(
+                                    Some((&listener, signals)),
+                                    request,
+                                    to_guest,
+                                    timing,
+                                    &guest_abi,
+                                ),
                                 false,
                             ),
                             None,
@@ -2274,8 +2336,7 @@ fn serve_workload(
                                     crate::warm::resumed_tokens(t)
                                         .ok_or_else(|| "a resumed run's tokens, malformed".to_string())
                                 })
-                                .transpose()
-                                ?;
+                                .transpose()?;
                             let (tokens, engine, mcp) = match &brought {
                                 Some((run, kept)) => (
                                     Some(run.to_vec()),
@@ -2311,16 +2372,13 @@ fn serve_workload(
                             // The CPUs its vCPUs are held to (D191), before its guest
                             // hears of the run: what its workload may use whatever its
                             // guest does.
-                            stopper
-                                .hold_rate(u64::from(request.cpus).saturating_mul(vm::MILLI_PER_CPU))
-                                ?;
+                            stopper.hold_rate(u64::from(request.cpus).saturating_mul(vm::MILLI_PER_CPU))?;
                             // Its group's CPU budget too (D183), which every microVM of
                             // the group charges, before its guest hears of the run.
                             if let Some(file) = request.group {
                                 shards_vmm::vm::group::GroupCpu::map(file)
                                     .map_err(|e| format!("its group's CPU budget: {e}"))
-                                    .and_then(|group| stopper.hold_group(group))
-                                    ?;
+                                    .and_then(|group| stopper.hold_group(group))?;
                             }
                             // Its I/O limits, before its guest hears of the run (D178).
                             IO.set(request.io.0, request.io.1);
@@ -2337,8 +2395,7 @@ fn serve_workload(
                                 Some(file) if request.layer_over => {
                                     stopper
                                         .stage_layer(file)
-                                        .map_err(|e| format!("its writable layer: {e}"))
-                                        ?;
+                                        .map_err(|e| format!("its writable layer: {e}"))?;
                                     (None, true)
                                 }
                                 layer_in => (layer_in, false),
@@ -2349,15 +2406,12 @@ fn serve_workload(
                                 spec.setup.push(shards_abi::ring::SPEC.to_vec());
                             }
                             match request.swap {
-                                Some(file) if resumed => stopper
-                                    .restore_swap(file)
-                                    .map_err(|e| format!("its swap: {e}"))
-                                    ?,
+                                Some(file) if resumed => {
+                                    stopper.restore_swap(file).map_err(|e| format!("its swap: {e}"))?
+                                }
                                 Some(file) => {
-                                    if let Some(len) = stopper
-                                        .attach_swap(file)
-                                        .map_err(|e| format!("its swap: {e}"))
-                                        ?
+                                    if let Some(len) =
+                                        stopper.attach_swap(file).map_err(|e| format!("its swap: {e}"))?
                                     {
                                         spec.setup.push(format!("swap={len}").into_bytes());
                                     }
@@ -2365,21 +2419,13 @@ fn serve_workload(
                                 None => {}
                             }
                             // And its connections, awaited before its guest runs, which dials
-                            // them again as it resumes, by its save's tokens; in a guest whose
-                            // init speaks this shards' protocol, as a run is handed only to
-                            // such a guest.
+                            // them again as it resumes, by its save's tokens. Its init is this
+                            // build's: every resume asked `snapshot::resumable` of its state
+                            // before this process was started to restore it (D176), and the
+                            // contract its control page announces is the one its saver recorded.
                             let conns = match &tokens {
                                 Some(tokens) => {
                                     let conns = workload::await_resumed(tokens)?;
-                                    let abi = stopper.guest_abi();
-                                    if abi != Some(shards_abi::IDENTITY) {
-                                        let spoken = abi.map_or_else(|| "none".to_string(), |abi| format!("{abi:016x}"));
-                                        return Err(format!(
-                                            "the saved microVM's shards-init speaks another shards' protocol ({spoken}, \
-                                             where this shards speaks {:016x}): restore it with the shards that saved it",
-                                            shards_abi::IDENTITY
-                                        ));
-                                    }
                                     stopper.release();
                                     // Its command runs already: its layer reads ahead (PM M297).
                                     stopper.layer_reads_ahead();
@@ -2421,13 +2467,8 @@ fn serve_workload(
                             })
                         };
                         let ports = (!resumed).then_some((&listener, signals));
-                        let served = workload::serve(
-                            ports,
-                            Request::Later(&ask),
-                            to_guest,
-                            timing,
-                            &guest_abi,
-                        );
+                        let served =
+                            workload::serve(ports, Request::Later(&ask), to_guest, timing, &guest_abi);
                         // A run taken that failed before its end was told, its setup after
                         // TAKEN among them, is told now: exactly one end on its link.
                         let outcome = match TAKEN.get() {
@@ -3706,6 +3747,7 @@ mod rate_tests {
             }],
             departed_ns: 2,
         };
+        use shards_vmm::vm::Charged;
         let usage = shards_vmm::platform::process_usage(std::process::id()).unwrap();
         let answer = use_answer(
             || {
@@ -3713,20 +3755,46 @@ mod rate_tests {
                 Ok(times.clone())
             },
             || {
+                order.borrow_mut().push("charged");
+                Charged::ToThread
+            },
+            || {
                 order.borrow_mut().push("host");
                 Ok(usage)
             },
         );
-        assert_eq!(*order.borrow(), ["guest", "host"]);
+        assert_eq!(*order.borrow(), ["guest", "charged", "host"]);
         let read = shards_abi::rate::read_used(answer.as_bytes()).unwrap();
-        assert_eq!(read.guest, Ok(times));
+        assert_eq!(read.guest, Ok(times.clone()));
         let host = read.host.unwrap();
         assert_eq!(
-            (host.cpu_ns, host.resident_bytes, host.footprint_bytes),
-            (usage.cpu_ns, usage.resident, usage.footprint)
+            (
+                host.cpu_ns,
+                host.resident_bytes,
+                host.footprint_bytes,
+                host.charged
+            ),
+            (usage.cpu_ns, usage.resident, usage.footprint, Charged::ToThread)
         );
+        // Run apart from their threads (WHP's classic and core schedulers, D265), the vCPUs'
+        // guest time is added to the process's count; with none read, the count stands.
+        let apart = |guest: Result<shards_vmm::vm::GuestTimes, String>| {
+            let answer = use_answer(|| guest, || Charged::Apart, || Ok(usage));
+            shards_abi::rate::read_used(answer.as_bytes())
+                .unwrap()
+                .host
+                .unwrap()
+        };
+        let host = apart(Ok(times.clone()));
+        assert_eq!(
+            (host.cpu_ns, host.charged),
+            (usage.cpu_ns + times.total_ns(), Charged::Apart)
+        );
+        let host = apart(Err("the microVM has not started".into()));
+        assert_eq!((host.cpu_ns, host.charged), (usage.cpu_ns, Charged::Unknown));
         let refused = use_answer(
             || Err("the microVM has not started".into()),
+            || Charged::Unknown,
             || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
         );
         let read = shards_abi::rate::read_used(refused.as_bytes()).unwrap();
@@ -3811,6 +3879,24 @@ mod managed_report_tests {
         ];
         args.extend_from_slice(extra);
         parse_run(args.into_iter().map(OsString::from))
+    }
+
+    /// The console shards-api tells orchestrators (D261; `shards_api::CONSOLE` is
+    /// `shards_abi::CONSOLE`, re-exported) is the one a default `run vm --kernel` boot's
+    /// command line names: its first argument, as `/proc/cmdline` shows it.
+    #[test]
+    fn the_console_shards_api_exports_is_a_default_boots() {
+        let run = parse_run(
+            ["--kernel", "/never-opened/kernel"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(run.cfg.cmdline.split(' ').next(), Some(shards_abi::CONSOLE));
+        assert_eq!(
+            shards_abi::CONSOLE,
+            format!("console={}", shards_abi::GUEST_CONSOLE)
+        );
     }
 
     /// D233: a warm boot and a warm restore write a GPU report of the scope their spawner (an
@@ -4223,16 +4309,16 @@ mod tests {
         };
         let options = "quiet noautogroup rt_group_sched=0 shards_root=/dev/pmem0";
         assert_eq!(
-            booted("console=ttyS0 -- managed-network capabilities", true),
-            format!("console=ttyS0 {options} shards_template=1 -- managed-network capabilities")
+            booted("console=hvc0 -- managed-network capabilities", true),
+            format!("console=hvc0 {options} shards_template=1 -- managed-network capabilities")
         );
         assert_eq!(
-            booted("console=ttyS0 \"--\"\tx  'y z'", false),
-            format!("console=ttyS0 {options} \"--\"\tx  'y z'")
+            booted("console=hvc0 \"--\"\tx  'y z'", false),
+            format!("console=hvc0 {options} \"--\"\tx  'y z'")
         );
         assert_eq!(
-            booted("console=ttyS0 earlycon panic=-1", true),
-            format!("console=ttyS0 earlycon panic=-1 {options} shards_template=1")
+            booted("console=hvc0 panic=-1", true),
+            format!("console=hvc0 panic=-1 {options} shards_template=1")
         );
     }
     use std::os::unix::ffi::OsStrExt as _;
@@ -4248,6 +4334,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("{flag}: taken without a value"));
             assert!(e.contains("needs a value"), "{flag}: {e}");
         }
+    }
+
+    /// A boot's components' window (D270) takes its value, as a run's boot gives it beside its
+    /// slots (run.rs `boot_args`): unlisted among the flags `run` reads a value after
+    /// (`spec::RUN_VALUED`), every orchestrator's image boot was refused, "--component-window
+    /// needs a value".
+    #[test]
+    fn a_components_window_takes_its_value() {
+        let run = parse_run(args(&[
+            b"--kernel",
+            b"/k",
+            b"--pci-slots",
+            b"2",
+            b"--component-window",
+            b"8192",
+        ]))
+        .unwrap();
+        assert_eq!((run.cfg.pci_slots, run.cfg.component_window_mib), (2, 8192));
     }
 
     /// What `restore` alone reads a value after, as `spec::RESTORE_VALUED` tells what reads

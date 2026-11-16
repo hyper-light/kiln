@@ -2,7 +2,8 @@
 import * as React from "react";
 import { useServerEvents } from "@/api/events";
 import { harnessApi, listed, type AgentInfo } from "@/api/harness";
-import { preload, useSuspenseResource } from "@/lib/resource";
+import { harnessSessionsRes } from "@/lib/data";
+import { preload, recent, useSuspenseResource } from "@/lib/resource";
 
 /**
  * How often the list takes in what changed. Many agents working at once send a stream of events;
@@ -12,7 +13,15 @@ import { preload, useSuspenseResource } from "@/lib/resource";
 const BATCH_MS = 250;
 
 const KEY = "harness/agents";
-const list = () => harnessApi.list();
+/**
+ * Read from the server, unless every page's list of them (lib/data.ts, which reads this one the
+ * same way) was read a moment ago: whichever of the two is asked first as a page opens, the server
+ * is asked once. A failure is this list's own to say (Mission control says it couldn't load).
+ */
+const list = () => {
+  const kept = recent<AgentInfo[]>(harnessSessionsRes.key, 5_000);
+  return kept ? Promise.resolve(kept) : harnessApi.list();
+};
 
 /** The agents as last read (suspends until the first list is in). */
 export function useAgentList(): AgentInfo[] {

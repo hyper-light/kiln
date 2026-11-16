@@ -65,8 +65,51 @@ impl ImageGuest for Run {
         &[]
     }
 
-    fn published(&self) -> &[Bound] {
-        &[]
+    fn published(&self) -> Vec<Bound> {
+        Vec::new()
+    }
+
+    /// It has no network: nothing past its microVM is granted.
+    fn egress(&self) -> shards_api::image::Narrowing {
+        use shards_api::image::Keep;
+        shards_api::image::Narrowing {
+            egress: Keep::Only(Vec::new()),
+            mcp: Keep::Only(Vec::new()),
+            destinations: Keep::Only(Vec::new()),
+            dns: false,
+            members: None,
+        }
+    }
+    fn grant_egress(
+        &self,
+        _: &shards_api::image::EgressGrant,
+        _: Duration,
+    ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
+        Err(unasked())
+    }
+    fn revoke_egress(
+        &self,
+        _: &shards_api::image::EgressGrant,
+        _: Duration,
+    ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
+        Err(unasked())
+    }
+
+    fn publish(
+        &self,
+        _: shards_api::image::Publish,
+        _: Duration,
+    ) -> Result<Vec<Bound>, ImageRefusal> {
+        Err(unasked())
+    }
+
+    fn unpublish(
+        &self,
+        _: shards_api::image::Proto,
+        _: std::net::SocketAddr,
+        _: Duration,
+    ) -> Result<(), ImageRefusal> {
+        Err(unasked())
     }
 
     fn control(&self) -> Option<&shards_api::image::ControlAt> {
@@ -110,6 +153,7 @@ impl ImageGuest for Run {
                     cpu_ns,
                     resident_bytes: 0,
                     footprint_bytes: 0,
+                    charged: shards_api::image::Charged::ToThread,
                 }),
                 guest: Ok(GuestTimes::default()),
             }),
@@ -156,14 +200,7 @@ impl ImageGuest for Run {
         }
     }
 
-    fn plug(
-        &self,
-        _: &MemberName,
-        _: &std::path::Path,
-        _: &str,
-        _: bool,
-        _: Duration,
-    ) -> Result<(), ImageRefusal> {
+    fn plug(&self, _: &shards_api::image::Plug, _: Duration) -> Result<(), ImageRefusal> {
         Err(unasked())
     }
 
@@ -172,6 +209,14 @@ impl ImageGuest for Run {
     }
 
     fn save(&self, _: &std::path::Path, _: Duration) -> Result<(), ImageRefusal> {
+        Err(unasked())
+    }
+
+    fn pause(&self, _: Duration) -> Result<shards_api::image::Paused, ImageRefusal> {
+        Err(unasked())
+    }
+
+    fn resume(&self, _: Duration) -> Result<shards_api::image::Paused, ImageRefusal> {
         Err(unasked())
     }
 

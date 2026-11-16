@@ -715,6 +715,10 @@ pub enum Input {
     /// older runs with the same key (workflow and branch, stack or pull request).
     RunQueued { run: String, group: Option<(String, String, GroupConfig)>, supersede: Option<(String, Supersede)> },
     RunFinished { run: String },
+    /// After a restart (W05-R25): a run that had started holds its place in its workflow-level
+    /// group again, so the runs behind it wait for it as they did. Nothing starts and nothing is
+    /// cancelled by it.
+    RunResumed { run: String, key: String, cfg: GroupConfig },
     /// A run's demand (W28-R40), before its `RunQueued`: that withdraws older demands on its lane
     /// when its `supersede` adopts. On its own (a rerun's), it is live again and withdraws nothing.
     Demand(Box<Demand>),
@@ -1785,6 +1789,10 @@ impl Scheduler {
                     }
                 }
                 self.demands.leave(&run);
+            }
+            Input::RunResumed { run, key, cfg } => {
+                self.groups.resume(&key, &format!("run:{run}"), &cfg);
+                self.run_groups.insert(run, key);
             }
             Input::Demand(d) => {
                 let _ = self.demands.arrive(*d, false);

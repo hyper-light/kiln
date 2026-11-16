@@ -62,7 +62,9 @@ test("W21-R02 a live subagent has one unclipped summary through successive activ
         if (complete) return;
         const text = typeof message === "string" ? message : gunzipSync(message).toString("utf8");
         for (const line of text.split("\n").filter(Boolean)) {
-          const frame = JSON.parse(line) as { t: string; state?: Record<string, unknown>; events?: object[] };
+          const frame = JSON.parse(line) as { t: string; state?: Record<string, unknown>; events?: object[]; part?: boolean };
+          // The events given here are the snapshot whole, and nothing after its end is let through: no rest follows it.
+          if (frame.t === "history") delete frame.part;
           if (frame.t === "state") {
             control.state = { ...frame.state, tasks: [task] };
             frame.state = control.state;

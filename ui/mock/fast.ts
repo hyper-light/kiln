@@ -414,6 +414,7 @@ class Run {
     this.send({ t: "changes", files: [...this.changes.values()] });
     for (let i = 0; i < bounded.events.length; i += 120) this.emit(...bounded.events.slice(i, i + 120));
     this.send({ t: "synced" });
+    if (bounded.rest) this.send(bounded.rest);
     void this.main();
   }
 

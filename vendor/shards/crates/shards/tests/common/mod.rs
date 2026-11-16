@@ -189,6 +189,27 @@ fn skip(why: &str) -> bool {
     true
 }
 
+/// The most a window's vCPU guest time, read twice, may say past what its vCPU ran between
+/// the reads: one step of its count, measured as its VM process says it, `read` of a guest
+/// whose vCPU spins unheld: read until it has moved twice, the second move's size, as a thread
+/// clock's step is measured (`granule::clock_step`). A count's unit is not its step: WHP's
+/// runtime counters count 100 ns (`TotalRuntime100ns`) but moved every ~10 ms on hex-winvm,
+/// 9.4 ms of guest each (p50, n 200; D265); KVM's gtime moves in clock ticks
+/// (fs/proc/array.c); Hypervisor.framework's as its vCPU leaves its guest to be read
+/// (docs/research/measurements/guest-cpu-time-v1).
+pub fn guest_time_step(mut read: impl FnMut() -> u64) -> Duration {
+    let moved = |read: &mut dyn FnMut() -> u64, from: u64| loop {
+        let now = read();
+        if now != from {
+            return now;
+        }
+    };
+    let first = read();
+    let once = moved(&mut read, first);
+    let twice = moved(&mut read, once);
+    Duration::from_nanos(twice.saturating_sub(once))
+}
+
 /// Whether this host cannot run VMs: no backend for it yet, or no hardware virtualization
 /// (e.g. a CI runner that is itself a VM). VM tests then return early with a SKIP line,
 /// or fail where `SHARDS_REQUIRE_VMS=1` says they must run;
@@ -196,7 +217,7 @@ fn skip(why: &str) -> bool {
 pub fn cannot_run_vms() -> bool {
     match shards_vmm::vm::check_host() {
         Ok(()) => false,
-        Err(why) => skip(&why),
+        Err(why) => skip(&why.to_string()),
     }
 }
 
@@ -416,14 +437,14 @@ pub fn kvm_kernel() -> Option<&'static Path> {
         let pinned = match ARCH {
             _ if cfg!(windows) => return None,
             "aarch64" => Artifact {
-                name: "Image-6.18.48-aarch64-kvm-54fba99afaee",
-                url: "https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-54fba99afaee/Image-6.18.48-aarch64-kvm",
-                sha256: "ed1e6dabf2f4088b37e3405a40b12962eb5eff76afe4303730e9d76ee1a7a3ba",
+                name: "Image-6.18.48-aarch64-kvm-836568f8ad2c",
+                url: "https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-836568f8ad2c/Image-6.18.48-aarch64-kvm",
+                sha256: "ff68fc5ede1ef64f9f8c9323c9429dcfbec065e579aa98a4028bb8a269b55d08",
             },
             "x86_64" => Artifact {
-                name: "vmlinux-6.18.48-x86_64-kvm-54fba99afaee",
-                url: "https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-54fba99afaee/vmlinux-6.18.48-x86_64-kvm",
-                sha256: "71b5de5f7c9b4abfc543e230ad09bc1736e2ca15f7e76cbd28efbc546e6fa89e",
+                name: "vmlinux-6.18.48-x86_64-kvm-836568f8ad2c",
+                url: "https://github.com/hyper-light/shards/releases/download/kernel-6.18.48-836568f8ad2c/vmlinux-6.18.48-x86_64-kvm",
+                sha256: "759273d6df9d6b3800ab1ba8a792be8c3bf8f956d5a72d7ea850b831bc6ecf76",
             },
             _ => return None,
         };
@@ -1975,7 +1996,7 @@ pub fn run_shards_in<S: AsRef<std::ffi::OsStr>>(dir: &Path, command: &[&str], ar
 /// judge's look.
 #[track_caller]
 pub fn client_output(cmd: &mut Command, home: Option<&Path>) -> std::process::Output {
-    let kind = WaitKind::of(
+    let kind = WaitKind::command(
         std::panic::Location::caller(),
         &command_words(cmd),
         &keyed_line(cmd),
@@ -1995,7 +2016,11 @@ pub fn client_output(cmd: &mut Command, home: Option<&Path>) -> std::process::Ou
         if status.is_none()
             && let Some(st) = child.try_wait().unwrap()
         {
-            wait.answered();
+            if st.success() {
+                wait.answered();
+            } else {
+                wait.unserved();
+            }
             status = Some(st);
         }
         let output = more(&out, &mut out_got) | more(&err, &mut err_got);
@@ -2304,11 +2329,86 @@ enum Patient {
     Spent,
 }
 
+/// Waits, judged as a state's wait is ([`Patience`]: its party `home`'s daemon, no clock),
+/// until `home`'s daemon has done the work its clients' request slots left it (D185): a slot
+/// a client took is replaced and its names removed as its session ends, work the daemon does
+/// after its client has gone (slots.rs' `make_slots`: 125 to 317 µs of its CPU on a loaded
+/// Mac, PM M255), which a test's wait that begins at once counts as its party's progress
+/// (ROOT's batch 22, HVF: harness.rs' `a_wait_is_refused_though_its_own_polls_outlast_w_star`,
+/// its daemon started by a `shards ps`, "its last progress its daemon ran"; the daemon
+/// measured running 65 to 73 µs of CPU 5.3 to 5.9 ms after that `ps` returned in 2 of 6
+/// starts with every CPU of the host busy, in none of 3 without). Settled, on Unix: each
+/// list offers [`OFFERED`](shards_ipc::slots::OFFERED) slots again, that many records unread
+/// in its FIFO (FIONREAD, as the daemon's own `Requests::waiting` counts them, none read), and
+/// the directory names no slot past them, a taken one's names removed. On Windows a slot is
+/// a pipe's instance, which no listing shows (slots/named.rs): unread there.
+#[track_caller]
+pub fn settled(home: &Path) {
+    let mut patience = Patience::of(home);
+    while !slots_settled(home) {
+        assert!(
+            patience.holds(),
+            "{}'s request slots never settled",
+            home.display()
+        );
+        std::thread::sleep(patience.next_look());
+    }
+    patience.done();
+}
+
+/// Whether `home`'s request slots are as its daemon offers them with no client's work left
+/// ([`settled`]).
+#[cfg(unix)]
+fn slots_settled(home: &Path) -> bool {
+    use shards_ipc::slots::{DIR, FREE, FREE_STREAMS, OFFERED, RECORD};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    let dir = home.join(DIR);
+    let offering = |list: &str| {
+        // A reader of its own, which reads nothing: the records stay the clients'.
+        let Ok(fifo) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(dir.join(list))
+        else {
+            return false;
+        };
+        let mut bytes: libc::c_int = 0;
+        // SAFETY: FIONREAD of a FIFO this holds open, into an int on this stack.
+        let read = unsafe { libc::ioctl(fifo.as_raw_fd(), libc::FIONREAD, &raw mut bytes) };
+        read == 0 && usize::try_from(bytes).is_ok_and(|bytes| bytes / RECORD == OFFERED)
+    };
+    if !(offering(FREE) && offering(FREE_STREAMS)) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let slots: std::collections::BTreeSet<u64> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.split_once('.')?.0.parse().ok())
+        .collect();
+    slots.len() == 2 * OFFERED
+}
+
+#[cfg(not(unix))]
+fn slots_settled(_: &Path) -> bool {
+    true
+}
+
 impl Patience {
     /// Patience with the daemon of `home` and its microVMs, and this test's own.
     #[track_caller]
     pub fn of(home: &Path) -> Patience {
-        Patience::with(Some(home), std::panic::Location::caller())
+        Patience::at(home, std::panic::Location::caller())
+    }
+
+    /// [`of`](Self::of) as the wait at `site`: for a `#[track_caller]` helper that waits on a
+    /// thread of its own, which takes its caller's site before it spawns it, as a closure
+    /// is no `#[track_caller]` and its own site would be every caller's one kind (log
+    /// lanes' `controlled`: a quick read's W* refused a run's bulk write 83 ms in).
+    pub fn at(home: &Path, site: &'static std::panic::Location<'static>) -> Patience {
+        Patience::with(Some(home), site)
     }
 
     /// Patience with client `client`, what descends from it, and the daemon of `home`: a
@@ -2331,6 +2431,15 @@ impl Patience {
     #[track_caller]
     pub fn started() -> Patience {
         Patience::on(Party::started(None), std::panic::Location::caller())
+    }
+
+    /// Patience with every process of process groups `groups`, wherever it is listed
+    /// ([`Party::groups`]): run hosts whose holder has ended, none of them this test's
+    /// process's own since, each leading its group, its VM's among it.
+    #[cfg(unix)]
+    #[track_caller]
+    pub fn groups(groups: &[u32]) -> Patience {
+        Patience::on(Party::groups(groups), std::panic::Location::caller())
     }
 
     fn with(home: Option<&Path>, site: &'static std::panic::Location<'static>) -> Patience {
@@ -2392,6 +2501,13 @@ impl Patience {
     /// Its wait's account ([`Wait::account`]): what its last look counted as progress.
     pub fn account(&self) -> String {
         self.wait.account()
+    }
+
+    /// The window a stillness of its party is refused over as its looks so far say it: W*, or
+    /// what its looks resolve where that is longer (a counter's tick, a look's own time). None
+    /// while it is not judged.
+    pub fn window(&self) -> Option<Duration> {
+        self.wait.judge.stillness().map(|(_, _, window)| window)
     }
 }
 
@@ -2476,7 +2592,12 @@ impl Falling {
             if ended {
                 if let Some(fell) = self.fell {
                     let took = fell.saturating_duration_since(self.wait.began);
-                    self.wait.kind.record().teach(took, self.wait.work);
+                    self.wait.read_through();
+                    if self.wait.read == Some(true) {
+                        self.wait.kind.record().teach(took, self.wait.work);
+                    } else {
+                        self.wait.kind.record().teach_unrated(took);
+                    }
                     self.wait.kind.keep();
                 }
                 return now;
@@ -2640,6 +2761,24 @@ pub fn processes() -> Vec<(u32, u32, String)> {
         .collect()
 }
 
+/// The processes of `listed` ([`processes`]) in one of process groups `groups`, as
+/// getpgid(2) reads each now (POSIX.1-2024, XSH getpgid): one gone since it was listed is
+/// left out.
+#[cfg(unix)]
+pub fn grouped<'a>(
+    listed: &'a [(u32, u32, String)],
+    groups: &'a [u32],
+) -> impl Iterator<Item = &'a (u32, u32, String)> + 'a {
+    listed.iter().filter(|(pid, ..)| {
+        let Ok(id) = libc::pid_t::try_from(*pid) else {
+            return false;
+        };
+        // SAFETY: getpgid(2) of a process ID: it reads the kernel's record alone.
+        let group = unsafe { libc::getpgid(id) };
+        u32::try_from(group).is_ok_and(|group| groups.contains(&group))
+    })
+}
+
 /// Runs `cmd` as built, `shards` itself ([`run_shards_with`]) or a program that runs it
 /// (given [`as_tests_run`]'s environment), its output collected, for as long as it goes on:
 /// a wait on its party ([`Party`]) judged by its kind's record ([`WaitKind`]: its caller's
@@ -2668,6 +2807,32 @@ pub fn run_command(cmd: Command, asked: &[String]) -> Run {
         }
         Err(ended) => panic!("{}", ended.said),
     }
+}
+
+/// Whether child `pid` has ended, left unreaped for a look to read its CPU through its end:
+/// waitid(2) with WNOWAIT (POSIX.1-2024, XSH waitid), which leaves it waitable.
+#[cfg(unix)]
+fn ended_unreaped(pid: u32) -> bool {
+    let id = libc::id_t::from(pid);
+    // SAFETY: siginfo_t is plain C data, for which all zeroes is a value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid(2) of this process's own child into a siginfo_t of ours; WNOWAIT leaves
+    // it to be reaped by its `Child`.
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &raw mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // With WNOHANG and no child ended, waitid(2) leaves si_pid 0.
+    #[cfg(target_os = "linux")]
+    // SAFETY: the si_pid of a siginfo_t waitid(2) filled for a child's end.
+    let ended = unsafe { info.si_pid() } != 0;
+    #[cfg(not(target_os = "linux"))]
+    let ended = info.si_pid != 0;
+    waited == 0 && ended
 }
 
 /// What a run ended at its end or its stall leaves of the processes under it ([`end_run`]).
@@ -2715,7 +2880,7 @@ fn run_ending(
     end: Option<Duration>,
     leftovers: Leftovers,
 ) -> Result<Run, Ended> {
-    let kind = WaitKind::of(
+    let kind = WaitKind::command(
         std::panic::Location::caller(),
         &command_words(&cmd),
         &keyed_line(&cmd),
@@ -2750,13 +2915,29 @@ fn run_ending(
         }
     };
     let mut wait = Wait::begin(kind, child.id(), home.as_deref(), &asked.join(" "));
+    // Its answer, its client's end, is missing as it begins: its client started just now,
+    // so an end its first check finds before any look is its party's answer, which teaches
+    // its kind, never one there before it.
+    wait.absent();
     let mut status = None;
     loop {
+        // Its client read as it ends, before it is reaped, for its work through its answer:
+        // on Unix while it is a zombie, on Windows through the handle its watch holds.
+        #[cfg(unix)]
+        if status.is_none() && ended_unreaped(child.id()) {
+            wait.read_through();
+        }
         if status.is_none()
             && let Some(st) = child.try_wait().unwrap()
         {
-            // Its client's own end: its kind's answer.
-            wait.answered();
+            #[cfg(windows)]
+            wait.read_through();
+            // Its client's own end: its kind's answer, taught where it served.
+            if st.success() {
+                wait.answered();
+            } else {
+                wait.unserved();
+            }
             status = Some(st);
         }
         let output = came(&out, &mut out_got) | came(&err, &mut err_got);
@@ -2998,7 +3179,8 @@ pub fn guest_text(text: &str) -> String {
 /// party ran at meanwhile, a refusal's diagnosis and never its bound. None on a host until
 /// its first answer there; then kept under `target/judge-records`, by the host and the call
 /// site, so that a later run on the host begins from what it learned (ROOT, 2026-11-13: a
-/// record learned on the host is data, not a seed), and taught again by each answer. The
+/// record learned on the host is data, not a seed), and taught again by each answer: a
+/// command's by each served one alone ([`Wait::unserved`], [`SERVED`]). The
 /// person's ruling of 2026-11-13 holds each of them: "No record seeds. The cold start, and
 /// every wait after a run-out, follows the party's liveness and progress. After that the
 /// bound is the slowest answer seen. No ×2."
@@ -3006,6 +3188,7 @@ pub struct WaitKind {
     site: &'static std::panic::Location<'static>,
     words: String,
     line: String,
+    taught: Taught,
     record: shards_api::Record,
     file: PathBuf,
 }
@@ -3033,8 +3216,27 @@ impl WaitKind {
     /// name of bounded length whatever the line): one a host kept before commands were told
     /// apart, keyed by its call site alone, is read by waits on no command still, and a
     /// command's kind is cold on a host until its own first answer there.
+    pub fn command(
+        site: &'static std::panic::Location<'static>,
+        words: &str,
+        line: &str,
+    ) -> &'static WaitKind {
+        WaitKind::taught(site, words, line, Taught::Served)
+    }
+
+    /// The kind of `site` waiting for `awaited` keyed by `line` (a guest's text,
+    /// [`guest_text`]), or for nothing where both are empty: taught by every answer.
     pub fn of(site: &'static std::panic::Location<'static>, words: &str, line: &str) -> &'static WaitKind {
-        type Kind = (&'static str, u32, u32, String, String);
+        WaitKind::taught(site, words, line, Taught::Every)
+    }
+
+    fn taught(
+        site: &'static std::panic::Location<'static>,
+        words: &str,
+        line: &str,
+        taught: Taught,
+    ) -> &'static WaitKind {
+        type Kind = (&'static str, u32, u32, String, String, Taught);
         static KINDS: std::sync::Mutex<std::collections::BTreeMap<Kind, &'static WaitKind>> =
             std::sync::Mutex::new(std::collections::BTreeMap::new());
         let mut kinds = KINDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3045,12 +3247,14 @@ impl WaitKind {
                 site.column(),
                 words.to_string(),
                 line.to_string(),
+                taught,
             ))
             .or_insert_with(|| {
                 let kind: &'static WaitKind = Box::leak(Box::new(WaitKind {
                     site,
                     words: words.to_string(),
                     line: line.to_string(),
+                    taught,
                     record: shards_api::Record::new(),
                     file: WaitKind::kept_at(site, words, line),
                 }));
@@ -3093,17 +3297,39 @@ impl WaitKind {
         &self.record
     }
 
-    /// Teaches its record what this host kept of it: R*'s own answer, then W*'s with work no
-    /// rate is below, so that each comes back as it was kept. Nothing where nothing whole is
-    /// kept.
+    /// Teaches its record what this host kept of it, W*, and R* and C* where they were
+    /// rated ([`RATED`]), each as it was kept (`shards_api::Record::merge`). Nothing where
+    /// nothing whole is kept (one kept before answers were rated, W* and R* alone, leaves its
+    /// kind cold until its next answer rewrites it: its R* may be of none read, 0 ns), and,
+    /// for a command's kind, nothing that does not say it is of served answers alone
+    /// ([`SERVED`]).
     fn learn_kept(&self) {
         let kept = std::fs::read_to_string(&self.file).unwrap_or_default();
-        let ns: Vec<u64> = kept.split_whitespace().filter_map(|n| n.parse().ok()).collect();
-        if let [slowest, cpu, over] = ns[..] {
-            self.record
-                .teach(Duration::from_nanos(over), Duration::from_nanos(cpu));
-            self.record.teach(Duration::from_nanos(slowest), Duration::MAX);
+        let mut words = kept.split_whitespace();
+        if self.served_only() && words.next() != Some(SERVED) {
+            return;
         }
+        let ns = |word: Option<&str>| word.and_then(|n| n.parse().ok()).map(Duration::from_nanos);
+        let Some(slowest) = ns(words.next()) else {
+            return;
+        };
+        let rated = match words.next() {
+            None => None,
+            Some(RATED) => match (ns(words.next()), ns(words.next()), ns(words.next()), words.next()) {
+                (Some(cpu), Some(over), Some(most), None) => Some(shards_api::Rated {
+                    least: shards_api::Rate { cpu, over },
+                    most,
+                }),
+                _ => return,
+            },
+            Some(_) => return,
+        };
+        self.record.merge(shards_api::Seen::Learned { slowest, rated });
+    }
+
+    /// Whether it is a command's kind, taught by its served answers alone ([`Wait::unserved`]).
+    fn served_only(&self) -> bool {
+        self.taught == Taught::Served
     }
 
     /// A kind of its own whose record is kept at `file`: two of them stand for two
@@ -3114,6 +3340,7 @@ impl WaitKind {
             site: std::panic::Location::caller(),
             words: String::new(),
             line: String::new(),
+            taught: Taught::Every,
             record: shards_api::Record::new(),
             file,
         }
@@ -3171,7 +3398,7 @@ impl WaitKind {
     ) -> std::io::Result<()> {
         static KEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         self.learn_kept();
-        let shards_api::Seen::Learned { slowest, least } = self.record.seen() else {
+        let shards_api::Seen::Learned { slowest, rated } = self.record.seen() else {
             return Ok(());
         };
         between();
@@ -3184,12 +3411,46 @@ impl WaitKind {
             KEEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let temporary = dir.join(temporary);
+        let tag = if self.served_only() {
+            format!("{SERVED} ")
+        } else {
+            String::new()
+        };
         std::fs::write(
             &temporary,
-            format!("{} {} {}\n", ns(slowest), ns(least.cpu), ns(least.over)),
+            match rated {
+                Some(rated) => format!(
+                    "{tag}{} {RATED} {} {} {}\n",
+                    ns(slowest),
+                    ns(rated.least.cpu),
+                    ns(rated.least.over),
+                    ns(rated.most)
+                ),
+                None => format!("{tag}{}\n", ns(slowest)),
+            },
         )?;
         std::fs::rename(&temporary, &self.file)
     }
+}
+
+/// The first word of a command's kept record ([`WaitKind::keep`]): its W*, R* and C* are of
+/// served answers alone ([`Wait::unserved`]). A record kept without it, before a refusal
+/// taught nothing, may hold a refusal's answer (adacachy2's `shards run` record of
+/// containers.rs' `a_logs_history_is_what_its_user_set`, W* 5.4 ms), and is read as none:
+/// its kind cold until its next served answer rewrites it.
+const SERVED: &str = "served";
+
+/// The word before a kept record's R* and C* ([`WaitKind::keep`]): of answers whose work was
+/// read through their end alone (`shards_api::Rated`). A record kept without it has none.
+const RATED: &str = "rated";
+
+/// Which answers teach a [`WaitKind`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Taught {
+    /// Each: a state, a line, a stream's bytes, a call's return.
+    Every,
+    /// A command's served ones alone, its client's status 0 ([`Wait::unserved`], [`SERVED`]).
+    Served,
 }
 
 /// What a [`Patience`] awaits, and keys its kind by ([`WaitKind::awaiting`]).
@@ -3228,10 +3489,76 @@ pub struct Party {
     beside: Option<Beside>,
     /// What this process's serving threads had run at the look before ([`Server`]).
     served: Option<u64>,
+    /// Each member's parent and name as its last look's listing gave them ([`processes`]),
+    /// for its account: which of them a refusal's last progress was (b24: a run's VM
+    /// process, its daemon's spawner's child, told from the client's by its name alone).
+    kin: std::collections::BTreeMap<u32, (u32, String)>,
 }
 
+/// Process `pid`'s status as its OS gives it: Linux its `/proc/<pid>/stat` state (field 3,
+/// proc(5)), macOS its `pbsi_status` (`PROC_PIDT_SHORTBSDINFO`, sys/proc.h's `SIDL` to
+/// `SZOMB`; `SRUN` for any live process, sleeping or not: HVF's accounts said "running
+/// (status 2), 0 of 12 threads runnable" of an idle daemon), each said with its letter or
+/// number; none where it cannot be read (Windows,
+/// whose process has no such state).
+#[cfg(target_os = "linux")]
+fn process_status(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let state = stat.rsplit_once(')')?.1.split_whitespace().next()?.to_string();
+    let word = match state.as_str() {
+        "R" => "running or runnable",
+        "S" => "sleeping",
+        "D" => "in an uninterruptible wait",
+        "Z" => "a zombie",
+        "T" => "stopped",
+        "t" => "traced",
+        "X" => "dead",
+        "I" => "idle",
+        _ => "in a state proc(5) does not name",
+    };
+    Some(format!("{word} ({state})"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_status(pid: u32) -> Option<String> {
+    let id = libc::c_int::try_from(pid).ok()?;
+    let size = libc::c_int::try_from(size_of::<libc::proc_bsdshortinfo>()).ok()?;
+    // SAFETY: proc_bsdshortinfo is plain C data, for which all zeroes is a value.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: a buffer of `size` bytes for the call to fill.
+    let filled =
+        unsafe { libc::proc_pidinfo(id, libc::PROC_PIDT_SHORTBSDINFO, 0, (&raw mut info).cast(), size) };
+    if filled != size {
+        return None;
+    }
+    let word = match info.pbsi_status {
+        libc::SIDL => "being created",
+        // XNU keeps SRUN for every live process, a sleeping one too: its threads' run
+        // states, said beside it, tell whether one runs.
+        libc::SRUN => "live",
+        libc::SSLEEP => "sleeping",
+        libc::SSTOP => "stopped",
+        libc::SZOMB => "a zombie",
+        _ => "in a status sys/proc.h does not name",
+    };
+    Some(format!("{word} (status {})", info.pbsi_status))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_status(_: u32) -> Option<String> {
+    None
+}
+
+/// The name a VM process runs as (`shards-vm`, `shards-vm-gpu`): a daemon's descendant of
+/// another name is its helper (its spawner, its network process), whose run for a waiter's
+/// own clients is the daemon's ([`Looked::daemon_ran`]; ROOT's batch, KVM: the polled test's
+/// party progressed by a process of the daemon's serving its polls, 13 of 30 whole binaries
+/// never refused).
+#[cfg(unix)]
+const VM_PROCESS: &str = "shards-vm";
+
 /// Whose processes a [`Party`]'s are, besides its home's daemon and what descends from it.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Members {
     /// A client and what descends from it: a command [`run_command`] runs, or a `run
     /// --kernel` or `restore` (the VM process on Unix, its starter on Windows).
@@ -3249,6 +3576,12 @@ enum Members {
     /// shards-api's `ImageShards` starts and its VM process, which a call of the API's waits
     /// on ([`judged`]), the host's work before its VM starts among them.
     Started,
+    /// Every process of these process groups, wherever it is listed ([`grouped`]): a pool's
+    /// warm run hosts, each leading a group of its own with its VM, network and share
+    /// processes in it (shards-api session.rs `start_host`), which their holder's end leaves
+    /// orphans of no process of this test's.
+    #[cfg(unix)]
+    Groups(Vec<u32>),
 }
 
 /// What a [`Party`]'s processes' CPU time says of it.
@@ -3278,6 +3611,16 @@ pub struct Looked {
     /// Its home's daemon ran ([`Cpu::Progress`]), said apart from `found`: the work of its
     /// waiter's own clients where its waiter asked the daemon meanwhile ([`Wait::look`]).
     pub daemon_ran: Option<String>,
+    /// Whether it saw its party's own processes run or rest unheld: none of them held from
+    /// running, stopped, starved of a CPU (`shards_api::Watch::starved`), ending or found
+    /// anew, no run of its home in its stop grace, its daemon saying nothing (words are
+    /// progress its CPU does not show), and no progress of this process's servers', which it
+    /// may be waiting on. Only such looks' windows are its judge's rate's
+    /// (`shards_api::Span::work`, D215).
+    pub vouched: bool,
+    /// Whether a process of it had gone, or could not be read, before this look read its
+    /// last CPU: what it ran since the look before is lost to its work.
+    pub lost: bool,
 }
 
 impl Party {
@@ -3305,6 +3648,12 @@ impl Party {
         Party::with(Members::Started, home)
     }
 
+    /// The party of every process of process groups `groups` ([`Members::Groups`]).
+    #[cfg(unix)]
+    pub fn groups(groups: &[u32]) -> Party {
+        Party::with(Members::Groups(groups.to_vec()), None)
+    }
+
     fn with(members: Members, home: Option<&Path>) -> Party {
         Party {
             members,
@@ -3315,6 +3664,7 @@ impl Party {
             looked: false,
             beside: None,
             served: None,
+            kin: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3335,14 +3685,16 @@ impl Party {
     /// daemon, and on Unix what descends from them, from one listing of the system's
     /// ([`processes`]); on Windows each is followed with what descends from it (shards-api's
     /// tree of a process, Toolhelp32). None for a machine of this process's.
-    fn members(&self) -> Vec<u32> {
-        let listed = match self.members {
+    fn members(&mut self) -> (Vec<u32>, std::collections::BTreeSet<u32>) {
+        let listed = match &self.members {
             Members::Machine => Vec::new(),
             Members::Client(_) if cfg!(windows) => Vec::new(),
             Members::Client(_) | Members::Own | Members::Started => processes(),
+            #[cfg(unix)]
+            Members::Groups(_) => processes(),
         };
-        let own = match self.members {
-            Members::Client(client) => vec![client],
+        let own = match &self.members {
+            Members::Client(client) => vec![*client],
             Members::Own => own_vms(),
             Members::Machine => Vec::new(),
             Members::Started => listed
@@ -3350,23 +3702,39 @@ impl Party {
                 .filter(|(_, ppid, _)| *ppid == std::process::id())
                 .map(|(pid, ..)| *pid)
                 .collect(),
+            #[cfg(unix)]
+            Members::Groups(groups) => grouped(&listed, groups).map(|(pid, ..)| *pid).collect(),
         };
-        let roots: Vec<u32> = own.into_iter().chain(self.daemon()).collect();
+        let daemon = self.daemon();
+        let roots: Vec<u32> = own.into_iter().chain(daemon).collect();
         #[cfg(windows)]
-        return roots;
+        return (roots, std::collections::BTreeSet::new());
         #[cfg(unix)]
         {
-            let mut tree = roots;
+            // Each member, and whether it is its daemon's helper: under the daemon, with no
+            // VM process between them.
+            let mut tree: Vec<(u32, bool)> = roots.into_iter().map(|pid| (pid, false)).collect();
             let mut i = 0;
-            while let Some(&parent) = tree.get(i) {
-                for (pid, ppid, _) in &listed {
-                    if *ppid == parent && !tree.contains(pid) {
-                        tree.push(*pid);
+            while let Some(&(parent, parent_helps)) = tree.get(i) {
+                let under_daemon = parent_helps || Some(parent) == daemon;
+                for (pid, ppid, name) in &listed {
+                    if *ppid == parent && !tree.iter().any(|(member, _)| member == pid) {
+                        tree.push((*pid, under_daemon && !name.starts_with(VM_PROCESS)));
                     }
                 }
                 i += 1;
             }
-            tree
+            let helpers = tree
+                .iter()
+                .filter(|(_, helps)| *helps)
+                .map(|(pid, _)| *pid)
+                .collect();
+            self.kin = listed
+                .into_iter()
+                .filter(|(pid, ..)| tree.iter().any(|(member, _)| member == pid))
+                .map(|(pid, ppid, name)| (pid, (ppid, name)))
+                .collect();
+            (tree.into_iter().map(|(pid, _)| pid).collect(), helpers)
         }
     }
 
@@ -3392,7 +3760,7 @@ impl Party {
     /// again (#77 waits-09: a zombie's every look says its end under way).
     pub fn look(&mut self) -> Looked {
         use shards_api::Found;
-        let members = self.members();
+        let (members, helpers) = self.members();
         let daemon = self.daemon();
         let mut looked = Looked {
             found: Found::Still,
@@ -3400,9 +3768,12 @@ impl Party {
             cpu: Duration::ZERO,
             resolution: Duration::ZERO,
             daemon_ran: None,
+            vouched: true,
+            lost: false,
         };
         let mut based = !std::mem::replace(&mut self.looked, true);
         if self.said.as_mut().is_some_and(Said::said) {
+            looked.vouched = false;
             looked.found = Found::Progressed;
             looked.what = "its daemon said something".into();
         }
@@ -3412,6 +3783,14 @@ impl Party {
             match ran {
                 Ran::Based => based = true,
                 Ran::Still => {}
+                Ran::Held => {
+                    looked.vouched = false;
+                    if looked.found == Found::Still {
+                        looked.found = Found::Held;
+                        looked.what =
+                            "its host held a thread of this process beside its waiter from running".into();
+                    }
+                }
                 Ran::Others(cpu) => {
                     looked.cpu = looked.cpu.saturating_add(cpu);
                     if self.cpu == Cpu::Progress && looked.found != Found::Progressed {
@@ -3432,6 +3811,7 @@ impl Party {
                 looked.what = "this process's serving threads ran".into();
             }
             server_held = served == before && serving;
+            looked.vouched &= served == before && !server_held;
         }
         // Whether a process of it was found live: one found anew, or one still to be read.
         let mut live = false;
@@ -3468,13 +3848,35 @@ impl Party {
             let found = watch.look();
             if matches!(found, Ok(Found::Gone)) || (was_ended && watch.ended()) {
                 gone.push(pid);
+                looked.vouched = false;
+                looked.lost |= matches!(found, Ok(Found::Gone));
                 continue;
             }
+            looked.lost |= found.is_err();
             looked.cpu = looked.cpu.saturating_add(watch.cpu().saturating_sub(before));
             live |= matches!(found, Ok(Found::Progressed | Found::Held | Found::Still));
+            // A party whose CPU is its liveness alone ran, some threads of it, while the one
+            // its answer waits on may have sat runnable on no CPU: its host's hold
+            // (`shards_api::Watch::starved`), read at each look so its window is theirs.
+            // Read under either CPU, as the rate's window needs it (D215).
+            let starved = watch.starved();
+            looked.vouched &= found
+                .as_ref()
+                .is_ok_and(|&found| watch.vouched_by(found, starved));
             match (found, self.cpu) {
+                (Ok(Found::Progressed | Found::Still), Cpu::Liveness)
+                    if starved && looked.found == Found::Still =>
+                {
+                    looked.found = Found::Held;
+                    looked.what = format!("its host held a thread of process {pid} from any CPU");
+                }
                 (Ok(Found::Progressed), Cpu::Progress) if daemon == Some(pid) => {
                     looked.daemon_ran = Some(format!("its daemon {pid} ran"));
+                }
+                (Ok(Found::Progressed), Cpu::Progress) if helpers.contains(&pid) => {
+                    looked
+                        .daemon_ran
+                        .get_or_insert_with(|| format!("its daemon's process {pid} ran"));
                 }
                 (Ok(Found::Progressed), Cpu::Progress) if looked.found != Found::Progressed => {
                     looked.found = Found::Progressed;
@@ -3494,16 +3896,37 @@ impl Party {
         for pid in gone {
             self.watched.remove(&pid);
         }
+        if !found_anew.is_empty() {
+            looked.vouched = false;
+        }
         if server_held && looked.found == Found::Still {
             looked.found = Found::Held;
             looked.what = "its host held a serving thread of this process from running".into();
         }
+        // A VM process of it in its launch, the host's work before its own code (PM M166):
+        // its one thread waits on amfid's, syspolicyd's and secinitd's work asleep, so it is
+        // followed by its liveness alone until its launch is over, as the daemon follows one
+        // before its first request (daemon.rs `launch`). Read only of a look that would find
+        // it still.
+        #[cfg(target_os = "macos")]
         if live
             && looked.found == Found::Still
-            && let Some((run, left)) = self.graced()
+            && let Some(pid) = processes().into_iter().find_map(|(pid, _, name)| {
+                (self.watched.contains_key(&pid)
+                    && name.starts_with(VM_PROCESS)
+                    && shards_vmm::platform::in_launch(pid) == Some(true))
+                .then_some(pid)
+            })
         {
             looked.found = Found::Held;
-            looked.what = format!("its daemon in run {run}'s stop grace, {left:?} more");
+            looked.what = format!("its VM process {pid} in its launch, the host's to admit (PM M166)");
+        }
+        if live && let Some((run, left)) = self.graced() {
+            looked.vouched = false;
+            if looked.found == Found::Still {
+                looked.found = Found::Held;
+                looked.what = format!("its daemon in run {run}'s stop grace, {left:?} more");
+            }
         }
         if !live && looked.found == Found::Still && !matches!(self.members, Members::Machine) {
             looked.found = Found::Gone;
@@ -3531,13 +3954,51 @@ impl Party {
             .max_by_key(|(_, left)| *left)
     }
 
+    /// What each process it follows is doing now, as its OS gives it, for a wait's account of
+    /// itself, so that a refusal names its own premise (ROOT, 2026-11-14: api_image.rs:1379's
+    /// refusal named no member's state, whether one was ending among them): its status
+    /// ([`process_status`]), how many of its threads are runnable (`shards_api::
+    /// runnable_threads`), and its end under way or its stop, as its look found them.
+    fn states(&self) -> String {
+        if self.watched.is_empty() {
+            return "none followed".into();
+        }
+        let states: Vec<String> = self
+            .watched
+            .iter()
+            .map(|(&pid, watch)| {
+                let kin = self
+                    .kin
+                    .get(&pid)
+                    .map_or_else(String::new, |(parent, name)| format!(" {name} (parent {parent})"));
+                let mut said = format!(
+                    "{pid}{kin} {}",
+                    process_status(pid).unwrap_or_else(|| "unread".into())
+                );
+                if let Some((runnable, threads)) = shards_api::runnable_threads(pid) {
+                    said.push_str(&format!(", {runnable} of {threads} threads runnable"));
+                }
+                if watch.ended() {
+                    said.push_str(", its end under way");
+                }
+                if watch.stopped() {
+                    said.push_str(", stopped");
+                }
+                said
+            })
+            .collect();
+        states.join("; ")
+    }
+
     /// Who it is, for a wait's account of itself.
     fn named(&self) -> String {
-        let who = match self.members {
+        let who = match &self.members {
             Members::Client(c) => format!("client {c}"),
             Members::Own => "this test's own VM processes".to_string(),
             Members::Machine => "a machine of this test's process".to_string(),
             Members::Started => "the processes this test's process started".to_string(),
+            #[cfg(unix)]
+            Members::Groups(groups) => format!("the processes of process groups {groups:?}"),
         };
         let who = match self.cpu {
             Cpu::Progress => who,
@@ -3574,6 +4035,16 @@ impl Party {
 ///   A thread's own clock brings a running thread up to date as it is read
 ///   (kernel/sched/core.c `task_sched_runtime`). The process's clock still counts a thread
 ///   that ran and exited between two looks; either showing a run is its progress.
+/// - macOS, beside that: each other thread's own times (task_threads(2) and
+///   thread_info(THREAD_BASIC_INFO), as [`ServerThread`] reads one). proc_pid_rusage(2) did
+///   not show a thread spinning beside its waiter within 450 µs windows on HVF
+///   (`a_judged_calls_own_work_is_its_progress`' first form, and ROOT's batch: this file's
+///   `a_machines_host_work_is_its_progress` refused under 14 busy loops), where its own
+///   times did.
+/// - Linux and macOS: whether another thread is runnable as it is read (Linux its state `R`,
+///   macOS `TH_STATE_RUNNING`, each running or waiting for a CPU): one whose others ran
+///   nothing since the look before while one of them was runnable was held by its host
+///   ([`Ran::Held`]), as a busy host keeps a spinning thread from its CPU.
 /// - Windows: QueryProcessCycleTime and QueryThreadCycleTime, cycle counts, exact (their
 ///   time undocumented: what they ran is said as no CPU time, R* a refusal's diagnosis).
 ///
@@ -3590,14 +4061,23 @@ struct Beside {
 }
 
 /// One look's reading, in its OS's units (Unix nanoseconds, Windows cycles): the looking
-/// thread's counter, this process's, then the looking thread's again; on Linux each other
-/// thread's own counter too, by its thread ID.
+/// thread's counter, this process's, then the looking thread's again; on Linux and macOS
+/// each other thread's own counter too, by its thread ID (macOS: its port's name), and
+/// whether one of them was runnable.
 struct Reading {
     before: u64,
     process: u64,
     after: u64,
-    #[cfg(target_os = "linux")]
-    others: std::collections::BTreeMap<u32, u64>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    others: Others,
+}
+
+/// This process's threads but the calling one, each by its ID and its own CPU time, and
+/// whether one was runnable as it was read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Others {
+    cpu: std::collections::BTreeMap<u32, u64>,
+    runnable: bool,
 }
 
 /// What [`Beside::look`] found.
@@ -3607,6 +4087,8 @@ enum Ran {
     Based,
     /// Nothing beyond its waiter's own run and the counters' uncertainty.
     Still,
+    /// Nothing, while one of its other threads was runnable: its host held it.
+    Held,
     /// Its other threads ran, this much (none said on Windows, whose cycles are no time).
     Others(Duration),
 }
@@ -3622,9 +4104,14 @@ impl Beside {
             Some((by, last)) if by == thread => Some(self.others(&last, &now)),
             _ => None,
         };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let held = now.others.runnable;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let held = false;
         self.last = Some((thread, now));
         match others {
             None => Ran::Based,
+            Some(0) if held => Ran::Held,
             Some(0) => Ran::Still,
             Some(ns) if cfg!(unix) => Ran::Others(Duration::from_nanos(ns)),
             Some(_) => Ran::Others(Duration::ZERO),
@@ -3674,8 +4161,8 @@ impl Beside {
             before: ns(before),
             process: ns(process),
             after: ns(after),
-            #[cfg(target_os = "linux")]
-            others: other_threads_cpu()?,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            others: other_threads()?,
         })
     }
 
@@ -3699,16 +4186,16 @@ impl Beside {
     }
 }
 
-/// What the other threads' own counters grew by from `last` to `now` (Linux; none read
-/// elsewhere). A thread not read at the look before began since: all it ran is since.
-#[cfg(target_os = "linux")]
+/// What the other threads' own counters grew by from `last` to `now` (Linux and macOS; none
+/// read elsewhere). A thread not read at the look before began since: all it ran is since.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn threads_ran(last: &Reading, now: &Reading) -> u64 {
-    now.others.iter().fold(0u64, |ran, (tid, &cpu)| {
-        ran.saturating_add(cpu.saturating_sub(last.others.get(tid).copied().unwrap_or(0)))
+    now.others.cpu.iter().fold(0u64, |ran, (tid, &cpu)| {
+        ran.saturating_add(cpu.saturating_sub(last.others.cpu.get(tid).copied().unwrap_or(0)))
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn threads_ran(_: &Reading, _: &Reading) -> u64 {
     0
 }
@@ -3727,10 +4214,13 @@ fn thread_cpu(
 /// `make_thread_cpuclock`; glibc's and musl's `pthread_getcpuclockid` make the same). A
 /// thread that ended between this process's listing and its read is left out.
 #[cfg(target_os = "linux")]
-fn other_threads_cpu() -> Option<std::collections::BTreeMap<u32, u64>> {
+fn other_threads() -> Option<Others> {
     // SAFETY: gettid(2) takes nothing and always succeeds.
     let me = unsafe { libc::gettid() };
-    let mut others = std::collections::BTreeMap::new();
+    let mut others = Others {
+        cpu: std::collections::BTreeMap::new(),
+        runnable: false,
+    };
     for entry in std::fs::read_dir("/proc/self/task").ok()? {
         let Some(tid) = entry
             .ok()
@@ -3750,9 +4240,99 @@ fn other_threads_cpu() -> Option<std::collections::BTreeMap<u32, u64>> {
         let (Ok(tid), Ok(ns)) = (u32::try_from(tid), u64::try_from(cpu.as_nanos())) else {
             continue;
         };
-        others.insert(tid, ns);
+        others.cpu.insert(tid, ns);
+        // Its state (`/proc/self/task/<tid>/stat` field 3, after its command's closing
+        // parenthesis, proc(5)).
+        others.runnable |= std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .map(|(_, rest)| rest.trim_start().starts_with('R'))
+            })
+            .unwrap_or(false);
     }
     Some(others)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// This task's port, which the SDK's `mach_task_self()` reads (mach/mach_init.h), as
+    /// shards-vmm's `platform` binds it.
+    static mach_task_self_: libc::mach_port_t;
+    /// Releases one reference of right `name` in `task`'s port space (mach/mach_port.h;
+    /// libSystem), which libc binds no name for.
+    fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
+}
+
+/// This process's threads but the calling one, each by its port's name, its user and system
+/// time (thread_info(THREAD_BASIC_INFO), as [`ServerThread`] reads one), and whether one is
+/// `TH_STATE_RUNNING` (running or waiting for a CPU). A thread that ended between the list
+/// and its read is left out.
+#[cfg(target_os = "macos")]
+fn other_threads() -> Option<Others> {
+    // SAFETY: this thread's own pthread, whose port it returns without a new reference.
+    let me = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+    let mut list: libc::thread_act_array_t = std::ptr::null_mut();
+    let mut count: libc::mach_msg_type_number_t = 0;
+    // SAFETY: a read of the task's port, which the system sets before main and never
+    // changes.
+    let task = unsafe { mach_task_self_ };
+    // SAFETY: task_threads(2) of this task, into a list and a count it allocates and fills;
+    // each port it names carries a send right of ours, released below.
+    if unsafe { libc::task_threads(task, &raw mut list, &raw mut count) } != libc::KERN_SUCCESS {
+        return None;
+    }
+    let ports: Vec<libc::thread_act_t> = (0..usize::try_from(count).unwrap_or(0))
+        // SAFETY: `count` ports the call wrote at `list`.
+        .map(|i| unsafe { *list.add(i) })
+        .collect();
+    let mut others = Others {
+        cpu: std::collections::BTreeMap::new(),
+        runnable: false,
+    };
+    for &port in &ports {
+        if port != me
+            && let Some((ns, runnable)) = thread_times(port)
+        {
+            others.cpu.insert(port, ns);
+            others.runnable |= runnable;
+        }
+        // SAFETY: the send right task_threads gave of this port, released once.
+        unsafe { mach_port_deallocate(task, port) };
+    }
+    let bytes = usize::try_from(count)
+        .ok()
+        .and_then(|n| n.checked_mul(std::mem::size_of::<libc::thread_act_t>()))
+        .unwrap_or(0);
+    // SAFETY: the list task_threads allocated in this task, of `count` ports, freed once.
+    unsafe { libc::vm_deallocate(task, list as libc::vm_address_t, bytes as libc::vm_size_t) };
+    Some(others)
+}
+
+/// Thread `port`'s user and system time in nanoseconds, and whether it is
+/// `TH_STATE_RUNNING`; none where it cannot be read (it ended).
+#[cfg(target_os = "macos")]
+fn thread_times(port: libc::thread_act_t) -> Option<(u64, bool)> {
+    // SAFETY: plain data, for thread_info to fill.
+    let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+    let flavor = libc::thread_flavor_t::try_from(libc::THREAD_BASIC_INFO).ok()?;
+    let mut count = libc::THREAD_BASIC_INFO_COUNT;
+    // SAFETY: THREAD_BASIC_INFO of a thread port of ours into a thread_basic_info of its
+    // count's size (mach/thread_info.h).
+    let code = unsafe { libc::thread_info(port, flavor, (&raw mut info).cast(), &raw mut count) };
+    if code != libc::KERN_SUCCESS {
+        return None;
+    }
+    let us = |t: libc::time_value_t| {
+        u64::try_from(t.seconds)
+            .ok()?
+            .checked_mul(1_000_000)?
+            .checked_add(u64::try_from(t.microseconds).ok()?)
+    };
+    let ns = us(info.user_time)?
+        .checked_add(us(info.system_time)?)?
+        .checked_mul(1000)?;
+    Some((ns, info.run_state == libc::TH_STATE_RUNNING))
 }
 
 /// `read` (clock_gettime(2) or clock_getres(2)) of CPU clock `clock`.
@@ -3838,8 +4418,9 @@ fn servers_ran() -> (u64, bool) {
     (ran, runnable)
 }
 
-/// A serving thread as its OS lets another thread of its process read it, and what it was
-/// last read to have run: a read that fails counts that, so the total never falls.
+/// A thread of this process as its OS lets another thread of its process read it, and what
+/// it was last read to have run: a read that fails counts that, so the total never falls. A
+/// serving thread ([`Server`]), or a judged call's own ([`judging`]).
 struct ServerThread {
     #[cfg(target_os = "linux")]
     tid: libc::pid_t,
@@ -3864,7 +4445,7 @@ impl ServerThread {
         ServerThread { tid, last: 0 }
     }
 
-    /// Its own CPU clock, `make_thread_cpuclock`'s (see [`other_threads_cpu`]), in
+    /// Its own CPU clock, `make_thread_cpuclock`'s (see [`other_threads`]), in
     /// nanoseconds.
     #[cfg(target_os = "linux")]
     fn read(&self) -> Option<u64> {
@@ -3998,6 +4579,12 @@ pub struct Wait {
     gone: bool,
     /// Its party's CPU since it began.
     work: Duration,
+    /// Whether every look since its judge's look before saw its party run or rest unheld
+    /// ([`Looked::vouched`]): only then is its work its judge's rate's (D215).
+    vouched: bool,
+    /// Whether its work was read through its answer ([`read_through`](Wait::read_through)):
+    /// none until a read at its answer, which only then teaches its kind R* and C*.
+    read: Option<bool>,
     /// The clients this thread had begun against its party's home as its judge's window
     /// began ([`asked_of`]), and whether its daemon ran in the window: its daemon's progress
     /// only where none began since, as its own clients' work is no progress of its party's.
@@ -4101,6 +4688,8 @@ impl Wait {
             holding: None,
             gone: false,
             work: Duration::ZERO,
+            vouched: false,
+            read: None,
             polls,
             daemon_ran: None,
             live: Live::new(),
@@ -4114,14 +4703,64 @@ impl Wait {
     /// missing first ([`Stage::Awaited`]). What it reads after is judged anew
     /// ([`Stage::Answered`]).
     pub fn answered(&mut self) {
-        if self.stage == Stage::Awaited {
-            self.judge.answered(self.work);
+        self.ended(true);
+    }
+
+    /// Its command's client ended unserved, by a status other than 0 or a signal: its
+    /// answer, which teaches its kind nothing. A command's words and line are its kind, and
+    /// only a served answer says it did their work: one refused stops short of it, at a
+    /// check before or along it, in what may be a fraction of the work's time (ROOT's batch
+    /// 22, KVM, f385b8dac: containers.rs' `shards run --rm --pull never IMAGE exit 0`,
+    /// refused in 5.4 ms for a settings file that did not read, taught its line W* 5.4 ms,
+    /// which refused the same line's real run, a microVM's boot, 300 ms in). What it reads
+    /// after is judged anew, as after any answer.
+    pub fn unserved(&mut self) {
+        self.ended(false);
+    }
+
+    /// Reads its party's CPU now, at its answer, for its work through it: read through where
+    /// none of its processes was lost before its last CPU was read (its command's client
+    /// read as it ended, before it was reaped). Once.
+    pub fn read_through(&mut self) {
+        if self.read.is_none() {
+            let looked = self.party.look();
+            self.work = self.work.saturating_add(looked.cpu);
+            self.read = Some(!looked.lost);
+        }
+    }
+
+    /// Its answer came, taught to its kind where `teaches` and it was found missing first:
+    /// its R* and C* too where its work was read through it ([`read_through`](Self::read_through)).
+    fn ended(&mut self, teaches: bool) {
+        if teaches && self.stage == Stage::Awaited {
+            self.read_through();
+            if self.read == Some(true) {
+                self.judge.answered(self.work);
+            } else {
+                self.judge.answered_unrated();
+            }
             self.kind.keep();
         }
         if self.stage != Stage::Answered {
             self.stage = Stage::Answered;
             self.judge = shards_api::Judge::begin(&self.kind.record);
-            (self.progressed, self.held) = (None, None);
+            (self.progressed, self.held, self.vouched) = (None, None, false);
+        }
+    }
+
+    /// What its call's own thread did since it was read before ([`judging`]): progress where
+    /// it ran, its host's hold where it ran nothing yet was runnable.
+    fn call_looked(&mut self, ran: bool, runnable: bool) {
+        if ran {
+            // Its CPU is no part of its party's work: no window of its rate (D215).
+            self.vouched = false;
+            self.last = (Instant::now(), "its call's own thread ran".into());
+            self.progressed
+                .get_or_insert_with(|| "its call's own thread ran".into());
+        } else if runnable {
+            self.vouched = false;
+            self.held
+                .get_or_insert_with(|| "its host held its call's own thread from running".into());
         }
     }
 
@@ -4152,6 +4791,8 @@ impl Wait {
         use shards_api::Found;
         let now = Instant::now();
         if output {
+            // Words are progress its CPU does not show: no window of its rate (D215).
+            self.vouched = false;
             self.last = (now, "its output".into());
             self.progressed.get_or_insert_with(|| "its output".into());
         }
@@ -4167,13 +4808,15 @@ impl Wait {
         if self.stage == Stage::Answered && looked.found == Found::Gone {
             looked.found = Found::Still;
         }
+        self.work = self.work.saturating_add(looked.cpu);
+        self.vouched &= looked.vouched && matches!(looked.found, Found::Progressed | Found::Still);
         let span = shards_api::Span {
             began: now,
             ended: Instant::now(),
             resolution: looked.resolution,
             own,
+            work: None,
         };
-        self.work = self.work.saturating_add(looked.cpu);
         if self.daemon_ran.is_none() {
             self.daemon_ran = looked.daemon_ran;
         }
@@ -4214,12 +4857,15 @@ impl Wait {
             } else {
                 Found::Still
             };
-            judged = self.judge.found_over(found, span);
+            // Its rate's window is this one where every look in it vouched, and the next
+            // begins vouched.
+            let work = std::mem::replace(&mut self.vouched, true).then_some(self.work);
+            judged = self.judge.found_over(found, shards_api::Span { work, ..span });
         } else if looked.found == Found::Based {
             // Its evidence begins at this look's end, due or not: a based look refuses nothing.
             judged = self.judge.found_over(Found::Based, span);
         }
-        self.live.set(self.account());
+        self.live.set(self.account(), self.party.home.as_deref());
         let left = self
             .judge
             .due()
@@ -4233,9 +4879,16 @@ impl Wait {
     pub fn account(&self) -> String {
         let record = match self.kind.record.seen() {
             shards_api::Seen::Cold => "none yet on this host: its party's liveness alone".to_string(),
-            shards_api::Seen::Learned { slowest, least } => {
-                format!("W* {slowest:?}, R* {:?} of CPU in {:?}", least.cpu, least.over)
+            shards_api::Seen::Learned { slowest, rated: None } => {
+                format!("W* {slowest:?}, no answer's work read through its end")
             }
+            shards_api::Seen::Learned {
+                slowest,
+                rated: Some(rated),
+            } => format!(
+                "W* {slowest:?}, R* {:?} of CPU in {:?}, C* {:?} of CPU",
+                rated.least.cpu, rated.least.over, rated.most
+            ),
         };
         let kind = if self.kind.line.is_empty() {
             self.kind.site.to_string()
@@ -4243,7 +4896,7 @@ impl Wait {
             format!("{} {}", self.kind.site, self.kind.line)
         };
         format!(
-            "{kind}: {} ({}), {:?} in: its last progress {} {:?} ago; {}; its record {record}",
+            "{kind}: {} ({}), {:?} in: its last progress {} {:?} ago; {}; its record {record}{}; its members now: {}",
             self.asked,
             self.party.named(),
             self.began.elapsed(),
@@ -4253,6 +4906,10 @@ impl Wait {
                 || "its host not holding it".to_string(),
                 |held| format!("held: {held}")
             ),
+            self.judge.stillness().map_or_else(String::new, |(still, held, window)| format!(
+                "; still {still:?} of its {window:?} window as its last look saw, {held:?} of its looks' lateness out"
+            )),
+            self.party.states(),
         )
     }
 
@@ -4276,6 +4933,20 @@ impl Wait {
 
     /// What a refusal says of it.
     pub fn refused(&self, stall: &shards_api::Stall) -> String {
+        if let (Some(rate), Some(least)) = (stall.rate(), stall.least()) {
+            return format!(
+                "{} ran too slowly to be answering: {:?} of CPU in the {:?} it was seen to run unheld, below the least rate any answer of its kind came at on this host (R* {:?} in {:?}) and more than any such answer took (C* {:?}), past the slowest such answer ({:?}), {:?} into its wait\n--- its wait\n{}",
+                self.asked,
+                rate.cpu,
+                rate.over,
+                least.cpu,
+                least.over,
+                stall.most().unwrap_or_default(),
+                stall.slowest(),
+                stall.waited(),
+                self.account()
+            );
+        }
         format!(
             "{} made no progress for {:?}, past the slowest answer of its kind seen on this host ({:?}), {:?} into its wait\n--- its wait\n{}",
             self.asked,
@@ -4304,10 +4975,11 @@ impl Drop for Wait {
 
 /// Each live wait's account as its last look gave it, by a number of its own: what
 /// [`dump_live_waits`] says as the test process is ended.
-static LIVE: std::sync::Mutex<std::collections::BTreeMap<u64, String>> =
+static LIVE: std::sync::Mutex<std::collections::BTreeMap<u64, (String, Option<PathBuf>)>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-fn live_waits() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, String>> {
+fn live_waits() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, (String, Option<PathBuf>)>>
+{
     LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -4321,8 +4993,8 @@ impl Live {
         Live(NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
-    fn set(&self, account: String) {
-        live_waits().insert(self.0, account);
+    fn set(&self, account: String, home: Option<&Path>) {
+        live_waits().insert(self.0, (account, home.map(Path::to_path_buf)));
     }
 }
 
@@ -4334,15 +5006,24 @@ impl Drop for Live {
 
 /// Says each live wait's account on stderr: as the test process is ended by SIGINT or
 /// SIGTERM (CI's job limit, a person's ^C), or by Windows' console control event, so that a
-/// wait that never ends, cold or not, leaves what it knew (ROOT, 2026-11-13).
+/// wait that never ends, cold or not, leaves what it knew (ROOT, 2026-11-13): its members,
+/// each by its name, parent and state at its last look, and what each home its waits were
+/// on wrote ([`show_why`]: its runs' stderr, its daemon's samples, its daemon's log's tail),
+/// which go with the home as the process ends (b24's 62-minute wait was ended with its home
+/// and no word of which process its last progress was, nor what its daemon said).
 fn dump_live_waits(why: &str) {
     let live = live_waits();
     let mut said = format!("shards tests: ended by {why}, {} wait(s) under way", live.len());
-    for account in live.values() {
+    for (account, _) in live.values() {
         said.push_str("\n  ");
         said.push_str(account);
     }
     let _ = writeln!(io::stderr(), "{said}");
+    let homes: std::collections::BTreeSet<&PathBuf> =
+        live.values().filter_map(|(_, home)| home.as_ref()).collect();
+    for home in homes {
+        show_why(home);
+    }
 }
 
 /// The write end of the pipe on which [`ended_by`] tells [`dump_at_the_end`]'s thread a
@@ -5508,6 +6189,8 @@ pub struct Vm {
     pub seen: Vec<String>,
     /// Every line it has printed, read or not: what a test that stalls says.
     log: Log,
+    /// Its guest's size (its vCPUs), which keys its streamed waits' kinds ([`Vm::sized`]).
+    size: String,
 }
 
 /// Lines a process printed, as they came.
@@ -5591,7 +6274,15 @@ pub fn judged_there<T: Send>(
 }
 
 /// [`judged`]'s wait, its looks saying its answer missing where `stage` is
-/// [`Stage::Awaited`], and never where it is [`Stage::Begun`].
+/// [`Stage::Awaited`], and never where it is [`Stage::Begun`]. `call` runs on a thread of
+/// this process, shards-api's client, whose work (a spec's checks, an image's reads, a
+/// request's writes) no process this test started shows: that thread is its party's member
+/// too ([`ServerThread`]: its own CPU clock), so a call that works on it is progress and one
+/// idle there is not (ROOT's batch 22, f385b8dac: api_image.rs' `refused` calls, a refusal in
+/// 206 µs on HVF and one in 28.6 ms on KVM at 0 ns of the started processes' CPU, taught
+/// their call sites a W* that refused the next call as it worked). The thread names itself
+/// as it starts and is let go of before it returns, under one lock, so its clock is read
+/// only while it lives.
 fn judging<T: Send>(
     mut wait: Wait,
     stage: Stage,
@@ -5599,10 +6290,15 @@ fn judging<T: Send>(
     stop: impl FnOnce(),
     call: impl FnOnce() -> T + Send,
 ) -> Result<T, String> {
+    let calling: std::sync::Mutex<Option<ServerThread>> = std::sync::Mutex::new(None);
+    let thread = || calling.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::thread::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = scope.spawn(move || {
-            let _ = tx.send(call());
+            *thread() = Some(ServerThread::this());
+            let answer = call();
+            *thread() = None;
+            let _ = tx.send(answer);
         });
         let refused = loop {
             match rx.recv_timeout(wait.next_look()) {
@@ -5616,6 +6312,10 @@ fn judging<T: Send>(
                     Ok(()) => return Err(format!("{asked}: ended with no answer")),
                 },
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Some(thread) = thread().as_mut() {
+                let before = thread.last;
+                wait.call_looked(thread.ran() > before, thread.runnable());
             }
             let looked = if stage == Stage::Awaited {
                 wait.look(false)
@@ -5708,7 +6408,16 @@ impl Vm {
             lines,
             seen: Vec::new(),
             log,
+            size: String::new(),
         }
+    }
+
+    /// Its guest's size (its vCPUs, say), which keys its streamed waits' kinds beside their
+    /// call sites ([`Heard::streaming_sized`]): one site's waits on guests of different sizes
+    /// are kinds apart.
+    pub fn sized(mut self, size: String) -> Vm {
+        self.size = size;
+        self
     }
 
     /// Every line it has printed so far, and those to come.
@@ -5751,7 +6460,7 @@ impl Vm {
     /// host has CPUs, which show CPU time for ever.
     #[track_caller]
     pub fn wait_for_any_streamed(&mut self, texts: &[&str], streamed: Option<&AtomicU64>) -> String {
-        let heard = Heard::streaming(self.child.id(), streamed);
+        let heard = Heard::streaming_sized(self.child.id(), streamed, &self.size);
         self.wait_lines(texts, heard)
     }
 
@@ -5823,7 +6532,7 @@ impl Vm {
     /// waited on while it gets on with it.
     #[track_caller]
     pub fn wait_exit_streamed(&mut self, streamed: Option<&AtomicU64>) -> Option<i32> {
-        let heard = Heard::streaming(self.child.id(), streamed);
+        let heard = Heard::streaming_sized(self.child.id(), streamed, &self.size);
         self.wait_end(heard)
     }
 
@@ -5901,6 +6610,15 @@ impl<'a> Heard<'a> {
         } else {
             WaitKind::of(site, PROGRESS, &guest_text(awaited))
         };
+        Heard::keyed(kind, party, guest, streamed)
+    }
+
+    fn keyed(
+        kind: &'static WaitKind,
+        party: Party,
+        guest: Guest,
+        streamed: Option<&'a AtomicU64>,
+    ) -> Heard<'a> {
         Heard {
             wait: Wait::on(kind, party, PROGRESS),
             guest,
@@ -5914,13 +6632,17 @@ impl<'a> Heard<'a> {
     /// time counted only before its first line, and `streamed`'s bytes as it carries them.
     #[track_caller]
     pub fn streaming(vm: u32, streamed: Option<&'a AtomicU64>) -> Heard<'a> {
-        Heard::with(
-            std::panic::Location::caller(),
-            Party::client(vm, None),
-            Guest::Streaming,
-            streamed,
-            "",
-        )
+        Heard::streaming_sized(vm, streamed, "")
+    }
+
+    /// [`streaming`](Self::streaming), its guest of size `size` (its vCPUs), which keys its
+    /// kind beside its call site: one site's waits on guests of different sizes are kinds
+    /// apart, so that a 64-vCPU storm is not judged by a 2-vCPU one's W* (HVF at ddb88cd47:
+    /// "still running" refused at a W* of 49.9 ms and of 753 ms learned of smaller storms).
+    #[track_caller]
+    pub fn streaming_sized(vm: u32, streamed: Option<&'a AtomicU64>, size: &str) -> Heard<'a> {
+        let kind = WaitKind::of(std::panic::Location::caller(), PROGRESS, size);
+        Heard::keyed(kind, Party::client(vm, None), Guest::Streaming, streamed)
     }
 
     /// The guest of the VM process `vm` is or started (`run --kernel`, `restore`), its CPU
@@ -5983,6 +6705,12 @@ impl<'a> Heard<'a> {
     /// What it waited for came: its kind's answer.
     pub fn answered(&mut self) {
         self.wait.answered();
+    }
+
+    /// Its caller found what it waits for missing ([`Wait::absent`]): a party's end it
+    /// started just now, which no check finds there before it.
+    pub fn absent(&mut self) {
+        self.wait.absent();
     }
 
     /// What its kind has learned on this host.
@@ -6102,7 +6830,44 @@ pub struct Following<'a, S: Timed = shards_vmm::platform::UnixStream> {
 /// TCP stream to a port its daemon publishes.
 pub trait Timed {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
-    fn set_nonblocking(&self, on: bool) -> io::Result<()>;
+    /// A read of what is there now, waiting for nothing (WouldBlock where nothing is), that
+    /// leaves its descriptor's mode as it was. A non-blocking mode is its open socket's,
+    /// which every clone of it shares: `echo`'s writer, writing through one while a read
+    /// had set it, was refused (EAGAIN) as its peer stopped reading and ended, and the
+    /// stream stood still for good (HVF at f385b8dac, storm through its snapshot, D209).
+    fn read_now(&self, buf: &mut [u8]) -> io::Result<usize>;
+}
+
+/// [`Timed::read_now`] of socket `fd`: recv(2) with `MSG_DONTWAIT`, this call's alone.
+#[cfg(unix)]
+fn recv_now(fd: std::os::fd::RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: recv(2) into `buf`, of its length, from a socket its caller holds open.
+    let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+    usize::try_from(n).map_err(|_| io::Error::last_os_error())
+}
+
+/// [`Timed::read_now`] of socket `socket` on Windows, which has no `MSG_DONTWAIT`: as many
+/// bytes as are there (ioctlsocket `FIONREAD`), read by `read`, which cannot wait for them;
+/// WouldBlock where none are, its end among them, which the timed read after finds.
+#[cfg(windows)]
+fn recv_now(
+    socket: std::os::windows::io::BorrowedSocket<'_>,
+    buf: &mut [u8],
+    read: impl FnOnce(&mut [u8]) -> io::Result<usize>,
+) -> io::Result<usize> {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{FIONREAD, SOCKET, ioctlsocket};
+    let mut there: u32 = 0;
+    // SAFETY: FIONREAD's count into a local, of a socket its caller holds open.
+    if unsafe { ioctlsocket(socket.as_raw_socket() as SOCKET, FIONREAD, &raw mut there) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let there = usize::try_from(there).unwrap_or(usize::MAX);
+    if there == 0 {
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+    let len = buf.len().min(there);
+    read(buf.get_mut(..len).unwrap_or_default())
 }
 
 /// A read timeout set, or none needed: macOS refuses SO_RCVTIMEO with EINVAL on a socket both
@@ -6122,8 +6887,14 @@ impl Timed for shards_vmm::platform::UnixStream {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         timed(shards_vmm::platform::UnixStream::set_read_timeout(self, timeout))
     }
-    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
-        shards_vmm::platform::UnixStream::set_nonblocking(self, on)
+    fn read_now(&self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        return recv_now(std::os::fd::AsRawFd::as_raw_fd(self), buf);
+        #[cfg(windows)]
+        return recv_now(std::os::windows::io::AsSocket::as_socket(self), buf, |b| {
+            let mut s = self;
+            s.read(b)
+        });
     }
 }
 
@@ -6131,8 +6902,14 @@ impl Timed for std::net::TcpStream {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         timed(std::net::TcpStream::set_read_timeout(self, timeout))
     }
-    fn set_nonblocking(&self, on: bool) -> io::Result<()> {
-        std::net::TcpStream::set_nonblocking(self, on)
+    fn read_now(&self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        return recv_now(std::os::fd::AsRawFd::as_raw_fd(self), buf);
+        #[cfg(windows)]
+        return recv_now(std::os::windows::io::AsSocket::as_socket(self), buf, |b| {
+            let mut s = self;
+            s.read(b)
+        });
     }
 }
 
@@ -6159,20 +6936,35 @@ where
         home: Option<&Path>,
         site: &'static std::panic::Location<'static>,
     ) -> Following<'a, S> {
+        Following::keyed(stream, carried, home, WaitKind::awaiting(site, STREAM))
+    }
+
+    /// Reads of `stream` from now on, from a guest of size `size` (its vCPUs), which keys
+    /// its kind beside its call site: one site's streams from guests of different sizes are
+    /// kinds apart, so that a 64-vCPU storm's stream is not judged by a 2-vCPU one's W*
+    /// (HVF at ddb88cd47: "64 vCPUs: stream 6", refused 35 s past a W* of 17.6 s).
+    #[track_caller]
+    pub fn sized(stream: &'a S, carried: Option<&'a AtomicU64>, size: &str) -> Following<'a, S> {
+        let kind = WaitKind::of(std::panic::Location::caller(), STREAM, size);
+        Following::keyed(stream, carried, None, kind)
+    }
+
+    fn keyed(
+        stream: &'a S,
+        carried: Option<&'a AtomicU64>,
+        home: Option<&Path>,
+        kind: &'static WaitKind,
+    ) -> Following<'a, S> {
         Following {
             stream,
             carried,
-            wait: Wait::on(WaitKind::awaiting(site, STREAM), Party::own(home), STREAM),
+            wait: Wait::on(kind, Party::own(home), STREAM),
         }
     }
 
     /// A read of what is there now, waiting for nothing: WouldBlock where nothing is.
     fn read_now(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut stream = self.stream;
-        stream.set_nonblocking(true)?;
-        let read = stream.read(buf);
-        stream.set_nonblocking(false)?;
-        read
+        self.stream.read_now(buf)
     }
 
     /// It read `n` bytes: `carried` counts them, and from its first its party's CPU is its
@@ -6267,9 +7059,23 @@ pub fn echo(
     len: usize,
     carried: Option<&AtomicU64>,
 ) -> Result<(), String> {
+    echo_of(sock, port, salt, len, carried, "")
+}
+
+/// [`echo`] through the echo of a guest of size `size` (its vCPUs), which keys its stream's
+/// kind ([`Following::sized`]).
+#[track_caller]
+pub fn echo_of(
+    sock: &Path,
+    port: u32,
+    salt: u64,
+    len: usize,
+    carried: Option<&AtomicU64>,
+    size: &str,
+) -> Result<(), String> {
     let s =
         shards_vmm::platform::UnixStream::connect(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
-    let mut r = Following::of(&s, carried);
+    let mut r = Following::sized(&s, carried, size);
     vsock_handshake(&s, &mut r, port)?;
     let mut w = s.try_clone().map_err(|e| e.to_string())?;
     let writer = std::thread::spawn(move || -> Result<(), String> {

@@ -1165,6 +1165,7 @@ Swap:                  0 kB
                     },
                 }],
                 holdings: vec![Tick { at, reading: held }],
+                own: None,
             };
             measured(
                 Duration::ZERO,

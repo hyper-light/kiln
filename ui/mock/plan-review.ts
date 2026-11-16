@@ -744,6 +744,7 @@ export function handleReviewSession(ws: WebSocket, id: string, params?: URLSearc
   send({ t: "state", state: stateOf(m) });
   send({ t: "events", events: bounded.events });
   if (process.env.MOCK_NO_SYNCED !== "1") send({ t: "synced" });
+  if (bounded.rest) send(bounded.rest);
   return true;
 }
 

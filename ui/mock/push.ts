@@ -6,10 +6,14 @@
  *
  * `MOCK_PUSH_FLEET=1` adds agents standing every way Mission control shows (needs you first, a
  * question, one stopped, one paused, some working…), for a list worth sorting on a phone.
+ * `MOCK_BUSY=N` adds N more, all working, each saying what it does next every 0.7 s or so, and
+ * `MOCK_BUSY_SUBAGENTS=S` gives each of those S subagents of its harness's own (`subagents`), some
+ * at work and saying what they're at as their agent moves on, the rest done: a fleet as busy as a
+ * real one, with trees to open under its rows, for measuring the pages under it. Neither set, none.
  */
 import type http from "node:http";
 import { createECDH, randomBytes } from "node:crypto";
-import type { AgentInfo } from "../src/api/harness.ts";
+import type { AgentInfo, SubagentBrief } from "../src/api/harness.ts";
 import { defaultInfo } from "./defaults.ts";
 import { MAC_MINI } from "./data.ts";
 
@@ -184,8 +188,31 @@ const fleet: AgentInfo[] = !FLEET
  */
 const BUSY = Number(process.env.MOCK_BUSY ?? 0);
 const STEPS = ["Reading src/lib.rs", "Running cargo test", "Editing src/api.rs", "Thinking", "Running npm run build", "Searching for usages", "Writing tests", "Reviewing the diff"];
+/**
+ * `MOCK_BUSY_SUBAGENTS=S`: each of those agents has S subagents of its harness's own (the briefs its
+ * row and the tree under it draw). As many of them are at work as there are steps to be at, one at
+ * each (`last_tool`), each moving on to the next as its agent does; the rest are done. 0, the
+ * default: the busy agents have none, as before.
+ */
+const BUSY_SUBAGENTS = Number(process.env.MOCK_BUSY_SUBAGENTS ?? 0);
+/** A busy agent's subagents while it's at step `step` of `STEPS` (none asked for: nothing, and the agent is as it was without them). */
+function busySubagents(agent: string, step: number): { subagents?: SubagentBrief[] } {
+  if (!(BUSY_SUBAGENTS > 0)) return {};
+  return {
+    subagents: Array.from({ length: BUSY_SUBAGENTS }, (_, j): SubagentBrief => {
+      // Started one after another (a millisecond apart, the clock's own step) before the mock did; those done, done by then.
+      const brief = { id: `${agent}-sub-${j}`, description: `Subtask ${j + 1}`, started: t0 - (BUSY_SUBAGENTS - j) };
+      return j < STEPS.length ? { ...brief, status: "running", last_tool: STEPS[(step + j) % STEPS.length] } : { ...brief, status: "completed", ended: t0 };
+    }),
+  };
+}
 for (let i = 0; i < BUSY; i++) {
-  fleet.push({ ...base(`busy-${i}`, `Busy agent ${i + 1}`, `agent:metal-ryzen-0${(i % 3) + 1}`, i % 2 ? "codex" : "claude", 9 - (i % 9)), status: "running", doing: STEPS[i % STEPS.length] });
+  fleet.push({
+    ...base(`busy-${i}`, `Busy agent ${i + 1}`, `agent:metal-ryzen-0${(i % 3) + 1}`, i % 2 ? "codex" : "claude", 9 - (i % 9)),
+    status: "running",
+    doing: STEPS[i % STEPS.length],
+    ...busySubagents(`busy-${i}`, i % STEPS.length),
+  });
 }
 /**
  * `MOCK_STANDS=paused:7,finished:16,offline:3,stopped:1`: that many more agents standing each of
@@ -209,8 +236,9 @@ if (BUSY > 0)
     for (let i = 0; i < fleet.length; i++) {
       const a = fleet[i];
       if (!a?.id.startsWith("busy-") || Math.random() > 0.7) continue;
-      const doing = STEPS[Math.floor(Math.random() * STEPS.length)];
-      fleet[i] = { ...a, doing, activity: doing, last_activity: Date.now(), cost_usd: a.cost_usd + 0.002 };
+      const step = Math.floor(Math.random() * STEPS.length);
+      const doing = STEPS[step];
+      fleet[i] = { ...a, doing, activity: doing, last_activity: Date.now(), cost_usd: a.cost_usd + 0.002, ...busySubagents(a.id, step) };
       emitFleet(fleet[i]!);
     }
   }, 500);

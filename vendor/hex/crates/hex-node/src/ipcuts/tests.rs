@@ -7,29 +7,20 @@ use hex_testkit::waits::follow::{self, Party};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
 
-/// Waits for `fact`, one the refill thread makes on its own, measuring, its answer recorded under `name` for the census
-/// to come, by the refill thread's life (the review's C-5): ended once no `hex-ipcuts` task of this process runs. A
-/// look: the pool tells no event as its thread makes a pair or fails one, its counts and namespaces read.
-fn wait_for(name: &'static str, what: &str, fact: impl FnMut() -> bool) {
-    follow::until(&Patience::measuring(name), what, refill_thread, fact).unwrap();
-}
-
-/// The pool's refill thread as a party: live while a `hex-ipcuts` task of this process runs, read from procfs.
-fn refill_thread() -> Party {
-    let running = std::fs::read_dir("/proc/self/task").is_ok_and(|tasks| {
-        tasks.flatten().any(|task| {
-            let path = task.path();
-            std::fs::read_to_string(path.join("comm")).is_ok_and(|c| c.trim() == "hex-ipcuts")
-                && std::fs::read_to_string(path.join("stat")).is_ok_and(|stat| {
-                    !matches!(
-                        stat.rsplit_once(')')
-                            .and_then(|(_, fields)| fields.split_whitespace().next()),
-                        Some("Z" | "X" | "x")
-                    )
-                })
-        })
-    });
-    if running { Party::Live } else { Party::Ended }
+/// Waits for `fact`, one `pool`'s refill thread makes on its own, measuring, its answer recorded under `name` for the
+/// census to come, by that thread's life (the review's C-5): ended once its handle says it has
+/// (`IpcUtsPool::refill_ended`). Never by its name in procfs: a new thread takes its name only as it first runs, so a
+/// look before then read it ended and gave the fact up at once (14 in 20 on adacachy2, 2026-11-15). A look: the pool
+/// tells no event as its thread makes a pair or fails one, its counts and namespaces read.
+fn wait_for(pool: &IpcUtsPool, name: &'static str, what: &str, fact: impl FnMut() -> bool) {
+    let refill = || {
+        if pool.refill_ended() {
+            Party::Ended
+        } else {
+            Party::Live
+        }
+    };
+    follow::until(&Patience::measuring(name), what, refill, fact).unwrap();
 }
 
 fn ns_of(fd: &OwnedFd) -> PathBuf {
@@ -61,7 +52,7 @@ fn refill_thread_in(kind: &str) -> PathBuf {
 #[test]
 fn the_refill_thread_fills_the_pool_or_counts_each_make_that_fails() {
     let pool = IpcUtsPool::start(2).unwrap();
-    wait_for("test.ipcuts.first_outcome", "first make", || {
+    wait_for(&pool, "test.ipcuts.first_outcome", "first make", || {
         let c = pool.counts().unwrap();
         c.made_ahead + c.failed > 0
     });
@@ -76,13 +67,14 @@ fn the_refill_thread_fills_the_pool_or_counts_each_make_that_fails() {
         assert!(pool.take().unwrap().is_none(), "a dry take");
         assert_eq!(pool.counts().unwrap().made_on_path, 1);
         wait_for(
+            &pool,
             "test.ipcuts.second_failed_make",
             "second failed make",
             || pool.counts().unwrap().failed == 2,
         );
         return;
     }
-    wait_for("test.ipcuts.filled", "the pool's bound", || {
+    wait_for(&pool, "test.ipcuts.filled", "the pool's bound", || {
         pool.counts().unwrap().made_ahead == 2
     });
     let first = pool.take().unwrap().expect("a pair made ahead");
@@ -96,12 +88,14 @@ fn the_refill_thread_fills_the_pool_or_counts_each_make_that_fails() {
         assert_ne!(ns_of(a), ns_of(b), "no two pairs share a {kind} namespace");
     }
     wait_for(
+        &pool,
         "test.ipcuts.refilled",
         "makes in the taken ones' places",
         || pool.counts().unwrap().made_ahead == 4,
     );
     for kind in ["ipc", "uts"] {
         wait_for(
+            &pool,
             "test.ipcuts.back_home",
             "the refill thread back home",
             || refill_thread_in(kind) == own(kind),

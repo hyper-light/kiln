@@ -703,6 +703,78 @@ fn events_burst_costs_fewer_frames_and_bytes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An agent's entry in a `harness` frame, as `Hub::emit_harness` writes one: how it stands, what it said last, when it
+/// was last at work.
+fn entry(id: &str, status: crate::harness::model::Status, summary: &str, at: i64) -> anyhow::Result<Value> {
+    let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), status, summary: summary.into(), last_activity: at, ..Default::default() };
+    Ok(serde_json::from_str(&crate::wire::events::harness_frame(&serde_json::to_vec(&info)?))?)
+}
+
+/// W21-R02: a socket that takes the agents lean (`?lean=1`) is sent an agent's entry once, lean, and then, in its
+/// `harness` frames' place, only what changed of it: nothing while only what it's saying does; one frame's worth for a
+/// window's several; whole again once it's gone and back, and after anything the socket may have missed. A socket that
+/// doesn't is sent every one whole, as before, and both are sent everything else alike.
+#[test]
+fn w21_r02_a_lean_socket_is_sent_an_agent_once_then_what_changed_of_it() -> anyhow::Result<()> {
+    use crate::harness::model::Status;
+    let (mut lean, mut whole) = (Outbox::new(None).lean(), Outbox::new(None));
+    let mut sent = |frames: Vec<Arc<Frame>>| -> anyhow::Result<(Vec<Value>, Vec<Value>)> {
+        for f in &frames {
+            lean.add(Arc::clone(f));
+            whole.add(Arc::clone(f));
+        }
+        let read_all = |text: Option<String>| -> anyhow::Result<Vec<Value>> { text.map_or(Ok(Vec::new()), |text| read(&text).map(|(_, events)| events)) };
+        Ok((read_all(lean.flush(AT, false))?, read_all(whole.flush(AT, false))?))
+    };
+    // First: whole, without where its harness started, with what it said last (its turn isn't running).
+    let (l, w) = sent(vec![frame(1, entry("a", Status::Idle, "Done: green", 100)?), frame(2, json!({ "type": "updates" }))])?;
+    assert_eq!((kinds(&l), kinds(&w)), (vec!["harness".to_owned(), "updates".to_owned()], vec!["harness".to_owned(), "updates".to_owned()]));
+    let (first, all) = (l.first().and_then(|e| e.get("info")).cloned().unwrap_or_default(), w.first().and_then(|e| e.get("info")).cloned().unwrap_or_default());
+    anyhow::ensure!(all.get("starts").is_some() && first.get("starts").is_none(), "where it started is the whole entry's alone: {first} and {all}");
+    assert_eq!((first.get("summary"), first.get("id"), first.get("status")), (Some(&json!("Done: green")), Some(&json!("a")), Some(&json!("idle"))));
+    // Its turn starts: what changed, its last words gone from what the page keeps of it. The other socket: the entry whole.
+    let (l, w) = sent(vec![frame(3, entry("a", Status::Running, "Done: green", 200)?)])?;
+    assert_eq!(l, vec![json!({ "type": "harness_patch", "id": "a", "set": { "status": "running", "last_activity": 200 }, "unset": ["summary"] })]);
+    assert_eq!((kinds(&w), w.first().and_then(|e| e.pointer("/info/summary"))), (vec!["harness".to_owned()], Some(&json!("Done: green"))));
+    // What it's saying changes: nothing a lean socket is sent; the whole entry to the other.
+    let (l, w) = sent(vec![frame(4, entry("a", Status::Running, "Looking at", 200)?)])?;
+    assert_eq!((l.len(), kinds(&w)), (0, vec!["harness".to_owned()]));
+    // A window's several changes: what changed since it was last told, once.
+    let (l, _) = sent(vec![frame(5, entry("a", Status::Running, "Looking at the", 300)?), frame(6, entry("b", Status::Idle, "", 1)?), frame(7, entry("a", Status::Running, "Looking at the gate", 400)?)])?;
+    assert_eq!(kinds(&l), ["harness", "harness_patch"], "another agent's first is whole; this one's two changes are one");
+    assert_eq!(l.get(1), Some(&json!({ "type": "harness_patch", "id": "a", "set": { "last_activity": 400 } })));
+    // Its turn over: how it stands and what it said last.
+    let (l, _) = sent(vec![frame(8, entry("a", Status::Idle, "Fixed: two tests", 500)?)])?;
+    assert_eq!(l, vec![json!({ "type": "harness_patch", "id": "a", "set": { "status": "idle", "last_activity": 500, "summary": "Fixed: two tests" } })]);
+    // Gone, and back under its id: said as it went, then whole.
+    let (l, w) = sent(vec![frame(9, json!({ "type": "harness_closed", "id": "a" }))])?;
+    assert_eq!((kinds(&l), &l), (vec!["harness_closed".to_owned()], &w));
+    let (l, _) = sent(vec![frame(10, entry("a", Status::Idle, "Fixed: two tests", 500)?)])?;
+    assert_eq!((kinds(&l), l.first().and_then(|e| e.pointer("/info/summary"))), (vec!["harness".to_owned()], Some(&json!("Fixed: two tests"))));
+    Ok(())
+}
+
+/// W21-R02: after anything a lean socket may have missed (its topics changed, a resync), what it was last sent of
+/// the agents counts for nothing: each one's next is whole, where what changed of an entry it never had would be lost.
+#[test]
+fn w21_r02_a_lean_socket_is_sent_an_agent_whole_again_after_what_it_may_have_missed() -> anyhow::Result<()> {
+    use crate::harness::model::Status;
+    let mut out = Outbox::new(None).lean();
+    let sent = |out: &mut Outbox, seq: u64, at: i64| -> anyhow::Result<Vec<Value>> {
+        out.add(frame(seq, entry("a", Status::Running, "", at)?));
+        Ok(read(&out.flush(AT, false).unwrap_or_default())?.1)
+    };
+    assert_eq!(kinds(&sent(&mut out, 1, 100)?), ["harness"]);
+    assert_eq!(kinds(&sent(&mut out, 2, 200)?), ["harness_patch"]);
+    out.set_topics(Some(topics("harness")));
+    assert_eq!(kinds(&sent(&mut out, 3, 300)?), ["harness"], "its topics changed: whole");
+    assert_eq!(kinds(&sent(&mut out, 4, 400)?), ["harness_patch"]);
+    out.resync();
+    assert_eq!(kinds(&sent(&mut out, 5, 500)?), ["resync", "harness"], "a resync: whole, after it");
+    assert_eq!(kinds(&sent(&mut out, 6, 600)?), ["harness_patch"]);
+    Ok(())
+}
+
 /// An agent's info frame of `title`, as `Hub::emit_harness` writes one.
 fn info(id: &str, title: &str) -> anyhow::Result<Arc<str>> {
     let info = crate::harness::session::Info { id: id.into(), kind: "claude".into(), title: title.into(), ..Default::default() };

@@ -17,6 +17,7 @@ import type http from "node:http";
 import { randomBytes } from "node:crypto";
 import type { WebSocket } from "ws";
 import type { Account, AccountFlow, AccountMethod, AgentInfo, HEvent, Meta, SlashCommand, State } from "../src/api/harness.ts";
+import { leanSessions, summariesOf } from "./lean.ts";
 import { defaultInfo, defaultMeta, defaultState } from "./defaults.ts";
 import { longInfo } from "./conversation.ts";
 import { fleetCommand, fleetInfos } from "./push.ts";
@@ -512,7 +513,10 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
   if (p === "/api/harness/sessions" && m === "GET") {
-    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo(), ...fastInfos(), ...fleetInfos(), ...familyInfos(), ...reviewInfos()]);
+    const every = [...[...demos.values()].map((d) => d.info), longInfo(), ...fastInfos(), ...fleetInfos(), ...familyInfos(), ...reviewInfos()];
+    // As the server answers them (W21-R02): the last words of those asked for, the list lean and as columns, or the list.
+    const summaries = url.searchParams.get("summaries");
+    json(res, 200, summaries !== null ? summariesOf(every, summaries) : url.searchParams.get("lean") === "1" ? leanSessions(every) : every);
     return true;
   }
   // What those picked understand, for the line over Mission control's box as it messages them: each

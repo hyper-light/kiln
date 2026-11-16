@@ -166,6 +166,8 @@ async-lock = "3.4.2"
 argon2 = "0.6"
 rpassword = "7"
 vt100 = "0.16.2"
+# The parser vt100 reads with: `termpart` reads a terminal's replay with it too.
+vte = "0.15.0"
 socket2 = { version = "0.6.5", features = ["all"] }
 # Process tables everywhere (AI sessions); host and process metrics where there is no procfs.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk", "network"] }

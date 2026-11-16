@@ -1627,7 +1627,7 @@ function stateOf(m: Member): State {
     model: m.info.model,
     mode: m.info.mode,
     title: m.info.title,
-    summary: m.info.summary,
+    summary: m.info.summary ?? "",
     doing: m.info.doing,
     approvals: m.approval ? [m.approval] : [],
     queue: Array.from({ length: m.info.queued }, (_, i) => ({ id: `queued-${i}`, text: "A message waiting for its turn", at: Date.now() })),

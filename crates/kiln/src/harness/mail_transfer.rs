@@ -34,6 +34,23 @@ fn floor(hub: &Hub) -> Result<Option<u64>, Refusal> {
     hub.cfg.ci.scheduler.admission.as_ref().map(|p| p.admission().map(|p| p.disk_free).map_err(|_| Refusal::Unavailable)).transpose()
 }
 
+/// A runner process named the features it speaks (`AgentMsg::Features`, each time it connects): one
+/// that takes it is told the room a hand-over's spool leaves on its volume, the operator's floor
+/// or none set (CP-T3.2). A runner forgets it as its server drops and takes no session over until
+/// it knows it again; it came only with a transfer's offer, which a move between machines doesn't
+/// make, so every such move was refused ("transfer storage policy or volume authority is
+/// unavailable": 41 of them in production on 2026-11-14 and 15). A floor that doesn't read is said
+/// to no one: its runners go on refusing, as its transfers are.
+pub async fn on_features(hub: &Hub, runner: &str, peer: PeerId, names: &[String]) {
+    if !crate::proto::feature::speaks(names, crate::proto::feature::ADOPT_POLICY) {
+        return;
+    }
+    let Ok(disk_floor) = floor(hub) else { return };
+    let Ok(json) = serde_json::to_string(&super::moving::stream::Told { disk_floor }) else { return };
+    let pending = hub.command_peers(runner, vec![peer], &crate::proto::ServerMsg::AdoptPolicy { json }).await;
+    pending.log_when_answered(crate::hub::LOG_WITHIN);
+}
+
 async fn room(hub: &Hub, manifest: &TransferManifest, rows: u64) -> Result<(), Refusal> {
     // Prior bounded originals may be larger than a metadata-only epoch update. Reserve their
     // existing protocol bound for each affected row, without loading communication bodies.

@@ -4,6 +4,7 @@
  * control, where it's kept for you (`organize`: pin, park, archive; attention plan 01a199e1b177752e84dad5dc990e6a15).
  */
 import * as React from "react";
+import { flushSync } from "react-dom";
 import { DropdownMenu } from "radix-ui";
 import { Check, MoreHorizontal } from "lucide-react";
 import { harnessApi, sessionStore, type AgentInfo, type Command } from "@/api/harness";
@@ -90,6 +91,40 @@ export function useAgentActions(
   // A row moved by what was chosen (pinned, unpinned…): focus goes back to its button where the row now is, the page not scrolling to it.
   const stayNext = React.useRef(false);
   const button = React.useRef<HTMLButtonElement>(null);
+  // Its own button's menu, and its End dialog, are put in the page when first asked for (W26-R15): a
+  // list of agents has one of each for every row, and until a row's is opened only its button shows.
+  const [menuAsked, setMenuAsked] = React.useState(false);
+  const [endAsked, setEndAsked] = React.useState(false);
+  if (act === "end" && !endAsked) setEndAsked(true);
+  /**
+   * The button's first press, or key: the menu is put in (closed, its own trigger in this button's
+   * place, listening as it does from the start) and told what this button heard, so it opens exactly
+   * as it would have: under the pointer, or with its first item taking the focus from the keys.
+   */
+  const wake = (e: React.PointerEvent | React.KeyboardEvent) => {
+    const heard = e.nativeEvent;
+    flushSync(() => setMenuAsked(true));
+    const trigger = button.current;
+    if (!trigger) return;
+    let again: Event;
+    if (heard instanceof KeyboardEvent) {
+      trigger.focus({ preventScroll: true });
+      again = new KeyboardEvent("keydown", { key: heard.key, code: heard.code, bubbles: true, cancelable: true });
+    } else {
+      again = new PointerEvent("pointerdown", {
+        button: heard.button,
+        pointerId: heard.pointerId,
+        pointerType: heard.pointerType,
+        isPrimary: heard.isPrimary,
+        clientX: heard.clientX,
+        clientY: heard.clientY,
+        bubbles: true,
+        cancelable: true,
+      });
+    }
+    // What its trigger does with it (taking the press, so the focus goes to the menu) is done with this one too.
+    if (!trigger.dispatchEvent(again)) e.preventDefault();
+  };
   const live = a.status !== "exited";
   // Stopped through its session where that shows (its head then says Stopping…, as its own Stop
   // does); from elsewhere over HTTP, saying so if it couldn't.
@@ -146,7 +181,7 @@ export function useAgentActions(
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : remove()), danger: true, going: removing },
   ];
-  const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) => (
+  const wholeMenu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) => (
     // A row's menu in Mission control (with where it's kept) doesn't lock the page's scroll: in WebKit that lock moved the list it opens over.
     <DropdownMenu.Root modal={organize.length === 0}>
       <DropdownMenu.Trigger asChild>
@@ -220,22 +255,47 @@ export function useAgentActions(
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
   );
+  /** The menu; until its own button is first pressed, that button alone, as the closed menu draws it (what its trigger says of itself, closed), opening on what opens that one. */
+  const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) =>
+    trigger || menuAsked ? (
+      wholeMenu(trigger, extra, organize)
+    ) : (
+      <button
+        ref={button}
+        type="button"
+        className="hx-icon"
+        aria-label={`Actions for ${a.name}`}
+        aria-haspopup="menu"
+        aria-expanded={false}
+        data-state="closed"
+        onPointerDown={(e) => {
+          if (e.button === 0 && !e.ctrlKey) wake(e);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " " || e.key === "ArrowDown") wake(e);
+        }}
+      >
+        <MoreHorizontal size={16} />
+      </button>
+    );
   const dialogs = (
     <>
-      <ConfirmDialog
-        open={act === "end"}
-        onOpenChange={(o) => !o && setAct(null)}
-        title={`End ${a.name}?`}
-        description={
-          <>
-            {`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
-            {act === "end" && ending.note}
-          </>
-        }
-        confirmLabel="End agent"
-        danger
-        onConfirm={end}
-      />
+      {endAsked && (
+        <ConfirmDialog
+          open={act === "end"}
+          onOpenChange={(o) => !o && setAct(null)}
+          title={`End ${a.name}?`}
+          description={
+            <>
+              {`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
+              {act === "end" && ending.note}
+            </>
+          }
+          confirmLabel="End agent"
+          danger
+          onConfirm={end}
+        />
+      )}
       {act === "move" && <MoveDialog agent={a} onClose={() => setAct(null)} />}
       <React.Suspense fallback={null}>{act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}</React.Suspense>
     </>

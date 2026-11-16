@@ -177,8 +177,32 @@ pub enum SessionFrame {
     },
     /// W21-R02: optional bounded history, sent only when `recent_turns` was requested. The cursor
     /// belongs to this session and server incarnation; a reset invalidates it. Whole required
-    /// events can exceed the requested byte budget (`oversized`), never truncated text.
-    History { cursor: String, before: Option<u64>, has_more: bool, oversized: bool },
+    /// events can exceed the requested byte budget (`oversized`), never truncated text. `part`: to
+    /// a viewer that takes a first part ahead (`first_bytes`), the events that follow are its
+    /// window's newest alone, and the rest of the window follows this snapshot's `synced`
+    /// (`earlier`), before anything live.
+    History {
+        cursor: String,
+        before: Option<u64>,
+        has_more: bool,
+        oversized: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+        part: bool,
+    },
+    /// W21-R02: the rest of a window whose first part the snapshot before it was (`history`'s
+    /// `part`): the window's events from before that part, oldest first, each as its viewer takes
+    /// events, and the window's own head (where it begins, whether there's more before it). Of
+    /// the same copy as the part, to its revision: the two are the window that a viewer that
+    /// takes no part is sent at once.
+    Earlier {
+        #[cfg_attr(test, ts(as = "Vec<crate::harness::model::Event>"))]
+        events: Vec<Value>,
+        cursor: String,
+        before: Option<u64>,
+        has_more: bool,
+        oversized: bool,
+    },
 }
 
 impl SessionFrame {
@@ -532,8 +556,16 @@ impl Socket {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalDown {
-    /// First on every attach: which session this socket is on.
-    Session { session: crate::termsess::Info },
+    /// First on every attach: which session this socket is on. `screen`, to a viewer that asked
+    /// (`first=screen`): the binary message after this one is the part of the session's replay that
+    /// draws its screen, and the one after that the replay, each to be drawn on a terminal reset first
+    /// (W21-R02, `crate::termpart`).
+    Session {
+        session: crate::termsess::Info,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+        screen: bool,
+    },
     /// The session isn't known (yet), e.g. its machine is reconnecting: try again by its id.
     Missing { session: String },
     /// The session's machine dropped; it keeps running there: attach again by its id.

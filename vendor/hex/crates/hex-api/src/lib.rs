@@ -52,7 +52,7 @@ pub use grants::{
 pub use id::BoxId;
 pub use runtime::{
     Allocation, Asked, BackingGrant, BackingKey, BackingOffer, BackingPhase, BoxInfo, BoxState,
-    Capacity, CapacityResources, ConnectFailure, ConnectPhase, ConnectReply, ControlWake,
+    Capacity, CapacityResources, Charged, ConnectFailure, ConnectPhase, ConnectReply, ControlWake,
     Execution, Exit, GpuEligibility, GuestEnd, GuestFailure, GuestTime, HostUse, ImageArch,
     ImageOs, ImagePlatform, IoKind, Killer, Learned, LearnedAwait, LearnedCeiling, LearnedEnd,
     LearnedHolder, LearnedHolding, LearnedOverhead, LearnedPrior, LearnedRank, LearnedRate,

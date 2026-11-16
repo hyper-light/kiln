@@ -93,7 +93,61 @@ pub enum Runs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         reach: Option<Box<crate::sandbox::narrow::Reach>>,
+        /// What its launch gave its run as it started ([`Granted`]): the base its live overrides change. None from
+        /// a runner before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        granted: Option<Box<Granted>>,
     },
+}
+
+/// What a microVM session's launch gave its harness as it started (kiln plan 01a1dd2e…, P5.2's page: its base
+/// beside its live overrides, `sessions.grants`), as the runner launched it: its working folder, the machine's folders
+/// it sees, each where it sees it and whether it may write it, and its credentials by reference, each with the hosts
+/// it is filled in toward at the microVM's egress (Shards' D242; never a value or a placeholder).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentGranted"))]
+pub struct Granted {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub volumes: Vec<GrantedVolume>,
+    #[serde(default)]
+    pub secrets: Vec<GrantedSecret>,
+}
+
+/// A folder of the machine's a microVM session's harness sees ([`Granted`]): its path on the machine, where the
+/// harness sees it, and whether it may write it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentGrantedVolume"))]
+pub struct GrantedVolume {
+    pub host: String,
+    pub at: String,
+    pub writable: bool,
+}
+
+/// A credential a microVM session's harness was granted by reference ([`Granted`]): its reference and the hosts it is
+/// filled in toward.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentGrantedSecret"))]
+pub struct GrantedSecret {
+    pub name: String,
+    pub toward: Vec<String>,
+}
+
+impl Granted {
+    /// What a run's launch gave it, as its held run keeps it (`sandbox::held::Declared`).
+    pub fn of(d: &crate::sandbox::held::Declared) -> Self {
+        Granted {
+            folder: d.folder.clone(),
+            volumes: d.shares.iter().map(|s| GrantedVolume { host: s.host.clone(), at: s.at.clone(), writable: s.writable }).collect(),
+            secrets: d.credentials.iter().map(|(name, toward)| GrantedSecret { name: name.clone(), toward: toward.clone() }).collect(),
+        }
+    }
 }
 
 /// The link a session's harness's stdio rides into its microVM, as each end says its TLS 1.3
@@ -134,6 +188,54 @@ pub struct Start {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub ended: Option<Ended>,
+    /// What its microVM measured (P7.1): how long it took to start and how it started, and, once it ended, what it
+    /// lived on. None for a run of the machine's, or one its boundary measures nothing of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub measured: Option<Measured>,
+}
+
+/// The variant of a deployment experiment a session runs as (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1): drawn
+/// by its variants' weights as it started, or its experiment's promoted variant once one was decided.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentExperiment"))]
+pub struct Assigned {
+    pub experiment: String,
+    pub arm: String,
+    /// Its experiment's decision promoted it: the split had ended, so no draw.
+    #[serde(default)]
+    pub promoted: bool,
+}
+
+/// What a start of a session's harness in a microVM measured (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1, a
+/// deployment experiment's measures), each from Hex where Hex says it: its start, from its launch asked to its member
+/// running, and how its microVM started (Hex's `Usage::started_from`: `booted`, `saved`, `restored`, `replaced`,
+/// `warm`; `swapped` where its member was swapped into the microVM its session ran in, P6c.5); once it ended, its
+/// VM's CPU time over its run and its footprint, steady (its last) and peak (the most).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentMeasured"))]
+pub struct Measured {
+    /// Its start, from its launch asked to its member running, in microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub start_us: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub started_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub cpu_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub window_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub footprint_steady_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub footprint_peak_bytes: Option<u64>,
 }
 
 /// How a start of a session's harness ended.
@@ -289,6 +391,10 @@ pub struct Spec {
     /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
+    /// The deployment experiment's variant it was assigned as it started (P7.1, `ci::experiments::assign`): kept
+    /// for its life. Set by kiln, never from what was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment: Option<Assigned>,
     /// What it helps with when it's a card's helper (`harness::about`: `about`, answering what a
     /// person tapped in its parent's conversation): no row of Mission Control, its parent not told
     /// of it, ended once no card reads it. Set by kiln, never from what was asked.
@@ -398,6 +504,7 @@ impl Default for Spec {
             reach: None,
             parent: None,
             plan_run: None,
+            experiment: None,
             helper: None,
             subagent: false,
             workspace: None,
@@ -614,8 +721,11 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub objective: Option<super::model::Objective>,
-    /// The agent's latest words, shortened.
+    /// The agent's latest words, shortened. A row of the sessions' list read lean (W21-R02,
+    /// `GET /api/harness/sessions?lean=1`) says nothing of them when there are some: a page asks for
+    /// those of the rows it shows (docs/agents.md, "The snapshot, lean"). So a reader's type may find none.
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<String>", optional))]
     pub summary: String,
     /// What it is doing right now, in plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -716,6 +826,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub plan_run: Option<String>,
+    /// The deployment experiment's variant it runs as (as `Spec::experiment`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub experiment: Option<Assigned>,
     /// What it helps with when it's a card's helper (as `Spec::helper`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -748,7 +862,10 @@ pub struct Info {
     #[cfg_attr(test, ts(optional))]
     pub runs: Option<Runs>,
     /// kiln's record of each start of its harness on its machine: when, where it ran, how it ended.
+    /// A row of the sessions' list read lean says nothing of them, nor of `runs` (W21-R02: no list
+    /// reads either), so a reader's type may find none.
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<Vec<Start>>", optional))]
     pub starts: Vec<Start>,
 }
 
@@ -890,7 +1007,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, helper, subagent, variant_of, no_bypass, workspace, isolation, runs, starts } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, workspace, isolation, runs, starts } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -948,6 +1065,7 @@ impl Info {
             && *max_subagents == o.max_subagents
             && *parent == o.parent
             && *plan_run == o.plan_run
+            && *experiment == o.experiment
             && *helper == o.helper
             && *subagent == o.subagent
             && *variant_of == o.variant_of
@@ -1550,7 +1668,7 @@ impl Session {
     /// upgrade), or one whose end went unseen, which ends now.
     fn began(&self, p: &crate::proc::Duplex) {
         let runs = match (p.boundary(), p.host_pid()) {
-            (Some(held), host_pid) => Runs::Microvm { vm: held.id(), image: held.image().to_owned(), host_pid, control: None, reach: Some(Box::new(held.reach().clone())) },
+            (Some(held), host_pid) => Runs::Microvm { vm: held.id(), image: held.image().to_owned(), host_pid, control: None, reach: Some(Box::new(held.reach().clone())), granted: Some(Box::new(Granted::of(held.declared()))) },
             (None, Some(pid)) => Runs::Host { pid },
             // A `Duplex` is a process of the machine's or a boundary's run: there's no third.
             (None, None) => return,
@@ -1564,7 +1682,7 @@ impl Session {
             if open && let Some(l) = starts.last_mut() {
                 l.ended = Some(Ended { at: now, code: None });
             }
-            starts.push(Start { at: now, runs: runs.clone(), ended: None });
+            starts.push(Start { at: now, runs: runs.clone(), ended: None, measured: p.boundary().and_then(|h| h.measured()) });
         }
         // Its image's destinations kept whole for want of knowing what its session uses: said, never
         // a silent widening (ROOT, 2026-11-13), once for each start.
@@ -1585,12 +1703,16 @@ impl Session {
     }
 
     /// Its harness ended, `code` its exit code where it was seen: nothing runs, and kiln's record of
-    /// its start says how it ended.
-    fn ended_run(&self, code: Option<i32>) {
+    /// its start says how it ended and what its boundary `held` measured of it (P7.1).
+    fn ended_run(&self, code: Option<i32>, held: Option<std::sync::Arc<crate::sandbox::held::Held>>) {
         let now = Core::now();
+        let measured = held.and_then(|h| h.measured());
         let mut core = self.core.lock();
         if let Some(l) = core.state.starts.last_mut().filter(|l| l.ended.is_none()) {
             l.ended = Some(Ended { at: now, code });
+            if measured.is_some() {
+                l.measured = measured;
+            }
         }
         core.state.runs = None;
         core.touch_state();
@@ -2292,6 +2414,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         max_subagents: core.state.max_subagents,
         parent: spec.parent.clone(),
         plan_run: spec.plan_run.clone(),
+        experiment: spec.experiment.clone(),
         helper: spec.helper.clone(),
         subagent: spec.subagent,
         variant_of: spec.variant_of.clone(),
@@ -3450,16 +3573,18 @@ fn switch_now(core: &Core) -> bool {
 
 /// A person chose a model of harness `to`: the session goes on in it once nothing is under way
 /// (kiln's queue waits for it meanwhile). None: it can't (said in the timeline).
-fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<Switch> {
+fn wanted(s: &Session, from: &'static Kind, to: &str, model: String, swaps: bool) -> Option<Switch> {
     let target = Kind::get(to).filter(|k| k.switchable() && from.switchable());
-    let installed = target.is_some_and(Kind::available);
     // Its spec before its core: never the one lock inside the other.
     let (allow_bypass, isolated) = {
         let spec = s.spec.lock();
         (spec.allow_bypass, spec.isolation.is_some())
     };
+    // In a microVM, its harness is its image's, swapped there for the other's (kiln plan 01a1dd2e…, P6c.5): where its
+    // microVMs swap one in place, never in a new microVM; none installed on the machine is asked for.
+    let installed = isolated || target.is_some_and(Kind::available);
     let mut core = s.core.lock();
-    if isolated {
+    if isolated && !swaps {
         core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: crate::sandbox::isolated::NO_SWITCH.to_owned() });
         return None;
     }
@@ -3481,6 +3606,22 @@ fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<S
         core.upsert("switch-pending", None, super::model::Body::Notice { level: Level::Info, text });
     }
     Some(Switch { to: target, model })
+}
+
+/// `spec` as its session goes on in harness `to` in its microVM (kiln plan 01a1dd2e…, P6c.5): `to`'s own image, kiln's
+/// Agentfile for it, the one it started from being its first harness's.
+fn switched_spec(spec: &Spec, to: &Kind) -> Spec {
+    let mut target = spec.clone();
+    to.id.clone_into(&mut target.kind);
+    if let Some(i) = target.isolation.as_mut() {
+        i.image = None;
+    }
+    target
+}
+
+/// Whether this machine's microVMs swap a harness for another in place (`Holds::swaps`: kiln plan 01a1dd2e…, P6c.5).
+fn swaps_here(files: &Files) -> bool {
+    files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()).is_some_and(|v| v.sandbox.holds().swaps)
 }
 
 /// A model's name as its harness lists it, else its id.
@@ -3533,10 +3674,19 @@ struct Carried {
 /// default). Err: `from`'s record couldn't be read.
 #[allow(clippy::too_many_arguments)]
 async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)], session: Option<String>, timeline: Option<super::handoff::Conversation>, cwd: &str, old_model: &str, mode: &str, effort: &str, allow_bypass: bool, model: &str, more: Option<&str>) -> Result<Carried, String> {
+    carried_in(from, to, env, session, timeline, cwd, old_model, mode, effort, allow_bypass, model, more, false).await
+}
+
+/// [`carried`], for a session in a microVM where `isolated`: its harness's own record is its microVM's, so kiln carries
+/// its own timeline, into a harness's own record where it takes one over its protocol (Codex's thread items), else in
+/// words with the next message (Claude Code's transcript is written nowhere on the machine for it; kiln plan
+/// 01a1dd2e…, P6c.5).
+#[allow(clippy::too_many_arguments, reason = "carried's own, and whether its session is in a microVM")]
+async fn carried_in(from: &'static Kind, to: &'static Kind, env: &[(String, String)], session: Option<String>, timeline: Option<super::handoff::Conversation>, cwd: &str, old_model: &str, mode: &str, effort: &str, allow_bypass: bool, model: &str, more: Option<&str>, isolated: bool) -> Result<Carried, String> {
     use super::handoff;
     // What the model saw: from the harness's own record (no session yet: nothing to carry), or
-    // for one whose record kiln doesn't read, kiln's timeline.
-    let read = match (from.own_record(), session) {
+    // for one whose record kiln doesn't read, kiln's timeline (a microVM's harness's too).
+    let read = match (from.own_record() && !isolated, session) {
         (false, _) => Some(timeline.unwrap_or_default()),
         (true, None) => Some(handoff::Conversation::default()),
         (true, Some(id)) => {
@@ -3552,8 +3702,8 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
         }
     };
     let Some(mut conv) = read else { return Err(format!("kiln could not read {}'s record of this conversation", from.name)) };
-    // In words it all goes with one message: less of it.
-    let words = !to.own_record();
+    // In words it all goes with one message: less of it. A microVM's Claude Code takes it so.
+    let words = !to.own_record() || (isolated && to.protocol == Protocol::ClaudeStreamJson);
     let dropped = handoff::fit(&mut conv, if words { handoff::WORDS_BUDGET } else { CARRY_MAX });
     let empty = conv.entries.is_empty() && conv.summary.is_none();
     let (mode, effort) = carried_settings(from, to, mode, effort, allow_bypass, model);
@@ -3564,6 +3714,7 @@ async fn carried(from: &'static Kind, to: &'static Kind, env: &[(String, String)
     }
     let record = match to.protocol {
         _ if empty => Record::Nothing,
+        Protocol::ClaudeStreamJson if isolated => Record::Words(handoff::as_words(conv, &note, usize::MAX)),
         Protocol::ClaudeStreamJson => {
             let id = uuid::Uuid::now_v7().to_string();
             let records = handoff::to_claude(&conv, Some(&format!("<system-reminder>\n{note}\n</system-reminder>")), &id, cwd, if old_model.is_empty() { "unknown" } else { old_model });
@@ -3583,9 +3734,14 @@ fn timeline_of<'a>(from: &Kind, events: impl IntoIterator<Item = &'a super::mode
     if from.own_record() {
         return None;
     }
+    Some(timeline(events, todos, queue))
+}
+
+/// The conversation as kiln's timeline keeps it, with the plan as it stands, whatever its harness.
+fn timeline<'a>(events: impl IntoIterator<Item = &'a super::model::Event>, todos: &[super::model::Todo], queue: &[super::model::QueueItem]) -> super::handoff::Conversation {
     let mut c = super::handoff::from_events(handed_events(events, queue));
     c.todos = todos.to_vec();
-    Some(c)
+    c
 }
 
 /// CP-T3.2: shown queued input still travels in the durable queue, and must not also become
@@ -3679,14 +3835,16 @@ fn picks_up_there(st: &mut super::model::State) -> bool {
 async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usize, sink: &Sink) -> Option<(&'static Kind, Option<Vec<serde_json::Value>>)> {
     use super::handoff;
     let to = sw.to;
-    let (env, allow_bypass) = {
+    let (env, allow_bypass, isolated) = {
         let sp = s.spec.lock();
-        (sp.env.clone(), sp.allow_bypass)
+        (sp.env.clone(), sp.allow_bypass, sp.isolation.is_some())
     };
+    // In a microVM, its harness's own record is its microVM's: kiln carries its own timeline (kiln plan 01a1dd2e…, P6c.5).
     let (cwd, session, old_model, mode, effort, timeline) = {
         let core = s.core.lock();
         let st = &core.state;
-        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone(), timeline_of(from, core.events(), &st.todos, &st.queue))
+        let timeline = if isolated { Some(timeline(core.events(), &st.todos, &st.queue)) } else { timeline_of(from, core.events(), &st.todos, &st.queue) };
+        (st.cwd.clone(), if isolated { None } else { st.harness_session.clone() }, st.model.clone(), st.mode.clone(), st.effort.clone(), timeline)
     };
     let fail = |s: &Arc<Session>, text: String| {
         let mut core = s.core.lock();
@@ -3698,7 +3856,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
             e.body = super::model::Body::Notice { level: Level::Info, text: "Switch cancelled".to_owned() };
         }
     };
-    let c = match carried(from, to, &env, session, timeline, &cwd, &old_model, &mode, &effort, allow_bypass, &sw.model, None).await {
+    let c = match carried_in(from, to, &env, session, timeline, &cwd, &old_model, &mode, &effort, allow_bypass, &sw.model, None, isolated).await {
         Ok(c) => c,
         Err(e) => {
             fail(s, format!("{e}, so it goes on in {}.", from.name));
@@ -3725,6 +3883,10 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
     {
         let mut sp = s.spec.lock();
         sp.kind = to.id.to_owned();
+        // In a microVM, its image is the new harness's own from now on (kiln plan 01a1dd2e…, P6c.5).
+        if let Some(i) = sp.isolation.as_mut() {
+            i.image = None;
+        }
         // None chosen: the harness's own default.
         sp.model = Some(sw.model.clone()).filter(|m| !m.is_empty());
         sp.mode.clone_from(&mode);
@@ -4694,6 +4856,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
     // A switch to another harness, waiting for the turn under way to end; and the conversation
     // carried over, for a harness that takes it once started (Codex), until it has.
     let mut switching: Option<Switch> = None;
+    // A microVM session's harness, handed on whole as it switches harness: swapped for the next in its microVM there
+    // (kiln plan 01a1dd2e…, P6c.5), never stopped here.
+    let mut swap_from: Option<crate::proc::Duplex> = None;
     // A session that moved here with a new thread's history starts with it.
     let mut seed: Option<Vec<serde_json::Value>> = carried;
     // A move to another runner, waiting for the turn under way to end.
@@ -4824,7 +4989,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     None if isolated => {
                         let host = files.host.as_ref().and_then(std::sync::Weak::upgrade);
                         match host.as_ref().and_then(|h| h.microvm()) {
-                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets).await,
+                            Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets, swap_from.take()).await,
                             None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                         }
                     }
@@ -4930,6 +5095,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 let roots = std::sync::Arc::new(super::whose::Roots::of(&spec));
                 // The link its stdio rides into its microVM, said once it's made.
                 let mut linking = link_made(p.boundary());
+                // Its run's boundary as its end records it (P7.1's measures): kept apart from `p`, which a switch in
+                // its microVM hands on to the next harness's launch (P6c.5), and read again as a resume replaces `p`.
+                let mut boundary = p.boundary();
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -5058,7 +5226,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 on_change();
                             }
                             Command::SetModel { model, kind: Some(to) } if to != kind.id => {
-                                if let Some(sw) = wanted(&s, kind, &to, model) {
+                                if let Some(sw) = wanted(&s, kind, &to, model, swaps_here(&files)) {
                                     switching = Some(sw);
                                 }
                             }
@@ -5243,7 +5411,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                                 *s.pid.lock() = None;
                                 keep_ran_in(&s, &files, kept_in.as_deref()).await;
-                                s.ended_run(None);
+                                s.ended_run(None, p.boundary());
                                 // What its adapter held goes with its record, in its queue.
                                 adapter.let_go(&mut s.core.lock());
                                 let _ = reply.send(Ok(None));
@@ -5264,7 +5432,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             if unresolved {
                                 let _ = reply.send(Err("trailing native input effects could not commit; the current owner is retained".into()));
                                 match crate::proc::adopt_duplex(process) {
-                                    Ok(resumed) => { p = resumed; out_open = true; err_open = true; continue; }
+                                    Ok(resumed) => { p = resumed; boundary = p.boundary(); out_open = true; err_open = true; continue; }
                                     Err(error) => {
                                         crate::proc::terminate_tree(i32::try_from(process.pid).unwrap_or(0), Duration::from_secs(2)).await;
                                         let mut core = s.core.lock();
@@ -5318,7 +5486,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
                             keep_ran_in(&s, &files, kept_in.as_deref()).await;
-                            s.ended_run(None);
+                            s.ended_run(None, p.boundary());
                             if let Some(g) = group {
                                 end_group(g, Duration::from_millis(3500));
                             }
@@ -5421,6 +5589,37 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     };
                     if go {
                         left = s.core.lock().state.tasks.iter().filter(|t| t.left_running()).count();
+                        // A switch in a microVM: its member is swapped for the next harness's there, as it starts, once
+                        // the next one's image is in the machine's store (built there now where it isn't).
+                        if let Some(to) = switching.as_ref().map(|sw| sw.to).filter(|_| s.spec.lock().isolation.is_some() && p.boundary().is_some()) {
+                            let vms = files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm());
+                            let ready = match vms {
+                                Some(vms) => {
+                                    let target = switched_spec(&s.spec.lock(), to);
+                                    crate::sandbox::isolated::ready_to_swap(to, &target, vms.as_ref(), &build_secrets).await
+                                }
+                                None => Err("its machine holds no microVMs now".to_owned()),
+                            };
+                            match ready {
+                                Ok(()) => {
+                                    swap_from = Some(p);
+                                    ending = true;
+                                    break;
+                                }
+                                Err(why) => {
+                                    switching = None;
+                                    let mut core = s.core.lock();
+                                    core.hold = false;
+                                    core.state.switching = None;
+                                    core.touch_state();
+                                    let text = format!("It can't switch to {} in its microVM: {why}. It goes on in {}.", to.name, kind.name);
+                                    core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text });
+                                    drop(core);
+                                    on_change();
+                                    continue;
+                                }
+                            }
+                        }
                         p.stdin.close();
                         if crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await.is_err() {
                             p.terminate(Duration::from_secs(2));
@@ -5467,7 +5666,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 }
                 *s.pid.lock() = None;
                 keep_ran_in(&s, &files, kept_in.as_deref()).await;
-                s.ended_run(code);
+                s.ended_run(code, boundary);
                 // A conversation carried in that it took is in its own session now, which it
                 // starts again on (Antigravity starts again for a new mode, model or effort); one
                 // it hasn't taken yet is given to it again.
@@ -5639,7 +5838,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     // Another harness's model: the session goes on in it, now.
                     Command::SetModel { model, kind: Some(to) } if to != kind.id => {
-                        if let Some(sw) = wanted(&s, kind, &to, model) {
+                        if let Some(sw) = wanted(&s, kind, &to, model, swaps_here(&files)) {
                             switching = Some(sw);
                             break;
                         }
@@ -5840,7 +6039,7 @@ mod tests {
     fn s17_a_microvm_run_keeps_the_agentfile_and_image_its_conversation_ran_in() -> anyhow::Result<()> {
         use super::{Isolation, Runs, Spec, ran_in_of};
         use crate::harness::isolated::home::RanIn;
-        let run = Runs::Microvm { vm: None, image: "agentfile-0123@sha256:00".into(), host_pid: None, control: None, reach: None };
+        let run = Runs::Microvm { vm: None, image: "agentfile-0123@sha256:00".into(), host_pid: None, control: None, reach: None, granted: None };
         let isolated = |image: Option<&str>, person: Option<&str>| Isolation { image: image.map(str::to_owned), person: person.map(str::to_owned), ..Isolation::microvm() };
         let own = Spec { kind: "claude".into(), isolation: Some(isolated(Some("agentfile:0123"), Some("user:u1"))), agentfile: Some("FROM x\n".into()), ..Spec::default() };
         let ran = |agentfile: &str, digest: String| RanIn { conversation: "c-1".into(), agentfile: agentfile.into(), digest, image: "agentfile-0123@sha256:00".into(), kept_in: None };
@@ -5865,7 +6064,7 @@ mod tests {
     #[test]
     fn s17_a_run_kept_whole_by_a_fallback_says_so() {
         use crate::sandbox::narrow::{Reach, Whole};
-        let run = |reach| super::Runs::Microvm { vm: None, image: "i@sha256:00".into(), host_pid: None, control: None, reach: Some(Box::new(reach)) };
+        let run = |reach| super::Runs::Microvm { vm: None, image: "i@sha256:00".into(), host_pid: None, control: None, reach: Some(Box::new(reach)), granted: None };
         let said = super::whole_notice(&run(Reach::Whole { why: Whole::NoHome })).unwrap_or_default();
         assert!(said.contains("isn't narrowed") && said.contains("keeps no home"), "{said}");
         let unread = super::whole_notice(&run(Reach::Whole { why: Whole::Unread { file: "/home/h/x.json".into(), error: "denied".into() } })).unwrap_or_default();
@@ -7880,7 +8079,7 @@ sys.exit(1)
             pause_at: None,
             max_subagents: None,
             parent: None,
-            plan_run: None,
+            plan_run: None, experiment: None,
             helper: None,
             subagent: false,
             no_bypass: false,

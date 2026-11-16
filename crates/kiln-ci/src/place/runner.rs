@@ -693,9 +693,11 @@ impl Admission {
         self.fair.get(c.index())
     }
 
-    /// What kiln may place here in all: the budget, else the machine (CPUs as overcommitted).
+    /// What kiln may place here in all: the machine, held to the budget in each dimension it names
+    /// (CPUs as overcommitted).
     pub fn cap(&self) -> Amounts {
-        let size = self.settings.budget.as_ref().map_or_else(|| ask::amounts(&self.sample.size), ask::amounts);
+        let machine = ask::amounts(&self.sample.size);
+        let size = self.settings.budget.as_ref().map_or(machine, |b| ask::least(&machine, &ask::amounts(b)));
         let [cpu, mem, disk, gpu] = size;
         let cpu = u64::try_from(u128::from(cpu).saturating_mul(u128::from(self.settings.overcommit_cpu.max(1000))) / 1000).unwrap_or(u64::MAX);
         [cpu, mem, disk, gpu]
@@ -740,10 +742,11 @@ impl Admission {
     }
 
     /// What the runner offers in each of fair share's dimensions (the engine's `offers` in resource
-    /// mode): its slots, and its CPUs, memory and GPUs, of the budget or else the machine.
+    /// mode): its slots, and its CPUs, memory and GPUs, the machine's held to the budget in each it
+    /// names.
     fn offers(&self) -> [u64; FAIR] {
-        let size = self.settings.budget.unwrap_or(self.sample.size);
-        [u64::from(self.settings.slots), size.cpu.get(), size.mem, u64::from(size.gpu)]
+        let [cpu, mem, _, gpu] = self.settings.budget.as_ref().map_or_else(|| ask::amounts(&self.sample.size), |b| ask::least(&ask::amounts(&self.sample.size), &ask::amounts(b)));
+        [u64::from(self.settings.slots), cpu, mem, gpu]
     }
 
     /// What a run holds of the runner in each of fair share's dimensions (the engine's `asks`): a

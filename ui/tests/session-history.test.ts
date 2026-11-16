@@ -37,7 +37,7 @@ const meta = (before: number | null, has_more = true) => ({ cursor, before, has_
 function open(store: InstanceType<typeof SessionStore>, events = [event(10), event(11)]) {
   const off = store.subscribe(() => {});
   const ws = Socket.all.at(-1)!;
-  assert.match(ws.url, /recent_turns=8&event_bytes=262144/);
+  assert.match(ws.url, /recent_turns=8&event_bytes=262144&first_bytes=16384/);
   ws.frame({ t: "open", info: { id: "history", status: "running" }, window: { before: 10, more: true }, rev: 10, born: 77 });
   ws.frame({ t: "history", ...meta(10) });
   ws.frame({ t: "events", events });
@@ -299,6 +299,179 @@ await test("W21-R02 stale restore cleanup cannot cancel a newer history request"
   await tick();
   assert.equal(store.event("e1"), undefined);
   assert.equal(store.event("e2")?.id, "e2");
+  off();
+  store.dispose();
+});
+
+/** A snapshot that is its window's first part (`part`), as a server sends one to a viewer that takes a part ahead. */
+function openPart(store: InstanceType<typeof SessionStore>, events = [event(10), event(11)]) {
+  const off = store.subscribe(() => {});
+  const ws = Socket.all.at(-1)!;
+  ws.frame({ t: "open", info: { id: "history", status: "running" }, window: { before: 10, more: true }, rev: 10, born: 77 });
+  ws.frame({ t: "history", ...meta(10), part: true });
+  ws.frame({ t: "events", events });
+  ws.frame({ t: "synced" });
+  return { ws, off };
+}
+
+await test("W21-R02 a window comes in two parts: its newest first, the rest joining what's held", async () => {
+  const store = new SessionStore("history");
+  const { ws, off } = openPart(store);
+  assert.equal(store.get().ready, true, "the first part is the snapshot: the conversation shows on it");
+  assert.equal(store.get().history?.filling, true);
+  assert.deepEqual(
+    store.get().events.map((e) => e.id),
+    ["e10", "e11"],
+  );
+  const held = store.event("e11");
+  let settled = false;
+  const filled = store.filled().then(() => (settled = true));
+  // Nothing before the window is asked for until the window is whole.
+  const fetch = pendingFetch();
+  const older = store.loadOlder();
+  await tick();
+  assert.equal(fetch.count(), 0);
+  assert.equal(settled, false);
+  ws.frame({ t: "earlier", events: [event(6), event(7), event(11, "not over what's held")], ...meta(6) });
+  await Promise.all([filled, older]);
+  await tick();
+  assert.deepEqual(
+    store.get().events.map((e) => e.id),
+    ["e6", "e7", "e10", "e11"],
+  );
+  assert.equal(store.event("e11"), held, "what's held stays the same object: nothing shown renders again");
+  assert.deepEqual([store.get().history?.filling, store.get().history?.before, store.get().history?.hasMore, store.get().more], [false, 6, true, true]);
+  assert.equal(store.filled(), store.filled(), "a whole window is filled already");
+  // It's the window, not history its reader asked for: a long session still lets go of its oldest.
+  ws.frame({ t: "events", events: Array.from({ length: 6000 }, (_, i) => event(i + 100)) });
+  await tick();
+  assert.equal(store.get().events.length, 4000);
+  // And what's before it is a page away, as ever.
+  const page = store.loadOlder();
+  assert.equal(fetch.count(), 1);
+  fetch.finish({ events: [], history: meta(null, false) });
+  await page;
+  off();
+  store.dispose();
+});
+
+await test("W21-R02 a window's rest that never came is asked for again, the window whole this time", async () => {
+  const store = new SessionStore("history");
+  const { ws, off } = openPart(store);
+  let looked = false;
+  const waiting = store.filled().then(() => (looked = true));
+  // Its socket closed before the rest came: a resume would bring what came after the part, never the rest. What's
+  // shown is added to, so the window is asked for whole, no part of it ahead.
+  ws.close();
+  store.wake();
+  const again = Socket.all.at(-1)!;
+  assert.notEqual(again, ws);
+  assert.doesNotMatch(again.url, /after=|first_bytes=/);
+  again.frame({ t: "open", info: { id: "history", status: "running" }, window: { before: 8, more: true }, rev: 12, born: 77 });
+  again.frame({ t: "history", ...meta(8) });
+  again.frame({ t: "events", events: [event(8), event(10), event(11), event(12)] });
+  again.frame({ t: "synced" });
+  await waiting;
+  assert.equal(looked, true, "whoever waited for the rest looks again at the snapshot that took its place");
+  assert.deepEqual(
+    store.get().events.map((e) => e.id),
+    ["e8", "e10", "e11", "e12"],
+  );
+  assert.equal(store.get().history?.filling, false);
+  // The rest of a snapshot that isn't what's held: not this window's.
+  again.frame({ t: "earlier", events: [event(1)], ...meta(1, false) });
+  await tick();
+  assert.equal(store.event("e1"), undefined);
+  // A whole window resumes as ever.
+  again.close();
+  store.wake();
+  assert.match(Socket.all.at(-1)!.url, /after=77\.12/);
+  assert.doesNotMatch(Socket.all.at(-1)!.url, /first_bytes=/);
+  off();
+  store.dispose();
+});
+
+await test("W21-R02 a first part that comes while a conversation is shown takes its place together with its rest", async () => {
+  const store = new SessionStore("history");
+  const shown: string[] = [];
+  const { ws } = open(store, [event(8), event(9), event(10), event(11)]);
+  const off = store.subscribe(() =>
+    shown.push(
+      store
+        .get()
+        .events.map((e) => e.id)
+        .join(" "),
+    ),
+  );
+  await tick();
+  // A viewer that fell behind is sent a snapshot again on its socket, and its window's first part first.
+  ws.frame({ t: "open", info: { id: "history", status: "running" }, window: { before: 11, more: true }, rev: 20, born: 77 });
+  ws.frame({ t: "history", ...meta(11), cursor: "77.3.history", part: true });
+  ws.frame({ t: "events", events: [event(11), event(12)] });
+  ws.frame({ t: "synced" });
+  await tick();
+  assert.deepEqual(
+    store.get().events.map((e) => e.id),
+    ["e8", "e9", "e10", "e11"],
+    "what's shown stays until the window that takes its place is whole",
+  );
+  ws.frame({ t: "earlier", events: [event(9), event(10)], ...meta(9), cursor: "77.3.history" });
+  await tick();
+  assert.deepEqual(
+    store.get().events.map((e) => e.id),
+    ["e9", "e10", "e11", "e12"],
+  );
+  assert.deepEqual([store.get().history?.filling, store.get().history?.before, store.get().history?.cursor], [false, 9, "77.3.history"]);
+  assert.ok(!shown.includes("e11 e12"), `the page never held the part alone: ${JSON.stringify(shown)}`);
+  // And it resumes from the snapshot that took its place.
+  ws.close();
+  store.wake();
+  assert.match(Socket.all.at(-1)!.url, /after=77\.20/);
+  off();
+  store.dispose();
+});
+
+await test("W21-R02 something live before a window's rest means none is coming: what's before the part is a page away", async () => {
+  const store = new SessionStore("history");
+  const { ws, off } = openPart(store);
+  assert.equal(store.get().history?.filling, true);
+  const waiting = store.filled();
+  // The rest comes before anything live. A live frame first: this socket brings none.
+  ws.frame({ t: "events", events: [event(12)], rev: 11 });
+  await waiting;
+  await tick();
+  assert.equal(store.get().history?.filling, false);
+  assert.deepEqual(
+    store.get().events.map((e) => e.id),
+    ["e10", "e11", "e12"],
+  );
+  // A rest that comes after all isn't this window's any more; a page reads what's before the part.
+  ws.frame({ t: "earlier", events: [event(7)], ...meta(7) });
+  await tick();
+  assert.equal(store.event("e7"), undefined);
+  const fetch = pendingFetch();
+  const page = store.loadOlder();
+  assert.equal(fetch.count(), 1);
+  fetch.finish({ events: [event(8), event(9)], history: meta(8) });
+  await page;
+  await tick();
+  assert.deepEqual(
+    store.get().events.map((e) => e.id),
+    ["e8", "e9", "e10", "e11", "e12"],
+  );
+  off();
+  store.dispose();
+});
+
+await test("W21-R02 a window that fits its first part is whole at once", async () => {
+  const store = new SessionStore("history");
+  const { off } = open(store);
+  assert.equal(store.get().history?.filling, false);
+  const fetch = pendingFetch();
+  const p = store.loadOlder();
+  assert.equal(fetch.count(), 1, "what's before it is asked for at once");
+  fetch.finish({ events: [event(4)], history: meta(4) });
+  await p;
   off();
   store.dispose();
 });

@@ -2534,6 +2534,7 @@ dependencies = [
  "turso_core",
  "uuid",
  "vt100",
+ "vte",
  "webpki-roots",
  "winapi-util",
  "x509-parser",

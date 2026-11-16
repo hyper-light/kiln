@@ -101,7 +101,7 @@ pub async fn response_to(hub: &Hub, caller: &Caller, agent: &str, key: &str, res
 /// goals, asking about its conversation, a change request from its work, and landing its workspace. Reads, waits and an
 /// agent's own git credential aren't.
 pub fn tracks_operation(name: &str) -> bool {
-    matches!(name, "agents.send" | "agents.start" | "agents.interrupt" | "agents.control" | "agents.restart" | "agents.stop" | "agents.about" | "agents.change" | "agents.land") || name.starts_with("goals.") && !matches!(name, "goals.get")
+    matches!(name, "agents.send" | "agents.start" | "agentdefs.run" | "agents.interrupt" | "agents.control" | "agents.restart" | "agents.stop" | "agents.about" | "agents.change" | "agents.land") || name.starts_with("goals.") && !matches!(name, "goals.get")
 }
 
 pub fn prepare_operation(hub:&Hub,name:&str,input:&Value)->Option<super::attention::HumanResponse>{
@@ -132,7 +132,8 @@ pub async fn operation(hub: &Hub, caller: &Caller, name: &str, input: &Value, ou
         _ => "command",
     };
     let key = output.get("message").and_then(Value::as_str).or_else(|| input.get("key").and_then(Value::as_str)).map(str::to_owned).unwrap_or_else(crate::util::new_id);
-    if name == "agents.start" {
+    // A start, by agents.start or as an agent definition's run (which starts as agents.start does).
+    if matches!(name, "agents.start" | "agentdefs.run") {
         if let Some(agents) = output.get("agents").and_then(Value::as_array) {
             for id in agents.iter().filter_map(|a| a.get("id").and_then(Value::as_str)) {
                 record(hub, caller, id, if input.get("prompt").and_then(Value::as_str).is_some() { "message" } else { "command" }, id, at).await;

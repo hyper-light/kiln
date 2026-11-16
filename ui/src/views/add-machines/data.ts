@@ -1,6 +1,6 @@
 /** Data for Runners → Add machines (and the notice on Runners): join requests, what discovery hears, and what each machine is to this server. */
 import { api } from "@/api/client";
-import type { Agent, DiscoveredInstance, DiscoveryInfo, DiscoveryVia, InstallOs, JoinInfo, JoinRequest } from "@/api/types";
+import type { DiscoveredInstance, DiscoveryInfo, DiscoveryVia, InstallOs, JoinInfo, JoinRequest, LeanAgent } from "@/api/types";
 import type { Res } from "@/lib/data";
 
 /**
@@ -16,7 +16,7 @@ export const joinRes: Res<JoinInfo> = { key: "join", fetch: (s) => api.join(s) }
 
 /** A runner that connected while Add machines was open. */
 export interface Arrival {
-  agent: Agent;
+  agent: LeanAgent;
   /** When the page saw it connect (unix seconds). */
   at: number;
 }

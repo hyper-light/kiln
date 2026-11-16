@@ -681,6 +681,8 @@ struct Read {
     /// its scope's CPU taken there between two reads around it, or its later read where no sample came; an image VM's
     /// its read's own.
     at: Instant,
+    /// Whether `cpu_ns` holds the vCPUs' guest time (D265), as the VM process said it.
+    charged: hex_api::Charged,
 }
 
 impl Read {
@@ -700,6 +702,7 @@ impl Read {
                 guest_ns: Ok(host.guest_ns),
                 life: Some(host.window),
                 at,
+                charged: host.charged,
             });
         }
         // Its scope's use read on each side of its VM process's sample of its vCPUs' guest time (D260), its CPU taken at
@@ -708,20 +711,23 @@ impl Read {
         let (before, from) = timed(clock, || io.usage(holder))?;
         let guest = io.guest_time(holder)?;
         let (usage, to) = timed(clock, || io.usage(holder))?;
-        let (cpu_usec, at, guest_ns) = match guest {
+        let (cpu_usec, at, guest_ns, charged) = match guest {
             ManagedGuestTime::PerVcpu {
                 ns,
                 asked,
                 answered,
+                charged,
             } => {
                 let (cpu, at) = between(
                     (before.cpu_usec, from),
                     (usage.cpu_usec, to),
                     mid(asked, answered),
                 );
-                (cpu, at, Ok(ns))
+                (cpu, at, Ok(ns), charged)
             }
-            ManagedGuestTime::Unheld(why) => (usage.cpu_usec, to, Err(why)),
+            ManagedGuestTime::Unheld(why) => {
+                (usage.cpu_usec, to, Err(why), hex_api::Charged::Unknown)
+            }
         };
         let life = match (&guest_ns, first) {
             (Ok(_), true) => Some(io.life(holder)?),
@@ -733,6 +739,7 @@ impl Read {
             guest_ns,
             life,
             at,
+            charged,
         })
     }
 
@@ -743,7 +750,7 @@ impl Read {
             return None;
         };
         let vcpus = guest.iter().fold(0u64, |sum, ns| sum.saturating_add(*ns));
-        milli_over(self.cpu_ns.saturating_sub(vcpus), life)
+        milli_over(self.charged.own(self.cpu_ns, vcpus), life)
     }
 }
 
@@ -839,14 +846,17 @@ fn milli_over(ns: u64, span: Duration) -> Option<u64> {
         .map(|n| u64::try_from(n).unwrap_or(u64::MAX))
 }
 
-/// What a VM ran over a window, its whole CPU `cpu_ns` since its reading before: split into each vCPU's guest time and
-/// its VMM's own where its host read each vCPU's both times (D241), its VMM's own the whole less its vCPUs', never less
-/// than none past the clocks' steps; whole where it didn't. Two readings naming different vCPU counts are refused,
+/// What a VM ran over a window, its VM process's CPU `cpu_ns` since its reading before: split into each vCPU's guest
+/// time and its VMM's own where its host read each vCPU's both times (D241), its VMM's own as `charged` says
+/// ([`hex_api::Charged::own`], Shards' D265): the whole less its vCPUs' where its threads hold their guest time (never
+/// less than none past the clocks' steps), the whole where they ran apart or it isn't told, so a VM is never charged
+/// less than it ran; whole where it didn't read them. Two readings naming different vCPU counts are refused,
 /// typed: no vCPU's time is paired with another's.
 pub(crate) fn ran(
     cpu_ns: u64,
     now: Option<&[u64]>,
     before: Option<&[u64]>,
+    charged: hex_api::Charged,
 ) -> Result<Cpu, ChargeError> {
     let (Some(now), Some(before)) = (now, before) else {
         return Ok(Cpu::Whole(Duration::from_nanos(cpu_ns)));
@@ -867,7 +877,7 @@ pub(crate) fn ran(
     });
     Ok(Cpu::Split {
         guest,
-        own: Duration::from_nanos(cpu_ns.saturating_sub(vcpus)),
+        own: Duration::from_nanos(charged.own(cpu_ns, vcpus)),
     })
 }
 
@@ -1947,6 +1957,7 @@ impl Learner {
                     cpu_ns,
                     read.guest_ns.as_deref().ok(),
                     vm.guest_ns.as_deref(),
+                    read.charged,
                 )
                 .map_err(refused)?;
                 // Its VMM's own CPU (D260): over the window where both readings split it, over its life where this is

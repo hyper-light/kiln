@@ -27,14 +27,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 mod pool;
-mod session;
+pub(crate) mod session;
 pub mod wire;
 
+pub use pool::{Gave, PoolHeld, PoolId, Released, WarmHost, WarmRoom};
+
 pub use wire::{
-    Bound, Captured, Channel, Cli, ControlAsk, ControlAt, CredentialGrant, Fill, FinalUse, GuestTimes,
-    HostUse, Keep, LeaseRefusal, MemberInfo, MemberKind, MemberReach, Microvm, Narrowing, PlugRefusal, Proto,
-    Publish, Ready, Receiving, RunEnd, RunEnded, SaveRefusal, Secret, SignInGrant, SignInRefusal,
-    SignInTokens, SocketGrant, StartedFrom, Stats, StatsScope, Unused, UseBroken, VcpuTime, decide,
+    Bound, Captured, Channel, Charged, Cli, ControlAsk, ControlAt, CredentialGrant, Fill, FinalUse,
+    GuestTimes, HostUse, Keep, LeaseRefusal, MemberInfo, MemberKind, MemberReach, Microvm, Narrowing,
+    NetRefusal, Paused, PlugRefusal, Proto, Publish, Ready, Receiving, RunEnd, RunEnded, SaveRefusal, Secret,
+    SignInGrant, SignInRefusal, SignInTokens, SocketGrant, StartedFrom, Stats, StatsScope, Unused, UseBroken,
+    VcpuTime, decide,
 };
 
 /// A credential's lease, as a run's [`Lessor`] gives it (D242): what its release names it
@@ -276,6 +279,15 @@ pub struct ImageSpec {
     /// `Empty`). None: no report. A run that asks one boots on a run host of its own, never a
     /// warm one ([`ImagePools`]), as a warm host's VM starts before its run names the scope.
     pub gpu_report: Option<[u8; 16]>,
+    /// The plug roots the orchestrator grants the run at its start, beside its host's own and
+    /// each share's top-level directory (D235, D271): each a top-level directory of its members'
+    /// view (`/session`), not one of init's own (`/proc`, `/sys`, `/dev`, `/tmp`, `/etc`,
+    /// `/run`), as `shards_abi::run::plug::root_name` takes one. A member's domain is given
+    /// every right beneath its roots as it starts and no right is added to it later (Landlock
+    /// only narrows), so what is plugged into it as it runs ([`ImageGuest::plug`]) lies
+    /// beneath one: a session's volumes are placed beneath a root granted here. Empty: the
+    /// host's own and its shares' alone. Refused by field where one is no root.
+    pub plug_roots: Vec<String>,
 }
 
 /// A root a run's injector trusts beside the host's own ([`ImageSpec::upstream_roots`], D242).
@@ -286,6 +298,51 @@ pub enum UpstreamRoot {
     /// One or more X.509 certificates, PEM (RFC 7468 §5): a bundle's, any text between its
     /// sections, and no section of anything else (a key).
     Pem(String),
+}
+
+/// One of a run's grants past its microVM, as its image's Agentfile writes it (D59, D236, D246),
+/// added or taken out as the run goes ([`ImageGuest::grant_egress`], D273).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressGrant {
+    /// Egress ports, as the Agentfile writes them: `443/tcp`, `8000-8010/udp`.
+    Ports(String),
+    /// A remote MCP server, `host:port`: added to the reach of each member named, where the run
+    /// holds its members apart ([`Narrowing::members`]), and taken out of every member's.
+    Mcp { at: String, members: Vec<MemberName> },
+    /// A destination, `host:port` (D236), as a remote MCP server's.
+    Destination { at: String, members: Vec<MemberName> },
+    /// Names asked past the microVM (`NETWORK --dns`).
+    Dns,
+}
+
+/// What [`ImageGuest::plug`] gives the members it plugs into (D235, D271).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlugSource {
+    /// A host directory, absolute: the host's files there are its members'.
+    Host(PathBuf),
+    /// A volume of the run's home's store, by its name, made where it is not there, as a
+    /// run's `-v NAME:PATH` makes one: its files are kept in the home past the run.
+    Volume(String),
+}
+
+/// Whom [`ImageGuest::plug`] plugs into (D271): every member of the run that runs, or those
+/// named, each one that runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlugFor {
+    Every,
+    Members(Vec<MemberName>),
+}
+
+/// A plug into the running run's members (D235, D271): what, into whom, where they see it,
+/// and whether read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plug {
+    pub source: PlugSource,
+    pub to: PlugFor,
+    /// Absolute and plain, strictly beneath one of the run's plug roots (its host's own, each
+    /// share's top-level directory, and [`ImageSpec::plug_roots`]).
+    pub at: String,
+    pub read_only: bool,
 }
 
 /// How a member ended.
@@ -358,6 +415,18 @@ pub enum ImageRefusal {
     /// A bound for the run host's diagnostics ([`ImageGuest::keep_diagnostics`]) short of
     /// `tail`, the bytes of them kept to quote, which a cut leaves the file holding.
     DiagnosticsBound { bound: u64, tail: u64 },
+    /// A [`WarmTicket`] booted with the spec of another pool than the one it reserved; `asked`
+    /// none for a spec that is no pool's.
+    OtherPool { reserved: PoolId, asked: Option<PoolId> },
+    /// An ask its guest would answer, refused at once as its run is paused or pausing (D267):
+    /// `room`, `resize`, `plug`, `unplug`, or `stats` of its own command or a member. Its guest
+    /// runs nothing until the run goes on ([`ImageGuest::resume`]); none of it was applied.
+    Paused { what: &'static str },
+    /// A pause or a resume its run's VM did not do (D267), in its words: its machine stopped
+    /// before every vCPU was held.
+    Pause(String),
+    /// A change of the running run's network its host refused (D269), by what refused it.
+    Net(NetRefusal, String),
 }
 
 impl std::fmt::Display for ImageRefusal {
@@ -377,10 +446,23 @@ impl std::fmt::Display for ImageRefusal {
             Self::Terminal(why) => write!(f, "a member's terminal: {why}"),
             Self::Save(cause, why) => write!(f, "the save: {cause:?}: {why}"),
             Self::GpuProbe(why) => write!(f, "the run's GPU report: {why}"),
+            Self::OtherPool { reserved, asked } => match asked {
+                Some(asked) => write!(f, "a host reserved of pool {reserved}, asked for pool {asked}"),
+                None => write!(
+                    f,
+                    "a host reserved of pool {reserved}, asked for a run that is no pool's"
+                ),
+            },
             Self::DiagnosticsBound { bound, tail } => write!(
                 f,
                 "the run host's diagnostics: a bound of {bound} bytes, short of the {tail} kept to quote"
             ),
+            Self::Paused { what } => write!(
+                f,
+                "{what}: the run is paused, and its guest answers nothing until it resumes"
+            ),
+            Self::Pause(why) => write!(f, "the pause: {why}"),
+            Self::Net(cause, why) => write!(f, "the run's network: {cause:?}: {why}"),
         }
     }
 }
@@ -505,8 +587,53 @@ impl BootStop {
 pub trait ImageGuest: Send + Sync {
     /// Every member the image declares, by its declared index.
     fn members(&self) -> &[MemberInfo];
-    /// Each port published, as bound, and the members it reaches ([`Bound::to`]).
-    fn published(&self) -> &[Bound];
+    /// Each port the run publishes now, as bound, and the members it reaches ([`Bound::to`]):
+    /// its start's, and those [`publish`](Self::publish)ed since and not let go of, as its
+    /// host last said them.
+    fn published(&self) -> Vec<Bound>;
+    /// Guest port `publish` published on the host as the run goes (D269), in its running
+    /// microVM in place: no image built, no template saved, its guest neither restarted nor
+    /// rebooted. Bound as the run's start binds its [`ImageSpec::publish`]: at its host address,
+    /// or at every one (IPv4's, and IPv6's where IPv6 listens), its host port or one the host
+    /// picks; checked as the start checks them, so that a port the image's Agentfile declares
+    /// `AS egress`, or one it gives no member coming in on a run with no command of its own, is
+    /// refused as [`NetRefusal::Widening`]. Answers what it bound, each binding one of
+    /// [`published`](Self::published)'s from then on, waiting at most `patience`; refused as
+    /// [`ImageRefusal::Net`], by what refused it: [`NetRefusal::NoNetwork`] for a run its
+    /// microVM started with no network device (nothing published, kept or linked past it).
+    /// Answered while the run is paused too: its host's network process makes it, not its guest.
+    fn publish(&self, publish: Publish, patience: Duration) -> Result<Vec<Bound>, ImageRefusal>;
+    /// The port the run publishes at `host` for `proto` let go of, in place (D269): one of
+    /// [`published`](Self::published)'s, its start's among them; its host's socket closed, so
+    /// that nothing more comes in on it: a TCP connection it took before goes on to its end,
+    /// and its UDP peers' flows end with it. Waiting and refused as
+    /// [`publish`](Self::publish), [`NetRefusal::Unknown`] where the run publishes nothing
+    /// there.
+    fn unpublish(
+        &self,
+        proto: Proto,
+        host: std::net::SocketAddr,
+        patience: Duration,
+    ) -> Result<(), ImageRefusal>;
+    /// The run's grants past its microVM now (D273), as its host last said them: what of its
+    /// image's grants each list keeps, written out whole (`Keep::Only`), whether names are
+    /// asked, and each member's reach where the run holds its members apart.
+    fn egress(&self) -> Narrowing;
+    /// `grant` added to the run's grants past its microVM as it runs (D273), in its running
+    /// microVM in place: its network process holds every flow to its grants from then on, no
+    /// image built, no template saved, its guest neither restarted nor rebooted. Checked as the
+    /// start's grants are: a grant its image does not give (its Agentfile's grants are the most
+    /// a run may have, the ceiling its network process is held to), or a member's reach other
+    /// than its image lets it have where the run holds its members apart (D246), is refused
+    /// [`NetRefusal::Widening`]. Answers the run's grants once its network process holds them,
+    /// waiting at most `patience`; refused as [`ImageRefusal::Net`]: [`NetRefusal::NoNetwork`]
+    /// for a run with no network device. Made while the run is paused too.
+    fn grant_egress(&self, grant: &EgressGrant, patience: Duration) -> Result<Narrowing, ImageRefusal>;
+    /// `grant` taken out of the run's grants past its microVM as it runs (D273), in place: its
+    /// network process refuses the next flow to it, and ends at once each flow its grants no
+    /// longer reach (a TCP connection its guest opened is reset, a UDP flow closed). Answers
+    /// and is refused as [`grant_egress`](Self::grant_egress).
+    fn revoke_egress(&self, grant: &EgressGrant, patience: Duration) -> Result<Narrowing, ImageRefusal>;
     /// Where the run's agent-control endpoint is bound, and its microVM's key, which its
     /// controller pins (D252), where [`ImageSpec::control`] asked for one: as the run started,
     /// unchanged until it ends. With it, the endpoint's two other sockets, its waker and its
@@ -598,22 +725,22 @@ pub trait ImageGuest: Send + Sync {
     /// where it stays. Refused for a run whose spec does not ask for the grant, and once the
     /// run has ended with nothing newer ([`ImageRefusal::Ended`]).
     fn wait_ready(&self, seen: Option<Ready>, timeout: Duration) -> Result<Option<Ready>, ImageRefusal>;
-    /// Host directory `host` plugged into running member `member` as the run goes (D235),
-    /// at `at`: absolute, strictly beneath one of the run's plug roots, which its host names
-    /// as it starts (its OS's own, and the top-level directory of each of its shares), so
-    /// that a project is plugged at its host path. The host's files there are the member's,
-    /// read-only where asked; the plug grants nothing beyond its own path. Waits at most
-    /// `patience`; refused as [`ImageRefusal::Plug`], by what refused it.
-    fn plug(
-        &self,
-        member: &MemberName,
-        host: &std::path::Path,
-        at: &str,
-        read_only: bool,
-        patience: Duration,
-    ) -> Result<(), ImageRefusal>;
-    /// What is plugged in at `at` let go of: unmounted in its member, refused while anything
-    /// there uses it ([`PlugRefusal::Busy`]), then taken off the microVM.
+    /// `plug.source` plugged into the running run's members `plug.to` as the run goes (D235,
+    /// D271), in its running microVM in place (no image built, no template saved, no guest
+    /// restarted): a host directory, or a volume of its home's store. Each member is given it
+    /// at `plug.at`, absolute and strictly beneath one of the run's plug roots, which its host
+    /// names as it starts (its OS's own, the top-level directory of each of its shares, and
+    /// those its spec grants, [`ImageSpec::plug_roots`]), so that a project is plugged at its
+    /// host path and a session's volumes beneath a root granted for them; each member its own
+    /// device, read-only where asked. The plug grants nothing beyond its own path. A member
+    /// that is files alone is refused ([`PlugRefusal::Member`]), as is one plugged at `at`
+    /// already; a plug that one member refuses is let go of by those it was given to first.
+    /// Waits at most `patience`; refused as [`ImageRefusal::Plug`], by what refused it.
+    fn plug(&self, plug: &Plug, patience: Duration) -> Result<(), ImageRefusal>;
+    /// What is plugged in at `at` let go of, in each member it was plugged into: unmounted
+    /// there, then taken off the microVM. Refused while anything in a member uses it
+    /// ([`PlugRefusal::Busy`], naming the members whose plug stays); those of other members
+    /// nothing used are let go of all the same, so that an unplug asked again finishes it.
     fn unplug(&self, at: &str, patience: Duration) -> Result<(), ImageRefusal>;
     /// The run's microVM saved whole and left running (D176, D259): its memory, its vCPUs'
     /// and devices' state, its run's swap and its writable layer, as the daemon's `save vm`
@@ -626,6 +753,26 @@ pub trait ImageGuest: Send + Sync {
     /// nowhere else, and its owner's to remove. Waits at most `patience`; refused as
     /// [`ImageRefusal::Save`], by what refused it: a path not UTF-8 as [`ImageRefusal::Spec`].
     fn save(&self, to: &std::path::Path, patience: Duration) -> Result<(), ImageRefusal>;
+    /// The run's microVM paused where it is (D267): every vCPU held out of its guest by its
+    /// VMM, as `shards pause vm` holds one, so that its guest runs no CPU and its host's use
+    /// of it grows by its VMM's own alone; its memory, devices and connections kept, each
+    /// channel buffered within its flow control. Asks are applied in the order sent. It is held
+    /// at once, nothing of it asked of its guest, which may be slow or hung: an ask of its guest
+    /// already under way is answered as it goes on. While paused, an ask its guest would answer
+    /// is refused at once, [`ImageRefusal::Paused`] (`room`, `resize`, `plug`, `unplug`, `stats`
+    /// of its command or a member); the run's stats, its rate, a save, a stop and every wait are
+    /// answered as ever, its stats' guest lines what its init last said before the pause
+    /// ([`Stats::paused`]). Its guest's clocks run on through it (no snapshot is taken), and its
+    /// init sets its clock to its host's as it goes on. A pause of a paused run is done already,
+    /// so that a caller that lost an answer may ask again. Answers its paused time as it stands
+    /// then, waiting at most `patience` (`Duration::MAX`: until it is done or the run ends);
+    /// refused [`ImageRefusal::Pause`] where its VM held nothing, and [`ImageRefusal::Ended`]
+    /// once the run has ended.
+    fn pause(&self, patience: Duration) -> Result<Paused, ImageRefusal>;
+    /// A paused run goes on where it stopped (D267), its vCPUs held no more but by their rate;
+    /// a resume of a running run is done already. Answers its paused time as it stands then,
+    /// the pause ended in its total; waiting and refused as [`pause`](Self::pause) is.
+    fn resume(&self, patience: Duration) -> Result<Paused, ImageRefusal>;
     /// Ends it at once: its VM's process is killed, and [`wait_for`](Self::wait_for) then
     /// returns [`RunEnd::Stopped`], or the end the run had come to before: its command's, or
     /// its host's failure, in its words, as `wait_for` saw it. Returns released, as a boot's
@@ -709,9 +856,12 @@ impl Images for ImageShards {
 /// the daemon's warm VMs wait for theirs. A pool is the runs of one microVM, alike in all but
 /// their members' stages, deadline and control ask ([`wire::Request::exemplar`]); each keeps
 /// the largest burst of its runs within one refill window while in use, at least one, and
-/// none once idle past its keep-alive (`shards_api::demand`, the daemon's own rule). Nothing
-/// is warm until a pool's first run, which starts a host of its own, as [`ImageShards`]
-/// would. Dropping it ends every warm host.
+/// none once idle past its keep-alive (`shards_api::demand`, the daemon's own rule), each of
+/// its hosts charged to the orchestrator's [`WarmRoom`] before it starts. A size a spec
+/// leaves to `shards run` (`0`) is resolved as its run host would give it, so the spec pools
+/// as one naming that size; a run that asks its GPU report is no pool's. Nothing is warm until a
+/// pool's first run, which starts a host of its own, as [`ImageShards`] would. Dropping it
+/// ends every warm host, each followed to its end and its room given back, before it returns.
 #[derive(Debug)]
 pub struct ImagePools(pool::Pooling<session::ShardsHosts>);
 
@@ -720,10 +870,60 @@ impl ImagePools {
     /// minutes (Shahrad et al., "Serverless in the Wild", USENIX ATC 2020, §1).
     pub const KEEP: Duration = crate::demand::KEEP;
 
-    /// Pools that all together keep at most `most` warm run hosts, the orchestrator's bound,
-    /// each pool keeping its hosts `keep` once idle ([`KEEP`](Self::KEEP) is D26's).
-    pub fn new(most: usize, keep: Duration) -> Result<ImagePools, ImageRefusal> {
-        Ok(ImagePools(pool::Pooling::new(session::ShardsHosts, most, keep)?))
+    /// Pools whose every warm host is charged to `room` before it starts and given back to it
+    /// once ([`WarmRoom`]), each pool keeping its hosts `keep` once idle ([`KEEP`](Self::KEEP)
+    /// is D26's).
+    pub fn new(room: impl WarmRoom, keep: Duration) -> Result<ImagePools, ImageRefusal> {
+        Ok(ImagePools(pool::Pooling::new(session::ShardsHosts, room, keep)?))
+    }
+
+    /// Ends the coldest warm hosts (of the pools wanting fewest, then the longest idle), then
+    /// those starting, until at least `memory` bytes of them are freed or none is left; never
+    /// a reserved one. Returns once their processes have ended, each one's room given
+    /// ([`Gave::Ended`]), with what was freed.
+    pub fn release(&self, memory: u64) -> Result<Released, ImageRefusal> {
+        self.0.release(memory)
+    }
+
+    /// What each pool holds of its room now.
+    pub fn held(&self) -> Vec<PoolHeld> {
+        self.0.held()
+    }
+
+    /// Holds one warm host of `spec`'s pool for one box, at once and without waiting; None if
+    /// none is warm (or `spec` is no pool's, or is refused, as its boot will say). Its room is
+    /// given here ([`Gave::Taken`]), so its owner moves the charge to the box in the same step.
+    pub fn reserve(&self, spec: &ImageSpec) -> Option<WarmTicket> {
+        let request = request(spec).ok()?;
+        self.0.reserve(spec, &request).map(WarmTicket)
+    }
+}
+
+/// One warm host held for one box ([`ImagePools::reserve`]), its room the box's. Dropped
+/// unused, it goes back to its pool under a claim of its own, or ends where that is refused,
+/// with no give for its first claim, whose room went to its box.
+pub struct WarmTicket(pool::Ticket<session::ShardsHosts>);
+
+impl std::fmt::Debug for WarmTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarmTicket").finish_non_exhaustive()
+    }
+}
+
+impl WarmTicket {
+    /// Boots on the reserved host, as [`Images::boot_stoppable`] does. A spec of another pool
+    /// is refused, typed ([`ImageRefusal::OtherPool`]).
+    pub fn boot(
+        self,
+        spec: &ImageSpec,
+        patience: Duration,
+        stop: &BootStop,
+    ) -> Result<Box<dyn ImageGuest>, ImageRefusal> {
+        if stop.is_stopped() {
+            return Err(ImageRefusal::Ended(not_started()));
+        }
+        let request = request(spec)?;
+        self.0.boot(spec, &request, patience, stop)
     }
 }
 
@@ -859,6 +1059,35 @@ fn upstream_roots(roots: &[UpstreamRoot]) -> Result<Vec<Vec<u8>>, ImageRefusal> 
             .map_err(|e| refuse(format!("the certificate at {i}: {e}")))?;
     }
     Ok(ders)
+}
+
+/// The plug roots a spec grants (D271), each a root its guest takes (`plug::root_name`: one
+/// top-level directory, none of init's own) and each once; refused by field otherwise.
+fn plug_roots(roots: &[String]) -> Result<Vec<String>, ImageRefusal> {
+    let mut granted: Vec<String> = Vec::with_capacity(roots.len());
+    for root in roots {
+        if shards_abi::run::plug::root_name(root.as_bytes()).is_none() {
+            return Err(ImageRefusal::Spec {
+                what: "a plug root",
+                why: format!(
+                    "{root:?}: a plug root is one top-level directory (`/session`), none of {}",
+                    shards_abi::run::plug::REFUSED
+                        .iter()
+                        .map(|r| format!("/{}", String::from_utf8_lossy(r)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        if granted.contains(root) {
+            return Err(ImageRefusal::Spec {
+                what: "a plug root",
+                why: format!("{root:?}: granted twice"),
+            });
+        }
+        granted.push(root.clone());
+    }
+    Ok(granted)
 }
 
 /// `spec` as the run host reads it, refused here where it could never be run: a member's
@@ -1101,6 +1330,7 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
         sign_ins,
         upstream_roots,
         gpu_report: spec.gpu_report,
+        plug_roots: plug_roots(&spec.plug_roots)?,
     };
     // Past the channel's bound it would never be read; the guest's bound is the same one.
     request.encode().map_err(|e| ImageRefusal::Spec {
@@ -1155,6 +1385,7 @@ mod tests {
             gpu_devices: Vec::new(),
             sign_ins: Vec::new(),
             upstream_roots: Vec::new(),
+            plug_roots: Vec::new(),
             gpu_report: None,
         }
     }
@@ -1561,6 +1792,52 @@ mod tests {
         s.members[0].stdin = true;
         assert!(request(&s).unwrap().members[0].input);
         assert!(!request(&spec()).unwrap().members[0].input);
+    }
+
+    /// D271: the plug roots a spec grants ride its request as granted, each a top-level
+    /// directory of the members' view; one that is relative, nested, one of init's own or
+    /// granted twice is refused by field before any run host starts, as the guest would refuse
+    /// it; and they are none of a warm pool's microVM, which runs of other roots share.
+    #[test]
+    fn a_specs_plug_roots_are_top_level_directories_granted_once() {
+        let mut s = spec();
+        s.plug_roots = vec!["/session".into(), "/data".into()];
+        let r = request(&s).unwrap();
+        assert_eq!(r.plug_roots, s.plug_roots);
+        assert_eq!(wire::Request::decode(&r.encode().unwrap()).unwrap(), r);
+        assert!(r.exemplar().plug_roots.is_empty());
+        for wrong in [
+            "session",
+            "/",
+            "/session/a",
+            "/session/",
+            "/..",
+            "/tmp",
+            "/run",
+            "/proc",
+        ] {
+            let mut s = spec();
+            s.plug_roots = vec![wrong.into()];
+            assert!(
+                matches!(
+                    request(&s),
+                    Err(ImageRefusal::Spec {
+                        what: "a plug root",
+                        ..
+                    })
+                ),
+                "{wrong:?} was granted"
+            );
+        }
+        let mut twice = spec();
+        twice.plug_roots = vec!["/session".into(), "/session".into()];
+        assert!(matches!(
+            request(&twice),
+            Err(ImageRefusal::Spec {
+                what: "a plug root",
+                ..
+            })
+        ));
     }
 
     /// A spec past the channel's bound is refused before the run host starts: a file's bytes,

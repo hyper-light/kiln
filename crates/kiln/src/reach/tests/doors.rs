@@ -534,6 +534,18 @@ fn p5_1_running_an_agent_definition_starts_its_session_in_its_agentfiles_microvm
         anyhow::ensure!(info.get("kind") == Some(&json!("claude")) && info.get("model") == Some(&json!(model)), "its harness and model: {info}");
         anyhow::ensure!(info.pointer("/isolation/kind") == Some(&json!("microvm")) && info.pointer("/isolation/image") == Some(&json!(agentfile)), "in its Agentfile's microVM: {info}");
         anyhow::ensure!(info.get("target") == Some(&json!("agent:linux")), "placed where microVMs start: {info}");
+        // kiln plan 01a1dd2e…, P5.2's page: the session says the definition and version it started from, and the
+        // definition lists it, where it runs and on which engine; a new version leaves it behind. Taking the run's
+        // `Ask::definition` out lists nothing and says no definition.
+        anyhow::ensure!(got.get("definition") == Some(&json!({"id": id, "version": 1, "name": "reviewer", "current": 1})), "its definition: {got}");
+        let listed = op("agentdefs.sessions", json!({"id": id})).await.map_err(failed)?;
+        anyhow::ensure!(
+            listed.pointer("/sessions/0/id") == Some(&json!(agent)) && listed.pointer("/sessions/0/version") == Some(&json!(1)) && listed.pointer("/sessions/0/runner") == Some(&json!("linux")) && listed.pointer("/sessions/0/engine") == Some(&json!("microvm")),
+            "its definition's sessions: {listed}"
+        );
+        op("agentdefs.update", json!({"id": id, "base": 1, "instructions": "Review the diff twice."})).await.map_err(failed)?;
+        let got = op("agents.get", json!({"agent": agent})).await.map_err(failed)?;
+        anyhow::ensure!(got.pointer("/definition/version") == Some(&json!(1)) && got.pointer("/definition/current") == Some(&json!(2)), "behind its definition: {got}");
         drop(stop);
         anyhow::Ok(())
     })

@@ -213,6 +213,7 @@ impl Managed for Record {
                 ns: vec![steady.at(asked + half).1; 16],
                 asked,
                 answered,
+                charged: hex_api::Charged::ToThread,
             });
         }
         Ok(self
@@ -1344,6 +1345,7 @@ fn w14_a_capping_node_learns_an_image_vm_through_its_run() {
         resident_bytes: held,
         guest_ns: vec![each_ns; usize::try_from(vcpus).unwrap()],
         window: std::time::Duration::ZERO,
+        charged: hex_api::Charged::ToThread,
     };
     io.host
         .borrow_mut()
@@ -1470,6 +1472,7 @@ fn w14_an_answer_carries_each_learned_vms_holding_an_image_vms_too() {
             resident_bytes: GIB,
             guest_ns: vec![0; 16],
             window: std::time::Duration::ZERO,
+            charged: hex_api::Charged::ToThread,
         },
     );
     let records = vec![vm("vm-1", 1), image_vm("img-1", 2)];
@@ -1598,6 +1601,7 @@ fn unused(io: &Record, name: &str, held: u64) {
             resident_bytes: held,
             guest_ns: vec![0; 16],
             window: Duration::ZERO,
+            charged: hex_api::Charged::ToThread,
         },
     );
 }
@@ -1805,6 +1809,7 @@ impl hex_api::Runtime for Images {
             resident_bytes: GIB,
             guest_ns: Vec::new(),
             window: Duration::ZERO,
+            charged: hex_api::Charged::ToThread,
         })
     }
 }
@@ -1839,6 +1844,7 @@ impl crate::recorded::Recover for Images {
             resident_bytes: GIB,
             guest_ns: Vec::new(),
             window: self.node_vm_rate_period(run)?.unwrap_or_default(),
+            charged: hex_api::Charged::ToThread,
         })
     }
     fn node_vm_rate_period(&self, run: hex_api::NodeRun) -> Result<Option<Duration>, Refusal> {
@@ -2206,6 +2212,7 @@ fn sixteen(each_ns: u64) -> ManagedGuestTime {
         ns: vec![each_ns; 16],
         asked: at,
         answered: at,
+        charged: hex_api::Charged::ToThread,
     }
 }
 
@@ -2433,6 +2440,7 @@ fn w14_d260_an_image_vms_governor_takes_its_share_less_its_vmms_own() {
         resident_bytes: GIB,
         guest_ns: vec![each_ns; 16],
         window,
+        charged: hex_api::Charged::ToThread,
     };
     io.host.borrow_mut().insert(
         "img-1".to_owned(),
@@ -3106,6 +3114,7 @@ fn w39_a_node_vms_guest_is_told_its_room_as_an_image_vms_is() {
         resident_bytes: bytes,
         guest_ns: vec![each_ns; 16],
         window: Duration::ZERO,
+        charged: hex_api::Charged::ToThread,
     };
     io.host
         .borrow_mut()
@@ -4136,5 +4145,32 @@ fn reads2_a_windows_reads_read_no_record_file_at_10_100_and_1000() {
             read, 0,
             "at {n} records and rows, a window's reads read {read} files"
         );
+    }
+}
+
+/// Shards' D265 (AC-T7.4.1): a VM whose hypervisor runs its vCPUs apart from its process's threads (WHP's classic and
+/// core schedulers, every Windows Server's) counts its vCPUs' guest time beside its process's CPU, never in it. Do:
+/// split one window's 900 ms of the VM process's CPU beside 600 ms of its vCPUs' guest time, as each charge says.
+/// Expect: where its threads hold their guest time, its own the whole less theirs (300 ms) and its total the whole
+/// (900 ms); where they ran apart, or its process hasn't told, its own the whole (900 ms) and its total the whole and
+/// theirs (1500 ms): a VM is never charged less than it ran.
+#[test]
+fn d265_a_vm_whose_vcpus_run_apart_is_charged_its_whole_cpu_and_theirs_beside() {
+    let ms = |n: u64| n * 1_000_000;
+    let (now, before) = ([ms(400), ms(200)], [0u64, 0]);
+    for (charged, own, total) in [
+        (hex_api::Charged::ToThread, ms(300), ms(900)),
+        (hex_api::Charged::Apart, ms(900), ms(1500)),
+        (hex_api::Charged::Unknown, ms(900), ms(1500)),
+    ] {
+        let cpu = ran(ms(900), Some(&now), Some(&before), charged).unwrap();
+        let Cpu::Split { guest, own: split } = &cpu else {
+            panic!("{charged:?}: a whole reading {cpu:?}");
+        };
+        assert_eq!(split.as_nanos(), u128::from(own), "{charged:?}: its own");
+        let sum = guest
+            .iter()
+            .fold(split.as_nanos(), |sum, vcpu| sum + vcpu.as_nanos());
+        assert_eq!(sum, u128::from(total), "{charged:?}: its total");
     }
 }

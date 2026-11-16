@@ -1,7 +1,7 @@
 import type { OlderPage, SessionStore } from "@/api/harness";
 import { survivingPosition, type RowPosition } from "./row-window";
 
-type RestoreStore = Pick<SessionStore, "get" | "event" | "loadOlder" | "cancelOlder">;
+type RestoreStore = Pick<SessionStore, "get" | "event" | "loadOlder" | "cancelOlder" | "filled">;
 /** A place restored reads the most the server gives at once (api.rs `conversation_events_for`), so one far back is a read
  * or two rather than one per hundred events (plan 01a1cc09, step 3). */
 const RESTORE_PAGE: OlderPage = { limit: 1000, bytes: 1024 * 1024 };
@@ -31,6 +31,13 @@ export async function restoreCanonicalPlace(store: RestoreStore, position: RowPo
     if (!snapshot.ready || (cursor !== undefined && history?.cursor !== cursor)) return { type: "error", message: "The conversation changed. Retry restoring your place." };
     if (store.event(position.id)) return { type: "found", position };
     if (!history) return { type: "error", message: "Earlier history is unavailable. Retry or go to the latest messages." };
+    // What's held is its window's first part: the place may be in the rest of the window, which follows by itself.
+    if (history.filling) {
+      await Promise.race([store.filled(), new Promise<void>((done) => signal.addEventListener("abort", () => done(), { once: true }))]);
+      if (signal.aborted) return { type: "cancelled" };
+      await yieldFrame(signal);
+      continue;
+    }
     const covered = !history.hasMore || (position.seq !== undefined && history.before !== null && history.before <= position.seq);
     if (covered) {
       const neighbor = survivingPosition(position, (id) => store.event(id) !== undefined);

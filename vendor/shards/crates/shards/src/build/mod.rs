@@ -49,6 +49,7 @@ pub mod gc;
 mod gha;
 mod git;
 mod give;
+mod grant;
 pub(crate) mod http;
 mod live;
 pub(crate) mod multi;
@@ -173,6 +174,36 @@ pub fn build(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
 }
 
+/// Whether this process's build tells its progress to shards-api (D263): set once, by
+/// [`for_api`], before its one build runs.
+static API_EVENTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The build `shards api-build` runs for shards-api (D263): `argv`, buildx's flags as
+/// `shards build image` takes them, read and run as that command's are (`run`), its progress
+/// told as events in place of a display, and its build cache collected after, as theirs is.
+/// It names no image to the daemon (`publish_built`): a build for an orchestrator reaches
+/// no daemon.
+pub(crate) fn for_api(argv: &[String]) -> Result<(), String> {
+    let parsed = match flags::parse(&BUILD, PATH, argv, &buildflags::validate) {
+        Outcome::Run(parsed) => parsed,
+        Outcome::Help { .. } => return Err("a build's flags asked for help".into()),
+        Outcome::Fail { text, .. } => return Err(text),
+    };
+    API_EVENTS.store(true, std::sync::atomic::Ordering::Relaxed);
+    let status = std::cell::Cell::new(0u8);
+    let built = run(&parsed, &status);
+    if let Ok(home) = shards_ipc::home()
+        && let Ok(store) = crate::pull::store(&home)
+        && let Err(e) = gc::after_build(&home, &store)
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "WARNING: the build cache was not collected: {e}"
+        );
+    }
+    built
+}
+
 /// What the build read of stdin (`-` as the context or the Dockerfile), once for every
 /// platform's build: a file in the home's `tmp`, removed when the build ends, its size, its
 /// digest, and its first 1024 bytes, which tell an archive from a Dockerfile.
@@ -253,6 +284,9 @@ struct Progress {
     /// What follows the recap: the warnings, then the excerpt of the Dockerfile where the
     /// failing step comes from, as buildx prints them before its error (D108).
     epilogue: RefCell<String>,
+    /// Each step's progress told as shards-api's events on stdout, in place of a display: a
+    /// build `shards api-build` runs (D263).
+    events: bool,
 }
 
 impl Progress {
@@ -266,8 +300,27 @@ impl Progress {
             recapped: std::cell::Cell::new(false),
             current: std::cell::Cell::new(0),
             epilogue: RefCell::new(String::new()),
+            events: false,
         }
     }
+
+    /// `event` told to shards-api, where this build's progress goes there (D263): a frame on
+    /// stdout, which carries nothing else in such a build. A client gone ends the build with
+    /// its group (`shards_api::Builds`), so a write it refuses is let go of.
+    fn tell(&self, event: shards_api::BuildEvent) {
+        if !self.events {
+            return;
+        }
+        if let Ok(frame) = shards_api::builds::wire::event(&event) {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&frame).and_then(|()| out.flush());
+        }
+    }
+}
+
+/// A step's number as shards-api tells it: no build has more steps than a u32 counts.
+fn told_index(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX)
 }
 
 /// A step's name, last lines and whether it failed.
@@ -325,6 +378,10 @@ impl Progress {
         if let Some(live) = &self.live {
             live.borrow_mut().start(name);
         }
+        self.tell(shards_api::BuildEvent::Step {
+            index: told_index(self.next),
+            name: name.to_string(),
+        });
         self.to(self.next);
         Vertex {
             index: self.next,
@@ -362,6 +419,10 @@ impl Progress {
         if let Some(live) = &self.live {
             live.borrow_mut().line(v.index, text);
         }
+        self.tell(shards_api::BuildEvent::Line {
+            index: told_index(v.index),
+            text: text.to_string(),
+        });
         self.to(v.index);
         self.say(&format!("#{} {text}\n", v.index));
     }
@@ -390,6 +451,10 @@ impl Progress {
         if let Some(step) = self.steps.borrow_mut().get_mut(&index) {
             step.0 = name.to_string();
         }
+        self.tell(shards_api::BuildEvent::Step {
+            index: told_index(index),
+            name: name.to_string(),
+        });
         self.resume(index, name)
     }
 
@@ -409,6 +474,10 @@ impl Progress {
             if let Some(live) = &self.live {
                 live.borrow_mut().line(v.index, line);
             }
+            self.tell(shards_api::BuildEvent::Line {
+                index: told_index(v.index),
+                text: line.to_string(),
+            });
             self.say(&format!("#{} {secs:.places$} {line}\n", v.index));
             self.remember(v.index, &format!("{secs:.places$} {line}"));
         }
@@ -452,6 +521,10 @@ impl Progress {
         if let Some(live) = &self.live {
             live.borrow_mut().done(v.index);
         }
+        self.tell(shards_api::BuildEvent::Ended {
+            index: told_index(v.index),
+            how: shards_api::StepEnd::Done,
+        });
         let secs = v.started.elapsed().as_secs_f64();
         self.ended(v);
         self.say(&format!("#{} DONE {secs:.1}s\n", v.index));
@@ -464,6 +537,10 @@ impl Progress {
         if let Some(live) = &self.live {
             live.borrow_mut().error(v.index, message);
         }
+        self.tell(shards_api::BuildEvent::Ended {
+            index: told_index(v.index),
+            how: shards_api::StepEnd::Failed(message.to_string()),
+        });
         self.ended(v);
         self.say(&format!("#{} ERROR: {message}\n", v.index));
     }
@@ -473,6 +550,10 @@ impl Progress {
         if let Some(live) = &self.live {
             live.borrow_mut().cached(v.index);
         }
+        self.tell(shards_api::BuildEvent::Ended {
+            index: told_index(v.index),
+            how: shards_api::StepEnd::Cached,
+        });
         self.ended(v);
         self.say(&format!("#{} CACHED\n", v.index));
     }
@@ -483,6 +564,10 @@ impl Progress {
             live.borrow_mut().canceled(v.index);
             live.borrow_mut().leave();
         }
+        self.tell(shards_api::BuildEvent::Ended {
+            index: told_index(v.index),
+            how: shards_api::StepEnd::Canceled,
+        });
         self.ended(v);
         self.say(&format!("#{} CANCELED\n", v.index));
     }
@@ -1499,7 +1584,7 @@ impl Bases<'_> {
                 offset,
             }))
         } else if id.starts_with(b"http://") || id.starts_with(b"https://") {
-            let made = self.http_time(id, op.attrs.get(b"http.checksum".as_slice()).map(Vec::as_slice))?;
+            let made = self.http_time(id, &op.attrs)?;
             Ok(made.map(|(secs, nanos)| plan::Epoch {
                 secs,
                 nanos,
@@ -1514,17 +1599,21 @@ impl Bases<'_> {
 
     /// When an HTTP source was made: its Last-Modified where nothing pins its bytes, else
     /// the newest regular file of the archive it is (none where it is no archive).
-    fn http_time(&self, url: &[u8], checksum: Option<&[u8]>) -> Result<Option<(i64, u32)>, String> {
+    fn http_time(
+        &self,
+        url: &[u8],
+        attrs: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<Option<(i64, u32)>, String> {
         let limits = crate::pull::limits()?;
         // Removed, with what it holds, once the time is known.
         let stage = self.store.stage().map_err(|e| e.to_string())?;
-        let checksum = checksum.map(show);
-        let fetched = http::fetch_now(
-            &show(url),
-            checksum.as_deref(),
-            stage.path().join("source"),
-            &limits,
-        )?;
+        let checksum = attrs.get(b"http.checksum".as_slice()).map(|c| show(c));
+        let source = http::Source::Url {
+            url: show(url),
+            checksum: checksum.clone(),
+            reach: http::Reach::of(&show(url), attrs, self.secrets)?,
+        };
+        let fetched = http::fetch_source(source, stage.path().join("source"), &limits)?;
         if checksum.is_none()
             && let Some(t) = fetched.last_modified
         {
@@ -1988,7 +2077,17 @@ impl policy::Resolve for PolicyMeta<'_, '_> {
             // BuildKit resolves an HTTP source's metadata by fetching it: its digest.
             let limits = crate::pull::limits()?;
             let stage = self.bases.store.stage().map_err(|e| e.to_string())?;
-            let fetched = http::fetch_now(&source.identifier, None, stage.path().join("source"), &limits)?;
+            let attrs = source
+                .attrs
+                .iter()
+                .map(|(k, v)| (k.clone().into_bytes(), v.clone().into_bytes()))
+                .collect();
+            let fetch = http::Source::Url {
+                url: source.identifier.clone(),
+                checksum: None,
+                reach: http::Reach::of(&source.identifier, &attrs, self.bases.secrets)?,
+            };
+            let fetched = http::fetch_source(fetch, stage.path().join("source"), &limits)?;
             // A ChecksumRequest: the content, then the suffix, hashed as asked.
             let signature_checksum = match &request.http_checksum {
                 None => None,
@@ -2488,6 +2587,11 @@ fn stored_at(path: &Path) -> Option<Time> {
 }
 
 /// An HTTP source's identifier: its URL.
+/// Whether a source is an S3 object's (D54).
+fn is_s3(identifier: &[u8]) -> bool {
+    identifier.starts_with(b"s3://")
+}
+
 fn is_http(identifier: &[u8]) -> bool {
     identifier.starts_with(b"https://") || identifier.starts_with(b"http://")
 }
@@ -2959,7 +3063,9 @@ fn run(parsed: &Parsed, status: &std::cell::Cell<u8>) -> Result<(), String> {
         "rawjson" => return Err("--progress=rawjson is not supported by shards yet".into()),
         other => return Err(format!("invalid progress mode {other:?}")),
     };
-    let quiet = parsed.bool("quiet") || mode == "quiet";
+    // A build for shards-api tells its progress as events, and shows no display (D263).
+    let events = API_EVENTS.load(std::sync::atomic::Ordering::Relaxed);
+    let quiet = parsed.bool("quiet") || mode == "quiet" || events;
     let host = host_platform();
     let progress = RefCell::new(Progress {
         quiet,
@@ -2975,6 +3081,7 @@ fn run(parsed: &Parsed, status: &std::cell::Cell<u8>) -> Result<(), String> {
         recapped: std::cell::Cell::new(false),
         current: std::cell::Cell::new(0),
         epilogue: RefCell::new(String::new()),
+        events,
     });
     // Said once of a build of several platforms, not again by each platform's.
     if !multi::active() {
@@ -3612,23 +3719,28 @@ fn run(parsed: &Parsed, status: &std::cell::Cell<u8>) -> Result<(), String> {
     }
     // Every HTTP source is fetched from the start, as BuildKit's solver fetches them (D33); a
     // step waits only for the one it reads.
-    let sources: Vec<(usize, String, Option<String>)> = def
-        .ops
-        .iter()
-        .enumerate()
-        .filter_map(|(i, op)| match &op.kind {
+    let mut sources: Vec<(usize, http::Source)> = Vec::new();
+    for (i, op) in def.ops.iter().enumerate() {
+        match &op.kind {
             OpKind::Source { identifier, attrs }
                 if is_http(identifier) && !given.iter().any(|g| g.identifier == *identifier) =>
             {
-                Some((
+                let url = show(identifier);
+                sources.push((
                     i,
-                    show(identifier),
-                    attrs.get(b"http.checksum".as_slice()).map(|c| show(c)),
-                ))
+                    http::Source::Url {
+                        reach: http::Reach::of(&url, attrs, &secrets)?,
+                        url,
+                        checksum: attrs.get(b"http.checksum".as_slice()).map(|c| show(c)),
+                    },
+                ));
             }
-            _ => None,
-        })
-        .collect();
+            OpKind::Source { identifier, attrs } if is_s3(identifier) => {
+                sources.push((i, http::Source::S3(s3::Object::of(identifier, attrs, &secrets)?)));
+            }
+            _ => {}
+        }
+    }
     let dir = if sources.is_empty() {
         PathBuf::new()
     } else {
@@ -3998,7 +4110,7 @@ fn run(parsed: &Parsed, status: &std::cell::Cell<u8>) -> Result<(), String> {
                 progress.borrow().done(&v);
                 vec![r]
             }
-            OpKind::Source { identifier, attrs } if is_http(identifier) => {
+            OpKind::Source { identifier, attrs } if is_http(identifier) || is_s3(identifier) => {
                 let v = progress.borrow_mut().start(&name);
                 let download = match downloads.take(i) {
                     Ok(d) => d,
@@ -4015,11 +4127,21 @@ fn run(parsed: &Parsed, status: &std::cell::Cell<u8>) -> Result<(), String> {
                 };
                 let file = attrs
                     .get(b"http.filename".as_slice())
+                    .or_else(|| attrs.get(b"s3.filename".as_slice()))
                     .ok_or_else(|| fail(&v, "an HTTP source without a file name"))?;
+                if let Some(signed) = &download.signed {
+                    progress
+                        .borrow()
+                        .line(&v, &format!("{}: {signed}", show(identifier)));
+                }
                 let pin = download.digest.to_string();
                 let (algorithm, hex) = pin.split_once(':').unwrap_or(("sha256", pin.as_str()));
+                let uri = match &download.served_as {
+                    Some(served) => format!("{}?{served}", show(identifier)),
+                    None => show(identifier),
+                };
                 http_materials.push(provenance::Material {
-                    uri: redact_credentials(&show(identifier)),
+                    uri: redact_credentials(&uri),
                     algorithm: algorithm.to_string(),
                     hex: hex.to_string(),
                 });
@@ -6269,6 +6391,53 @@ fn frontend_attrs(
     Ok(a)
 }
 
+/// A source the planner made: its identifier and attributes.
+#[cfg(test)]
+pub(crate) type PlannedSource = (Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>);
+
+/// The fetched sources (http(s), Git, s3) of the Agentfile `FROM alpine` and `lines`, as the
+/// planner makes them: each identifier and its attributes, in the graph's order.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn planned_sources(lines: &str) -> Vec<PlannedSource> {
+    struct Alpine;
+    impl Resolver for Alpine {
+        fn resolve(&self, name: &[u8], _: Option<&Platform>, _: &[u8]) -> Result<Resolved, Vec<u8>> {
+            Ok(Resolved {
+                reference: name.to_vec(),
+                digest: None,
+                config: br#"{"architecture":"amd64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[]}}"#.to_vec(),
+            })
+        }
+
+        fn epoch(&self, _: &EpochSource) -> Result<Option<plan::Epoch>, Vec<u8>> {
+            Ok(None)
+        }
+    }
+    let opts = Options {
+        target_platform: Platform::new("linux", "amd64"),
+        build_platforms: vec![Platform::new("linux", "amd64")],
+        dialect: shards_agentfile::parser::Dialect::Agentfile,
+        ..Default::default()
+    };
+    let built = plan::plan(format!("FROM alpine\n{lines}\n").as_bytes(), &opts, &Alpine).unwrap();
+    built
+        .graph
+        .vertices
+        .iter()
+        .filter_map(|v| match &v.kind {
+            shards_agentfile::llb::Kind::Source { identifier, attrs }
+                if [b"http://".as_slice(), b"https://", b"git://", b"s3://"]
+                    .iter()
+                    .any(|s| identifier.starts_with(s)) =>
+            {
+                Some((identifier.clone(), attrs.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// [`frontend_attrs`] of a build given `flags` alone: a named context's directory taken
 /// as one, by its name, wherever it is.
 #[cfg(test)]
@@ -7177,14 +7346,19 @@ fn solve_context(
                             size: stdin.size,
                             digest: stdin.digest.clone(),
                             last_modified: None,
+                            served_as: None,
+                            signed: None,
                         },
                         None,
                     ),
                     _ => {
                         let path = exec.stage()?.join("context");
-                        let checksum = attrs.get(b"http.checksum".as_slice()).map(|c| show(c));
-                        let d = http::fetch_now(&url, checksum.as_deref(), path, limits)
-                            .map_err(|e| failed(&v, &e))?;
+                        let source = http::Source::Url {
+                            reach: http::Reach::of(&url, attrs, secrets).map_err(|e| failed(&v, &e))?,
+                            url: url.clone(),
+                            checksum: attrs.get(b"http.checksum".as_slice()).map(|c| show(c)),
+                        };
+                        let d = http::fetch_source(source, path, limits).map_err(|e| failed(&v, &e))?;
                         let pin = d.digest.to_string();
                         let (algorithm, hex) = pin.split_once(':').unwrap_or(("sha256", pin.as_str()));
                         let m = provenance::Material {

@@ -1365,7 +1365,9 @@ mod tests {
         assert!(deps(&g, Ecosystem::Cargo, "kiln").contains(&"kiln-ci"));
         let ci = hit(&g, Ecosystem::Cargo, &["crates/kiln-ci/src/work/graph.rs"]);
         assert!(ci.contains(&"kiln-ci".to_owned()) && ci.contains(&"kiln".to_owned()), "{ci:?}");
-        assert!(!ci.contains(&"kiln-seams".to_owned()), "{ci:?}");
+        // kiln-seams depends on kiln-ci (R12's `Negotiated` is `kiln_ci::facts`'), so it's hit with
+        // it; kiln-http depends on neither, and isn't.
+        assert!(ci.contains(&"kiln-seams".to_owned()) && !ci.contains(&"kiln-http".to_owned()), "{ci:?}");
         assert_eq!(hit(&g, Ecosystem::Cargo, &["docs/ci.md", ".kiln/ci.yaml"]), Vec::<String>::new());
         assert_eq!(hit(&g, Ecosystem::Cargo, &["Cargo.lock"]), crates);
         assert!(hit(&g, Ecosystem::Cargo, &["vendor/turso/core/lib.rs"]).contains(&"kiln".to_owned()));

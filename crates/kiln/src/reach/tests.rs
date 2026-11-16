@@ -86,23 +86,25 @@ async fn lab() -> anyhow::Result<Lab> {
 
 /// [`lab`], mac and linux serving their peers from these caches (docs/ci.md W24-R27).
 async fn lab_with(objects: [Option<Arc<crate::runner::work::store::Store>>; 2]) -> anyhow::Result<Lab> {
-    lab_full(objects, false, [super::wire::VERSION, super::wire::VERSION]).await
+    lab_full(objects, false, [super::wire::VERSION, super::wire::VERSION], Default::default()).await
 }
 
 /// [`lab`] with both runners saying they place (docs/needs.md E5): the directory lists the features
 /// each announces.
 async fn lab_placing() -> anyhow::Result<Lab> {
-    lab_full([None, None], true, [super::wire::VERSION, super::wire::VERSION]).await
+    lab_full([None, None], true, [super::wire::VERSION, super::wire::VERSION], Default::default()).await
 }
 
 /// [`lab_with`], mac and linux speaking these reach versions (1: a build from before, W27-R08).
 async fn lab_at(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], versions: [u32; 2]) -> anyhow::Result<Lab> {
-    lab_full(objects, false, versions).await
+    lab_full(objects, false, versions, Default::default()).await
 }
 
-async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], place: bool, versions: [u32; 2]) -> anyhow::Result<Lab> {
+/// The lab, mac's and linux's placement settings as `places` says (their budgets: docs/needs.md §6).
+async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], place: bool, versions: [u32; 2], places: [kiln_ci::place::runner::Settings; 2]) -> anyhow::Result<Lab> {
     let [mac_objects, linux_objects] = objects;
     let [mac_version, linux_version] = versions;
+    let [mac_place, linux_place] = places;
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
     let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
     let (adopt_tx, adoptions) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
@@ -123,8 +125,8 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
         root: Vec::new(),
         capacity: None,
     };
-    let (mac, mac_out) = node::start(Config { objects: mac_objects, version: mac_version, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
-    let (linux, linux_out) = node::start(Config { objects: linux_objects, version: linux_version, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
+    let (mac, mac_out) = node::start(Config { objects: mac_objects, version: mac_version, place: mac_place, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
+    let (linux, linux_out) = node::start(Config { objects: linux_objects, version: linux_version, place: linux_place, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
     let features = if place { crate::proto::feature::all() } else { Vec::new() };
     let directory = Arc::new(Mutex::new(vec![RunnerInfo { features: features.clone(), ..info("mac", mac.fingerprint()) }, RunnerInfo { features, ..info("linux", linux.fingerprint()) }]));
     // Each runner's current connection, as the server would number them.
@@ -1704,6 +1706,96 @@ fn e5_a_queued_command_waits_through_a_disconnect_and_starts_after() -> anyhow::
         assert_eq!(evs.iter().filter(|e| matches!(e, Ev::Started { .. })).count(), 1, "started once: {evs:?}");
         assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
         assert!(output(&evs, false).contains("after"), "{evs:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// A run stopped while it waits for a runner with room never starts (docs/needs.md E5; ROOT's machine
+/// runs, 2026-11-15: three stopped runs answered "collected" and ran 13 minutes later): its asker's
+/// signal gives its place up and it is told "stopped before it started"; room freeing after starts
+/// nothing of it, and nothing of it waits or is held on either runner. Without the stop heard while it
+/// waits, it waits on and starts once room frees.
+#[cfg(unix)]
+#[test]
+fn e5_a_queued_run_stopped_never_starts_and_says_so() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab_placing().await?;
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(100.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let req = RunReq { target: "cpus=2".into(), command: "echo it-ran".into(), ..RunReq::default() };
+        let (ev_tx, ev_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        let (ctl_tx, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+        let handle = lab.mac.clone();
+        crate::rt::spawn(async move { local::run(&handle, "mac", req, ev_tx, ctl_rx).await });
+        let mut evs: Vec<Ev> = Vec::new();
+        loop {
+            let e = crate::rt::timeout(HANG, ev_rx.recv()).await.map_err(|_| anyhow::anyhow!("timed out: {evs:?}"))?.map_err(|_| anyhow::anyhow!("its events ended: {evs:?}"))?;
+            let queued = matches!(&e, Ev::Placed { json } if json.contains("\"queued\""));
+            if queued && !evs.iter().any(|x| matches!(x, Ev::Placed { .. })) {
+                ctl_tx.send(local::Req::Signal(super::wire::Signal::Interrupt)).await.map_err(|_| anyhow::anyhow!("its run took no signal"))?;
+            }
+            let end = matches!(e, Ev::Exit { .. } | Ev::Error(_));
+            evs.push(e);
+            if end {
+                break;
+            }
+        }
+        let said = evs.iter().find_map(|e| if let Ev::Error(m) = e { Some(m.clone()) } else { None }).unwrap_or_default();
+        anyhow::ensure!(said.starts_with(local::STOPPED_BEFORE), "told it stopped before it started: {evs:?}");
+        anyhow::ensure!(!evs.iter().any(|e| matches!(e, Ev::Started { .. })), "it never started: {evs:?}");
+        // Room frees on linux: nothing of it starts there, and nothing of it waits or is held anywhere.
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        crate::rt::sleep(Duration::from_millis(500)).await;
+        for v in [lab.linux.place_view().await?, lab.mac.place_view().await?] {
+            anyhow::ensure!(v.get("held").cloned() == Some(serde_json::json!([0, 0, 0, 0])), "nothing held: {v}");
+            let waiting: u64 = v.get("queued").and_then(serde_json::Value::as_object).map_or(0, |q| q.values().filter_map(serde_json::Value::as_u64).sum());
+            anyhow::ensure!(waiting == 0, "nothing waits: {v}");
+        }
+        anyhow::ensure!(ev_rx.try_recv().is_err(), "nothing more was said of it");
+        anyhow::Ok(())
+    })
+}
+
+/// docs/needs.md §6: a runner whose `[runner] budget` is zero in every dimension takes no run that
+/// asks for room, however idle it is (its person's laptop; ROOT's runs, 2026-11-15): a sized ask from
+/// mac, mac full and linux idle, waits for mac and starts there, never on linux; a run naming linux
+/// (by its host name, as `on` names one) still runs on linux.
+#[cfg(unix)]
+#[test]
+fn e5_a_zero_budget_runner_takes_no_sized_run_but_one_that_names_it() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let zero = kiln_ci::place::runner::Settings { budget: Some(kiln_ci::sched::state::Resources::default()), ..kiln_ci::place::runner::Settings::default() };
+        let lab = lab_full([None, None], true, [super::wire::VERSION, super::wire::VERSION], [kiln_ci::place::runner::Settings::default(), zero]).await?;
+        lab.mac.feed(In::Sampled(reading(100.0))).await;
+        lab.linux.feed(In::Sampled(reading(0.0))).await;
+        lab.mac.directory().await?;
+        lab.linux.directory().await?;
+        let req = RunReq { target: "cpus=2".into(), command: "echo placed".into(), ..RunReq::default() };
+        let mac = lab.mac.clone();
+        let once = std::sync::atomic::AtomicBool::new(false);
+        let evs = run_from_mac(&lab, req, move |e| {
+            // Once it waits, mac has room: linux, idle all along, never took it.
+            if let Ev::Placed { json } = e
+                && json.contains("\"queued\"")
+                && !once.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let m = mac.clone();
+                crate::rt::spawn(async move { m.feed(In::Sampled(reading(0.0))).await });
+            }
+            None
+        })
+        .await?;
+        let said = answers(&evs);
+        assert!(said.first().is_some_and(|a| a.starts_with("queued")), "it waited, linux idle: {said:?} {evs:?}");
+        assert!(!said.iter().any(|a| a.contains("linux")), "never placed on linux: {said:?}");
+        assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
+        let named = RunReq { target: "linux.lan".into(), command: "echo named".into(), ..RunReq::default() };
+        let evs = run_from_mac(&lab, named, |_| None).await?;
+        assert!(evs.iter().any(|e| matches!(e, Ev::Picked { runner, .. } if runner == "linux")), "run where it was named: {evs:?}");
+        assert_eq!(exit(&evs).map(|e| e.0), Some(Some(0)), "{evs:?}");
+        assert!(output(&evs, false).contains("named"), "{evs:?}");
         anyhow::Ok(())
     })
 }

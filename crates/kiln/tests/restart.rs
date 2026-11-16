@@ -362,46 +362,88 @@ fn w05_r25_a_cancel_holds_over_a_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// W05-R25 across a restart: a run held behind its concurrency group as the server went had never
-/// started, and the rebuild brings it back with none of its legs made. Cancelled then, it ends
-/// cancelled. Before, it stayed queued whatever cancelled it: its plan waited for legs that were
-/// never made (production's runs #2758 to #2761, 2026-11-13).
+/// A run's status.
+fn status(s: &Server, run: &str) -> anyhow::Result<String> {
+    let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
+    Ok(serde_json::from_str::<Value>(&detail)?.pointer("/run/status").and_then(Value::as_str).unwrap_or_default().to_owned())
+}
+
+/// Two pushes of `.kiln/one.yaml`, whose runs go one at a time (`concurrency`, the one under way
+/// finishing): the first, its leg running, and the second, held behind it with none of its legs
+/// made. Each leg goes on until `gate` is there, and succeeds then. It never outlives its test: it
+/// fails once the folder `gate` is in is gone, or after the 300 s this suite's slow steps sleep.
+fn one_behind_another(s: &Server, tree: &Tree, gate: &Path) -> anyhow::Result<(String, String)> {
+    let folder = gate.parent().ok_or_else(|| anyhow::anyhow!("the gate is in no folder"))?;
+    let step = format!("for i in $(seq 1500); do [ -e '{}' ] && exit 0; [ -d '{}' ] || exit 1; sleep 0.2; done; exit 1", gate.display(), folder.display());
+    tree.commit(".kiln/one.yaml", &format!("on: push\nconcurrency: {{ group: one, cancel-in-progress: false }}\njobs:\n  slow:\n    runs-on: local\n    steps:\n      - run: {step}\n"))?;
+    let first = run_of(s, ".kiln/one.yaml")?;
+    until(s, 300, "the first run's leg running", || {
+        let all = legs(s, &first)?;
+        Ok((!all.iter().any(|(_, _, st, _)| st == "running")).then(|| format!("{all:?}")))
+    })?;
+    tree.commit("README.md", "again\n")?;
+    let mut second = String::new();
+    until(s, 120, "the second push's run", || {
+        second = run_of(s, ".kiln/one.yaml")?;
+        Ok((second == first).then(|| second.clone()))
+    })?;
+    anyhow::ensure!(status(s, &second)? == "queued" && legs(s, &second)?.is_empty(), "held behind the first, nothing of it made: {} {:?}", status(s, &second)?, legs(s, &second)?);
+    Ok((first, second))
+}
+
+/// The server back, its runs rebuilt: the first run's leg, lost with its runner, has its next
+/// attempt by then.
+fn rebuilt(s: &Server, first: &str) -> anyhow::Result<()> {
+    until(s, 300, "the first run's leg, lost with its runner, run again", || {
+        let all = legs(s, first)?;
+        Ok((!all.iter().any(|(_, _, _, attempt)| *attempt >= 2)).then(|| format!("{all:?}")))
+    })
+}
+
+/// W05-R25 across a restart: a run held behind its concurrency group as the server went comes back
+/// waiting there, and starts in its turn. The run under way holds the group again (the one behind
+/// it makes no leg while it goes on), and once it has finished the one behind it starts and runs to
+/// its end. Before, the rebuild took the waiting run for one that had started, so nothing ever
+/// started it: it stayed queued for good (production's runs #2758 to #2761, 2026-11-13).
+#[test]
+fn w05_r25_a_run_held_behind_its_group_over_a_restart_starts_in_its_turn() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
+    let tree = Tree::new(dir.path(), &s)?;
+    let gate = dir.path().join("gate");
+    let (first, second) = one_behind_another(&s, &tree, &gate)?;
+    s.restart()?;
+    rebuilt(&s, &first)?;
+    anyhow::ensure!(status(&s, &second)? == "queued" && legs(&s, &second)?.is_empty(), "the first holds the group again, the second still behind it: {} {:?}", status(&s, &second)?, legs(&s, &second)?);
+    // The first run's leg may end now: the first finishes, and the second has its turn.
+    std::fs::write(&gate, "")?;
+    until(&s, 300, "the second run, started in its turn, succeeded", || {
+        let now = status(&s, &second)?;
+        Ok((now != "succeeded").then(|| format!("{now}: {:?}; the first is {:?}: {:?}", legs(&s, &second), status(&s, &first), legs(&s, &first))))
+    })?;
+    assert_eq!(status(&s, &first)?, "succeeded", "the first finished before it\n{}", s.log());
+    Ok(())
+}
+
+/// W05-R25 across a restart: a run held behind its concurrency group as the server went, still
+/// behind it once the server is back, ends when it's cancelled, none of its legs ever made. Before,
+/// it stayed queued whatever cancelled it: the rebuild took it for one that had started, and its
+/// plan waited for legs that were never made (production's runs #2758 to #2761, 2026-11-13).
 #[test]
 fn w05_r25_a_run_held_behind_its_group_over_a_restart_ends_when_cancelled() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut s = start(dir.path(), &Options { agent: true, ci: "kiln_workflows = true", ..Options::default() })?;
     let tree = Tree::new(dir.path(), &s)?;
-    let status = |s: &Server, run: &str| -> anyhow::Result<String> {
-        let (_, detail) = http(s.port, "GET", &format!("/api/ci/runs/{run}"), &s.admin, None)?;
-        Ok(serde_json::from_str::<Value>(&detail)?.pointer("/run/status").and_then(Value::as_str).unwrap_or_default().to_owned())
-    };
-    // One run at a time, and the one under way finishes: the next push's waits behind it.
-    tree.commit(".kiln/one.yaml", "on: push\nconcurrency: { group: one, cancel-in-progress: false }\njobs:\n  slow:\n    runs-on: local\n    steps:\n      - run: if [ \"$KILN_ATTEMPT\" = 1 ]; then sleep 300; fi\n")?;
-    let first = run_of(&s, ".kiln/one.yaml")?;
-    until(&s, 300, "the first run's leg running", || {
-        let all = legs(&s, &first)?;
-        Ok((!all.iter().any(|(_, _, st, _)| st == "running")).then(|| format!("{all:?}")))
-    })?;
-    tree.commit("README.md", "again\n")?;
-    let mut second = String::new();
-    until(&s, 120, "the second push's run", || {
-        second = run_of(&s, ".kiln/one.yaml")?;
-        Ok((second == first).then(|| second.clone()))
-    })?;
-    anyhow::ensure!(status(&s, &second)? == "queued" && legs(&s, &second)?.is_empty(), "held behind the first, nothing of it made: {} {:?}", status(&s, &second)?, legs(&s, &second)?);
-    // The server goes while it waits. Back, it has rebuilt its runs by the time the first's leg,
-    // lost with its runner, has its next attempt.
+    let (first, second) = one_behind_another(&s, &tree, &dir.path().join("gate"))?;
     s.restart()?;
-    until(&s, 300, "the first run's leg, lost with its runner, run again", || {
-        let all = legs(&s, &first)?;
-        Ok((!all.iter().any(|(_, _, _, attempt)| *attempt >= 2)).then(|| format!("{all:?}")))
-    })?;
+    rebuilt(&s, &first)?;
     let (st, body) = http(s.port, "POST", &format!("/api/ci/runs/{second}/cancel"), &s.admin, Some(&json!({})))?;
     anyhow::ensure!((200..300).contains(&st), "cancel: {st} {body}");
     until(&s, 120, "the second run cancelled", || {
         let now = status(&s, &second)?;
         Ok((now != "cancelled").then(|| format!("{now}: {:?}", legs(&s, &second))))
     })?;
+    anyhow::ensure!(legs(&s, &second)?.is_empty(), "none of its legs was ever made: {:?}", legs(&s, &second)?);
     Ok(())
 }
 

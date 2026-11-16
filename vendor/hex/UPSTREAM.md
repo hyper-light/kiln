@@ -3,15 +3,16 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `e19198bdb451e3f0cd1d3a19de1484e887ca18be`
-  (2026-11-14), MIT (`LICENSE`): its `main`. Its Shards image class in a process that links Hex
+- **Upstream:** https://github.com/hyper-light/hex, commit `1969a423ee4d3a518f0e42b9792c6f630aeefd67`
+  (2026-11-14), MIT (`LICENSE`): its `main`. Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
+  Shards deleted the 16550 at `35e2de91e`; Hex's D261, D262), its Shards image class in a process that links Hex
   (`hex_node::images::ImageRuntime::new`, and `ImageRuntime::leasing`, made with its orchestrator's lessors), a member's
   run-time arguments (`ImageMember::args`) and the host folders it sees (`ShardsImage::shares`), a box's host use at
   its end (`Runtime::delete_with_host_use`), a member's stdio and end over its wire (`Call::Member`, 0x0017), each peer
   link's negotiated suite and group (`Call::Links` 0x0018, `Answer::Links` 0x8010), a member's MCP bridge
   (`ImageMember::mcp`, `Runtime::mcp`: each connection its harness makes to `/run/shards/mcp` a program of its caller's;
   Shards' D254) and a member's own signals on its run's agent-control endpoint (`Runtime::signal_member`,
-  `Call::MemberSignal`; Shards' D238). It pins Shards at `fa953e3c`, kiln's own, with no change of Hex's to it, and
+  `Call::MemberSignal`; Shards' D238). It pins Shards at `d993d83e`, kiln's own, with no change of Hex's to it, and
   hyper-raft at `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
   of what kiln touches: docs/shards.md).
 - **How kiln uses it:** `hex-node`, and through it Hex's runtime, client, QUIC wire, scheduler simulation, health
@@ -32,7 +33,7 @@ Each change is recorded in `vendor/patches/hex/`, applied in this order on upstr
 
 | File | Change | Why | Recorded as |
 |---|---|---|---|
-| `vendor/patches/hyper-raft/` | Hex's records of hyper-raft's changes made kiln's. Its hyper-raft and Shards pins are kiln's own (`e0613f52`, `fa953e3c`) since Hex `e19198bd`, so this change's pin parts dropped out as upstream's own | kiln holds one copy of each project, with one record of its changes, and Hex must build on it: one Shards revision serves Hex and kiln (the joint plan's step 16) | `0001-hex-builds-on-kiln-s-shards-and-hyper-raft.patch` |
+| `vendor/patches/hyper-raft/` | Hex's records of hyper-raft's changes made kiln's. Its hyper-raft and Shards pins are kiln's own (`e0613f52`, `d993d83e`) since Hex `414aa30d`, so this change's pin parts dropped out as upstream's own | kiln holds one copy of each project, with one record of its changes, and Hex must build on it: one Shards revision serves Hex and kiln (the joint plan's step 16) | `0001-hex-builds-on-kiln-s-shards-and-hyper-raft.patch` |
 | `crates/hex-sim/src/lib.rs`, `crates/hex-gpu/src/nvml.rs`, `crates/hex-gpu/src/adl.rs`, `crates/hex-gpu/src/amd.rs` | the files Hex includes by path (hyper-swim's `coordinates.rs`, cuda-rust's loader, all-smi's AMD readers) named at kiln's copies (`vendor/hyper-raft`, `vendor/cuda-rust`, `vendor/all-smi`) | kiln's copy leaves Hex's own copies of them out | `0002-files-hex-includes-by-path-from-kiln-s-copies.patch` |
 | `vendor/MANIFEST.toml` | its `shards-gpu` entry left out | it names the GPU renderer build Hex's `scripts/shards-gpu/build.sh` makes, which Hex compiles nothing of and kiln's copy holds nothing of; kiln carries no GPU VM process (docs/shards.md) | `0003-no-gpu-renderer-build-of-hex-s-in-kiln-s-copy.patch` |
 | `crates/hex-runtime/Cargo.toml`, `crates/hex-client/Cargo.toml`, `crates/hex-node/Cargo.toml` | their path dependencies on Shards' crates (`shards-abi`, `shards-remote`, `shards-ipc`, `shards-afunix`, `shards-testdir`) named at kiln's copy (`vendor/shards`) | kiln's copy leaves Hex's own copy of Shards out, and a path dependency can't be patched | `0004-hex-s-path-dependencies-on-shards-crates-from-kiln-s-copy.patch` |

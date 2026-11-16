@@ -16,7 +16,10 @@
 //! as an owner probes it, and by the server over what each runner says, for placement and the runners
 //! API alike. So a session that needs a microVM is placed only on a `microvm` runner, and the start of
 //! one that asks for none only on a `host` one ([`super::lineage`]). A switch takes nothing running away:
-//! the sessions of the engine it had finish there ([`view`]'s `draining`), and new sessions take the new.
+//! the sessions of the engine it had finish there ([`view`]'s `draining`, each listed), and new sessions take
+//! the new. While they drain (ROOT's decision 8 of the design): "End them now" ends each ([`end_draining`]),
+//! and the switch can be cancelled ([`cancel`]), its engine set back to what its owner had set before, so
+//! they're on its engine again. What it had is kept with the setting ([`Kept::switched`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -190,6 +193,34 @@ pub fn here() -> Asked {
 
 pub(crate) const KEY_PREFIX: &str = "runner_engine/";
 
+/// A change of what its owner set for a runner's engine (decision 8: a switch drains, and can be
+/// cancelled while it does): what was set before (`from`; none: what the runner can do), what it was
+/// set to (`to`), and when (Unix ms). Kept on the server alone, with the setting ([`Kept`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Switch {
+    #[serde(default)]
+    pub from: Option<Engine>,
+    #[serde(default)]
+    pub to: Option<Engine>,
+    pub at: i64,
+}
+
+/// What the server keeps for a runner's engine (`kv`, [`KEY_PREFIX`]): the setting its runner is sent
+/// ([`Asked`]) and the latest switch of it. Read as an `Asked` alone ([`Engines::load`]), the switch is
+/// passed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Kept {
+    #[serde(flatten)]
+    pub asked: Asked,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switched: Option<Switch>,
+}
+
+/// What the server keeps for `runner`'s engine: none where nothing was set, or it can't be read.
+async fn kept_for(hub: &Hub, runner: &str) -> Option<Kept> {
+    serde_json::from_str(&hub.store.kv_get(format!("{KEY_PREFIX}{runner}")).await.ok()??).ok()
+}
+
 pub type Answer = Result<Response, (StatusCode, String)>;
 
 fn fail(code: StatusCode, msg: impl Into<String>) -> (StatusCode, String) {
@@ -295,18 +326,56 @@ async fn known(hub: &Hub, name: &str) -> bool {
     hub.agents.load().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
 }
 
-/// How many of `sessions` (a runner's) run on `engine`, and how many on the other: those whose harness
-/// still runs (not exited or crashed).
-fn counted(sessions: &[crate::harness::session::Info], engine: Engine) -> (usize, usize) {
+/// Of `sessions` (a runner's), those whose harness still runs (not exited or crashed) on `engine`, and
+/// those on the other, which drain: they finish there.
+fn split(sessions: &[crate::harness::session::Info], engine: Engine) -> (Vec<&crate::harness::session::Info>, Vec<&crate::harness::session::Info>) {
     use crate::harness::model::Status;
-    let running = sessions.iter().filter(|i| !matches!(i.status, Status::Exited | Status::Crashed));
-    let (on, other): (Vec<_>, Vec<_>) = running.partition(|i| i.isolation.is_some() == (engine == Engine::Microvm));
-    (on.len(), other.len())
+    sessions.iter().filter(|i| !matches!(i.status, Status::Exited | Status::Crashed)).partition(|i| i.isolation.is_some() == (engine == Engine::Microvm))
+}
+
+/// The engine runner `name` holds now, as the server has its facts: none before they've come.
+fn held_now(hub: &Hub, name: &str) -> Option<Held> {
+    let facts = hub.agents.load().get(name).and_then(|a| a.facts.as_deref().cloned())?;
+    Some(held(hub.engines.asked(name), &capable(&facts)))
+}
+
+/// The sessions of runner `name` that drain (they run on the engine it doesn't hold: [`split`]),
+/// each before the agent that started it where both drain, so ending them in order ends none before
+/// what it started.
+fn draining_of(hub: &Hub, name: &str) -> Vec<crate::harness::session::Info> {
+    let Some(h) = held_now(hub, name) else { return Vec::new() };
+    let target = format!("agent:{name}");
+    let sessions: Vec<_> = hub.harness.list().into_iter().filter(|i| i.target == target).collect();
+    let (_, draining) = split(&sessions, h.engine);
+    let mut out: Vec<crate::harness::session::Info> = Vec::with_capacity(draining.len());
+    let all = hub.harness.list();
+    for i in draining {
+        // The agents it started that drain too come before it (the deepest first).
+        let mut kids = super::lineage::descendants(&all, &i.id);
+        kids.reverse();
+        for k in kids {
+            if !out.iter().any(|o| o.id == k.id) && k.target == target && !matches!(k.status, crate::harness::model::Status::Exited | crate::harness::model::Status::Crashed) && k.isolation.is_some() != (h.engine == Engine::Microvm) {
+                out.push(k);
+            }
+        }
+        if !out.iter().any(|o| o.id == i.id) {
+            out.push(i.clone());
+        }
+    }
+    out
+}
+
+/// A draining session as the view lists it: its id and name, its harness, how it stands (as
+/// `agents.list`'s `stand`), the engine it runs on and when it was made (Unix ms).
+fn drained(i: &crate::harness::session::Info) -> Value {
+    json!({"id": i.id, "name": i.name, "kind": i.kind, "state": super::wait::stand(i), "engine": if i.isolation.is_some() { Engine::Microvm } else { Engine::Host }, "created_at": i.created_at})
 }
 
 /// `GET /api/runners/:name/engine` (and what `PUT` answers): the engine it holds, where that comes
 /// from and why, what its owner set, whether it can hold microVMs now and why not, its isolation facts,
-/// and its sessions on each engine (`draining`: those of the other engine, which finish there).
+/// and its sessions on each engine (`draining`: how many of the other engine, which finish there, and
+/// `draining_sessions`, each of them); with the switch they drain for (`switch`: what was set before,
+/// what it was set to, and when), while any drains.
 pub async fn view(hub: &Hub, name: &str) -> Value {
     let asked = hub.engines.asked(name);
     let facts = hub.agents.load().get(name).and_then(|a| a.facts.as_deref().cloned());
@@ -319,7 +388,12 @@ pub async fn view(hub: &Hub, name: &str) -> Value {
     };
     let target = format!("agent:{name}");
     let sessions: Vec<_> = hub.harness.list().into_iter().filter(|i| i.target == target).collect();
-    let (on, draining) = held.as_ref().map_or((0, 0), |h| counted(&sessions, h.engine));
+    let (on, draining) = held.as_ref().map_or((0, 0), |h| {
+        let (on, other) = split(&sessions, h.engine);
+        (on.len(), other.len())
+    });
+    let listed: Vec<Value> = if draining == 0 { Vec::new() } else { draining_of(hub, name).iter().map(drained).collect() };
+    let switch = if draining == 0 { None } else { kept_for(hub, name).await.and_then(|k| k.switched).filter(|s| s.to == asked.engine) };
     json!({
         "runner": name,
         "engine": held.as_ref().map(|h| h.engine),
@@ -332,6 +406,8 @@ pub async fn view(hub: &Hub, name: &str) -> Value {
         "virt": facts.as_ref().map(|f| json!({"microvm": f.virt.microvm, "kvm": f.virt.kvm, "hvf": f.virt.hvf})),
         "sessions": on,
         "draining": draining,
+        "draining_sessions": listed,
+        "switch": switch,
     })
 }
 
@@ -390,9 +466,12 @@ pub async fn set(hub: &Hub, name: &str, body: &Value, by: &str) -> Result<Value,
         }
     }
     // The one before's plus one: a start decided under the setting before is refused by the runner.
-    let version = hub.engines.asked(name).version.checked_add(1).ok_or_else(|| fail(StatusCode::CONFLICT, format!("{name}'s engine was set as many times as a setting's version counts")))?;
+    let before = hub.engines.asked(name);
+    let version = before.version.checked_add(1).ok_or_else(|| fail(StatusCode::CONFLICT, format!("{name}'s engine was set as many times as a setting's version counts")))?;
     let asked = Asked { version, ..asked };
-    let json = serde_json::to_string(&asked).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // A change of it is a switch, kept for its drain to be cancelled; the same set again keeps the one before.
+    let switched = if asked.engine == before.engine { kept_for(hub, name).await.and_then(|k| k.switched) } else { Some(Switch { from: before.engine, to: asked.engine, at: crate::util::now_ms() }) };
+    let json = serde_json::to_string(&Kept { asked, switched }).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     hub.store.kv_set(format!("{KEY_PREFIX}{name}"), json).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     hub.engines.inner.update(|g| {
         g.insert(name.to_owned(), asked);
@@ -401,6 +480,49 @@ pub async fn set(hub: &Hub, name: &str, body: &Value, by: &str) -> Result<Value,
     hub.store.audit(by.to_owned(), "runner_engine.update".into(), format!("{name}: {said}")).await;
     push(hub, name).await;
     Ok(view(hub, name).await)
+}
+
+/// "End them now" (decision 8): runner `name`'s sessions that drain ([`draining_of`]) ended now, each
+/// after the agents it started, rather than waiting for each to finish on the engine it had, as `by`
+/// asks. The view after it, with those it ended (`ended`): each its runner closed, or kiln forgot as its
+/// runner couldn't say (it drops them as it comes back). One its runner keeps (its archive or restore
+/// under way) stays among those draining.
+pub async fn end_draining(hub: &Hub, name: &str, by: &str) -> Result<Value, (StatusCode, String)> {
+    if !known(hub, name).await {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no runner named {name}")));
+    }
+    let mut ended: Vec<String> = Vec::new();
+    for s in draining_of(hub, name) {
+        super::about::ended(&s.id);
+        if super::ops::end(hub, &s.id, by).await || hub.harness.info(&s.id).is_none() {
+            ended.push(s.id);
+        }
+    }
+    hub.store.audit(by.to_owned(), "runner_engine.end_draining".into(), format!("{name}: {} ended ({})", ended.len(), ended.join(", "))).await;
+    let mut v = view(hub, name).await;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("ended".into(), json!(ended));
+    }
+    Ok(v)
+}
+
+/// A switch of runner `name`'s engine cancelled while what it drains still runs (decision 8): its engine
+/// set back to what its owner had set before the switch, as `by` asks, so those sessions are on its
+/// engine again (a setting of its own, its version the next). Refused where it wasn't switched, or
+/// nothing drains (the switch is done: set its engine instead). The view after it.
+pub async fn cancel(hub: &Hub, name: &str, by: &str) -> Result<Value, (StatusCode, String)> {
+    if !known(hub, name).await {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no runner named {name}")));
+    }
+    let asked = hub.engines.asked(name);
+    let Some(s) = kept_for(hub, name).await.and_then(|k| k.switched).filter(|s| s.to == asked.engine) else {
+        return Err(fail(StatusCode::CONFLICT, format!("{}'s engine wasn't switched: set it instead", hub.shown(name))));
+    };
+    if draining_of(hub, name).is_empty() {
+        let to = s.to.map_or_else(|| "what it can do".to_owned(), |e| e.to_string());
+        return Err(fail(StatusCode::CONFLICT, format!("nothing of {} drains: its switch to {to} is done, so set its engine instead", hub.shown(name))));
+    }
+    set(hub, name, &json!({"engine": s.from}), by).await
 }
 
 #[cfg(test)]
@@ -481,6 +603,73 @@ mod tests {
         for bad in [json!({}), json!({"engin": "host"}), json!({"engine": "docker"}), json!({"engine": 1}), json!({"engine": "host", "x": 1}), json!(["host"])] {
             assert!(asked_of(&bad).is_err(), "{bad} was taken");
         }
+    }
+
+    /// Decision 8 of the design (ROOT's rulings: "Draining waits for each session to end, with an explicit End them
+    /// now press"), through the operations as REST, MCP and code mode call them, on a runner that holds microVMs
+    /// (`linux`) running two sessions in them, one started by the other: nothing drains, so `cancel` is refused and
+    /// "End them now" ends nothing. Switched to `host`, both drain, each listed (`draining_sessions`, the child first)
+    /// with the switch they drain for; cancelled, its engine is what it was (what it can do: `microvm`), a setting of
+    /// its own, and nothing drains. Switched again, "End them now" ends both, the child before its parent, and as
+    /// their runner says each closed, nothing drains and no session is left. A runner kiln doesn't know is 404 to
+    /// both. Taking the switch out of what `set` keeps refuses the cancel; ending them parent first fails the order.
+    #[test]
+    fn d8_a_switch_lists_what_drains_ends_it_on_ask_and_is_cancelled_while_it_drains() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::registry::Location;
+        use crate::harness::session::{Info, Isolation as Boundary};
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            crate::hub::tests::join_runner(&hub, 2, "linux", crate::proto::CAP_WIRE);
+            let mut f = facts(Some(able()));
+            overlay(&mut f, Asked::default());
+            hub.put_agent(crate::hub::AgentLive { facts: Some(Box::new(f)), ..crate::hub::tests::live_runner("linux", "linux", "x86_64") });
+            let there = Location::Machine("linux".into());
+            for (id, parent) in [("vm-lead", None), ("vm-child", Some("vm-lead"))] {
+                let info = Info { id: id.into(), kind: "claude".into(), name: id.into(), target: "agent:linux".into(), status: crate::harness::model::Status::Idle, isolation: Some(Boundary::microvm()), parent: parent.map(str::to_owned), ..Default::default() };
+                hub.harness.ingest(&there, id, Update::Open { info: Box::new(info), since: None }).await;
+            }
+            let op = |name: &'static str, input: Value| crate::ops::call(crate::ops::Cx { hub: std::sync::Arc::clone(&hub), caller: crate::authz::Caller::owner() }, name, input);
+            let ids = |v: &Value, k: &str| -> Vec<String> { v.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.get("id").or(Some(s)).and_then(Value::as_str)).map(str::to_owned).collect() };
+            let linux = json!({"runner": "linux"});
+
+            // Nothing drains: no switch to cancel, nothing to end.
+            let v = op("runners.engine", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+            anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("sessions") == Some(&json!(2)) && v.get("draining") == Some(&json!(0)) && v.get("draining_sessions") == Some(&json!([])) && v.get("switch") == Some(&Value::Null), "{v}");
+            let refused = op("runners.engine.cancel", linux.clone()).await.err().ok_or_else(|| anyhow::anyhow!("a cancel with no switch went"))?;
+            anyhow::ensure!(refused.0 == StatusCode::CONFLICT && refused.1.contains("wasn't switched"), "{refused:?}");
+            let v = op("runners.engine.end_draining", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+            anyhow::ensure!(v.get("ended") == Some(&json!([])) && v.get("sessions") == Some(&json!(2)), "nothing ended: {v}");
+
+            // Switched to host: both drain, listed, the agent it started before the one that started it.
+            let v = op("runners.engine.set", json!({"runner": "linux", "engine": "host"})).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+            anyhow::ensure!(v.get("engine") == Some(&json!("host")) && v.get("draining") == Some(&json!(2)) && ids(&v, "draining_sessions") == ["vm-child", "vm-lead"], "{v}");
+            anyhow::ensure!(v.pointer("/draining_sessions/0/engine") == Some(&json!("microvm")) && v.pointer("/switch/from") == Some(&Value::Null) && v.pointer("/switch/to") == Some(&json!("host")) && v.pointer("/switch/at").is_some_and(Value::is_i64), "{v}");
+
+            // Cancelled: its engine as it was, a setting of its own, and nothing drains.
+            let v = op("runners.engine.cancel", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+            anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("from") == Some(&json!("default")) && v.get("asked") == Some(&Value::Null) && v.get("version") == Some(&json!(2)), "{v}");
+            anyhow::ensure!(v.get("draining") == Some(&json!(0)) && v.get("sessions") == Some(&json!(2)) && v.get("switch") == Some(&Value::Null), "{v}");
+            let refused = op("runners.engine.cancel", linux.clone()).await.err().ok_or_else(|| anyhow::anyhow!("a second cancel went"))?;
+            anyhow::ensure!(refused.0 == StatusCode::CONFLICT && refused.1.contains("nothing of"), "{refused:?}");
+
+            // Switched again, then "End them now": both ended, the child first; as their runner says each closed,
+            // nothing drains and none is left.
+            op("runners.engine.set", json!({"runner": "linux", "engine": "host"})).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+            let v = op("runners.engine.end_draining", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+            anyhow::ensure!(v.get("ended") == Some(&json!(["vm-child", "vm-lead"])), "{v}");
+            for id in ["vm-child", "vm-lead"] {
+                hub.harness.ingest(&there, id, Update::Closed).await;
+            }
+            let v = op("runners.engine", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+            anyhow::ensure!(v.get("draining") == Some(&json!(0)) && v.get("sessions") == Some(&json!(0)) && v.get("draining_sessions") == Some(&json!([])), "{v}");
+
+            for name in ["runners.engine.end_draining", "runners.engine.cancel"] {
+                let refused = op(name, json!({"runner": "nobody"})).await.err().ok_or_else(|| anyhow::anyhow!("{name} on no runner went"))?;
+                anyhow::ensure!(refused.0 == StatusCode::NOT_FOUND, "{name}: {refused:?}");
+            }
+            anyhow::Ok(())
+        })
     }
 
     /// What was set on the server is kept on the machine for its restarts, and goes once nothing is.

@@ -694,7 +694,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "runners.engine",
-            summary: "How a runner runs new agent sessions, its engine: `host` (each a process on the machine, no microVM) or `microvm` (each in a Shards microVM of its own, through Hex); where that comes from (its owner set it, or what the runner can do: `microvm` where it can hold microVMs, else `host`) and why; whether it can hold microVMs now and why not; its isolation facts; and how many of its sessions run on its engine and how many on the other, which finish there (`draining`).",
+            summary: "How a runner runs new agent sessions, its engine: `host` (each a process on the machine, no microVM) or `microvm` (each in a Shards microVM of its own, through Hex); where that comes from (its owner set it, or what the runner can do: `microvm` where it can hold microVMs, else `host`) and why; whether it can hold microVMs now and why not; its isolation facts; and how many of its sessions run on its engine and how many on the other, which finish there (`draining`), each of those listed (`draining_sessions`: id, name, harness, state, engine), with the switch they drain for while any does (`switch`: `from`, `to`, `at`).",
             read_only: true,
             destructive: false,
             input: Input::of::<input::RunnersEngine>(),
@@ -714,6 +714,24 @@ pub fn list_ops() -> Vec<Op> {
                     crate::harness::engine::set(&cx.hub, &runner_of(&v)?, &body, &cx.caller.name).await
                 })
             },
+        },
+        Op {
+            name: "runners.engine.end_draining",
+            summary: "End now the agent sessions a runner's engine switch drains (those still on the engine it had: runners.engine's `draining_sessions`), each after the agents it started, rather than waiting for each to finish there. Answers runners.engine's view after it, with those it ended (`ended`). Destructive: an agent's call waits for its person's click.",
+            read_only: false,
+            destructive: true,
+            input: Input::of::<input::RunnersEngineEndDraining>(),
+            route: |v| Ok((Method::POST, path(&["api", "runners", &runner_of(v)?, "engine", "end"]))),
+            run: |cx, v| Box::pin(async move { crate::harness::engine::end_draining(&cx.hub, &runner_of(&v)?, &cx.caller.name).await }),
+        },
+        Op {
+            name: "runners.engine.cancel",
+            summary: "Cancel a runner's engine switch while what it drains still runs: its engine set back to what its owner had set before the switch (runners.engine's `switch.from`), so those sessions are on its engine again. Refused where it wasn't switched, or nothing drains (the switch is done: runners.engine.set it instead). Answers runners.engine's view after it.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::RunnersEngineCancel>(),
+            route: |v| Ok((Method::POST, path(&["api", "runners", &runner_of(v)?, "engine", "cancel"]))),
+            run: |cx, v| Box::pin(async move { crate::harness::engine::cancel(&cx.hub, &runner_of(&v)?, &cx.caller.name).await }),
         },
         Op {
             name: "updates.list",
@@ -817,6 +835,20 @@ pub mod input {
         pub runner: String,
         /// `host` or `microvm`; null for what the runner can do.
         pub engine: Option<RunnerEngine>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct RunnersEngineEndDraining {
+        /// The runner (machine) by name, as Runners lists it.
+        pub runner: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct RunnersEngineCancel {
+        /// The runner (machine) by name, as Runners lists it.
+        pub runner: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

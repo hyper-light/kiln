@@ -9,7 +9,7 @@ import { useNavigate } from "@/lib/router";
 import { create } from "zustand";
 import { Activity, ArrowUpRight, Bot, Box, CornerDownLeft, Cpu, FolderSync, GitBranch, LayoutGrid, ListTree, LogOut, Play, Rocket, Search, Server, Settings, SquareTerminal } from "lucide-react";
 import { api } from "@/api/client";
-import type { Agent, Repo, Run } from "@/api/types";
+import type { LeanAgent, Repo, Run } from "@/api/types";
 import { StatusDot } from "@/components/ui/status";
 import { sendingProps, useAction } from "@/lib/action";
 import { noteLabels, shownName } from "@/lib/data";
@@ -20,7 +20,7 @@ interface PaletteState {
   open: boolean;
   repos: Repo[];
   runs: Run[];
-  agents: Agent[];
+  agents: LeanAgent[];
 }
 
 /** Shared by the header's Search button, the hotkey and the palette itself. */

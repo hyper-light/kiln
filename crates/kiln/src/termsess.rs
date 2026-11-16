@@ -160,12 +160,33 @@ fn unpack(size: u32) -> (u16, u16) {
 
 /// What a client gets when it attaches.
 pub struct Attachment {
+    /// For a viewer that asked to be shown the session's screen ahead of its replay
+    /// ([`Session::attach_screen_first`], W21-R02): where in the replay the part that draws it is to be
+    /// found ([`Ahead::part`]). None where none goes: a viewer that didn't ask, a full-screen program.
+    pub ahead: Option<Ahead>,
     /// Bytes that bring a fresh terminal to the session's current state.
     pub replay: Vec<u8>,
     /// Everything after the replay.
     pub live: crate::memory::ring::Subscription<Frame>,
     /// Set when the session had already ended.
     pub ended: Option<(Option<i32>, Option<String>)>,
+}
+
+/// A shell's replay as its part is looked for: where in it the session's output is (after the reset it
+/// begins with, before the modes it ends with), and the height of the terminal that draws it.
+pub struct Ahead {
+    output: std::ops::Range<usize>,
+    rows: u16,
+}
+
+impl Ahead {
+    /// The newest part of `replay` (the one this came with), where it has one that stands alone and is
+    /// worth sending ahead (`crate::termpart`): drawn on a fresh terminal of the session's size, it's the
+    /// screen the whole replay ends on. It reads the replay through, a millisecond of a full backlog:
+    /// off a shard.
+    pub fn part(self, replay: &[u8]) -> Option<Vec<u8>> {
+        crate::termpart::ahead(replay, self.output, self.rows)
+    }
 }
 
 impl Session {
@@ -326,11 +347,26 @@ impl Session {
 
     /// Join the session: the replay that reproduces its current state, then live output.
     pub fn attach(&self) -> Attachment {
+        self.join(false)
+    }
+
+    /// [`Session::attach`], for a viewer that draws the session's screen ahead of its replay (W21-R02):
+    /// a shell's replay is its backlog, up to [`BACKLOG_BYTES`], and its screen is drawn by the newest
+    /// part of that ([`Ahead::part`]: docs/wire.md, "A terminal's screen first"). The replay is the one
+    /// [`Session::attach`] gives, and a viewer that draws it on a terminal it has reset shows what it
+    /// would have shown without the part. A full-screen program's replay is its screen already: no
+    /// part is looked for.
+    pub fn attach_screen_first(&self) -> Attachment {
+        self.join(true)
+    }
+
+    fn join(&self, screen_first: bool) -> Attachment {
         let st = self.state.lock();
         self.attached.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.touch();
         let screen = st.screen.screen();
-        let mut replay = b"\x1b[0m".to_vec();
+        let mut replay = crate::termpart::RESET.to_vec();
+        let mut ahead = None;
         if screen.alternate_screen() {
             // A full-screen program owns the display: repaint it from the emulator.
             replay.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
@@ -345,12 +381,14 @@ impl Session {
             {
                 bytes.drain(..=nl);
             }
+            let output = replay.len()..replay.len().saturating_add(bytes.len());
             replay.extend(bytes);
             replay.extend(screen.input_mode_formatted());
+            ahead = screen_first.then_some(Ahead { output, rows: st.rows });
         }
         let ended = self.ended().map(|e| (e.code, e.error));
         let live = self.out.subscribe();
-        Attachment { replay, live, ended }
+        Attachment { ahead, replay, live, ended }
     }
 
     pub fn detach(&self) {
@@ -909,6 +947,97 @@ mod tests {
         assert_eq!(s.info().attached, 2);
         s.detach();
         assert_eq!(s.info().attached, 1);
+    }
+
+    /// What a terminal of `rows` by `cols` shows once it has drawn `bytes`: every cell and its colours, the
+    /// cursor, and the modes its input goes by.
+    fn drawn(bytes: &[u8], rows: u16, cols: u16) -> Vec<u8> {
+        let mut term = vt100::Parser::new(rows, cols, 0);
+        term.process(bytes);
+        term.screen().state_formatted()
+    }
+
+    /// A shell's output of `lines` lines: coloured ones, ones longer than the terminal is wide, wide
+    /// characters, a tab, a progress bar drawn over itself on its line; then a prompt being typed at.
+    fn shell_output(lines: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 0..lines {
+            out.extend(match i % 5 {
+                0 => format!("\x1b[32m   Compiling\x1b[0m crate-{i} v0.{i}.0\r\n"),
+                1 => format!("line {i}: {}\r\n", "the retry loop reads the header and sleeps for what it says. ".repeat(3)),
+                2 => format!("\x1b[1;38;5;208mwarning\x1b[0m: 名前 {i} is never read \x1b[2m(dim)\x1b[0m\r\n"),
+                3 => format!("building {i} [=>  ]\r\x1b[K\x1b[48;2;10;40;20;38;2;10;200;120mbuilt {i}\x1b[0m\r\n"),
+                _ => format!("\x1b[7m {i} \x1b[0m\x1b[4munderlined\x1b[24m\ttabbed\r\n"),
+            }
+            .into_bytes());
+        }
+        out.extend_from_slice(b"\x1b[?2004h\x1b[1;34m~/kiln\x1b[0m $ cargo te");
+        out
+    }
+
+    /// W21-R02: the part a viewer is sent ahead of a shell's replay is the replay's own newest lines, a
+    /// screen of them, which draw the screen the replay ends on; whether the session's backlog still holds
+    /// all it has said or has let its oldest go. And the replay is the one a viewer that didn't ask is sent.
+    #[test]
+    fn w21_r02_the_newest_part_of_a_shells_replay_draws_the_screen_it_ends_on() {
+        for (lines, trimmed) in [(400, false), (6000, true)] {
+            let (s, _input) = Session::new("local".into(), None, 80, 24);
+            let said = shell_output(lines);
+            // As a shell's output comes: in pieces that end anywhere.
+            for piece in said.chunks(1021) {
+                feed(&s, piece);
+            }
+            assert_eq!(said.len() > BACKLOG_BYTES, trimmed, "{} bytes said", said.len());
+            let asked = s.attach_screen_first();
+            let part = asked.ahead.and_then(|ahead| ahead.part(&asked.replay)).unwrap_or_default();
+            assert!(!part.is_empty(), "{lines} lines: no part of a replay of {} bytes", asked.replay.len());
+            assert_eq!(drawn(&part, 24, 80), drawn(&asked.replay, 24, 80), "{lines} lines: the part doesn't draw the screen the replay ends on");
+            // Its bytes are the replay's last, after the reset and where it puts the cursor: the last row.
+            let ends = part.strip_prefix(b"\x1b[0m\x1b[24;1H".as_slice()).unwrap_or_default();
+            assert!(asked.replay.ends_with(ends) && String::from_utf8_lossy(ends).contains("~/kiln\x1b[0m $ cargo te"), "{lines} lines: {}", String::from_utf8_lossy(&part));
+            // A screen of lines, however much the session has said.
+            assert_eq!(ends.iter().filter(|b| **b == b'\n').count(), 24, "{lines} lines");
+            assert_eq!(s.attach().replay, asked.replay, "{lines} lines: the replay behind a part is the replay");
+            assert!(s.attach().ahead.is_none(), "a viewer that didn't ask is sent no part");
+        }
+    }
+
+    /// W21-R02: no part goes ahead of a replay it wouldn't gain on (one short beside it), of a full-screen
+    /// program's, which is its screen already, or of one whose latest lines don't stand alone (a display
+    /// that redraws the lines above its last).
+    #[test]
+    fn w21_r02_no_part_goes_ahead_where_it_gains_nothing_or_doesnt_stand_alone() {
+        let part = |s: &Session| {
+            let asked = s.attach_screen_first();
+            asked.ahead.and_then(|ahead| ahead.part(&asked.replay))
+        };
+        let (s, _input) = Session::new("local".into(), None, 80, 24);
+        feed(&s, b"$ echo hi\r\nhi\r\n$ ");
+        assert_eq!(part(&s), None, "a replay of a few lines");
+        // Said line by line until a part goes ahead: from then its replay is more than twice the part.
+        let mut ahead = None;
+        for i in 0..200 {
+            feed(&s, format!("line {i} of a build's output, as long as a line of one is\r\n").as_bytes());
+            let replay = s.attach().replay.len();
+            match part(&s) {
+                Some(part) => {
+                    assert!(replay - part.len() > part.len(), "line {i}: a part of {} bytes ahead of a replay of {replay}", part.len());
+                    ahead.get_or_insert(i);
+                }
+                None => assert!(ahead.is_none(), "line {i}: no part of a replay longer than one that had it"),
+            }
+        }
+        assert!(ahead.is_some_and(|i| i > 24), "a part went ahead from line {ahead:?}");
+        // Lines redrawn above the last, as a pull's progress is: none of them stands alone.
+        let (redrawn, _input) = Session::new("local".into(), None, 80, 24);
+        for i in 0..400 {
+            feed(&redrawn, format!("pulling layer {i}\r\n\x1b[1A\x1b[2Kpulled layer {i}\r\n").as_bytes());
+        }
+        assert_eq!(part(&redrawn), None);
+        // A full-screen program: its replay is its screen.
+        feed(&s, b"\x1b[?1049h\x1b[H\x1b[2JTOP 1\r\nload 0.5");
+        let full = s.attach_screen_first();
+        assert!(full.ahead.is_none() && full.replay.starts_with(b"\x1b[0m\x1b[?1049h"));
     }
 
     /// Goal 3, plan 01a1a59c2a8e step 5: a relay asks for one replay a gap, sets the output aside until

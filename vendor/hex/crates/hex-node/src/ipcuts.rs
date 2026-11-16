@@ -106,6 +106,15 @@ impl IpcUtsPool {
         Ok(self.shared.pool().map_err(Refusal::from)?.bound())
     }
 
+    /// Whether its refill thread has ended, by the thread's own handle (none started is ended): a test's party for the
+    /// facts that thread makes, never read off the thread's name, which a new thread takes only as it first runs.
+    #[cfg(test)]
+    pub(crate) fn refill_ended(&self) -> bool {
+        self.refill
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
     /// What the pool has done. Counted at the take, so a create that fails after it took a pair, or found the
     /// pool dry, is counted all the same.
     pub fn counts(&self) -> Result<Counts, Refusal> {

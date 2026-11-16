@@ -90,9 +90,10 @@ impl Windows {
         self.at(rate)
     }
 
-    /// Whether a census at one rate may find another window: the Mac's cycle, which the rate sets. A governor holds
-    /// every rate over its one period, and each guest's own answer is held to the census's window
-    /// ([`super::seam::Driver::governed_window`]).
+    /// Whether a census at one rate may find another window: the Mac's cycle, which the rate sets. A governor's
+    /// window is one guest's answer at the envelope's rate, which every boot of the census is read at; each guest is
+    /// read from its hold on at its own governor's answer ([`super::seam::Driver::hold`]), which may differ from it
+    /// (Shards' D191: each VM process's own g).
     pub fn depends_on_rate(&self) -> bool {
         match self {
             #[cfg(any(target_os = "linux", test))]
@@ -112,10 +113,20 @@ pub struct Tick<R> {
     pub reading: R,
 }
 
-/// A ready guest's readings: its CPU's at each window boundary, and what it held, read apart.
+/// A ready guest's readings: its CPU's at each window boundary, and what it held, read apart; and, where its own
+/// governor holds it, where its CPU's readings at that governor's period began.
 pub struct Readings {
     pub cpu: Vec<Tick<Use>>,
     pub holdings: Vec<Tick<Holding>>,
+    pub own: Option<Own>,
+}
+
+/// A guest's own windows: from its CPU's first reading after its hold, `at` after its VMM's launch, each `window` long,
+/// the period its own governor answered as it was held ([`super::seam::Driver::hold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Own {
+    pub at: Duration,
+    pub window: Duration,
 }
 
 /// What the census tells a sampling thread.
@@ -123,6 +134,9 @@ pub struct Readings {
 enum Told {
     /// Read through this window boundary, then end.
     Until(u32),
+    /// The guest is held by its own governor over `window`: from the next reading on, read at each `window`
+    /// boundary after it, through the `last`, then end.
+    Own { window: Duration, last: u32 },
     /// End now: the guest was not ready, or its measure failed.
     Abandon,
 }
@@ -182,46 +196,69 @@ impl Clock {
     }
 }
 
+/// A sampling thread's readings, and where it began reading at its guest's own governor's period, if it was told one.
+struct Sampled<R> {
+    ticks: Vec<Tick<R>>,
+    own: Option<Own>,
+}
+
 /// Reads `probe` at each `window` boundary after `began` (the VMM's launch) through the one it is told,
 /// taking the census's words at each boundary. Each reading is stamped as it starts; a boundary passed while
 /// this thread read or was held up is passed over, so a window is longer after a stall, never shorter, and
-/// the next is the next boundary to come.
+/// the next is the next boundary to come. Told its guest's own window, it reads at once, and from that reading on
+/// at each boundary of that window after it.
 fn sample<P: Probe>(
     mut probe: P,
     began: Instant,
     window: Duration,
     told: &mpsc::Receiver<Told>,
-) -> Result<Vec<Tick<P::Reading>>, String> {
+) -> Result<Sampled<P::Reading>, String> {
     let mut clock = Clock::new()?;
-    let mut ticks = Vec::new();
+    let mut sampled = Sampled {
+        ticks: Vec::new(),
+        own: None,
+    };
+    let (mut base, mut window) = (began, window);
     let mut last = None;
     let mut next: u32 = 1;
+    let mut held = None;
     loop {
         let due = window
             .checked_mul(next)
-            .and_then(|span| began.checked_add(span))
+            .and_then(|span| base.checked_add(span))
             .ok_or("a window boundary overflows the clock")?;
         clock.until(due, window)?;
         loop {
             match told.try_recv() {
                 Ok(Told::Until(until)) => last = Some(until),
-                Ok(Told::Abandon) | Err(TryRecvError::Disconnected) => return Ok(ticks),
+                Ok(Told::Own {
+                    window: own,
+                    last: until,
+                }) => held = Some((own, until)),
+                Ok(Told::Abandon) | Err(TryRecvError::Disconnected) => return Ok(sampled),
                 Err(TryRecvError::Empty) => break,
             }
         }
-        if last.is_some_and(|last| next > last) {
+        if held.is_none() && last.is_some_and(|last| next > last) {
             probe.verify()?;
-            return Ok(ticks);
+            return Ok(sampled);
         }
-        let at = began.elapsed();
+        let now = Instant::now();
+        let at = now.saturating_duration_since(began);
         let reading = probe.read()?;
-        ticks.push(Tick { at, reading });
-        let passed = u32::try_from(began.elapsed().as_nanos() / window.as_nanos())
+        sampled.ticks.push(Tick { at, reading });
+        if let Some((own, until)) = held.take() {
+            // Its own windows begin at this reading: the first of its CPU read once its governor held it.
+            (base, window, next, last) = (now, own, 1, Some(until));
+            sampled.own = Some(Own { at, window: own });
+            continue;
+        }
+        let passed = u32::try_from(base.elapsed().as_nanos() / window.as_nanos())
             .map_err(|_| "a guest outlasts the windows a count holds".to_owned())?;
         next = next.max(passed).saturating_add(1);
         if last.is_some_and(|last| next > last) {
             probe.verify()?;
-            return Ok(ticks);
+            return Ok(sampled);
         }
     }
 }
@@ -229,7 +266,7 @@ fn sample<P: Probe>(
 /// A sampling thread of `probe` from `began`, told through the returned sender.
 type Sampler<R> = (
     mpsc::Sender<Told>,
-    std::thread::JoinHandle<Result<Vec<Tick<R>>, String>>,
+    std::thread::JoinHandle<Result<Sampled<R>, String>>,
 );
 
 fn sampler<P: Probe>(
@@ -246,7 +283,7 @@ fn sampler<P: Probe>(
 }
 
 /// Its readings, once its thread ends.
-fn joined<R>(sampler: Sampler<R>) -> Result<Vec<Tick<R>>, String> {
+fn joined<R>(sampler: Sampler<R>) -> Result<Sampled<R>, String> {
     let (tell, thread) = sampler;
     let ticks = thread
         .join()
@@ -266,6 +303,16 @@ fn hold_end(ready: Duration, window: Duration) -> Result<u32, String> {
         .map_err(|_| "a hold outlasts the windows a count holds".to_owned())
 }
 
+/// The boundary a guest held by its own governor ends its idle hold on, counted from its first reading at that
+/// governor's period: held as long as its boot took and at least one whole window of its own, to a whole window.
+fn own_hold_end(ready: Duration, own: Duration) -> Result<u32, String> {
+    if own.is_zero() {
+        return Err("its governor answered a period of no time".to_owned());
+    }
+    u32::try_from(ready.max(own).as_nanos().div_ceil(own.as_nanos()))
+        .map_err(|_| "a hold outlasts the windows a count holds".to_owned())
+}
+
 fn after(from: Instant, span: Duration) -> Result<Instant, String> {
     from.checked_add(span)
         .ok_or_else(|| format!("a wait of {span:?} overflows the clock"))
@@ -281,7 +328,8 @@ struct Booted {
 /// Launches one guest, its guest told no deadline, reads it per window from its launch through its readiness, which it
 /// follows to its answer (decision 9: past its W* its run-out told once, never ended at it), and its idle hold, has its
 /// agent report, and tears it down whatever came of the rest, each followed by its party: no guest or sampling thread
-/// outlives this.
+/// outlives this. A guest its own governor holds ([`Driver::hold`]) is read from its hold on at that governor's period,
+/// as its node reads each VM at its own.
 fn measure<D: Driver>(driver: &mut D, window: Duration) -> Result<Booted, String> {
     let began = Instant::now();
     let (mut guest, cpu, holds) = driver.launch()?;
@@ -309,32 +357,61 @@ fn measure<D: Driver>(driver: &mut D, window: Duration) -> Result<Booted, String
             ));
         }
     };
-    let held = (|| -> Result<Duration, String> {
+    let held = (|| -> Result<(Duration, Option<Duration>), String> {
         driver.ready(&mut guest)?;
         let ready = began.elapsed();
-        let until = hold_end(ready, window)?;
+        let own = driver.hold(&guest)?;
         // A refused word means its sampler has ended: its own error comes with its join below.
-        let _ = cpu.0.send(Told::Until(until));
-        let _ = holds.0.send(Told::Until(until));
-        let end = window
-            .checked_mul(until)
-            .ok_or("a hold overflows the clock")?;
-        driver.idle(&guest, after(began, end)?)?;
-        Ok(ready)
+        let end = match own {
+            None => {
+                let until = hold_end(ready, window)?;
+                let _ = cpu.0.send(Told::Until(until));
+                let _ = holds.0.send(Told::Until(until));
+                let span = window
+                    .checked_mul(until)
+                    .ok_or("a hold overflows the clock")?;
+                after(began, span)?
+            }
+            Some(own) => {
+                let last = own_hold_end(ready, own)?;
+                let _ = cpu.0.send(Told::Own { window: own, last });
+                let _ = holds.0.send(Told::Own { window: own, last });
+                // Each sampler's own windows begin at its next boundary of the census's, a window from now at most.
+                let span = own
+                    .checked_mul(last)
+                    .and_then(|span| span.checked_add(window))
+                    .ok_or("a hold overflows the clock")?;
+                after(Instant::now(), span)?
+            }
+        };
+        driver.idle(&guest, end)?;
+        Ok((ready, own))
     })();
     if held.is_err() {
         let _ = cpu.0.send(Told::Abandon);
         let _ = holds.0.send(Told::Abandon);
     }
-    let readings =
-        joined(cpu).and_then(|cpu| joined(holds).map(|holdings| Readings { cpu, holdings }));
+    let readings = joined(cpu).and_then(|cpu| {
+        joined(holds).map(|holdings| Readings {
+            cpu: cpu.ticks,
+            holdings: holdings.ticks,
+            own: cpu.own,
+        })
+    });
     let reported = match (&held, &readings) {
         (Ok(_), Ok(_)) => Some(driver.report(&guest)),
         _ => None,
     };
     let ended = driver.tear_down(guest);
     let booted = match (held, readings, reported) {
-        (Ok(ready), Ok(readings), Some(Ok(free))) => Ok(Booted {
+        // Held by its own governor, its CPU is read at that governor's period from its hold on, or the guest is refused.
+        (Ok((_, own)), Ok(readings), Some(Ok(_))) if readings.own.map(|o| o.window) != own => {
+            Err(format!(
+                "its CPU was read at {:?} from its hold on, not at its governor's period {own:?}",
+                readings.own.map(|o| o.window)
+            ))
+        }
+        (Ok((ready, _)), Ok(readings), Some(Ok(free))) => Ok(Booted {
             ready,
             readings,
             free,
@@ -355,13 +432,18 @@ fn measure<D: Driver>(driver: &mut D, window: Duration) -> Result<Booted, String
 pub struct Sample {
     /// How long it took from its VMM's launch to its agent answering.
     pub ready: Duration,
+    /// Where its steady state's windows begin, from its VMM's launch: its readiness, or, where its own governor holds
+    /// it, its CPU's first reading at that governor's period; and how long each is: the census's window, or that
+    /// period.
+    pub steady: Duration,
+    pub window: Duration,
     /// Its CPU's windows, and its longest (a boundary read late after a stall makes one longer).
     pub windows: usize,
     pub longest: Duration,
-    /// Its VMM's own CPU in one window from its readiness on (its steady state, idle), its guest's left out,
-    /// in milli-CPU rounded up: what is charged.
+    /// Its VMM's own CPU in one window of its steady state (idle), its guest's left out, in milli-CPU rounded up:
+    /// what is charged.
     pub cpu_milli: u64,
-    /// The same in one window before its readiness: its boot's burst, not charged.
+    /// The same in one window before its steady state: its boot's burst, not charged.
     pub boot_milli: u64,
     /// Its VMM's whole CPU in one window, its guest's included, for the record.
     pub total_milli: u64,
@@ -478,7 +560,9 @@ fn own_disk(files: &Files, before: &Files, after: &Files) -> u64 {
 /// launch and after its end. Its CPU is its VMM's less its guest's, each window's from the reading before
 /// (the first from its launch, when its VMM had used nothing) over the window or, read late, over its whole
 /// span: a reading never charges a window shorter than the window. A window that began before its readiness
-/// is its boot's; one that began at or after it, its steady state's, of which there must be one. Its vCPU
+/// is its boot's; one that began at or after it, its steady state's, of which there must be one. Where its own
+/// governor holds it ([`Readings::own`]), its steady state's windows are those from its first reading at that
+/// governor's period on, each charged over no less than that period, and the windows before them its boot's. Its vCPU
 /// threads at its last CPU reading are the envelope's where its OS names them. Its memory is as
 /// [`Sample::mem_bytes`] says, its guest's RAM told apart by its last reading of what it held (a reading
 /// whose footprint is below its guest's RAM counts none, and is counted); its page cache is recorded apart.
@@ -509,8 +593,18 @@ pub fn measured(
     if held.reading.guest_memory.is_none() {
         return Err("the guest's RAM was never told apart in its VMM's memory".to_owned());
     }
+    // Its steady state: from its readiness over the census's window, or from its own windows' first reading over
+    // its governor's period.
+    let (steady_from, steady_window) = readings
+        .own
+        .map_or((ready, window), |own| (own.at.max(ready), own.window));
+    if steady_window.is_zero() {
+        return Err("a window of no time".to_owned());
+    }
     let mut sample = Sample {
         ready,
+        steady: steady_from,
+        window: steady_window,
         windows: readings.cpu.len(),
         longest: Duration::ZERO,
         cpu_milli: 0,
@@ -529,10 +623,14 @@ pub fn measured(
         let reading = &tick.reading;
         let span = tick.at.checked_sub(at).ok_or("readings out of order")?;
         sample.longest = sample.longest.max(span);
-        let charged = span.max(window);
+        let charged = span.max(if at >= steady_from {
+            steady_window
+        } else {
+            window
+        });
         let now_own = reading.cpu.saturating_sub(reading.guest_cpu);
         let used = milli(now_own.saturating_sub(own), charged)?;
-        if at >= ready {
+        if at >= steady_from {
             steady = steady.saturating_add(1);
             sample.cpu_milli = sample.cpu_milli.max(used);
         } else {
@@ -545,7 +643,7 @@ pub fn measured(
         (at, cpu, own) = (tick.at, cpu.max(reading.cpu), own.max(now_own));
     }
     if steady == 0 {
-        return Err("no window began after its readiness".to_owned());
+        return Err("no window began in its steady state".to_owned());
     }
     let mut settled = 0usize;
     for tick in &readings.holdings {
@@ -589,7 +687,7 @@ impl Record {
         };
         record.line("# hex-guest-cost samples 2")?;
         record.line("# a census at a window: \"census <k> window_ns <ns> rate_cpu_milli <r>\", then its guests")?;
-        record.line("# a ready guest: \"guest <n> ready_ns <ns>\", then its readings, each stamped from its VMM's launch:")?;
+        record.line("# a ready guest: \"guest <n> ready_ns <ns> steady_ns <ns> window_ns <ns>\" (its steady state's windows from steady_ns on, each window_ns long: the census's window from its readiness, or its own governor's period from its first reading at it), then its readings, each stamped from its VMM's launch:")?;
         record.line("#   cpu at_ns cpu_ns guest_cpu_ns guest_threads|-")?;
         record.line("#   held at_ns footprint_bytes file_pages_bytes|- peak_footprint_bytes|- guest_memory_bytes|- own_disk_bytes held_disk_bytes")?;
         Ok(record)
@@ -604,13 +702,18 @@ impl Record {
     fn guest(
         &mut self,
         n: usize,
-        ready: Duration,
+        sample: &Sample,
         readings: &Readings,
         before: &Files,
         after: &Files,
     ) -> Result<(), String> {
         let dash = |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
-        self.line(&format!("guest {n} ready_ns {}", ready.as_nanos()))?;
+        self.line(&format!(
+            "guest {n} ready_ns {} steady_ns {} window_ns {}",
+            sample.ready.as_nanos(),
+            sample.steady.as_nanos(),
+            sample.window.as_nanos()
+        ))?;
         for tick in &readings.cpu {
             let r = &tick.reading;
             self.line(&format!(
@@ -711,7 +814,7 @@ pub fn census<D: Driver>(
         } = booted;
         let sample = measured(ready, &readings, free, window.length, vcpus, &known, &after)
             .map_err(|e| format!("guest {n}: {e}"))?;
-        record.guest(census.samples.len(), ready, &readings, &known, &after)?;
+        record.guest(census.samples.len(), &sample, &readings, &known, &after)?;
         census.samples.push(sample);
         known = after;
     }
@@ -917,17 +1020,17 @@ pub fn produce<D: Driver>(
         ));
     }
     line(format!(
-        "census seedable={} (SEEDABLE, bench/competitive/probes/waits_census.py, decision 9) ready={}; each guest booted with no deadline told and followed to its agent's answer, its boot-to-ready time its sample, its link's dials each within their own W* (the slowest dial this process has seen, client.guest.link.dial) and past it their run-out told once and the boot never ended at it; its report and its teardown followed by their parties, no record read; each guest read at every window boundary from its VMM's launch through its readiness and an idle hold as long as its boot took and at least one whole window after it, to a whole window",
+        "census seedable={} (SEEDABLE, bench/competitive/probes/waits_census.py, decision 9) ready={}; each guest booted with no deadline told and followed to its agent's answer, its boot-to-ready time its sample, its link's dials each within their own W* (the slowest dial this process has seen, client.guest.link.dial) and past it their run-out told once and the boot never ended at it; its report and its teardown followed by their parties, no record read; each guest read at every window boundary from its VMM's launch through its readiness and an idle hold as long as its boot took and at least one whole window after it, to a whole window; a guest its own governor holds (Shards' D191, D255: its period its VM process's own) held once ready and read from then on at that governor's period, through as long as its boot took and at least one whole window of its own",
         plan.seedable,
         census.samples.len()
     ));
     line(format!(
-        "overhead {} at RAM {} bytes (the envelope's: a cost is per envelope) (the census maximum of each ready guest's: its VMM's own CPU in one window from its readiness on, its guest's left out, rounded up; its VMM's own memory, as the memory source says; the bytes held in its own folders at a reading, there during its life and neither before it nor after it) (evidence alone, not in the cost: a node learns a VM's overhead from its windows, decision 9)",
+        "overhead {} at RAM {} bytes (the envelope's: a cost is per envelope) (the census maximum of each ready guest's: its VMM's own CPU in one window of its steady state (from its readiness on, or, where its own governor holds it, from its hold on at that governor's period), its guest's left out, rounded up; its VMM's own memory, as the memory source says; the bytes held in its own folders at a reading, there during its life and neither before it nor after it) (evidence alone, not in the cost: a node learns a VM's overhead from its windows, decision 9)",
         resources(overhead),
         envelope.resources.mem_bytes
     ));
     line(format!(
-        "boot_burst cpu_milli={boot} (the census maximum of its VMM's own CPU in one window that began before its guest was ready: not charged; for concurrent-boot admission)"
+        "boot_burst cpu_milli={boot} (the census maximum of its VMM's own CPU in one window that began before its steady state: not charged; for concurrent-boot admission)"
     ));
     line(format!(
         "file_pages bytes={} (the census maximum of the page cache its OS charged its VMM apart: the images it read, shared by every VM that reads them and reclaimable: not charged)",
@@ -960,10 +1063,10 @@ pub fn produce<D: Driver>(
         samples_file.display(),
         hex(&samples_sha256)
     ));
-    line("guests ready_ns windows longest_ns cpu_milli boot_milli total_milli holdings mem_bytes file_bytes behind disk_bytes free_cpu_milli free_mem_bytes free_disk_bytes (the charged census's; holdings: readings of what it held; behind: those whose footprint was below their guest RAM's pages)".to_owned());
+    line("guests ready_ns windows longest_ns cpu_milli boot_milli total_milli holdings mem_bytes file_bytes behind disk_bytes free_cpu_milli free_mem_bytes free_disk_bytes window_ns (the charged census's; holdings: readings of what it held; behind: those whose footprint was below their guest RAM's pages; window_ns: its steady state's windows', the census's or its own governor's period)".to_owned());
     for (n, s) in census.samples.iter().enumerate() {
         line(format!(
-            "guest {n} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            "guest {n} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
             s.ready.as_nanos(),
             s.windows,
             s.longest.as_nanos(),
@@ -977,7 +1080,8 @@ pub fn produce<D: Driver>(
             s.disk_bytes,
             s.free.cpu_milli,
             s.free.mem_bytes,
-            s.free.disk_bytes
+            s.free.disk_bytes,
+            s.window.as_nanos()
         ));
     }
     let mut evidence = Vec::with_capacity(prefix.len().saturating_add(body.len()));
@@ -1025,7 +1129,8 @@ mod tests {
     use crate::seam::{Envelope, Launched, Lines};
 
     /// One scripted guest: its readings in turn (the last repeated), what its agent reports, what it
-    /// leaves on disk after its end, and how long after its launch it is ready.
+    /// leaves on disk after its end, how long after its launch it is ready, and the period its own governor
+    /// answers once it is held (none: its node holds every VM over one window).
     #[derive(Clone)]
     struct Script {
         uses: Vec<Use>,
@@ -1033,6 +1138,7 @@ mod tests {
         free: CapacityResources,
         left: Files,
         boots_in: Duration,
+        own: Option<Duration>,
     }
 
     /// Readings in turn, the last repeated.
@@ -1064,6 +1170,8 @@ mod tests {
         disk: Files,
         /// The rates its governed window was asked at.
         governed: Vec<u64>,
+        /// The ready guests held to the census's rate.
+        held: usize,
     }
 
     impl Driven {
@@ -1076,6 +1184,7 @@ mod tests {
                 torn_down: 0,
                 disk: Vec::new(),
                 governed: Vec::new(),
+                held: 0,
             }
         }
     }
@@ -1134,6 +1243,10 @@ mod tests {
             // Ready `boots_in` after its launch, followed to then.
             park_until(self.launched_at.ok_or("ready before a launch")? + script.boots_in);
             Ok(())
+        }
+        fn hold(&mut self, guest: &Option<Script>) -> Result<Option<Duration>, String> {
+            self.held += 1;
+            Ok(guest.as_ref().and_then(|s| s.own))
         }
         fn idle(&mut self, _: &Option<Script>, until: Instant) -> Result<(), String> {
             while let Some(left) = until.checked_duration_since(Instant::now()) {
@@ -1207,6 +1320,7 @@ mod tests {
             free: free(free_mem),
             left: Vec::new(),
             boots_in: Duration::ZERO,
+            own: None,
         }
     }
 
@@ -1216,7 +1330,11 @@ mod tests {
             .into_iter()
             .map(|(ms, (cpu, held))| (tick(ms, cpu), tick(ms, held)))
             .unzip();
-        Readings { cpu, holdings }
+        Readings {
+            cpu,
+            holdings,
+            own: None,
+        }
     }
 
     fn window(ms: u64) -> Window {
@@ -1301,6 +1419,60 @@ mod tests {
         assert_eq!(sample.behind, 0);
         assert_eq!(sample.longest, Duration::from_millis(210));
         assert_eq!((sample.windows, sample.holdings), (5, 5));
+    }
+
+    /// AC-T7.4.1 (Shards' D191: a governor's period is its own VM process's): a guest ready at 50 ms over a census
+    /// window of 20 ms, held by its own governor over 40 ms and read at it from 60 ms on: expect the windows before
+    /// 60 ms its boot's, each charged over no less than the census's window, those from 60 ms on its steady state's,
+    /// each charged over no less than its own period, and its sample naming where they began and how long each is.
+    #[test]
+    fn a_guests_own_windows_are_its_steady_state_charged_over_its_own_period() {
+        let mut ticks = readings(vec![
+            (20, reading(4, 0, 1 << 20, 1 << 20, Vec::new())),
+            (40, reading(8, 0, 1 << 20, 1 << 20, Vec::new())),
+            (60, reading(10, 0, 1 << 20, 1 << 20, Vec::new())),
+            (100, reading(12, 0, 1 << 20, 1 << 20, Vec::new())),
+            (140, reading(13, 0, 1 << 20, 1 << 20, Vec::new())),
+        ]);
+        ticks.own = Some(Own {
+            at: Duration::from_millis(60),
+            window: Duration::from_millis(40),
+        });
+        let sample = measured(
+            Duration::from_millis(50),
+            &ticks,
+            free(0),
+            Duration::from_millis(20),
+            2,
+            &Vec::new(),
+            &Vec::new(),
+        )
+        .unwrap();
+        // Boot, the windows from 0, 20 and 40 ms: 4 ms in 20 (200 milli), 4 in 20 (200), 2 in 20 (100); the last began
+        // after its readiness and before its own windows.
+        assert_eq!(sample.boot_milli, 200);
+        // Steady, from 60 ms: 2 ms in 40 (50 milli), then 1 in 40 (25); never over the census's 20 ms (100).
+        assert_eq!(sample.cpu_milli, 50);
+        assert_eq!(
+            (sample.steady, sample.window),
+            (Duration::from_millis(60), Duration::from_millis(40))
+        );
+        // Its own windows from a reading before its readiness would begin its steady state at its readiness.
+        ticks.own = Some(Own {
+            at: Duration::from_millis(40),
+            window: Duration::from_millis(40),
+        });
+        let early = measured(
+            Duration::from_millis(50),
+            &ticks,
+            free(0),
+            Duration::from_millis(20),
+            2,
+            &Vec::new(),
+            &Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(early.steady, Duration::from_millis(50));
     }
 
     /// AC-T7.4.1 (ROOT: the page cache is no one VM's cost): readings whose OS charges the VMM page cache apart,
@@ -1513,6 +1685,34 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.matches("\nwindow_census ").count(), 1, "{text}");
+    }
+
+    /// AC-T7.4.1 (Shards' D191: a governor's period is its vCPUs times its own g over its share, g the step its VM
+    /// process measured itself; WHP item4, 2026-11-15: two guests at one rate answered 15.625 ms and 31.25 ms): a census
+    /// whose guests' governors answer periods other than its window's, one longer and one shorter: expect each guest held
+    /// once it is ready, none refused, and each read from its hold on at its own governor's period, as its node reads
+    /// each VM at its own: its samples' line naming that period.
+    #[test]
+    fn a_governed_guest_is_read_at_its_own_governors_period_from_its_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let steady: Vec<(Use, Holding)> = (0..64)
+            .map(|n| reading(n, 0, 1 << 20, 1 << 20, Vec::new()))
+            .collect();
+        let mut longer = script(steady.clone(), 400 << 20);
+        longer.own = Some(Duration::from_millis(40));
+        let mut shorter = script(steady, 400 << 20);
+        shorter.own = Some(Duration::from_millis(10));
+        let mut driver = Driven::new(dir.path(), vec![Some(longer), Some(shorter)]);
+        let mut samples = record(dir.path());
+        let census = census(&mut driver, 2, &window(20), 2, true, &mut samples).unwrap();
+        assert_eq!(census.samples.len(), 2);
+        assert_eq!(driver.held, 2, "a ready guest was never held");
+        let (path, _) = samples.finish().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let guests: Vec<&str> = text.lines().filter(|l| l.starts_with("guest ")).collect();
+        assert_eq!(guests.len(), 2, "{text}");
+        assert!(guests[0].ends_with(" window_ns 40000000"), "{text}");
+        assert!(guests[1].ends_with(" window_ns 10000000"), "{text}");
     }
 
     /// AC-T7.4.1 (ROOT, the Mac window's fixed point): a window that the rate sets, over guests whose VMM uses

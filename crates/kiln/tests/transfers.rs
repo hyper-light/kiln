@@ -320,6 +320,57 @@ fn w27_r08_session_hand_overs_a_move_signed_by_both_machines() -> anyhow::Result
     Ok(())
 }
 
+/// The machine session `id` runs on, as the server lists it (`agent:<machine id>`).
+fn runs_on(port: u16, admin: &str, id: &str) -> anyhow::Result<String> {
+    let (_, body) = http(port, "GET", "/api/harness/sessions", admin, None)?;
+    let v: Value = serde_json::from_str(&body).unwrap_or_default();
+    let list = v.as_array().cloned().or_else(|| v.get("agents").and_then(Value::as_array).cloned()).unwrap_or_default();
+    Ok(list.iter().find(|a| field(a, "id") == id).map(|a| field(a, "target").to_owned()).unwrap_or_default())
+}
+
+/// CP-T3.2: a session moves between two machines once the server has started again, as it does at
+/// every deploy. A runner takes a hand-over only when it knows the room its spool must leave on
+/// its volume, and forgets that as its server drops. The server says it to each runner as it
+/// connects (`ServerMsg::AdoptPolicy`), so the hand-over is taken and the session runs on the
+/// other machine. Before, a runner heard it only with a transfer's offer, which a move between
+/// machines doesn't make: every one was refused ("transfer storage policy or volume authority is
+/// unavailable"; production, 2026-11-14 and 15: 41 moves at a usage limit), and the session went
+/// on where it was.
+#[test]
+fn cp_t3_2_a_session_moves_between_machines_after_the_server_started_again() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut s = start(dir.path(), &Options::default())?;
+    let _harnesses = Harnesses::new(&dir.path().join("work-here"), &dir.path().join("home"))?;
+    // The stand-in keeps Claude Code's own record of the session, which a move carries.
+    let claude = dir.path().join("home").join(".claude").to_string_lossy().into_owned();
+    let env = [("FAKE_CLAUDE_RECORD", "1"), ("CLAUDE_CONFIG_DIR", claude.as_str())];
+    let (_a, log_a) = agents::runner_with(dir.path(), s.port, "box-a", None, TALK, &env)?;
+    let (_b, log_b) = agents::runner_with(dir.path(), s.port, "box-b", None, TALK, &env)?;
+    for (name, log) in [("box-a", &log_a), ("box-b", &log_b)] {
+        agents::connected(s.port, &s.admin, name, log, Duration::from_secs(60))?;
+        agents::headroom_off(s.port, &s.admin, name, Duration::from_secs(60))?;
+    }
+    let cwd = dir.path().join("work-here");
+    let id = agents::open_session(s.port, &s.admin, "box-a", &cwd, Duration::from_secs(60))?;
+    record_written(dir.path())?;
+    // The server goes and comes back: both runners connect to it again, and its copy of the
+    // session says where it runs.
+    s.restart()?;
+    let (port, admin) = (s.port, s.admin.as_str());
+    let on_a = format!("agent:{}", machine("box-a"));
+    let on_b = format!("agent:{}", machine("box-b"));
+    until(Duration::from_secs(120), || Ok((connected(port, admin, "box-a")? && connected(port, admin, "box-b")? && runs_on(port, admin, &id)? == on_a).then_some(())))?;
+    // Asked to move, as a person asks: it goes, and runs on box-b.
+    let asked = until(Duration::from_secs(60), || {
+        let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+        Ok((200..300).contains(&st).then_some(body))
+    })?;
+    anyhow::ensure!(!asked.contains("from_store"), "a move between two machines online, not a resume: {asked}");
+    until(Duration::from_secs(120), || Ok((runs_on(port, admin, &id)? == on_b).then_some(())))
+        .map_err(|e| anyhow::anyhow!("it didn't move to box-b ({e}); it runs on {:?}: {}", runs_on(port, admin, &id), said_of(dir.path(), port, admin, &id)))?;
+    Ok(())
+}
+
 /// A runner kept by `kiln supervise`, as `kiln install --agent` runs one (so it upgrades
 /// blue/green), in a process group of its own: dropped, the group goes, the supervisor with the
 /// runner and the new build it started beside it.

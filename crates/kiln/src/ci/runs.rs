@@ -95,6 +95,19 @@ pub async fn approval(hub: &Hub, run: &str) -> anyhow::Result<Option<String>> {
     hub.store.call(move |c| Ok(c.query_row("SELECT approval FROM runs WHERE id = ?1", [&run], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
 }
 
+/// When a run last arrived at its workflow-level group (W05-R06): when it was made, when a
+/// maintainer approved it (W18-R06), or when its attempt was started (W05-R17), whichever is last.
+/// The dispatcher's rebuild has the runs that never started arrive again in this order (W05-R25).
+pub async fn arrived_at(hub: &Hub, run: &str) -> anyhow::Result<i64> {
+    let run = run.to_owned();
+    hub.store
+        .call(move |c| {
+            let read = "SELECT MAX(r.created_at, COALESCE(r.approved_at, 0), COALESCE((SELECT a.created_at FROM ci_run_attempts a WHERE a.run_id = r.id AND a.attempt = r.attempt), 0)) FROM runs r WHERE r.id = ?1";
+            Ok(c.query_row(read, [&run], |r| r.get(0))?)
+        })
+        .await
+}
+
 /// The v1-shaped job spec the run pages read, for a leg.
 fn planned_json(spec: &LegSpec) -> serde_json::Value {
     let steps: Vec<serde_json::Value> = spec

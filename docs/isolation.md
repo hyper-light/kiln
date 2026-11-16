@@ -116,8 +116,12 @@ What a session does to its harness maps onto the member:
   there are its machine's. Refused as it's asked, before anything of it stops, so its member goes on.
   A move to the machine's newer runner process (an in-place upgrade) isn't refused: there it starts
   again in a microVM of the newer process, its conversation going on.
-- **A switch to another harness** (`NO_SWITCH`): its microVM runs its own harness's image. Refused as
-  it's asked, as a switch kiln can't make is.
+- **A switch to another harness** where its machine's microVMs swap none in place (`NO_SWITCH`; Hex's,
+  until its wire calls land, P6c.2): refused as it's asked, as a switch kiln can't make is. Where they swap
+  one (`Holds::swaps`, `Run::swap`), the switch swaps its member for the other harness's in the same
+  microVM (kiln plan 01a1dd2e…, P6c.5): `sandbox::isolated::ready_to_swap` pins the other's image first,
+  then its running member is handed on whole and `isolated::launch` swaps it there, its conversation
+  carried from kiln's timeline.
 - **kiln's MCP** reaches it over its link's own MCP lane (Shards D254), never the network: its harness's
   config names its microVM's bridge, `/run/shards/mcp`, and its runner serves each connection to it in its
   own process (`sandbox::isolated::bridge`, over `reach::mcp::serve_lane`), knowing its session by the lane,
@@ -151,8 +155,15 @@ its own through Hex (`sandbox::hexvm`).
   `none` needs a `host` runner. Each is refused where nothing fits, the engine named. The server itself
   (`local`) runs sessions on its host. Once kiln vendors Hex's `shards-image` class (P2.2), a `microvm` runner
   must also list it (`engine::node_images`).
-- **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view), and
-  new sessions take the new one. Each setting has a version (the one before's plus one, kept with it), and a
+- **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view, each
+  of them in `draining_sessions`, with the switch they drain for, `switch`: what was set before, what it was set
+  to, and when), and new sessions take the new one. While they drain (ROOT's decision 8 of the design):
+  `runners.engine.end_draining` ("End them now", `POST /api/runners/:name/engine/end`; destructive, so an
+  agent's call waits for its person's click) ends each, after the agents it started; `runners.engine.cancel`
+  (`POST /api/runners/:name/engine/cancel`) sets the engine back to what was set before the switch, so they're
+  on its engine again, refused where it wasn't switched or nothing drains. Both need `runners.manage` on that
+  runner. The switch is kept with the setting (`engine::Kept`), on the server alone: the runner is sent the
+  setting. Each setting has a version (the one before's plus one, kept with it), and a
   start carries the version its boundary was decided under, taken before it waits to be placed
   (`Spec::engine_version`). The runner refuses one decided under another (`engine::stale`), naming its engine
   now, so a session placed just before a switch never starts on the engine the runner had. The push is ordered
@@ -247,7 +258,7 @@ A held run is never stopped by a process id: its `Duplex` has none (`host_pid`, 
 at `os/proc_unix.rs:384`), so the handover paths that stop a harness by its pid (`harness/host.rs`
 `stop_process`, `agent.rs:3161,3273`) never take it, and the session terminates it through its boundary
 instead (`harness/session.rs:4953`). Hex delivers a member's own signal (`Runtime::signal_member`,
-`Call::MemberSignal`, over Shards' agent-control endpoint) since its `e19198bd`, which kiln vendors.
+`Call::MemberSignal`, over Shards' agent-control endpoint) since its `414aa30d`, which kiln vendors.
 
 ## Tests
 

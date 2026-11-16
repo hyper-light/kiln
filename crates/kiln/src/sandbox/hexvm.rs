@@ -9,10 +9,13 @@
 //! - **Its spec** is `ClassSpec::ShardsImage`: the image pinned by its digest; one `Grant::Egress` by TCP for each
 //!   destination its launch names (`host:port`, to its harness member); its harness member, given the launch's
 //!   environment, folder and arguments; the launch's shares, and its folder at its own path, writable.
-//! - **Its size** is the least Shards boots (`shards_api::envelope` of no vCPU and no memory: one vCPU and
-//!   shards-vmm's least memory for this architecture), as an allocation that envelope keeps: Shards gives an image
-//!   run's microVM the host's memory to plug as its workload asks (D148, `api_run`'s `Shape::host_memory`), and the
-//!   person's sizes reach it through placement (plan step 32). No number of kiln's.
+//! - **Its size** is its session's isolation's where it gives one (vCPUs and memory, plan step 32, as a deployment
+//!   experiment's variant sizes it: P7.1), else the least Shards boots (`shards_api::envelope` of no vCPU and no
+//!   memory: one vCPU and shards-vmm's least memory for this architecture), as an allocation that envelope keeps:
+//!   Shards gives an image run's microVM the host's memory to plug as its workload asks (D148, `api_run`'s
+//!   `Shape::host_memory`). No number of kiln's.
+//! - **What it lived on** ([`Meter::lived`], P7.1): its CPU time over its run and its footprint, steady (its last
+//!   read, its final use once its box is gone) and peak (the most any read said), for its session's record.
 //! - **Its run** is the member's: stdin, stdout and stderr its streams (`Proc::streams`), its end the member's,
 //!   said once its box is gone (as Hex's own `Runtime::run` says a run's end), after all it wrote. Kill and drop
 //!   delete its box (`Runtime::delete_with_host_use`). If a delete fails, it is asked again as the run's end is
@@ -61,7 +64,7 @@ use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, R
 /// (`Runtime::signal_member`, Shards' agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or
 /// refused fork of an image VM's guest: its `usage_of`), or weights. Credentials it holds where its runtime leases
 /// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
 pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (kiln's credential store is its server's, which this runner doesn't hold), and a run granted one is never run without it (Shards' D242)";
@@ -99,7 +102,21 @@ pub enum Charge {
     LastRead,
 }
 
-/// A run's charge as [`USE`] keeps it: Hex's [`HostUse`], its window in nanoseconds, and which use it is.
+/// What a VM process's counters say it cost its host in all, its vCPUs' guest time among it (Shards' D265, Hex's
+/// `HostUse::charged`): its CPU time where its OS charges its vCPUs' guest time to it (`ToThread`: Linux's KVM,
+/// macOS' Hypervisor.framework, Windows' root scheduler), that and its vCPUs' guest time beside it where it doesn't
+/// (`Apart`: Windows' classic scheduler), and where its run host can't say (`Unknown`), no less than its vCPUs ran.
+pub fn host_cpu_ns(used: &HostUse) -> u64 {
+    let guest = used.guest_ns.iter().fold(0u64, |all, n| all.saturating_add(*n));
+    match used.charged {
+        hex_api::Charged::ToThread => used.cpu_ns,
+        hex_api::Charged::Apart => used.cpu_ns.saturating_add(guest),
+        hex_api::Charged::Unknown => used.cpu_ns.max(guest),
+    }
+}
+
+/// A run's charge as [`USE`] keeps it: Hex's [`HostUse`] (its CPU time all it cost its host, its vCPUs' guest time
+/// among it: [`host_cpu_ns`]), its window in nanoseconds, and which use it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Charged {
     pub of: Charge,
@@ -113,7 +130,7 @@ pub struct Charged {
 impl Charged {
     pub fn of(used: &HostUse, of: Charge) -> Self {
         let window_ns = u64::try_from(used.window.as_nanos()).unwrap_or(u64::MAX);
-        Charged { of, cpu_ns: used.cpu_ns, footprint_bytes: used.footprint_bytes, resident_bytes: used.resident_bytes, guest_ns: used.guest_ns.clone(), window_ns }
+        Charged { of, cpu_ns: host_cpu_ns(used), footprint_bytes: used.footprint_bytes, resident_bytes: used.resident_bytes, guest_ns: used.guest_ns.clone(), window_ns }
     }
 }
 
@@ -126,6 +143,9 @@ struct Vm {
     /// Its harness member, whose MCP connections its lane takes.
     member: Member,
     last: parking_lot::Mutex<Option<(HostUse, Charge)>>,
+    /// The most memory any read of it said its VM held, its final use's among them (a session's peak footprint,
+    /// P7.1).
+    peak: std::sync::atomic::AtomicU64,
     ledger: Option<Arc<dyn Records>>,
 }
 
@@ -154,19 +174,41 @@ impl Meter {
     /// where its box is gone or its run host read none.
     pub fn read(&self) -> Result<Used, hex_api::Refusal> {
         let now = self.0.runtime.host_use(&self.0.id)?;
+        self.0.peak.fetch_max(now.footprint_bytes, Ordering::AcqRel);
         let mut last = self.0.last.lock();
         let (cpu0, window0) = match &*last {
-            Some((u, Charge::LastRead)) if u.window <= now.window => (u.cpu_ns, u.window),
+            Some((u, Charge::LastRead)) if u.window <= now.window => (host_cpu_ns(u), u.window),
             _ => (0, Duration::ZERO),
         };
         let span = now.window.saturating_sub(window0).as_nanos();
-        let milli = u128::from(now.cpu_ns.saturating_sub(cpu0)).saturating_mul(1000) / span.max(1);
+        let milli = u128::from(host_cpu_ns(&now).saturating_sub(cpu0)).saturating_mul(1000) / span.max(1);
         let used = Used { cpu_milli: u64::try_from(milli).unwrap_or(u64::MAX), footprint_bytes: now.footprint_bytes };
         // Once its delete has answered a final use, that use is what the run is charged: no read replaces it.
         if !matches!(*last, Some((_, Charge::Final))) {
             *last = Some((now, Charge::LastRead));
         }
         Ok(used)
+    }
+}
+
+/// What a run's VM used over its life, as its meter last knew it (P7.1): its CPU time and window as its charge has
+/// them (Hex's final use once its box is gone, else the use last read), its footprint then (its steady footprint), and
+/// the most any read said it held (its peak).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lived {
+    pub cpu_ns: u64,
+    pub window_ns: u64,
+    pub footprint_steady_bytes: u64,
+    pub footprint_peak_bytes: u64,
+}
+
+impl Meter {
+    /// What its run used over its life ([`Lived`]); none where nothing of it was ever read.
+    pub fn lived(&self) -> Option<Lived> {
+        let last = self.0.last.lock();
+        let (used, of) = last.as_ref()?;
+        let c = Charged::of(used, *of);
+        Some(Lived { cpu_ns: c.cpu_ns, window_ns: c.window_ns, footprint_steady_bytes: c.footprint_bytes, footprint_peak_bytes: self.0.peak.load(Ordering::Acquire).max(c.footprint_bytes) })
     }
 }
 
@@ -193,7 +235,10 @@ async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
     let (runtime, id) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(|e| e.to_string())?);
     let answered = crate::rt::blocking(move || runtime.delete_with_host_use(&id)).await.map_err(|e| format!("its delete didn't run: {e:#}"))?;
     match answered {
-        Ok(Some(used)) => *vm.last.lock() = Some((used, Charge::Final)),
+        Ok(Some(used)) => {
+            vm.peak.fetch_max(used.footprint_bytes, Ordering::AcqRel);
+            *vm.last.lock() = Some((used, Charge::Final));
+        }
         Ok(None) | Err(hex_api::Refusal::NoSuchBox(_)) => {}
         Err(e) => return Err(e.to_string()),
     }
@@ -201,6 +246,17 @@ async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
     match charge {
         Some((used, of)) => vm.keep(&used, of).await,
         None => Ok(()),
+    }
+}
+
+/// Hex's word for how a microVM started, as a session's record keeps it.
+pub fn said(from: hex_api::StartedFrom) -> &'static str {
+    match from {
+        hex_api::StartedFrom::Booted => "booted",
+        hex_api::StartedFrom::Saved => "saved",
+        hex_api::StartedFrom::Restored => "restored",
+        hex_api::StartedFrom::Replaced => "replaced",
+        hex_api::StartedFrom::Warm => "warm",
     }
 }
 
@@ -231,9 +287,24 @@ impl HexVms {
         self.vms.lock().get(vm).and_then(Weak::upgrade).map(Meter)
     }
 
-    /// `launch` in a box named `name`: created, started and its harness member's streams taken, or refused, typed,
-    /// with no box left behind.
-    pub async fn launch_as(&self, name: BoxName, launch: Launch) -> Result<Box<dyn Run>, Refusal> {
+    /// How live run `vm`'s microVM started, as its run host said it (Hex's `Usage::started_from`, Shards' D253): none
+    /// where it said none, or its box is gone.
+    pub async fn started_from(&self, vm: &str) -> Option<hex_api::StartedFrom> {
+        let meter = self.meter(vm)?;
+        let (runtime, id) = (Arc::clone(&meter.0.runtime), meter.0.id.try_clone().ok()?);
+        crate::rt::blocking(move || runtime.usage(&id)).await.ok()?.ok()?.started_from
+    }
+
+    /// [`HexVms::launch_as`] in a box its namer names (the seam's launch, sized).
+    pub async fn launch_sized(&self, launch: Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
+        let name = (self.names)().ok_or_else(|| Refusal::Unsupported(UNNAMED.into()))?;
+        self.launch_as(name, launch, size).await
+    }
+
+    /// `launch` in a box named `name`, its microVM `size` (vCPUs, MiB) where its session's isolation gives one, as
+    /// Shards' envelope keeps it (`shards_api::envelope`), else Shards' least: created, started and its harness
+    /// member's streams taken, or refused, typed, with no box left behind.
+    pub async fn launch_as(&self, name: BoxName, launch: Launch, size: Option<(u32, u64)>) -> Result<Box<dyn Run>, Refusal> {
         // Its grants checked as any sandbox's would be first (`Invalid`), then refused where no broker leases them.
         Holds { credentials: true, ..HOLDS }.check(&launch)?;
         if !launch.credentials.is_empty() && !self.leases {
@@ -253,9 +324,9 @@ impl HexVms {
         let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone(), mcp: true };
         let class = ShardsImage { grants, members: vec![driven], shares, credentials, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
-        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation()?), route: None, band: 0 };
+        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
         let name = id.to_string();
-        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), member: member.clone(), last: parking_lot::Mutex::new(None), ledger: self.ledger.clone() });
+        let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), member: member.clone(), last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
         let runtime = Arc::clone(&self.runtime);
         let made = crate::rt::blocking(move || boot(&*runtime, spec, &id, &member)).await.map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?;
         let started = match made {
@@ -284,7 +355,7 @@ impl HexVms {
 impl Sandbox for HexVms {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
         match (self.names)() {
-            Some(name) => Box::pin(self.launch_as(name, launch)),
+            Some(name) => Box::pin(self.launch_as(name, launch, None)),
             None => Box::pin(async { Err(Refusal::Unsupported(UNNAMED.into())) }),
         }
     }
@@ -373,11 +444,13 @@ fn grants_of(member: &Member, egress: &Egress) -> Result<Vec<Grant>, Refusal> {
     Ok(grants)
 }
 
-/// Shards' least VM on this architecture as an allocation its envelope keeps (module docs): whole vCPUs and MiB,
-/// in the units Hex's `Allocation::vm_size` reads them (1,000 CPU milli a vCPU, 2^20 bytes a MiB).
-fn allocation() -> Result<Allocation, Refusal> {
+/// The VM `asked` (vCPUs, MiB; none: Shards' least on this architecture, module docs) as an allocation its envelope
+/// keeps: whole vCPUs and MiB, in the units Hex's `Allocation::vm_size` reads them (1,000 CPU milli a vCPU, 2^20
+/// bytes a MiB).
+fn allocation(asked: Option<(u32, u64)>) -> Result<Allocation, Refusal> {
     let size = |why: String| Refusal::Invalid { what: "its microVM's size", why };
-    let (vcpus, mib) = shards_api::envelope(std::env::consts::ARCH, 0, 0).map_err(|e| size(format!("{e:?}")))?;
+    let (cpus, memory) = asked.unwrap_or((0, 0));
+    let (vcpus, mib) = shards_api::envelope(std::env::consts::ARCH, cpus, memory).map_err(|e| size(format!("{e:?}")))?;
     let guest = CapacityResources {
         cpu_milli: u64::from(vcpus).checked_mul(1000).ok_or_else(|| size(format!("{vcpus} vCPUs")))?,
         mem_bytes: mib.checked_mul(1 << 20).ok_or_else(|| size(format!("{mib} MiB")))?,
@@ -640,7 +713,17 @@ impl Run for HexRun {
         let over = self.over();
         Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_LIVE.to_owned())) } })
     }
+
+    // None yet (`HOLDS.swaps`): Hex's wire calls for a component swapped into a running box (P6c.2, over Shards' P6c.1).
+    fn swap(&self, launch: Launch) -> BoxFuture<'_, Result<Box<dyn Run>, Refusal>> {
+        drop(launch);
+        let over = self.over();
+        Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_SWAP.to_owned())) } })
+    }
 }
+
+/// Why a box's harness isn't swapped for another in place yet.
+pub const NO_SWAP: &str = "a harness swapped for another in its running microVM: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6c.2)";
 
 /// Why a box's network and folders don't change while it runs yet.
 pub const NO_LIVE: &str = "a change to a running microVM's network or folders: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6b.3)";
@@ -664,7 +747,7 @@ pub(crate) mod tests {
     use kiln_seams::records::{Consistency, SimRecords};
     use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Output, Refusal, Run, Sandbox as _, Signal};
 
-    use super::{Charge, Charged, HexVms, USE, Used};
+    use super::{Charge, Charged, HexVms, USE, Used, host_cpu_ns};
 
     /// The sandbox over Hex's simulator, its boxes numbered as a runner process of epoch 7 numbers those of its runs
     /// that reserve nothing.
@@ -1084,12 +1167,26 @@ pub(crate) mod tests {
     /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
     /// growth since the read before, not its whole run's.
     fn use_at(n: u64) -> HostUse {
-        HostUse { cpu_ns: n * n * 1_000_000, footprint_bytes: (64 << 20) + n, resident_bytes: (80 << 20) + n, guest_ns: vec![n * 500_000], window: Duration::from_millis(n * 4) }
+        HostUse { cpu_ns: n * n * 1_000_000, footprint_bytes: (64 << 20) + n, resident_bytes: (80 << 20) + n, guest_ns: vec![n * 500_000], window: Duration::from_millis(n * 4), charged: hex_api::Charged::ToThread }
     }
 
     /// A VM's final use, as its delete reads it with its end.
     fn final_use() -> HostUse {
-        HostUse { cpu_ns: 90_000_000, footprint_bytes: 96 << 20, resident_bytes: 112 << 20, guest_ns: vec![70_000_000], window: Duration::from_secs(1) }
+        HostUse { cpu_ns: 90_000_000, footprint_bytes: 96 << 20, resident_bytes: 112 << 20, guest_ns: vec![70_000_000], window: Duration::from_secs(1), charged: hex_api::Charged::ToThread }
+    }
+
+    /// D265: a VM's host CPU is its process's CPU time where its OS charges its vCPUs' guest time to it, that and its
+    /// vCPUs' beside it where it doesn't, and, where its run host can't say, no less than its vCPUs ran.
+    #[test]
+    fn a_vms_host_cpu_counts_its_guest_time_once_however_its_os_charges_it() {
+        let at = |charged| HostUse { cpu_ns: 30, guest_ns: vec![50, 20], charged, ..HostUse::default() };
+        assert_eq!(host_cpu_ns(&at(hex_api::Charged::ToThread)), 30);
+        assert_eq!(host_cpu_ns(&at(hex_api::Charged::Apart)), 100);
+        assert_eq!(host_cpu_ns(&at(hex_api::Charged::Unknown)), 70);
+        let held = HostUse { cpu_ns: 90, guest_ns: vec![50, 20], ..HostUse::default() };
+        assert_eq!(host_cpu_ns(&held), 90, "unknown, its CPU time past its guest time's is all of it");
+        let huge = HostUse { cpu_ns: u64::MAX, guest_ns: vec![u64::MAX, 1], charged: hex_api::Charged::Apart, ..HostUse::default() };
+        assert_eq!(host_cpu_ns(&huge), u64::MAX, "saturates, never wraps");
     }
 
     impl Runtime for Metered {

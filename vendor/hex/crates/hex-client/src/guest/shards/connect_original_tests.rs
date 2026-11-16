@@ -214,7 +214,7 @@ fn b15_each_of_shards_guest_failures_is_its_own_typed_refusal() {
         .stalled(since, since.checked_add(Duration::from_millis(1)).unwrap())
         .expect("a learned judge finds a whole W* with no progress a stall");
     let kinds = [
-        SdkRefusal::Stalled(stall),
+        SdkRefusal::Stalled(stall.clone()),
         SdkRefusal::Ended(shards_api::End::Failed("its VMM exited".to_owned())),
         SdkRefusal::Ended(shards_api::End::Stopped),
         SdkRefusal::Gone {

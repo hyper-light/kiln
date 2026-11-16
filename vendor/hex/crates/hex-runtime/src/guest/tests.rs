@@ -484,16 +484,26 @@ fn where_shards_has_no_backend_the_class_is_refused_before_anything_boots() {
 }
 
 /// HEX-GUEST-17: read the guest's spec from its config: expect the initramfs as its init, the init's
-/// command line naming the shares, the channel's three ports alone, and each share as configured.
+/// command line naming Shards' console and the shares, the channel's three ports alone, and each share as configured.
+/// Shards' guests have virtio-console alone since Shards 35e2de91e (the 16550 gone): a line naming `console=ttyS0`
+/// left init no /dev/console, so PID 1 died, and a line naming none left the kernel no console at all, so Shards kept
+/// none of its boot's lines (g121, 2026-11-15).
 #[test]
 fn the_guests_spec_names_its_init_ports_and_shares() {
     let spec = config().spec().unwrap();
-    assert_eq!(spec.cmdline, "console=ttyS0 panic=-1 hex.shares=rw");
+    assert_eq!(
+        spec.cmdline,
+        format!("{} panic=-1 hex.shares=rw", shards_api::CONSOLE)
+    );
+    assert_eq!(shards_api::CONSOLE, "console=hvc0");
     let none = GuestConfig {
         shares: Vec::new(),
         ..config()
     };
-    assert_eq!(none.spec().unwrap().cmdline, "console=ttyS0 panic=-1");
+    assert_eq!(
+        none.spec().unwrap().cmdline,
+        format!("{} panic=-1", shards_api::CONSOLE)
+    );
     assert_eq!(
         spec.ports,
         [stream::CONTROL_PORT, stream::STDIO_PORT, files::FILES_PORT]

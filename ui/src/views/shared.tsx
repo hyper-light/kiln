@@ -1,7 +1,7 @@
 import { shownName } from "@/lib/data";
 import { Link } from "@/lib/router";
 import { Clock, GitCommitHorizontal, GitPullRequest, Hand, Tag } from "lucide-react";
-import type { Agent, Child, HostSample, Run } from "@/api/types";
+import type { Child, HostSample, LeanAgent, Run } from "@/api/types";
 import { StatusDot, Chips } from "@/components/ui/status";
 import { Meter, Sparkline } from "@/components/ui/misc";
 import { formatBytes, formatDuration, firstLine, relativeTime, shortSha, spanSeconds, formatPct } from "@/lib/format";
@@ -75,7 +75,7 @@ export function diskPct(s: HostSample | null | undefined) {
   return s && s.disk_total > 0 ? (s.disk_used / s.disk_total) * 100 : 0;
 }
 
-export function AgentMiniCard({ agent, history, onOpen }: { agent: Agent; history: HostSample[]; onOpen?: () => void }) {
+export function AgentMiniCard({ agent, history, onOpen }: { agent: LeanAgent; history: HostSample[]; onOpen?: () => void }) {
   const s = agent.sample;
   const cpu = history.map((h) => h.cpu_pct);
   const mem = history.map((h) => memPct(h));

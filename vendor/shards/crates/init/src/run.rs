@@ -4009,6 +4009,8 @@ fn builtin(
             run::builtin::RESIZE => resize_member(args, domains),
             // A member's command signalled (D238, goal 58's step 5).
             run::builtin::SIGNAL => signal_member(args, domains),
+            // Its clock its host's, as its run goes on from a pause (D267).
+            run::builtin::CLOCK => crate::linux::sync_clock(),
             run::builtin::SIZE => match &layers {
                 Some((_, upper)) => Some(format!("/proc/self/fd/{}", upper.as_raw_fd())),
                 None => crate::changes::upper(),
@@ -6001,6 +6003,12 @@ impl Workload {
                             && let Err(e) = capture.progress()
                             && !e.transient()
                         {
+                            // Its every channel's end sent whole, its host ends it: the
+                            // capture's own end, which can come before the loop lets it go.
+                            if capture.ended_once_done(&e) {
+                                self.capture = None;
+                                continue;
+                            }
                             // Once the command has ended its status stands: the members'
                             // output, drained to its end (D240), ends where its host went.
                             if status.is_some() {

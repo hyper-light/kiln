@@ -10,7 +10,7 @@ import { create } from "zustand";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
 import { harnessApi, listed, type AgentInfo } from "@/api/harness";
-import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
+import type { Agent, AiSession, HostSample, LeanAgent, MetricsHistory, Overview, Repo, Run, ServerEvent, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
 import { loaded, preload, recent, useSuspenseResource, type ResourceOptions, type ResourceFetcher } from "./resource";
 
 /** What a key loads, and how. */
@@ -105,15 +105,20 @@ export function useLabels(): Labels {
   return useMachineLabels();
 }
 
-/** The agents, their labels noted on the way (`labelOf`). */
-const agentsNoted = (signal?: AbortSignal) =>
-  api.agents(signal).then((list) => {
-    noteLabels(list);
-    return list;
-  });
+/** The agents as `read` lists them, their labels noted on the way (`labelOf`). */
+const agentsNoted =
+  <A extends LeanAgent>(read: (signal?: AbortSignal) => Promise<A[]>) =>
+  (signal?: AbortSignal) =>
+    read(signal).then((list) => {
+      noteLabels(list);
+      return list;
+    });
 
 export const overviewRes: Res<Overview> = { key: "overview", fetch: (s) => api.overview(s), opts: { pollMs: 30_000 } };
-export const agentsRes: Res<Agent[]> = { key: "agents", fetch: agentsNoted, opts: { pollMs: 30_000 } };
+/** The machines that have joined, lean (W21-R02): what the pages that list them by name and what they're doing read. */
+export const agentsRes: Res<LeanAgent[]> = { key: "agents", fetch: agentsNoted(api.agents), opts: { pollMs: 30_000 } };
+/** The machines that have joined, each with all its facts: the Runners page, which shows each one's hardware. */
+export const agentsWholeRes: Res<Agent[]> = { key: "agents/whole", fetch: agentsNoted(api.agentsWhole), opts: { pollMs: 30_000 } };
 export const historyRes: Res<MetricsHistory> = { key: "metrics/history", fetch: (s) => api.metricsHistory(undefined, s), opts: { pollMs: 120_000 } };
 export const reposRes: Res<Repo[]> = { key: "repos", fetch: (s) => api.repos(s), opts: { pollMs: 30_000 } };
 export const recentRunsRes = (limit: number): Res<Run[]> => ({ key: `runs/recent/${limit}`, fetch: (s) => api.runs({ limit }, s), opts: { pollMs: 60_000 } });
@@ -129,15 +134,21 @@ export function useOverview() {
   return ov;
 }
 
-/** Every machine that has joined (Kubernetes job pods included: callers leave them out). */
-export function useAgentsLive() {
-  const agents = useRes(agentsRes);
+/** The machines `res` lists as their events change them: an `agent` event carries its machine whole, which `as` takes as one of the list's. */
+function useMachinesLive<A extends LeanAgent>(res: Res<A[]>, as: (whole: Agent) => A) {
+  const agents = useRes(res);
   useServerEvents(["agent", "sample"], (ev) => {
-    if (ev.type === "agent") agents.setData((l) => upsert<Agent>(l, ev.agent, (a) => a.name, false));
+    if (ev.type === "agent") agents.setData((l) => upsert<A>(l, as(ev.agent), (a) => a.name, false));
     else if (ev.type === "sample" && ev.agent !== "server") agents.setData((l) => (l.some((a) => a.name === ev.agent) ? l.map((a) => (a.name === ev.agent ? { ...a, sample: ev.sample } : a)) : l));
   });
   return agents;
 }
+
+/** Every machine that has joined (Kubernetes job pods included: callers leave them out), lean ([`agentsRes`]). */
+export const useAgentsLive = () => useMachinesLive(agentsRes, (whole) => whole);
+
+/** Every machine that has joined, each with all its facts ([`agentsWholeRes`]): the Runners page. */
+export const useAgentsWholeLive = () => useMachinesLive(agentsWholeRes, (whole) => whole);
 
 /** Samples kept per machine (the last hour at 5 s is 720). */
 const HISTORY_CAP = 800;
@@ -217,15 +228,45 @@ export const harnessSessionsRes: Res<AgentInfo[]> = {
   // Each event carries the agent's whole entry (or says it closed): applied, the list isn't loaded again.
   opts: {
     on: ["harness", "harness_closed"],
-    apply: (list, ev) => {
-      if (ev.type === "harness_closed") return list.filter((a) => a.id !== ev.id);
-      if (ev.type !== "harness") return undefined;
-      if (!listed(ev.info)) return list.filter((a) => a.id !== ev.info.id);
-      const i = list.findIndex((a) => a.id === ev.info.id);
-      return i === -1 ? [...list, ev.info] : list.map((a, j) => (j === i ? ev.info : a));
-    },
+    applyMany: agentsWith,
   },
 };
+
+/**
+ * The agents `list` with what `events` say of them, in the order they came: each agent's newest
+ * entry in its place (one that isn't listed, or closed, gone), new ones after the rest in the order
+ * they first came. One pass over the list whatever the events (W26-R15): applied one by one, a burst
+ * of E events to N agents looked each up among the N and copied the list E times. An agent no event
+ * names keeps its very entry, and a list no event changes is the list itself.
+ */
+export function agentsWith(list: AgentInfo[], events: readonly ServerEvent[]): AgentInfo[] | undefined {
+  // Each agent's last word: its entry, or null once it's gone.
+  const news = new Map<string, AgentInfo | null>();
+  for (const ev of events) {
+    if (ev.type === "harness") news.set(ev.info.id, listed(ev.info) ? ev.info : null);
+    else if (ev.type === "harness_closed") news.set(ev.id, null);
+    else return undefined;
+  }
+  if (news.size === 0) return list;
+  let changed = false;
+  const next: AgentInfo[] = [];
+  for (const a of list) {
+    if (!news.has(a.id)) {
+      next.push(a);
+      continue;
+    }
+    const now = news.get(a.id);
+    news.delete(a.id);
+    if (now) next.push(now);
+    if (now !== a) changed = true;
+  }
+  for (const now of news.values())
+    if (now) {
+      next.push(now);
+      changed = true;
+    }
+  return changed ? next : list;
+}
 
 /** The terminal sessions the server keeps (any device can attach to them). */
 export const terminalSessionsRes: Res<TerminalSessionInfo[]> = { key: "terminal/sessions", fetch: (s) => api.terminalSessions(s).catch(() => []), opts: { on: ["terminals"] } };

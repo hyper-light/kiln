@@ -32,7 +32,19 @@ mod warm;
 mod workload;
 
 fn main() -> ExitCode {
+    // Its launch, the host's work before this (PM M166), is over: said first, for its judges.
+    #[cfg(target_os = "macos")]
+    if let Err(e) = shards_vmm::platform::launch_over() {
+        let _ = writeln!(std::io::stderr(), "shards-vm: naming its main thread: {e}");
+    }
     shards_vmm::log::init();
+    // Its log's clock on the wall's, first, for lining its lines up with its spawner's
+    // (`SHARDS_TIMING`; api_image's `image_start_costs`).
+    if std::env::var_os("SHARDS_TIMING").is_some()
+        && let Some(at) = shards_vmm::log::began_unix_us()
+    {
+        shards_vmm::debug!("its log began at unix {at} us");
+    }
     // Started through its descriptor, its name is that descriptor's number until it takes
     // its own; a VM runs without it, said once.
     #[cfg(target_os = "linux")]
