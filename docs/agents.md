@@ -1367,28 +1367,32 @@ to `s28-pi-agentfile`).
   the first time a request needs it, held outside the microVM while its lease lasts, and every lease
   is given back as the run ends, however it ends. kiln keeps a ledger of them, so not even a restart
   of kiln leaves one live past its run's end.
-- **Signing in.** The harness's own sign-in will run inside its microVM, on its own terminal. For
-  Claude Code and Codex, the tokens their providers send back are taken out on the way in: kiln keeps
-  them in its secret store, with the scope they were granted, under the sign-in's name, which says
-  whose they are (`claude/…` for Claude Code, `codex/…` for Codex; any other name is refused and
-  nothing is kept). The harness gets placeholders. kiln makes each refresh itself, as that CLI makes
-  it (Claude Code's at `platform.claude.com`, Codex's at `auth.openai.com`), one at a time for a
-  sign-in however many runs use it, keeps the new tokens where the old ones were, so the harness's
+- **Signing in.** The harness's own sign-in will run inside its microVM, on its own terminal. Claude
+  Code's and Codex's runs are granted your sign-in by name (`claude/<you>`, `codex/<you>`), and the
+  tokens their providers send back are taken out on the way in: kiln keeps them in its secret store,
+  with the scope they were granted, and the harness gets placeholders, which its file in your volume
+  keeps, so your next run's harness holds the same ones. Its access token is filled in only toward
+  its provider's API (`api.anthropic.com`, `chatgpt.com`). kiln makes each refresh itself, as that
+  CLI makes it (Claude Code's at `platform.claude.com`, Codex's at `auth.openai.com`), one at a time
+  for a sign-in however many runs use it, keeps the new tokens where the old ones were, so the
   placeholders stay, and answers the harness with placeholders alone: a refresh never brings a new
   token in. A refresh its provider refuses tells the harness to sign in again. Signing out inside is
   noted in kiln's log and ends nothing outside. Codex keeps what it reads of its ID token (your email,
   plan and account), never its signature, and a refresh's new ID token isn't passed on. A request
-  that would make an API key from a taken token is refused.
+  that would make an API key from a taken token is refused. Every runner leases these from kiln's
+  server, which answers a runner only for the people its own isolated agents act for. The other
+  harnesses sign in themselves, their tokens in your volume: Shards knows no profile of their
+  sign-ins.
 - **Yours stay in your volume.** What a harness keeps of its sign-in it keeps in your volume, which
   no other person's agent is given. Once its tokens are taken outside, what it keeps there are
   placeholders.
-- **Not yet.** kiln doesn't yet grant a run its credentials or its sign-ins: an isolated agent's
-  harness signs in inside its microVM as it would on a machine, and keeps its tokens in your volume.
-  Once kiln does, only the runner kiln's server runs itself can lease them; any other refuses such a
-  run, saying why. kiln has no terminal into a microVM yet. The egress has filled in a value and
-  masked its echo in real microVMs only in Shards' own tests (Linux and Windows, on x86-64), not yet
-  for a harness kiln starts; the check that no value is anywhere in a run's memory, disk or
-  environment is built, its runs over real sessions still to come.
+- **Not yet.** kiln grants a run no other credential yet, an API key for one: only those two
+  sign-ins. Where a runner's microVMs can't lease, or its server answers no leases yet, Claude Code
+  and Codex sign in themselves too, their tokens in your volume, as the runner's log says. kiln has
+  no terminal into a microVM yet. The egress has filled in a value and masked its echo in real
+  microVMs only in Shards' own tests (Linux and Windows, on x86-64), not yet for a harness kiln
+  starts; the check that no value is anywhere in a run's memory, disk or environment is built, its
+  runs over real sessions still to come.
 - **When a value has to be inside.** Every harness kiln ships reads its trust from where its run's
   certificate authority is laid, and none pins its provider's certificates, as its own build shows,
   so none should need its value inside. Claude Code signed in
