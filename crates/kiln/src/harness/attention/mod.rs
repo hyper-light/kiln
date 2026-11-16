@@ -380,7 +380,27 @@ pub async fn route(hub:&Arc<Hub>,caller:&Caller,method:&Method,rest:&[&str],req:
     if method!=Method::POST{return Err((StatusCode::METHOD_NOT_ALLOWED,"use GET or POST".into()));}
     // Match the existing API JSON body allowance; three rendered orders can exceed64KiB.
     let action:Action=srv::body_json(req.into_body(),4<<20).await.map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
+    // An agent's place in a person's attention is changed by its operations (kiln plan 01a1dd2e8618733a87f2793aab1322a8
+    // P5.6, S6): one way in for each, held to what every operation is held to.
+    if let Some(op)=PLACES.iter().find(|(verb,_)|*verb==action.action).map(|(_,op)|*op){
+        return Err((StatusCode::BAD_REQUEST,format!("an agent's {} is {op}'s: POST /api/harness/agents/{{agent}}/{}",action.action,op.trim_start_matches("agents."))));
+    }
     act(hub,caller,who,action,receipt_at).await.map(|value|srv::json(StatusCode::OK,&value))
+}
+
+/// The actions on an agent's place in a person's attention that are operations of their own (P5.6, S6), and which.
+const PLACES:[(&str,&str);7]=[("pin","agents.pin"),("unpin","agents.unpin"),("park","agents.park"),("unpark","agents.unpark"),("archive","agents.archive"),("restore","agents.restore"),("restore_copy","agents.restore")];
+
+/// An agent's place in its caller's attention changed by its operation (P5.6, S6): `verb` (`pin`, `unpin`, `park`,
+/// `unpark`, `archive`, `restore`; `restore` from its copy where `copy` is true) on agent `v.agent`, as a person's
+/// attention takes it (the snapshot after it, with its undo), received now. Attention is a person's: an agent's call
+/// is refused, as it is on every route of attention, unless its person's click runs it as theirs.
+pub async fn placed(cx:crate::ops::Cx,verb:&str,mut v:Value)->crate::ops::Out{
+    let who=person(&cx.caller).ok_or((StatusCode::FORBIDDEN,"attention belongs to a person: an agent's change of it runs once its person confirms it".to_owned()))?;
+    let verb=if verb=="restore" && v.get("copy").and_then(Value::as_bool)==Some(true){"restore_copy"}else{verb};
+    if let Some(o)=v.as_object_mut(){o.remove("copy");o.insert("action".into(),json!(verb));}
+    let action:Action=serde_json::from_value(v).map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()))?;
+    act(&cx.hub,&cx.caller,who,action,crate::util::now_ms()).await
 }
 
 /// Each agent's uses the caller may see, theirs and its own turns (kind, time, and for a turn which end), oldest first (step 1).

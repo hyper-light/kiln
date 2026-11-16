@@ -1145,6 +1145,60 @@ pub fn list_ops() -> Vec<Op> {
             run: |cx, v| Box::pin(move_to(cx, v)),
         },
         Op {
+            name: "agents.pin",
+            summary: "Pin an agent to the top of your attention (Mission Control's list): it stays in sight until you unpin it.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPlace>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "pin"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "pin", v)),
+        },
+        Op {
+            name: "agents.unpin",
+            summary: "Unpin an agent from the top of your attention: it's placed by what needs you again.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPlace>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "unpin"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "unpin", v)),
+        },
+        Op {
+            name: "agents.park",
+            summary: "Park an agent out of your attention until `until` (Unix ms, in the future): its requests wait there, and it comes back then, or once you unpark it.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPark>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "park"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "park", v)),
+        },
+        Op {
+            name: "agents.unpark",
+            summary: "Bring a parked agent back into your attention now.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPlace>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "unpark"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "unpark", v)),
+        },
+        Op {
+            name: "agents.archive",
+            summary: "Archive an agent, with its subagents: ended and put away with its conversation, off your attention, to restore later.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsPlace>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "archive"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "archive", v)),
+        },
+        Op {
+            name: "agents.restore",
+            summary: "Restore an archived agent, with its subagents, where it was: its conversation goes on (`copy`: from kiln's copy of it, where its machine's is gone).",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsRestore>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "restore"]))),
+            run: |cx, v| Box::pin(super::attention::placed(cx, "restore", v)),
+        },
+        Op {
             name: "agents.broadcast",
             summary: "Send one thing to many agents at once, among those you may act on: `to` picks them (`ids`, or `all`, or `machines`, `kinds` and `status` to match); then a prompt or slash command (`text`, with `attachments` and a `mode`: queue, steer or now), a `command` as the console sends one, or `approvals` (allow or deny every tool call waiting). `key` makes it once however often it's sent. What became of each agent comes back.",
             read_only: false,
@@ -1532,6 +1586,53 @@ pub mod input {
         pub kind: Option<String>,
         /// The model it goes on with there.
         pub model: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsPlace {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// The revision of its place you saw, refused where another device has moved it since.
+        pub revision: Option<i64>,
+        /// A key that makes it once however often it's sent.
+        pub key: Option<String>,
+        /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
+        pub mode: Option<String>,
+        /// The visit it's made in, as the snapshot named it.
+        pub visit: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsPark {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// When it comes back, Unix ms, in the future.
+        pub until: i64,
+        /// The revision of its place you saw, refused where another device has moved it since.
+        pub revision: Option<i64>,
+        /// A key that makes it once however often it's sent.
+        pub key: Option<String>,
+        /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
+        pub mode: Option<String>,
+        /// The visit it's made in, as the snapshot named it.
+        pub visit: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsRestore {
+        /// The archived agent's id.
+        pub agent: String,
+        /// From kiln's copy of its conversation, where its machine's is gone.
+        pub copy: Option<bool>,
+        /// A key that makes it once however often it's sent.
+        pub key: Option<String>,
+        /// The snapshot answered: "arrival" (a new visit) or "refresh" (this one, re-ranked).
+        pub mode: Option<String>,
+        /// The visit it's made in, as the snapshot named it.
+        pub visit: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
