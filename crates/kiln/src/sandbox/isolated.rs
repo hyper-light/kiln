@@ -160,8 +160,10 @@ pub const SWAPPED: &str = "swapped";
 pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret], swap_from: Option<crate::proc::Duplex>) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
-    // kiln's own state, which its project is, holds or lies in none of: where its microVMs are held, and its people's volumes.
-    let kiln: Vec<&Path> = vms.state().into_iter().chain(homes).collect();
+    // kiln's own state, which its project is, holds or lies in none of: where its microVMs are held, its people's volumes,
+    // and its server's data folder (kiln.db, its secrets and tokens), as its runner keeps it.
+    let server = host.as_ref().and_then(|h| h.server_data().map(Path::to_path_buf));
+    let kiln: Vec<&Path> = vms.state().into_iter().chain(homes).chain(server.as_deref()).collect();
     let mut launch = launch_of(kind, spec, source.name(), &kiln)?;
     let folder = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
     let files = crate::rt::blocking(move || host_tools::tracked(Path::new(&folder))).await?;
@@ -228,7 +230,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         }
     };
     if lanes.is_some() {
-        offer_mcp(kind, &source, person, homes, &mut launch.args).await;
+        offer_mcp(kind, layout.as_ref(), &mut launch.args).await;
     }
     // Every folder it starts with is its harness's own: given to that member at its start, where it sees it
     // (Shards' share member scope). A start share given to no member reaches its microVM's root alone, which
@@ -446,7 +448,8 @@ pub fn project_share(cwd: &str) -> Result<Share, String> {
 /// (CP-T4.1's AC-T4.1.5, as T4's `cp/t4-isolation` held it, 6134fd63b): the home of the user kiln runs as, or a
 /// folder holding it, every file of theirs among it (an agent started with no folder starts there); a folder that is,
 /// holds or lies in `~/.ssh` or one of `kiln`'s own (its state: its runner's keys and records, its microVMs' store,
-/// its people's volumes); or one holding another worktree of its repository, whose files are another agent's.
+/// its people's volumes, its server's data folder with kiln.db, its secrets and tokens); or one holding another worktree
+/// of its repository, whose files are another agent's.
 /// Compared with their links resolved, where they resolve.
 pub fn kept_out(cwd: &Path, kiln: &[&Path]) -> Option<String> {
     let cwd = canonical(cwd);
@@ -525,8 +528,9 @@ pub fn plugin_folders(kind: &Kind, session: &str) -> Vec<String> {
 
 /// `person`'s home for `kind`'s harness under `root` (the machine's `<state>/homes`), as image `pinned`
 /// of `source` lays it out (`harness::isolated::home::Layout`): its volumes made on this machine, each
-/// its directory here and its path in the microVM (`Layout::prepare`), and where its harness keeps its
-/// conversations there (`Layout::kept_in`). kiln's own Agentfile says its harness's volumes and run
+/// its directory here and its path in the microVM (`Layout::prepare`), and that layout, which says where
+/// its harness keeps its conversations there (`Layout::kept_in`) and where its files are here
+/// (`Layout::host_of`: agy's MCP config, [`offer_mcp`]). kiln's own Agentfile says its harness's volumes and run
 /// environment (`home::of_builtin`); a person's own, its volumes ([`kept_volumes`]), and its image, its
 /// harness's environment ([`harness_env`]). Refused, typed, where kiln can't keep it
 /// (`harness::isolated::Refusal`), or in words where its image can't be read.
@@ -733,22 +737,22 @@ fn in_layers(store: &shards_image::store::Store, layers: &[shards_image::store::
 
 /// kiln's MCP for `kind`'s harness in its microVM, through its link's `mcp` lane's bridge (step 18,
 /// `crate::harness::isolated::mcp`): its command line's form added to `args`; Antigravity's entry put
-/// in its own config in its person's volume under `homes` (the only place agy reads one from, kept as
-/// agy keeps it: `mcp::agy_config`), for kiln's own Agentfile, whose volumes kiln keeps; an ACP
-/// agent's is given at its `session/new` (`kinds::acp_servers`). A config that couldn't be written
-/// starts it without kiln's MCP, said, as on its machine (`Kind::prepare`).
-async fn offer_mcp(kind: &Kind, source: &Source<'_>, person: Option<&str>, homes: Option<&Path>, args: &mut Vec<String>) {
+/// in its own config in its person's volume as `home` lays it out ([`home_of`]; the only place agy reads one
+/// from, kept as agy keeps it: `mcp::agy_config`), from kiln's own Agentfile or a person's alike: the one fixed
+/// entry, as its lane, not the entry, names its session (Shards D254); none with no home of its person's here. An
+/// ACP agent's is given at its `session/new` (`kinds::acp_servers`). A config that couldn't be written, or that
+/// lies in none of its volumes, starts it without kiln's MCP, said, as on its machine (`Kind::prepare`).
+async fn offer_mcp(kind: &Kind, home: Option<&home::Layout>, args: &mut Vec<String>) {
     use crate::harness::isolated::mcp;
     match mcp::for_harness(kind) {
         mcp::Config::Args(more) => args.extend(more),
         mcp::Config::Shared(_) => {
-            let (Source::Builtin(b), Some(person), Some(root)) = (source, person, homes) else { return };
-            let (b, person, root) = (*b, person.to_owned(), root.to_path_buf());
+            let Some(layout) = home.cloned() else { return };
             let put = crate::rt::blocking(move || -> anyhow::Result<()> {
-                let (volumes, image_env) = home::of_builtin(b);
-                let layout = home::Layout::new(&root, &person, b.harness, &volumes, &image_env)?;
                 let guest = format!("{}/.gemini/config/mcp_config.json", layout.guest_home().trim_end_matches('/'));
-                let at = layout.host_of(&guest).ok_or_else(|| anyhow::anyhow!("{guest} isn't a path in its microVM"))?;
+                // Outside its volumes is its microVM's scratch, which kiln never makes and its harness never sees here.
+                let at = layout.host_of(&guest).filter(|at| layout.mounts().iter().any(|m| at.starts_with(&m.host)));
+                let at = at.ok_or_else(|| anyhow::anyhow!("{guest} is in none of its volumes, where kiln could put it"))?;
                 let config = match std::fs::read(&at) {
                     Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Bool(false)),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
@@ -920,33 +924,22 @@ mod tests {
         use super::super::fake::{FakeLanes, connection};
         let dir = tempfile::tempdir()?;
         let homes = dir.path().join("homes");
-        let root = homes.clone();
+        // The person's home as kiln's own Agentfile lays it out, as `home_of` gives it to both launches.
+        let (volumes, env) = crate::harness::isolated::home::of_builtin(builtin_of("antigravity")?);
+        let layout = crate::harness::isolated::home::Layout::new(&homes, "user:u1", "antigravity", &volumes, &env)?;
+        let laid = layout.clone();
         crate::rt::block_on(async move {
             let agy = kind("antigravity")?;
-            let spec = Spec { kind: agy.id.into(), isolation: Some(microvm(None)), ..Spec::default() };
-            let source = source_of(agy, &spec).map_err(anyhow::Error::msg)?;
             for _ in 0..2 {
                 let mut args = Vec::new();
-                offer_mcp(agy, &source, Some("user:u1"), Some(root.as_path()), &mut args).await;
+                offer_mcp(agy, Some(&laid), &mut args).await;
                 anyhow::ensure!(args.is_empty(), "agy takes kiln's MCP from its own config alone: {args:?}");
             }
             anyhow::Ok(())
         })?;
-        let (mut written, mut dirs) = (Vec::new(), vec![homes.clone()]);
-        while let Some(d) = dirs.pop() {
-            for entry in std::fs::read_dir(&d)? {
-                let path = entry?.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                } else {
-                    written.push(path);
-                }
-            }
-        }
+        let written = files_in(&homes)?;
         let [kept_at] = written.as_slice() else { anyhow::bail!("written in the person's volume: {written:?}") };
         anyhow::ensure!(kept_at.ends_with(".gemini/config/mcp_config.json"), "{}", kept_at.display());
-        let (volumes, env) = crate::harness::isolated::home::of_builtin(builtin_of("antigravity")?);
-        let layout = crate::harness::isolated::home::Layout::new(&homes, "user:u1", "antigravity", &volumes, &env)?;
         anyhow::ensure!(layout.mounts().iter().any(|m| kept_at.starts_with(&m.host)), "not in the person's volume: {}", kept_at.display());
         let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(kept_at)?)?;
         anyhow::ensure!(kept == serde_json::json!({"mcpServers": {"kiln": {"command": crate::harness::isolated::mcp::BRIDGE, "args": []}}}), "{kept}");
@@ -976,6 +969,66 @@ mod tests {
             let told = init.pointer("/result/instructions").and_then(serde_json::Value::as_str).unwrap_or_default();
             anyhow::ensure!(told.contains(own) && !told.contains(other), "{own}'s connection answered as {told:?}");
         }
+        Ok(())
+    }
+
+    /// Every file beneath `dir`, at any depth.
+    fn files_in(dir: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+        let (mut files, mut dirs) = (Vec::new(), vec![dir.to_path_buf()]);
+        while let Some(d) = dirs.pop() {
+            for entry in std::fs::read_dir(&d)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    /// Plan step 35 (s35-tests' P1): Antigravity started from a person's own Agentfile gets kiln's MCP as from kiln's own:
+    /// the one fixed entry, the lane's bridge alone (Shards D254), in agy's own `mcp_config.json` beneath the home its
+    /// image's harness names, in the volume its Agentfile gives that harness, as its launch lays them out ([`home_of`]).
+    /// An image whose harness's home is in none of its volumes (its microVM's scratch, `/tmp`) gets none: nothing is
+    /// written for it, and no scratch is made here.
+    #[test]
+    fn s35_mcp_antigravity_from_a_persons_own_agentfile_gets_the_one_fixed_entry() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let homes = dir.path().join("homes");
+        let images = Images::new(dir.path().join("no-shards"), dir.path().join("shards-home"), dir.path().join("scratch"));
+        let osi = |env: &str| serde_json::json!({"schemaVersion": 1, "name": "antigravity", "run": {"command": ["agy"], "env": [env]}}).to_string();
+        let (home_osi, scratch_osi) = (osi("HOME=/home/me"), osi("XDG_DATA_HOME=/data/agy"));
+        let (pinned_home, _) = image_in(&images.store(), "agentfile-home", &["PATH=/usr/bin"], &[&[("harness/antigravity.d/osi.json", &home_osi)]])?;
+        let (pinned_scratch, _) = image_in(&images.store(), "agentfile-scratch", &["PATH=/usr/bin"], &[&[("harness/antigravity.d/osi.json", &scratch_osi)]])?;
+        let root = homes.clone();
+        let laid = crate::rt::block_on(async move {
+            let agy = kind("antigravity")?;
+            let image = format!("{KEPT}0123456789abcdef0123456789abcdef");
+            let mut laid = Vec::new();
+            for (volume, pinned) in [("/home/me", pinned_home), ("/data/agy", pinned_scratch)] {
+                let text = format!("FROM scratch\nHARNESS antigravity FROM ./agy\nVOLUME --target-kind=harness {volume} FOR antigravity\n");
+                let spec = Spec { kind: agy.id.into(), isolation: Some(microvm(Some(image.as_str()))), agentfile: Some(text), ..Spec::default() };
+                let source = source_of(agy, &spec).map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(matches!(source, Source::Kept { .. }), "{} isn't the person's own", source.name());
+                let (_, layout) = home_of(&root, "user:u1", agy, source, &images, &pinned).await?;
+                let mut args = Vec::new();
+                offer_mcp(agy, Some(&layout), &mut args).await;
+                anyhow::ensure!(args.is_empty(), "agy takes kiln's MCP from its own config alone: {args:?}");
+                laid.push(layout);
+            }
+            anyhow::Ok(laid)
+        })?;
+        let [in_volume, in_scratch] = laid.as_slice() else { anyhow::bail!("two launches: {laid:?}") };
+        anyhow::ensure!(in_volume.guest_home() == "/home/me", "its home as its image names it: {}", in_volume.guest_home());
+        let kept_at = in_volume.host_of("/home/me/.gemini/config/mcp_config.json").ok_or_else(|| anyhow::anyhow!("no path here for its config"))?;
+        anyhow::ensure!(in_volume.mounts().iter().any(|m| kept_at.starts_with(&m.host)), "not in its volume: {}", kept_at.display());
+        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&kept_at)?)?;
+        anyhow::ensure!(kept == serde_json::json!({"mcpServers": {"kiln": {"command": crate::harness::isolated::mcp::BRIDGE, "args": []}}}), "{kept}");
+        let written = files_in(&homes)?;
+        anyhow::ensure!(written == [kept_at], "written for either launch: {written:?}");
+        anyhow::ensure!(!in_scratch.host_home().exists(), "a scratch made here: {}", in_scratch.host_home().display());
         Ok(())
     }
 
@@ -1150,6 +1203,39 @@ mod tests {
         assert!(launched(&in_workspace(mine.as_path(), project.as_path())).is_ok(), "its own workspace over a project");
         assert!(refusal(&in_workspace(mine.as_path(), crate::os::home_dir().as_path())).contains("home folder"), "its own workspace over the home");
         assert!(refusal(&in_workspace(theirs.as_path(), project.as_path())).contains("lies in"), "another agent's workspace");
+        Ok(())
+    }
+
+    /// CP-T4.1's AC-T4.1.5 (step 17): the kiln server's data folder (kiln.db, its secrets and tokens; on a machine that
+    /// runs both, the parent of its runner's default state) is kiln's state too, as its runner keeps it
+    /// (`Host::server_data`). No isolated agent works in a folder that is, holds or lies in it, refused before anything
+    /// starts; with its runner's state alone kept out, the server's folders beside that state were shared. Not made yet
+    /// (its server not started), it compares as made folders do, through the folders it lies in (macOS's `/var` is
+    /// `/private/var`), whichever way it and the project are named.
+    #[test]
+    fn s17_t4_the_kiln_servers_data_folder_is_no_isolated_agents_project() -> anyhow::Result<()> {
+        let base = tempfile::tempdir()?;
+        let (data, project) = (base.path().join("kiln"), base.path().join("project"));
+        let (runner, secrets) = (data.join("agent"), data.join("secrets"));
+        for dir in [&runner, &secrets, &project] {
+            std::fs::create_dir_all(dir)?;
+        }
+        assert_eq!(kept_out(&secrets, &[runner.as_path()]), None, "the server's secrets, its runner's state alone kept out");
+        let kiln = [runner.as_path(), data.as_path()];
+        assert_eq!(kept_out(&project, &kiln), None, "a project beside kiln's data");
+        for (folder, said) in [(data.as_path(), "lies in"), (secrets.as_path(), "lies in"), (base.path(), "holds")] {
+            let why = kept_out(folder, &[data.as_path()]).unwrap_or_default();
+            assert!(why.contains(said), "{}: {why}", folder.display());
+        }
+        let spec = Spec { kind: "codex".into(), cwd: Some(secrets.to_string_lossy().into_owned()), isolation: Some(microvm(None)), ..Spec::default() };
+        let refusal = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into(), &kiln).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(refusal.contains("lies in"), "refused before anything starts: {refusal}");
+        let real = std::fs::canonicalize(base.path())?;
+        for (folder, unmade) in [(real.as_path(), base.path().join("unmade")), (base.path(), real.join("unmade"))] {
+            assert!(kept_out(folder, &[unmade.as_path()]).is_some_and(|why| why.contains("holds")), "{} holds {}", folder.display(), unmade.display());
+            let inside = folder.join("unmade").join("kiln.db");
+            assert!(kept_out(&inside, &[unmade.as_path()]).is_some_and(|why| why.contains("lies in")), "{} lies in {}", inside.display(), unmade.display());
+        }
         Ok(())
     }
 

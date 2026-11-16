@@ -365,6 +365,7 @@ fn p4_5_the_asks_and_words_read_back_and_an_ask_never_shows_a_secret() -> anyhow
         secrets: vec![BuildSecret {
             id: "GIT_AUTH_TOKEN".into(),
             value: "ghp_p45_never_shown".into(),
+            given: crate::secrets::mine::Given::Secret,
         }],
     };
     anyhow::ensure!(serde_json::from_str::<Ask>(&serde_json::to_string(&ask)?)? == ask);

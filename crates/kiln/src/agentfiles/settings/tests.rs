@@ -519,3 +519,197 @@ fn p5_4_an_agents_settings_round_trip_through_its_directives() -> anyhow::Result
     ));
     Ok(())
 }
+
+/// P4.6: each harness's and agent's source says the secrets its fetch reads, by Shards' ids for them, and which of the
+/// person's own the text names for each: a Git source's host token over HTTPS, its SSH agent over SSH, an http(s) URL's
+/// host token, an S3 object's key pair for its bucket, and none for a path or an OCI reference.
+#[test]
+fn p4_6_a_sources_credentials_are_its_fetchs_secrets_and_the_names_the_text_gives_them()
+-> anyhow::Result<()> {
+    let text = "FROM ubuntu:24.04\nLABEL kiln.secret.GIT_AUTH_TOKEN.github.com=user:GH_TOKEN\nHARNESS claude FROM https://github.com/acme/claude.git#v1:dist\nAGENT main FROM ssh://git@github.com/acme/agent.git#v2\nAGENT helper FROM ./helper\n";
+    let s = of(text)?;
+    let s3 = of("FROM ubuntu:24.04\nHARNESS --version-id=a1 codex FROM s3://tools/codex.tgz\n")?;
+    let ids = |c: &[Credential]| {
+        c.iter()
+            .map(|c| (c.id.clone(), c.given, c.secret.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&harness(&s, "claude")?.credentials),
+        [(
+            "GIT_AUTH_TOKEN.github.com".to_owned(),
+            Given::Secret,
+            Some("GH_TOKEN".to_owned())
+        )]
+    );
+    assert_eq!(
+        ids(&harness(&s3, "codex")?.credentials),
+        [
+            ("AWS_ACCESS_KEY_ID.tools".to_owned(), Given::Secret, None),
+            (
+                "AWS_SECRET_ACCESS_KEY.tools".to_owned(),
+                Given::Secret,
+                None
+            )
+        ]
+    );
+    let agent = |name: &str| {
+        s.agents
+            .iter()
+            .find(|a| a.name == name)
+            .ok_or_else(|| anyhow::anyhow!("no agent {name}"))
+    };
+    let main = agent("main")?;
+    assert_eq!(
+        (main.source.as_str(), main.version.as_deref()),
+        ("ssh://git@github.com/acme/agent.git#v2", Some("v2"))
+    );
+    assert_eq!(
+        ids(&main.credentials),
+        [("default".to_owned(), Given::Ssh, None)]
+    );
+    assert!(
+        agent("helper")?.credentials.is_empty(),
+        "a path is fetched with none"
+    );
+    assert_eq!(
+        wanted_by(b"https://files.example:8443/claude.tgz"),
+        [("HTTP_AUTH_TOKEN_files.example".to_owned(), Given::Secret)]
+    );
+    assert_eq!(
+        wanted_by(b"https://git.example:8443/acme/h.git#v1"),
+        [("GIT_AUTH_TOKEN.git.example:8443".to_owned(), Given::Secret)]
+    );
+    assert!(wanted_by(b"ghcr.io/acme/claude:3").is_empty());
+    Ok(())
+}
+
+/// P4.6: a harness's source set to a Git repository over SSH, its key chosen by reference from the person's secrets,
+/// writes its `HARNESS … FROM ssh://…` line and the key's reference alone, which its build is given
+/// (`secrets::mine::references`); null takes the reference out. An agent's source and credentials are set as a
+/// harness's are. An id its source isn't fetched with, a value where a name goes (never repeated) and an agent's
+/// model asked here are refused, typed.
+#[test]
+fn p4_6_set_a_git_source_with_an_ssh_key_by_reference() -> anyhow::Result<()> {
+    let text = "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nAGENT main FROM ./agent\nCMD [\"claude\"]\n";
+    let change = HarnessChange {
+        source: Some("ssh://git@github.com/acme/claude.git".into()),
+        version: Some(Some("0123456789abcdef0123456789abcdef01234567".into())),
+        credentials: BTreeMap::from([("default".to_owned(), Some("deploy_key".to_owned()))]),
+        ..HarnessChange::default()
+    };
+    let set = set_harness(text, "claude", &change)?;
+    passes(&set)?;
+    let (added, lost) = diff(text, &set);
+    anyhow::ensure!(
+        added
+            == [
+                "HARNESS claude FROM ssh://git@github.com/acme/claude.git#0123456789abcdef0123456789abcdef01234567",
+                "LABEL kiln.ssh.default=user:DEPLOY_KEY"
+            ]
+            && lost == ["HARNESS claude FROM ./harness"],
+        "{added:?} {lost:?}"
+    );
+    let (refs, bad) = crate::secrets::mine::references(&set);
+    anyhow::ensure!(
+        bad.is_empty()
+            && refs
+                == [Reference {
+                    id: "default".into(),
+                    name: "DEPLOY_KEY".into(),
+                    given: Given::Ssh
+                }],
+        "{refs:?} {bad:?}"
+    );
+    let read = harness(&of(&set)?, "claude")?.credentials.clone();
+    anyhow::ensure!(
+        read == [Credential {
+            id: "default".into(),
+            given: Given::Ssh,
+            secret: Some("DEPLOY_KEY".into())
+        }],
+        "{read:?}"
+    );
+    let out = set_harness(
+        &set,
+        "claude",
+        &HarnessChange {
+            credentials: BTreeMap::from([("default".to_owned(), None)]),
+            ..HarnessChange::default()
+        },
+    )?;
+    anyhow::ensure!(
+        !out.contains("kiln.ssh") && out.contains("FROM ssh://git@github.com/acme/claude.git#"),
+        "{out}"
+    );
+
+    let agent = set_agent_source(
+        text,
+        "main",
+        &HarnessChange {
+            source: Some("https://github.com/acme/agent.git".into()),
+            version: Some(Some("v3".into())),
+            credentials: BTreeMap::from([(
+                "GIT_AUTH_TOKEN.github.com".to_owned(),
+                Some("GH_TOKEN".to_owned()),
+            )]),
+            ..HarnessChange::default()
+        },
+    )?;
+    let (added, _) = diff(text, &agent);
+    anyhow::ensure!(
+        added
+            == [
+                "AGENT main FROM https://github.com/acme/agent.git#v3",
+                "LABEL kiln.secret.GIT_AUTH_TOKEN.github.com=user:GH_TOKEN"
+            ],
+        "{added:?}"
+    );
+
+    let other = set_harness(
+        &set,
+        "claude",
+        &HarnessChange {
+            credentials: BTreeMap::from([(
+                "GIT_AUTH_TOKEN.github.com".to_owned(),
+                Some("GH".to_owned()),
+            )]),
+            ..HarnessChange::default()
+        },
+    );
+    anyhow::ensure!(
+        matches!(&other, Err(Refusal::Value { setting: "credentials", why }) if why.contains("default")),
+        "{other:?}"
+    );
+    let pasted = set_harness(
+        &set,
+        "claude",
+        &HarnessChange {
+            credentials: BTreeMap::from([(
+                "default".to_owned(),
+                Some("-----BEGIN OPENSSH PRIVATE KEY-----".to_owned()),
+            )]),
+            ..HarnessChange::default()
+        },
+    );
+    anyhow::ensure!(
+        matches!(&pasted, Err(Refusal::Value { setting: "credentials", why }) if !why.contains("BEGIN")),
+        "{pasted:?}"
+    );
+    let model = set_agent_source(
+        text,
+        "main",
+        &HarnessChange {
+            model: Some(Some("m".into())),
+            ..HarnessChange::default()
+        },
+    );
+    anyhow::ensure!(matches!(
+        model,
+        Err(Refusal::Value {
+            setting: "agent",
+            ..
+        })
+    ));
+    Ok(())
+}

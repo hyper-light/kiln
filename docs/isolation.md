@@ -135,8 +135,13 @@ What a session does to its harness maps onto the member:
   AC-T4.1.5, as T4's `cp/t4-isolation` held it, 6134fd63b): the home of the user kiln runs as or a
   folder holding it (where an agent started with no folder would work); a folder that is, holds or
   lies in `~/.ssh` or kiln's own state (the folder its microVMs are held beneath, `Microvms::state`:
-  its runner's keys and records, its microVMs' store; and its people's volumes, `Host::homes`); or one
-  holding another worktree of its repository, whose files are another agent's. In a workspace of its
+  its runner's keys and records, its microVMs' store; its people's volumes, `Host::homes`; and the kiln
+  server's data folder, `Host::server_data`: kiln.db, its secrets and tokens, the server's own
+  `[server] data_dir` for its in-process runner and as the machine's kiln config names it for any
+  other runner, which on a machine that runs both holds that runner's default state); or one holding another
+  worktree of its repository, whose files are another agent's. A folder of kiln's not made yet (a
+  person's volumes, a server's data before it starts) is compared as made ones are, through the
+  folders it lies in (macOS's `/var` is `/private/var`). In a workspace of its
   own (a Slates volume kiln mounts beneath its state) it's the folder the workspace lies over that's
   judged, whose files the volume holds. Refused before anything starts, saying which; a project's own
   folder, or a worktree of its own, is shared.
