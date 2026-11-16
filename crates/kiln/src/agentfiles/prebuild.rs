@@ -358,9 +358,20 @@ pub async fn queue(hub: &Hub, id: &str) {
     }
 }
 
+/// What [`queue_in`]'s write found.
+enum Queued {
+    /// The Agentfile was saved again before it: the later save's rows stand.
+    SavedOver,
+    /// It had no rows and has none: nothing changed to tell, nothing to send.
+    Unchanged,
+    /// Its rows were written anew.
+    Written,
+}
+
 /// [`queue`]'s work: a row for each of its person's runners ([`runners_of`]) and each harness its sessions run
 /// ([`harnesses`]), `queued`, or `failed` saying why where its secrets can't be read. A save that finds the Agentfile
-/// changed again before it writes leaves the rows to the later save's.
+/// changed again before it writes leaves the rows to the later save's. Whoever hears of the Agentfile is told its builds
+/// changed only where its rows did, as [`heard`] tells a runner's word.
 async fn queue_in(hub: &Hub, id: &str) -> anyhow::Result<()> {
     let Some(kept) = current(hub, id).await? else {
         return Ok(());
@@ -379,18 +390,19 @@ async fn queue_in(hub: &Hub, id: &str) -> anyhow::Result<()> {
             let tx = crate::store::tx(c)?;
             let at: Option<i64> = tx.query_row("SELECT version FROM agentfiles WHERE id = ?1", params![i], |r| r.get(0)).optional()?;
             if at != Some(version) {
-                return Ok(false);
+                return Ok(Queued::SavedOver);
             }
-            tx.execute("DELETE FROM prebuilds WHERE agentfile_id = ?1", params![i])?;
+            let gone = tx.execute("DELETE FROM prebuilds WHERE agentfile_id = ?1", params![i])?;
             for (runner, harness) in &rows {
                 tx.execute("INSERT INTO prebuilds (agentfile_id, runner, harness, version, state, why, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![i, runner, harness, version, state.as_str(), why, now])?;
             }
             tx.commit()?;
-            Ok(true)
+            Ok(if gone == 0 && rows.is_empty() { Queued::Unchanged } else { Queued::Written })
         })
         .await?;
-    if !written {
-        return Ok(());
+    match written {
+        Queued::SavedOver | Queued::Unchanged => return Ok(()),
+        Queued::Written => {}
     }
     let kept = &asking.kept;
     changed(hub, &kept.owner, id, &kept.name, kept.version);
