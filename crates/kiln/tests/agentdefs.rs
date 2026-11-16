@@ -460,3 +460,23 @@ fn p5_1_kilns_own_agent_definitions_are_listed_copied_and_read_only() -> anyhow:
     anyhow::ensure!(theirs == want && after.get("agents").and_then(Value::as_array).map(Vec::len) == Some(2), "kiln's own as they were: {after}");
     Ok(())
 }
+
+/// kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, slice S2: the Agents page's interrupt, controls and
+/// restart are operations (agents.interrupt, agents.control, agents.restart, listed with every other),
+/// and the bare command route takes none of them, saying which operation does. Taking the refusal out
+/// of the command route answers those commands there again.
+#[test]
+fn p5_6_s2_the_agents_pages_controls_are_operations_and_the_command_route_takes_none() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let srv = start_env(dir.path(), &Options::default(), false, &[])?;
+    for (c, op) in [(json!({"type": "interrupt"}), "interrupt"), (json!({"type": "control", "id": "rename", "value": "x"}), "control"), (json!({"type": "restart"}), "restart")] {
+        let (st, said) = call(&srv, &srv.admin, "POST", "/api/harness/sessions/s-none/command", Some(c))?;
+        anyhow::ensure!(st == 400 && said.to_string().contains(&format!("agents.{op}'s: POST /api/harness/agents/s-none/{op}")), "{op}: {st} {said}\n{}", srv.log());
+    }
+    let (st, ops) = call(&srv, &srv.admin, "GET", "/api/ops", None)?;
+    let names: Vec<String> = ops.get("operations").and_then(Value::as_array).into_iter().flatten().map(|o| s(o, "/name")).collect();
+    anyhow::ensure!(st == 200 && ["agents.control", "agents.restart", "agents.interrupt", "agents.remove"].iter().all(|n| names.iter().any(|m| m == n)), "{names:?}");
+    let (st, said) = call(&srv, &srv.admin, "POST", "/api/harness/agents/s-none/control", Some(json!({ "control": "rename", "value": "x" })))?;
+    anyhow::ensure!(st == 404, "no such agent: {st} {said}");
+    Ok(())
+}

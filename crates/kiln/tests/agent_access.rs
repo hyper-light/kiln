@@ -182,7 +182,8 @@ fn a_person_reaches_the_agents_they_opened() -> anyhow::Result<()> {
     let mut t = t.ok_or_else(|| anyhow::anyhow!("dev1's socket wasn't upgraded: {st}"))?;
     let _ = agents::until_synced(&mut t)?;
     send_text(&mut t, &interrupt.to_string())?;
-    let (st, said) = dev1.call(&s, "POST", &format!("/api/harness/sessions/{mine}/command"), Some(&interrupt))?;
+    // An interrupt is `agents.interrupt`'s, by its own route (P5.6 S2: the generic command route refuses it, naming it).
+    let (st, said) = dev1.call(&s, "POST", &format!("/api/harness/agents/{mine}/interrupt"), None)?;
     assert!((200..300).contains(&st), "dev1 commands their own: {st} {said}");
 
     // mia, a maintainer, reaches both.

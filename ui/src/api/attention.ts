@@ -134,6 +134,28 @@ export const commandAgents = (commands: readonly AttentionCommand[]): string[] =
 const post = <T>(body: object) => request<T>("POST", "/api/harness/attention", body);
 
 /**
+ * A command to the person's attention as its server takes it: a change of an agent's place is its operation's
+ * (`agents.pin`, `agents.unpin`, `agents.park`, `agents.unpark`, `agents.archive`, `agents.restore`: kiln plan
+ * 01a1dd2e8618733a87f2793aab1322a8 P5.6, S6), on its own route; the rest go to attention's.
+ */
+function placeOf(command: AttentionCommand, asked: { key: string; mode: string; visit: string | undefined }): Promise<AttentionSnapshot> {
+  switch (command.action) {
+    case "pin":
+    case "unpin":
+    case "unpark":
+    case "archive":
+    case "restore":
+      return request<AttentionSnapshot>("POST", `/api/harness/agents/${encodeURIComponent(command.agent)}/${command.action}`, asked);
+    case "restore_copy":
+      return request<AttentionSnapshot>("POST", `/api/harness/agents/${encodeURIComponent(command.agent)}/restore`, { ...asked, copy: true });
+    case "park":
+      return request<AttentionSnapshot>("POST", `/api/harness/agents/${encodeURIComponent(command.agent)}/park`, { ...asked, until: command.until });
+    default:
+      return post<AttentionSnapshot>({ ...command, ...asked });
+  }
+}
+
+/**
  * The snapshot `params` ask for, as the list's page reads one (W21-R02): lean (api/attention-lean.ts; a server from
  * before answers the snapshot itself), with the last words of the `rows` rows the list shows first, which the rows
  * that show them then have without asking (api/last-words.ts).
@@ -367,7 +389,8 @@ async function settleOrganized(
   let last: AttentionSnapshot | undefined;
   for (const command of commands) {
     try {
-      const next = await post<AttentionSnapshot>({ ...command, key: clientId(), mode: arrival ? "arrival" : "refresh", visit: arrival ?? visit });
+      const asked = { key: clientId(), mode: arrival ? "arrival" : "refresh", visit: arrival ?? visit };
+      const next = await placeOf(command, asked);
       if (next.undo) result.undo.push(next.undo);
       last = next;
     } catch (e) {

@@ -271,7 +271,7 @@ fn w27_r08_a_session_resumed_from_kilns_copy_is_kilns_take() -> anyhow::Result<(
     // box-a goes away: the session goes on on box-b, from kiln's copy.
     drop(a);
     until(Duration::from_secs(60), || Ok((!connected(port, admin, "box-a")?).then_some(())))?;
-    let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+    let (st, body) = http(port, "POST", &format!("/api/harness/agents/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
     anyhow::ensure!((200..300).contains(&st) && body.contains("from_store"), "{st} {body}");
     let v = session_chain(dir.path(), port, admin, &id, 2)?;
     let hops = v.get("hops").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -307,7 +307,7 @@ fn w27_r08_session_hand_overs_a_move_signed_by_both_machines() -> anyhow::Result
     let e0 = first_epoch(port, admin, &id)?;
     record_written(dir.path())?;
     let moved = until(Duration::from_secs(60), || {
-        let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+        let (st, body) = http(port, "POST", &format!("/api/harness/agents/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
         Ok((200..300).contains(&st).then_some(body))
     })?;
     anyhow::ensure!(!moved.contains("from_store"), "a move between two machines online, not a resume: {moved}");
@@ -362,7 +362,7 @@ fn cp_t3_2_a_session_moves_between_machines_after_the_server_started_again() -> 
     until(Duration::from_secs(120), || Ok((connected(port, admin, "box-a")? && connected(port, admin, "box-b")? && runs_on(port, admin, &id)? == on_a).then_some(())))?;
     // Asked to move, as a person asks: it goes, and runs on box-b.
     let asked = until(Duration::from_secs(60), || {
-        let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+        let (st, body) = http(port, "POST", &format!("/api/harness/agents/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
         Ok((200..300).contains(&st).then_some(body))
     })?;
     anyhow::ensure!(!asked.contains("from_store"), "a move between two machines online, not a resume: {asked}");
@@ -550,7 +550,7 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
     // Moved to box-b, both online.
     record_written(dir.path())?;
     until(Duration::from_secs(60), || {
-        let (st, _) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+        let (st, _) = http(port, "POST", &format!("/api/harness/agents/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
         Ok((200..300).contains(&st).then_some(()))
     })?;
     chain_through(1, "moved")?;
@@ -572,7 +572,7 @@ fn w27_r08_session_hand_overs() -> anyhow::Result<()> {
         let (_, agents) = http(port, "GET", "/api/agents", admin, None).unwrap_or_default();
         anyhow::anyhow!("box-b away: {e}: {agents}")
     })?;
-    let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-a"})))?;
+    let (st, body) = http(port, "POST", &format!("/api/harness/agents/{id}/move"), admin, Some(&json!({"to": "box-a"})))?;
     anyhow::ensure!((200..300).contains(&st) && body.contains("from_store"), "{st} {body}");
     let v = chain_through(4, "resumed")?;
     let got = transfers(&v);
@@ -800,7 +800,7 @@ fn w27_ac05_the_twin_played_again() -> anyhow::Result<()> {
     };
     // box-a cut off: the session goes on on box-b, from kiln's copy.
     until(Duration::from_secs(120), || Ok((!connected(port, admin, "box-a")?).then_some(())))?;
-    let (st, body) = http(port, "POST", &format!("/api/harness/sessions/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
+    let (st, body) = http(port, "POST", &format!("/api/harness/agents/{id}/move"), admin, Some(&json!({"to": "box-b"})))?;
     anyhow::ensure!((200..300).contains(&st) && body.contains("from_store"), "{st} {body}");
     session_chain(dir.path(), port, admin, &id, 2)?;
     // The copy, cut off and still at epoch e0, acts: its goal met and a CI run, through its runner
