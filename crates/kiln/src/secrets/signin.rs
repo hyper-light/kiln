@@ -3,11 +3,12 @@
 //! CLI's own refresh would ([`Provider::upstream`]), and the CLI in the microVM is answered a token
 //! response whose tokens are placeholders ([`answer`]).
 //!
-//! A sign-in's name says its provider: `claude/…` for Claude Code's, `codex/…` for Codex's, kiln's
-//! harness kinds (`crate::accounts`). A name that names no provider is captured by no run, so
-//! nothing is kept that couldn't be refreshed.
+//! A sign-in's name says its provider: `claude/…` for Claude Code's, `codex/…` for Codex's,
+//! `goose/…` for goose's ChatGPT sign-in, kiln's harness kinds (`crate::accounts`). A name that
+//! names no provider is captured by no run, so nothing is kept that couldn't be refreshed. Each
+//! other harness's reason is its row in Shards' D242 (the sign-in profiles lane's survey).
 //!
-//! An isolated harness of either is granted its sign-in as it launches ([`SignIn`], made by
+//! An isolated harness of any of them is granted its sign-in as it launches ([`SignIn`], made by
 //! [`Provider::grant`] alone, so its name and its CLI come from one provider; Shards' D242, step 8;
 //! Hex's C8): `<provider>/<person>`, the person it acts for by the folder kiln keeps their homes in
 //! (`harness::isolated::home::person_dir`), so one sign-in of a CLI serves each person's runs, as
@@ -21,7 +22,11 @@
 //! `access_token`, `refresh_token` (keeping its own where none comes), `expires_in` and `scope`;
 //! Codex rust-v0.167.2 posts JSON `grant_type`, `client_id` and `refresh_token`
 //! (login/src/oauth/client.rs:97-113), and keeps each of `id_token`, `access_token` and
-//! `refresh_token` only where one comes (auth/manager.rs:1758-1766, 1855-1860).
+//! `refresh_token` only where one comes (auth/manager.rs:1758-1766, 1855-1860). goose 1.59.0's
+//! ChatGPT sign-in is Codex's OAuth client (`chatgpt_codex.rs`:38-39, commit 5d03ef6e): it posts
+//! the same fields as a form (500-514) and reads `access_token`, `refresh_token`, and `id_token`
+//! and `expires_in` where they come (461-466, 774-781); the broker refreshes it as Codex's, in
+//! JSON, which that client's provider takes from Codex.
 
 use futures::future::BoxFuture;
 use kiln_seams::secrets::SecretValue;
@@ -33,6 +38,13 @@ use super::broker::{Captured, Tokens, Unrefreshed, Upstream};
 pub enum Provider {
     ClaudeCode,
     Codex,
+    /// goose 1.59.0's ChatGPT sign-in (its `chatgpt_codex` provider), which signs in as Codex's OAuth
+    /// client (`CLIENT_ID` `app_EMoamEEZ73f0CkXaXp7hrann` at `https://auth.openai.com`,
+    /// crates/goose/src/providers/chatgpt_codex.rs:38-39 at commit 5d03ef6e): so its token endpoint,
+    /// its refresh, the hosts its access token goes to and Shards' profile of it are Codex's; its
+    /// name and its file are its own. It reads its account from its ID token's claims, unverified
+    /// (412-422), which Shards' inert ID token keeps.
+    Goose,
 }
 
 /// Claude Code 2.1.311's OAuth client: its production config's `CLIENT_ID` (offset 238938203).
@@ -45,7 +57,7 @@ const CODEX_CLIENT: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const RESPONSE_MAX: usize = 4 << 20;
 
 /// Every provider, in the order kiln reads a sign-in's name against them.
-const PROVIDERS: [Provider; 2] = [Provider::ClaudeCode, Provider::Codex];
+const PROVIDERS: [Provider; 3] = [Provider::ClaudeCode, Provider::Codex, Provider::Goose];
 
 /// A sign-in an isolated harness's launch grants it (Shards' D242, step 8; Hex's C8): its CLI's own
 /// sign-in, its token response taken outside the microVM, its CLI given placeholders. Made by
@@ -70,8 +82,8 @@ impl Provider {
     }
 
     /// The provider whose CLI kiln's harness `harness` runs (`crate::harness::kinds::Kind`'s id),
-    /// where the broker answers its sign-in; none for every other harness, whose CLI no Shards
-    /// profile captures (Shards' D242, step 8).
+    /// where the broker answers its sign-in; none for every other harness, whose sign-in no Shards
+    /// profile captures (each one's reason is its row in Shards' D242).
     pub fn of_harness(harness: &str) -> Option<Provider> {
         PROVIDERS.into_iter().find(|p| p.word() == harness)
     }
@@ -81,14 +93,16 @@ impl Provider {
         match self {
             Provider::ClaudeCode => "claude",
             Provider::Codex => "codex",
+            Provider::Goose => "goose",
         }
     }
 
-    /// Its CLI, as Hex grants it a sign-in.
+    /// The CLI whose OAuth client it signs in as, as Hex grants it a sign-in: Shards' profile of its
+    /// token endpoint is that client's (D242).
     pub fn cli(self) -> hex_api::SignInCli {
         match self {
             Provider::ClaudeCode => hex_api::SignInCli::ClaudeCode,
-            Provider::Codex => hex_api::SignInCli::Codex,
+            Provider::Codex | Provider::Goose => hex_api::SignInCli::Codex,
         }
     }
 
@@ -104,7 +118,7 @@ impl Provider {
     fn token(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Provider::ClaudeCode => ("claude:token", "platform.claude.com", "/v1/oauth/token"),
-            Provider::Codex => ("codex:token", "auth.openai.com", "/oauth/token"),
+            Provider::Codex | Provider::Goose => ("codex:token", "auth.openai.com", "/oauth/token"),
         }
     }
 
@@ -117,30 +131,46 @@ impl Provider {
     /// The hosts its CLI sends its sign-in's access token to, which kiln's Agentfile for its harness
     /// grants: Claude Code's API (`Authorization: Bearer`, Shards' STEP8.md question 7, offset
     /// 242399004), and Codex's Responses through ChatGPT's backend (`https://chatgpt.com/backend-api/codex`,
-    /// its record's "Hosts by name", docs/research/s20-codex-agentfile). Never its token host, where
-    /// Shards' injector fills nothing in.
+    /// its record's "Hosts by name", docs/research/s20-codex-agentfile), as goose's is
+    /// (`CODEX_API_ENDPOINT`, chatgpt_codex.rs:40). Never its token host, where Shards' injector
+    /// fills nothing in.
     pub fn toward(self) -> &'static [&'static str] {
         match self {
             Provider::ClaudeCode => &["api.anthropic.com"],
-            Provider::Codex => &["chatgpt.com"],
+            Provider::Codex | Provider::Goose => &["chatgpt.com"],
         }
     }
 
-    /// The file its CLI keeps its sign-in in, in the folder it keeps its configuration in (Claude
-    /// Code's `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME`: `home::Layout::kept_in`): Claude Code
+    /// The file its CLI keeps its sign-in in, in the folder [`Provider::file_in`] finds: Claude Code
     /// 2.1.311's `storagePath`, `.credentials.json` (Shards' evidence e_q2_creds.txt, offset
-    /// 241605977), and Codex rust-v0.167.2's `auth.json` (login/src/auth/storage.rs:168).
+    /// 241605977), Codex rust-v0.167.2's `auth.json` (login/src/auth/storage.rs:168), and goose
+    /// 1.59.0's `chatgpt_codex/tokens.json` in its configuration folder (chatgpt_codex.rs:331-333).
     pub fn file(self) -> &'static str {
         match self {
             Provider::ClaudeCode => ".credentials.json",
             Provider::Codex => "auth.json",
+            Provider::Goose => "chatgpt_codex/tokens.json",
         }
+    }
+
+    /// Where its CLI's file is in its microVM, by `layout`'s run environment: in the folder Claude
+    /// Code and Codex keep their configuration in (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`:
+    /// `home::Layout::kept_in`), and in goose's configuration folder, `config` beneath the
+    /// `GOOSE_PATH_ROOT` kiln's goose image sets (crates/goose/src/config/paths.rs:8-16, 41). None
+    /// where its run environment doesn't say.
+    pub fn file_in(self, layout: &crate::harness::isolated::home::Layout) -> Option<String> {
+        let dir = match self {
+            Provider::ClaudeCode | Provider::Codex => layout.kept_in()?,
+            Provider::Goose => format!("{}/config", layout.dir_named("GOOSE_PATH_ROOT")?.trim_end_matches('/')),
+        };
+        Some(format!("{}/{}", dir.trim_end_matches('/'), self.file()))
     }
 
     /// The placeholders `text`, its CLI's file ([`Provider::file`]), holds for its access token and
     /// its refresh token where it holds one: Claude Code's `claudeAiOauth.accessToken` and
     /// `refreshToken` (offset 242352375), Codex's `tokens.access_token` and `refresh_token`
-    /// (login/src/token_data.rs:20-22), each of the broker's form. None where it holds no sign-in,
+    /// (login/src/token_data.rs:20-22), goose's `access_token` and `refresh_token` at its top
+    /// (`TokenData`, chatgpt_codex.rs:317-324), each of the broker's form. None where it holds no sign-in,
     /// one with a token of another form (one from before kiln captured its sign-ins, which its first
     /// refresh through Shards' injector gives placeholders), or one placeholder for both, which no
     /// capture gives and Hex refuses.
@@ -148,6 +178,7 @@ impl Provider {
         let (at, access, refresh) = match self {
             Provider::ClaudeCode => ("/claudeAiOauth", "accessToken", "refreshToken"),
             Provider::Codex => ("/tokens", "access_token", "refresh_token"),
+            Provider::Goose => ("", "access_token", "refresh_token"),
         };
         let file: serde_json::Value = serde_json::from_str(text).ok()?;
         let tokens = file.pointer(at)?;
@@ -175,12 +206,13 @@ impl Provider {
         Some(SignIn { provider: self, name, toward: self.toward().iter().map(|h| (*h).to_owned()).collect(), captured })
     }
 
-    /// Its refresh's body, as its CLI's own makes it: Claude Code asks the scope its sign-in holds
-    /// again; where none is held, none is asked, which asks the scope first granted (RFC 6749 §6).
+    /// Its refresh's body, as its OAuth client's own CLI makes it (goose's is Codex's): Claude Code
+    /// asks the scope its sign-in holds again; where none is held, none is asked, which asks the
+    /// scope first granted (RFC 6749 §6).
     fn body(self, refresh: &str, scope: Option<&str>) -> Result<Vec<u8>, Unrefreshed> {
         let mut body = match self {
             Provider::ClaudeCode => serde_json::json!({ "grant_type": "refresh_token", "refresh_token": refresh, "client_id": CLAUDE_CODE_CLIENT }),
-            Provider::Codex => serde_json::json!({ "client_id": CODEX_CLIENT, "grant_type": "refresh_token", "refresh_token": refresh }),
+            Provider::Codex | Provider::Goose => serde_json::json!({ "client_id": CODEX_CLIENT, "grant_type": "refresh_token", "refresh_token": refresh }),
         };
         if let (Provider::ClaudeCode, Some(scope), Some(fields)) = (self, scope, body.as_object_mut()) {
             fields.insert("scope".into(), scope.into());
@@ -407,6 +439,49 @@ mod tests {
         for text in unheld {
             assert_eq!(Provider::ClaudeCode.held(&text), None, "{text}");
         }
+        Ok(())
+    }
+
+    /// Plan step 33 (Shards' D242, the sign-in profiles lane): goose's ChatGPT sign-in is Codex's OAuth
+    /// client, so Hex is told Codex's CLI, and its token endpoint, its refresh and the hosts its access
+    /// token goes to are Codex's; its name and the file its placeholders are read back from are its own.
+    #[test]
+    fn s33_gooses_chatgpt_sign_in_is_codexs_client_under_its_own_name() -> anyhow::Result<()> {
+        assert_eq!((Provider::of_harness("goose"), Provider::of("goose/user-ada")), (Some(Provider::Goose), Some(Provider::Goose)));
+        assert_eq!(Provider::Goose.sign_in("user:ada").as_deref(), Some("goose/user-ada"));
+        assert_eq!(Provider::Goose.cli(), hex_api::SignInCli::Codex);
+        assert_eq!((Provider::Goose.token(), Provider::Goose.toward()), (Provider::Codex.token(), Provider::Codex.toward()));
+        let read = |b: Vec<u8>| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_slice(&b)?) };
+        assert_eq!(read(Provider::Goose.body("rt-1", Some("openid")).map_err(anyhow::Error::msg)?)?, read(Provider::Codex.body("rt-1", Some("openid")).map_err(anyhow::Error::msg)?)?);
+        let (a, r) = (placeholder('a'), placeholder('b'));
+        let file = serde_json::json!({ "access_token": a, "refresh_token": r, "id_token": "h.p.shards-placeholder", "expires_at": "2026-11-16T00:00:00Z", "account_id": "acct" }).to_string();
+        let egress: Vec<String> = ["auth.openai.com:443", "chatgpt.com:443"].map(String::from).to_vec();
+        let granted = Provider::Goose.grant("user:ada", &egress, Some(&file)).ok_or_else(|| anyhow::anyhow!("no goose grant"))?;
+        assert_eq!((granted.name.as_str(), granted.toward.clone()), ("goose/user-ada", vec!["chatgpt.com".to_owned()]));
+        assert_eq!(granted.captured, Some(hex_api::Captured { access: "sign-ins/goose/user-ada/access".into(), access_placeholder: a.clone(), refresh_placeholder: Some(r.clone()) }));
+        assert_eq!(Provider::Codex.held(&file), None, "goose's file is no Codex file");
+        let codex = serde_json::json!({ "tokens": { "access_token": a, "refresh_token": r } }).to_string();
+        assert_eq!(Provider::Goose.held(&codex), None, "Codex's file is no goose file");
+        assert_eq!(Provider::Goose.grant("user:ada", &["auth.openai.com:443".to_owned()], None), None, "its egress doesn't reach chatgpt.com");
+        Ok(())
+    }
+
+    /// Plan step 33 (Shards' D242, the sign-in profiles lane): a CLI's sign-in file is where its run
+    /// environment puts it: Codex's in its `CODEX_HOME`, goose's in `config` beneath its
+    /// `GOOSE_PATH_ROOT`, as kiln's goose image sets it; none where its environment doesn't say.
+    #[test]
+    fn s33_a_clis_sign_in_file_is_where_its_run_environment_puts_it() -> anyhow::Result<()> {
+        use crate::harness::isolated::home::Layout;
+        fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+        }
+        let root = std::path::Path::new("/kiln/homes");
+        let goose = Layout::new(root, "owner", "goose", &["/home/goose".to_owned()], &env(&[("HOME", "/home/goose"), ("GOOSE_PATH_ROOT", "/home/goose/.local/share/goose")]))?;
+        assert_eq!(Provider::Goose.file_in(&goose).as_deref(), Some("/home/goose/.local/share/goose/config/chatgpt_codex/tokens.json"));
+        let unsaid = Layout::new(root, "owner", "goose", &["/home/goose".to_owned()], &env(&[("HOME", "/home/goose")]))?;
+        assert_eq!(Provider::Goose.file_in(&unsaid), None);
+        let codex = Layout::new(root, "owner", "codex", &["/home/codex/.codex".to_owned()], &env(&[("CODEX_HOME", "/home/codex/.codex")]))?;
+        assert_eq!(Provider::Codex.file_in(&codex).as_deref(), Some("/home/codex/.codex/auth.json"));
         Ok(())
     }
 }

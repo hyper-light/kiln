@@ -1368,12 +1368,13 @@ to `s28-pi-agentfile`).
   is given back as the run ends, however it ends. kiln keeps a ledger of them, so not even a restart
   of kiln leaves one live past its run's end.
 - **Signing in.** The harness's own sign-in will run inside its microVM, on its own terminal. Claude
-  Code's and Codex's runs are granted your sign-in by name (`claude/<you>`, `codex/<you>`), and the
+  Code's, Codex's and goose's runs are granted your sign-in by name (`claude/<you>`, `codex/<you>`,
+  `goose/<you>`: goose's ChatGPT sign-in, which signs in as Codex does), and the
   tokens their providers send back are taken out on the way in: kiln keeps them in its secret store,
   with the scope they were granted, and the harness gets placeholders, which its file in your volume
   keeps, so your next run's harness holds the same ones. Its access token is filled in only toward
   its provider's API (`api.anthropic.com`, `chatgpt.com`). kiln makes each refresh itself, as that
-  CLI makes it (Claude Code's at `platform.claude.com`, Codex's at `auth.openai.com`), one at a time
+  CLI makes it (Claude Code's at `platform.claude.com`, Codex's and goose's at `auth.openai.com`), one at a time
   for a sign-in however many runs use it, keeps the new tokens where the old ones were, so the
   placeholders stay, and answers the harness with placeholders alone: a refresh never brings a new
   token in. A refresh its provider refuses tells the harness to sign in again. Signing out inside is
@@ -1381,14 +1382,15 @@ to `s28-pi-agentfile`).
   plan and account), never its signature, and a refresh's new ID token isn't passed on. A request
   that would make an API key from a taken token is refused. Every runner leases these from kiln's
   server, which answers a runner only for the people its own isolated agents act for. The other
-  harnesses sign in themselves, their tokens in your volume: Shards knows no profile of their
-  sign-ins.
+  harnesses, and goose's other sign-ins, sign in themselves, their tokens in your volume: each
+  checks or reads its token in a way a placeholder can't pass, or takes a key instead (Shards'
+  D242 says which, for each).
 - **Yours stay in your volume.** What a harness keeps of its sign-in it keeps in your volume, which
   no other person's agent is given. Once its tokens are taken outside, what it keeps there are
   placeholders.
-- **Not yet.** kiln grants a run no other credential yet, an API key for one: only those two
-  sign-ins. Where a runner's microVMs can't lease, or its server answers no leases yet, Claude Code
-  and Codex sign in themselves too, their tokens in your volume, as the runner's log says. kiln has
+- **Not yet.** kiln grants a run no other credential yet, an API key for one: only those
+  sign-ins. Where a runner's microVMs can't lease, or its server answers no leases yet, Claude Code,
+  Codex and goose sign in themselves too, their tokens in your volume, as the runner's log says. kiln has
   no terminal into a microVM yet. The egress has filled in a value and masked its echo in real
   microVMs only in Shards' own tests (Linux and Windows, on x86-64), not yet for a harness kiln
   starts; the check that no value is anywhere in a run's memory, disk or environment is built, its
@@ -1483,7 +1485,7 @@ a resume, a restore), for the session's life.
 |---|---|---|
 | `sessions.ports.publish` / `unpublish` | `agent`, `bind` (the host address: who may reach it), `host_port`, `guest_port`, `protocol` (`tcp`, `udp`); a port reaches the members its image gives it coming in, as Shards publishes one | microVM |
 | `sessions.egress.grant` / `revoke` | `agent`, `host` (a DNS name or an address), `port`, `member` | microVM |
-| `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member` | microVM |
+| `sessions.networks.connect` / `disconnect` | `agent`, `network`, `member`, and one grant there, every part named (Shards' D285: joining grants nothing else): `name` (the member's name on the network, a host's name, one member's there), `peer` (a member of another run on it, by its name there), `way` (`out`: it opens flows toward its peer; `in`: its peer opens them toward it), `protocol` (`tcp`, `udp`), `port` (to `last_port`, a range); a flow between two runs' members is where the grants of both its ends take it, and a grant taken back resets the flows it let open | microVM |
 | `sessions.volumes.add` / `remove` | `agent`, `path` (a folder of its machine), `access` (`ro`, `rw`), `at` (where a microVM sees it), `members` | every engine |
 | `sessions.components.swap` / `restore` | `agent`, `kind` (`agent`, `harness`, `mcp`), `path` (its member's directory: `/harness/<harness>`, the default, `/agents/<name>`, `/mcp/<name>`), `source` and its pin (`checksum`, `version_id`), `force` | every engine |
 

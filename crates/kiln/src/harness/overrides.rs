@@ -5,9 +5,10 @@
 //! edit, no image build, no new microVM and no session restart.
 //!
 //! - **What.** Ports published into its microVM (a host address and port to a member's port, TCP or UDP), egress
-//!   granted out of it (a member to a host and port), its members on named networks, and volumes: a folder of its
-//!   machine, read-only or read-write, at a path, for some of its members. Every grant names who, to whom, which ports
-//!   and which way (default deny): nothing is implied.
+//!   granted out of it (a member to a host and port), its members on named networks shared with other runs (each grant
+//!   there its member's name on the network, a peer by its name there, ports and which way: Shards' D285), and volumes:
+//!   a folder of its machine, read-only or read-write, at a path, for some of its members. Every grant names who, to
+//!   whom, which ports and which way (default deny): nothing is implied.
 //! - **Where each applies.** Ports, egress and networks are a microVM's: a session on its machine's host (engine
 //!   `host`, P2.3) refuses them, naming its engine, and `agents.get` offers them only on a `microvm` one ([`ops_for`]).
 //!   A volume is every engine's: its folder joins its harness's own allowed folders (each harness's own mechanism,
@@ -86,6 +87,16 @@ pub enum Protocol {
     Udp,
 }
 
+/// Which way a grant on a network lets a flow open: from its member toward its peer, or from its peer toward it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "LiveWay"))]
+#[serde(rename_all = "lowercase")]
+pub enum Way {
+    In,
+    Out,
+}
+
 /// Whether a volume's members may change it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -137,13 +148,34 @@ pub struct Egress {
     pub port: u16,
 }
 
-/// A member on a named network, shared with the runs connected to it.
+/// A member on a named network, shared with the runs connected to it, and what it's granted there.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "LiveNetwork"))]
 pub struct Network {
     pub member: Member,
     pub name: String,
+    /// Its grant there (Shards' D285): none in a record from before grants named their parts, which grants nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub grant: Option<NetworkGrant>,
+}
+
+/// What a member's connection to a network grants it, every part named (Shards' D285; default deny): its name there,
+/// its peer, the ports and which way a flow opens.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "LiveNetworkGrant"))]
+pub struct NetworkGrant {
+    /// Its name on the network, a host's name, as its peers name it: one member's there.
+    pub name: String,
+    /// The member of another run it reaches or is reached by, by its name on the network.
+    pub peer: String,
+    pub protocol: Protocol,
+    /// The first port and the last: one port, the same.
+    pub first: u16,
+    pub last: u16,
+    pub way: Way,
 }
 
 /// A folder of the session's machine, given to some of its members.
@@ -545,7 +577,11 @@ pub fn check(change: &Change, microvm: bool, harness: &str) -> Result<(), String
         Change::Connect(n) | Change::Disconnect(n) => {
             on_host("A network")?;
             members(std::slice::from_ref(&n.member))?;
-            if named(&n.name) { Ok(()) } else { Err(format!("{:?} is no network's name: letters, digits, `-`, `_` and `.`", n.name)) }
+            if !named(&n.name) {
+                return Err(format!("{:?} is no network's name: letters, digits, `-`, `_` and `.`", n.name));
+            }
+            let grant = n.grant.as_ref().ok_or_else(|| "a connection names its grant whole: its member's name on the network, its peer there, its protocol and ports, and which way (default deny: nothing is implied)".to_owned())?;
+            network_grant(grant).check().map_err(|e| e.to_string())
         }
         Change::Add(v) => {
             if v.members.is_empty() {
@@ -678,6 +714,7 @@ pub fn take(o: &mut Overrides, change: &Change) -> Result<Taken, String> {
             if o.networks.iter().any(|h| h.network == *n) {
                 Taken::Same
             } else {
+                named_once(o, n)?;
                 o.networks.push(HeldNetwork { network: n.clone(), microvm: waiting() });
                 Taken::Added
             }
@@ -723,6 +760,23 @@ pub fn take(o: &mut Overrides, change: &Change) -> Result<Taken, String> {
     Ok(taken)
 }
 
+/// Whether `n` keeps its network's names among those `o` holds as Shards' D285 keeps them: one name a member there, and
+/// a name one member's (RFC 4343: names compare case-insensitively). Why not, in words.
+fn named_once(o: &Overrides, n: &Network) -> Result<(), String> {
+    let Some(g) = &n.grant else { return Ok(()) };
+    let on = o.networks.iter().filter(|h| h.network.name == n.name).filter_map(|h| Some((&h.network.member, h.network.grant.as_ref()?)));
+    for (member, held) in on {
+        let same = held.name.eq_ignore_ascii_case(&g.name);
+        if *member == n.member && !same {
+            return Err(format!("{} is on network {} as {} already: a member has one name there (take its grants there back first)", n.member.said(), n.name, held.name));
+        }
+        if *member != n.member && same {
+            return Err(format!("{} on network {} is {}'s already: a name there is one member's", g.name, n.name, member.said()));
+        }
+    }
+    Ok(())
+}
+
 fn proto(p: Protocol) -> &'static str {
     match p {
         Protocol::Tcp => "tcp",
@@ -743,7 +797,7 @@ pub fn changes(o: &Overrides) -> Vec<(Place, kiln_seams::sandbox::Change)> {
     let mut out = Vec::new();
     out.extend(o.ports.iter().enumerate().map(|(i, h)| (Place::Port(i), seam_publish(&h.port))));
     out.extend(o.egress.iter().enumerate().map(|(i, h)| (Place::Egress(i), seam_grant(&h.egress, true))));
-    out.extend(o.networks.iter().enumerate().map(|(i, h)| (Place::Network(i), seam_network(&h.network, true))));
+    out.extend(o.networks.iter().enumerate().filter_map(|(i, h)| Some((Place::Network(i), seam_network(&h.network, true)?))));
     out.extend(o.volumes.iter().enumerate().map(|(i, h)| (Place::Volume(i), seam_plug(&h.volume))));
     out
 }
@@ -844,13 +898,13 @@ pub fn seam_change(change: &Change, removed: Option<&Removed>) -> Option<kiln_se
     match (change, removed) {
         (Change::Publish(p), _) => Some(seam_publish(p)),
         (Change::Grant(e), _) => Some(seam_grant(e, true)),
-        (Change::Connect(n), _) => Some(seam_network(n, true)),
+        (Change::Connect(n), _) => seam_network(n, true),
         (Change::Add(v), _) => Some(seam_plug(v)),
         (Change::Swap { component, .. }, _) => Some(kiln_seams::sandbox::Change::Swap { at: component.path.clone(), component: seam_component(component) }),
         (_, Some(Removed::Component(c))) => Some(kiln_seams::sandbox::Change::Restore { at: c.path.clone() }),
         (_, Some(Removed::Port(p))) => Some(kiln_seams::sandbox::Change::Unpublish { udp: p.protocol == Protocol::Udp, host: bound(&p.bind, p.host_port) }),
         (_, Some(Removed::Egress(e))) => Some(seam_grant(e, false)),
-        (_, Some(Removed::Network(n))) => Some(seam_network(n, false)),
+        (_, Some(Removed::Network(n))) => seam_network(n, false),
         (_, Some(Removed::Volume(v))) => Some(kiln_seams::sandbox::Change::Unplug { at: v.at.clone() }),
         (_, None) => None,
     }
@@ -879,9 +933,19 @@ fn seam_grant(e: &Egress, grant: bool) -> kiln_seams::sandbox::Change {
     if grant { kiln_seams::sandbox::Change::Grant { member, host, port } } else { kiln_seams::sandbox::Change::Revoke { member, host, port } }
 }
 
-fn seam_network(n: &Network, connect: bool) -> kiln_seams::sandbox::Change {
-    let (member, network) = (member_of(&n.member), n.name.clone());
-    if connect { kiln_seams::sandbox::Change::Connect { member, network } } else { kiln_seams::sandbox::Change::Disconnect { member, network } }
+/// The seam's connection of `n`, or its grant taken back; none where it names no grant, which grants nothing.
+fn seam_network(n: &Network, connect: bool) -> Option<kiln_seams::sandbox::Change> {
+    let (member, network, grant) = (member_of(&n.member), n.name.clone(), network_grant(n.grant.as_ref()?));
+    Some(if connect { kiln_seams::sandbox::Change::Connect { member, network, grant } } else { kiln_seams::sandbox::Change::Disconnect { member, network, grant } })
+}
+
+fn network_grant(g: &NetworkGrant) -> kiln_seams::sandbox::NetworkGrant {
+    use kiln_seams::sandbox::{Ports, Way as W};
+    let way = match g.way {
+        Way::In => W::In,
+        Way::Out => W::Out,
+    };
+    kiln_seams::sandbox::NetworkGrant { name: g.name.clone(), peer: g.peer.clone(), ports: Ports { udp: g.protocol == Protocol::Udp, first: g.first, last: g.last }, way }
 }
 
 fn seam_plug(v: &Volume) -> kiln_seams::sandbox::Change {
@@ -1046,7 +1110,9 @@ async fn network(cx: Cx, v: Value, connect: bool) -> Out {
     let info = session_of(&cx, &v).await?;
     let i: input::Network = read(&v)?;
     let member = Member::read(i.member.as_deref(), &info.kind).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let n = Network { member, name: i.network.trim().to_owned() };
+    // Names on a network as Shards' D285 leases them, lowercased (RFC 4343).
+    let grant = NetworkGrant { name: i.name.trim().to_ascii_lowercase(), peer: i.peer.trim().to_ascii_lowercase(), protocol: i.protocol, first: i.port, last: i.last_port.unwrap_or(i.port), way: i.way };
+    let n = Network { member, name: i.network.trim().to_owned(), grant: Some(grant) };
     send(&cx, &info, if connect { Change::Connect(n) } else { Change::Disconnect(n) }).await
 }
 
@@ -1151,7 +1217,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "sessions.networks.connect",
-            summary: "Connect a running microVM session's `member` (`harness`, the default, `agent:<name>` or `mcp:<name>`) to the named `network` it shares with the runs connected to it, in place. A microVM session's alone: a session on its machine's host refuses it, naming its engine.",
+            summary: "Connect a running microVM session's `member` (`harness`, the default, `agent:<name>` or `mcp:<name>`) to the named `network` it shares with the runs connected to it, in place, on one grant whose every part is named (default deny: joining grants nothing else; Shards D285): its `name` on the network (a host's name, one member's there, as its peers name it), its `peer` (a member of another run on it, by its name there), `way` out (it opens flows toward its peer) or in (its peer opens them toward it), `protocol` tcp or udp, and `port` (to `last_port`, a range). A flow between two runs' members is where the grants of both its ends take it; connect again for each other peer, port or way. A microVM session's alone: a session on its machine's host refuses it, naming its engine.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::Network>(),
@@ -1160,7 +1226,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "sessions.networks.disconnect",
-            summary: "Disconnect a running microVM session's `member` from the named `network`.",
+            summary: "Take back a grant a running microVM session's `member` holds on the named `network`, named as it was connected (`name`, `peer`, `way`, `protocol`, `port`, `last_port`): the flows it let open are reset, and the member leaves the network with its last grant there.",
             read_only: false,
             destructive: true,
             input: Input::of::<input::Network>(),
@@ -1220,7 +1286,7 @@ pub mod input {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
-    pub use super::{Access, ComponentKind, Protocol};
+    pub use super::{Access, ComponentKind, Protocol, Way};
 
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -1266,6 +1332,17 @@ pub mod input {
         pub member: Option<String>,
         /// The network's name.
         pub network: String,
+        /// The member's name on the network, a host's name, as its peers name it: one member's there.
+        pub name: String,
+        /// The member of another run it reaches or is reached by: its name on the network.
+        pub peer: String,
+        /// out: it opens flows toward its peer; in: its peer opens them toward it.
+        pub way: Way,
+        pub protocol: Protocol,
+        /// The port, 1 to 65535: the first of a range that ends at `last_port`.
+        pub port: u16,
+        /// The last port of a range; none, `port` alone.
+        pub last_port: Option<u16>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
