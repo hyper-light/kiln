@@ -255,7 +255,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.experiments.criteria.add",
-            summary: "Add a criterion to one of your experiments, whatever it stands at: its `name`, its `query` in kiln's monitoring syntax (Datadog's, as kiln's monitors take one) without its comparison (`avg(last_14d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`), its `op` (>, >=, ==, !=, < or <=) and `bound`, kept as you wrote them once kiln's monitors read them. Answers `{experiment}` as agentdefs.experiments.create does.",
+            summary: "Add a criterion to one of your experiments, whatever it stands at: its `name`, its `query` in kiln's monitoring syntax (Datadog's, as kiln's monitors take one) without its comparison (`avg(last_7d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`), its `op` (>, >=, ==, !=, < or <=) and `bound`, kept as you wrote them once kiln's monitors read them. Answers `{experiment}` as agentdefs.experiments.create does.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::ExperimentsCriteriaAdd>(),
@@ -370,7 +370,7 @@ pub mod input {
     pub struct Criterion {
         pub name: String,
         /// What it measures, in kiln's monitoring syntax (Datadog's, as kiln's monitors take a query), without its
-        /// comparison: `avg(last_14d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`.
+        /// comparison: `avg(last_7d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`.
         pub query: String,
         /// How its value compares with `bound`: >, >=, ==, !=, < or <=.
         pub op: Comparison,

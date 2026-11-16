@@ -58,7 +58,7 @@ fn vm(weight: u32, cpus: u32, gib: u64) -> Value {
 }
 
 fn warm(experiment: &str) -> Value {
-    json!({"name": "Warm start", "query": format!("avg(last_14d):avg:kiln.session.warm_ms{{experiment:{experiment}}} by {{variant}}"), "op": "<=", "bound": 250})
+    json!({"name": "Warm start", "query": format!("avg(last_7d):avg:kiln.session.warm_ms{{experiment:{experiment}}} by {{variant}}"), "op": "<=", "bound": 250})
 }
 
 /// P7.1's operations, each: Ada starts an experiment on her definition (two microVM sizes, a criterion), and it's
@@ -125,7 +125,7 @@ fn p7_1_an_experiment_round_trips_through_every_operation() -> anyhow::Result<()
         refused(call("agentdefs.experiments.variants.remove", json!({"id": id, "experiment": e, "variant": large})).await, 409, "2 variants")?;
 
         // Criteria: added once kiln's monitors read one, taken out.
-        let crit = call("agentdefs.experiments.criteria.add", json!({"id": id, "experiment": e, "name": "Failed sessions", "query": format!("avg(last_14d):avg:kiln.session.failed_pct{{experiment:{e}}} by {{variant}}"), "op": "<", "bound": 10})).await.map_err(failed)?;
+        let crit = call("agentdefs.experiments.criteria.add", json!({"id": id, "experiment": e, "name": "Failed sessions", "query": format!("avg(last_7d):avg:kiln.session.failed_pct{{experiment:{e}}} by {{variant}}"), "op": "<", "bound": 10})).await.map_err(failed)?;
         let crits: Vec<String> = crit.pointer("/experiment/criteria").and_then(Value::as_array).map(|c| c.iter().map(|x| s(x, "/id")).collect()).unwrap_or_default();
         anyhow::ensure!(crits.len() == 2 && s(&crit, "/experiment/criteria/1/name") == "Failed sessions", "{crit}");
         refused(call("agentdefs.experiments.criteria.add", json!({"id": id, "experiment": e, "name": "Odd", "query": "not a query", "op": "<", "bound": 1})).await, 400, "kiln's monitors can't read")?;
@@ -146,7 +146,7 @@ fn p7_1_an_experiment_round_trips_through_every_operation() -> anyhow::Result<()
         refused(call("agentdefs.experiments.weights", json!({"id": id, "experiment": e, "weights": {small.as_str(): 60, large.as_str(): 40}})).await, 409, "it's over")?;
         refused(call("agentdefs.experiments.variants.add", json!({"id": id, "experiment": e, "engine": "host"})).await, 409, "it's over")?;
         call("agentdefs.experiments.rename", json!({"id": id, "experiment": e, "name": "Sizes, done"})).await.map_err(failed)?;
-        call("agentdefs.experiments.criteria.add", json!({"id": id, "experiment": e, "name": "Peak", "query": format!("avg(last_14d):avg:kiln.session.peak_memory_gib{{experiment:{e}}} by {{variant}}"), "op": "<", "bound": 3.5})).await.map_err(failed)?;
+        call("agentdefs.experiments.criteria.add", json!({"id": id, "experiment": e, "name": "Peak", "query": format!("avg(last_7d):avg:kiln.session.peak_memory_gib{{experiment:{e}}} by {{variant}}"), "op": "<", "bound": 3.5})).await.map_err(failed)?;
 
         // One live at a time; promoted, the variant is the definition's next version and the experiment's over.
         let second = call("agentdefs.experiments.create", json!({"id": id, "name": "Bigger", "variants": [vm(50, 2, 4), vm(50, 8, 16)]})).await.map_err(failed)?;

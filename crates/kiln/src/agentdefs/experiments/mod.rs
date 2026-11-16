@@ -160,7 +160,7 @@ pub struct Criterion {
     pub id: String,
     pub name: String,
     /// What it measures, in kiln's monitoring syntax (Datadog's, as kiln's monitors take a query), its comparison
-    /// apart: `avg(last_14d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`.
+    /// apart: `avg(last_7d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`.
     pub query: String,
     pub op: Comparison,
     pub bound: f64,
