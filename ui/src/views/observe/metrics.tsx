@@ -8,7 +8,7 @@ import { Link, useNavigate } from "@/lib/router";
 import { observeApi, type MetricSummary, type QueryAnswer } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
 import { SERIES } from "@/components/charts/types";
-import { metricTags } from "@/components/code/query-words";
+import { metricTags, type QueryWords } from "@/components/code/query-words";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Hold } from "@/components/ui/hold";
@@ -30,6 +30,10 @@ const QueryInput = React.lazy(() => import("@/components/code/query-input"));
 
 /** A metric's tags and their values, for the query field to complete: loaded once a metric and kept (lib/resource.ts), not once a key typed. */
 const tagsOf = (metric: string, signal: AbortSignal) => acquireResource(summaryRes(metric), signal).then((m) => metricTags(m.tags));
+/** Every metric's name, for the query field to complete where a metric goes: loaded once (lib/resource.ts) and only then, so the field shows whether they load or not. */
+const metricsOf = (signal: AbortSignal) => acquireResource(namesRes, signal);
+/** A metric query's words: its metrics and tags looked up as they're typed (`metricsOf`, `tagsOf`). */
+const METRIC_QUERY: QueryWords = { metrics: [], tags: {}, kind: "metric" };
 
 const EXAMPLES = ["avg:system.cpu.user{*} by {host}", "max:system.disk.in_use{*} by {host,mount}", "sum:kiln.ci.jobs.finished{*} by {status}.as_count()", "avg:kiln.ci.job.duration{*} by {repo}"];
 
@@ -101,8 +105,7 @@ function QueryForm({ initial, onRun }: { initial: string; onRun: (q: string) => 
 
 /** The query in kiln's syntax, coloured and completed as it's typed: every metric's name, then the named metric's tags and their values. */
 function QueryField({ value, onChange, onEnter }: { value: string; onChange: (q: string) => void; onEnter: (q: string) => void }) {
-  const metrics = useRes(namesRes).data;
-  return <QueryInput frame="field" label="Query" placeholder={EXAMPLES[0]} value={value} onChange={onChange} onEnter={onEnter} words={{ metrics, tags: {}, kind: "metric" }} tagsOf={tagsOf} />;
+  return <QueryInput frame="field" label="Query" placeholder={EXAMPLES[0]} value={value} onChange={onChange} onEnter={onEnter} words={METRIC_QUERY} tagsOf={tagsOf} metricsOf={metricsOf} />;
 }
 
 /** With no query: every metric kiln keeps, found by name, and a few queries to start from. */

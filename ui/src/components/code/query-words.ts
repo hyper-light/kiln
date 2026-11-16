@@ -31,6 +31,9 @@ export type Completions = { from: number; options: Completion[]; validFor?: RegE
 /** A metric's own tags and their values (a metric query's), asked for as the cursor comes into its scope or its groups: read them through lib/resource.ts, which loads a metric's once. */
 export type TagsOf = (metric: string, signal: AbortSignal) => Promise<QueryWords["tags"]>;
 
+/** Every metric's name (a metric query's), asked for as the cursor comes to where a metric goes: read through lib/resource.ts, which loads them once. */
+export type MetricsOf = (signal: AbortSignal) => Promise<readonly string[]>;
+
 const TIME_AGGS = ["avg", "sum", "min", "max", "last"];
 export const SPACE_AGGS = ["avg", "sum", "min", "max"];
 const WINDOWS = ["last_5m", "last_15m", "last_1h", "last_4h", "last_1d", "last_7d", "last_14d", "last_30d"];
@@ -65,6 +68,8 @@ const COMPARISONS: { label: string; detail: string }[] = [
 
 /** The cursor is in a group's braces (`by {…`). */
 const IN_GROUPS = /\bby\s*\{[^}]*$/;
+/** The cursor is where a metric goes: after a space aggregation (`avg:`). */
+const AT_METRIC = /(?:^|[\s(:])(?:avg|sum|min|max):\s*[\w.]*$/;
 /**
  * A tag (a scope's or a group's) and a tag's value (`10.0.0.1:9100` too), as they're typed: their
  * completions hold till what ends them (a `,`; a tag's `:`) asks again, not at each key.
@@ -97,8 +102,7 @@ export function completeQuery(words: QueryWords, before: string, pos: number): C
   // these: its `max(` and `min(` are functions of queries.
   if (!metric && /\b(?:avg|sum|min|max|last)\(\s*[\w]*$/.test(before)) return { from, options: WINDOWS.map((w) => ({ label: w, type: "constant" })) };
   if (!metric && /\):\s*[\w]*$/.test(before)) return { from, options: spaceAggs() };
-  if (/(?:^|[\s(:])(?:avg|sum|min|max):\s*[\w.]*$/.test(before))
-    return { from, options: [...words.metrics.map((m) => ({ label: m, type: "variable" })), ...FUNCTIONS.map((f) => ({ label: `${f}(`, type: "function" }))] };
+  if (AT_METRIC.test(before)) return { from, options: [...words.metrics.map((m) => ({ label: m, type: "variable" })), ...FUNCTIONS.map((f) => ({ label: `${f}(`, type: "function" }))] };
   // After a scope, its groups; and a monitor's comparison, after either.
   if (/\}\s*[\w]*$/.test(before) && !/\bby\s*\{[^}]*\}\s*[\w]*$/.test(before))
     return { from, options: [{ label: "by {", detail: "grouped", type: "keyword" }, ...(metric ? [] : COMPARISONS.map((c) => ({ ...c, type: "operator" })))] };
@@ -125,15 +129,22 @@ export function metricTags(tags: readonly { key: string; top?: readonly { value:
 }
 
 /**
- * `completeQuery`, with the tags of the metric whose braces the cursor is in looked up (`tagsOf`) in
- * place of the words' own: a promise then, as CodeMirror takes one, never rejected (the words' own
- * tags where the lookup fails). Elsewhere, and with no `tagsOf`, `completeQuery` as it is.
+ * `completeQuery`, with what's looked up in place of the words' own: the tags of the metric whose braces
+ * the cursor is in (`tagsOf`), every metric's name where a metric goes (`metricsOf`). A promise then, as
+ * CodeMirror takes one, never rejected (the words' own where a lookup fails). Elsewhere, and with no
+ * lookups, `completeQuery` as it is.
  */
-export function completeQueryWith(words: QueryWords, tagsOf: TagsOf | undefined, before: string, pos: number, signal: AbortSignal): Completions | Promise<Completions> {
+export function completeQueryWith(words: QueryWords, tagsOf: TagsOf | undefined, before: string, pos: number, signal: AbortSignal, metricsOf?: MetricsOf): Completions | Promise<Completions> {
   const metric = tagsOf ? metricOfBraces(before) : null;
-  if (!tagsOf || metric === null) return completeQuery(words, before, pos);
-  return tagsOf(metric, signal).then(
-    (tags) => completeQuery({ ...words, tags }, before, pos),
-    () => completeQuery(words, before, pos),
-  );
+  if (tagsOf && metric !== null)
+    return tagsOf(metric, signal).then(
+      (tags) => completeQuery({ ...words, tags }, before, pos),
+      () => completeQuery(words, before, pos),
+    );
+  if (metricsOf && AT_METRIC.test(before))
+    return metricsOf(signal).then(
+      (metrics) => completeQuery({ ...words, metrics }, before, pos),
+      () => completeQuery(words, before, pos),
+    );
+  return completeQuery(words, before, pos);
 }

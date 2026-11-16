@@ -2,7 +2,7 @@
 // in its turn, from the text before the cursor (an experiment's criterion, the metrics page).
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { completeQuery, completeQueryWith, metricOfBraces, metricTags, type QueryWords, type TagsOf } from "../src/components/code/query-words";
+import { completeQuery, completeQueryWith, metricOfBraces, metricTags, type MetricsOf, type QueryWords, type TagsOf } from "../src/components/code/query-words";
 
 const words: QueryWords = {
   metrics: ["kiln.session.warm_ms", "kiln.session.failed_pct"],
@@ -154,4 +154,28 @@ test("a metric's tags load once through the resource layer as its braces are typ
   for (const before of ["avg:kiln.session.warm_ms{", "avg:kiln.session.warm_ms{h", "avg:kiln.session.warm_ms{host:", "avg:kiln.session.warm_ms{host:w", "avg:kiln.session.warm_ms{host:web-1} by {"])
     await completeQueryWith(metricWords, tagsOf, before, before.length, new AbortController().signal);
   assert.equal(loads, 1);
+});
+
+test("a metric query's field asks for every metric's name only where a metric goes, and offers what it has where that fails (metrics.tsx metricsOf)", async () => {
+  let asks = 0;
+  const metricsOf: MetricsOf = async () => {
+    asks++;
+    return ["kiln.ci.job.duration", "system.cpu.user"];
+  };
+  const none = { ...metricWords, metrics: [] };
+  const at = async (before: string, of: MetricsOf = metricsOf) =>
+    (await completeQueryWith(none, undefined, before, before.length, new AbortController().signal, of))?.options.map((o) => o.label) ?? [];
+  // Where a metric goes: the names looked up, then the functions.
+  const named = await at("avg:");
+  assert.deepEqual(named.slice(0, 2), ["kiln.ci.job.duration", "system.cpu.user"]);
+  assert.ok(named.some((l) => l.endsWith("(")));
+  assert.equal(asks, 1);
+  // Anywhere else nothing is asked.
+  await at("");
+  await at("avg:system.cpu.user{*} ");
+  assert.equal(asks, 1);
+  // Names that fail to load: the functions alone, never an error.
+  const failing: MetricsOf = () => Promise.reject(new Error("no route"));
+  const fallback = await at("avg:", failing);
+  assert.ok(fallback.length > 0 && fallback.every((l) => l.endsWith("(")));
 });

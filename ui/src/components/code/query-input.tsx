@@ -16,10 +16,10 @@ import { HighlightStyle, StreamLanguage, syntaxHighlighting } from "@codemirror/
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap, placeholder } from "@codemirror/view";
 import { tags as t } from "@lezer/highlight";
-import { completeQueryWith, SPACE_AGGS, type QueryWords, type TagsOf } from "./query-words";
+import { completeQueryWith, SPACE_AGGS, type MetricsOf, type QueryWords, type TagsOf } from "./query-words";
 import "./query-input.css";
 
-export type { QueryWords, TagsOf };
+export type { MetricsOf, QueryWords, TagsOf };
 
 export interface QueryInputProps {
   value: string;
@@ -31,6 +31,8 @@ export interface QueryInputProps {
   onEnter?: (text: string) => void;
   /** A metric's own tags, in place of `words.tags` in its scope's and its groups' braces (a metric query's). */
   tagsOf?: TagsOf;
+  /** Every metric's name, in place of `words.metrics` where a metric goes: looked up then, so the field never waits on them (a metric query's). */
+  metricsOf?: MetricsOf;
   /**
    * Its frame: a definition's field (`ms-edit-in`, three lines at the least; unless said) or a page's
    * (`field`, as tall as the fields beside it: one line, more as it wraps).
@@ -128,7 +130,7 @@ export default function QueryInput(props: QueryInputProps) {
                 // A lookup of a metric's tags ends with the query it's for (CodeMirror aborts one it no longer needs).
                 const stop = new AbortController();
                 ctx.addEventListener("abort", () => stop.abort());
-                return completeQueryWith(latest.current.words, latest.current.tagsOf, ctx.state.doc.sliceString(0, ctx.pos), ctx.pos, stop.signal);
+                return completeQueryWith(latest.current.words, latest.current.tagsOf, ctx.state.doc.sliceString(0, ctx.pos), ctx.pos, stop.signal, latest.current.metricsOf);
               },
             ],
             icons: false,

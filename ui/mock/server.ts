@@ -36,6 +36,7 @@ import { handleOffers } from "./offers.ts";
 import { handleReap } from "./reap.ts";
 import { handleExperiments } from "./experiments.ts";
 import { handleObserveCheck } from "./observe-check.ts";
+import { handleObserveMetrics } from "./observe-metrics.ts";
 import { handleAgentdefs } from "./agentdefs.ts";
 import { handleMicrovms, sessionOf, sessionsOn } from "./microvms.ts";
 import { handleOverrides } from "./overrides.ts";
@@ -1864,6 +1865,7 @@ const server = http.createServer(async (req, res) => {
     // ---- experiments from an agent's question (docs/ci.md W20-R11) ----
     if (await handleExperiments(req, res, url, { json, body })) return;
     if (await handleObserveCheck(req, res, url, { json, body })) return;
+    if (handleObserveMetrics(req, res, url, { json })) return;
     if (await handleAgentdefs(req, res, url, { json, body })) return;
     if (await handleEngine(req, res, url, { json, body, runner: (n) => agents.get(n), runners: () => [...agents.values()], sessionsOn })) return;
     if (await handleMicrovms(req, res, url, { json, body })) return;
