@@ -588,8 +588,6 @@ mod tests {
         let field = |p: &serde_json::Value, name: &str| p.get(name).cloned().unwrap_or_default();
         let first = pools.first().map(|p| {
             (
-                field(p, "agent_from"),
-                field(p, "agent_name"),
                 field(p, "vcpus"),
                 field(p, "memory_mib"),
                 field(p, "until_ms"),
@@ -599,13 +597,22 @@ mod tests {
         assert_eq!(
             first,
             Some((
-                serde_json::json!("definition"),
-                serde_json::json!("agent-a-name"),
                 serde_json::json!(2),
                 serde_json::json!(2048),
                 serde_json::json!(2_000 + k),
                 serde_json::Value::Null
             ))
+        );
+        let named = pools
+            .first()
+            .map(|p| (field(p, "agent_from"), field(p, "agent_name")));
+        assert_eq!(
+            named,
+            Some((
+                serde_json::json!("definition"),
+                serde_json::json!("agent-a-name")
+            )),
+            "its agent, the definition its sessions started from, by its name"
         );
         assert_eq!(
             view("runner-1", vec![(shown("agent-a", None), 0, true)], k + 1).get("pools"),
