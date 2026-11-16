@@ -290,6 +290,30 @@ start. Where its machine holds as many agents at work as it may, it starts again
 A runner that starts again (an upgrade, a crash, the system stopping it) starts each of its agents
 again the same way, from its record (above).
 
+### An agent definition's limits
+
+An agent started from one of your agent definitions (docs/api.md, "Agent definitions") is held to
+the limits that definition set at the version it started from, and kiln ends it for good once it's
+past one of them:
+
+- **Time** (`limits.seconds`): counted from when it started from its definition.
+- **Tokens** (`limits.tokens`): its tokens in and out, as its harness counts them.
+- **Cost** (`limits.cents`): what it has cost, in US cents, as its harness says it.
+
+kiln looks at what an agent has spent each time its harness says so: at the end of every turn, and
+during a turn where the harness says it sooner (Codex counts tokens as it goes, and Pi with each
+reply). An agent past its limit is ended at the first of those, never a whole turn later. Its
+definition's sessions say why (`ended`: `past its token limit of 1000 tokens (agent definition
+reviewer)`), and the audit trail's `agent.close` names the limit as who ended it (`kiln (token
+limit: 1000 tokens, agent definition reviewer)`). A server that restarts holds the agents it finds
+to the same limits.
+
+Only Claude Code and Pi say what their sessions cost. Codex and Antigravity say tokens alone, and
+none of kiln's ACP agents is known to say a cost, so a definition of theirs with a cost limit is
+refused as you save it: give it a token limit instead. Where an agent runs another harness than its
+definition's (one its start chose, such as an attachment's) and that harness says no cost, a cost
+limit can't be held, so the agent is ended as it starts, saying so.
+
 ### Crashed agents
 
 An agent reads **offline** only when its machine is: the computer is off, or its runner can't reach
@@ -2704,6 +2728,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | restore files on rewind | ✓ | — | — | — | — | — |
 | thinking display / budget, output style | ✓ | ✓ (reasoning summaries) | — | — | ? | unit (its thinking, its levels) |
 | plan limits (`limits`) | ✓ none for an API key; unit for subscriber windows | ✓ (pushed during turns); unit for ChatGPT reads | — | — | — | — |
+| what a session cost, so an agent definition's cost limit holds (`limits.cents`) | unit (`total_cost_usd`, at each turn's end) | — (it says tokens alone: a cost limit is refused) | — (a cost only where an agent gives one: a cost limit is refused) | — (a cost limit is refused) | — (a cost limit is refused) | unit (each reply's `cost.total`) |
 | harness status (`harness_status`) | ✓ | ✓ | unit | ? | unit | unit |
 | MCP servers: list with tools, enable/disable, reconnect | ✓ | ✓ | — | — | — | — |
 | MCP sign-in (OAuth, finished from another device) | ✓ | ✓ | — | — | — | — |

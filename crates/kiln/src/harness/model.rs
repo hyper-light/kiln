@@ -1005,6 +1005,14 @@ pub struct Usage {
     pub context_window: Option<u64>,
 }
 
+impl Usage {
+    /// Its tokens, in and out: what an attachment's tokens a day count (`crate::ci::attach`) and an agent definition's
+    /// token limit holds (`crate::agentdefs::limits`).
+    pub fn tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 /// One window of the plan limits of the account a session runs on (what the harness's own
 /// /usage shows): how much of it is used and when it starts over.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
