@@ -308,7 +308,7 @@ fn step30_texts_are_kept_once_in_the_store_of_bytes() -> anyhow::Result<()> {
         let mine = create(&hub, &sim, &ada, "claude", CLAUDE, "user:u-ada").await?;
         create(&hub, &sim, &bo, "claude", CLAUDE, "user:u-bo").await?;
         let id = mine.agentfile.id.clone();
-        update(&hub, &sim, &ada, &id, Patch { name: None, text: Some(CLAUDE_2.into()) }, "user:u-ada").await?;
+        update(&hub, &sim, &ada, &id, Patch { name: None, text: Some(CLAUDE_2.into()) }, None, "user:u-ada").await?;
         let back = restore(&hub, &sim, &ada, &id, 1, "user:u-ada").await?;
         anyhow::ensure!(back.agentfile.version == 3 && back.agentfile.text == CLAUDE, "{back:?}");
         let taken = create(&hub, &sim, &ada, "claude", "FROM scratch\n", "user:u-ada").await;
@@ -364,7 +364,7 @@ fn step30_a_text_the_store_cant_keep_writes_no_record() -> anyhow::Result<()> {
         let id = create(&hub, &sim, &ada, "claude", CLAUDE, "user:u-ada").await?.agentfile.id;
         let r = create(&hub, &sim, &ada, "codex", CLAUDE_2, "user:u-ada").await;
         anyhow::ensure!(matches!(&r, Err(Error::Store(m)) if m.contains("couldn't keep")), "{r:?}");
-        let r = update(&hub, &sim, &ada, &id, Patch { name: None, text: Some(CLAUDE_2.into()) }, "user:u-ada").await;
+        let r = update(&hub, &sim, &ada, &id, Patch { name: None, text: Some(CLAUDE_2.into()) }, None, "user:u-ada").await;
         anyhow::ensure!(matches!(&r, Err(Error::Store(_))), "{r:?}");
         let rows: (i64, i64) = hub.store.read(|c| Ok((c.query_row("SELECT COUNT(*) FROM agentfiles", [], |r| r.get(0))?, c.query_row("SELECT COUNT(*) FROM agentfile_versions", [], |r| r.get(0))?))).await?;
         anyhow::ensure!(rows == (1, 1), "{rows:?} Agentfiles and versions");
@@ -386,13 +386,41 @@ fn step30_a_delete_lets_go_of_texts_no_record_names() -> anyhow::Result<()> {
         let (ada, bo) = (who("user:u-ada"), who("user:u-bo"));
         let mine = create(&hub, &sim, &ada, "claude", CLAUDE, "user:u-ada").await?.agentfile.id;
         let theirs = create(&hub, &sim, &bo, "claude", CLAUDE, "user:u-bo").await?.agentfile.id;
-        update(&hub, &sim, &ada, &mine, Patch { name: None, text: Some(CLAUDE_2.into()) }, "user:u-ada").await?;
+        update(&hub, &sim, &ada, &mine, Patch { name: None, text: Some(CLAUDE_2.into()) }, None, "user:u-ada").await?;
         let gone = delete(&hub, &sim, &ada, &mine).await?;
         anyhow::ensure!(gone.name == "claude" && gone.owner == "user:u-ada" && gone.version == 2, "{gone:?}");
         anyhow::ensure!(matches!(sim.head(&key_of(CLAUDE_2)).await, Err(Refusal::NotFound(_))), "Ada's second text stayed");
         anyhow::ensure!(sim.head(&key_of(CLAUDE)).await.is_ok(), "Bo's text went with Ada's");
         delete(&hub, &sim, &bo, &theirs).await?;
         anyhow::ensure!(matches!(sim.head(&key_of(CLAUDE)).await, Err(Refusal::NotFound(_))), "the last text named stayed");
+        Ok(())
+    })
+}
+
+/// P5.3 through the operation table (kiln plan 01a1dd2e8618733a87f2793aab1322a8): `agentfiles.settings` reads a
+/// text's harnesses and agents, with Shards' check of it, and with `harness` changes that harness's settings in
+/// the text first (a model set, its sign-in taken out), keeping nothing. A harness the text doesn't declare is
+/// 404, a value its setting can't take 400, and a change that names no harness 400.
+#[test]
+fn p5_3_the_settings_operation_reads_and_changes_a_text() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let ada = person("u-ada", &["admin"]);
+        let text = "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nLABEL kiln.harness.claude.sign-in=work\nAGENT main FROM ./agent\nATTACH main FOR claude\n";
+        let read = op(&hub, &ada, "agentfiles.settings", json!({"text": text})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(read.pointer("/text") == Some(&json!(text)), "{read}");
+        anyhow::ensure!(read.pointer("/settings/harnesses/0/sign_in") == Some(&json!("work")) && read.pointer("/settings/agents/0/name") == Some(&json!("main")), "{read}");
+        let set = op(&hub, &ada, "agentfiles.settings", json!({"text": text, "harness": "claude", "model": "claude-opus-4-1", "sign_in": null})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(text_of(&set, "/text"), "FROM ubuntu:24.04\nHARNESS claude FROM ./harness\nLABEL kiln.harness.claude.model=claude-opus-4-1\nAGENT main FROM ./agent\nATTACH main FOR claude\n");
+        anyhow::ensure!(set.pointer("/settings/harnesses/0/model") == Some(&json!("claude-opus-4-1")) && set.pointer("/settings/harnesses/0/sign_in") == Some(&Value::Null), "{set}");
+        let errors = set.pointer("/check/diagnostics").and_then(Value::as_array).map_or(0, |d| d.iter().filter(|d| d.get("severity") == Some(&json!("error"))).count());
+        anyhow::ensure!(set.pointer("/check/checked") == Some(&json!(true)) && errors == 0, "Shards' check passes: {set}");
+        let none = op(&hub, &ada, "agentfiles.settings", json!({"text": text, "harness": "codex", "model": "m"})).await;
+        anyhow::ensure!(matches!(none, Err((StatusCode::NOT_FOUND, _))), "{none:?}");
+        let bad = op(&hub, &ada, "agentfiles.settings", json!({"text": text, "harness": "claude", "model": "two words"})).await;
+        anyhow::ensure!(matches!(bad, Err((StatusCode::BAD_REQUEST, _))), "{bad:?}");
+        let unnamed = op(&hub, &ada, "agentfiles.settings", json!({"text": text, "model": "m"})).await;
+        anyhow::ensure!(matches!(unnamed, Err((StatusCode::BAD_REQUEST, _))), "{unnamed:?}");
         Ok(())
     })
 }

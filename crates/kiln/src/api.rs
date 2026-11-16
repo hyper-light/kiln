@@ -1357,6 +1357,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let body = boxed(|| body_value(req)).await?;
             boxed(|| own_op(&hub, &caller, "agentfiles.check", body)).await
         }
+        (&Method::POST, ["api", "agentfiles", "settings"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentfiles.settings", body)).await
+        }
         (&Method::GET, ["api", "agentfiles", id]) => boxed(|| own_op(&hub, &caller, "agentfiles.get", json!({ "id": id }))).await,
         (&Method::PATCH, ["api", "agentfiles", id]) => {
             let id = (*id).to_owned();

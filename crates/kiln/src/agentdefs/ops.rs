@@ -20,6 +20,7 @@ pub(crate) fn fail(e: Error) -> Fail {
         Error::Forbidden(m) => (StatusCode::FORBIDDEN, m),
         e @ Error::ReadOnly(_) => (StatusCode::FORBIDDEN, e.to_string()),
         Error::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+        e @ Error::Diverged(_) => (StatusCode::CONFLICT, e.to_string()),
         Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
@@ -98,7 +99,7 @@ fn audit_line(d: &super::AgentDef) -> String {
 
 async fn create(cx: Cx, v: Value) -> Out {
     let (name, settings) = (crate::ops::text(&v, "name")?, settings_of(&v)?);
-    let made = super::create(&cx.hub, &who(&cx)?, &name, settings, &cx.caller.name).await.map_err(fail)?;
+    let made = super::sync::create(&cx.hub, &who(&cx)?, &name, settings, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.create".into(), audit_line(&made)).await;
     json_of(&made)
 }
@@ -117,7 +118,7 @@ async fn update(cx: Cx, v: Value) -> Out {
         agentfile: field(&v, "agentfile")?,
     };
     let base = field::<Option<i64>>(&v, "base")?.flatten();
-    let saved = super::update(&cx.hub, &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
+    let saved = super::sync::update(&cx.hub, &who(&cx)?, &id, patch, base, &cx.caller.name).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentdef.update".into(), audit_line(&saved)).await;
     json_of(&saved)
 }

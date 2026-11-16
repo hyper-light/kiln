@@ -13,8 +13,10 @@
 //! mode (`kiln.agentdefs.*`): [`ops`]. kiln.db keeps them: a definition is small, its settings JSON.
 
 pub mod builtin;
+pub mod limits;
 pub mod ops;
 pub mod sessions;
+pub mod sync;
 pub mod uses;
 
 use rusqlite::{OptionalExtension as _, params};
@@ -149,6 +151,10 @@ pub enum Error {
     /// What it names couldn't be read just now (an Agentfile's record).
     #[error("{0}")]
     Unavailable(String),
+    /// It and its Agentfile's `AGENT` each changed a setting they share differently since they last
+    /// agreed (kiln plan 01a1dd2e… P5.4): neither is changed.
+    #[error("{}", sync::words(.0))]
+    Diverged(Vec<sync::Diverged>),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -363,7 +369,7 @@ pub async fn settings_of(hub: &Hub, who: &Who, id: &str) -> R<(String, i64, Sett
 /// `name` (by default as it is): version 1, checked as [`create`] checks it.
 pub async fn copy(hub: &Hub, who: &Who, id: &str, name: Option<&str>, by: &str) -> R<AgentDef> {
     let (was, _, settings) = settings_of(hub, who, id).await?;
-    create(hub, who, name.unwrap_or(&was), settings, by).await
+    sync::create(hub, who, name.unwrap_or(&was), settings, by).await
 }
 
 /// Its versions, newest first.
@@ -540,7 +546,7 @@ pub async fn restore(hub: &Hub, who: &Who, id: &str, version: i64, by: &str) -> 
         agentfile: Some(s.agentfile),
         name: None,
     };
-    update(hub, who, id, patch, None, by).await
+    sync::update(hub, who, id, patch, None, by).await
 }
 
 /// Agent definition `id` and its versions, gone: what it was.
