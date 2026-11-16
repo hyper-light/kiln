@@ -121,7 +121,7 @@ fn p7_1_a_split_assigns_by_weight_keeps_it_counts_failures_and_promotes() -> any
     // Sticky: its harness started again, it's the variant it was.
     let first = sessions.first().and_then(|i| i.get("id")).and_then(Value::as_str).unwrap_or_default().to_owned();
     let was = arm_of(&info(&s, &first)?);
-    let (code, body) = http(s.port, "POST", &format!("/api/harness/sessions/{first}/command"), &s.admin, Some(&json!({ "type": "restart" })))?;
+    let (code, body) = http(s.port, "POST", &format!("/api/harness/agents/{first}/restart"), &s.admin, Some(&json!({})))?;
     anyhow::ensure!((200..300).contains(&code), "the restart was refused: {code} {body}");
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(arm_of(&info(&s, &first)?), was, "a session's variant never changes");

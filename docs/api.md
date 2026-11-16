@@ -140,7 +140,7 @@ interface FrontDoorView { runner; connected: boolean; supported: boolean|null /*
 | GET, POST | `/api/push/subscriptions` | your devices; a browser's subscription with its name and what it hears (at most 20 devices each) |
 | DELETE | `/api/push/subscriptions/:id` | forgets one of your devices |
 | POST | `/api/push/test` | `{ id? }`: a test to your devices → `{ sent, results }` |
-| PUT, DELETE | `/api/push/mutes/:agent` | mutes or unmutes an agent's notifications for you |
+| PUT, DELETE | `/api/push/mutes/:agent` | mutes or unmutes an agent's notifications for you: `push.mute`, `push.unmute` |
 | GET | `/sw.js`, `/manifest.webmanifest` | **open** · the service worker that shows pushes (no fetch handler: it never intercepts the app), and the web app manifest |
 | GET | `/api/voice` | `{ transcribe, language }`: whether kiln transcribes recordings ([voice.md](voice.md)) |
 | POST | `/api/voice/transcribe?lang=` | body: the recording (`Content-Type: audio/*`, up to 25 MiB) → `{ text }`; 501 not set up, 415 not a recording, 413 too big, 502 the service failed |
@@ -248,7 +248,7 @@ runs and its runners: a definition's run is one of those agents.)
 | POST | `/api/agentdefs/{id}/restore` | `{ version }` → `AgentDef`, that version's settings as a new version |
 | DELETE | `/api/agentdefs/{id}` | `{ deleted: true }` |
 | POST | `/api/agentdefs/{id}/run` | `{ prompt?, on?, cwd?, name? }` → as `agents.start` answers, with `agentdef: { id, version }`; `id` one of yours or kiln's |
-| GET | `/api/agentdefs/{id}/sessions` | `{ sessions: { id, version, at, runner, state, engine, agent }[], starts: { n, by_kind: { [kind]: { n, timed, p50_ms } }, warm } }`: the sessions you started from it (`id` one of yours, or kiln's `kiln:<name>`), newest first, each with the version it started from, its `state` (as agents.list's `stand`; `gone` once kiln no longer has it), runner and engine; and what their starts took, by how each started |
+| GET | `/api/agentdefs/{id}/sessions` | `{ sessions: { id, version, at, runner, state, engine, agent }[], starts: { n, by_kind: { [kind]: { n, timed, p50_ms } }, by_start: { [start]: { n, timed, p50_us, from: { [word]: n } } }, warm } }`: the sessions you started from it (`id` one of yours, or kiln's `kiln:<name>`), newest first, each with the version it started from, its `state` (as agents.list's `stand`; `gone` once kiln no longer has it), runner and engine; and what their starts took, by how each started: `by_kind` by engine (`host`, `microvm`), each session's first start timed from its open to its harness running; `by_start` by how each microVM started, where Hex said (`cold`: its guest booted, Shards' `booted`, `saved` or `replaced`; `template`: `restored`; `warm`; `swapped`: a harness switched into its running microVM; a word kiln doesn't know as its own), each timed from its launch to its member running, with the words each kind counts |
 | POST | `/api/agentdefs/{id}/copy` | `{ name? }` → `AgentDef`: one of kiln's (`kiln:<name>`) or yours, made yours, version 1 |
 | POST | `/api/agentdefs/use` | `{ builtin, id }` → `{ uses }`: your own `id` stands in for kiln's UI agent `builtin` for you (null `id`: kiln's own again) |
 

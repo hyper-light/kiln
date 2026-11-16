@@ -143,8 +143,8 @@ nobody sees or removes another person's.
 | `POST /api/push/subscriptions` | `{subscription, device, hears?, replaces?}`: a browser's subscription (`PushSubscription.toJSON()`), its name, and what it hears (all kinds when absent). The same endpoint again is the same device. `replaces`: the endpoint it takes over from (its name and kinds go on). At most 20 devices each (409 beyond) |
 | `DELETE /api/push/subscriptions/:id` | forgets one of your devices |
 | `POST /api/push/test` | `{id?}`: a test to your devices (or one), each tried once: `{sent, results: [{id, device, ok, error?}]}` |
-| `PUT /api/push/mutes/:agent` | mutes an agent for you |
-| `DELETE /api/push/mutes/:agent` | unmutes it |
+| `PUT /api/push/mutes/:agent` | mutes an agent for you (`push.mute`, on MCP and code mode too) |
+| `DELETE /api/push/mutes/:agent` | unmutes it (`push.unmute`) |
 | `GET /api/push/notices` | `{you, marks}`: who you are to them (`owner`, `user:<id>`) and your marks, each `{key, how, at}`, newest first |
 | `POST /api/push/notices` | `{keys, how, tags?}`: marks up to 200 notices (`how`: `away`, `done`, or `seen` for `seen:<agent>`), at the server's time; `tags`: the agents whose shown notifications close on your devices with kiln open. Your pages hear it as a `notices` event |
 

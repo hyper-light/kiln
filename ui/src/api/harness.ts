@@ -626,7 +626,7 @@ export const harnessApi = {
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
   move: (id: string, to: string, now = false, kind?: string, model?: string) =>
-    call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now, ...(kind ? { kind } : {}), ...(model ? { model } : {}) }),
+    call<{ moving: string }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/move`, { to, now, ...(kind ? { kind } : {}), ...(model ? { model } : {}) }),
   /** Resume a crashed agent in place: a fresh harness under its id, its conversation, plans, goals and subagents its own. */
   resume: (id: string) => call<{ resumed: unknown; subagents: string[] }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/resume`),
   /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
@@ -638,9 +638,16 @@ export const harnessApi = {
    * however often it's sent under it (docs/wire.md, "The UI's sockets").
    */
   command: (id: string, c: Command, key: string = clientId()) =>
-    ownAgentAction(call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }), [
-      id,
-    ]),
+    ownAgentAction(
+      // An interrupt, a control and a restart are operations of their own (agents.interrupt, agents.control, agents.restart: kiln plan
+      // 01a1dd2e8618733a87f2793aab1322a8 P5.6, S2); the rest go as commands.
+      c.type === "interrupt" || c.type === "restart"
+        ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/${c.type}`, {})
+        : c.type === "control"
+          ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/control`, { control: c.id, value: c.value ?? null })
+          : call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }),
+      [id],
+    ),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
   said: (p: { q: string; agent?: string; until?: number; beforeSeq?: number; limit?: number }) => {
     const qs = new URLSearchParams({ q: p.q });
@@ -663,8 +670,6 @@ export const harnessApi = {
     if (!j.file_id) throw new Error("no file id");
     return j.file_id;
   },
-  /** One command to many agents (each send gets its own message id). */
-  broadcast: (ids: string[], c: Command) => ownAgentAction(call<{ sent: string[] }>("POST", "/api/harness/command", { ids, command: c }), ids),
   /** One thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits. */
   broadcastTo: (body: BroadcastBody) => ownAgentAction(call<BroadcastReport>("POST", "/api/harness/broadcast", body), body.to.ids ?? [], (r) => r.results.map((x) => x.id)),
   /** Who a broadcast to `to` would reach, and their catalogs merged (each entry with how many have it). */

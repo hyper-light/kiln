@@ -9,14 +9,16 @@
 //! (`crate::harness::session::Start`), of the sessions kiln still has: how it started, which that record says by its
 //! engine (its harness a process of its machine's, or in a microVM), and, for a session's first start, how long from
 //! its session's open on its machine to its harness running (room waits and image builds included), both read off
-//! that machine's one clock. Every recorded start counts: no window is picked.
+//! that machine's one clock. A microVM's start says too how its microVM started and how long that took, where Hex
+//! measured it (`crate::harness::session::Measured`, P7.1): those are counted by kind ([`by_start`]). Every recorded
+//! start counts: no window is picked.
 
 use rusqlite::{OptionalExtension as _, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::{Error, R, Who, builtin};
-use crate::harness::session::{Info, Runs};
+use crate::harness::session::{Info, Runs, Start};
 use crate::hub::Hub;
 
 /// The definition a session started from: its id, and its version then (kiln's own, which have no versions: 0).
@@ -99,8 +101,8 @@ pub struct Listed {
     pub variant: Option<String>,
 }
 
-/// What a start of a harness was, as kiln's record of it says: its engine. (How a microVM started, cold, from a
-/// template or warm, isn't in that record.)
+/// What a start of a harness was, as kiln's record of it says: its engine. (How a microVM started is its measure's,
+/// [`by_start`].)
 fn kind_of(runs: &Runs) -> &'static str {
     match runs {
         Runs::Host { .. } => "host",
@@ -129,7 +131,47 @@ fn starts(infos: &[Info]) -> Value {
     }
     let by_kind: serde_json::Map<String, Value> = kinds.into_iter().map(|(k, (n, timed))| (k.to_owned(), json!({"n": n, "timed": timed.len(), "p50_ms": kiln_ci::work::slots::median(&timed)}))).collect();
     // A warm pool's hosts, where its runners' Hex nodes report them: none does yet (kiln plan 01a1dd2e…, P3.1, P3.2).
-    json!({"n": n, "by_kind": by_kind, "warm": Value::Null})
+    json!({"n": n, "by_kind": by_kind, "by_start": by_start(infos.iter().flat_map(|i| i.starts.iter())), "warm": Value::Null})
+}
+
+/// The kind of start a microVM's was, of Shards' word for how it started (its D253, Hex's `StartedFrom`): `cold` where
+/// its guest booted (`booted`; `saved`, its image's template saved on the way; `replaced`, a template that failed to
+/// restore made again), `template` where it restored its image's template (`restored`), `warm` where a warm run
+/// host's microVM was ready before its run asked (`warm`), and `swapped` where its member was swapped into the
+/// microVM its session ran in (P6c.5). A word kiln doesn't know yet is a kind of its own, so no start goes uncounted.
+fn start_kind(started_from: &str) -> String {
+    match started_from {
+        "booted" | "saved" | "replaced" => "cold",
+        "restored" => "template",
+        "warm" => "warm",
+        crate::sandbox::isolated::SWAPPED => "swapped",
+        other => other,
+    }
+    .to_owned()
+}
+
+/// The starts of `starts` whose microVM said how it started (`Measured::started_from`), by kind ([`start_kind`]): how
+/// many, how many were timed (from the launch asked to its member running, `Measured::start_us`), the median of those
+/// times in microseconds, and how many each of Shards' words gave the kind.
+fn by_start<'a>(starts: impl Iterator<Item = &'a Start>) -> Value {
+    type Kind = (u64, Vec<u64>, std::collections::BTreeMap<String, u64>);
+    let mut kinds: std::collections::BTreeMap<String, Kind> = std::collections::BTreeMap::new();
+    for m in starts.filter_map(|s| s.measured.as_ref()) {
+        let Some(from) = m.started_from.as_deref() else { continue };
+        let kind = kinds.entry(start_kind(from)).or_default();
+        kind.0 = kind.0.saturating_add(1);
+        if let Some(us) = m.start_us {
+            kind.1.push(us);
+        }
+        let word = kind.2.entry(from.to_owned()).or_default();
+        *word = word.saturating_add(1);
+    }
+    Value::Object(
+        kinds
+            .into_iter()
+            .map(|(k, (n, timed, from))| (k, json!({"n": n, "timed": timed.len(), "p50_us": kiln_ci::work::slots::median(&timed), "from": from})))
+            .collect(),
+    )
 }
 
 /// Definition `id`'s sessions that `who` may see (their own; everyone's for `who.all`), newest first, and what their
@@ -183,4 +225,46 @@ pub async fn list(hub: &Hub, who: &Who, id: &str) -> R<Value> {
 /// Definition `id`'s sessions forgotten, as it goes.
 pub fn forget_in(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<usize> {
     c.execute("DELETE FROM agent_def_sessions WHERE agent_def_id = ?1", params![id])
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::by_start;
+    use crate::harness::session::{Measured, Runs, Start};
+
+    fn start(started_from: Option<&str>, start_us: Option<u64>) -> Start {
+        let measured = started_from.map(|f| Measured { start_us, started_from: Some(f.to_owned()), ..Measured::default() });
+        Start { at: 0, runs: Runs::Host { pid: 1 }, ended: None, measured }
+    }
+
+    /// kiln plan 01a1dd2e…, P5.2's page (uicontract slice 2b): a definition's starts by how each microVM started, each
+    /// kind's median start where Hex measured it, and Shards' words each kind counts; starts that measured nothing are
+    /// in no kind, and a word kiln doesn't know is a kind of its own.
+    #[test]
+    fn p5_2_starts_are_counted_by_how_their_microvm_started() {
+        let starts = [
+            start(Some("warm"), Some(1_000)),
+            start(Some("warm"), Some(3_000)),
+            start(Some("warm"), Some(2_000)),
+            start(Some("restored"), Some(30_000)),
+            start(Some("booted"), Some(90_000)),
+            start(Some("saved"), Some(300_000)),
+            start(Some("replaced"), None),
+            start(Some("swapped"), Some(500)),
+            start(Some("thawed"), Some(7)),
+            start(None, None),
+        ];
+        let got = by_start(starts.iter());
+        let want = json!({
+            "warm": {"n": 3, "timed": 3, "p50_us": 2_000, "from": {"warm": 3}},
+            "template": {"n": 1, "timed": 1, "p50_us": 30_000, "from": {"restored": 1}},
+            "cold": {"n": 3, "timed": 2, "p50_us": 90_000, "from": {"booted": 1, "replaced": 1, "saved": 1}},
+            "swapped": {"n": 1, "timed": 1, "p50_us": 500, "from": {"swapped": 1}},
+            "thawed": {"n": 1, "timed": 1, "p50_us": 7, "from": {"thawed": 1}},
+        });
+        assert_eq!(got, want);
+        assert_eq!(by_start(std::iter::empty()), json!({}), "no microVM start: no kind");
+    }
 }

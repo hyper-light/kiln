@@ -232,3 +232,96 @@ fn p5_6_s1_remove_is_an_operation_held_to_the_gate_as_deployments_are() -> anyho
         Ok(())
     })
 }
+
+/// P5.6's slice S2: the Agents page's controls (rename, keep going), restart and interrupt are
+/// operations, held to the gate: in the owner's chat turn its own child's run at once, another of
+/// theirs waits on their click.
+#[test]
+fn p5_6_s2_controls_and_restart_are_operations_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let renamed = call(chat.clone(), "agents.control", json!({"agent": "kid", "control": "rename", "value": "Kid"})).await;
+        anyhow::ensure!(code(&renamed) == 200, "agents.control on its own child: {renamed:?}");
+        // Past the gate at once; its fixture's machine isn't connected, which the operation itself then says (502).
+        for (op, input) in [("agents.restart", json!({"agent": "kid"})), ("agents.interrupt", json!({"agent": "kid"}))] {
+            let at_once = call(chat.clone(), op, input).await;
+            anyhow::ensure!(!matches!(code(&at_once), 403 | 428), "{op} on its own child goes past the gate: {at_once:?}");
+        }
+        for (op, input) in [("agents.control", json!({"agent": "other", "control": "keep_going", "value": true})), ("agents.restart", json!({"agent": "other"}))] {
+            let waits = call(chat.clone(), op, input).await;
+            anyhow::ensure!(code(&waits) == 428, "{op} on another of the owner's: {waits:?}");
+        }
+        let by_person = call(person(&hub), "agents.control", json!({"agent": "other", "control": "rename", "value": "Other"})).await;
+        anyhow::ensure!(code(&by_person) == 200, "the owner's own: {by_person:?}");
+        Ok(())
+    })
+}
+
+/// P5.6's slice S3: the Agents page's Move to… is `agents.move`, held to the gate: in the owner's chat turn a move of
+/// its own child goes past it at once (to a machine this hub hasn't, so the move itself refuses it, saying why),
+/// another of theirs waits on their click.
+#[test]
+fn p5_6_s3_move_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let own = call(chat.clone(), "agents.move", json!({"agent": "kid", "to": "nowhere"})).await;
+        anyhow::ensure!(!matches!(code(&own), 403 | 428), "a move of its own child goes past the gate: {own:?}");
+        let waits = call(chat.clone(), "agents.move", json!({"agent": "other", "to": "nowhere"})).await;
+        anyhow::ensure!(code(&waits) == 428, "a move of another of the owner's waits for the click: {waits:?}");
+        Ok(())
+    })
+}
+
+/// P5.6's slice S4: the Agents page's Recover (a gone machine's agents going on elsewhere) is `agents.recover`, which
+/// moves agents its chat didn't start: an agent's waits on its person's click; the person's own goes at once.
+#[test]
+fn p5_6_s4_recover_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let waits = call(chat.clone(), "agents.recover", json!({"machine": "gone"})).await;
+        anyhow::ensure!(code(&waits) == 428, "an agent's recover waits for the click: {waits:?}");
+        let by_person = call(person(&hub), "agents.recover", json!({"machine": "gone"})).await;
+        anyhow::ensure!(by_person.as_ref().is_ok_and(|v| v.get("moved") == Some(&json!([]))), "the owner's own, of a machine none of whose agents are kiln's: {by_person:?}");
+        Ok(())
+    })
+}
+
+/// P5.6's slice S5: a broadcast is `agents.broadcast` (the bare `/api/harness/command` gone, its one command to the
+/// agents listed a broadcast's `to.ids`), which reaches agents its chat didn't start: an agent's waits on its person's
+/// click; the person's own goes past the gate at once.
+#[test]
+fn p5_6_s5_broadcast_is_an_operation_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let to = json!({"to": {"ids": ["other"]}, "command": {"type": "interrupt"}});
+        let waits = call(chat.clone(), "agents.broadcast", to.clone()).await;
+        anyhow::ensure!(code(&waits) == 428, "an agent's broadcast waits for the click: {waits:?}");
+        let by_person = call(person(&hub), "agents.broadcast", to).await;
+        anyhow::ensure!(!matches!(code(&by_person), 403 | 428), "the owner's own goes past the gate: {by_person:?}");
+        Ok(())
+    })
+}
+
+/// P5.6's slice S6: an agent's place in a person's attention is changed by operations (`agents.pin` here): an agent's
+/// pin of another of the owner's agents waits on their click; the owner's own goes past the gate at once.
+#[test]
+fn p5_6_s6_attention_places_are_operations_held_to_the_gate() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = hub().await?;
+        says(&hub, "chat").await;
+        let chat = agent(&hub, "chat").await?;
+        let waits = call(chat.clone(), "agents.pin", json!({"agent": "other"})).await;
+        anyhow::ensure!(code(&waits) == 428, "an agent's pin of another of the owner's waits for the click: {waits:?}");
+        let by_person = call(person(&hub), "agents.pin", json!({"agent": "other"})).await;
+        anyhow::ensure!(!matches!(code(&by_person), 403 | 428), "the owner's own goes past the gate: {by_person:?}");
+        Ok(())
+    })
+}
