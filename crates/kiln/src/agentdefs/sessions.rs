@@ -3,7 +3,8 @@
 //! from a definition it keeps which, and at which version ([`record`]): a run of one (`agentdefs.run`), and a start of
 //! one of kiln's UI agents, made from the person's own definition standing in for it or from kiln's own (`super::uses`).
 //! It's kiln's to say, never what was asked (`crate::harness::lineage::Ask::definition`). `agentdefs.sessions` lists a
-//! definition's ([`list`]), with what its starts took; `agents.get` says a session's ([`of`]).
+//! definition's ([`list`]), with what its starts took, or every definition's the caller sees at once ([`all`]: the
+//! Agents page's rows); `agents.get` says a session's ([`of`]).
 //!
 //! What a start took comes from kiln's record of each start of a session's harness on its machine
 //! (`crate::harness::session::Start`), of the sessions kiln still has: how it started, which that record says by its
@@ -179,7 +180,7 @@ pub async fn list(hub: &Hub, who: &Who, id: &str) -> R<Value> {
         }
     }
     let (i, person, all) = (id.to_owned(), who.person.clone(), who.all);
-    let rows: Vec<(String, i64, String, i64)> = hub
+    let rows: Vec<Row> = hub
         .store
         .read(move |c| {
             let mut st = c.prepare("SELECT session_id, version, target, at FROM agent_def_sessions WHERE agent_def_id = ?1 AND (?3 OR person = ?2) ORDER BY at DESC, session_id")?;
@@ -187,6 +188,49 @@ pub async fn list(hub: &Hub, who: &Who, id: &str) -> R<Value> {
             Ok(rows)
         })
         .await?;
+    listed_of(hub, rows)
+}
+
+/// Every definition's sessions that `who` may see, by the definition's id, each as [`list`] answers for it: of theirs
+/// (everyone's for `who.all`) and of kiln's own as they started them, in one read. A definition none of whose sessions
+/// they see isn't among them, nor one that's gone (deleted, or one of kiln's it no longer has).
+pub async fn all(hub: &Hub, who: &Who) -> R<Value> {
+    let (person, all) = (who.person.clone(), who.all);
+    let rows: Vec<(String, Option<String>, String, i64, String, i64)> = hub
+        .store
+        .read(move |c| {
+            let mut st = c.prepare(
+                "SELECT s.agent_def_id, d.owner, s.session_id, s.version, s.target, s.at FROM agent_def_sessions s LEFT JOIN agent_defs d ON d.id = s.agent_def_id \
+                 WHERE (?2 OR s.person = ?1) ORDER BY s.agent_def_id, s.at DESC, s.session_id",
+            )?;
+            let rows = st.query_map(params![person, all], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await?;
+    let mut by_def: std::collections::BTreeMap<String, Vec<Row>> = std::collections::BTreeMap::new();
+    for (def, owner, session, version, target, at) in rows {
+        // One the caller reaches (another's is as none, as `list` has it), or one of kiln's own that it still has.
+        let seen = match owner {
+            Some(owner) => who.reaches(&owner),
+            None => builtin::get(&def).is_some(),
+        };
+        if seen {
+            by_def.entry(def).or_default().push((session, version, target, at));
+        }
+    }
+    let mut answer = serde_json::Map::new();
+    for (def, rows) in by_def {
+        answer.insert(def, listed_of(hub, rows)?);
+    }
+    Ok(Value::Object(answer))
+}
+
+/// One session of a definition as kiln keeps it: its id, the definition's version it started from, where it was
+/// placed and when (Unix ms).
+type Row = (String, i64, String, i64);
+
+/// The sessions `rows` keep, in their order, as `agentdefs.sessions` lists them, and what their starts took.
+fn listed_of(hub: &Hub, rows: Vec<Row>) -> R<Value> {
     let mut listed = Vec::with_capacity(rows.len());
     let mut infos = Vec::new();
     for (session, version, target, at) in rows {

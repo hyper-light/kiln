@@ -187,7 +187,12 @@ async fn run(cx: Cx, v: Value) -> Out {
 
 /// The sessions started from one of the caller's definitions, or from one of kiln's own as they ran it.
 async fn sessions(cx: Cx, v: Value) -> Out {
-    super::sessions::list(&cx.hub, &who(&cx)?, &id_of(&v)?).await.map_err(fail)
+    let who = who(&cx)?;
+    match v.get("id").filter(|id| !id.is_null()) {
+        Some(_) => super::sessions::list(&cx.hub, &who, &id_of(&v)?).await,
+        None => super::sessions::all(&cx.hub, &who).await,
+    }
+    .map_err(fail)
 }
 
 /// The operations, in the order they are listed.
@@ -294,11 +299,14 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.sessions",
-            summary: "The sessions started from one of your agent definitions (or from one of kiln's own, `kiln:<name>`, as you started them): newest first, each with the definition's version it started from (`version`; behind the definition where less than its `version` now), how it stands (`state`, as agents.list's `stand`; `gone` once kiln no longer has it), its `runner` and `engine` (host or microvm), and its brief (`agent`). With what their starts took (`starts`): how many kiln recorded (`n`), and by how each started (`by_kind`: its engine), how many, how many were timed (a session's first start: from its open on its machine to its harness running) and their median (`p50_ms`); `warm`, the warm hosts its runners' nodes keep for it, where they say (none does yet).",
+            summary: "The sessions started from one of your agent definitions (or from one of kiln's own, `kiln:<name>`, as you started them): newest first, each with the definition's version it started from (`version`; behind the definition where less than its `version` now), how it stands (`state`, as agents.list's `stand`; `gone` once kiln no longer has it), its `runner` and `engine` (host or microvm), and its brief (`agent`). With what their starts took (`starts`): how many kiln recorded (`n`), and by how each started (`by_kind`: its engine), how many, how many were timed (a session's first start: from its open on its machine to its harness running) and their median (`p50_ms`); `warm`, the warm hosts its runners' nodes keep for it, where they say (none does yet). Without `id`: every definition's whose sessions you see, by its id, each answered so (one with none isn't among them).",
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentdefsSessions>(),
-            route: |v| Ok((Method::GET, path(&["api", "agentdefs", &id_of(v)?, "sessions"]))),
+            route: |v| match v.get("id").filter(|id| !id.is_null()) {
+                Some(_) => Ok((Method::GET, path(&["api", "agentdefs", &id_of(v)?, "sessions"]))),
+                None => Ok((Method::GET, path(&["api", "agentdef-sessions"]))),
+            },
             run: |cx, v| Box::pin(sessions(cx, v)),
         },
     ]
@@ -427,8 +435,9 @@ pub mod input {
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct AgentdefsSessions {
-        /// The agent definition's id: one of yours, or one of kiln's own (`kiln:<name>`).
-        pub id: String,
+        /// The agent definition's id: one of yours, or one of kiln's own (`kiln:<name>`). Left out:
+        /// every definition's whose sessions you see, by its id.
+        pub id: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
