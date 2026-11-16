@@ -100,13 +100,16 @@ lane). `REQUIRED_LINKS` says so beside the list.
 
 ### A real task's words
 
-Each of a real harness's turns says what the checks read, a line each:
+Each of a real harness's turns says what the checks read, a line each. Where kiln gives the harness its MCP
+server in a microVM, the drive waits for the agent its first turn starts there (`in_microvm`'s `child`, from
+kiln's Agentfile and from a person's own alike), so the first turn's words ask for one:
 
 ```text
 VM_E2E_PROMPT:          Run `pwd`, `uname -s` and `cat /proc/sys/kernel/random/boot_id` in your shell and reply
                         with the lines `CWD <the folder>` and `WHERE <the kernel name> <the boot id>`. Write a file
-                        named {file} in this folder whose only words are {file}. Call kiln's `runners` tool.
-                        Then <the real task>. End your reply with the line E2E-DONE.
+                        named {file} in this folder whose only words are {file}. Call kiln's `runners` tool, and
+                        start one {kind} agent with kiln's `agents_start` tool. Then <the real task>. End your
+                        reply with the line E2E-DONE.
 VM_E2E_RESUMED_PROMPT:  Say the name of the file you wrote in this conversation. End your reply with the line E2E-DONE.
 VM_E2E_STEERED_PROMPT:  Run `for i in $(seq 1 120); do echo $i; sleep 1; done` in your shell, then end your reply
                         with the line E2E-DONE.

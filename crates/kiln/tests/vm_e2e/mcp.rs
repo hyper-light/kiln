@@ -125,9 +125,10 @@ pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> a
     let (_, e) = pace.until(f, &id, vm_e2e::Asked::Stop { said: None }, &format!("{what}: stopping its turn"), |i, _| vm_e2e::status(i) == "idle")?;
     anyhow::ensure!(!stub || !vm_e2e::said_marker(&said_after(&e, &stop_me), &marker), "{what}: the interrupted turn ran to its end");
 
-    // Stop: ended for good, its conversation kept to take up again.
+    // Stop: ended for good, its conversation kept to take up again, with any agent a real task's first turn
+    // started (the README's words ask for one), which this drive doesn't look at.
     let hs = vm_e2e::info(f, &id)?.get("harness_session").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("{what}: kiln knows no harness session of {id}"))?;
-    let ended = call(f, via, "agents.stop", json!({"agent": id}))?;
+    let ended = call(f, via, "agents.stop", json!({"agent": id, "children": true}))?;
     anyhow::ensure!(ended.get("ended").and_then(Value::as_array).is_some_and(|a| a.iter().any(|x| x.as_str() == Some(id.as_str()))), "{what}: agents.stop said {ended}");
     pace.unlisted(f, &id, &format!("{what}: {id} still listed after agents.stop"))?;
 
@@ -137,7 +138,7 @@ pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> a
     let (i, _) = pace.until(f, &resumed, vm_e2e::Asked::Opening, &format!("{what}: taking its conversation up again"), done)?;
     anyhow::ensure!(i.get("harness_session").and_then(Value::as_str) == Some(hs.as_str()), "{what}: the resumed agent's harness session is {}, not {hs}", i.get("harness_session").unwrap_or(&Value::Null));
     anyhow::ensure!(i.pointer("/isolation/image").and_then(Value::as_str) == Some(image), "{what}: resumed outside its Agentfile: {}", i.get("isolation").unwrap_or(&Value::Null));
-    call(f, via, "agents.stop", json!({"agent": resumed}))?;
+    call(f, via, "agents.stop", json!({"agent": resumed, "children": true}))?;
     Ok(())
 }
 
