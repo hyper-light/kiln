@@ -1612,6 +1612,12 @@ async fn reapply_overrides(s: &Session, run: Option<Arc<crate::sandbox::held::He
                 core.touch_state();
             }
         }
+        // A connection held from before each grant on a network named its parts (Shards' D285) granted nothing, default
+        // deny, and no microVM took one (Hex's refused every change): let go of, once.
+        if core.state.overrides.networks.iter().any(|h| h.network.grant.is_none()) {
+            core.state.overrides.networks.retain(|h| h.network.grant.is_some());
+            core.touch_state();
+        }
         if core.state.overrides.ports.is_empty() && core.state.overrides.egress.is_empty() && core.state.overrides.networks.is_empty() && core.state.overrides.volumes.is_empty() {
             return;
         }

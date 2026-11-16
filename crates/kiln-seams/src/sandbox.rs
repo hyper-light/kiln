@@ -468,9 +468,13 @@ pub enum Change {
     Grant { member: Member, host: String, port: u16 },
     /// That grant taken back: its next connection there is refused.
     Revoke { member: Member, host: String, port: u16 },
-    /// `member` joins the named `network`, shared with the runs connected to it.
-    Connect { member: Member, network: String },
-    Disconnect { member: Member, network: String },
+    /// `member` on the named `network`, shared with the runs connected to it, on `grant`'s terms
+    /// (Shards' D285): joining grants nothing else, and a flow between two runs' members is where
+    /// the grants of both its ends take it.
+    Connect { member: Member, network: String, grant: NetworkGrant },
+    /// That grant taken back: a flow it let open is reset, and its member leaves the network with
+    /// its last grant there.
+    Disconnect { member: Member, network: String, grant: NetworkGrant },
     /// `source` plugged into the members `to` at `at` (absolute, strictly beneath one of its plug
     /// roots: its launch's [`Launch::plug_roots`] and each share's top-level directory), read-only
     /// where it says, as Shards' `ImageGuest::plug` takes one (D271).
@@ -484,6 +488,63 @@ pub enum Change {
     Swap { at: String, component: Component },
     /// The image's own component back at `at`, its member started again with it at once.
     Restore { at: String },
+}
+
+/// What a member's connection to a network shared with other runs grants it, every part named
+/// (Shards' D285; default deny): its name there, as its peers name it (one member's on the
+/// network); its peer, a member of another run on it, by its name there, which outlasts that run's
+/// restarts as its [`Run::id`] doesn't; the ports; and which way a flow opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkGrant {
+    pub name: String,
+    pub peer: String,
+    pub ports: Ports,
+    pub way: Way,
+}
+
+/// A grant's ports on a shared network, UDP's else TCP's: `first` to `last`, a range as Shards'
+/// D285 takes one (one port: the same).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ports {
+    pub udp: bool,
+    pub first: u16,
+    pub last: u16,
+}
+
+/// Which way a [`NetworkGrant`] lets a flow open: from its member toward its peer (`Out`), or from
+/// its peer toward its member (`In`). A flow's replies come back by its state, whichever way it
+/// opened (Shards' D285).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Way {
+    In,
+    Out,
+}
+
+impl NetworkGrant {
+    /// `Ok` where it names its name and its peer, each a host's name and not the other, and ports
+    /// from 1 to 65535, the first at most the last; else `Invalid`, saying what.
+    pub fn check(&self) -> Result<(), Refusal> {
+        let invalid = |why: String| Err(Refusal::Invalid { what: "a grant on a network", why });
+        for (what, name) in [("its name", &self.name), ("its peer", &self.peer)] {
+            if !host_name(name) {
+                return invalid(format!("{what}, {name:?}, isn't a host's name: labels of letters, digits and hyphens, 63 bytes each and 253 in all (RFC 1035 §2.3.4, RFC 1123 §2.1)"));
+            }
+        }
+        // RFC 4343: DNS names compare case-insensitively.
+        if self.name.eq_ignore_ascii_case(&self.peer) {
+            return invalid(format!("its peer is {}, itself: a peer is a member of another run", self.peer));
+        }
+        if self.ports.first == 0 || self.ports.first > self.ports.last {
+            return invalid(format!("ports {} to {}: from 1 to 65535, the first at most the last (0 names no port)", self.ports.first, self.ports.last));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `name` is a host's name: labels of 1 to 63 letters, digits and hyphens, none starting or
+/// ending with one, 253 bytes in all (RFC 1035 §2.3.4; RFC 1123 §2.1 lets a label start with a digit).
+fn host_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 253 && name.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && !l.starts_with('-') && !l.ends_with('-'))
 }
 
 /// What a [`Change::Plug`] gives the members it plugs into, as Shards takes one (D271).
@@ -754,8 +815,14 @@ impl Run for SimRun {
         let out = {
             let mut st = self.state.lock();
             let component = matches!(change, Change::Swap { .. } | Change::Restore { .. });
+            let granted = match &change {
+                Change::Connect { grant, .. } | Change::Disconnect { grant, .. } => grant.check(),
+                _ => Ok(()),
+            };
             if st.ended {
                 Err(Refusal::Ended)
+            } else if let Err(e) = granted {
+                Err(e)
             } else if component && !self.components {
                 Err(Refusal::Unsupported("a component swapped into a run while it runs".into()))
             } else if !component && !self.live {
@@ -1243,6 +1310,25 @@ fn c14<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
             };
         }
         fine("a change to a run while it runs", run.change(change.clone()).await)?;
+        let grant = NetworkGrant { name: "alice".into(), peer: "bob".into(), ports: Ports { udp: false, first: 8080, last: 8081 }, way: Way::Out };
+        let connect = |grant: NetworkGrant| Change::Connect { member: Member("harness".into()), network: "team".into(), grant };
+        fine("a member connected to a network, its grant whole", run.change(connect(grant.clone())).await)?;
+        let malformed = [
+            ("no name", NetworkGrant { name: String::new(), ..grant.clone() }),
+            ("no peer", NetworkGrant { peer: String::new(), ..grant.clone() }),
+            ("a peer that's no host's name", NetworkGrant { peer: "-bob".into(), ..grant.clone() }),
+            ("itself as its peer", NetworkGrant { peer: "ALICE".into(), ..grant.clone() }),
+            ("port 0", NetworkGrant { ports: Ports { first: 0, ..grant.ports }, ..grant.clone() }),
+            ("its ports out of order", NetworkGrant { ports: Ports { first: 8081, last: 8080, ..grant.ports }, ..grant.clone() }),
+        ];
+        for (what, bad) in malformed {
+            let taken = run.change(connect(bad)).await;
+            if !matches!(taken, Err(Refusal::Invalid { .. })) {
+                run.kill();
+                return Err(format!("a connection naming {what}: {taken:?}, not refused Invalid"));
+            }
+        }
+        fine("its grant taken back", run.change(Change::Disconnect { member: Member("harness".into()), network: "team".into(), grant }).await)?;
         run.kill();
         same("its end", end(&drain(run.as_ref()).await), Some(Exit::Killed))?;
         same("a change after its end", run.change(change).await, Err(Refusal::Ended))
@@ -1383,7 +1469,7 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
         },
         Case {
             id: "SANDBOX-14",
-            says: "a run takes a change to its network or folders while it runs, and one after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on",
+            says: "a run takes a change to its network or folders while it runs, a member connected to a network and its grant there taken back among them; a connection whose grant names no host's name or peer, itself as its peer, port 0 or its ports out of order is refused Invalid; a change after its end is refused Ended; a sandbox that takes no change live refuses one Unsupported, and its run goes on",
             check: c14::<F>,
         },
         Case {
@@ -1509,6 +1595,145 @@ mod tests {
         let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
         assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15", "SANDBOX-16", "SANDBOX-17"], "{:?}", report.failed);
         assert!(report.failed.iter().all(|(_, why)| why.contains("doesn't hold it")), "{:?}", report.failed);
+    }
+
+    /// Holds everything, as the simulator does, but its runs take a connection whatever its grant names.
+    struct Lax(SimSandbox);
+
+    /// A run of [`Lax`]'s: the simulator's, but for the connections it takes unchecked.
+    struct LaxRun(Box<dyn Run>);
+
+    impl Run for LaxRun {
+        fn stdin<'a>(&'a self, bytes: Vec<u8>) -> BoxFuture<'a, Result<(), Refusal>> {
+            self.0.stdin(bytes)
+        }
+        fn close_stdin(&self) {
+            self.0.close_stdin();
+        }
+        fn next(&self) -> BoxFuture<'_, Option<Output>> {
+            self.0.next()
+        }
+        fn signal(&self, signal: Signal) -> Result<(), Refusal> {
+            self.0.signal(signal)
+        }
+        fn kill(&self) {
+            self.0.kill();
+        }
+        fn id(&self) -> Option<String> {
+            self.0.id()
+        }
+        fn link(&self) -> BoxFuture<'_, Option<Link>> {
+            self.0.link()
+        }
+        fn change(&self, change: Change) -> BoxFuture<'_, Result<(), Refusal>> {
+            match change {
+                Change::Connect { .. } | Change::Disconnect { .. } => Box::pin(async { Ok(()) }),
+                other => self.0.change(other),
+            }
+        }
+        fn swap(&self, launch: Launch) -> BoxFuture<'_, Result<Box<dyn Run>, Refusal>> {
+            self.0.swap(launch)
+        }
+    }
+
+    impl Sandbox for Lax {
+        fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
+            Box::pin(async move { Ok(Box::new(LaxRun(self.0.launch(launch).await?)) as Box<dyn Run>) })
+        }
+        fn boundaries(&self) -> Vec<&'static str> {
+            self.0.boundaries()
+        }
+        fn holds(&self) -> Holds {
+            self.0.holds()
+        }
+        fn keep(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+            self.0.keep(pool)
+        }
+        fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
+            self.0.let_go(pool)
+        }
+        fn pools(&self) -> Vec<PoolHeld> {
+            self.0.pools()
+        }
+    }
+
+    /// The simulator's launches, made by [`Lax`].
+    struct LaxFixture(SimSandboxFixture, Lax);
+
+    impl SandboxFixture for LaxFixture {
+        fn sandbox(&self) -> &dyn Sandbox {
+            &self.1
+        }
+        fn say(&self, text: &str) -> Launch {
+            self.0.say(text)
+        }
+        fn echo(&self) -> Launch {
+            self.0.echo()
+        }
+        fn fail(&self, code: i32) -> Launch {
+            self.0.fail(code)
+        }
+        fn wait(&self) -> Launch {
+            self.0.wait()
+        }
+        fn hog(&self, bytes: u64, limit: Option<u64>) -> Launch {
+            self.0.hog(bytes, limit)
+        }
+        fn spawn(&self, n: u32, limit: Option<u32>) -> Launch {
+            self.0.spawn(n, limit)
+        }
+        fn connect(&self, host: &str, egress: Egress) -> Launch {
+            self.0.connect(host, egress)
+        }
+        fn fill(&self, host: &str, reference: &str, credentials: Vec<CredentialGrant>, egress: Egress) -> Launch {
+            self.0.fill(host, reference, credentials, egress)
+        }
+        fn pwd(&self, folder: &str) -> Launch {
+            self.0.pwd(folder)
+        }
+        fn components(&self, laid: Vec<ComponentAt>) -> Launch {
+            self.0.components(laid)
+        }
+        fn folder(&self) -> String {
+            self.0.folder()
+        }
+    }
+
+    /// Kiln plan 01a1dd2e…, P6b.4, for Shards' D285: the suite isn't vacuous about a connection's grant. A sandbox
+    /// whose runs take a connection whatever its grant names fails SANDBOX-14 for it, and only that clause.
+    #[test]
+    fn p6b_4_a_sandbox_that_takes_any_connection_fails_its_clause() {
+        let make = || async { LaxFixture(SimSandboxFixture::default(), Lax(SimSandbox::new())) };
+        let report = futures::executor::block_on(run("Sandbox", &cases::<LaxFixture>(), make));
+        let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(failed, ["SANDBOX-14"], "{:?}", report.failed);
+        assert!(report.failed.iter().all(|(_, why)| why.contains("not refused Invalid")), "{:?}", report.failed);
+    }
+
+    /// Kiln plan 01a1dd2e…, P6b.4, for Shards' D285: a connection's grant names its name and its peer, each a host's
+    /// name (a label may start with a digit, RFC 1123 §2.1; 63 bytes a label and 253 in all, RFC 1035 §2.3.4) and not
+    /// the other in any case (RFC 4343), and ports 1 to 65535, the first at most the last; else it's refused Invalid,
+    /// saying which.
+    #[test]
+    fn p6b_4_a_network_grant_is_whole_or_refused_invalid() {
+        let grant = NetworkGrant { name: "alice".into(), peer: "bob.team".into(), ports: Ports { udp: true, first: 53, last: 53 }, way: Way::In };
+        assert_eq!(grant.check(), Ok(()));
+        let longest = format!("{}.{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        assert_eq!(longest.len(), 253);
+        assert_eq!(NetworkGrant { name: "1a-b".into(), peer: longest.clone(), ports: Ports { udp: false, first: 1, last: u16::MAX }, way: Way::Out }.check(), Ok(()));
+        for (says, bad) in [
+            ("its name", NetworkGrant { name: String::new(), ..grant.clone() }),
+            ("its peer", NetworkGrant { peer: "bob_1".into(), ..grant.clone() }),
+            ("its peer", NetworkGrant { peer: "bob.".into(), ..grant.clone() }),
+            ("its peer", NetworkGrant { peer: "-bob".into(), ..grant.clone() }),
+            ("its peer", NetworkGrant { peer: format!("{longest}x"), ..grant.clone() }),
+            ("its peer", NetworkGrant { peer: format!("{}.b", "a".repeat(64)), ..grant.clone() }),
+            ("itself", NetworkGrant { peer: "Alice".into(), ..grant.clone() }),
+            ("0 names no port", NetworkGrant { ports: Ports { first: 0, last: 0, ..grant.ports }, ..grant.clone() }),
+            ("the first at most the last", NetworkGrant { ports: Ports { first: 2, last: 1, ..grant.ports }, ..grant.clone() }),
+        ] {
+            assert!(matches!(bad.check(), Err(Refusal::Invalid { what: "a grant on a network", ref why }) if why.contains(says)), "{says}: {:?}", bad.check());
+        }
     }
 
     /// CP-T4.1: what each kind of launch is refused by a sandbox that holds only part of it.
