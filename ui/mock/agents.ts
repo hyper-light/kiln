@@ -1593,8 +1593,15 @@ function descendants(id: string, all: AgentInfo[], live: boolean): AgentInfo[] {
   return out;
 }
 
-/** A Claude Code agent's models and efforts, as its harness lists them. */
-const CLAUDE_CAN: Pick<Meta, "models" | "efforts"> = {
+/** A Claude Code agent's permission modes, models and efforts, as its harness lists them: every mode, its bypass ("Don't ask") among them. */
+const CLAUDE_CAN: Pick<Meta, "modes" | "models" | "efforts"> = {
+  modes: [
+    { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
+    { id: "default", label: "Ask", description: "Asks before edits and commands" },
+    { id: "acceptEdits", label: "Accept edits", description: "Edits files without asking; asks before commands" },
+    { id: "auto", label: "Auto", description: "Decides for itself what needs asking" },
+    { id: "bypassPermissions", label: "Don't ask", description: "Runs every command and edit without asking", dangerous: true },
+  ],
   models: [
     { id: "default", label: "Default (recommended)", description: "Opus 5.5" },
     { id: "claude-opus-5-5", label: "claude-opus-5-5", description: "" },
