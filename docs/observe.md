@@ -1876,6 +1876,19 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   `month_starts` (1) and `timezone` for a day and a month; unless it says, at the hour, midnight UTC
   and the 1st. Metric monitors alone take them, and not `anomalies()` or `outliers()`, which read a
   rolling window.
+- **Formula monitors** are Datadog's (its API client's own
+  `formula("query1 / query2").rollup("avg").last("5m") > threshold`): an expression of the
+  monitor's `options.variables` by their names, each a metric query (`data_source: metrics`; logs,
+  spans and events are their own monitors'), read over its `.last()` window (up to six of
+  Datadog's 730-hour months, its own examples' longest) by its `.rollup()` (`avg`, `sum`, `min`,
+  `max`, `pXX`; `avg` unless it says, a metric monitor's default "average"), as the metric monitor
+  of the expression is. A name in it not followed by `(` (a function's) is one of its variables, or
+  it's refused. Its threshold a number, or Datadog's dynamic threshold, `> threshold`: then
+  `thresholds.critical_query` (and `critical_recovery_query` beside it) is a formula of the same
+  variables (`formula("query1 / query2").rollup("p99").last("1w").multiplier(1.5)`), read with the
+  monitor, each group's value its threshold (an ungrouped one's, every group's); a group without one
+  now has no data. "Cannot be combined with static thresholds": a `critical` or
+  `critical_recovery` number beside it is refused.
 - **Evaluation paths** are Datadog's (its guide "as_count() in Monitor Evaluations"). A metric
   monitor reads its window bucket by bucket, its time aggregation of the values its formula gives
   (the classic path). `sum` of a query read `.as_count()` sums each of its queries over the window

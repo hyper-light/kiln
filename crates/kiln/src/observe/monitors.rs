@@ -62,6 +62,12 @@ pub struct ThresholdsIn {
     pub ok: Option<f64>,
     /// A service check monitor's: UNKNOWN runs in a row to NO DATA (none: never).
     pub unknown: Option<f64>,
+    /// Datadog's dynamic thresholds, a formula monitor's (`> threshold`): formulas of its variables
+    /// (`formula("query1 / query2").rollup("p99").last("1w").multiplier(1.5)`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critical_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critical_recovery_query: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -84,6 +90,9 @@ pub struct Options {
     /// and the one its recovery reads (`kiln_obs::monitor::Query::windows`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold_windows: Option<ThresholdWindows>,
+    /// Datadog's, a formula monitor's queries by their names ([`Variable`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<Variable>,
 }
 
 /// Datadog's `threshold_windows` of an anomaly monitor, timeframes (`last_15m`).
@@ -92,6 +101,54 @@ pub struct Options {
 pub struct ThresholdWindows {
     pub trigger_window: Option<String>,
     pub recovery_window: Option<String>,
+}
+
+/// A monitor's query read with what its options give it (Datadog's): a formula monitor's variables
+/// and dynamic thresholds (`options.variables`, `thresholds.critical_query`), a cumulative window's
+/// start (`scheduling_options.evaluation_window`), an anomaly monitor's `threshold_windows`.
+pub fn query_of(query: &str, o: &Options) -> Result<monitor::Query, String> {
+    let q = if query.trim_start().starts_with("formula(") {
+        let vars = o.variables.iter().map(Variable::metric).collect::<Result<Vec<(&str, &str)>, String>>()?;
+        monitor::parse_formula(query, &vars, o.thresholds.critical_query.as_deref(), o.thresholds.critical_recovery_query.as_deref()).map_err(|e| e.to_string())?
+    } else {
+        if !o.variables.is_empty() || o.thresholds.critical_query.is_some() || o.thresholds.critical_recovery_query.is_some() {
+            return Err("options.variables and thresholds.critical_query: a formula monitor's (formula(\"query1 / query2\").last(\"5m\") > threshold)".into());
+        }
+        monitor::parse(query).map_err(|e| e.to_string())?
+    };
+    let q = match o.scheduling_options.as_ref().and_then(|s| s.evaluation_window.as_ref()) {
+        Some(w) => q.starting(w.hour_starts, w.day_starts.as_deref(), w.month_starts, w.timezone.as_deref()).map_err(|e| e.to_string())?,
+        None => q,
+    };
+    match &o.threshold_windows {
+        // Datadog's rule: both windows, or none.
+        Some(ThresholdWindows { trigger_window: Some(trigger), recovery_window: Some(recovery) }) => q.windows(trigger, recovery).map_err(|e| e.to_string()),
+        Some(_) => Err("threshold_windows: both trigger_window and recovery_window (Datadog's \"must include both\")".into()),
+        None => Ok(q),
+    }
+}
+
+/// A formula monitor's query by its name (Datadog's `options.variables`): kiln's read metrics
+/// (`data_source: metrics`, its `query` a metric query); logs, spans and events are their own
+/// monitors' (`logs(…)`, `spans(…)`, `events(…)`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Variable {
+    pub name: String,
+    pub data_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+impl Variable {
+    /// Its name and its metric query.
+    fn metric(&self) -> Result<(&str, &str), String> {
+        match (self.data_source.as_str(), self.query.as_deref()) {
+            ("metrics", Some(q)) if !self.name.is_empty() => Ok((self.name.as_str(), q)),
+            ("metrics", _) => Err("a formula's variable: its name and its query (data_source metrics)".into()),
+            (other, _) => Err(format!("a formula's variable of data_source {other}: kiln's formulas read metrics (logs, spans and events: logs(…), spans(…) and events(…) monitors)")),
+        }
+    }
 }
 
 /// Datadog's `scheduling_options` of a monitor: its `evaluation_window`.
@@ -246,27 +303,20 @@ impl Monitor {
         if checks::is_check(&self.query) || self.kind.as_deref() == Some(SERVICE_CHECK) {
             return self.compiled_check().map(|(q, t)| Compiled::Check(q, t));
         }
-        let q = monitor::parse(&self.query).map_err(|e| e.to_string())?;
-        let q = match self.options.scheduling_options.as_ref().and_then(|s| s.evaluation_window.as_ref()) {
-            Some(w) => q.starting(w.hour_starts, w.day_starts.as_deref(), w.month_starts, w.timezone.as_deref()).map_err(|e| e.to_string())?,
-            None => q,
-        };
-        let q = match &self.options.threshold_windows {
-            // Datadog's rule: both windows, or none.
-            Some(ThresholdWindows { trigger_window: Some(trigger), recovery_window: Some(recovery) }) => q.windows(trigger, recovery).map_err(|e| e.to_string())?,
-            Some(_) => return Err("threshold_windows: both trigger_window and recovery_window (Datadog's \"must include both\")".into()),
-            None => q,
-        };
+        let q = query_of(&self.query, &self.options)?;
         if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) && self.options.notify_no_data {
             return Err("an Error Tracking monitor has no NO DATA: an issue without errors in its window counts none".into());
         }
         let t = &self.options.thresholds;
+        if q.dynamic.is_some() && (t.critical.is_some() || t.critical_recovery.is_some()) {
+            return Err("a dynamic threshold (`> threshold`): no critical or critical_recovery number beside it (Datadog's \"cannot be combined with static thresholds\")".into());
+        }
         if let Some(c) = t.critical
             && c != q.threshold
         {
             return Err(format!("the critical threshold {c} is not the query's {}", q.threshold));
         }
-        let t = Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery, dynamic: false };
+        let t = Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery, dynamic: q.dynamic.is_some() };
         Ok(Compiled::Query(q, t))
     }
 

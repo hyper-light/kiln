@@ -81,6 +81,8 @@ pub enum TimeAggr {
     /// Datadog's `percentile(pXX)` of a distribution: its values over the whole window, at the pXX
     /// its query's aggregator names (`percentile(last_5m):p95:latency{*}`).
     Percentile,
+    /// A percentile of the window's values, in hundredths (a formula's `.rollup("p99")`: 9900).
+    Pct(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,8 +221,30 @@ pub const ERROR_FACETS: [&str; 4] = ["issue.id", "service", "env", "version"];
 pub struct Query {
     pub kind: Kind,
     pub op: Op,
-    /// The threshold the query states (the critical one).
+    /// The threshold the query states (the critical one); none stated (`f64::NAN`, never compared:
+    /// [`Thresholds::dynamic`]) where it says Datadog's `threshold` and `dynamic` says each group's.
     pub threshold: f64,
+    /// Datadog's dynamic thresholds (a formula monitor's `> threshold`, its options'
+    /// `thresholds.critical_query` and `critical_recovery_query`): each a formula, read as the
+    /// monitor's own is and evaluated with it, a value for each group ([`Own::critical`]).
+    pub dynamic: Option<Box<Dynamic>>,
+}
+
+/// A formula monitor's dynamic thresholds ([`parse_formula`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dynamic {
+    pub critical: Formula,
+    pub critical_recovery: Option<Formula>,
+}
+
+/// A formula read as a monitor reads one: its time aggregation over its window of its query, its
+/// variables in place, the value times `multiplier` (a threshold's `.multiplier(1.5)`; 1 else).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Formula {
+    pub aggr: TimeAggr,
+    pub window_ms: i64,
+    pub query: String,
+    pub multiplier: f64,
 }
 
 impl Query {
@@ -308,6 +332,8 @@ fn window(s: &str, most: i64) -> Result<i64, MonitorError> {
         "h" => 3_600_000,
         "d" => 86_400_000,
         "w" => 7 * 86_400_000,
+        // Datadog's month: 730 hours ("730 hours (1 month)").
+        "mo" => 730 * 3_600_000,
         _ => return Err(syntax(format!("a window's unit: {unit}"))),
     };
     let w = n.checked_mul(ms).filter(|&w| w > 0 && w <= most).ok_or_else(|| syntax(format!("a window of {s}: at most {} hours", most / 3_600_000)))?;
@@ -465,6 +491,9 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     if q.starts_with("slo(") {
         return parse_slo(q);
     }
+    if q.starts_with("formula(") {
+        return Err(syntax("formula(…): a formula monitor reads its options' variables (parse_formula)"));
+    }
     if q.strip_prefix("error-tracking").is_some_and(|r| r.starts_with('(')) {
         return parse_error_tracking(q);
     }
@@ -523,7 +552,7 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     if matches!(kind, Kind::Metric { cumulative: Some(_), .. }) && ast.nodes.iter().any(|n| matches!(n, Node::Call(Func::Anomalies | Func::Outliers, _))) {
         return Err(syntax("a cumulative window (current_…) reads its period so far: anomalies() and outliers() read a rolling one (last_…)"));
     }
-    Ok(Query { kind, op, threshold })
+    Ok(Query { kind, op, threshold, dynamic: None })
 }
 
 /// `current_1h`, `current_1d`, `current_1mo`: a metric monitor's cumulative window, begun where
@@ -537,6 +566,129 @@ fn current(s: &str) -> Result<Option<Cumulative>, MonitorError> {
         other => return Err(syntax(format!("a cumulative window: current_{other} (current_1h, current_1d, current_1mo)"))),
     };
     Ok(Some(Cumulative::of(period)))
+}
+
+/// The longest a formula monitor's window, or its dynamic threshold's, may be: Datadog's longest
+/// in its API's own dynamic thresholds (`formula("2 * query1").rollup("avg").last("6mo")`), its
+/// months 730 hours ("730 hours (1 month)").
+pub const MAX_FORMULA_WINDOW_MS: i64 = 6 * 730 * 3_600_000;
+
+/// Datadog's formula monitor (its API client's own `formula("query1 / query2").rollup("avg")
+/// .last("5m") > threshold`): an expression of its queries by their names, each one of its
+/// monitor's `options.variables` (`variables`: a name and its metric query), read over its
+/// `.last()` window by its `.rollup()` (`avg`, `sum`, `min`, `max`, `pXX`; `avg` unless it says, as
+/// a metric monitor's "monitor query aggregation" defaults to "average"). Its threshold a number,
+/// or Datadog's `threshold`: then `critical_query` (and `critical_recovery_query`, beside it alone)
+/// says each group's, a formula of the same variables with its own `.multiplier()` ("Only
+/// supported on metric monitors with a formula query and options['variables']. Cannot be combined
+/// with static thresholds.").
+pub fn parse_formula(q: &str, variables: &[(&str, &str)], critical_query: Option<&str>, critical_recovery_query: Option<&str>) -> Result<Query, MonitorError> {
+    let q = q.trim();
+    let (left, op, threshold) = match dynamic_comparison(q) {
+        Some((left, op)) => (left, op, None),
+        None => {
+            let (left, op, t) = comparison(q)?;
+            (left, op, Some(t))
+        }
+    };
+    let f = formula_of(left, variables, false)?;
+    let dynamic = match (threshold, critical_query, critical_recovery_query) {
+        (None, Some(c), r) => Some(Box::new(Dynamic { critical: formula_of(c, variables, true)?, critical_recovery: r.map(|r| formula_of(r, variables, true)).transpose()? })),
+        (None, None, _) => return Err(syntax("> threshold: its monitor's thresholds.critical_query says the threshold")),
+        (Some(_), None, None) => None,
+        (Some(_), _, _) => return Err(syntax("thresholds.critical_query and critical_recovery_query: with `> threshold` alone (Datadog's: \"cannot be combined with static thresholds\")")),
+    };
+    Ok(Query { kind: Kind::Metric { aggr: f.aggr, window_ms: f.window_ms, query: f.query, cumulative: None, recovery_ms: None }, op, threshold: threshold.unwrap_or(f64::NAN), dynamic })
+}
+
+/// A formula monitor's comparison with Datadog's `threshold` keyword for its threshold: what comes
+/// before, and its operator.
+fn dynamic_comparison(s: &str) -> Option<(&str, Op)> {
+    let head = s.trim_end().strip_suffix("threshold")?.trim_end();
+    [(">=", Op::Ge), ("<=", Op::Le), ("==", Op::Eq), ("!=", Op::Ne), (">", Op::Gt), ("<", Op::Lt)].into_iter().find_map(|(sym, op)| head.strip_suffix(sym).map(|left| (left.trim_end(), op)))
+}
+
+/// `formula("…")[.rollup("…")].last("…")`, and with `threshold` its `.multiplier(x)`, read as a
+/// [`Formula`]: its expression's variables' names each its query, in brackets.
+fn formula_of(s: &str, variables: &[(&str, &str)], threshold: bool) -> Result<Formula, MonitorError> {
+    let Some((args, mut rest)) = call(s, "formula")? else { return Err(syntax("formula(\"query1 / query2\")")) };
+    let [expr] = args.as_slice() else { return Err(syntax("formula(\"…\"): one expression of its variables")) };
+    let (mut aggr, mut window_ms, mut multiplier) = (TimeAggr::Avg, None, 1.0);
+    while !rest.trim().is_empty() {
+        if let Some((a, r)) = call(rest, "rollup")? {
+            let [m] = a.as_slice() else { return Err(syntax(".rollup(\"avg\")")) };
+            aggr = rollup_aggr(m)?;
+            rest = r;
+        } else if let Some((a, r)) = call(rest, "last")? {
+            window_ms = Some(window(a.first().copied().unwrap_or(""), MAX_FORMULA_WINDOW_MS)?);
+            rest = r;
+        } else if let Some((x, r)) = number_call(rest, "multiplier").filter(|_| threshold) {
+            multiplier = x.ok_or_else(|| syntax(".multiplier(1.5): a finite number"))?;
+            rest = r;
+        } else {
+            return Err(syntax(format!("after formula(...): {}", rest.trim())));
+        }
+    }
+    let window_ms = window_ms.ok_or_else(|| syntax(".last(\"5m\")"))?;
+    let query = substituted(&unescape(expr), variables)?;
+    crate::query::parse::parse(&query).map_err(|e| syntax(e.to_string()))?;
+    Ok(Formula { aggr, window_ms, query, multiplier })
+}
+
+/// A formula's `.rollup()`: Datadog's `avg`, `sum`, `min`, `max`, or a percentile, `pXX`.
+fn rollup_aggr(m: &str) -> Result<TimeAggr, MonitorError> {
+    Ok(match m.trim() {
+        "avg" => TimeAggr::Avg,
+        "sum" => TimeAggr::Sum,
+        "min" => TimeAggr::Min,
+        "max" => TimeAggr::Max,
+        p => {
+            let x: f64 = p.strip_prefix('p').and_then(|x| x.parse().ok()).filter(|x: &f64| *x > 0.0 && *x <= 100.0).ok_or_else(|| syntax(format!(".rollup(\"{p}\"): avg, sum, min, max or pXX")))?;
+            TimeAggr::Pct((x * 100.0).round() as u16)
+        }
+    })
+}
+
+/// `.name(x)` at the start of `s`, `x` a number: it (none if not a finite one), and what follows.
+fn number_call<'a>(s: &'a str, name: &str) -> Option<(Option<f64>, &'a str)> {
+    let rest = s.trim_start().trim_start_matches('.').strip_prefix(name)?.trim_start().strip_prefix('(')?;
+    let (x, after) = rest.split_once(')')?;
+    Some((x.trim().parse::<f64>().ok().filter(|x| x.is_finite()), after))
+}
+
+/// A formula's expression with each of its variables' names its query, in brackets: a name not
+/// followed by `(` (a function's) is a variable's, or refused; strings (`'desc'`) and numbers
+/// (`1e5`) as they are.
+fn substituted(expr: &str, variables: &[(&str, &str)]) -> Result<String, MonitorError> {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0;
+    while let Some(c) = expr.get(i..).and_then(|r| r.chars().next()) {
+        let rest = expr.get(i..).unwrap_or("");
+        let len = if c == '\'' || c == '"' {
+            // A string, to its closing quote (or the end).
+            rest.get(1..).and_then(|r| r.find(c)).map_or(rest.len(), |e| e + 2)
+        } else if c.is_ascii_digit() || c == '.' {
+            rest.find(|c: char| !(word(c) || c == '.')).unwrap_or(rest.len())
+        } else if word(c) {
+            let len = rest.find(|c: char| !word(c)).unwrap_or(rest.len());
+            let (name, after) = rest.split_at(len);
+            if !after.trim_start().starts_with('(') {
+                let (_, query) = variables.iter().find(|(n, _)| *n == name).ok_or_else(|| syntax(format!("formula(…): {name} names none of its variables")))?;
+                out.push('(');
+                out.push_str(query);
+                out.push(')');
+                i += len;
+                continue;
+            }
+            len
+        } else {
+            c.len_utf8()
+        };
+        out.push_str(rest.get(..len).unwrap_or(rest));
+        i += len.max(1);
+    }
+    Ok(out)
 }
 
 /// An anomaly monitor's reading, from Datadog's named arguments of its `anomalies()`: the last part
@@ -585,7 +737,7 @@ fn parse_slo(q: &str) -> Result<Query, MonitorError> {
     } else {
         return Err(syntax("slo(\"id\").burn_rate(\"1h\", \"5m\") or slo(\"id\").error_budget()"));
     };
-    Ok(Query { kind: Kind::Slo { id, burn }, op, threshold })
+    Ok(Query { kind: Kind::Slo { id, burn }, op, threshold, dynamic: None })
 }
 
 /// An Error Tracking monitor's query (`error-tracking(...)`), as Datadog's API has it: a search of
@@ -643,7 +795,7 @@ fn parse_error_tracking(q: &str) -> Result<Query, MonitorError> {
     let new = new.ok_or_else(|| syntax(".new() (new issues and regressions) or .impact() (issues for review or reviewed)"))?;
     let by = by.filter(|b| b.iter().any(|f| f == "issue.id")).ok_or_else(|| syntax(".by(\"issue.id\"): an Error Tracking monitor tells of each issue"))?;
     let window_ms = window_ms.ok_or_else(|| syntax(".last(\"1d\")"))?;
-    Ok(Query { kind: Kind::ErrorTracking { search, new, by, window_ms }, op, threshold })
+    Ok(Query { kind: Kind::ErrorTracking { search, new, by, window_ms }, op, threshold, dynamic: None })
 }
 
 /// A log monitor's query (`logs(...)`), or with `spans` a trace analytics monitor's (`name(...)`:
@@ -682,7 +834,7 @@ fn parse_records(q: &str, name: &str, spans: bool) -> Result<Query, MonitorError
         (false, "events") => Kind::Logs { search: events_only(&search), measure, by, window_ms },
         (false, _) => Kind::Logs { search, measure, by, window_ms },
     };
-    Ok(Query { kind, op, threshold })
+    Ok(Query { kind, op, threshold, dynamic: None })
 }
 
 /// Where events are kept: log records of this source (kiln's own, its integrations', the API's).
@@ -754,6 +906,10 @@ fn reduce(aggr: TimeAggr, values: &[f64]) -> Option<f64> {
         }
         TimeAggr::Min => finite.reduce(f64::min),
         TimeAggr::Max => finite.reduce(f64::max),
+        TimeAggr::Pct(p) => {
+            let mut v: Vec<f64> = finite.collect();
+            (!v.is_empty()).then(|| crate::query::eval::percentile(&mut v, f64::from(p) / 100.0))
+        }
     }
 }
 
@@ -902,7 +1058,18 @@ pub fn evaluate_shared(store: &crate::lock::RwLock<Store>, q: &Query, now: i64, 
 fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
     let to = now - delay_ms.max(0);
     match &q.kind {
-        Kind::Metric { aggr, window_ms, query, cumulative, recovery_ms } => metric_values(src, query, *aggr, *window_ms, *cumulative, *recovery_ms, to),
+        Kind::Metric { aggr, window_ms, query, cumulative, recovery_ms } => {
+            let mut out = metric_values(src, query, *aggr, *window_ms, *cumulative, *recovery_ms, to)?;
+            if let Some(d) = &q.dynamic {
+                let critical = threshold_values(src, &d.critical, to)?;
+                let recovery = d.critical_recovery.as_ref().map(|r| threshold_values(src, r, to)).transpose()?;
+                for v in &mut out {
+                    v.own.critical = of_group(&critical, &v.group);
+                    v.own.critical_recovery = recovery.as_ref().and_then(|r| of_group(r, &v.group));
+                }
+            }
+            Ok(out)
+        }
         Kind::Change { aggr, window_ms, shift_ms, pct, query } => {
             let changed = |now: f64, then: f64| -> Option<f64> {
                 let change = now - then;
@@ -949,6 +1116,21 @@ fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Resu
         Kind::ErrorTracking { .. } => Err(MonitorError::Eval("an Error Tracking monitor is evaluated with its issues".into())),
         Kind::Logs { .. } | Kind::Spans { .. } => Err(MonitorError::Eval("a monitor of logs or spans reads its records (`evaluate_records`)".into())),
     }
+}
+
+/// A dynamic threshold's values ([`Formula`]), a group's each, times its multiplier.
+fn threshold_values(src: Source<'_>, f: &Formula, to: i64) -> Result<Vec<Value>, MonitorError> {
+    let mut out = metric_values(src, &f.query, f.aggr, f.window_ms, None, None, to)?;
+    for v in &mut out {
+        v.value *= f.multiplier;
+    }
+    Ok(out)
+}
+
+/// Group `group`'s value of `values`: its own, else an ungrouped one's (every group's, as a lone
+/// ungrouped series is in arithmetic).
+fn of_group(values: &[Value], group: &[(String, String)]) -> Option<f64> {
+    values.iter().find(|v| v.group == group).or_else(|| values.iter().find(|v| v.group.is_empty())).map(|v| v.value)
 }
 
 /// Whether a monitor reads log records or spans (`Some(true)`: spans), which
@@ -1203,7 +1385,7 @@ mod tests {
     #[test]
     fn datadog_s_monitor_queries_parse() {
         let q = parse("avg(last_5m):avg:system.cpu.user{env:prod} by {host} > 90").unwrap();
-        assert_eq!(q, Query { kind: Kind::Metric { aggr: TimeAggr::Avg, window_ms: 300_000, query: "avg:system.cpu.user{env:prod} by {host}".into(), cumulative: None, recovery_ms: None }, op: Op::Gt, threshold: 90.0 });
+        assert_eq!(q, Query { kind: Kind::Metric { aggr: TimeAggr::Avg, window_ms: 300_000, query: "avg:system.cpu.user{env:prod} by {host}".into(), cumulative: None, recovery_ms: None }, op: Op::Gt, threshold: 90.0, dynamic: None });
         let q = parse("max(last_1h):sum:kiln.ci.jobs.finished{status:failed}.as_count() / sum:kiln.ci.jobs.finished{*}.as_count() >= 0.25").unwrap();
         assert_eq!((q.op, q.threshold), (Op::Ge, 0.25));
         let q = parse("pct_change(avg(last_5m),last_1h):avg:http.requests{*} < -50").unwrap();
@@ -1480,6 +1662,55 @@ mod tests {
         let averaged = one("avg(last_5m):p50:lat{*} > 50");
         assert!(within(averaged, 50.5), "{averaged}");
         assert!(evaluate(&s, &parse("percentile(last_5m):p50:cpu{*} > 1").unwrap(), now, 0).is_err());
+    }
+
+    /// Datadog's formula monitors (its API client's own `formula("query1 / query2").rollup("avg")
+    /// .last("5m") > threshold`, its variables metric queries by their names) and their dynamic
+    /// thresholds (`critical_query`, `.multiplier(1.5)`): each group's value and threshold, read as
+    /// the monitor's own is; a static threshold read as the metric monitor of the formula is.
+    #[test]
+    fn formula_monitors_and_dynamic_thresholds_read_as_datadog_s_do() {
+        let mut s = Store::new(Keyed::new());
+        let mut b = Builder::new();
+        let now: i64 = 1_000_200_000;
+        // An hour of two services' errors and hits a minute: web's rate 0.1, 0.3 in the last five
+        // minutes; api's 0.2 throughout.
+        for (svc, early, late) in [("web", 1.0, 3.0), ("api", 2.0, 2.0)] {
+            let errors = SeriesKey::new("req.errors", [("service", svc)], SKind::Count).unwrap();
+            let hits = SeriesKey::new("req.hits", [("service", svc)], SKind::Count).unwrap();
+            b.define(&errors);
+            b.define(&hits);
+            b.run(errors.fp, (0..60).map(|i| (now - (60 - i) * 60_000 + 1_000, if i >= 55 { late } else { early })));
+            b.run(hits.fp, (0..60).map(|i| (now - (60 - i) * 60_000 + 1_000, 10.0)));
+        }
+        s.apply(&b.finish()).unwrap();
+        let vars = [("query1", "sum:req.errors{*} by {service}.as_count()"), ("query2", "sum:req.hits{*} by {service}.as_count()")];
+        let q = parse_formula(r#"formula("query1 / query2").rollup("avg").last("5m") > threshold"#, &vars, Some(r#"formula("query1 / query2").rollup("p50").last("1h").multiplier(1.5)"#), None).unwrap();
+        assert!(q.threshold.is_nan() && q.dynamic.is_some(), "{q:?}");
+        let got = evaluate(&s, &q, now, 0).unwrap();
+        let of = |svc: &str| got.iter().find(|v| v.group == [("service".to_owned(), svc.to_owned())]).cloned().unwrap_or_else(|| panic!("{svc}: {got:?}"));
+        let (web, api) = (of("web"), of("api"));
+        // Its threshold a group's own: the median of its hour's rates (five-minute buckets), times 1.5.
+        assert!((web.value - 0.3).abs() < 1e-9 && web.own.critical.is_some_and(|t| (t - 0.15).abs() < 1e-9), "{web:?}");
+        assert!((api.value - 0.2).abs() < 1e-9 && api.own.critical.is_some_and(|t| (t - 0.3).abs() < 1e-9), "{api:?}");
+        let t = Thresholds { dynamic: true, ..Thresholds::default() };
+        assert_eq!(next(State::Ok, Some(web.value), web.own, q.op, &t, false), State::Alert);
+        assert_eq!(next(State::Ok, Some(api.value), api.own, q.op, &t, false), State::Ok);
+        let plain = parse_formula(r#"formula("query1 / query2").last("5m") > 0.25"#, &vars, None, None).unwrap();
+        assert_eq!(plain, parse("avg(last_5m):(sum:req.errors{*} by {service}.as_count()) / (sum:req.hits{*} by {service}.as_count()) > 0.25").unwrap());
+        assert!(parse_formula(r#"formula("top(query1, 5, 'mean', 'desc') * 1e2").rollup("p99").last("6mo") > 1"#, &vars, None, None).is_ok(), "strings, numbers, a percentile, months");
+        for (bad, critical, recovery) in [
+            (r#"formula("query1 / query2").last("5m") > threshold"#, None, None),
+            (r#"formula("query1 / query2").last("5m") > 0.25"#, Some(r#"formula("query1").last("1h")"#), None),
+            (r#"formula("query1 / query2").last("5m") > threshold"#, None, Some(r#"formula("query1").last("1h")"#)),
+            (r#"formula("query1 / query3").last("5m") > 1"#, None, None),
+            (r#"formula("query1").rollup("median").last("5m") > 1"#, None, None),
+            (r#"formula("query1").last("5m").multiplier(2) > 1"#, None, None),
+            (r#"formula("query1").last("7mo") > 1"#, None, None),
+        ] {
+            assert!(parse_formula(bad, &vars, critical, recovery).is_err(), "{bad} {critical:?} {recovery:?}");
+        }
+        assert!(parse(r#"formula("query1").last("5m") > 1"#).is_err(), "a formula's variables are its monitor's");
     }
 
     /// Datadog's cumulative windows (its API client's own `avg(current_1mo):…`, its Terraform

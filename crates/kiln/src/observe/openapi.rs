@@ -544,6 +544,8 @@ fn schemas() -> Map<String, Value> {
             ("warning_recovery", nullable(number())),
             ("ok", describe(nullable(number()), "a service check monitor's: OK runs in a row to recover (its critical and warning: runs in a row too)")),
             ("unknown", describe(nullable(number()), "a service check monitor's: UNKNOWN runs in a row to NO DATA")),
+            ("critical_query", describe(nullable(string()), "a formula monitor's dynamic threshold (its query `> threshold`): a formula of its variables, formula(\"query1 / query2\").rollup(\"p99\").last(\"1w\").multiplier(1.5)")),
+            ("critical_recovery_query", describe(nullable(string()), "beside critical_query: its recovery threshold, a formula as it is")),
         ],
         &[],
     );
@@ -566,6 +568,13 @@ fn schemas() -> Map<String, Value> {
                         &[],
                     )),
                     "where a cumulative window (current_1h, current_1d, current_1mo) begins: hour_starts alone (a minute), or day_starts (04:00), month_starts (1) and timezone",
+                ),
+            ),
+            (
+                "variables",
+                describe(
+                    array(object(&[("name", string()), ("data_source", string()), ("query", string())], &["name", "data_source", "query"])),
+                    "a formula monitor's queries by their names (data_source metrics), its query formula(\"query1 / query2\").rollup(\"avg\").last(\"5m\")",
                 ),
             ),
             (
