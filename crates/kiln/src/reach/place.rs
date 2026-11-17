@@ -833,9 +833,14 @@ pub fn machine_of(r: &RunnerInfo) -> Machine {
     Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, syncs: feature::speaks(&r.features, feature::PLACE_SYNC), fast: feature::speaks(&r.features, feature::FAST) }
 }
 
-/// How long after a strain measured from the pace's stand-ins they're read again, ms: a PSI
-/// window, the least an unprivileged process may arm on Linux (2 s, `crate::os::pace_linux::window_us`),
-/// over which Linux's trigger reads the calm once more after a stall.
+/// How long after a strain measured from the pace's stand-ins they're read again, ms: Linux's PSI
+/// window for an unprivileged process, borrowed so a strain's end is seen as soon after it on every
+/// OS as Linux's trigger sees it (docs/needs.md §17.2). The kernel's own words
+/// (Documentation/accounting/psi.rst, torvalds/linux blob d455db3e5808, read 2026-11-17):
+/// "Unprivileged users can also create monitors, with the only limitation that the window size must
+/// be a multiple of 2s", and "Notifications to the userspace are rate-limited to one per tracking
+/// window". A runner is unprivileged; its trigger arms that least window (`crate::os::pace_linux::window_us`)
+/// and reads the calm once more a window after the last.
 const FOLLOW_UP_MS: i64 = 2_000;
 
 /// When a measure at `now` that found the machine `strained` has its stand-ins read again
@@ -1099,6 +1104,13 @@ impl Placer {
             h.measured(&m);
         }
         if strained != self.strained {
+            // Its onset, with why, and its end in the runner's log (docs/needs.md §17.2): when it took
+            // nothing new, for a run that keeps its runners' logs. Not each new figure while it stands.
+            match (&self.strained, &strained) {
+                (None, Some(why)) => tracing::info!(why = %why, "placement: this machine is under strain: it takes nothing new until a measure shows it isn't"),
+                (Some(_), None) => tracing::info!("placement: this machine is no longer under strain"),
+                _ => {}
+            }
             self.admission.strain(strained.clone(), now, said);
             self.strained = strained;
         }
