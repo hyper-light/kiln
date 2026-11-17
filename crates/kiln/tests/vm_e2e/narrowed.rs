@@ -101,7 +101,7 @@ pub fn notices(events: &[Value], level: &str) -> Vec<String> {
 }
 
 /// This machine's guests' platform, as kiln builds their images (`sandbox::image`).
-fn platform() -> anyhow::Result<&'static str> {
+pub fn platform() -> anyhow::Result<&'static str> {
     match std::env::consts::ARCH {
         "x86_64" => Ok("linux/amd64"),
         "aarch64" => Ok("linux/arm64"),

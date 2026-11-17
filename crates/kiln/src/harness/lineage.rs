@@ -1412,9 +1412,10 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         let one = draw.ask(Ask { count: Some(1), ..ask.clone() });
         let assigned = draw.assigned();
         let got = start_as(hub, by, one, move |spec| spec.experiment = Some(assigned)).await;
+        // A start that answered no session is kiln's own failure (RFC 9110 §15.6.1).
         let came = match &got {
-            Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| "no session started".to_owned()),
-            Err((_, why)) => Err(why.clone()),
+            Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "no session started".to_owned())),
+            Err((status, why)) => Err((*status, why.clone())),
         };
         draw.started(hub, came).await;
         // A variant that can't start is its failure, kept as its draw's: the rest are drawn still.
@@ -1469,9 +1470,9 @@ impl Drawn {
     }
 
     /// What its start came to, kept as its draw's: its session, or why it was refused (its variant's failure).
-    async fn started(&self, hub: &Hub, came: Result<String, String>) {
+    async fn started(&self, hub: &Hub, came: Result<String, Refused>) {
         match self {
-            Drawn::Experiment(d) => crate::agentdefs::experiments::started(hub, d, came).await,
+            Drawn::Experiment(d) => crate::agentdefs::experiments::started(hub, d, came.map_err(|(_, why)| why)).await,
             Drawn::Split(d) => crate::ci::experiments::started(hub, d, came).await,
         }
     }

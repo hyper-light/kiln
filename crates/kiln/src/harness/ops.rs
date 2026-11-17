@@ -14,7 +14,7 @@ use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::lineage::{self, Ask, Starter};
-use super::model::{Command, SendMode};
+use super::model::{Command, SendMode, Status};
 use super::registry::Sent;
 use super::session::Info;
 use super::wait::{self, Until};
@@ -834,9 +834,14 @@ async fn recover_machine(cx: Cx, v: Value) -> Out {
 /// has it, else why not.
 async fn commanded(cx: &Cx, v: &Value, c: Command, done: &str) -> Out {
     let info = known(cx, &agent_of(v)?)?;
-    let id = info.id.clone();
-    may_steer(cx, &id).await?;
-    match cx.hub.harness.command(&cx.hub, &id, c).await {
+    may_steer(cx, &info.id).await?;
+    given(cx, &info, c, done).await
+}
+
+/// Command `c` given to agent `info`, which the caller may steer: `done` true once its machine has it, else why not.
+async fn given(cx: &Cx, info: &Info, c: Command, done: &str) -> Out {
+    let id = &info.id;
+    match cx.hub.harness.command(&cx.hub, id, c).await {
         Sent::Published(receipt) => Ok(json!({"publication": receipt})),
         Sent::PublicationRefused(error) => Err(mail_failed(error)),
         Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({done: true})),
@@ -883,6 +888,65 @@ async fn stop(cx: Cx, v: Value) -> Out {
         ended.push(id);
     }
     Ok(json!({"ended": ended}))
+}
+
+/// Where a session's harness runs: `microvm`, or its machine's `host`.
+fn engine(info: &Info) -> &'static str {
+    if info.isolation.is_some() { "microvm" } else { "host" }
+}
+
+/// A session paused where it is (`on`), or let go on (`sessions.pause`, `sessions.resume`: kiln plan 01a1dd2e…, P5.5c,
+/// the Agents page's Pause and Resume), by a caller that may steer it. A pause goes to its machine as the page's does
+/// (`Command::Pause`, the subagents kiln started under it with it), which holds it: its processes by the machine's pacer
+/// on its host, its microVM by its boundary (`Run::pause`, through Hex). Taken isn't held: `agents.get` says it's paused
+/// once it is (stand `paused`, `frozen`), and its timeline why not where it isn't. A resume ends what pauses it: a
+/// person's pause, a usage limit's (`Command::Resume`), or both.
+async fn session_paused(cx: Cx, v: Value, on: bool) -> Out {
+    let info = known(&cx, &agent_of(&v)?)?;
+    may_steer(&cx, &info.id).await?;
+    let mut asked = Vec::new();
+    if on && info.frozen.is_some() {
+        return Err((StatusCode::CONFLICT, format!("{} is paused already", info.name)));
+    }
+    if on {
+        asked.push(Command::Pause { on: true, task: None });
+    }
+    if !on && info.frozen.is_some() {
+        asked.push(Command::Pause { on: false, task: None });
+    }
+    if !on && info.pause.is_some() {
+        asked.push(Command::Resume);
+    }
+    if asked.is_empty() {
+        return Err((StatusCode::CONFLICT, format!("{} isn't paused: it's {}", info.name, wait::stand(&info))));
+    }
+    for c in asked {
+        given(&cx, &info, c, "asked").await?;
+    }
+    Ok(json!({"agent": info.id, "asked": if on { "pause" } else { "resume" }, "engine": engine(&info)}))
+}
+
+/// A session started again now (`sessions.restart`: kiln plan 01a1dd2e…, P5.5c, the Agents page's Restart), by a caller
+/// that may steer it: its harness ends, whatever it was doing, and starts again from its own launch (`resume_spec`), so
+/// of the same agent and its definition's version, in a fresh microVM where it ran in one, its conversation going on in
+/// its harness's own record, under its id. Running, it's stopped by force (`Command::ForceStop`, its timeline saying
+/// so: `how` `force_stop`); its harness exited, it's started again (`Command::Restart`: `start`); crashed, its runner
+/// process gone, it's resumed in place (`relocate::resume`, as `agents.resume`: `resume`).
+async fn session_restart(cx: Cx, v: Value) -> Out {
+    let info = known(&cx, &agent_of(&v)?)?;
+    may_steer(&cx, &info.id).await?;
+    let (c, how) = match info.status {
+        Status::Idle | Status::Running | Status::Waiting => (Command::ForceStop, "force_stop"),
+        Status::Exited => (Command::Restart, "start"),
+        Status::Crashed => {
+            let resumed = super::relocate::resume(&cx.hub, &info.id).await.map_err(|e| (StatusCode::CONFLICT, e))?;
+            return Ok(json!({"agent": info.id, "how": "resume", "engine": engine(&info), "resumed": resumed}));
+        }
+        Status::Starting => return Err((StatusCode::CONFLICT, format!("{} is starting: restart it once it runs", info.name))),
+        Status::Disconnected => return Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now", info.name))),
+    };
+    given(&cx, &info, c, "asked").await?;
+    Ok(json!({"agent": info.id, "how": how, "engine": engine(&info)}))
 }
 
 /// Agent `agent` ended for good and taken off kiln's lists (the Agents page's Remove: kiln plan
@@ -1116,6 +1180,33 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentsStop>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "stop"]))),
             run: |cx, v| Box::pin(stop(cx, v)),
+        },
+        Op {
+            name: "sessions.pause",
+            summary: "Pause a session where it is (yours, or an agent's you started), and the subagents kiln started under it: on its machine's host its processes stop where they are, held by the machine's pacer; in a microVM its microVM is paused, through Hex. Taken isn't paused: agents.get says it is once its machine holds it (stand `paused`, `frozen` since when), and its timeline says why not where it can't be (a microVM's, until Hex pauses one: kiln plan 01a1dd2e…, P5.5b). One paused already is refused (409). sessions.resume lets it go on.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsInterrupt>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "pause"]))),
+            run: |cx, v| Box::pin(session_paused(cx, v, true)),
+        },
+        Op {
+            name: "sessions.resume",
+            summary: "Let a paused session go on (yours, or an agent's you started): a person's pause ends (sessions.pause), its subagents' with it, and so does a usage limit's, the turn it cut off going on first. One that isn't paused is refused (409); a crashed one goes on through sessions.restart.",
+            read_only: false,
+            destructive: false,
+            input: Input::of::<input::AgentsInterrupt>(),
+            route: |v| Ok((Method::DELETE, path(&["api", "harness", "sessions", &agent_of(v)?, "pause"]))),
+            run: |cx, v| Box::pin(session_paused(cx, v, false)),
+        },
+        Op {
+            name: "sessions.restart",
+            summary: "Restart a session now (yours, or an agent's you started): its harness ends, whatever it was doing, and starts again from its own launch, so of the same agent and its definition's version, in a fresh microVM where it ran in one, its conversation going on in its harness's own record, under the same id: its transcript, goals and subagents stay its own. `how`: `force_stop` (it was running: its timeline says it was stopped by force), `start` (its harness had exited) or `resume` (it had crashed: resumed in place, as agents.resume). One starting, or on a machine that's away, is refused.",
+            read_only: false,
+            destructive: true,
+            input: Input::of::<input::AgentsInterrupt>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "restart"]))),
+            run: |cx, v| Box::pin(session_restart(cx, v)),
         },
         Op {
             name: "agents.control",
@@ -2049,6 +2140,51 @@ pub(crate) mod end_to_end {
             let person = crate::ops::Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
             let sent = call(person, "agents.send", json!({"agent": b, "text": "go on", "mode": "steer"})).await;
             anyhow::ensure!(!matches!(sent, Err((http::StatusCode::FORBIDDEN, _))), "a person steering: {sent:?}");
+            Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1dd2e…, P5.5c: sessions.pause, sessions.resume and sessions.restart are kiln's own operations beside
+    /// agents.stop (each an HTTP route under its session's, an MCP tool and a code-mode function), on their routes:
+    /// a pause made, a pause taken away, a restart.
+    #[test]
+    fn p5_5c_sessions_pause_resume_and_restart_are_operations_on_their_routes() -> anyhow::Result<()> {
+        for (name, method, last) in [("sessions.pause", http::Method::POST, "pause"), ("sessions.resume", http::Method::DELETE, "pause"), ("sessions.restart", http::Method::POST, "restart")] {
+            let op = crate::ops::own().iter().find(|o| o.name == name).ok_or_else(|| anyhow::anyhow!("{name} isn't kiln's own"))?;
+            let (m, segs) = (op.route)(&json!({"agent": "a1"})).map_err(|(s, why)| anyhow::anyhow!("{name}: {s} {why}"))?;
+            anyhow::ensure!(m == method && segs == ["api", "harness", "sessions", "a1", last], "{name}: {m} {segs:?}");
+            anyhow::ensure!(!op.read_only, "{name} changes its session");
+        }
+        Ok(())
+    }
+
+    /// Kiln plan 01a1dd2e…, P5.5c: each of sessions.pause, sessions.resume and sessions.restart through the API, held to
+    /// whom the caller may steer as agents.stop is: an agent can't pause, resume or restart a fellow agent's session
+    /// (403); a resume of a session nothing pauses is refused, saying where it stands (409); a restart of one whose
+    /// harness never started starts it again (`how: start`), the same session under its id; and a pause is taken for its
+    /// machine to hold, which agents.get then says (`asked: pause` on its `host`).
+    #[test]
+    fn p5_5c_sessions_pause_resume_and_restart_through_the_api() -> anyhow::Result<()> {
+        run(async {
+            let hub = hub_with(|_| {}).await?;
+            let a = parent(&hub, "default", true).await?;
+            let b = parent(&hub, "default", true).await?;
+            let cx = as_agent(&hub, &a).await?;
+            for op in ["sessions.pause", "sessions.resume", "sessions.restart"] {
+                let Err((s, why)) = call(cx.clone(), op, json!({"agent": b})).await else { anyhow::bail!("{op} on a fellow agent went through") };
+                anyhow::ensure!(s == http::StatusCode::FORBIDDEN, "{op}: {s} {why}");
+            }
+            let person = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let Err((s, why)) = call(person.clone(), "sessions.resume", json!({"agent": b})).await else { anyhow::bail!("a resume of what nothing pauses went through") };
+            anyhow::ensure!(s == http::StatusCode::CONFLICT && why.contains("isn't paused"), "{s} {why}");
+            // Its harness can't start here (there's no program): it has stopped, waiting for a person.
+            let waited = call(person.clone(), "agents.wait", json!({"agent": b, "timeout_s": 20})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(matches!(waited.pointer("/agents/0/stand").and_then(Value::as_str), Some("stopped" | "ended")), "{waited}");
+            let restarted = call(person.clone(), "sessions.restart", json!({"agent": b})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(restarted.get("how") == Some(&json!("start")) && restarted.get("agent") == Some(&json!(b)), "{restarted}");
+            anyhow::ensure!(hub.harness.info(&b).is_some(), "the same session, under its id");
+            let paused = call(person, "sessions.pause", json!({"agent": a})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+            anyhow::ensure!(paused.get("asked") == Some(&json!("pause")) && paused.get("engine") == Some(&json!("host")), "{paused}");
             Ok(())
         })
     }

@@ -6,7 +6,8 @@
 //! The checks are pure and tested against samples in `vm_harnesses.rs`; the drive reads the live
 //! values they judge:
 //! 1. the negotiated cipher suite, read from both ends of every link the plan names
-//!    ([`REQUIRED_LINKS`], [`check_all_links`]);
+//!    ([`REQUIRED_LINKS`], [`check_all_links`]), failed by a gap's name where kiln's own word on the
+//!    session names why ([`check_links`], [`LinkGap`]);
 //! 2. nothing of a harness ran outside its microVM: no harness process in the session's process
 //!    trees on the host ([`harnesses_on_host`]), and the kernel the harness says it ran on is a
 //!    guest's ([`check_in_guest`]);
@@ -239,6 +240,58 @@ pub fn check_all_links(links: &[LinkSuites]) -> Result<(), String> {
         return Err(format!("no negotiated suite was read for the links {unread:?}: name each one's ends in VM_E2E_LINKS (tests/vm_e2e/README.md)"));
     }
     links.iter().try_for_each(check_link)
+}
+
+/// Why a drive's links can't pass the checks above where kiln's own word on its session says why: a gap of the built
+/// system's, named, so a run's red reads as that gap rather than as a check's words (gaps.json's `link_report`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkGap {
+    /// kiln says the session runs in a microVM and reports no agent-control link of it (`/runs/control` absent).
+    /// kiln's runner holds its microVMs through Hex's image runtime (`sandbox::held_in`), whose `Runtime` signals the
+    /// member and takes kiln's MCP lane over that link but has no call that reports it, so `HexRun::link` answers none.
+    HexReportsNoLink,
+}
+
+impl std::fmt::Display for LinkGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HexReportsNoLink => f.write_str("Hex reports no agent-control link: Hex has no Runtime call for it yet"),
+        }
+    }
+}
+
+/// The gap kiln's word on a session (`info`, `GET /api/harness/sessions/<id>`) shows its links fail for, if any: a
+/// session in a microVM whose agent-control link kiln reports nothing of.
+pub fn link_gap(info: &Value) -> Option<LinkGap> {
+    let microvm = info.pointer("/runs/in").and_then(Value::as_str) == Some("microvm");
+    (microvm && info.pointer("/runs/control").is_none_or(Value::is_null)).then_some(LinkGap::HexReportsNoLink)
+}
+
+/// A drive's links failing their checks: what the checks said, and the gap kiln's word on its session names, where
+/// it names one ([`link_gap`]), said first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinksFailed {
+    pub gap: Option<LinkGap>,
+    pub said: String,
+}
+
+impl std::fmt::Display for LinksFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.gap {
+            Some(gap) => write!(f, "{gap} (kiln says the session runs in a microVM and reports no /runs/control: gaps.json's link_report gap); its links' checks said: {}", self.said),
+            None => f.write_str(&self.said),
+        }
+    }
+}
+
+impl std::error::Error for LinksFailed {}
+
+/// The checks of a drive's `links`, read while its session ran: kiln's MCP lane on the agent-control link where kiln
+/// gives the harness its MCP (`mcp`, [`check_mcp_lane`]), then every link's suite ([`check_all_links`]). Where they
+/// fail, kiln's word on the session (`info`) names the gap they fail for, where it names one ([`link_gap`]).
+pub fn check_links(links: &[LinkSuites], mcp: bool, info: &Value) -> Result<(), LinksFailed> {
+    let lane = if mcp { check_mcp_lane(links) } else { Ok(()) };
+    lane.and_then(|()| check_all_links(links)).map_err(|said| LinksFailed { gap: link_gap(info), said })
 }
 
 /// The machine itself, as a microVM names it (Shards D236).
@@ -2175,8 +2228,9 @@ pub fn written_and_removed(project: &str, probe: &str) -> Result<(), String> {
 /// else: kiln holds it isolated; the project at its host path, inside and out; kiln's MCP from
 /// inside where kiln gives it (`mcp`), on the agent-control link's lane alone ([`MCP_LANE`]), and an
 /// agent started from there (`child`); no harness in the session's process trees on the host at any
-/// look; a Linux kernel of its own; every link's suite at both ends. A vendor's own CLI runs only
-/// with ROOT's task ([`untasked`]): it skips without it, and `VM_E2E=1` makes that a failure.
+/// look; a Linux kernel of its own; and last every link's suite at both ends and the MCP lane, which fail
+/// by the gap's name where kiln's word on the session names one ([`check_links`], [`LinkGap`]). A vendor's
+/// own CLI runs only with ROOT's task ([`untasked`]): it skips without it, and `VM_E2E=1` makes that a failure.
 pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool, child: bool) -> anyhow::Result<()> {
     if let Some(why) = untasked(kind, image, |v| std::env::var_os(v).is_some()) {
         anyhow::ensure!(!isolation_required(), "{why} (VM_E2E=1 requires a real task)");
@@ -2212,7 +2266,6 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
     written_and_removed(project, &probe).map_err(fail)?;
     if mcp {
         mcp_round_trip(&d.events, &d.first).map_err(fail)?;
-        check_mcp_lane(&d.links).map_err(fail)?;
         anyhow::ensure!(mcp_calls_over_lane(&f.runner_log_whole()?, &d.id) > 0, "{what}: its runner's log says no call of kiln's MCP over the session's lane ({MCP_LANE_SAID:?}, session={})", d.id);
     }
     if let Some(c) = &d.child {
@@ -2228,7 +2281,8 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
     for (which, said) in [("its session", &d.last), ("its resumed session", &d.resumed_info)] {
         check_no_host_pid(said).and_then(|()| check_starts(said)).map_err(|e| fail(format!("{which}: {e}")))?;
     }
-    check_all_links(&d.links).map_err(fail)?;
+    // Its links last, so a gap of the built system's there hides no other check.
+    check_links(&d.links, mcp, &d.last).map_err(|e| anyhow::Error::new(e).context(what.clone()))?;
     Ok(())
 }
 

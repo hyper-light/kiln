@@ -498,7 +498,12 @@ at its member's directory (`components`: those a person swapped into its session
 back (`Restore`) while it runs, that member alone started again with it at once. A boundary that holds no components
 refuses both `Unsupported`, and its run goes on.
 
-Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, `change`, `swap`.
+A run is paused where it is and resumed (`pause`; kiln plan 01a1dd2e…, P5.5c, through Hex's P5.5b for Shards'
+D267): paused, its boundary runs none of it (a microVM's guest runs no CPU) and keeps its stdio and connections until
+it's resumed. A pause after its end is refused `Ended`; a boundary that pauses none refuses one `Unsupported`, and its
+run goes on as it was.
+
+Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, `change`, `swap`, `pause`.
 
 - **SANDBOX-1** what a run writes reaches its stdout in order, then its end, then nothing
 - **SANDBOX-2** stdin reaches the program in order, and closing it is the end of its input

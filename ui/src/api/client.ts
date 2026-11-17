@@ -48,6 +48,7 @@ import type {
   UpdatesOverview,
   UpgradeWaits,
   UpgradeWay,
+  WarmPoolsView,
 } from "./types";
 
 export class ApiError extends Error {
@@ -353,6 +354,8 @@ export const api = {
   agentLimit: (name: string, signal?: AbortSignal) => get<AgentLimitView>(`/api/runners/${enc(name)}/agent-limit`, signal),
   /** Set it here (wins over the runner's config); `null` takes it away, and its config's (or kiln's default) holds again. */
   setAgentLimit: (name: string, max_sessions: number | null) => request<AgentLimitView>("PUT", `/api/runners/${enc(name)}/agent-limit`, { max_sessions }),
+  /** The warm pools kiln names on runner `name`'s microVMs now (kiln plan 01a1dd2e…, P3.2): each pool's agent, as you may know it, its size, starts and hits. */
+  runnerPools: (name: string, signal?: AbortSignal) => get<WarmPoolsView>(`/api/runners/${enc(name)}/pools`, signal),
   /** The name people see for runner `name` (docs/machines.md), which kiln goes on knowing by `name`: the label as the server keeps it. */
   labelAgent: (name: string, label: string) => post<{ name: string; label: string }>(`/api/agents/${enc(name)}/label`, { label }),
   join: (signal?: AbortSignal) => get<JoinInfo>("/api/agents/join", signal),

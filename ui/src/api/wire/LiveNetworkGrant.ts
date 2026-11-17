@@ -7,15 +7,15 @@ import type { LiveWay } from "./LiveWay";
  * What a member's connection to a network grants it, every part named (Shards' D285; default deny): its name there,
  * its peer, the ports and which way a flow opens.
  */
-export type LiveNetworkGrant = {
+export type LiveNetworkGrant = { 
 /**
  * Its name on the network, a host's name, as its peers name it: one member's there.
  */
-name: string,
+name: string, 
 /**
  * The member of another run it reaches or is reached by, by its name on the network.
  */
-peer: string, protocol: LiveProtocol,
+peer: string, protocol: LiveProtocol, 
 /**
  * The first port and the last: one port, the same.
  */
