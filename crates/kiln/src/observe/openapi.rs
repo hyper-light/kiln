@@ -568,6 +568,13 @@ fn schemas() -> Map<String, Value> {
                     "where a cumulative window (current_1h, current_1d, current_1mo) begins: hour_starts alone (a minute), or day_starts (04:00), month_starts (1) and timezone",
                 ),
             ),
+            (
+                "threshold_windows",
+                describe(
+                    nullable(object(&[("trigger_window", nullable(string())), ("recovery_window", nullable(string()))], &[])),
+                    "an anomaly monitor's, both: trigger_window its query's alert_window, recovery_window the window its recovery thresholds are of (last_15m)",
+                ),
+            ),
         ],
         &[],
     );

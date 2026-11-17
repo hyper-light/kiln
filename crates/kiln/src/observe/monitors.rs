@@ -80,6 +80,18 @@ pub struct Options {
     /// Datadog's: where a cumulative window (`current_1h`, `current_1d`, `current_1mo`) begins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduling_options: Option<SchedulingOptions>,
+    /// Datadog's, an anomaly monitor's: the window its trigger reads (its query's `alert_window`)
+    /// and the one its recovery reads (`kiln_obs::monitor::Query::windows`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold_windows: Option<ThresholdWindows>,
+}
+
+/// Datadog's `threshold_windows` of an anomaly monitor, timeframes (`last_15m`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThresholdWindows {
+    pub trigger_window: Option<String>,
+    pub recovery_window: Option<String>,
 }
 
 /// Datadog's `scheduling_options` of a monitor: its `evaluation_window`.
@@ -106,7 +118,7 @@ pub const COMPOSITE: &str = "composite";
 /// Datadog's type for a service check monitor.
 pub const SERVICE_CHECK: &str = "service check";
 /// Datadog's types of the monitors whose kind their query says, as its API names them.
-pub const TYPES: [&str; 7] = ["metric alert", "query alert", "log alert", "trace-analytics alert", "slo alert", "error-tracking alert", SERVICE_CHECK];
+pub const TYPES: [&str; 8] = ["metric alert", "query alert", "log alert", "trace-analytics alert", "slo alert", "error-tracking alert", "event-v2 alert", SERVICE_CHECK];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Monitor {
@@ -151,7 +163,7 @@ fn slo_values(store: &Shared, id: &str, burn: Option<(i64, i64)>, now: i64) -> R
         },
         None => kiln_obs::slo::status(store, &slo, now).map_err(eval)?.budget_left,
     };
-    Ok(value.map(|v| vec![monitor::Value { group: Vec::new(), value: v }]).unwrap_or_default())
+    Ok(value.map(|v| vec![monitor::Value::of(Vec::new(), v)]).unwrap_or_default())
 }
 
 /// An Error Tracking monitor's values (`monitor::Kind::ErrorTracking`): its issues' errors over
@@ -239,6 +251,12 @@ impl Monitor {
             Some(w) => q.starting(w.hour_starts, w.day_starts.as_deref(), w.month_starts, w.timezone.as_deref()).map_err(|e| e.to_string())?,
             None => q,
         };
+        let q = match &self.options.threshold_windows {
+            // Datadog's rule: both windows, or none.
+            Some(ThresholdWindows { trigger_window: Some(trigger), recovery_window: Some(recovery) }) => q.windows(trigger, recovery).map_err(|e| e.to_string())?,
+            Some(_) => return Err("threshold_windows: both trigger_window and recovery_window (Datadog's \"must include both\")".into()),
+            None => q,
+        };
         if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) && self.options.notify_no_data {
             return Err("an Error Tracking monitor has no NO DATA: an issue without errors in its window counts none".into());
         }
@@ -248,7 +266,7 @@ impl Monitor {
         {
             return Err(format!("the critical threshold {c} is not the query's {}", q.threshold));
         }
-        let t = Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery };
+        let t = Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery, dynamic: false };
         Ok(Compiled::Query(q, t))
     }
 
@@ -610,6 +628,8 @@ impl Monitors {
             }
         };
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * Monitor::window_ms(&q), |mins| i64::from(mins) * 60_000);
+        // What each group's state moves by besides its value (`kiln_obs::monitor::Own`).
+        let owns: HashMap<Group, monitor::Own> = values.iter().map(|v| (v.group.clone(), v.own)).collect();
         let mut found: Vec<(Group, Option<f64>, Option<State>)> = values.into_iter().map(|v| (v.group, Some(v.value), None)).collect();
         // An Error Tracking monitor's group in trouble that it no longer finds (its issue resolved,
         // ignored, no longer new, or without errors in the window) counts none, and recovers: a
@@ -621,7 +641,7 @@ impl Monitors {
             found.extend(gone.into_iter().map(|g| (g, Some(0.0), None)));
         }
         let said = Said { threshold: q.threshold, warning: t.warning };
-        self.apply(store, m, now, no_data_ms, found, |prev, value, _| monitor::next(prev, value, q.op, &t, m.options.notify_no_data), said)
+        self.apply(store, m, now, no_data_ms, found, |group, prev, value, _| monitor::next(prev, value, owns.get(group).copied().unwrap_or_default(), q.op, &t, m.options.notify_no_data), said)
     }
 
     /// A service check monitor's evaluation: each group moved by its last runs
@@ -635,7 +655,7 @@ impl Monitors {
         let groups = checks::evaluate(&held(store), q, t, now - delay, lookback);
         let found = groups.into_iter().map(|g| (g.group, Some(f64::from(g.status)), g.state)).collect();
         let said = Said { threshold: f64::from(t.critical), warning: t.warning.map(f64::from) };
-        self.apply(store, m, now, 0, found, |prev, _, made| made.unwrap_or(prev), said)
+        self.apply(store, m, now, 0, found, |_, prev, _, made| made.unwrap_or(prev), said)
     }
 
     /// A composite's evaluation: its groups' states from the states of the monitors it reads, as
@@ -651,7 +671,7 @@ impl Monitors {
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * every_ms, |mins| i64::from(mins) * 60_000);
         let notify = m.options.notify_no_data;
         let found: Vec<(Group, Option<f64>, Option<State>)> = results.into_iter().map(|(g, s)| (g, None, Some(s))).collect();
-        self.apply(store, m, now, no_data_ms, found, |prev, _, s| s.filter(|&s| s != State::NoData || notify).unwrap_or(prev), Said { threshold: f64::NAN, warning: None })
+        self.apply(store, m, now, no_data_ms, found, |_, prev, _, s| s.filter(|&s| s != State::NoData || notify).unwrap_or(prev), Said { threshold: f64::NAN, warning: None })
     }
 
     /// What an evaluation found, applied: each group found moves from its last state to what
@@ -666,7 +686,7 @@ impl Monitors {
         now: i64,
         no_data_ms: i64,
         found: Vec<(Group, Option<f64>, Option<State>)>,
-        next: impl Fn(State, Option<f64>, Option<State>) -> State,
+        next: impl Fn(&Group, State, Option<f64>, Option<State>) -> State,
         said: Said,
     ) -> bool {
         let renotify_ms = m.options.renotify_interval.map(|mins| i64::from(mins) * 60_000).filter(|&r| r > 0);
@@ -685,7 +705,7 @@ impl Monitors {
                 seen.insert(key.clone());
                 let g = groups.entry(key).or_insert_with(|| GroupState { group, state: State::Ok.as_str().into(), value: None, since: now, last_data: now, notified: 0, quiet_recovery: false });
                 let prev = State::parse(&g.state).unwrap_or(State::Ok);
-                let to = next(prev, value, made);
+                let to = next(&g.group, prev, value, made);
                 g.value = value;
                 g.last_data = now;
                 if to != prev {

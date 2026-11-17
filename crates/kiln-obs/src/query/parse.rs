@@ -1392,7 +1392,8 @@ mod tests {
         assert!(parse("avg:cpu{env:$env.value}").is_ok());
         for bad in [
             r#"logs("x").last("5m")"#,
-            r#"logs("x").rollup("median", "@d")"#,
+            r#"logs("x").rollup("pc80", "@d")"#,
+            r#"logs("x").rollup("median")"#,
             r#"logs("x").rollup("sum")"#,
             r#"logs("(x")"#,
             r#"logs("x").by(service)"#,

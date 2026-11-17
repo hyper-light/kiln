@@ -646,9 +646,7 @@ monitor's query, kiln leaves out only what has no meaning here:
 span, chosen anew, could make a monitor flap); kiln takes it. Datadog's limits kiln does not keep:
 `top()` counts besides 5, 10, 25, 50 and 100; a `.fill()` limit past 600 s; `!` and `,` beside `AND`,
 `OR` or `NOT` in one filter; a threshold under one without its leading zero; a monitor's `last`
-aggregation; `moving_rollup`'s aggregators beyond its five outside lookback mode. Not yet read
-(§9's list): a dynamic threshold (`> threshold` with `critical_query`, in Datadog's preview), an
-anomaly monitor's `threshold_windows`, and a log or span monitor's `median` and `pcXX` measures.
+aggregation; `moving_rollup`'s aggregators beyond its five outside lookback mode.
 
 ## 7. API
 
@@ -1861,9 +1859,12 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   last buckets of its `alert_window='last_5m'` when it names one, read at its `interval=<seconds>`
   when it names one (each within the window); log monitors
   `logs("service:web status:error").rollup("count").by("host").last("5m") > 10` (count,
-  cardinality, sum, avg, min, max of a facet); trace analytics monitors, Datadog's, the same of a
-  span search (`trace-analytics("service:checkout status:error").by("resource_name").last("5m") > 5`,
-  or `spans(...)`; §8.7). A string's `\"` is a quote within it, as Datadog's monitor API has it
+  cardinality, sum, avg, min, max, median, pc75, pc90, pc95, pc98, pc99 of a facet: Datadog's log
+  monitor's measures, a percentile from the values' exponential buckets as a distribution's, §4.4);
+  trace analytics monitors, Datadog's, the same of a span search
+  (`trace-analytics("service:checkout status:error").by("resource_name").last("5m") > 5`, or
+  `spans(...)`; §8.7); event monitors, Datadog's Event V2 (`events("status:error").rollup("count")
+  .by("service").last("5m") > 3`), the same of kiln's events alone. A string's `\"` is a quote within it, as Datadog's monitor API has it
   (`logs("\"connection refused\"")`). A window is whole buckets of a step that divides it, aligned
   to the step. A threshold is a finite number.
 - **Cumulative windows** are Datadog's `current_1h`, `current_1d` and `current_1mo` (its API's own
@@ -1895,9 +1896,12 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
 - **Options**: thresholds (critical, warning, recoveries), `notify_no_data` and its timeframe,
   `renotify_interval`, `evaluation_delay` (late data counts), `every` (60 s unless it says, 10 s
   at the most often), `scheduling_options.evaluation_window` (a cumulative window's start, above);
-  mute until a time or unmuted. Not yet read: an anomaly monitor's `threshold_windows`
-  (`trigger_window`, `recovery_window`), a dynamic threshold (`> threshold` with
-  `thresholds.critical_query`, Datadog's preview), `require_full_window`.
+  an anomaly monitor's `threshold_windows` (Datadog's: both, its `trigger_window` its query's
+  `alert_window`, its `recovery_window` the window whose share past the band its recovery
+  thresholds are of); mute until a time or unmuted. An anomaly monitor recovers once that share is
+  at or below its recovery threshold (its page's "`warning_recovery` of 0 ... recovers ... only when
+  0% of the points in the `recovery_window` are anomalous"); other monitors as Datadog's recovery
+  thresholds page says (`>` recovered at or below, `>=` below, and the mirror for `<`, `<=`).
 - **Messages** are Datadog's templates (`{{value}}`, `{{threshold}}`, `{{host.name}}`,
   `{{#is_alert}}…{{/is_alert}}`, `{{^is_recovery}}`, …), their `@slack-<name>`,
   `@discord-<name>`, `@teams-<name>`, `@pagerduty-<name>`, `@webhook-<name>` mentions naming

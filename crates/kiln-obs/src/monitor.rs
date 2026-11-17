@@ -188,8 +188,9 @@ impl Cumulative {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
     /// `cumulative`: its window the current hour, day or month so far (`window_ms`, that period's
-    /// longest); none: the last `window_ms`.
-    Metric { aggr: TimeAggr, window_ms: i64, query: String, cumulative: Option<Cumulative> },
+    /// longest); none: the last `window_ms`. `recovery_ms`: an anomaly monitor's `recovery_window`
+    /// ([`Query::windows`]).
+    Metric { aggr: TimeAggr, window_ms: i64, query: String, cumulative: Option<Cumulative>, recovery_ms: Option<i64> },
     /// The value now against the value `shift_ms` before (`pct`: as a percent of it).
     Change { aggr: TimeAggr, window_ms: i64, shift_ms: i64, pct: bool, query: String },
     Logs { search: String, measure: Measure, by: Vec<Facet>, window_ms: i64 },
@@ -223,6 +224,30 @@ pub struct Query {
 }
 
 impl Query {
+    /// An anomaly monitor's `threshold_windows` (Datadog's anomaly page): both windows, timeframes
+    /// (`last_15m`); its `trigger_window` "must match the `alert_window` from the query", and its
+    /// `recovery_window` is "the time range that [is] analyzed for anomalies when evaluating whether
+    /// a triggered monitor should recover", within the monitor's window. A monitor of no
+    /// `anomalies()` takes none.
+    pub fn windows(mut self, trigger: &str, recovery: &str) -> Result<Self, MonitorError> {
+        let Kind::Metric { query, window_ms, recovery_ms, .. } = &mut self.kind else {
+            return Err(syntax("threshold_windows: an anomaly monitor's (avg(last_1h):anomalies(…) >= 1)"));
+        };
+        let ast = crate::query::parse::parse(query).map_err(|e| syntax(e.to_string()))?;
+        if !ast.nodes.iter().any(|n| matches!(n, Node::Call(Func::Anomalies, _))) {
+            return Err(syntax("threshold_windows: an anomaly monitor's (avg(last_1h):anomalies(…) >= 1)"));
+        }
+        let (trigger, recovery) = (window(trigger, MAX_METRIC_WINDOW_MS)?, window(recovery, MAX_METRIC_WINDOW_MS)?);
+        if anomaly_of(&ast)?.alert_ms != Some(trigger) {
+            return Err(syntax("threshold_windows.trigger_window: the query's alert_window='…', the same window (Datadog's \"must match\")"));
+        }
+        if recovery > *window_ms {
+            return Err(syntax("threshold_windows.recovery_window: within the monitor's window"));
+        }
+        *recovery_ms = Some(recovery);
+        Ok(self)
+    }
+
     /// Its cumulative window begun where its monitor's `scheduling_options.evaluation_window` says,
     /// held to Datadog's rules for it: `hour_starts` (0 to 59) with `current_1h` and nothing beside
     /// it; `day_starts` (a time of day, `04:00`), `month_starts` (1) and `timezone` (an IANA name) with
@@ -427,6 +452,11 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     if q.starts_with("logs(") {
         return parse_records(q, "logs", false);
     }
+    // Datadog's Event V2 monitor, `events(query).rollup(…).last(…)`: a log monitor of kiln's events
+    // (log records of [`EVENTS`]).
+    if q.starts_with("events(") {
+        return parse_records(q, "events", false);
+    }
     for name in ["trace-analytics", "spans"] {
         if q.strip_prefix(name).is_some_and(|r| r.starts_with('(')) {
             return parse_records(q, name, true);
@@ -468,8 +498,8 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
         let (a, rest) = head.split_once('(').ok_or_else(|| syntax("time_aggr(window):"))?;
         let w = rest.strip_suffix(')').ok_or_else(|| syntax("time_aggr(window)'s closing parenthesis"))?;
         match current(w)? {
-            Some(c) => Kind::Metric { aggr: aggr(a)?, window_ms: c.period.longest_ms(), query, cumulative: Some(c) },
-            None => Kind::Metric { aggr: aggr(a)?, window_ms: window(w, MAX_METRIC_WINDOW_MS)?, query, cumulative: None },
+            Some(c) => Kind::Metric { aggr: aggr(a)?, window_ms: c.period.longest_ms(), query, cumulative: Some(c), recovery_ms: None },
+            None => Kind::Metric { aggr: aggr(a)?, window_ms: window(w, MAX_METRIC_WINDOW_MS)?, query, cumulative: None, recovery_ms: None },
         }
     };
     // The metric query must parse as one.
@@ -647,12 +677,22 @@ fn parse_records(q: &str, name: &str, spans: bool) -> Result<Query, MonitorError
         }
     }
     let window_ms = window_ms.ok_or_else(|| syntax(".last(\"5m\")"))?;
-    let kind = if spans { Kind::Spans { search, measure, by, window_ms } } else { Kind::Logs { search, measure, by, window_ms } };
+    let kind = match (spans, name) {
+        (true, _) => Kind::Spans { search, measure, by, window_ms },
+        (false, "events") => Kind::Logs { search: events_only(&search), measure, by, window_ms },
+        (false, _) => Kind::Logs { search, measure, by, window_ms },
+    };
     Ok(Query { kind, op, threshold })
 }
 
 /// Where events are kept: log records of this source (kiln's own, its integrations', the API's).
 pub const EVENTS: &str = "kiln.event";
+
+/// An event search as an event monitor reads it: events alone (records of [`EVENTS`]).
+pub fn events_only(search: &str) -> String {
+    let s = search.trim();
+    if s.is_empty() || s == "*" { format!("source:{EVENTS}") } else { format!("source:{EVENTS} ({s})") }
+}
 
 /// A log search as a log monitor reads it: logs, not events (records of [`EVENTS`]), unless the
 /// search names them. Events are records too, and a monitor's own alerts are events at error's
@@ -675,6 +715,28 @@ pub struct Value {
     /// The group's tags, sorted.
     pub group: Vec<(String, String)>,
     pub value: f64,
+    /// What else its state moves by, where its monitor makes it the group's own.
+    pub own: Own,
+}
+
+impl Value {
+    pub fn of(group: Vec<(String, String)>, value: f64) -> Self {
+        Self { group, value, own: Own::default() }
+    }
+}
+
+/// What a group's state moves by besides its value, where its monitor makes it the group's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Own {
+    /// An anomaly monitor's: the share of its `threshold_windows`' `recovery_window` past the band
+    /// (its trigger window's where it names none), which its recovery thresholds are of, recovered
+    /// at or below them (Datadog's anomaly page: "a `warning_recovery` value of 0 means that the
+    /// monitor recovers from the warning state only when 0% of the points in the `recovery_window`
+    /// are anomalous").
+    pub share: Option<f64>,
+    /// A dynamic threshold's, the group's (Datadog's `critical_query`, `critical_recovery_query`).
+    pub critical: Option<f64>,
+    pub critical_recovery: Option<f64>,
 }
 
 fn reduce(aggr: TimeAggr, values: &[f64]) -> Option<f64> {
@@ -761,7 +823,7 @@ fn read_cumulative(src: Source<'_>, query: &str, path: Path, c: Cumulative, to: 
     Ok(Some((a, step)))
 }
 
-fn metric_values(src: Source<'_>, query: &str, aggr: TimeAggr, window_ms: i64, cumulative: Option<Cumulative>, to: i64) -> Result<Vec<Value>, MonitorError> {
+fn metric_values(src: Source<'_>, query: &str, aggr: TimeAggr, window_ms: i64, cumulative: Option<Cumulative>, recovery_ms: Option<i64>, to: i64) -> Result<Vec<Value>, MonitorError> {
     let ast = crate::query::parse::parse(query).map_err(|e| MonitorError::Eval(e.to_string()))?;
     let anomaly = anomaly_of(&ast)?;
     let path = path_of(aggr, &ast);
@@ -772,30 +834,38 @@ fn metric_values(src: Source<'_>, query: &str, aggr: TimeAggr, window_ms: i64, c
         },
         None => read_window(src, query, path, anomaly, window_ms, to)?,
     };
-    // The buckets of an anomaly monitor's `alert_window`, its window's last.
-    let alert = anomaly.alert_ms.map(|ms| usize::try_from(ms / step.max(1)).unwrap_or(usize::MAX).max(1));
+    // The buckets of an anomaly monitor's `alert_window` (its `trigger_window`) and of its
+    // `recovery_window`, each its window's last.
+    let buckets = |ms: i64| usize::try_from(ms / step.max(1)).unwrap_or(usize::MAX).max(1);
+    let (alert, recovery) = (anomaly.alert_ms.map(buckets), recovery_ms.map(buckets));
     let mut out = Vec::new();
     if let Some(v) = a.scalar.filter(|v| v.is_finite()) {
-        out.push(Value { group: Vec::new(), value: v });
+        out.push(Value::of(Vec::new(), v));
     }
     for s in a.series.into_iter().filter(|s| !not_applicable(s)) {
         // An `anomalies()` series: the share of its alert window's buckets past its band, as
         // Datadog's anomaly monitors compare it (`>= 1`: all of them); buckets it could not score
-        // left out.
+        // left out. Its recovery reads its recovery window's share ([`Own::share`]).
+        let mut own = Own::default();
         let v = match &s.bounds {
             // An `outliers()` series: 1 an outlier over the window, 0 not (Datadog's `> 0`).
             _ if s.outlier.is_some() => s.outlier.map(|o| f64::from(u8::from(o))),
             Some(b) if b.forecast_from.is_none() => {
-                let first = alert.map_or(0, |k| s.values.len().saturating_sub(k));
-                let read: Vec<bool> = (first..s.values.len()).filter_map(|i| b.anomalous(i)).collect();
-                (!read.is_empty()).then(|| read.iter().filter(|&&x| x).count() as f64 / read.len() as f64)
+                let past = |last: Option<usize>| -> Option<f64> {
+                    let first = last.map_or(0, |k| s.values.len().saturating_sub(k));
+                    let read: Vec<bool> = (first..s.values.len()).filter_map(|i| b.anomalous(i)).collect();
+                    (!read.is_empty()).then(|| read.iter().filter(|&&x| x).count() as f64 / read.len() as f64)
+                };
+                let v = past(alert);
+                own.share = if recovery.is_some() { past(recovery) } else { v };
+                v
             }
             _ => reduce(aggr, &s.values),
         };
         if let Some(v) = v {
             let mut group = s.tags;
             group.sort();
-            out.push(Value { group, value: v });
+            out.push(Value { group, value: v, own });
         }
     }
     Ok(out)
@@ -832,7 +902,7 @@ pub fn evaluate_shared(store: &crate::lock::RwLock<Store>, q: &Query, now: i64, 
 fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
     let to = now - delay_ms.max(0);
     match &q.kind {
-        Kind::Metric { aggr, window_ms, query, cumulative } => metric_values(src, query, *aggr, *window_ms, *cumulative, to),
+        Kind::Metric { aggr, window_ms, query, cumulative, recovery_ms } => metric_values(src, query, *aggr, *window_ms, *cumulative, *recovery_ms, to),
         Kind::Change { aggr, window_ms, shift_ms, pct, query } => {
             let changed = |now: f64, then: f64| -> Option<f64> {
                 let change = now - then;
@@ -846,13 +916,13 @@ fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Resu
             if path_of(*aggr, &ast) != Path::Buckets {
                 // Datadog's `.as_count()` path (and a percentile's): each window aggregated first,
                 // then the change at the window's level.
-                let now_v = metric_values(src, query, *aggr, *window_ms, None, to)?;
-                let then_v = metric_values(src, query, *aggr, *window_ms, None, to - shift_ms)?;
+                let now_v = metric_values(src, query, *aggr, *window_ms, None, None, to)?;
+                let then_v = metric_values(src, query, *aggr, *window_ms, None, None, to - shift_ms)?;
                 return Ok(now_v
                     .into_iter()
                     .filter_map(|v| {
                         let then = then_v.iter().find(|t| t.group == v.group)?.value;
-                        Some(Value { value: changed(v.value, then)?, group: v.group })
+                        Some(Value::of(v.group, changed(v.value, then)?))
                     })
                     .collect());
             }
@@ -869,7 +939,7 @@ fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Resu
                 if let Some(value) = reduce(*aggr, &changes) {
                     let mut group = s.tags.clone();
                     group.sort();
-                    out.push(Value { group, value });
+                    out.push(Value::of(group, value));
                 }
             }
             Ok(out)
@@ -904,11 +974,11 @@ pub fn evaluate_records(at: &LogsAt, q: &Query, now: i64, delay_ms: i64) -> Resu
     let parsed: Search = parsed.map_err(|e| MonitorError::Eval(e.to_string()))?;
     let ns = |ms: i64| ms.saturating_mul(1_000_000);
     let agg = at.aggregate(&parsed, ns(to - window_ms), ns(to) - 1, by, measure).map_err(|e| MonitorError::Eval(e.to_string()))?;
-    let mut out: Vec<Value> = agg.groups.into_iter().map(|(vals, value)| Value { group: by.iter().map(Facet::name).zip(vals).collect(), value }).collect();
+    let mut out: Vec<Value> = agg.groups.into_iter().map(|(vals, value)| Value::of(by.iter().map(Facet::name).zip(vals).collect(), value)).collect();
     // A count of nothing is a count: an ungrouped monitor of "fewer than 1 a minute" must see zero
     // when nothing came.
     if out.is_empty() && by.is_empty() && *measure == Measure::Count {
-        out.push(Value { group: Vec::new(), value: 0.0 });
+        out.push(Value::of(Vec::new(), 0.0));
     }
     Ok(out)
 }
@@ -930,20 +1000,22 @@ fn forecast_values(src: Source<'_>, query: &str, highest: bool, ahead_ms: i64, n
         if let Some(v) = v {
             let mut group = s.tags;
             group.sort();
-            out.push(Value { group, value: v });
+            out.push(Value::of(group, v));
         }
     }
     Ok(out)
 }
 
 /// A monitor's thresholds (Datadog's `options.thresholds`): the critical one the query states,
-/// and a warning and recoveries beside it.
+/// and a warning and recoveries beside it. `dynamic`: its critical one is a query's instead
+/// (Datadog's `> threshold` with `critical_query`), each group's its own ([`Own::critical`]).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Thresholds {
     pub critical: f64,
     pub warning: Option<f64>,
     pub critical_recovery: Option<f64>,
     pub warning_recovery: Option<f64>,
+    pub dynamic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -975,15 +1047,31 @@ impl State {
     }
 }
 
-/// A group's next state, from its last and its value now (none: no data).
-pub fn next(prev: State, value: Option<f64>, op: Op, t: &Thresholds, notify_no_data: bool) -> State {
-    let Some(v) = value.filter(|v| !v.is_nan()) else { return if notify_no_data { State::NoData } else { prev } };
-    let critical = op.passes(v, t.critical);
+/// A group's next state, from its last and its value now (none: no data), and what else is its own
+/// (its dynamic thresholds over the monitor's, an anomaly monitor's recovery share). A group with a
+/// dynamic threshold and none for it now has no data.
+pub fn next(prev: State, value: Option<f64>, own: Own, op: Op, t: &Thresholds, notify_no_data: bool) -> State {
+    let no_data = if notify_no_data { State::NoData } else { prev };
+    let Some(v) = value.filter(|v| !v.is_nan()) else { return no_data };
+    let critical_at = match (own.critical, t.dynamic) {
+        (Some(c), _) => c,
+        (None, false) => t.critical,
+        (None, true) => return no_data,
+    };
+    let t = Thresholds { critical: critical_at, critical_recovery: own.critical_recovery.or(t.critical_recovery), ..*t };
+    // In trouble still: Datadog's recovery thresholds ("> alert threshold: <= alert recovery
+    // threshold", and so on), an anomaly's share recovered at or below its recovery threshold.
+    let r = own.share.unwrap_or(v);
+    let holds = |recovery: Option<f64>, at: f64| match recovery {
+        Some(rt) if own.share.is_some() => r > rt,
+        Some(rt) => op.passes(r, rt),
+        None => op.passes(r, at),
+    };
     let warning = t.warning.is_some_and(|w| op.passes(v, w));
     match prev {
-        State::Alert if op.passes(v, t.critical_recovery.unwrap_or(t.critical)) => State::Alert,
-        _ if critical => State::Alert,
-        State::Warn | State::Alert if t.warning.is_some_and(|w| op.passes(v, t.warning_recovery.unwrap_or(w))) => State::Warn,
+        State::Alert if holds(t.critical_recovery, t.critical) => State::Alert,
+        _ if op.passes(v, t.critical) => State::Alert,
+        State::Warn | State::Alert if t.warning.is_some_and(|w| holds(t.warning_recovery, w)) => State::Warn,
         _ if warning => State::Warn,
         _ => State::Ok,
     }
@@ -1115,7 +1203,7 @@ mod tests {
     #[test]
     fn datadog_s_monitor_queries_parse() {
         let q = parse("avg(last_5m):avg:system.cpu.user{env:prod} by {host} > 90").unwrap();
-        assert_eq!(q, Query { kind: Kind::Metric { aggr: TimeAggr::Avg, window_ms: 300_000, query: "avg:system.cpu.user{env:prod} by {host}".into(), cumulative: None }, op: Op::Gt, threshold: 90.0 });
+        assert_eq!(q, Query { kind: Kind::Metric { aggr: TimeAggr::Avg, window_ms: 300_000, query: "avg:system.cpu.user{env:prod} by {host}".into(), cumulative: None, recovery_ms: None }, op: Op::Gt, threshold: 90.0 });
         let q = parse("max(last_1h):sum:kiln.ci.jobs.finished{status:failed}.as_count() / sum:kiln.ci.jobs.finished{*}.as_count() >= 0.25").unwrap();
         assert_eq!((q.op, q.threshold), (Op::Ge, 0.25));
         let q = parse("pct_change(avg(last_5m),last_1h):avg:http.requests{*} < -50").unwrap();
@@ -1176,21 +1264,21 @@ mod tests {
 
     #[test]
     fn states_alert_and_recover_with_hysteresis() {
-        let t = Thresholds { critical: 90.0, warning: Some(80.0), critical_recovery: Some(85.0), warning_recovery: Some(70.0) };
+        let t = Thresholds { critical: 90.0, warning: Some(80.0), critical_recovery: Some(85.0), warning_recovery: Some(70.0), dynamic: false };
         let steps = [(50.0, State::Ok), (82.0, State::Warn), (91.0, State::Alert), (88.0, State::Alert), (84.0, State::Warn), (75.0, State::Warn), (69.0, State::Ok), (95.0, State::Alert), (60.0, State::Ok)];
         let mut s = State::Ok;
         for (v, want) in steps {
-            s = next(s, Some(v), Op::Gt, &t, false);
+            s = next(s, Some(v), Own::default(), Op::Gt, &t, false);
             assert_eq!(s, want, "at {v}");
         }
         // Below: an availability that alerts under 99.
         let t = Thresholds { critical: 99.0, ..Thresholds::default() };
-        assert_eq!(next(State::Ok, Some(98.5), Op::Lt, &t, false), State::Alert);
-        assert_eq!(next(State::Alert, Some(99.5), Op::Lt, &t, false), State::Ok);
+        assert_eq!(next(State::Ok, Some(98.5), Own::default(), Op::Lt, &t, false), State::Alert);
+        assert_eq!(next(State::Alert, Some(99.5), Own::default(), Op::Lt, &t, false), State::Ok);
         // No data: the state stands, or is NO DATA when asked.
-        assert_eq!(next(State::Alert, None, Op::Gt, &t, false), State::Alert);
-        assert_eq!(next(State::Alert, None, Op::Gt, &t, true), State::NoData);
-        assert_eq!(next(State::NoData, Some(1.0), Op::Gt, &Thresholds { critical: 5.0, ..Thresholds::default() }, true), State::Ok);
+        assert_eq!(next(State::Alert, None, Own::default(), Op::Gt, &t, false), State::Alert);
+        assert_eq!(next(State::Alert, None, Own::default(), Op::Gt, &t, true), State::NoData);
+        assert_eq!(next(State::NoData, Some(1.0), Own::default(), Op::Gt, &Thresholds { critical: 5.0, ..Thresholds::default() }, true), State::Ok);
     }
 
     #[test]
@@ -1261,6 +1349,40 @@ mod tests {
         let q = parse("avg(last_1h):anomalies(avg:cpu{*}, 'robust', 3, alert_window='last_5m') >= 1").unwrap();
         let got = evaluate(&s, &q, now, 0).unwrap();
         assert!((got[0].value - 1.0).abs() < 1e-9, "{got:?}");
+        // Datadog's `threshold_windows`: its trigger window the alert window; its recovery window's
+        // share (the spike's bucket one of six) what its recovery thresholds are of.
+        let anomalous = "avg(last_1h):anomalies(avg:cpu{*}, 'robust', 3, alert_window='last_5m') >= 1";
+        let q = parse(anomalous).unwrap().windows("last_5m", "last_30m").unwrap();
+        let got = evaluate(&s, &q, now, 0).unwrap();
+        assert!((got[0].value - 1.0).abs() < 1e-9 && got[0].own.share.is_some_and(|r| (r - 1.0 / 6.0).abs() < 1e-9), "{got:?}");
+        let alone = evaluate(&s, &parse(anomalous).unwrap(), now, 0).unwrap();
+        assert_eq!(alone[0].own.share, Some(alone[0].value), "without a recovery window: its trigger window's");
+        for (trigger, recovery) in [("last_15m", "last_30m"), ("last_5m", "last_2h"), ("last_5x", "last_5m")] {
+            assert!(parse(anomalous).unwrap().windows(trigger, recovery).is_err(), "{trigger} {recovery}");
+        }
+        assert!(parse("avg(last_1h):avg:cpu{*} >= 1").unwrap().windows("last_5m", "last_5m").is_err(), "no anomalies(): no threshold_windows");
+    }
+
+    /// An anomaly monitor's recovery reads its recovery window's share, recovered at or below its
+    /// recovery threshold (Datadog's anomaly page: `critical: 1`, `critical_recovery: 0`, recovered
+    /// "only when 0% of the points in the `recovery_window` are anomalous"); a dynamic threshold is
+    /// each group's own, and a group without one now has no data.
+    #[test]
+    fn anomaly_recoveries_and_dynamic_thresholds_move_as_datadog_s_do() {
+        let t = Thresholds { critical: 1.0, critical_recovery: Some(0.0), ..Thresholds::default() };
+        let share = |r: f64| Own { share: Some(r), ..Own::default() };
+        assert_eq!(next(State::Ok, Some(1.0), share(1.0), Op::Ge, &t, false), State::Alert);
+        assert_eq!(next(State::Alert, Some(0.0), share(0.2), Op::Ge, &t, false), State::Alert, "its recovery window anomalous still");
+        assert_eq!(next(State::Alert, Some(0.0), share(0.0), Op::Ge, &t, false), State::Ok, "none of it: recovered");
+        // Datadog's general rule (`>=`: recovered below the recovery threshold) never would at 0.
+        assert_eq!(next(State::Alert, Some(0.0), Own::default(), Op::Ge, &t, false), State::Alert);
+        let d = Thresholds { dynamic: true, ..Thresholds::default() };
+        let at = |c: f64| Own { critical: Some(c), ..Own::default() };
+        assert_eq!(next(State::Ok, Some(12.0), at(10.0), Op::Gt, &d, false), State::Alert);
+        assert_eq!(next(State::Ok, Some(12.0), at(15.0), Op::Gt, &d, false), State::Ok);
+        assert_eq!(next(State::Alert, Some(12.0), Own { critical: Some(15.0), critical_recovery: Some(11.0), ..Own::default() }, Op::Gt, &d, false), State::Alert, "past its recovery threshold still");
+        assert_eq!(next(State::Alert, Some(12.0), Own::default(), Op::Gt, &d, true), State::NoData, "no threshold now: no data");
+        assert_eq!(next(State::Alert, Some(12.0), Own::default(), Op::Gt, &d, false), State::Alert);
     }
 
     /// What Datadog's metric monitors take besides: a change's `5m_ago`, `1h_ago` and `1d_ago`
@@ -1350,7 +1472,7 @@ mod tests {
         // would be 33.3).
         assert!((one("pct_change(avg(last_5m),5m_ago):avg:load{*} > 40") - 50.0).abs() < 1e-9);
         assert!((one("change(avg(last_5m),5m_ago):avg:load{*} > 1") - 5.0).abs() < 1e-9);
-        assert_eq!(value("avg(last_5m):avg:cpu{*} by {host} > 1"), vec![Value { group: vec![("host".into(), "a".into())], value: 5.0 }]);
+        assert_eq!(value("avg(last_5m):avg:cpu{*} by {host} > 1"), vec![Value::of(vec![("host".into(), "a".into())], 5.0)]);
         let bound = ((2f64).powi(-SCALE) * 0.5).exp2() - 1.0;
         let within = |got: f64, want: f64| ((got - want) / want).abs() <= bound * 1.000_001;
         let whole = one("percentile(last_5m):p50:lat{*} > 50");
@@ -1444,7 +1566,7 @@ mod tests {
         assert!(got.iter().all(|v| (v.value - 1.0).abs() < 1e-9), "{got:?}");
         // Logs: a count, zero when nothing came.
         let q = parse(r#"logs("status:error").last("5m") > 3"#).unwrap();
-        assert_eq!(evaluate(&s, &q, now, 0).unwrap(), vec![Value { group: Vec::new(), value: 0.0 }]);
+        assert_eq!(evaluate(&s, &q, now, 0).unwrap(), vec![Value::of(Vec::new(), 0.0)]);
         // An error logged, and an alert said (an event, at error's severity): the monitor counts the
         // log, not its own alert; a monitor of events counts the event.
         let rec = |source: &str, message: &str| Record { ts: (now - 60_000) * 1_000_000, severity: 17, service: "api".into(), host: "a".into(), source: source.into(), message: message.into(), ..Record::default() };
@@ -1456,6 +1578,23 @@ mod tests {
         assert_eq!(count(r#"logs("*").last("5m") > 3"#), Some(1.0));
         assert_eq!(count(r#"logs("source:kiln.event status:error").last("5m") > 3"#), Some(1.0));
         assert_eq!(logs_only("service:api OR status:error"), "(service:api OR status:error) -source:kiln.event");
+        // Datadog's Event V2 monitor, `events(…)`: events alone.
+        assert_eq!(count(r#"events("*").rollup("count").last("5m") > 0"#), Some(1.0));
+        assert_eq!(count(r#"events("connection").last("5m") > 0"#), Some(0.0));
+        assert!(matches!(parse(r#"events("status:error").rollup("cardinality", "@host").by("service").last("1h") > 1"#).unwrap().kind, Kind::Logs { ref search, .. } if search == "source:kiln.event (status:error)"));
+        // A measure's percentiles, as Datadog's log monitors take them (`median`, `pc75` … `pc99`):
+        // within 1.09% (a distribution's bucket) of the values' own, between their least and most.
+        let mut b = Builder::new();
+        let timed: Vec<Record> = (1..=100)
+            .map(|i| Record { ts: (now - 120_000) * 1_000_000 + i, service: "timed".into(), source: "app".into(), message: "done".into(), attrs: vec![("ms".into(), i.to_string())], ..Record::default() })
+            .collect();
+        b.logs(&timed);
+        s.apply(&b.finish()).unwrap();
+        let count = |q: &str| evaluate(&s, &parse(q).unwrap(), now, 0).unwrap().first().map(|v| v.value);
+        for (rollup, want) in [("median", 50.5), ("pc75", 75.25), ("pc95", 95.05), ("pc99", 99.01)] {
+            let got = count(&format!(r#"logs("service:timed").rollup("{rollup}", "@ms").last("5m") > 0"#)).unwrap_or(f64::NAN);
+            assert!((got - want).abs() <= want * 0.0109 + 1.0, "{rollup}: {got}, the values' {want}");
+        }
         // Every window is whole buckets, at least ten.
         for w in [60_000, 300_000, 420_000, 900_000, 3_600_000, 86_400_000, 7 * 86_400_000] {
             let st = step_for(w);
