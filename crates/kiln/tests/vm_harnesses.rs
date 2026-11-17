@@ -577,14 +577,14 @@ mod waits {
         assert!(refused.to_string().starts_with("pi's first turn: it is idle") && refused.to_string().ends_with(&text));
     }
 
-    /// Before its harness's first answer, in a run that has none of its kind, a wait has no clock:
-    /// alive and silent, it waits on however long (the cold start, the person's ruling of 2026-11-13).
-    /// A picked bound (the 600 s this replaces) refuses at the third look.
+    /// Before its harness's first answer in its drive, a wait has no clock: alive and silent, it waits on
+    /// however long (the cold start, the person's ruling of 2026-11-13). A picked bound (the 600 s this
+    /// replaces) refuses at the third look.
     #[test]
     fn s35_before_its_first_answer_a_wait_follows_its_harness_alone() {
         let pace = Pace::default();
-        assert_eq!(pace.window(Asked::Opening, &Learned::default()), None);
-        let mut w = Watch::new(Asked::Opening, pace.window(Asked::Opening, &Learned::default()));
+        assert_eq!(pace.window(Asked::Opening), None);
+        let mut w = Watch::new(Asked::Opening, pace.window(Asked::Opening));
         for secs in [0, 1, 600, 86_400] {
             assert_eq!(w.look(&word("running"), &[], None, false, s(secs)), Verdict::Wait, "at {secs} s");
         }
@@ -601,7 +601,7 @@ mod waits {
             pace.answered(s(took));
         }
         assert_eq!(pace.slowest(), Some(s(11)));
-        let window = pace.window(Asked::Message("m"), &Learned::default());
+        let window = pace.window(Asked::Message("m"));
         assert_eq!(window, Some(s(11)));
         let mut w = Watch::new(Asked::Message("m"), window);
         let asked = vec![user(1, "m", "go")];
@@ -623,46 +623,51 @@ mod waits {
     fn s35_a_turn_asked_to_be_long_follows_its_harness_alone() {
         let mut pace = Pace::default();
         pace.answered(s(1));
-        let run = Learned { opening: Some(s(40)), steered: None };
-        assert_eq!(pace.window(Asked::Steered("steer"), &run), None);
-        let mut w = Watch::new(Asked::Steered("steer"), pace.window(Asked::Steered("steer"), &run));
+        assert_eq!(pace.window(Asked::Steered("steer")), None);
+        let mut w = Watch::new(Asked::Steered("steer"), pace.window(Asked::Steered("steer")));
         for secs in [0, 2, 3_600] {
             assert_eq!(w.look(&word("running"), &[user(1, "steer", "STEER x")], None, false, s(secs)), Verdict::Wait);
         }
     }
 
-    /// A run's later drives are judged where its first had nothing to go by (r637: the tenth drive on
-    /// one HVF runner, pi's, waited an hour, until its carrier ended the server and runner). A run keeps,
-    /// per kind, its runner's slowest start (an image built, a microVM booted, a first turn) and its
-    /// slowest turn asked to be long, each a whole wait from ask to answer; a later drive's cold start is
-    /// bounded by the first, a later steered turn by the second, and a drive's own answers still bound
-    /// its own later waits. The other kinds teach the run nothing, being shorter than a start. Taking
-    /// out the run's record leaves the cold start unbounded; keeping the other kinds in it bounds a start
-    /// by a message's answer.
+    /// A drive is judged by its own answers and its own processes alone (r707, the MacBook's HVF:
+    /// claude's first turn, 17.08 s, bounded every later drive's first turn, and codex's was refused at
+    /// 17.09 s while its own image was still building, built 4 s later). A later drive's cold start has
+    /// no window, whatever another drive's took; its own answers bound its own later waits (its resumed
+    /// session's start); and while a session of it starts, kiln's word on it unmoving, its own processes
+    /// moving (its build's CPU, its microVM's processes coming) are its progress: it is refused only once
+    /// they and kiln's word were still for a whole window. Reading kiln's word alone refuses it at its
+    /// second look, while its build works.
     #[test]
-    fn s35_a_runs_earlier_answers_bound_its_later_drives_cold_starts() {
-        let mut run = Learned::default();
-        for (asked, took) in [(Asked::Opening, 40), (Asked::Message("m"), 90), (Asked::Steered("steer"), 25), (Asked::Opening, 30), (Asked::Stop { said: None }, 95), (Asked::Kiln, 99)] {
-            run.answered(asked, s(took));
-        }
-        assert_eq!(run, Learned { opening: Some(s(40)), steered: Some(s(25)) });
+    fn s35_a_drive_is_judged_by_its_own_answers_and_processes_alone() {
         let later = Pace::default();
-        assert_eq!(later.window(Asked::Opening, &run), Some(s(40)));
-        assert_eq!(later.window(Asked::Steered("steer"), &run), Some(s(25)));
-        assert_eq!(later.window(Asked::Message("m"), &run), None, "a message's wait is its own drive's to bound");
-        // Its cold start, kiln's word on it still for a whole window of the run's slowest start: refused.
-        let mut w = Watch::new(Asked::Opening, later.window(Asked::Opening, &run));
-        assert_eq!(w.look(&word("starting"), &[], None, false, s(0)), Verdict::Wait);
-        assert_eq!(w.look(&word("starting"), &[], None, false, s(40)), Verdict::Wait);
-        assert_eq!(w.look(&word("starting"), &[], None, false, s(41)), Verdict::Refuse(Stall::Quiet { quiet: s(41), slowest: s(40) }));
-        // A drive's own answers bound its own later start (its resumed session's); a steered turn, the run's such turns alone.
+        assert_eq!(later.window(Asked::Opening), None, "a cold start, whatever another drive's took");
+        assert_eq!(later.window(Asked::Steered("steer")), None);
         let mut drove = Pace::default();
         drove.answered(s(11));
-        assert_eq!(drove.window(Asked::Opening, &run), Some(s(11)));
-        assert_eq!(drove.window(Asked::Steered("steer"), &run), Some(s(25)));
-        // A run's first of a kind is its cold start.
-        assert_eq!(later.window(Asked::Opening, &Learned::default()), None);
-        assert_eq!(drove.window(Asked::Steered("steer"), &Learned::default()), None);
+        assert_eq!(drove.window(Asked::Opening), Some(s(11)), "its own resumed start");
+        assert_eq!(drove.window(Asked::Steered("steer")), None);
+        let mut w = Watch::new(Asked::Opening, drove.window(Asked::Opening));
+        for (secs, cpu_us) in [(0, 1_000), (10, 900_000), (20, 1_800_000), (30, 2_500_000)] {
+            w.parties(json!({"pids": [4242], "cpu_us": cpu_us}));
+            assert_eq!(w.look(&word("starting"), &[], None, false, s(secs)), Verdict::Wait, "at {secs} s, its build working");
+        }
+        // Its build done, its microVM's processes come: a change of its processes is progress too.
+        w.parties(json!({"pids": [4250, 4251], "cpu_us": 40_000}));
+        assert_eq!(w.look(&word("starting"), &[], None, false, s(41)), Verdict::Wait);
+        assert_eq!(w.look(&word("starting"), &[], None, false, s(52)), Verdict::Wait, "still within its window");
+        assert_eq!(w.look(&word("starting"), &[], None, false, s(53)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+    }
+
+    /// A drive's own processes are those its runner's trees gained since it began: a build an earlier
+    /// drive left running there is none of its, nor the runner itself, nor another tree's process.
+    #[test]
+    fn s35_a_drives_own_processes_are_those_its_runner_gained_since_it_began() {
+        let p = |pid: u32, ppid: u32| HostProc { pid, ppid, argv: vec![format!("p{pid}")] };
+        let before = [p(1, 0), p(10, 1), p(11, 10), p(50, 1), p(500, 50)];
+        let own = Own::after(&[10], &before);
+        let now = [p(1, 0), p(10, 1), p(11, 10), p(12, 10), p(13, 12), p(50, 1), p(501, 50)];
+        assert_eq!(own.of(&now), vec![12, 13]);
     }
 
     /// A wait refused because a process of its fixture's own ended says which and how.

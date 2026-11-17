@@ -342,7 +342,7 @@ mod rest {
     /// Each harness in a microVM from kiln's Agentfile and from a person's own, each starting an agent
     /// from inside where kiln gives it its MCP server; every harness is driven and every failure said
     /// as it comes and again at the end, so one run shows where each stands. Its drives share one
-    /// runner, whose answers to the first bound the later ones' cold starts (`vm_e2e::Learned`).
+    /// runner, and each is judged by its own answers and its own processes alone (`vm_e2e::Pace`).
     #[test]
     fn s35_every_harness_in_a_microvm_from_kilns_agentfile_and_a_persons_own() -> anyhow::Result<()> {
         let gaps = super::gaps()?;

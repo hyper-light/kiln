@@ -788,20 +788,9 @@ pub struct Fixture {
     _server: Option<Mutex<common::Server>>,
     _runner: Option<Mutex<Runner>>,
     pub log: Option<PathBuf>,
-    /// What its runner answered so far in this run, of the kinds a drive's own answers don't bound ([`Learned`]).
-    learned: Mutex<Learned>,
 }
 
 impl Fixture {
-    /// What its runner answered so far in this run ([`Learned`]).
-    pub fn learned(&self) -> Learned {
-        *self.learned.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn learn(&self, asked: Asked<'_>, took: Duration) {
-        self.learned.lock().unwrap_or_else(PoisonError::into_inner).answered(asked, took);
-    }
-
     pub fn get(&self, path: &str) -> anyhow::Result<Value> {
         let (code, body) = common::http(self.port, "GET", path, &self.admin, None)?;
         anyhow::ensure!(code == 200, "GET {path}: {code} {body}");
@@ -1085,7 +1074,7 @@ pub fn up(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixtur
         let admin = std::env::var("VM_E2E_TOKEN").map_err(|_| anyhow::anyhow!("VM_E2E_SERVER needs VM_E2E_TOKEN, its admin token"))?;
         let machine = std::env::var("VM_E2E_MACHINE").map_err(|_| anyhow::anyhow!("VM_E2E_SERVER needs VM_E2E_MACHINE, its runner's machine id"))?;
         let runner_pid = std::env::var("VM_E2E_RUNNER_PID").ok().and_then(|p| p.trim().parse().ok());
-        return Ok(Fixture { port, admin, machine, dir: dir.to_path_buf(), runner_pid, _server: None, _runner: None, log: None, learned: Mutex::default() });
+        return Ok(Fixture { port, admin, machine, dir: dir.to_path_buf(), runner_pid, _server: None, _runner: None, log: None });
     }
     up_own(dir, name, env)
 }
@@ -1095,7 +1084,7 @@ pub fn up(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixtur
 pub fn up_own(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixture> {
     let server = common::start(dir, &common::Options::default())?;
     let (runner, log) = runner(dir, server.port, name, env)?;
-    let f = Fixture { port: server.port, admin: server.admin.clone(), machine: common::machine(name), dir: dir.to_path_buf(), runner_pid: Some(runner.0.id()), _server: Some(Mutex::new(server)), _runner: Some(Mutex::new(runner)), log: Some(log), learned: Mutex::default() };
+    let f = Fixture { port: server.port, admin: server.admin.clone(), machine: common::machine(name), dir: dir.to_path_buf(), runner_pid: Some(runner.0.id()), _server: Some(Mutex::new(server)), _runner: Some(Mutex::new(runner)), log: Some(log) };
     setup_on(&f, &format!("runner {name} connecting"), || {
         let (code, body) = common::http(f.port, "GET", "/api/agents", &f.admin, None)?;
         if code != 200 {
@@ -1364,7 +1353,7 @@ impl std::fmt::Display for Stall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stuck(s) => std::fmt::Display::fmt(s, f),
-            Self::Quiet { quiet, slowest } => write!(f, "no progress for {quiet:?}, a whole window as long as the slowest answer that bounds it ({slowest:?}: this drive's, else this run's of its kind)"),
+            Self::Quiet { quiet, slowest } => write!(f, "no progress for {quiet:?}, a whole window as long as the slowest answer that bounds it ({slowest:?}: this drive's own)"),
             Self::DeliveryStuck { message, quiet, slowest } => write!(
                 f,
                 "delivery stuck: {message} waits in kiln's queue on an idle session, and no cause kiln states applies to it (admission's own wait on it, a room wait, a pause, a freeze), for {quiet:?}, a whole window as long as the slowest answer that bounds it ({slowest:?})"
@@ -1392,39 +1381,59 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 /// What a drive has learned of its harness's answers: the slowest so far, each one whole wait from the
-/// drive's ask to its answer; none before its first, the drive's cold start. Its waits are bounded by
-/// it, and where it bounds none (its cold start, a turn asked to be long) by its run's [`Learned`]:
-/// nothing is picked, seeded or carried over from another run.
+/// drive's ask to its answer; none before its first, the drive's cold start. Its waits are bounded by it
+/// alone: another drive's answers, of another harness from another image built for it (r707: claude's
+/// first turn bounded codex's, refused while codex's image was still building), bound none of this one's,
+/// and nothing is picked, seeded or carried over from another run.
 #[derive(Debug, Default)]
 pub struct Pace {
     slowest: Option<Duration>,
     /// Each session's feed ([`Wake::session`]), held from its first wait until it's ended: what kiln
     /// says of a message the drive sends between waits (admission's word on it) is heard by the next.
     feeds: std::collections::BTreeMap<String, Wake>,
+    /// The drive's own processes on the host ([`Own`]), where it looks at them: a starting session's
+    /// progress, while kiln's word on it can't move.
+    own: Option<Own>,
 }
 
-/// What a run's drives have learned on one fixture's runner of the answers no drive's own bound: the
-/// slowest start of a session to its first turn's end ([`Asked::Opening`]) and the slowest turn asked to
-/// be long ([`Asked::Steered`]), each one whole wait from the ask to its answer. Kept per kind, as Shards
-/// keeps a VM process's boots apart from its connects (D215): a start builds an image and boots a microVM,
-/// far longer than a running harness's answer. Kept per run, from its own answers alone, so its later
-/// drives are judged where its first had nothing to go by; none of a kind before its first answer, whose
-/// wait is the run's cold start.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Learned {
-    pub opening: Option<Duration>,
-    pub steered: Option<Duration>,
+/// A drive's own processes on the host: those of its runner's trees (`roots`, [`host_roots`]) that
+/// weren't there as it began (`before`): its image's build, its microVM's run host and VM process, an
+/// agent its session started. One an earlier drive left running (a build its refused start left) is
+/// none of its.
+#[derive(Debug, Clone)]
+pub struct Own {
+    roots: Vec<u32>,
+    before: std::collections::BTreeSet<u32>,
 }
 
-impl Learned {
-    /// An answer to `asked` that took `took`, kept where it is the slowest of its kind.
-    pub fn answered(&mut self, asked: Asked<'_>, took: Duration) {
-        let kept = match asked {
-            Asked::Opening => &mut self.opening,
-            Asked::Steered(_) => &mut self.steered,
-            Asked::Message(_) | Asked::Stop { .. } | Asked::Kiln => return,
-        };
-        *kept = Some(kept.map_or(took, |s| s.max(took)));
+impl Own {
+    /// The processes under `roots` from now on: those there now are none of the drive's. None where no
+    /// root is known (ROOT's runner without `VM_E2E_RUNNER_PID`).
+    pub fn from_now(roots: &[u32]) -> anyhow::Result<Option<Own>> {
+        if roots.is_empty() {
+            return Ok(None);
+        }
+        let procs = host_processes()?;
+        Ok(Some(Own::after(roots, &procs)))
+    }
+
+    /// [`Own::from_now`], of the processes `procs` listed.
+    pub fn after(roots: &[u32], procs: &[HostProc]) -> Own {
+        Own { roots: roots.to_vec(), before: procs.iter().filter(|p| under(p, roots, procs)).map(|p| p.pid).collect() }
+    }
+
+    /// Its processes among `procs`, by pid, in order.
+    pub fn of(&self, procs: &[HostProc]) -> Vec<u32> {
+        let mut pids: Vec<u32> = procs.iter().filter(|p| !self.before.contains(&p.pid) && !self.roots.contains(&p.pid) && under(p, &self.roots, procs)).map(|p| p.pid).collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// Its processes now, and the CPU time they have used, µs, all told, as kiln charges a microVM's
+    /// processes (`kiln::os::metrics::cpu_us_of`): any change of either is their progress.
+    pub fn read(&self) -> anyhow::Result<Value> {
+        let pids = self.of(&host_processes()?);
+        Ok(json!({"pids": pids, "cpu_us": kiln::os::metrics::cpu_us_of(&pids)}))
     }
 }
 
@@ -1515,11 +1524,21 @@ pub struct Watch<'a> {
     end: Option<(i64, i64)>,
     /// kiln's admission's word on each message, from the session's feed ([`Watch::heard`]).
     admission: Admission,
+    /// The drive's own processes on the host as its caller last read them ([`Watch::parties`]); null
+    /// where it read none.
+    parties: Value,
 }
 
 impl<'a> Watch<'a> {
     pub fn new(asked: Asked<'a>, window: Option<Duration>) -> Self {
-        Self { asked, window, seen: None, moved: Duration::ZERO, end: None, admission: Admission::default() }
+        Self { asked, window, seen: None, moved: Duration::ZERO, end: None, admission: Admission::default(), parties: Value::Null }
+    }
+
+    /// The drive's own processes on the host, as its caller read them before a look ([`Own::read`]):
+    /// what of a starting session moves while kiln's word on it can't (its image's build, its microVM's
+    /// boot). Null: none read.
+    pub fn parties(&mut self, parties: Value) {
+        self.parties = parties;
     }
 
     /// A frame of the session's feed, as the wait's socket read it ([`Wake::next`]): admission's word
@@ -1559,7 +1578,7 @@ impl<'a> Watch<'a> {
         if let Some(stuck) = self.stuck(info, events, state) {
             return Verdict::Refuse(Stall::Stuck(stuck));
         }
-        let now = moving(info, events);
+        let now = moving(info, events, &self.parties);
         if self.seen.as_ref() != Some(&now) {
             if self.seen.is_some() {
                 self.moved = at;
@@ -1714,11 +1733,11 @@ pub fn holds(info: &Value, events: &[Value], state: Option<&Value>, admission: &
     (!why.is_empty()).then(|| format!("{client} in kiln's queue; {}", why.join(", ")))
 }
 
-/// What of a session moves as its harness and kiln work on it: kiln's word on it ([`MOVES`]) and its
-/// timeline.
-fn moving(info: &Value, events: &[Value]) -> Value {
+/// What of a session moves as its harness and kiln work on it: kiln's word on it ([`MOVES`]), its
+/// timeline, and the drive's own processes on the host where they were read ([`Watch::parties`]).
+fn moving(info: &Value, events: &[Value], parties: &Value) -> Value {
     let word: Vec<Value> = MOVES.iter().map(|key| info.get(*key).cloned().unwrap_or(Value::Null)).collect();
-    json!([word, events])
+    json!([word, events, parties])
 }
 
 /// `text` on one line: its first [`TOLD`] characters, `…` where it's cut.
@@ -1778,9 +1797,11 @@ fn state_of(f: &Fixture, id: &str) -> anyhow::Result<Value> {
     frames.into_iter().find(|frame| frame.get("t").and_then(Value::as_str) == Some("state")).and_then(|frame| frame.get("state").cloned()).ok_or_else(|| anyhow::anyhow!("its viewers' socket sent no state"))
 }
 
-/// A wait on session `id` refused: typed, with kiln's word on it then and its runner's log.
-fn refused(f: &Fixture, id: &str, what: &str, stall: Stall, info: &Value, events: &[Value]) -> anyhow::Error {
-    let evidence = format!("{}its runner's log, its last lines:\n{}", told(info, &state_of(f, id), events), f.runner_log());
+/// A wait on session `id` refused: typed, with kiln's word on it then, the drive's own processes on the
+/// host as last read where they were (`parties`, [`Own::read`]), and its runner's log.
+fn refused(f: &Fixture, id: &str, what: &str, stall: Stall, info: &Value, events: &[Value], parties: &Value) -> anyhow::Error {
+    let own = if parties.is_null() { String::new() } else { format!("its drive's own processes on the host, as last read: {parties}\n") };
+    let evidence = format!("{}{own}its runner's log, its last lines:\n{}", told(info, &state_of(f, id), events), f.runner_log());
     anyhow::Error::new(Refused { what: what.to_owned(), stall, evidence })
 }
 
@@ -1795,16 +1816,32 @@ impl Pace {
         self.slowest
     }
 
-    /// The longest a wait on `asked` may go without progress: the drive's slowest answer. Where that bounds
-    /// none, its run's slowest of the kind (`run`): the drive's cold start by the run's slowest start, and a
-    /// turn asked to be long ([`Asked::Steered`]), which no shorter kind of answer bounds, by the run's slowest
-    /// such turn. None before the run's first answer of that kind: that wait follows its harness's liveness
-    /// and kiln's word alone.
-    pub fn window(&self, asked: Asked<'_>, run: &Learned) -> Option<Duration> {
+    /// The longest a wait on `asked` may go without progress: the drive's own slowest answer. None before
+    /// its first (its cold start: its image built, its microVM booted, its harness's first answer), and none
+    /// for a turn asked to be long ([`Asked::Steered`]), which no shorter kind of answer bounds: such a wait
+    /// follows its own parties' liveness and progress and kiln's word alone, as the person ruled ("The cold
+    /// start, and every wait after a run-out, follows the party's liveness and progress. After that the bound
+    /// is the slowest answer seen."). Never another drive's.
+    pub fn window(&self, asked: Asked<'_>) -> Option<Duration> {
         match asked {
-            Asked::Steered(_) => run.steered,
-            Asked::Opening => self.slowest.or(run.opening),
-            Asked::Message(_) | Asked::Stop { .. } | Asked::Kiln => self.slowest,
+            Asked::Steered(_) => None,
+            Asked::Opening | Asked::Message(_) | Asked::Stop { .. } | Asked::Kiln => self.slowest,
+        }
+    }
+
+    /// The drive's own processes on the host from now on ([`Own::from_now`]), whose progress a starting
+    /// session's waits follow: none where `roots` names none.
+    pub fn owning(roots: &[u32]) -> anyhow::Result<Pace> {
+        Ok(Pace { own: Own::from_now(roots)?, ..Pace::default() })
+    }
+
+    /// What of the drive's own processes a look at a session kiln says `info` of takes: while it starts
+    /// (its image building, its microVM booting, kiln's word on it unmoving), those processes and their
+    /// CPU ([`Own::read`]); else, and where the drive knows none, null.
+    fn parties(&self, info: &Value) -> anyhow::Result<Value> {
+        match &self.own {
+            Some(own) if status(info) == "starting" => own.read(),
+            _ => Ok(Value::Null),
         }
     }
 
@@ -1814,15 +1851,15 @@ impl Pace {
     }
 
     /// Waits on session `id` until `done` holds of kiln's word on it and its timeline, following its
-    /// harness ([`Watch`]): the time its answer took is learned, by the drive and by its run
-    /// ([`Learned`]); refused, typed ([`Refused`]), where a process of the fixture's own ended, where
-    /// kiln's word says no answer can come, or once a whole window passes without progress where one
-    /// was learned ([`Pace::window`]). It wakes on the session's feed, whose frames it hears
-    /// ([`Watch::heard`]), kept for the session's next wait; kiln's word on a session moves when its
-    /// runner goes (`Disconnected`), so a wait with no window still looks again then.
+    /// harness ([`Watch`]) and, while it starts, the drive's own processes ([`Pace::parties`]): the time
+    /// its answer took is learned by the drive; refused, typed ([`Refused`]), where a process of the
+    /// fixture's own ended, where kiln's word says no answer can come, or once a whole window passes
+    /// without progress where the drive learned one ([`Pace::window`]). It wakes on the session's feed,
+    /// whose frames it hears ([`Watch::heard`]), kept for the session's next wait; kiln's word on a session
+    /// moves when its runner goes (`Disconnected`), so a wait with no window still looks again then.
     pub fn until(&mut self, f: &Fixture, id: &str, asked: Asked<'_>, what: &str, done: impl Fn(&Value, &[Value]) -> bool) -> anyhow::Result<(Value, Vec<Value>)> {
         let began = Instant::now();
-        let window = self.window(asked, &f.learned());
+        let window = self.window(asked);
         waiting(what, Some(id), window);
         let mut watch = Watch::new(asked, window);
         let mut wake = self.feeds.remove(id).unwrap_or_else(|| Wake::session(f, id));
@@ -1838,6 +1875,8 @@ impl Pace {
             // Its state read only where kiln's word says it may have answered, or its window runs out;
             // unread, it says nothing.
             let state = if !held && watch.wants_state(&i, &e, at) { state_of(f, id).ok() } else { None };
+            let parties = if held { Value::Null } else { self.parties(&i)? };
+            watch.parties(parties.clone());
             let verdict = watch.look(&i, &e, state.as_ref(), held, at);
             if let Verdict::Held(why) = &verdict
                 && *why != said_held
@@ -1848,9 +1887,7 @@ impl Pace {
             }
             match verdict {
                 Verdict::Done => {
-                    let took = began.elapsed();
-                    self.answered(took);
-                    f.learn(asked, took);
+                    self.answered(began.elapsed());
                     self.feeds.insert(id.to_owned(), wake);
                     return Ok((i, e));
                 }
@@ -1861,7 +1898,7 @@ impl Pace {
                 }
                 Verdict::Refuse(stall) => {
                     self.feeds.insert(id.to_owned(), wake);
-                    return Err(refused(f, id, what, stall, &i, &e));
+                    return Err(refused(f, id, what, stall, &i, &e, &parties));
                 }
             }
         }
@@ -1871,7 +1908,7 @@ impl Pace {
     /// word on it moving while it's listed, woken by kiln's events socket, which says each session's end.
     pub fn unlisted(&mut self, f: &Fixture, id: &str, what: &str) -> anyhow::Result<()> {
         let began = Instant::now();
-        let window = self.window(Asked::Kiln, &f.learned());
+        let window = self.window(Asked::Kiln);
         waiting(what, Some(id), window);
         let mut watch = Watch::new(Asked::Kiln, window);
         let mut wake = Wake::events(f);
@@ -1888,7 +1925,7 @@ impl Pace {
             anyhow::ensure!(code == 200, "{what}: GET its session: {code} {body}");
             let i: Value = serde_json::from_str(&body)?;
             match watch.look(&i, &[], None, false, began.elapsed()) {
-                Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &[])),
+                Verdict::Refuse(stall) => return Err(refused(f, id, what, stall, &i, &[], &Value::Null)),
                 Verdict::Done | Verdict::Wait | Verdict::Held(_) => {
                     wake.next(watch.left(began.elapsed()), looked.elapsed());
                 }
@@ -2030,9 +2067,9 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let nonce = nonce();
     let mut inventory = Inventory::new(programs);
     let look = |inv: &mut Inventory| if roots.is_empty() { Ok(()) } else { inv.look(roots) };
-    // Each wait follows the harness, bounded by its slowest answer in this drive once it gave one, before
-    // that by its run's ([`Pace::window`]).
-    let mut pace = Pace::default();
+    // Each wait follows the harness, and while its session starts the drive's own processes, bounded by its
+    // slowest answer in this drive once it gave one ([`Pace::window`]).
+    let mut pace = Pace::owning(roots)?;
     let mut ends = Ends::new(f);
 
     // Start: its first turn runs to its end.
