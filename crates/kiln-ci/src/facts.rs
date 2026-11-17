@@ -269,6 +269,26 @@ pub struct Isolation {
     #[cfg_attr(feature = "ts", ts(optional))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<Engine>,
+    /// Whether its Hex node lists the class its image VMs run as (Hex's `shards-image`; kiln plan
+    /// 01a1dd2e…, P2.2 and P2.4), as its runner read it from its node: a session that needs a
+    /// microVM is placed only where it's listed. Absent from a runner holding no microVMs through
+    /// Hex, and one from before it.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_class: Option<NodeImageClass>,
+}
+
+/// Whether a runner's Hex node lists the class its image VMs run as (Hex's `shards-image`; kiln
+/// plan 01a1dd2e…, P2.2 and P2.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "is", rename_all = "snake_case")]
+pub enum NodeImageClass {
+    /// Its node lists it: Shards' check of its host says it runs microVMs.
+    Listed,
+    /// Its node lists none, `why` in Hex's words: Shards' check of its host, or its node's image
+    /// boot unconfigured (Hex's `ImageClass::serves`).
+    Unlisted { why: String },
 }
 
 /// How a runner runs new agent sessions (kiln plan 01a1dd2e…, P2.3): as processes on its host, or

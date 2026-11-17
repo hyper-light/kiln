@@ -1129,8 +1129,12 @@ fn on_engine(hub: &Hub, targets: Vec<String>, want: Option<Engine>) -> Result<Ve
     for t in targets {
         let shown = t.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), |m| hub.shown(m));
         match engine_at(hub, &t) {
-            // Its Hex node must list image VMs' class too, once kiln's Hex has one (P2.2).
-            Ok(Engine::Microvm) if want == Engine::Microvm && images_at(hub, &t) == crate::harness::engine::NodeImages::NotListed => why.push(format!("{shown}'s Hex node lists no `shards-image` class")),
+            // Its Hex node must list image VMs' class too (P2.2): one whose node lists none is refused, in Hex's words; one
+            // whose runner doesn't say goes by its engine alone.
+            Ok(Engine::Microvm) if want == Engine::Microvm => match images_at(hub, &t) {
+                crate::harness::engine::NodeImages::NotListed { why: unlisted } => why.push(format!("{shown}'s Hex node lists no `shards-image` class: {unlisted}")),
+                crate::harness::engine::NodeImages::Listed | crate::harness::engine::NodeImages::Unknown => kept.push(t),
+            },
             Ok(e) if e == want => kept.push(t),
             Ok(Engine::Host) => why.push(format!("{shown} runs its sessions on its host (its engine is host)")),
             Ok(Engine::Microvm) => why.push(format!("{shown} runs its sessions in microVMs (its engine is microvm)")),
@@ -2038,6 +2042,33 @@ mod tests {
         })
     }
 
+    /// Kiln plan 01a1dd2e…, P2.4 (on Hex's P2.2): a session that needs a microVM is kept to `microvm` runners whose Hex
+    /// node lists the class its image VMs run as, as each runner said of its node. Do place one among a runner whose node
+    /// lists it, one whose node lists none (Shards' check of its host said no), and one that says nothing of its node;
+    /// then on the second alone. Expect the first and the last kept; the second alone refused, named, in Hex's words.
+    /// Written, not run (the person's rule of 2026-11-16).
+    #[test]
+    fn p2_4_a_microvm_start_is_kept_to_runners_whose_hex_node_lists_the_image_class() -> anyhow::Result<()> {
+        use kiln_ci::facts::NodeImageClass;
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let runner = |name: &str, class: Option<NodeImageClass>| {
+                let mut facts = kiln_ci::facts::RunnerFacts { isolation: Some(kiln_ci::facts::Isolation { available: true, image_class: class, ..Default::default() }), ..Default::default() };
+                crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked::default());
+                crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
+            };
+            let why = "Shards image VMs on linux: cannot open /dev/kvm: permission denied";
+            hub.put_agent(runner("listed", Some(NodeImageClass::Listed)));
+            hub.put_agent(runner("unlisted", Some(NodeImageClass::Unlisted { why: why.to_owned() })));
+            hub.put_agent(runner("unsaid", None));
+            let all = ["agent:listed", "agent:unlisted", "agent:unsaid"].map(str::to_owned).to_vec();
+            assert_eq!(on_engine(&hub, all, Some(Engine::Microvm)).map_err(|e| e.1), Ok(vec!["agent:listed".to_owned(), "agent:unsaid".to_owned()]));
+            let refused = on_engine(&hub, vec!["agent:unlisted".to_owned()], Some(Engine::Microvm)).err().map(|e| e.1).unwrap_or_default();
+            anyhow::ensure!(refused.contains("unlisted's Hex node lists no `shards-image` class") && refused.contains(why), "{refused}");
+            Ok(())
+        })
+    }
+
     /// Step 17: a runner that says why it holds no isolated agent (its facts' `isolation.why_not`) is
     /// refused in its own words; one from before those facts, in kiln's.
     #[test]
@@ -2049,7 +2080,7 @@ mod tests {
                 facts: Some(Box::new(kiln_ci::facts::RunnerFacts { isolation, ..Default::default() })),
                 ..crate::hub::tests::live_runner(name, "linux", "x86_64")
             };
-            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()), engine: None })));
+            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()), engine: None, image_class: None })));
             hub.put_agent(said("older", None));
             let refused = isolation_on(&hub, "agent:no-hypervisor").err().unwrap_or_default();
             anyhow::ensure!(refused.ends_with(why), "the runner's own reason: {refused}");
