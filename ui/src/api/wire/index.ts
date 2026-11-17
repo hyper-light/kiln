@@ -30,7 +30,7 @@ export type { AgentdefVariant } from "./AgentdefVariant";
 export type { Agentfile } from "./Agentfile";
 export type { AgentfileAgent } from "./AgentfileAgent";
 export type { AgentfileBrief } from "./AgentfileBrief";
-export type { AgentfileBuilds } from "./AgentfileBuilds";
+export type { AgentfileBuildsChange } from "./AgentfileBuildsChange";
 export type { AgentfileBuiltin } from "./AgentfileBuiltin";
 export type { AgentfileChange } from "./AgentfileChange";
 export type { AgentfileCheck } from "./AgentfileCheck";

@@ -188,7 +188,7 @@ pub enum ServerEvent {
     Agentfile(AgentfileChange),
     /// One of a person's Agentfiles' builds ahead of its sessions changed (`crate::agentfiles::prebuild`), heard
     /// as [`ServerEvent::Agentfile`] is. After every tagged frame before it; a page from before it doesn't apply it.
-    AgentfileBuilds(AgentfileBuilds),
+    AgentfileBuilds(AgentfileBuildsChange),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -266,7 +266,7 @@ pub struct AgentfileChange {
 /// and which. A page that shows them loads them again (`GET /api/agentfiles/:id/builds`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-pub struct AgentfileBuilds {
+pub struct AgentfileBuildsChange {
     /// `owner`, or `user:<id>`: who hears it.
     pub owner: String,
     pub id: String,

@@ -5,7 +5,7 @@
  * An Agentfile whose builds ahead of its sessions changed, and nothing else of it (kiln plan 01a1dd2e… P4.5): whose
  * and which. A page that shows them loads them again (`GET /api/agentfiles/:id/builds`).
  */
-export type AgentfileBuilds = { 
+export type AgentfileBuildsChange = { 
 /**
  * `owner`, or `user:<id>`: who hears it.
  */

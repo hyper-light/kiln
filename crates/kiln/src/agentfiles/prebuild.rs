@@ -41,7 +41,7 @@ use crate::instances::PeerId;
 use crate::proto::{AgentMsg, ServerMsg, feature};
 use crate::sandbox::image::Source;
 use crate::secrets::mine::BuildSecret;
-use crate::wire::events::{AgentfileBuilds, ServerEvent};
+use crate::wire::events::{AgentfileBuildsChange, ServerEvent};
 
 /// A build asked of a runner (`ServerMsg::Prebuild`): Agentfile `agentfile`'s `text` at `version`, for kiln's harness
 /// `harness`, given `secrets`.
@@ -363,7 +363,7 @@ async fn send(hub: &Hub, runner: &str, peer: PeerId, ask: &Ask) {
 /// Tells the sockets of whoever hears of Agentfile `id` (its owner's, and those of whoever reaches everyone's) that its
 /// builds changed.
 fn changed(hub: &Hub, owner: &str, id: &str) {
-    hub.emit(&ServerEvent::AgentfileBuilds(AgentfileBuilds {
+    hub.emit(&ServerEvent::AgentfileBuilds(AgentfileBuildsChange {
         owner: owner.to_owned(),
         id: id.to_owned(),
     }));

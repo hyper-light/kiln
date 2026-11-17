@@ -122,11 +122,11 @@ export const agentfileBuildsApi = {
 /** A build asked for and not done: queued or under way. */
 export const moving = (b: AgentfileBuilds) => b.builds.some((x) => x.state === "queued" || x.state === "building");
 
-/** Its sources and builds, as its versions change. */
+/** Its sources and builds, as its versions change and as its builds move (`agentfile_builds`). */
 export const agentfileBuildsRes = (id: string): Res<AgentfileBuilds> => ({
   key: `agentfiles/builds/${id}`,
   fetch: (s) => agentfileBuildsApi.get(id, s),
-  opts: { on: ["agentfile"], relevant: (ev) => ev.type === "agentfile" && ev.id === id },
+  opts: { on: ["agentfile", "agentfile_builds"], relevant: (ev) => (ev.type === "agentfile" || ev.type === "agentfile_builds") && ev.id === id },
 });
 
 /**
