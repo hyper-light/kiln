@@ -185,7 +185,7 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    `GET /api/harness/sessions/<id>`, through `VM_E2E_LINKS`' `agent-control` entry, and by
    `check_no_host_pid` and `check_starts`. On a Hex-held run the link's ends and lanes are Hex's report
    of it (`Runtime::link`, on Shards' `Linked::report`, 8c9c03cc4; in the Hex kiln vendors since
-   225fd3d97), which `HexRun::link` maps; that link carries none of its stdio, which Hex takes from the
+   fbc70cb06), which `HexRun::link` maps; that link carries none of its stdio, which Hex takes from the
    image channel. `in_microvm` checks the links after every other check and fails missing ones by that
    name (`vm_e2e::LinkGap`, gaps.json's `link_report` gaps). Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
    `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch

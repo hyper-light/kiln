@@ -570,7 +570,8 @@ fn device_backend_identity_survives_create_capacity_and_inspect() {
             expected
         );
     }
-    for tag in [4, u8::MAX] {
+    // The first tag past every class's (4 is shards-image's, P2.2) and the last.
+    for tag in [5, u8::MAX] {
         let mut bytes =
             request(94, &Request::Call(Call::Capacity(Class::Oci)), MAX_MESSAGE).unwrap();
         bytes[HEADER_BYTES] = tag;

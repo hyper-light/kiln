@@ -528,8 +528,9 @@ fn credentialed(id: &str) -> BoxSpec {
 
 /// AC-T7.7.2, joint plan step 33 (C3; Shards' D242; kiln's vendor patch 0005, taken upstream): an orchestrator linking
 /// hex-node gives its image runtime the lessors over its broker. Do: over a broker holding `anthropic/ada`, make a runtime
-/// with `ImageRuntime::new` and another with `ImageRuntime::leasing`, each over records of its own, and create a VM
-/// granting that credential in each; then, in a runtime built as `leasing` builds one but over the model's boot, create
+/// as `ImageRuntime::new` makes one and another as `ImageRuntime::leasing` does on a host whose Shards check says it runs
+/// microVMs (their boot Shards' own, as `host_images` gives it there: P2.2), each over records of its own, and create a
+/// VM granting that credential in each; then, in a runtime built as `leasing` builds one but over the model's boot, create
 /// and start such a VM and lease the credential through the lessor its boot was given. Expect: `new`'s create refused
 /// `Unconfigured` before any record; `leasing`'s made, its record holding the grant; and the boot given the box's
 /// credential and a lessor whose lease is the broker's value, held there.
@@ -541,11 +542,17 @@ fn w33_a_runtime_made_leasing_leases_its_vms_credentials_and_one_made_new_refuse
     let paths =
         |dir: &Path| shards_api::RuntimePaths::new(dir.join("cache"), dir.join("home")).unwrap();
 
+    // Shards' image boot, as `host_images` gives it where the host's check passes; `new` and `leasing` ask that
+    // check of their `shards` (P2.2: its own tests), which these paths don't name.
+    let serving = || Ok(Arc::new(shards_api::image::ImageShards::new()) as Arc<dyn Images>);
+
     let plain = tempfile::tempdir().unwrap();
-    let unleased = ImageRuntime::new(
+    let unleased = ImageRuntime::with_images(
         plain.path().join("shards"),
         paths(plain.path()),
         &plain.path().join("records"),
+        serving(),
+        Ok(ImageWaits::new()),
     )
     .unwrap();
     assert!(matches!(
@@ -555,11 +562,13 @@ fn w33_a_runtime_made_leasing_leases_its_vms_credentials_and_one_made_new_refuse
     assert!(Books::records(unleased.as_ref()).unwrap().is_empty());
 
     let leased_dir = tempfile::tempdir().unwrap();
-    let leasing = ImageRuntime::leasing(
+    let leasing = ImageRuntime::built(
         leased_dir.path().join("shards"),
         paths(leased_dir.path()),
         &leased_dir.path().join("records"),
-        Arc::new(broker.clone()),
+        serving(),
+        Ok(ImageWaits::new()),
+        Some(Arc::new(broker.clone())),
     )
     .unwrap();
     let spec = credentialed("kiln-r1-1");

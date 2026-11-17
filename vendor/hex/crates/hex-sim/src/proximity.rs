@@ -606,17 +606,19 @@ mod tests {
                 );
             }
         }
+        // Every kind a recorded host runs: H10's three (no trace carries the Shards image class, P2.2).
+        let kinds = CLASSES.into_iter().fold(Classes::NONE, Classes::with);
         assert!(
             recorded(Fleet::Mixed)
                 .nodes
                 .iter()
-                .any(|n| n.classes != Classes::ALL)
+                .any(|n| n.classes != kinds)
         );
         assert!(
             recorded(Fleet::AllKinds)
                 .nodes
                 .iter()
-                .all(|n| n.classes == Classes::ALL)
+                .all(|n| n.classes == kinds)
         );
     }
 

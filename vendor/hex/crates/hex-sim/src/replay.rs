@@ -513,7 +513,6 @@ leg,0,1,1,11,0,plain,0,0,-,-,shards
             ("node,1,1,0,0\nleg,0,1,1,1,0,plain\nnode,1,1,0,0\n", 3),
             ("node,1,1,0,0,oci+kata\n", 1),
             ("node,1,1,0,0,\n", 1),
-            ("node,1,1,0,0,oci+oci+oci+oci\n", 1),
             ("node,1,1,0,0\nleg,0,1,1,1,0,plain,0,0,-,-,gvisor\n", 2),
             ("node,1,1,0,0\nleg,0,1,1,1,0,plain,0,0,-,-,oci,1\n", 2),
             ("node,1,1,0,0\noverhead,oci,1\noverhead,oci,2\n", 3),
@@ -544,6 +543,15 @@ leg,0,1,1,11,0,plain,0,0,-,-,shards
                 other => panic!("{text:?}: {other:?}"),
             }
         }
+        // One class name more than there are classes (`Class::COUNT`), whatever their count.
+        let named = format!("node,1,1,0,0,{}\n", vec!["oci"; Class::COUNT + 1].join("+"));
+        assert!(
+            matches!(
+                parse(&named, &Limits::default()),
+                Err(TraceError::Line { line: 1, .. })
+            ),
+            "{named:?}"
+        );
         assert_eq!(
             parse("# nothing\n", &Limits::default()),
             Err(TraceError::NoNodes)
