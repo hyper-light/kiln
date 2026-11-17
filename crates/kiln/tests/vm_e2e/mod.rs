@@ -2491,9 +2491,11 @@ pub fn stub_host_env(dir: &Path) -> anyhow::Result<Vec<(&'static str, String)>> 
     let bin = dir.join("bin");
     if !bin.exists() {
         std::fs::create_dir_all(&bin)?;
-        let python = stub_python()?;
+        // cmd.exe expands `%` in a batch file's lines, quoted or not: each of a path's doubled. No path holds a `"`.
+        let in_batch = |p: &Path| p.display().to_string().replace('%', "%%");
+        let (python, stub) = (in_batch(stub_python()?.as_path()), in_batch(stub_path().as_path()));
         for k in kiln::harness::kinds::Kind::all() {
-            let shim = format!("@set \"VM_STUB_PROTOCOL={}\"\r\n@\"{}\" \"{}\" %*\r\n", k.program, python.display(), stub_path().display());
+            let shim = format!("@set \"VM_STUB_PROTOCOL={}\"\r\n@\"{python}\" \"{stub}\" %*\r\n", k.program);
             std::fs::write(bin.join(format!("{}.cmd", k.program)), shim)?;
         }
     }
