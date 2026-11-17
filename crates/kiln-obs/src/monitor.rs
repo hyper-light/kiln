@@ -9,16 +9,25 @@
 //! metric := time_aggr "(" window ")" ":" query op threshold
 //! forecast := ("max" | "min") "(" "next_" n unit ")" ":" "forecast(" query "," algorithm ["," deviations] ["," name "=" value]* ")" op threshold
 //! change := ("change" | "pct_change") "(" time_aggr "(" window ")" "," shift ")" ":" query op threshold
+//! shift  := <n>(m|h|d|w)"_ago" | window          (Datadog's 5m_ago, 1h_ago, 1d_ago)
 //! logs   := "logs(" '"' search '"' ")" [".index(" '"' * '"' ")"] ".rollup(" '"' measure '"' ["," '"' facet '"'] ")"
 //!           [".by(" '"' facets '"' ")"] ".last(" '"' window '"' ")" op threshold
 //! spans  := ("trace-analytics(" | "spans(") '"' search '"' ")" ... as logs   (a span search, its facets a span's)
 //! slo    := "slo(" '"' id '"' ")" ( ".burn_rate(" '"' long '"' "," '"' short '"' ")" | ".error_budget()" ) op threshold
 //! errors := "error-tracking(" '"' search '"' ")" [".source(" '"' ("all" | "backend") '"' ")"] (".new()" | ".impact()")
 //!           [".rollup(" '"' "count" '"' ")"] ".by(" '"' "issue.id" ["," facets] '"' ")" ".last(" '"' window '"' ")" op threshold
-//! time_aggr := avg | sum | min | max | last
+//! time_aggr := avg | sum | min | max | last | percentile
 //! window := last_<n>(m|h|d|w)  (logs: <n>(m|h|d|w))
 //! op     := > | >= | < | <= | == | !=
+//! threshold := a finite number
 //! ```
+//!
+//! A metric monitor reads its window as Datadog's evaluation paths do: bucket by bucket, the time
+//! aggregation over the values the formula gives (its classic path); with `sum` and a query read
+//! `.as_count()`, each query summed over the window before the formula (its `.as_count()` path);
+//! with `percentile`, a distribution's values over the whole window at its query's `pXX`. A change
+//! monitor's classic path compares each bucket with the one its shift before, then aggregates.
+//! Groups with an `N/A` tag value are left out ("`N/A` groups are not included in monitors").
 //!
 //! A string's `\"` is a quote within it and `\\` a backslash, as Datadog's monitor API has them:
 //! `logs("service:web \"connection refused\"")`.
@@ -32,14 +41,25 @@ pub mod checks;
 pub mod composite;
 pub mod downtime;
 
+use std::collections::HashMap;
+
 use crate::logs::search::Search;
 use crate::logs::store::{Facet, Measure};
-use crate::query::eval::{Request, Source};
+use crate::query::eval::{Answer, Path, Request, Series, Source};
+use crate::query::parse::{Ast, CountMode, Func, Node, SpaceAgg};
 use crate::store::{LogsAt, Store};
 
-/// The longest a monitor's window may be: a week (Datadog's longest, `last_1w`), so that one
-/// evaluation reads a bounded range.
+/// The longest window of logs, spans, errors or an SLO's burn: a week (Datadog's API's longest,
+/// `last_1w`), so that one evaluation reads a bounded range.
 pub const MAX_WINDOW_MS: i64 = 7 * 86_400_000;
+/// The longest a metric monitor's window, and a change monitor's shift, may be: 730 hours, Datadog's
+/// ("a value between 1 minute and 730 hours (1 month)", its metric monitor's page; "a custom time
+/// window of up to 1 month", its monitor configuration's). A window of whole hours is read in 365
+/// buckets at the most (`step_for`; any window in [`MAX_POINTS`]), from rollups where blocks hold
+/// them (`docs/observe.md` §4.7).
+///
+/// [`MAX_POINTS`]: crate::query::eval::MAX_POINTS
+pub const MAX_METRIC_WINDOW_MS: i64 = 730 * 3_600_000;
 /// The furthest a forecast monitor looks ahead: three months (Datadog's "between 12 hours and 3
 /// months"; shorter here too, an hour at the least).
 pub const MAX_AHEAD_MS: i64 = 92 * 86_400_000;
@@ -54,6 +74,9 @@ pub enum TimeAggr {
     Min,
     Max,
     Last,
+    /// Datadog's `percentile(pXX)` of a distribution: its values over the whole window, at the pXX
+    /// its query's aggregator names (`percentile(last_5m):p95:latency{*}`).
+    Percentile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,8 +161,8 @@ fn syntax(why: impl Into<String>) -> MonitorError {
     MonitorError::Syntax(why.into())
 }
 
-/// `last_5m`, `last_1h`, `5m` (a log monitor's), ... in ms.
-fn window(s: &str) -> Result<i64, MonitorError> {
+/// `last_5m`, `last_1h`, `5m` (a log monitor's), ... in ms, `most` at the most.
+fn window(s: &str, most: i64) -> Result<i64, MonitorError> {
     let s = s.trim().trim_matches('"');
     let s = s.strip_prefix("last_").unwrap_or(s);
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).ok_or_else(|| syntax(format!("a window without a unit: {s}")))?);
@@ -152,8 +175,15 @@ fn window(s: &str) -> Result<i64, MonitorError> {
         "w" => 7 * 86_400_000,
         _ => return Err(syntax(format!("a window's unit: {unit}"))),
     };
-    let w = n.checked_mul(ms).filter(|&w| w > 0 && w <= MAX_WINDOW_MS).ok_or_else(|| syntax(format!("a window of {s}: at most a week")))?;
+    let w = n.checked_mul(ms).filter(|&w| w > 0 && w <= most).ok_or_else(|| syntax(format!("a window of {s}: at most {} hours", most / 3_600_000)))?;
     Ok(w)
+}
+
+/// A change monitor's shift, in ms: Datadog's `5m_ago`, `1h_ago`, `1d_ago` (its API's `#m_ago`,
+/// `#h_ago`, `1d_ago`), or a window's `last_1h`.
+fn shift(s: &str) -> Result<i64, MonitorError> {
+    let s = s.trim();
+    window(s.strip_suffix("_ago").unwrap_or(s), MAX_METRIC_WINDOW_MS)
 }
 
 /// A forecast monitor's horizon (`1w`, `24h`, `3d`, ...): an hour to three months.
@@ -178,7 +208,8 @@ fn aggr(s: &str) -> Result<TimeAggr, MonitorError> {
         "min" => TimeAggr::Min,
         "max" => TimeAggr::Max,
         "last" => TimeAggr::Last,
-        other => return Err(syntax(format!("a time aggregation: {other} (avg, sum, min, max, last)"))),
+        "percentile" => TimeAggr::Percentile,
+        other => return Err(syntax(format!("a time aggregation: {other} (avg, sum, min, max, last, percentile)"))),
     })
 }
 
@@ -230,7 +261,8 @@ fn comparison(s: &str) -> Result<(&str, Op, f64), MonitorError> {
     } else {
         return Err(syntax("a comparison's operator"));
     };
-    let threshold: f64 = rest.get(len..).unwrap_or("").trim().parse().map_err(|_| syntax("a comparison's threshold, a number"))?;
+    // Datadog's "an integer or decimal number": no infinity, no NaN (which no value would pass).
+    let threshold: f64 = rest.get(len..).unwrap_or("").trim().parse().ok().filter(|t: &f64| t.is_finite()).ok_or_else(|| syntax("a comparison's threshold, a number"))?;
     Ok((s.get(..i).unwrap_or("").trim(), op, threshold))
 }
 
@@ -316,24 +348,62 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
         }
         Kind::Forecast { highest, ahead_ms, query }
     } else if let Some(inner) = head.strip_prefix("change(").or_else(|| head.strip_prefix("pct_change(")) {
-        // change(avg(last_5m),last_1h)
+        // change(avg(last_5m),5m_ago)
         let pct = head.starts_with("pct_change(");
         let inner = inner.strip_suffix(')').ok_or_else(|| syntax("change(...)'s closing parenthesis"))?;
         let (a, rest) = inner.split_once('(').ok_or_else(|| syntax("change(time_aggr(window), shift)"))?;
-        let (w, shift) = rest.split_once("),").ok_or_else(|| syntax("change(time_aggr(window), shift)"))?;
-        Kind::Change { aggr: aggr(a)?, window_ms: window(w)?, shift_ms: window(shift)?, pct, query }
+        let (w, back) = rest.split_once("),").ok_or_else(|| syntax("change(time_aggr(window), shift)"))?;
+        Kind::Change { aggr: aggr(a)?, window_ms: window(w, MAX_METRIC_WINDOW_MS)?, shift_ms: shift(back)?, pct, query }
     } else {
         let (a, rest) = head.split_once('(').ok_or_else(|| syntax("time_aggr(window):"))?;
         let w = rest.strip_suffix(')').ok_or_else(|| syntax("time_aggr(window)'s closing parenthesis"))?;
-        Kind::Metric { aggr: aggr(a)?, window_ms: window(w)?, query }
+        Kind::Metric { aggr: aggr(a)?, window_ms: window(w, MAX_METRIC_WINDOW_MS)?, query }
     };
     // The metric query must parse as one.
-    crate::query::parse::parse(match &kind {
+    let ast = crate::query::parse::parse(match &kind {
         Kind::Metric { query, .. } | Kind::Change { query, .. } | Kind::Forecast { query, .. } => query,
         Kind::Logs { .. } | Kind::Spans { .. } | Kind::Slo { .. } | Kind::ErrorTracking { .. } => "",
     })
     .map_err(|e| syntax(e.to_string()))?;
+    if let Kind::Metric { aggr, window_ms, .. } | Kind::Change { aggr, window_ms, .. } = &kind {
+        // Datadog's `percentile(pXX)`: "a matching percentile threshold is automatically specified"
+        // from the query's percentile aggregator.
+        if *aggr == TimeAggr::Percentile && !matches!(ast.nodes.get(ast.root), Some(Node::Metric(m)) if matches!(m.space, SpaceAgg::Pct(_))) {
+            return Err(syntax("percentile(window): a distribution's percentile alone, its pXX the window's (percentile(last_5m):p95:latency{*})"));
+        }
+        let anomaly = anomaly_of(&ast)?;
+        if anomaly.alert_ms.is_some_and(|a| a > *window_ms) || anomaly.step_ms.is_some_and(|s| s > *window_ms) {
+            return Err(syntax("anomalies(…, alert_window=, interval=): each within the monitor's window"));
+        }
+    }
     Ok(Query { kind, op, threshold })
+}
+
+/// An anomaly monitor's reading, from Datadog's named arguments of its `anomalies()`: the last part
+/// of its window its share past the band is of (`alert_window`; all of it unless said) and its
+/// buckets' width (`interval`, whole seconds; the window's own step unless said), in ms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Anomaly {
+    alert_ms: Option<i64>,
+    step_ms: Option<i64>,
+}
+
+fn anomaly_of(ast: &Ast) -> Result<Anomaly, MonitorError> {
+    let mut a = Anomaly::default();
+    for node in &ast.nodes {
+        let Node::Call(Func::Anomalies, args) = node else { continue };
+        for arg in args.iter().filter_map(|&id| ast.nodes.get(id)) {
+            match arg {
+                Node::Named(k, v) if k == "alert_window" => a.alert_ms = Some(window(v, MAX_METRIC_WINDOW_MS)?),
+                Node::Named(k, v) if k == "interval" => {
+                    let s = v.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 1.0 && s.fract() == 0.0).ok_or_else(|| syntax(format!("anomalies' interval: {v} (whole seconds, at least 1)")))?;
+                    a.step_ms = Some((s * 1000.0) as i64);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(a)
 }
 
 fn parse_slo(q: &str) -> Result<Query, MonitorError> {
@@ -342,7 +412,7 @@ fn parse_slo(q: &str) -> Result<Query, MonitorError> {
     let id = args.first().map(|s| (*s).to_owned()).filter(|s| !s.is_empty()).ok_or_else(|| syntax("slo(\"<the SLO's id>\")"))?;
     let burn = if let Some((a, r)) = call(rest, "burn_rate")? {
         let [long, short] = a.as_slice() else { return Err(syntax("burn_rate(\"1h\", \"5m\"): a long window and a short one")) };
-        let (long, short) = (window(long)?, window(short)?);
+        let (long, short) = (window(long, MAX_WINDOW_MS)?, window(short, MAX_WINDOW_MS)?);
         if short >= long || !r.trim().is_empty() {
             return Err(syntax("burn_rate(long, short): the short window shorter than the long, and nothing after"));
         }
@@ -404,7 +474,7 @@ fn parse_error_tracking(q: &str) -> Result<Query, MonitorError> {
             by = Some(facets);
             rest = r;
         } else if let Some((a, r)) = call(rest, "last")? {
-            window_ms = Some(window(a.first().copied().unwrap_or(""))?);
+            window_ms = Some(window(a.first().copied().unwrap_or(""), MAX_WINDOW_MS)?);
             rest = r;
         } else {
             return Err(syntax(format!("after error-tracking(...): {}", rest.trim())));
@@ -440,7 +510,7 @@ fn parse_records(q: &str, name: &str, spans: bool) -> Result<Query, MonitorError
             by = a.iter().flat_map(|s| s.split(',')).filter(|s| !s.trim().is_empty()).map(facet_of).collect();
             rest = r;
         } else if let Some((a, r)) = call(rest, "last")? {
-            window_ms = Some(window(a.first().copied().unwrap_or(""))?);
+            window_ms = Some(window(a.first().copied().unwrap_or(""), MAX_WINDOW_MS)?);
             rest = r;
         } else {
             return Err(syntax(format!("after {name}(...): {}", rest.trim())));
@@ -480,7 +550,8 @@ pub struct Value {
 fn reduce(aggr: TimeAggr, values: &[f64]) -> Option<f64> {
     let mut finite = values.iter().copied().filter(|v| v.is_finite());
     match aggr {
-        TimeAggr::Last => values.iter().rev().copied().find(|v| v.is_finite()),
+        // A percentile's window is one bucket (`Path::Whole`).
+        TimeAggr::Last | TimeAggr::Percentile => values.iter().rev().copied().find(|v| v.is_finite()),
         TimeAggr::Avg => {
             let (s, n) = finite.fold((0.0, 0u32), |(s, n), v| (s + v, n + 1));
             (n > 0).then(|| s / f64::from(n))
@@ -509,23 +580,60 @@ fn aligned(window_ms: i64, to: i64) -> (i64, i64, i64) {
     (end - window_ms, end, step)
 }
 
-fn metric_values(src: Source<'_>, query: &str, aggr: TimeAggr, window_ms: i64, to: i64) -> Result<Vec<Value>, MonitorError> {
-    let (from, to, step) = aligned(window_ms, to);
+/// How a metric monitor reads its window: a percentile, the window whole; a sum of a query read
+/// `.as_count()`, each query summed before its formula; else bucket by bucket.
+fn path_of(aggr: TimeAggr, ast: &Ast) -> Path {
+    match aggr {
+        TimeAggr::Percentile => Path::Whole,
+        TimeAggr::Sum if ast.nodes.iter().any(|n| matches!(n, Node::Metric(m) if m.mode == Some(CountMode::Count))) => Path::Summed,
+        _ => Path::Buckets,
+    }
+}
+
+/// `query` over the window of `window_ms` ending at or before `to`, read on `path`, and the
+/// window's step: the window is whole buckets of it (an anomaly monitor's `interval`, when it says
+/// one, aligned to it).
+fn read_window(src: Source<'_>, query: &str, path: Path, anomaly: Anomaly, window_ms: i64, to: i64) -> Result<(Answer, i64), MonitorError> {
+    let (from, to, step) = match anomaly.step_ms.filter(|&s| s > 0) {
+        Some(step) => {
+            let end = to.div_euclid(step) * step;
+            let buckets = window_ms / step + i64::from(window_ms % step != 0);
+            (end - buckets * step, end, step)
+        }
+        None => aligned(window_ms, to),
+    };
     let mut req = Request::new(query, from, to);
     req.step = Some(step);
-    let a = src.ask(&req).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let a = src.ask_path(&req, path).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    Ok((a, step))
+}
+
+/// A group with a tag without a value: Datadog's "`N/A` groups are not included in monitors, so tag
+/// keys must have a value".
+fn not_applicable(s: &Series) -> bool {
+    s.tags.iter().any(|(_, v)| v == "N/A")
+}
+
+fn metric_values(src: Source<'_>, query: &str, aggr: TimeAggr, window_ms: i64, to: i64) -> Result<Vec<Value>, MonitorError> {
+    let ast = crate::query::parse::parse(query).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let anomaly = anomaly_of(&ast)?;
+    let (a, step) = read_window(src, query, path_of(aggr, &ast), anomaly, window_ms, to)?;
+    // The buckets of an anomaly monitor's `alert_window`, its window's last.
+    let alert = anomaly.alert_ms.map(|ms| usize::try_from(ms / step.max(1)).unwrap_or(usize::MAX).max(1));
     let mut out = Vec::new();
     if let Some(v) = a.scalar.filter(|v| v.is_finite()) {
         out.push(Value { group: Vec::new(), value: v });
     }
-    for s in a.series {
-        // An `anomalies()` series: the share of its window's buckets past its band, as Datadog's
-        // anomaly monitors compare it (`>= 1`: all of them); buckets it could not score left out.
+    for s in a.series.into_iter().filter(|s| !not_applicable(s)) {
+        // An `anomalies()` series: the share of its alert window's buckets past its band, as
+        // Datadog's anomaly monitors compare it (`>= 1`: all of them); buckets it could not score
+        // left out.
         let v = match &s.bounds {
             // An `outliers()` series: 1 an outlier over the window, 0 not (Datadog's `> 0`).
             _ if s.outlier.is_some() => s.outlier.map(|o| f64::from(u8::from(o))),
             Some(b) if b.forecast_from.is_none() => {
-                let read: Vec<bool> = (0..s.values.len()).filter_map(|i| b.anomalous(i)).collect();
+                let first = alert.map_or(0, |k| s.values.len().saturating_sub(k));
+                let read: Vec<bool> = (first..s.values.len()).filter_map(|i| b.anomalous(i)).collect();
                 (!read.is_empty()).then(|| read.iter().filter(|&&x| x).count() as f64 / read.len() as f64)
             }
             _ => reduce(aggr, &s.values),
@@ -572,17 +680,45 @@ fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Resu
     match &q.kind {
         Kind::Metric { aggr, window_ms, query } => metric_values(src, query, *aggr, *window_ms, to),
         Kind::Change { aggr, window_ms, shift_ms, pct, query } => {
-            let now_v = metric_values(src, query, *aggr, *window_ms, to)?;
-            let then_v = metric_values(src, query, *aggr, *window_ms, to - shift_ms)?;
-            Ok(now_v
-                .into_iter()
-                .filter_map(|v| {
-                    let then = then_v.iter().find(|t| t.group == v.group)?.value;
-                    let change = v.value - then;
-                    let value = if *pct { if then == 0.0 { return None } else { change / then.abs() * 100.0 } } else { change };
-                    Some(Value { group: v.group, value })
-                })
-                .collect())
+            let changed = |now: f64, then: f64| -> Option<f64> {
+                let change = now - then;
+                match *pct {
+                    _ if !change.is_finite() => None,
+                    false => Some(change),
+                    true => (then != 0.0).then(|| change / then.abs() * 100.0),
+                }
+            };
+            let ast = crate::query::parse::parse(query).map_err(|e| MonitorError::Eval(e.to_string()))?;
+            if path_of(*aggr, &ast) != Path::Buckets {
+                // Datadog's `.as_count()` path (and a percentile's): each window aggregated first,
+                // then the change at the window's level.
+                let now_v = metric_values(src, query, *aggr, *window_ms, to)?;
+                let then_v = metric_values(src, query, *aggr, *window_ms, to - shift_ms)?;
+                return Ok(now_v
+                    .into_iter()
+                    .filter_map(|v| {
+                        let then = then_v.iter().find(|t| t.group == v.group)?.value;
+                        Some(Value { value: changed(v.value, then)?, group: v.group })
+                    })
+                    .collect());
+            }
+            // Its classic path: each bucket against the one `shift` before it, then the window's
+            // aggregation ("pct_change() is computed per-bucket and those values are summed over
+            // the evaluation window").
+            let (now_a, _) = read_window(src, query, Path::Buckets, Anomaly::default(), *window_ms, to)?;
+            let (then_a, _) = read_window(src, query, Path::Buckets, Anomaly::default(), *window_ms, to - shift_ms)?;
+            let then: HashMap<&Vec<(String, String)>, &Vec<f64>> = then_a.series.iter().map(|t| (&t.tags, &t.values)).collect();
+            let mut out = Vec::new();
+            for s in now_a.series.iter().filter(|s| !not_applicable(s)) {
+                let Some(before) = then.get(&s.tags) else { continue };
+                let changes: Vec<f64> = s.values.iter().zip(before.iter()).map(|(&n, &t)| changed(n, t).unwrap_or(f64::NAN)).collect();
+                if let Some(value) = reduce(*aggr, &changes) {
+                    let mut group = s.tags.clone();
+                    group.sort();
+                    out.push(Value { group, value });
+                }
+            }
+            Ok(out)
         }
         Kind::Forecast { highest, ahead_ms, query } => forecast_values(src, query, *highest, *ahead_ms, to),
         Kind::Slo { .. } => Err(MonitorError::Eval("an SLO's monitor is evaluated with its SLO".into())),
@@ -963,6 +1099,111 @@ mod tests {
         // Without the spike's bucket, nothing past the band.
         let before = evaluate(&s, &q, now - 300_000, 0).unwrap();
         assert!(before[0].value.abs() < 1e-9, "{before:?}");
+        // Datadog's named arguments: the share is of the alert window's last buckets (the spike's
+        // one of three, one of one), the direction named.
+        let q = parse("avg(last_1h):anomalies(avg:cpu{*}, 'robust', 3, direction='above', alert_window='last_15m') >= 0.05").unwrap();
+        let got = evaluate(&s, &q, now, 0).unwrap();
+        assert!((got[0].value - 1.0 / 3.0).abs() < 1e-9, "{got:?}");
+        let q = parse("avg(last_1h):anomalies(avg:cpu{*}, 'robust', 3, alert_window='last_5m') >= 1").unwrap();
+        let got = evaluate(&s, &q, now, 0).unwrap();
+        assert!((got[0].value - 1.0).abs() < 1e-9, "{got:?}");
+    }
+
+    /// What Datadog's metric monitors take besides: a change's `5m_ago`, `1h_ago` and `1d_ago`
+    /// shifts (its API's) and a window's; windows up to 730 hours; `percentile(…)` of a
+    /// distribution's percentile alone; anomaly monitors' named arguments, as its page's example
+    /// writes them, each within the window; a threshold a finite number.
+    #[test]
+    fn datadog_s_metric_monitor_forms_parse() {
+        for (q, back) in [
+            ("change(avg(last_5m),5m_ago):avg:cpu{*} > 1", 300_000),
+            ("pct_change(avg(last_1h), 1h_ago):avg:cpu{*} < -50", 3_600_000),
+            ("change(max(last_1d),1d_ago):avg:cpu{*} > 1", 86_400_000),
+            ("change(avg(last_5m),last_30m):avg:cpu{*} > 1", 1_800_000),
+        ] {
+            assert!(matches!(parse(q).unwrap().kind, Kind::Change { shift_ms, .. } if shift_ms == back), "{q}");
+        }
+        assert!(matches!(parse("avg(last_730h):avg:cpu{*} > 1").unwrap().kind, Kind::Metric { window_ms: 2_628_000_000, .. }));
+        assert!(matches!(parse("avg(last_30d):avg:cpu{*} > 1").unwrap().kind, Kind::Metric { window_ms: 2_592_000_000, .. }));
+        let q = parse("percentile(last_5m):p95:trace.http.request.duration{service:web} by {resource_name} > 0.5").unwrap();
+        assert!(matches!(q.kind, Kind::Metric { aggr: TimeAggr::Percentile, window_ms: 300_000, .. }));
+        let q = parse("avg(last_1h):anomalies(avg:system.cpu.system{name:cassandra}, 'basic', 3, direction='above', alert_window='last_5m', interval=20, count_default_zero='true') >= 1").unwrap();
+        assert_eq!((q.op, q.threshold), (Op::Ge, 1.0));
+        for bad in [
+            "avg(last_731h):avg:cpu{*} > 1",
+            "change(avg(last_5m),5x_ago):avg:cpu{*} > 1",
+            "change(avg(last_5m),_ago):avg:cpu{*} > 1",
+            "percentile(last_5m):avg:latency{*} > 1",
+            "percentile(last_5m):p95:a{*} / p95:b{*} > 1",
+            "avg(last_5m):avg:cpu{*} > inf",
+            "avg(last_5m):avg:cpu{*} > NaN",
+            "avg(last_1h):anomalies(avg:cpu{*}, 'basic', 2, alert_window='last_2h') >= 1",
+            "avg(last_1h):anomalies(avg:cpu{*}, 'basic', 2, interval=7200) >= 1",
+            "avg(last_1h):anomalies(avg:cpu{*}, 'basic', 2, interval=1.5) >= 1",
+            r#"logs("x").last("8d") > 1"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Datadog's evaluation paths: an error rate of counts read `.as_count()` and summed is its
+    /// errors' sum over its requests' (its guide's worked example: errors 1 to 5, ten requests a
+    /// bucket, 0.3), not the sum of each bucket's rate (1.5, the classic path's, which `max` keeps);
+    /// a change's classic path compares bucket with bucket; a group with a tag without a value is no
+    /// monitor's; a distribution's `percentile(…)` reads every value of the window, where `avg(…)`
+    /// of its percentile averages each bucket's, and a metric that is no distribution has none.
+    #[test]
+    fn monitors_read_their_window_as_datadog_s_evaluation_paths_do() {
+        use crate::dist::{BUCKET_TAG, SCALE, bucket_of, tag_value};
+        let mut s = Store::new(Keyed::new());
+        let mut b = Builder::new();
+        // A five-minute window ending at `now`: ten buckets of 30 s.
+        let now: i64 = 1_000_200_000;
+        let (errors, total) = (SeriesKey::new("req.errors", [("host", "a")], SKind::Count).unwrap(), SeriesKey::new("req.total", [("host", "a")], SKind::Count).unwrap());
+        for k in [&errors, &total] {
+            b.define(k);
+        }
+        b.run(errors.fp, (0..5).map(|i| (now - 300_000 + i * 60_000 + 1_000, (i + 1) as f64)));
+        b.run(total.fp, (0..5).map(|i| (now - 300_000 + i * 60_000 + 1_000, 10.0)));
+        // A load at 10 and 20 by turns a bucket, then at 20 throughout.
+        let load = SeriesKey::new("load", [("host", "a")], SKind::Gauge).unwrap();
+        b.define(&load);
+        b.run(load.fp, (0..20).map(|j| (now - 600_000 + j * 30_000 + 1_000, if j < 10 && j % 2 == 0 { 10.0 } else { 20.0 })));
+        // A cpu of a host, and one without a host.
+        for (k, v) in [(SeriesKey::new("cpu", [("host", "a")], SKind::Gauge).unwrap(), 5.0), (SeriesKey::new("cpu", [("zone", "z")], SKind::Gauge).unwrap(), 7.0)] {
+            b.define(&k);
+            b.run(k.fp, [(now - 60_000, v)]);
+        }
+        // A latency's distribution: 300 values of 1 in one minute, 100 of 100 in another.
+        for (t, v, n) in [(now - 240_000, 1.0, 300.0), (now - 120_000, 100.0, 100.0)] {
+            let bk = bucket_of(v, SCALE).unwrap();
+            let tag = tag_value(SCALE, bk);
+            let k = SeriesKey::new("lat.dist", [(BUCKET_TAG, tag.as_str())], SKind::Count).unwrap();
+            b.define(&k);
+            b.run(k.fp, [(t, n)]);
+        }
+        s.apply(&b.finish()).unwrap();
+        let value = |q: &str| -> Vec<Value> { evaluate(&s, &parse(q).unwrap(), now, 0).unwrap_or_else(|e| panic!("{q}: {e}")) };
+        let one = |q: &str| -> f64 {
+            let v = value(q);
+            assert_eq!(v.len(), 1, "{q}: {v:?}");
+            v[0].value
+        };
+        assert!((one("sum(last_5m):sum:req.errors{*}.as_count() / sum:req.total{*}.as_count() > 0.25") - 0.3).abs() < 1e-12);
+        assert!((one("sum(last_5m):sum:req.errors{*} / sum:req.total{*} > 0.25") - 1.5).abs() < 1e-12);
+        assert!((one("max(last_5m):sum:req.errors{*}.as_count() / sum:req.total{*}.as_count() > 0.25") - 0.5).abs() < 1e-12);
+        // Each bucket's change, then their average: 100% and 0% by turns, 50 (the averages' change
+        // would be 33.3).
+        assert!((one("pct_change(avg(last_5m),5m_ago):avg:load{*} > 40") - 50.0).abs() < 1e-9);
+        assert!((one("change(avg(last_5m),5m_ago):avg:load{*} > 1") - 5.0).abs() < 1e-9);
+        assert_eq!(value("avg(last_5m):avg:cpu{*} by {host} > 1"), vec![Value { group: vec![("host".into(), "a".into())], value: 5.0 }]);
+        let bound = ((2f64).powi(-SCALE) * 0.5).exp2() - 1.0;
+        let within = |got: f64, want: f64| ((got - want) / want).abs() <= bound * 1.000_001;
+        let whole = one("percentile(last_5m):p50:lat{*} > 50");
+        assert!(within(whole, 1.0), "{whole}");
+        let averaged = one("avg(last_5m):p50:lat{*} > 50");
+        assert!(within(averaged, 50.5), "{averaged}");
+        assert!(evaluate(&s, &parse("percentile(last_5m):p50:cpu{*} > 1").unwrap(), now, 0).is_err());
     }
 
     #[test]
