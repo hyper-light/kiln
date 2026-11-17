@@ -50,7 +50,7 @@ use crate::logs::search::Search;
 use crate::logs::store::{Facet, Measure};
 use crate::query::calendar::{Calendar, Unit, Zone};
 use crate::query::eval::{Answer, Path, Request, Series, Source};
-use crate::query::parse::{Ast, CountMode, Func, Node, SpaceAgg};
+use crate::query::parse::{Ast, CountMode, Func, Node, RecordSource, SpaceAgg};
 use crate::store::{LogsAt, Store};
 
 /// The longest window of logs, spans, errors or an SLO's burn: a week (Datadog's API's longest,
@@ -195,6 +195,11 @@ pub enum Kind {
     Metric { aggr: TimeAggr, window_ms: i64, query: String, cumulative: Option<Cumulative>, recovery_ms: Option<i64> },
     /// The value now against the value `shift_ms` before (`pct`: as a percent of it).
     Change { aggr: TimeAggr, window_ms: i64, shift_ms: i64, pct: bool, query: String },
+    /// Datadog's formula monitor of logs, spans or events (its options' `variables` of
+    /// `data_source` `logs`, `spans` or `events`, [`parse_formula`]): each of its queries measured
+    /// over the whole window, as a log monitor measures its one ("Datadog evaluates the number of
+    /// logs over a selected time frame", its log monitor page), then its formula, a value a group.
+    RecordsFormula { query: String, window_ms: i64 },
     Logs { search: String, measure: Measure, by: Vec<Facet>, window_ms: i64 },
     /// Datadog's trace analytics monitor: a span search, as a log monitor's is of logs.
     Spans { search: String, measure: Measure, by: Vec<Facet>, window_ms: i64 },
@@ -533,7 +538,7 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     };
     // The metric query must parse as one.
     let ast = crate::query::parse::parse(match &kind {
-        Kind::Metric { query, .. } | Kind::Change { query, .. } | Kind::Forecast { query, .. } => query,
+        Kind::Metric { query, .. } | Kind::Change { query, .. } | Kind::Forecast { query, .. } | Kind::RecordsFormula { query, .. } => query,
         Kind::Logs { .. } | Kind::Spans { .. } | Kind::Slo { .. } | Kind::ErrorTracking { .. } => "",
     })
     .map_err(|e| syntax(e.to_string()))?;
@@ -592,13 +597,59 @@ pub fn parse_formula(q: &str, variables: &[(&str, &str)], critical_query: Option
         }
     };
     let f = formula_of(left, variables, false)?;
+    let metrics_only = |d: Formula| -> Result<Formula, MonitorError> {
+        if of_records(&d.query)? {
+            return Err(syntax("a dynamic threshold (> threshold, thresholds.critical_query): a formula of metrics (Datadog's: \"only supported on metric monitors with a formula query\")"));
+        }
+        Ok(d)
+    };
+    if of_records(&f.query)? {
+        if threshold.is_none() || critical_query.is_some() || critical_recovery_query.is_some() {
+            return Err(syntax("a dynamic threshold (> threshold, thresholds.critical_query): a formula of metrics (Datadog's: \"only supported on metric monitors with a formula query\")"));
+        }
+        if f.window_ms > MAX_WINDOW_MS {
+            return Err(syntax(format!(".last(…) of logs, spans or events: at most {} hours", MAX_WINDOW_MS / 3_600_000)));
+        }
+        return Ok(Query { kind: Kind::RecordsFormula { query: f.query, window_ms: f.window_ms }, op, threshold: threshold.unwrap_or(f64::NAN), dynamic: None });
+    }
     let dynamic = match (threshold, critical_query, critical_recovery_query) {
-        (None, Some(c), r) => Some(Box::new(Dynamic { critical: formula_of(c, variables, true)?, critical_recovery: r.map(|r| formula_of(r, variables, true)).transpose()? })),
+        (None, Some(c), r) => Some(Box::new(Dynamic { critical: metrics_only(formula_of(c, variables, true)?)?, critical_recovery: r.map(|r| formula_of(r, variables, true).and_then(metrics_only)).transpose()? })),
         (None, None, _) => return Err(syntax("> threshold: its monitor's thresholds.critical_query says the threshold")),
         (Some(_), None, None) => None,
         (Some(_), _, _) => return Err(syntax("thresholds.critical_query and critical_recovery_query: with `> threshold` alone (Datadog's: \"cannot be combined with static thresholds\")")),
     };
     Ok(Query { kind: Kind::Metric { aggr: f.aggr, window_ms: f.window_ms, query: f.query, cumulative: None, recovery_ms: None }, op, threshold: threshold.unwrap_or(f64::NAN), dynamic })
+}
+
+/// Whether a formula's query reads logs, spans or events (records queries) rather than metrics;
+/// refused where it reads both: a formula of metrics is read bucket by bucket, one of records over
+/// its whole window ([`Kind::RecordsFormula`]).
+fn of_records(query: &str) -> Result<bool, MonitorError> {
+    let ast = crate::query::parse::parse(query).map_err(|e| syntax(e.to_string()))?;
+    let records = ast.nodes.iter().any(|n| matches!(n, Node::Records(_)));
+    if records && ast.nodes.iter().any(|n| matches!(n, Node::Metric(_))) {
+        return Err(syntax("formula(…): its variables metrics, or logs, spans and events, not both (a formula of metrics is read bucket by bucket, one of records over its whole window)"));
+    }
+    Ok(records)
+}
+
+/// A formula variable of Datadog's event platform (`data_source` `logs`, `spans` or `events`; its
+/// `search.query`, `compute.aggregation` and `.metric`, `group_by`'s facets) as kiln's query
+/// language writes a records query: `logs("<search>").rollup("<aggregation>"[, "<metric>"])
+/// [.by("<facets>")]`, each string quoted as the language reads one (`\"`, `\\`).
+pub fn records_query(of: RecordSource, search: &str, aggregation: &str, metric: Option<&str>, by: &[&str]) -> String {
+    let quoted = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    let name = match of {
+        RecordSource::Logs => "logs",
+        RecordSource::Spans => "spans",
+        RecordSource::Events => "events",
+    };
+    let rollup = match metric {
+        Some(m) => format!("{}, {}", quoted(aggregation), quoted(m)),
+        None => quoted(aggregation),
+    };
+    let by = if by.is_empty() { String::new() } else { format!(".by({})", quoted(&by.join(","))) };
+    format!("{name}({}).rollup({rollup}){by}", quoted(search))
 }
 
 /// A formula monitor's comparison with Datadog's `threshold` keyword for its threshold: what comes
@@ -1112,10 +1163,30 @@ fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Resu
             Ok(out)
         }
         Kind::Forecast { highest, ahead_ms, query } => forecast_values(src, query, *highest, *ahead_ms, to),
+        Kind::RecordsFormula { query, window_ms } => records_formula_values(src, query, *window_ms, to),
         Kind::Slo { .. } => Err(MonitorError::Eval("an SLO's monitor is evaluated with its SLO".into())),
         Kind::ErrorTracking { .. } => Err(MonitorError::Eval("an Error Tracking monitor is evaluated with its issues".into())),
         Kind::Logs { .. } | Kind::Spans { .. } => Err(MonitorError::Eval("a monitor of logs or spans reads its records (`evaluate_records`)".into())),
     }
+}
+
+/// A formula monitor of logs, spans or events' values ([`Kind::RecordsFormula`]): its window ending
+/// at `to` read as one bucket, each of its queries' measure over all of it, then its formula, a
+/// value a group (a group with a tag without a value left out, as a metric monitor's).
+fn records_formula_values(src: Source<'_>, query: &str, window_ms: i64, to: i64) -> Result<Vec<Value>, MonitorError> {
+    let a = src.ask_path(&Request::new(query, to - window_ms, to), Path::Whole).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let mut out = Vec::new();
+    if let Some(v) = a.scalar.filter(|v| v.is_finite()) {
+        out.push(Value::of(Vec::new(), v));
+    }
+    for s in a.series.into_iter().filter(|s| !not_applicable(s)) {
+        if let Some(v) = s.values.last().copied().filter(|v| v.is_finite()) {
+            let mut group = s.tags;
+            group.sort();
+            out.push(Value::of(group, v));
+        }
+    }
+    Ok(out)
 }
 
 /// A dynamic threshold's values ([`Formula`]), a group's each, times its multiplier.
@@ -1711,6 +1782,72 @@ mod tests {
             assert!(parse_formula(bad, &vars, critical, recovery).is_err(), "{bad} {critical:?} {recovery:?}");
         }
         assert!(parse(r#"formula("query1").last("5m") > 1"#).is_err(), "a formula's variables are its monitor's");
+    }
+
+    /// Datadog's formula monitors of its event platform (its API client's own RUM and CI examples,
+    /// `formula("query2 / query1 * 100").last("15m") >= 0.8` of `search`/`compute`/`group_by`
+    /// variables) of logs, spans and events: each query measured over its whole window, as a log
+    /// monitor measures its one, not the store's buckets (which align to their step, and split a
+    /// window that does not), then the formula, a value a group; refused beside metrics, with a
+    /// dynamic threshold (Datadog's: metric monitors'), past a week.
+    #[test]
+    fn formula_monitors_of_logs_spans_and_events_measure_their_whole_window() {
+        let mut s = Store::new(Keyed::new());
+        // No multiple of 15 minutes: the window straddles a 15-minute bucket's edge.
+        let now: i64 = 1_000_000_000_000 + 7 * 60_000 + 30_000;
+        let rec = |at: i64, service: &str, severity: u8, ms: i64| Record {
+            ts: at * 1_000_000,
+            severity,
+            service: service.into(),
+            host: "h".into(),
+            source: "app".into(),
+            message: "req".into(),
+            attrs: vec![("ms".into(), ms.to_string())],
+            ..Record::default()
+        };
+        // In the window, a minute apart: web 4 errors of 10 logs, api 1 of 5; web 3 errors an hour
+        // before, outside it.
+        let mut logs: Vec<Record> = (0..10).map(|i| rec(now - 14 * 60_000 + i * 60_000, "web", if i < 4 { 17 } else { 9 }, 100 + i)).collect();
+        logs.extend((0..5).map(|i| rec(now - 13 * 60_000 + i * 60_000, "api", if i == 0 { 17 } else { 9 }, 7)));
+        logs.extend((0..3).map(|i| rec(now - 3_600_000 + i * 1_000, "web", 17, 1)));
+        let mut b = Builder::new();
+        b.logs(&logs);
+        s.apply(&b.finish()).unwrap();
+        let (errors, all) = (records_query(RecordSource::Logs, "status:error", "count", None, &["service"]), records_query(RecordSource::Logs, "", "count", None, &["service"]));
+        assert_eq!(errors, r#"logs("status:error").rollup("count").by("service")"#);
+        let vars = [("query1", errors.as_str()), ("query2", all.as_str())];
+        let q = parse_formula(r#"formula("query1 / query2 * 100").last("15m") >= 30"#, &vars, None, None).unwrap();
+        assert!(matches!(&q.kind, Kind::RecordsFormula { window_ms: 900_000, .. }) && q.threshold == 30.0, "{q:?}");
+        let mut got = evaluate(&s, &q, now, 0).unwrap();
+        got.sort_by(|a, b| a.group.cmp(&b.group));
+        let of = |svc: &str| got.iter().find(|v| v.group == [("service".to_owned(), svc.to_owned())]).map(|v| v.value);
+        assert!(got.len() == 2 && of("web").is_some_and(|v| (v - 40.0).abs() < 1e-9) && of("api").is_some_and(|v| (v - 20.0).abs() < 1e-9), "{got:?}");
+        // A measure over the whole window: web's ms, 100 to 109, average 104.5.
+        let avg = records_query(RecordSource::Logs, "service:web", "avg", Some("@ms"), &[]);
+        let q = parse_formula(r#"formula("query1").last("15m") > 100"#, &[("query1", avg.as_str())], None, None).unwrap();
+        assert_eq!(evaluate(&s, &q, now, 0).unwrap(), vec![Value::of(Vec::new(), 104.5)]);
+        // Events alone, and a count of nothing is 0.
+        let events = records_query(RecordSource::Events, "*", "count", None, &[]);
+        let q = parse_formula(r#"formula("query1").last("5m") > 0"#, &[("query1", events.as_str())], None, None).unwrap();
+        assert_eq!(evaluate(&s, &q, now, 0).unwrap(), vec![Value::of(Vec::new(), 0.0)]);
+        // A shared store reads the same.
+        let shared = crate::lock::RwLock::new(s);
+        let q = parse_formula(r#"formula("query1 / query2 * 100").last("15m") >= 30"#, &vars, None, None).unwrap();
+        assert_eq!(evaluate_shared(&shared, &q, now, 0).unwrap(), evaluate(&shared.read().unwrap(), &q, now, 0).unwrap());
+        // Spans by their facets, a search's quotes kept.
+        assert_eq!(
+            records_query(RecordSource::Spans, r#"service:"a b""#, "pc99", Some("@duration"), &["resource_name", "@http.status_code"]),
+            r#"spans("service:\"a b\"").rollup("pc99", "@duration").by("resource_name,@http.status_code")"#
+        );
+        let metric = [("query1", errors.as_str()), ("query2", "sum:req.hits{*}.as_count()")];
+        for (bad, vars, critical) in [
+            (r#"formula("query1 / query2").last("5m") > 1"#, &metric[..], None),
+            (r#"formula("query1 / query2").last("5m") > threshold"#, &vars[..], Some(r#"formula("query1").last("1h")"#)),
+            (r#"formula("query1 / query2").last("8d") > 1"#, &vars[..], None),
+            (r#"formula("query2").last("5m") > threshold"#, &metric[..], Some(r#"formula("query1").last("1h")"#)),
+        ] {
+            assert!(parse_formula(bad, vars, critical, None).is_err(), "{bad} {critical:?}");
+        }
     }
 
     /// Datadog's cumulative windows (its API client's own `avg(current_1mo):…`, its Terraform

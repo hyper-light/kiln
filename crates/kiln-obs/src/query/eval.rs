@@ -522,15 +522,14 @@ fn eval_path(lease: &Lease<'_>, req: &Request<'_>, path: Path) -> Result<Answer,
                 Value::Set(if path == Path::Summed { summed(set) } else { set })
             }
             Node::Records(r) => {
-                if path == Path::Whole {
-                    return Err(QueryError::Invalid("percentile(…) reads a distribution's values over the window: a log, span or event query has none".into()));
-                }
                 let g = node_grid(id)?;
                 let (off, edges) = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
                 if edges.is_some() {
                     return Err(QueryError::Invalid("a log, span or event query is read in even buckets: no calendar rollup or calendar shift of one".into()));
                 }
-                let set = records(lease, r, g, off, req.max_series, &mut scanned)?;
+                // The range whole: a formula monitor of logs, spans or events (`crate::monitor`'s
+                // `Kind::RecordsFormula`), each query measured over all of its window.
+                let set = if path == Path::Whole { records_whole(lease, r, g, off, req.max_series, &mut scanned)? } else { records(lease, r, g, off, req.max_series, &mut scanned)? };
                 Value::Set(if path == Path::Summed { summed(set) } else { set })
             }
             Node::Neg(x) => match take(&mut values, *x)? {
@@ -2046,6 +2045,35 @@ fn records(lease: &Lease<'_>, r: &RecordQuery, grid: Grid, off: i64, max_series:
         let mut tags: Vec<(String, String)> = names.iter().cloned().zip(values).collect();
         tags.sort();
         out.push(Series { tags, values: v, bounds: None, outlier: None });
+    }
+    if out.is_empty() && r.by.is_empty() && r.measure.counts() {
+        out.push(Series { tags: Vec::new(), values: vec![0.0; grid.n], bounds: None, outlier: None });
+    }
+    Ok(out)
+}
+
+/// A records query's series over a grid of one bucket, `[from, to)` exactly (not the store's
+/// buckets, which align to their step), read `off` ms from it: each group's measure over all of its
+/// records there, as a log monitor measures its window (`crate::monitor::evaluate_records`), its
+/// groups' tags as [`records`]'s; a count of nothing by nothing one series of 0.
+fn records_whole(lease: &Lease<'_>, r: &RecordQuery, grid: Grid, off: i64, max_series: usize, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+    const NS: i64 = 1_000_000;
+    let (from, to) = (grid.from.saturating_add(off), grid.time(grid.n).saturating_add(off));
+    let at = {
+        let s = lease.hold()?;
+        if r.of == RecordSource::Spans { s.spans_at() } else { s.logs_at() }
+    };
+    let found = at.aggregate(&r.search, from.saturating_mul(NS), to.saturating_mul(NS).saturating_sub(1), &r.by, &r.measure).map_err(|e| QueryError::Invalid(e.to_string()))?;
+    scanned.1 = scanned.1.saturating_add(found.rows_scanned);
+    if found.groups.len() > max_series {
+        return Err(QueryError::TooManySeries(found.groups.len(), max_series));
+    }
+    let names: Vec<String> = r.by.iter().map(|f| f.name().trim_start_matches('@').to_owned()).collect();
+    let mut out: Vec<Series> = Vec::with_capacity(found.groups.len().max(1));
+    for (values, v) in found.groups {
+        let mut tags: Vec<(String, String)> = names.iter().cloned().zip(values).collect();
+        tags.sort();
+        out.push(Series { tags, values: vec![v; grid.n], bounds: None, outlier: None });
     }
     if out.is_empty() && r.by.is_empty() && r.measure.counts() {
         out.push(Series { tags: Vec::new(), values: vec![0.0; grid.n], bounds: None, outlier: None });

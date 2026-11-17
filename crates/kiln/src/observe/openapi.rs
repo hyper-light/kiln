@@ -573,8 +573,25 @@ fn schemas() -> Map<String, Value> {
             (
                 "variables",
                 describe(
-                    array(object(&[("name", string()), ("data_source", string()), ("query", string())], &["name", "data_source", "query"])),
-                    "a formula monitor's queries by their names (data_source metrics), its query formula(\"query1 / query2\").rollup(\"avg\").last(\"5m\")",
+                    array(object(
+                        &[
+                            ("name", string()),
+                            ("data_source", one_of(&["metrics", "logs", "spans", "events"])),
+                            ("query", describe(string(), "data_source metrics: a metric query")),
+                            ("search", describe(object(&[("query", string())], &["query"]), "logs, spans, events: Datadog's log search syntax")),
+                            (
+                                "compute",
+                                describe(
+                                    object(&[("aggregation", one_of(&["count", "cardinality", "median", "pc75", "pc90", "pc95", "pc98", "pc99", "sum", "min", "max", "avg"])), ("metric", string()), ("interval", integer())], &["aggregation"]),
+                                    "logs, spans, events: the measure of a facet (metric, `@duration`), over the monitor's whole window",
+                                ),
+                            ),
+                            ("group_by", describe(array(object(&[("facet", string()), ("limit", integer()), ("sort", any())], &["facet"])), "logs, spans, events: its groups' facets (every group evaluated)")),
+                            ("indexes", array(string())),
+                        ],
+                        &["name", "data_source"],
+                    )),
+                    "a formula monitor's queries by their names, its query formula(\"query1 / query2\").rollup(\"avg\").last(\"5m\"): metric queries (data_source metrics), or Datadog's event platform queries of logs, spans and events (each measured over the whole window, then the formula)",
                 ),
             ),
             (

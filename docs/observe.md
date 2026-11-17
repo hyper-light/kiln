@@ -640,7 +640,11 @@ monitor's query, kiln leaves out only what has no meaning here:
 - *Telemetry Source* functions: they choose among Datadog's own sources of a metric.
 - Other products' monitor queries in Datadog's API (cost, data jobs, network path, database
   monitoring, CI pipelines and tests, audit, processes, `"check".over(…)` service checks): data kiln
-  does not keep (kiln's service checks are §9.4's).
+  does not keep (kiln's service checks are §9.4's); so too a formula monitor's variables of those
+  products (`data_source` `rum`, `ci_pipelines`, `ci_tests`, `audit`, `database_queries`,
+  `network`, `network_path`, `llm_observability`, `cloud_cost`, `datadog_usage`, the data jobs' and
+  data quality's) and its aggregate queries over Datadog's reference tables
+  (`aggregate_augmented_query`, `aggregate_filtered_query`).
 
 **Where kiln still reads Datadog's syntax otherwise.** Datadog refuses `autosmooth()` in monitors (its
 span, chosen anew, could make a monitor flap); kiln takes it. Datadog's limits kiln does not keep:
@@ -1875,14 +1879,41 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   to Datadog's rules for it: `hour_starts` (a minute) alone for an hour; `day_starts` (`04:00`),
   `month_starts` (1) and `timezone` for a day and a month; unless it says, at the hour, midnight UTC
   and the 1st. Metric monitors alone take them, and not `anomalies()` or `outliers()`, which read a
-  rolling window.
+  rolling window. A log monitor's window is rolling, its `.last()`: Datadog's configuration page
+  offers "Current hour" and "Current day" beside a log monitor too (its "daily log index quota"
+  example; "Current month ... is only available for metric monitors",
+  <https://docs.datadoghq.com/monitors/configuration.md>, "Cumulative time windows"), but Datadog
+  documents no text form of one for a log monitor's query: its API's "Logs Alert Query" is
+  `logs(query).index(index_name).rollup(rollup_method[, measure]).last(time_window)`, its
+  `time_window` "#m (between 1 and 2880), #h (between 1 and 48)"
+  (<https://docs.datadoghq.com/api/latest/monitors/create-a-monitor.md>), and the same of its event,
+  audit, CI and Error Tracking queries; its `scheduling_options.evaluation_window` says only where
+  a cumulative window starts ("The time of the day at which a one day cumulative evaluation window
+  starts"), not how a log monitor's query asks for one. So kiln takes none for logs, spans or
+  events.
 - **Formula monitors** are Datadog's (its API client's own
   `formula("query1 / query2").rollup("avg").last("5m") > threshold`): an expression of the
-  monitor's `options.variables` by their names, each a metric query (`data_source: metrics`; logs,
-  spans and events are their own monitors'), read over its `.last()` window (up to six of
-  Datadog's 730-hour months, its own examples' longest) by its `.rollup()` (`avg`, `sum`, `min`,
-  `max`, `pXX`; `avg` unless it says, a metric monitor's default "average"), as the metric monitor
-  of the expression is. A name in it not followed by `(` (a function's) is one of its variables, or
+  monitor's `options.variables` by their names, each a metric query (`data_source: metrics`), read
+  over its `.last()` window (up to six of Datadog's 730-hour months, its own examples' longest) by
+  its `.rollup()` (`avg`, `sum`, `min`, `max`, `pXX`; `avg` unless it says, a metric monitor's
+  default "average"), as the metric monitor of the expression is. Its variables may instead be
+  Datadog's event platform queries of logs, spans or events (`data_source` `logs`, `spans`,
+  `events`, as its API client's RUM and CI examples write theirs: `search.query`,
+  `compute.aggregation` (`count`, `cardinality`, `median`, `pc75` to `pc99`, `sum`, `min`, `max`,
+  `avg`) of `compute.metric`, `group_by`'s facets): each is kiln's records query
+  (`logs("<search>").rollup("<aggregation>", "<metric>").by("<facets>")`, §6), measured over the
+  whole window as a log monitor measures its one ("Datadog evaluates the number of logs over a
+  selected time frame", its log monitor page), then the formula, a value a group
+  (`formula("query1 / query2 * 100").last("15m") >= 5`: each service's error share), a window a
+  week at the most, as a log monitor's. A formula reads metrics or records, not both (one is read
+  bucket by bucket, the other whole). Its `.rollup()` aggregates that one value, so changes nothing;
+  a dynamic threshold is refused (Datadog's: "only supported on metric monitors"). Every group is
+  evaluated, as kiln's log monitors evaluate theirs: a `group_by`'s `limit` and `sort` (Datadog's
+  top values a facet, a cost cap) are kept as said and leave no group out; `compute.interval` (a
+  graph's step) is kept as said, the window measured whole; `indexes` are taken as a log monitor's
+  `.index()` is. Other data sources (RUM, CI pipelines and tests, audit, database queries, network,
+  network path, LLM observability) are data kiln does not keep, refused by name. A name in a
+  formula not followed by `(` (a function's) is one of its variables, or
   it's refused. Its threshold a number, or Datadog's dynamic threshold, `> threshold`: then
   `thresholds.critical_query` (and `critical_recovery_query` beside it) is a formula of the same
   variables (`formula("query1 / query2").rollup("p99").last("1w").multiplier(1.5)`), read with the

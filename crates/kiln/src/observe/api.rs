@@ -996,6 +996,8 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                     let (kind, watched, window_ms) = match &q.kind {
                         kiln_obs::monitor::Kind::Metric { query, window_ms, .. } => ("metric", json!({ "query": query }), window_ms),
                         kiln_obs::monitor::Kind::Change { query, window_ms, .. } => ("change", json!({ "query": query }), window_ms),
+                        // A formula of logs, spans or events: its queries, each measured over the whole window.
+                        kiln_obs::monitor::Kind::RecordsFormula { query, window_ms } => ("records-formula", json!({ "query": query }), window_ms),
                         kiln_obs::monitor::Kind::Logs { search, window_ms, .. } => ("logs", json!({ "search": search }), window_ms),
                         kiln_obs::monitor::Kind::Spans { search, window_ms, .. } => ("spans", json!({ "search": search }), window_ms),
                         // A forecast's window is ahead: `window_ms` its horizon.

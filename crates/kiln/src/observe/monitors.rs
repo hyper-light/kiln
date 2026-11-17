@@ -108,7 +108,8 @@ pub struct ThresholdWindows {
 /// start (`scheduling_options.evaluation_window`), an anomaly monitor's `threshold_windows`.
 pub fn query_of(query: &str, o: &Options) -> Result<monitor::Query, String> {
     let q = if query.trim_start().starts_with("formula(") {
-        let vars = o.variables.iter().map(Variable::metric).collect::<Result<Vec<(&str, &str)>, String>>()?;
+        let named = o.variables.iter().map(Variable::named).collect::<Result<Vec<(&str, String)>, String>>()?;
+        let vars: Vec<(&str, &str)> = named.iter().map(|(n, q)| (*n, q.as_str())).collect();
         monitor::parse_formula(query, &vars, o.thresholds.critical_query.as_deref(), o.thresholds.critical_recovery_query.as_deref()).map_err(|e| e.to_string())?
     } else {
         if !o.variables.is_empty() || o.thresholds.critical_query.is_some() || o.thresholds.critical_recovery_query.is_some() {
@@ -128,9 +129,9 @@ pub fn query_of(query: &str, o: &Options) -> Result<monitor::Query, String> {
     }
 }
 
-/// A formula monitor's query by its name (Datadog's `options.variables`): kiln's read metrics
-/// (`data_source: metrics`, its `query` a metric query); logs, spans and events are their own
-/// monitors' (`logs(…)`, `spans(…)`, `events(…)`).
+/// A formula monitor's query by its name (Datadog's `options.variables`): a metric query
+/// (`data_source: metrics`, its `query`), or a query of Datadog's event platform of logs, spans or
+/// events (`data_source` `logs`, `spans`, `events`: its `search.query`, `compute` and `group_by`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Variable {
@@ -138,16 +139,76 @@ pub struct Variable {
     pub data_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<EventSearch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute: Option<Compute>,
+    /// Its groups' facets. Each one's `limit` and `sort` (Datadog's top values a facet) are kept as
+    /// said, but kiln evaluates every group, as its log monitors do: none is left out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<GroupBy>,
+    /// Datadog's log indexes it reads, taken as a log monitor's `.index()` is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub indexes: Vec<String>,
+}
+
+/// An event platform query's search (Datadog's `search.query`, its log search syntax).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EventSearch {
+    pub query: String,
+}
+
+/// What an event platform query measures: Datadog's `compute.aggregation` (`count`,
+/// `cardinality`, `median`, `pc75` to `pc99`, `sum`, `min`, `max`, `avg`) of its `metric` (a facet,
+/// `@duration`). Its `interval` (a graph's step, ms) is kept as said: a monitor measures its whole
+/// window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Compute {
+    pub aggregation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<i64>,
+}
+
+/// One of an event platform query's groups: its facet (`service`, `@http.status_code`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupBy {
+    pub facet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<serde_json::Value>,
 }
 
 impl Variable {
-    /// Its name and its metric query.
-    fn metric(&self) -> Result<(&str, &str), String> {
-        match (self.data_source.as_str(), self.query.as_deref()) {
-            ("metrics", Some(q)) if !self.name.is_empty() => Ok((self.name.as_str(), q)),
-            ("metrics", _) => Err("a formula's variable: its name and its query (data_source metrics)".into()),
-            (other, _) => Err(format!("a formula's variable of data_source {other}: kiln's formulas read metrics (logs, spans and events: logs(…), spans(…) and events(…) monitors)")),
+    /// Its name and its query in kiln's language: a metric query as it is; one of logs, spans or
+    /// events as `kiln_obs::monitor::records_query` writes it.
+    fn named(&self) -> Result<(&str, String), String> {
+        use kiln_obs::query::parse::RecordSource;
+        if self.name.is_empty() {
+            return Err("a formula's variable: its name".into());
         }
+        let of = match self.data_source.as_str() {
+            "metrics" => return self.query.clone().map(|q| (self.name.as_str(), q)).ok_or_else(|| format!("{}: its query (data_source metrics)", self.name)),
+            "logs" => RecordSource::Logs,
+            "spans" => RecordSource::Spans,
+            "events" => RecordSource::Events,
+            other => return Err(format!("{}: data_source {other} (metrics, logs, spans or events: {other} is data kiln does not keep)", self.name)),
+        };
+        let compute = self.compute.as_ref().ok_or_else(|| format!("{}: its compute (an aggregation: count, cardinality, median, pc75, pc90, pc95, pc98, pc99, sum, min, max, avg)", self.name))?;
+        if let Some(i) = compute.interval.filter(|&i| i <= 0) {
+            return Err(format!("{}: compute.interval {i} (milliseconds, above 0)", self.name));
+        }
+        if let Some(g) = self.group_by.iter().find(|g| g.facet.trim().is_empty() || g.limit.is_some_and(|l| l < 1)) {
+            return Err(format!("{}: group_by {:?} (a facet; a limit of 1 or more)", self.name, g.facet));
+        }
+        let by: Vec<&str> = self.group_by.iter().map(|g| g.facet.trim()).collect();
+        let search = self.search.as_ref().map_or("", |s| s.query.as_str());
+        Ok((self.name.as_str(), kiln_obs::monitor::records_query(of, search, compute.aggregation.trim(), compute.metric.as_deref(), &by)))
     }
 }
 
@@ -360,6 +421,7 @@ impl Monitor {
         match &q.kind {
             monitor::Kind::Metric { window_ms, .. }
             | monitor::Kind::Change { window_ms, .. }
+            | monitor::Kind::RecordsFormula { window_ms, .. }
             | monitor::Kind::Logs { window_ms, .. }
             | monitor::Kind::Spans { window_ms, .. }
             | monitor::Kind::ErrorTracking { window_ms, .. } => *window_ms,
@@ -1099,6 +1161,42 @@ mod tests {
             created: 0,
             modified: 0,
         }
+    }
+
+    /// Datadog's formula monitor of its event platform (its API client's RUM and CI examples' shape:
+    /// `search`, `indexes`, `compute`, `group_by` with its `limit` and `sort`) of logs: compiled to
+    /// a formula of kiln's records queries, measured over the whole window, its variables kept as
+    /// said; a data source kiln does not keep, a variable without its compute or with a group of no
+    /// facet, refused.
+    #[test]
+    fn a_formula_monitor_of_logs_reads_records_and_other_products_are_refused() -> anyhow::Result<()> {
+        let v = |name: &str, data_source: &str, search: &str| -> anyhow::Result<Variable> {
+            Ok(serde_json::from_value(serde_json::json!({
+                "data_source": data_source, "name": name, "search": { "query": search }, "indexes": ["*"],
+                "compute": { "aggregation": "count" }, "group_by": [{ "facet": "service", "limit": 10, "sort": { "aggregation": "count", "order": "desc" } }],
+            }))?)
+        };
+        let m = |variables: Vec<Variable>| Monitor { query: r#"formula("query1 / query2 * 100").last("15m") >= 5"#.into(), options: Options { variables, ..Options::default() }, ..metric_monitor() };
+        let logs = m(vec![v("query1", "logs", "status:error")?, v("query2", "logs", "")?]);
+        match logs.compiled() {
+            Ok(Compiled::Query(q, _)) => anyhow::ensure!(
+                matches!(&q.kind, monitor::Kind::RecordsFormula { query, window_ms: 900_000 } if query == r#"(logs("status:error").rollup("count").by("service")) / (logs("").rollup("count").by("service")) * 100"#),
+                "{q:?}"
+            ),
+            other => anyhow::bail!("{other:?}"),
+        }
+        let kept = serde_json::to_value(&logs.options.variables)?;
+        anyhow::ensure!(kept.pointer("/0/group_by/0/sort/order") == Some(&serde_json::json!("desc")) && kept.pointer("/0/indexes/0") == Some(&serde_json::json!("*")), "{kept}");
+        let mut no_compute = v("query2", "logs", "")?;
+        no_compute.compute = None;
+        let mut no_facet = v("query2", "spans", "")?;
+        if let Some(g) = no_facet.group_by.first_mut() {
+            g.facet = " ".into();
+        }
+        for bad in [vec![v("query1", "rum", "")?, v("query2", "rum", "")?], vec![v("query1", "logs", "")?, no_compute], vec![v("query1", "spans", "")?, no_facet]] {
+            anyhow::ensure!(m(bad.clone()).compiled().is_err(), "{bad:?} taken");
+        }
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: the next evaluation is due when the first monitor's is (one not evaluated yet:
