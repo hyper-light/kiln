@@ -14,8 +14,9 @@
 //! - **Where each build is** is kept in kiln.db's `prebuilds`, a row for each runner and harness ([`State`]): `queued` as
 //!   a save asks, or `failed` where its secrets can't be read; then `building`, `done` (its image, pinned) or `failed`
 //!   (Shards' words, or kiln's) as its runner says ([`Said`]). A save writes its rows anew; a runner's word moves the row
-//!   of the version it built alone, and only forward ([`State::follows`]). Each change is told to the sockets of whoever
-//!   hears of the Agentfile (`AgentfileChange::builds`).
+//!   of the version it built alone, and only forward ([`State::follows`]). Each change of its rows is told once, as a
+//!   frame of its own (`ServerEvent::AgentfileBuilds`), to the sockets of whoever hears of the Agentfile: the save's own
+//!   frame (`ServerEvent::Agentfile`) tells its version.
 //! - **Built again.** Whoever reaches it asks one runner's builds of it again (`agentfiles.rebuild`, [`rebuild`]) as a
 //!   save asks them, at its version now: each that ended, done or failed, is `queued` again ([`State::ended`]). Refused,
 //!   nothing written ([`Refusal`]), where that runner builds none of its person's Agentfiles or its kiln builds nothing
@@ -35,7 +36,7 @@ use crate::instances::PeerId;
 use crate::proto::{AgentMsg, ServerMsg, feature};
 use crate::sandbox::image::Source;
 use crate::secrets::mine::BuildSecret;
-use crate::wire::events::{AgentfileChange, ServerEvent};
+use crate::wire::events::{AgentfileBuilds, ServerEvent};
 
 /// A build asked of a runner (`ServerMsg::Prebuild`): Agentfile `agentfile`'s `text` at `version`, for kiln's harness
 /// `harness`, given `secrets`.
@@ -338,14 +339,10 @@ async fn send(hub: &Hub, runner: &str, peer: PeerId, ask: &Ask) {
 
 /// Tells the sockets of whoever hears of Agentfile `id` (its owner's, and those of whoever reaches everyone's) that its
 /// builds changed.
-fn changed(hub: &Hub, owner: &str, id: &str, name: &str, version: i64) {
-    hub.emit(&ServerEvent::Agentfile(AgentfileChange {
+fn changed(hub: &Hub, owner: &str, id: &str) {
+    hub.emit(&ServerEvent::AgentfileBuilds(AgentfileBuilds {
         owner: owner.to_owned(),
         id: id.to_owned(),
-        name: name.to_owned(),
-        version,
-        deleted: false,
-        builds: true,
     }));
 }
 
@@ -358,9 +355,20 @@ pub async fn queue(hub: &Hub, id: &str) {
     }
 }
 
+/// What [`queue_in`]'s write found.
+enum Queued {
+    /// The Agentfile was saved again before it: the later save's rows stand.
+    SavedOver,
+    /// It had no rows and has none: nothing changed to tell, nothing to send.
+    Unchanged,
+    /// Its rows were written anew.
+    Written,
+}
+
 /// [`queue`]'s work: a row for each of its person's runners ([`runners_of`]) and each harness its sessions run
 /// ([`harnesses`]), `queued`, or `failed` saying why where its secrets can't be read. A save that finds the Agentfile
-/// changed again before it writes leaves the rows to the later save's.
+/// changed again before it writes leaves the rows to the later save's. Whoever hears of the Agentfile is told its builds
+/// changed only where its rows did, as [`heard`] tells a runner's word.
 async fn queue_in(hub: &Hub, id: &str) -> anyhow::Result<()> {
     let Some(kept) = current(hub, id).await? else {
         return Ok(());
@@ -379,21 +387,22 @@ async fn queue_in(hub: &Hub, id: &str) -> anyhow::Result<()> {
             let tx = crate::store::tx(c)?;
             let at: Option<i64> = tx.query_row("SELECT version FROM agentfiles WHERE id = ?1", params![i], |r| r.get(0)).optional()?;
             if at != Some(version) {
-                return Ok(false);
+                return Ok(Queued::SavedOver);
             }
-            tx.execute("DELETE FROM prebuilds WHERE agentfile_id = ?1", params![i])?;
+            let gone = tx.execute("DELETE FROM prebuilds WHERE agentfile_id = ?1", params![i])?;
             for (runner, harness) in &rows {
                 tx.execute("INSERT INTO prebuilds (agentfile_id, runner, harness, version, state, why, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![i, runner, harness, version, state.as_str(), why, now])?;
             }
             tx.commit()?;
-            Ok(true)
+            Ok(if gone == 0 && rows.is_empty() { Queued::Unchanged } else { Queued::Written })
         })
         .await?;
-    if !written {
-        return Ok(());
+    match written {
+        Queued::SavedOver | Queued::Unchanged => return Ok(()),
+        Queued::Written => {}
     }
     let kept = &asking.kept;
-    changed(hub, &kept.owner, id, &kept.name, kept.version);
+    changed(hub, &kept.owner, id);
     for runner in &runners {
         asking.send_to(hub, runner, &asking.harnesses).await;
     }
@@ -505,7 +514,7 @@ pub async fn heard(hub: &Hub, runner: &str, json: &str) {
                 all: true,
             };
             if let Ok(a) = super::brief(hub, &anyone, &said.agentfile).await {
-                changed(hub, &a.owner, &a.id, &a.name, a.version);
+                changed(hub, &a.owner, &a.id);
             }
         }
         Ok(false) => {}
@@ -662,8 +671,7 @@ pub async fn rebuild(
     match written {
         Err(underway) => return Ok(Err(underway)),
         Ok(true) => {
-            let kept = &asking.kept;
-            changed(hub, &kept.owner, id, &kept.name, kept.version);
+            changed(hub, &asking.kept.owner, id);
             asking.send_to(hub, runner, &asked).await;
         }
         Ok(false) => {}

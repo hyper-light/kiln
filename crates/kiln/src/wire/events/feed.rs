@@ -113,8 +113,8 @@ impl Meta {
         let person = match kind.as_str() {
             "inbox" => v.get("person"),
             "attention" => v.get("principal"),
-            // An Agentfile's owner (`crate::agentfiles`).
-            "agentfile" => v.get("owner"),
+            // An Agentfile's owner (`crate::agentfiles`), of a change or of its builds.
+            "agentfile" | "agentfile_builds" => v.get("owner"),
             // A split's opener (`crate::ci::experiments`): an experiment of options names none.
             "experiment" => v.pointer("/experiment/opener"),
             _ => None,
