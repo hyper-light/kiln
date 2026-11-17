@@ -96,3 +96,14 @@ test("p7_2 a variant wins a measure only where its whole interval is below every
   assert.equal(winsMeasure([small, large, {}], 0, "peak_gib"), false);
   assert.equal(winsMeasure([small, {}], 1, "peak_gib"), false);
 });
+
+test("p7_2 a measure some variants lack has the axis of those that have it, and no winner", () => {
+  // A host's sessions: failures alone, no warm start or peak.
+  const host = { measures: { failed_pct: [0, 1, 9] as Interval } };
+  assert.deepEqual(measureAxis([small, host], "warm_ms"), [208, 223]);
+  assert.deepEqual(measureAxis([small, host], "failed_pct"), [0, 20]);
+  assert.deepEqual([winsMeasure([small, host], 0, "warm_ms"), winsMeasure([small, host], 1, "warm_ms")], [false, false]);
+  // Failures, which both have: [0, 9] overlaps [6, 20]; [0, 4] clears it.
+  assert.equal(winsMeasure([small, host], 1, "failed_pct"), false);
+  assert.equal(winsMeasure([small, { measures: { failed_pct: [0, 1, 4] as Interval } }], 1, "failed_pct"), true);
+});

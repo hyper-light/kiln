@@ -122,9 +122,10 @@ export interface Variant {
   current: boolean;
   /**
    * What its sessions measure: the median of its warm starts (ms) and of its microVMs' peak memory (GiB), and the
-   * percent of its sessions that failed; none until its sessions bound all three, and nothing is shown for it until then.
+   * percent of its sessions that failed, each once its sessions bound it (a host's have no warm start or peak); none
+   * until they bound one, and nothing is shown for it until then.
    */
-  measures?: Record<Measure, Interval>;
+  measures?: Partial<Record<Measure, Interval>>;
   /** Each measure's middle at the end of each day (UTC), oldest first, today's last, every variant's over the same days; a measure none of its sessions has yet left out. */
   trend?: Partial<Record<Measure, number[]>>;
 }

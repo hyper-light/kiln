@@ -30,9 +30,10 @@
  *   DELETE …/:e                                        {deleted: true}
  *   POST   /api/mock/agentdef-experiments              the seeded experiments again (the browser tests start from them)
  * Each change answers {experiment}. Its seeded variants' `measures` and `trend` stand in for what their sessions
- * measured (crates/kiln/src/agentdefs/experiments/measures.rs): one made here has none, as the server's has none until
- * its sessions bound all three. Each criterion's `values` stand in for kiln's monitors' evaluation of its query, a
- * variant's measure's middle where the query reads one of kiln's session metrics, and none for another.
+ * measured (crates/kiln/src/agentdefs/experiments/measures.rs), each measure once they bound it: one made here has none,
+ * as the server's has none until its sessions bound one, and "v9 image"'s sessions never started warm, so it has no warm
+ * start. Each criterion's `values` stand in for kiln's monitors' evaluation of its query, a variant's measure's middle
+ * where the query reads one of kiln's session metrics, and none for another.
  *
  * Errors are `{error}`, with the server's codes and words. Times are Unix seconds, an experiment's Unix ms.
  *
@@ -272,9 +273,9 @@ interface Variant {
   weight: number;
   /** How many of its draws' sessions started. */
   sessions: number;
-  /** What its sessions measured, the seeded variants' alone. */
-  measures?: { warm_ms: Interval; peak_gib: Interval; failed_pct: Interval };
-  trend?: { warm_ms: number[]; peak_gib: number[]; failed_pct: number[] };
+  /** What its sessions measured, each once they bound it, the seeded variants' alone. */
+  measures?: { warm_ms?: Interval; peak_gib?: Interval; failed_pct?: Interval };
+  trend?: { warm_ms?: number[]; peak_gib?: number[]; failed_pct?: number[] };
 }
 interface Criterion {
   id: string;
@@ -326,6 +327,8 @@ const variant = (
     trend: { warm_ms: trendOf(warm[1], warm[2] - warm[0], seed), peak_gib: trendOf(peak[1], peak[2] - peak[0], seed + 1), failed_pct: trendOf(failed[1], failed[2] - failed[0], seed + 2) },
   };
 };
+/** `v` as one none of whose sessions a warm host started: no warm start to measure, its other measures as they were. */
+const unwarmed = (v: Variant): Variant => ({ ...v, measures: { ...v.measures, warm_ms: undefined }, trend: { ...v.trend, warm_ms: undefined } });
 /** The seeded variants' Agentfiles by name, for the microVMs made of them (microvms.ts keys its images by name). */
 const AGENTFILE_NAMES = new Map(["rust-dev", "rust-dev-v9", "docs-site"].map((n) => [agentfile(n), n]));
 const DAY = 86_400_000;
@@ -377,7 +380,7 @@ function seededExperiments(): Experiment[] {
       criteria: [criterion("reviewer-image", "failed", "Failed sessions", "failed_pct", "<", 8), criterion("reviewer-image", "warm", "Warm start", "warm_ms", "<=", 260)],
       variants: [
         variant("b10c", "rust-dev", 2, 4, 70, 22, [206, 214, 222], [2.2, 2.27, 2.33], [4, 9, 16], "v8 image"),
-        variant("b20d", "rust-dev-v9", 2, 4, 30, 9, [198, 207, 219], [2.1, 2.18, 2.27], [1, 5, 14], "v9 image"),
+        unwarmed(variant("b20d", "rust-dev-v9", 2, 4, 30, 9, [198, 207, 219], [2.1, 2.18, 2.27], [1, 5, 14], "v9 image")),
       ],
     },
     {
@@ -514,7 +517,7 @@ function valuesOf(c: Criterion, vs: Variant[]) {
   const k = measureOf(c.query);
   const out: Record<string, { value: number; passes: boolean }> = {};
   for (const v of vs) {
-    const value = k ? v.measures?.[k][1] : undefined;
+    const value = k ? v.measures?.[k]?.[1] : undefined;
     if (value !== undefined) out[v.id] = { value, passes: passes(c.op, value, c.bound) };
   }
   return Object.keys(out).length ? out : undefined;

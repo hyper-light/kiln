@@ -180,6 +180,14 @@ test("p7_2 each variant's measures are 95% intervals on axes its variants share,
   await expect(crit("Queue").locator(".df-note")).toHaveText("No values yet.");
   await expect(crit("Queue").locator(".df-trend")).toHaveCount(0);
   await expect(crit("Warm start").locator(".df-trend")).toHaveCount(1);
+  // A variant no warm host started has no warm start: "—" in its place, its other measures shown, no value of a query
+  // over it, and no winner of it.
+  const image = under(line(card(body, "reviewer"), "rust-dev v9's image"));
+  const v9 = image.locator("li.df-vline", { hasText: "v9 image" });
+  await expect(v9.locator(".df-measure-v")).toHaveText(["—", "2.18G", "5%"]);
+  await expect(v9.locator(".df-measure[data-none]")).toHaveCount(1);
+  await expect(image.locator(".df-measure[data-win]")).toHaveCount(0);
+  await expect(image.locator(".df-crit", { has: page.locator(".df-crit-name", { hasText: /^Warm start$/ }) }).locator(".df-crit-val")).toHaveText(["214ms passes · best"]);
   // As the server answered them.
   const kept = (await listed(page, reviewer)).find((e) => e.id === "reviewer-size");
   expect(kept?.criteria.map((c) => c.values)).toEqual([

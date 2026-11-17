@@ -634,6 +634,13 @@ button.df-crumb:hover {
 .df-measure[data-win] > .df-measure-v {
   color: #bfdccf;
 }
+/* A measure its sessions haven't bounded: "—" in its place, no axis drawn. */
+.df-measure[data-none] > .df-measure-v {
+  color: #7b7e88;
+}
+.df-measure[data-none] > .df-whisk {
+  visibility: hidden;
+}
 .df-whisk {
   position: relative;
   height: 14px;

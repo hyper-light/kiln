@@ -86,10 +86,13 @@ export function rebalance(ws: readonly number[], i: number, w: number): number[]
 /**
  * Measure `k`'s axis across an experiment's variants (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.2): from the lowest
  * of their 95% intervals' lows to the highest of their highs, so every variant's interval is drawn to the same scale;
- * none where no variant has measures.
+ * none where no variant has it.
  */
 export function measureAxis(vs: readonly Pick<Variant, "measures">[], k: Measure): [number, number] | null {
-  const ivs = vs.flatMap((v) => (v.measures ? [v.measures[k]] : []));
+  const ivs = vs.flatMap((v) => {
+    const iv = v.measures?.[k];
+    return iv ? [iv] : [];
+  });
   if (ivs.length === 0) return null;
   return [Math.min(...ivs.map((iv) => iv[0])), Math.max(...ivs.map((iv) => iv[2]))];
 }
@@ -101,10 +104,15 @@ export function onAxis(x: number, [lo, hi]: readonly [number, number]): number {
 
 /**
  * Whether variant `i` clearly wins measure `k`: its whole 95% interval below every other variant's, so none overlaps
- * it (each measure is better lower: a faster warm start, less memory, fewer failures); only where every variant has
- * measures.
+ * it (each measure is better lower: a faster warm start, less memory, fewer failures); only where every variant has it.
  */
 export function winsMeasure(vs: readonly Pick<Variant, "measures">[], i: number, k: Measure): boolean {
-  const m = vs[i]?.measures;
-  return m !== undefined && vs.every((o, j) => j === i || (o.measures !== undefined && m[k][2] < o.measures[k][0]));
+  const m = vs[i]?.measures?.[k];
+  return (
+    m !== undefined &&
+    vs.every((o, j) => {
+      const x = o.measures?.[k];
+      return j === i || (x !== undefined && m[2] < x[0]);
+    })
+  );
 }

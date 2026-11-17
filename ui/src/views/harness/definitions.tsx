@@ -959,7 +959,7 @@ function VariantLine({
       {m && (
         <span className="df-vline-measures">
           {MEASURES.map((k) => (
-            <Measure key={k} k={k} iv={m[k]} axis={measureAxis(all, k) ?? [m[k][0], m[k][2]]} tone={tone} win={winsMeasure(all, i, k)} />
+            <Measure key={k} k={k} iv={m[k]} axis={measureAxis(all, k)} tone={tone} win={winsMeasure(all, i, k)} />
           ))}
         </span>
       )}
@@ -1340,10 +1340,18 @@ function SetupNodes({
 /**
  * A measure of a variant (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.2): its 95% interval a bar along `axis`, the
  * one its experiment's variants share, its middle a tick, in its swatch's tone; its middle beside, and a check where
- * its interval clears every other variant's.
+ * its interval clears every other variant's. One its sessions haven't bounded is "—", in its place.
  */
-function Measure({ k, iv, axis, tone, win }: { k: Measure; iv: Interval; axis: [number, number]; tone: string; win: boolean }) {
+function Measure({ k, iv, axis, tone, win }: { k: Measure; iv?: Interval; axis: [number, number] | null; tone: string; win: boolean }) {
   const { word, label, mid, f } = MEASURE[k];
+  if (!iv || !axis)
+    return (
+      <span className="df-measure" data-none="" title={`${word}: no interval`}>
+        <span className="df-measure-k">{label}</span>
+        <span className="df-whisk" aria-hidden="true" />
+        <span className="df-measure-v">—</span>
+      </span>
+    );
   const [low, high] = [onAxis(iv[0], axis), onAxis(iv[2], axis)];
   return (
     <span className="df-measure" data-win={win || undefined} title={`${word}: ${mid} ${f(iv[1])}, 95% ${f(iv[0])}–${f(iv[2])}${win ? ", clear of every other variant's" : ""}`}>
