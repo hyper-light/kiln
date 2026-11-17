@@ -2412,8 +2412,8 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
 /// stand-in under each harness's name and no real harness: a real one is never started here.
 #[cfg(unix)]
 pub fn host_fixture(dir: &Path) -> anyhow::Result<Fixture> {
-    let (path, shell) = stub_host_env(dir)?;
-    let f = up(dir, "box", &[("PATH", &path), ("SHELL", &shell)])?;
+    let stub = stub_host_env(dir)?;
+    let f = up(dir, "box", &stub.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
     // Its sessions as processes on this host: a runner of a kiln carrying Shards runs them in microVMs
     // unless its engine is set to host (kiln plan 01a1dd2e…, P2.3), as here. ROOT's runner
     // (`VM_E2E_SERVER`) is left as ROOT set it.
@@ -2424,10 +2424,11 @@ pub fn host_fixture(dir: &Path) -> anyhow::Result<Fixture> {
     Ok(f)
 }
 
-/// A runner's `PATH` and login shell with the stand-in under each harness's name and no real harness,
-/// under `dir`: [`host_fixture`]'s, and a second runner's beside it.
+/// A runner's environment with the stand-in under each harness's name and no real harness, under `dir`:
+/// [`host_fixture`]'s, and a second runner's beside it. Its `PATH`, and on Unix its login shell, whose PATH
+/// kiln searches too (`Kind::search_path`).
 #[cfg(unix)]
-pub fn stub_host_env(dir: &Path) -> anyhow::Result<(String, String)> {
+pub fn stub_host_env(dir: &Path) -> anyhow::Result<Vec<(&'static str, String)>> {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = dir.join("bin");
     if !bin.exists() {
@@ -2440,7 +2441,40 @@ pub fn stub_host_env(dir: &Path) -> anyhow::Result<(String, String)> {
     let shell = dir.join("login-shell");
     std::fs::write(&shell, format!("#!/bin/sh\nPATH='{path}'\nexport PATH\nwhile [ $# -gt 1 ]; do shift; done\nexec /bin/sh -c \"$1\"\n"))?;
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))?;
-    Ok((path, shell.to_string_lossy().into_owned()))
+    Ok(vec![("PATH", path), ("SHELL", shell.to_string_lossy().into_owned())])
+}
+
+/// [`stub_host_env`] on Windows: its `PATH` alone, as kiln asks no login shell there (`reach::serve`'s
+/// `ask_login_shell`). Each harness is `<program>.cmd`, which kiln finds by `PATHEXT` as it finds npm's
+/// (`kiln::os::which`) and starts through cmd.exe: the stand-in, a Python script, run by the Python found
+/// here, its dialect named as a microVM's image names it (`VM_STUB_PROTOCOL`, [`stub_agentfile`]), since the
+/// name it is started by here is the script's, not the harness's.
+#[cfg(windows)]
+pub fn stub_host_env(dir: &Path) -> anyhow::Result<Vec<(&'static str, String)>> {
+    let bin = dir.join("bin");
+    if !bin.exists() {
+        std::fs::create_dir_all(&bin)?;
+        let python = stub_python()?;
+        for k in kiln::harness::kinds::Kind::all() {
+            let shim = format!("@set \"VM_STUB_PROTOCOL={}\"\r\n@\"{}\" \"{}\" %*\r\n", k.program, python.display(), stub_path().display());
+            std::fs::write(bin.join(format!("{}.cmd", k.program)), shim)?;
+        }
+    }
+    Ok(vec![("PATH", format!("{};{}", bin.display(), common::agents::path_without_harnesses(dir)?))])
+}
+
+/// The Python 3 the stand-in runs on, by its own word (`sys.executable`): the launcher's (`py -3`), else
+/// `python`'s or `python3`'s. The Store's `python.exe` alias, which only offers to install one, says none.
+#[cfg(windows)]
+fn stub_python() -> anyhow::Result<PathBuf> {
+    for (program, first) in [("py", Some("-3")), ("python", None), ("python3", None)] {
+        let Ok(out) = std::process::Command::new(program).args(first).args(["-c", "import sys; print(sys.executable)"]).output() else { continue };
+        let exe = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if out.status.success() && !exe.is_empty() {
+            return Ok(PathBuf::from(exe));
+        }
+    }
+    anyhow::bail!("the stand-in harness is a Python script, and no Python 3 answers here (py -3, python, python3)")
 }
 
 /// Runner `machine`'s engine as kiln says it (`GET /api/runners/:name/engine`; kiln plan 01a1dd2e…, P2.3).
