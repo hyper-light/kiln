@@ -35,7 +35,7 @@ Then where it ran:
 
 | Acceptance | Check | Read from |
 |---|---|---|
-| the negotiated suite is `TLS13_AES_256_GCM_SHA384` on every link, both ends | `check_all_links`: every link of `REQUIRED_LINKS` (`server-runner`, `agent-control`, `mcp`) read, and every link read at both ends | `VM_E2E_LINKS` (below); a required link not read is a failure |
+| the negotiated suite is `TLS13_AES_256_GCM_SHA384` on every link, both ends | `check_all_links`: every link of `REQUIRED_LINKS` (`server-runner`, `agent-control`, `mcp`) read, and every link read at both ends; checked after every other check, and failed by a gap's name where kiln's word on the session names one (`check_links`, `LinkGap`: "Hex reports no agent-control link") | `VM_E2E_LINKS` (below); a required link not read is a failure |
 | nothing ran outside the microVMs | `harnesses_on_host`: no harness process in the session's process trees on the host (the runner's, and `VM_E2E_HOST_ROOTS`') at any of the drive's looks; `check_in_guest`: the kernel the harness's own shell said is Linux, and on a Linux host a boot other than the host's (a container shares the host's); `check_no_host_pid` and `check_starts`: kiln says the session runs in a microVM holding no process of the host, and every start of its harness was in one, so a harness that ran on the host and ended between two looks is found | `ps` (Linux, macOS) or CIM's `Win32_Process` (Windows); the harness's `WHERE <uname -s> <boot id>` line; the session's `/runs` and `/starts` (kiln plan step 17), read just before it is stopped and after its resumed turn |
 | the project at its host path | `check_project_path`: kiln's `cwd` is the host path, and the harness's own `CWD <path>` is that path as its guest sees it (the same path on Linux and macOS; Shards D235's WSL form on Windows, `C:\X` at `/mnt/c/X`); `check_written`: the file the harness wrote in its project (`{file}`, its name its words) is at the host path | `GET /api/harness/sessions/<id>`, the timeline, the host's file |
 | the harness reaches its provider | a real task's turns end with ROOT's marker, which only the model's answer says | the timeline |
@@ -89,8 +89,8 @@ for a run (`PUT /api/runners/<machine>/headroom` with `{"enabled": false}`) and 
 | Name | Client end | Server end | Owed by |
 |---|---|---|---|
 | `server-runner` | the runner's own view of its link to the server | the server's view of that runner's connection | kiln plan 01a1d2c1ef09707daafe3fe9b77754e6 step 2 (AES-256-GCM alone there, each end on kiln's API, read from step 16's `Endpoint::negotiated`) |
-| `agent-control` | Shards' `control::controller` in kiln | the agent-control endpoint's own report | Shards step 11 (on its control lane) and kiln's step 17 (on the session) |
-| `mcp` | the harness's client | kiln's MCP as the microVM reaches it | Decided (2026-11-13, Shards D254): kiln's MCP rides the agent-control link as its own `mcp` lane (step 11 with step 18), so no network grant names it. Until that lane is built and the session's link report names it, this link has no suite and the run fails, saying so |
+| `agent-control` | Shards' `control::controller` in kiln | the agent-control endpoint's own report | Hex: a `Runtime` call reporting a box's agent-control link, then kiln's `HexRun::link` mapped to it (owed item 1). Until then kiln reports no `/runs/control`, and the drive fails the links by that name (`vm_e2e::LinkGap`) |
+| `mcp` | the harness's client | kiln's MCP as the microVM reaches it | Decided (2026-11-13, Shards D254) and built: kiln's MCP rides the agent-control link as its own `mcp:<member>` lane (step 11 with step 18), so no network grant names it. Its suite and its lane are read from the agent-control link's report, owed as that link's are |
 
 No `kiln-hex` link (2026-11-16): the plan drew one, kiln to a Hex node, but kiln's runner holds Hex's image
 runtime in its own process (`sandbox::held_in`, `hex_node::images::ImageRuntime::new`; docs/isolation.md,
@@ -178,8 +178,14 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    Shards slice, as its agent names them: `/runs/in`, `/runs/vm`, `/runs/image`, `/runs/host_pid`,
    `/runs/control/{controller,endpoint}/{suite,group}`, `/runs/control/lanes` and `/starts`. Read from
    `GET /api/harness/sessions/<id>`, through `VM_E2E_LINKS`' `agent-control` entry, and by
-   `check_no_host_pid` and `check_starts`. The link's ends say nothing until it carries the stdio
-   (Shards' control link and kiln's re-vendor). Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
+   `check_no_host_pid` and `check_starts`. The link's ends and lanes say nothing until Hex reports the
+   link (2026-11-16): kiln's runner holds its microVMs through Hex's image runtime, whose `Runtime` (Hex
+   1969a423e, as kiln vendors it) signals the member and takes kiln's MCP lane over that link but has no
+   call that reports it, so `HexRun::link` answers none and `/runs/control` is absent. Owed: the Hex
+   lead's `Runtime` call answering both ends' suite and group and the link's lanes, `mcp:<member>` among
+   them (on a Shards that lists them); then kiln re-vendors Hex and maps `HexRun::link` to it. Until then
+   `in_microvm` checks the links after every other check and fails them by that name (`vm_e2e::LinkGap`,
+   gaps.json's `link_report` gaps). Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
    `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch
    (`p/s17-launch-seam-v1`, 64dfab21f) reads its process's `host_pid()` inside (`session.rs` 4328 and
    4724) and says none of it; Shards' `control::Controller` (`crates/remote/src/control/drive.rs`)
@@ -269,7 +275,7 @@ its cited reason (plan 01a1d2c16eb074f19cf7ae7f1025c0be, steps 2 and 7).
 |---|---|
 | `vm_e2e/step35.rs` | `step35::checks` (gaps.json held to kiln's code and its sources, the cite rule, the vendor-CLI rule), `step35::host` (the eight harnesses step 34 doesn't drive, through kiln on the host, the stand-in behind each name), `step35::rest` (the ten in microVMs through REST: start, steer, interrupt, stop, resume, kiln's MCP from inside, an agent started there, from kiln's Agentfile and from a person's own; and `s35_two_antigravity_agents_of_one_person_each_reach_kilns_mcp_as_themselves`: two Antigravity agents of one person on one runner, side by side, whose one agy config names no session, each reaching kiln's MCP as itself: the stand-in's `MCP_AS <agent>`, whom kiln's answer to its `initialize` named, or a real agy's calls of kiln's tools in the runner's log under its own session) |
 | `vm_e2e/mcp.rs` | `step35::mcp`: the ten in microVMs through kiln's MCP server: `agents_start` naming the Agentfile, `agents_send` steering, `agents_interrupt`, `agents_stop`, `agents_start` with `resume`; each as its own tool (`s35_every_harness_in_a_microvm_through_kilns_mcp_tools`), and in code mode, a `code_run` program calling `kiln.agents.start` and the rest (`s35_every_harness_in_a_microvm_through_code_mode`) |
-| `vm_e2e/gaps.json` | each harness's flags (`linux_build`, `mcp`, `mcp_in_microvm`, `resume`, `ui_pick_up`), each gap with why and its cites, caveats, and the sources its reason rests on; kiln's code cited by the text it holds (`path#text`), recorded evidence by its line |
+| `vm_e2e/gaps.json` | each harness's flags (`linux_build`, `mcp`, `mcp_in_microvm`, `resume`, `ui_pick_up`, `link_report`), each gap with why, where (the host OSes: macOS arm64 on HVF, Linux x86_64 on KVM, Windows x86_64 on WHP) and its cites, caveats, and the sources its reason rests on; kiln's code cited by the text it holds (`path#text`), recorded evidence by its line |
 | `ui/e2e/vm-harnesses.spec.ts` | against the mock: kiln's ten Agentfiles listed read-only, Claude Code and Codex started in a microVM from kiln's (step 34's), Codex from a person's own, a Codex conversation kept in a person's microVM volume picked up from the composer's past sessions in a microVM (one of the machine's own as a process); against ROOT's server: each harness from kiln's Agentfile and a person's own, started, steered, its turn stopped, ended, and picked up again from the composer where `ui_pick_up` holds |
 
 A vendor's own CLI takes ROOT's task alone: from kiln's Agentfile, and from a person's own made from

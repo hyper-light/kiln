@@ -1512,7 +1512,7 @@ What this page describes, once an isolated agent's start goes through:
 | Driving it: sending, steering, interrupting, stopping, models, modes, commands, questions, state, usage limits | Works: kiln speaks the same harness protocol over the microVM's stdio. |
 | Said at once when it can't sign in or reach its provider (State's `trouble`) | Works, as for every agent. |
 | The Changes tab, Commits, Compare, whose a file is, a subagent's edits, change requests | Works: the project is at its own path inside, so kiln reads its diffs, HEAD and checkpoints where it always does. |
-| Continuing a past session | Works: kiln reads its transcript from your volume on the machine, and the machine's past sessions name the Agentfile it ran in. |
+| Continuing a past session | Works for Claude Code, Codex and Devin: kiln reads their conversations from your volume on the machine, and the machine's past sessions name the Agentfile each ran in. The other harnesses' aren't listed: each goes on by its conversation's id (below, "Each harness, in a microVM of its own"). |
 | Its harness's settings, sign-in and memories | Kept in your volume, yours alone; no credential leaves it. |
 | Agents that run agents, and kiln's other tools | Works: through kiln's MCP, which comes over the link kiln drives the harness by (its own MCP lane, through the bridge `/run/shards/mcp` each harness names), never the network, on every OS, answered by the runner in its own process, each connection as its own agent's; what it starts is isolated too. Pi takes no MCP server from kiln. |
 | Skills kiln installs, and kiln's own | Its plugin folders are plugged in read-only at their own paths as it starts. |
@@ -1527,6 +1527,35 @@ What this page describes, once an isolated agent's start goes through:
 | Live overrides: ports, egress, networks, volumes (above) | Taken by its microVM live where its runtime takes them (`Holds::live`): through Hex once its wire calls land (P6b.3); until then refused, each saying why in `state.overrides`, its harness's folders and kiln's scope taken all the same. |
 | Components swapped in (below) | Laid by its microVM where its runtime lays them (`Holds::components`, and `Holds::swaps` for its harness's own): through Hex once its wire calls land (P6c.2); until then refused, saying why, its image's own running on. |
 | The machine's own tools (Xcode, MSVC) | Can't: refused, saying which and why (above). |
+
+### Each harness, in a microVM of its own
+
+Each of the ten harnesses kiln ships starts in a microVM from kiln's Agentfile or from one of yours, and is
+steered, interrupted, stopped and taken up again there as on its machine. That holds alike on a Mac with Apple
+silicon, on Linux, and on Windows on x86-64: every Agentfile kiln ships builds for arm64 and amd64, and a microVM
+is of its machine's architecture. What differs is the harness's own:
+
+| Harness | A message steered into its turn | Picked up from the composer's past sessions | kiln's MCP from inside, and the agents it starts |
+|---|---|---|---|
+| Claude Code | taken at once | yes | yes |
+| Codex | taken at once | yes | yes |
+| Gemini CLI | waits for its turn's end | no: it goes on by its conversation's id (below) | yes |
+| opencode | waits for its turn's end | no | yes |
+| Goose | waits for its turn's end | no | yes |
+| Amp | waits for its turn's end | no | yes |
+| Devin | taken at once | yes | yes |
+| Antigravity CLI | waits for its turn's end; a stop ends its process, which kiln starts again on the same conversation, and a tool that needs approval is denied | no | yes, through the one entry kiln writes in its `mcp_config.json` in your volume |
+| Cursor CLI | waits for its turn's end | no | yes |
+| Pi | taken at once | no | no: Pi takes no MCP server from kiln |
+
+A conversation the composer doesn't list goes on in a new agent that names it: `POST /api/harness/sessions` with
+`spec.resume` and its Agentfile as `spec.isolation`'s `image`, or `agents_start` with `resume` and `image`.
+
+Not yet: kiln shows no report of the link it holds into an isolated agent's microVM (`runs.control`: each end's
+negotiated suite, and the link's lanes), because Hex, which holds the microVMs, reports none yet. The signals that
+stop a harness and kiln's MCP ride that link all the same. And on a Windows machine, a harness that runs as a
+process there gets kiln's MCP only where that machine's kiln is the server, and only Claude Code; in a microVM
+there, every harness but Pi gets it, as on every machine.
 
 ## Live overrides: ports, egress, networks and volumes
 
@@ -2632,22 +2661,17 @@ mock-up, a small tool) as a page: see docs/previews.md.
     read-only, so harness.json's run.env sets `HOME=/home/antigravity`, and that whole home is a
     harness volume, the person's. It also sets `AGY_CLI_DISABLE_AUTO_UPDATE=true` (the pin is the
     version that runs) and `XDG_CACHE_HOME=/tmp/.cache` (caches on the harness's scratch).
-  - **The Shards it needs.** A shards at or after Shards main 997f4e47e, where run.env's HOME
-    replaces init's `HOME=/tmp`. v0.8.0 is the first release with it. No `env HOME=` launcher is
-    kept, since no earlier release starts a harness from its harness.json at all: that came with
-    Shards main 1da9132b7, after v0.7.0.
-  - **Volumes and grants.** `/workspace` and `/home/antigravity`, both outside `/tmp`, which each
-    harness's scratch covers. The network grants are the bring-up's: names through the microVM's
-    resolver and TCP 443 out, nothing in. agy speaks HTTPS alone, including its telemetry to
-    play.googleapis.com. A connect over IPv6 fails on Shards 8f3cd5b7, so names reach out over IPv4.
-  - **What later steps change.**
-    - Step 7 gives every harness a writable HOME of Shards' own.
-    - Step 8 plugs the project at its host path in place of `/workspace`.
-    - Step 9 grants providers by name instead of TCP 443 to anywhere.
-    - Steps 17 and 18 have kiln start agy in the microVM through Hex, with its config on a volume
-      kiln reads.
-    - Step 33 brings its sign-in as placeholders filled in at the microVM's egress, so no token
-      is ever kept in its volume.
+  - **The Shards it needs.** One whose run.env's HOME replaces init's `HOME=/tmp` (Shards main
+    997f4e47e, first released in v0.8.0). The Shards kiln carries has it: there's nothing to install.
+  - **Its volume and network.** Your volume at `/home/antigravity`, and your project at its own path;
+    neither is under `/tmp`, the harness's scratch. Out, HTTPS alone, to the hosts of its four sign-ins,
+    each by name (the table above), and nothing comes in. Its telemetry host (play.googleapis.com) isn't
+    granted, so that never leaves the microVM.
+  - **In a microVM, as on its machine.** A tool that needs approval is denied, a stop ends its process,
+    which kiln starts again on the same conversation, and a message steered in waits for its turn's end.
+    It reaches kiln's MCP through the one entry kiln writes in its `mcp_config.json` in your volume, the
+    same for each of your agy agents, and each reaches kiln as itself. It signs in itself, its tokens in
+    your volume ("Signing in, and your credentials", above).
   - **Records.** pin.sh's record is `pin.log`, beside it. docs/research/s26-agy-agentfile/ holds
     the rest: the tests' runs, the microVM build, smokes and probe on both platforms
     (`evidence/step4/`), and what stayed unverified (its README).
@@ -2684,14 +2708,14 @@ mock-up, a small tool) as a page: see docs/previews.md.
     is the session's to say.
   - **Two processes.** Every start is two node processes: a light parent that starts node again with
     a heap limit of half the machine's memory.
-  - **Volumes and grants.** `/workspace` and `/home/gemini`. The network grants are the bring-up's:
-    names through the microVM's resolver and TCP 443 out, nothing in. Every endpoint Gemini reaches
-    by default speaks HTTPS: Code Assist for a Google sign-in, the Gemini API for a key, Google's
-    OAuth endpoints and its usage statistics (play.googleapis.com).
-  - **What later steps change.** As agy's: steps 7, 8 and 9 (HOME, the project at its host path,
-    providers by name), 17 and 18 (the start through Hex, its config on a volume kiln reads, and its
-    sign-in on the terminal lane, which starts the same node and script), and 33 (its sign-in filled
-    in at the microVM's egress).
+  - **Its volume and network.** Your volume at `/home/gemini`, and your project at its own path. Out,
+    HTTPS alone, to its four hosts, each by name (the table above): Code Assist for a Google sign-in,
+    the Gemini API for a key, Google's OAuth and `www.googleapis.com`; nothing comes in. Its usage
+    statistics' host (play.googleapis.com) isn't granted, so they never leave the microVM.
+  - **In a microVM, as on its machine.** A message steered into its turn waits for the turn's end. It
+    signs in itself, its tokens in your volume ("Signing in, and your credentials", above). Its past
+    conversations aren't in the composer's list: one goes on by its conversation's id ("Each harness,
+    in a microVM of its own", above).
   - **Records.** docs/research/s21-gemini-agentfile/: its research's evidence, the pin's runs and its
     tests, and what stayed unverified (its README).
 - **ACP agents** report no MCP servers, skills or plan limits; their slash commands run with
