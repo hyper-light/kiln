@@ -43,16 +43,29 @@ const DAY_MS: i64 = 86_400_000;
 /// A GiB (2^30 bytes).
 const GIB: f64 = 1_073_741_824.0;
 
-/// A measure of a session, as the Agents page names it.
+/// A measure of a session: the three the Agents page names (each variant's `measures` and `trend`), and the rest of
+/// P7.1's deployment measures, which its criteria read in kiln's monitoring syntax (kiln plan
+/// 01a1dd2ea7a777a28970a43fc5f766d0 P7.1: "start cold/template/warm, footprint peak and steady, host CPU, failures,
+/// session outcome").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Measure {
     WarmMs,
     PeakGib,
     FailedPct,
+    /// Its first start's time, tagged with its kind (`start:cold|template|warm|swapped|other`).
+    StartMs,
+    /// Its microVM's footprint as its last start ended.
+    SteadyGib,
+    /// The host CPU its microVMs used, all its starts'.
+    CpuMs,
+    /// 1 a session, tagged with how it ended (`outcome:ended|failed|refused`): `count:` of it counts them.
+    Outcome,
 }
 
 impl Measure {
-    const ALL: [Measure; 3] = [Measure::WarmMs, Measure::PeakGib, Measure::FailedPct];
+    /// The Agents page's.
+    const SHOWN: [Measure; 3] = [Measure::WarmMs, Measure::PeakGib, Measure::FailedPct];
+    const ALL: [Measure; 7] = [Measure::WarmMs, Measure::PeakGib, Measure::FailedPct, Measure::StartMs, Measure::SteadyGib, Measure::CpuMs, Measure::Outcome];
 
     /// Its metric in kiln's observability.
     fn metric(self) -> &'static str {
@@ -60,6 +73,10 @@ impl Measure {
             Measure::WarmMs => "kiln.session.warm_ms",
             Measure::PeakGib => "kiln.session.peak_memory_gib",
             Measure::FailedPct => "kiln.session.failed_pct",
+            Measure::StartMs => "kiln.session.start_ms",
+            Measure::SteadyGib => "kiln.session.steady_memory_gib",
+            Measure::CpuMs => "kiln.session.cpu_ms",
+            Measure::Outcome => "kiln.session.outcome",
         }
     }
 
@@ -69,14 +86,28 @@ impl Measure {
             Measure::WarmMs => r.warm.map(|w| (w.at, w.ms)),
             Measure::PeakGib => r.end.and_then(|e| Some((e.at, e.peak? as f64 / GIB))),
             Measure::FailedPct => r.end.map(|e| (e.at, if e.failed { 100.0 } else { 0.0 })),
+            Measure::StartMs => r.first.map(|f| (f.at, f.ms)),
+            Measure::SteadyGib => r.end.and_then(|e| Some((e.at, e.steady? as f64 / GIB))),
+            Measure::CpuMs => r.end.and_then(|e| Some((e.at, e.cpu_ns? as f64 / 1e6))),
+            Measure::Outcome => r.end.map(|e| (e.at, 1.0)),
         }
     }
 
-    /// What `values` say of it: their median, or, of failures, their rate as a percent.
+    /// The tag a fact of it carries besides its experiment's and its variant's.
+    fn tag(self, r: &Reading) -> Option<(&'static str, &'static str)> {
+        match self {
+            Measure::StartMs => r.first.map(|f| ("start", f.kind)),
+            Measure::Outcome => r.end.map(|e| ("outcome", e.outcome.as_str())),
+            _ => None,
+        }
+    }
+
+    /// What `values` say of it: their median, or, of failures, their rate as a percent; of outcomes, nothing.
     fn point(self, values: &[f64]) -> Option<f64> {
         match self {
-            Measure::WarmMs | Measure::PeakGib => kiln_ci::stats::median(&mut values.to_vec()),
+            Measure::WarmMs | Measure::PeakGib | Measure::StartMs | Measure::SteadyGib | Measure::CpuMs => kiln_ci::stats::median(&mut values.to_vec()),
             Measure::FailedPct => (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64),
+            Measure::Outcome => None,
         }
     }
 
@@ -86,17 +117,18 @@ impl Measure {
         let alpha = 1.0 - LEVEL;
         let bounded = |s: Sequence| Some([s.low?, s.mid, s.high?]);
         match self {
-            Measure::WarmMs | Measure::PeakGib => bounded(sequence::median(values, alpha)?),
+            Measure::WarmMs | Measure::PeakGib | Measure::StartMs | Measure::SteadyGib | Measure::CpuMs => bounded(sequence::median(values, alpha)?),
             Measure::FailedPct => {
                 let failed: Vec<f64> = values.iter().map(|v| v / 100.0).collect();
                 bounded(sequence::rate(&failed, alpha)?).map(|i| i.map(|x| x * 100.0))
             }
+            Measure::Outcome => None,
         }
     }
 }
 
-/// One fact of a session: its measure, when it was taken (Unix ms), and its value.
-type Fact = (Measure, i64, f64);
+/// One fact of a session: its measure, when it was taken (Unix ms), its value, and the tag it carries besides.
+type Fact = (Measure, i64, f64, Option<(&'static str, &'static str)>);
 
 /// A session's warm start: when its first start began (Unix ms), and how long it took (ms).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -105,62 +137,120 @@ pub struct Warm {
     pub ms: f64,
 }
 
-/// How a session ended: when (Unix ms), whether it failed, and its microVM's peak memory (bytes) where Hex measured it.
+/// A session's first start: when it began (Unix ms), how long it took (ms), and its kind ([`kind_of`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct First {
+    pub at: i64,
+    pub ms: f64,
+    pub kind: &'static str,
+}
+
+/// How a drawn session ended: as it should (`ended`), in error or never having run (`failed`), or with its start refused
+/// (`refused`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Ended,
+    Failed,
+    Refused,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Ended => "ended",
+            Outcome::Failed => "failed",
+            Outcome::Refused => "refused",
+        }
+    }
+}
+
+/// How a session ended: when (Unix ms), whether it failed, its microVM's peak memory and its footprint as its last start
+/// ended (bytes), and the host CPU its microVMs used (ns, all its starts'), where Hex measured them; and its outcome.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct End {
     pub at: i64,
     pub failed: bool,
     pub peak: Option<u64>,
+    pub steady: Option<u64>,
+    pub cpu_ns: Option<u64>,
+    pub outcome: Outcome,
 }
 
-/// What a draw's session came to, as kept with its draw: its warm start, where it had one; its end, once it's over.
+/// What a draw's session came to, as kept with its draw: its warm start, where it had one, and its first start of any
+/// kind; its end, once it's over.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Reading {
     pub warm: Option<Warm>,
+    pub first: Option<First>,
     pub end: Option<End>,
 }
 
 impl Reading {
     /// Session `i` as kiln has it now (`now`, Unix ms: when its end was seen, where it says no time of its own).
     pub fn of(i: &Info, now: i64) -> Reading {
-        Reading { warm: warm_of(i), end: (i.status == Status::Exited).then(|| end_of(i, now)) }
+        Reading { warm: warm_of(i), first: first_of(i), end: (i.status == Status::Exited).then(|| end_of(i, now)) }
     }
 
     /// Session `i` as it goes: over, whatever it last said.
     pub fn over(i: &Info, now: i64) -> Reading {
-        Reading { warm: warm_of(i), end: Some(end_of(i, now)) }
+        Reading { warm: warm_of(i), first: first_of(i), end: Some(end_of(i, now)) }
     }
 
     /// A start kiln refused at `at`: a failure then.
     pub fn refused(at: i64) -> Reading {
-        Reading { warm: None, end: Some(End { at, failed: true, peak: None }) }
+        Reading { end: Some(End { at, failed: true, peak: None, steady: None, cpu_ns: None, outcome: Outcome::Refused }), ..Reading::default() }
     }
 
     /// `self` with what `now` says that it doesn't yet: a fact, once kept, stays as it was kept.
     pub fn and(self, now: Reading) -> Reading {
-        Reading { warm: self.warm.or(now.warm), end: self.end.or(now.end) }
+        Reading { warm: self.warm.or(now.warm), first: self.first.or(now.first), end: self.end.or(now.end) }
     }
 
     /// Its facts.
     fn facts(&self) -> Vec<Fact> {
-        Measure::ALL.into_iter().filter_map(|m| m.of(self).map(|(at, v)| (m, at, v))).collect()
+        Measure::ALL.into_iter().filter_map(|m| m.of(self).map(|(at, v)| (m, at, v, m.tag(self)))).collect()
     }
+}
+
+/// A start's kind as the Agents page's starts count it (`crate::agentdefs::sessions::start_kind` of Shards' word), a
+/// word kiln doesn't know yet `other`: a tag's values stay these few, whatever a microVM says.
+fn kind_of(started_from: &str) -> &'static str {
+    match crate::agentdefs::sessions::start_kind(started_from).as_str() {
+        "cold" => "cold",
+        "template" => "template",
+        "warm" => "warm",
+        "swapped" => "swapped",
+        _ => "other",
+    }
+}
+
+/// Session `i`'s first start Hex measured: when it began, and its kind and time where Shards says them.
+fn first_of(i: &Info) -> Option<First> {
+    let (at, m) = i.starts.iter().find_map(|s| Some((s.at, s.measured.as_ref()?)))?;
+    Some(First { at, ms: m.start_us? as f64 / 1000.0, kind: kind_of(m.started_from.as_deref()?) })
 }
 
 /// Session `i`'s warm start: its first start Hex measured, where Shards says it started warm and timed it.
 fn warm_of(i: &Info) -> Option<Warm> {
-    let (at, m) = i.starts.iter().find_map(|s| Some((s.at, s.measured.as_ref()?)))?;
-    let warm = m.started_from.as_deref().is_some_and(|w| crate::agentdefs::sessions::start_kind(w) == "warm");
-    let us = m.start_us.filter(|_| warm)?;
-    Some(Warm { at, ms: us as f64 / 1000.0 })
+    first_of(i).filter(|f| f.kind == "warm").map(|f| Warm { at: f.at, ms: f.ms })
 }
 
 /// How session `i` ended (seen at `now`, where it says no time): in error, or never having run, a failure; its peak the
-/// most any of its starts held.
+/// most any of its starts held, its steady footprint its last start's, its host CPU all its starts'.
 fn end_of(i: &Info, now: i64) -> End {
     let exit = i.exit.as_ref();
     let at = exit.map(|x| x.at).filter(|at| *at > 0).or_else(|| i.starts.last().and_then(|s| s.ended.as_ref()).map(|e| e.at)).unwrap_or(now);
-    End { at, failed: exit.is_some_and(|x| x.error.is_some()) || i.starts.is_empty(), peak: i.starts.iter().filter_map(|s| s.measured.as_ref()?.footprint_peak_bytes).max() }
+    let failed = exit.is_some_and(|x| x.error.is_some()) || i.starts.is_empty();
+    let measured = || i.starts.iter().filter_map(|s| s.measured.as_ref());
+    let cpu = measured().filter_map(|m| m.cpu_ns).reduce(u64::saturating_add);
+    End {
+        at,
+        failed,
+        peak: measured().filter_map(|m| m.footprint_peak_bytes).max(),
+        steady: measured().filter_map(|m| m.footprint_steady_bytes).last(),
+        cpu_ns: cpu,
+        outcome: if failed { Outcome::Failed } else { Outcome::Ended },
+    }
 }
 
 /// A variant's measures, each `[low, mid, high]` within its 95% interval.
@@ -183,11 +273,13 @@ pub struct Trend {
 }
 
 impl Trend {
-    fn line(&mut self, m: Measure) -> &mut Option<Vec<f64>> {
+    /// Its line of `m`, one of the Agents page's measures (`Measure::SHOWN`).
+    fn line(&mut self, m: Measure) -> Option<&mut Option<Vec<f64>>> {
         match m {
-            Measure::WarmMs => &mut self.warm_ms,
-            Measure::PeakGib => &mut self.peak_gib,
-            Measure::FailedPct => &mut self.failed_pct,
+            Measure::WarmMs => Some(&mut self.warm_ms),
+            Measure::PeakGib => Some(&mut self.peak_gib),
+            Measure::FailedPct => Some(&mut self.failed_pct),
+            Measure::StartMs | Measure::SteadyGib | Measure::CpuMs | Measure::Outcome => None,
         }
     }
 }
@@ -215,7 +307,7 @@ pub fn trends(variants: &[Vec<Reading>], started_at: i64, now: i64) -> Vec<Trend
     if today < first {
         return out;
     }
-    for m in Measure::ALL {
+    for m in Measure::SHOWN {
         // Each variant's values by day, those of one day in the order they were drawn.
         let days: Vec<Vec<(i64, f64)>> = variants
             .iter()
@@ -231,7 +323,9 @@ pub fn trends(variants: &[Vec<Reading>], started_at: i64, now: i64) -> Vec<Trend
                 continue;
             }
             let line: Vec<f64> = (from..=today).filter_map(|d| m.point(&v.iter().take_while(|(day, _)| *day <= d).map(|(_, x)| *x).collect::<Vec<f64>>())).collect();
-            *t.line(m) = Some(line);
+            if let Some(l) = t.line(m) {
+                *l = Some(line);
+            }
         }
     }
     out
@@ -320,14 +414,22 @@ struct Kept {
     reading: Reading,
 }
 
-const KEPT: &str = "draw, variant_id, session_id, warm_at, warm_ms, ended_at, failed, peak_bytes";
+const KEPT: &str = "draw, variant_id, session_id, warm_at, warm_ms, ended_at, failed, peak_bytes, first_at, first_ms, first_kind";
 
+/// A draw's row ([`KEPT`]'s columns). Of an end, the facts written as it was kept and not read again (its steady
+/// footprint, its CPU, a refusal apart from a failure) are as they were written; read back, none, and an outcome of its
+/// `failed` alone.
 fn kept(r: &rusqlite::Row<'_>) -> rusqlite::Result<Kept> {
     let (warm_at, warm_ms): (Option<i64>, Option<f64>) = (r.get(3)?, r.get(4)?);
     let (ended_at, failed, peak): (Option<i64>, Option<bool>, Option<i64>) = (r.get(5)?, r.get(6)?, r.get(7)?);
+    let (first_at, first_ms, first_kind): (Option<i64>, Option<f64>, Option<String>) = (r.get(8)?, r.get(9)?, r.get(10)?);
     let warm = warm_at.zip(warm_ms).map(|(at, ms)| Warm { at, ms });
-    let end = ended_at.map(|at| End { at, failed: failed.unwrap_or(false), peak: peak.and_then(|p| u64::try_from(p).ok()) });
-    Ok(Kept { n: r.get(0)?, variant: r.get(1)?, session: r.get(2)?, reading: Reading { warm, end } })
+    let first = first_at.zip(first_ms).map(|(at, ms)| First { at, ms, kind: kind_of(first_kind.as_deref().unwrap_or("")) });
+    let end = ended_at.map(|at| {
+        let failed = failed.unwrap_or(false);
+        End { at, failed, peak: peak.and_then(|p| u64::try_from(p).ok()), steady: None, cpu_ns: None, outcome: if failed { Outcome::Failed } else { Outcome::Ended } }
+    });
+    Ok(Kept { n: r.get(0)?, variant: r.get(1)?, session: r.get(2)?, reading: Reading { warm, first, end } })
 }
 
 /// Experiment `id`'s draws, in the order drawn, each with what its session came to: one not over yet read again now
@@ -373,7 +475,15 @@ async fn keep(hub: &Hub, experiment: &str, changed: Vec<(i64, String, Reading, R
                 if let (None, Some(w)) = (was.warm, read.warm)
                     && tx.execute("UPDATE agent_def_experiment_draws SET warm_at = ?3, warm_ms = ?4 WHERE experiment_id = ?1 AND draw = ?2 AND warm_at IS NULL", params![e, n, w.at, w.ms])? == 1
                 {
-                    new.push(Reading { warm: Some(w), end: None });
+                    new.push(Reading { warm: Some(w), ..Reading::default() });
+                }
+                if let (None, Some(f)) = (was.first, read.first)
+                    && tx.execute(
+                        "UPDATE agent_def_experiment_draws SET first_at = ?3, first_ms = ?4, first_kind = ?5 WHERE experiment_id = ?1 AND draw = ?2 AND first_at IS NULL",
+                        params![e, n, f.at, f.ms, f.kind],
+                    )? == 1
+                {
+                    new.push(Reading { first: Some(f), ..Reading::default() });
                 }
                 if let (None, Some(end)) = (was.end, read.end)
                     && tx.execute(
@@ -381,7 +491,7 @@ async fn keep(hub: &Hub, experiment: &str, changed: Vec<(i64, String, Reading, R
                         params![e, n, end.at, end.failed, end.peak.and_then(|p| i64::try_from(p).ok())],
                     )? == 1
                 {
-                    new.push(Reading { warm: None, end: Some(end) });
+                    new.push(Reading { end: Some(end), ..Reading::default() });
                 }
                 if !new.is_empty() {
                     kept.push((variant.clone(), new));
@@ -421,7 +531,7 @@ pub(super) async fn kept_as_closed(hub: &Hub, info: &Info) {
     let session = info.id.clone();
     let found = hub
         .store
-        .read(move |c| Ok(c.query_row(&format!("SELECT {KEPT}, experiment_id FROM agent_def_experiment_draws WHERE session_id = ?1"), params![session], |r| Ok((kept(r)?, r.get::<_, String>(8)?))).optional()?))
+        .read(move |c| Ok(c.query_row(&format!("SELECT {KEPT}, experiment_id FROM agent_def_experiment_draws WHERE session_id = ?1"), params![session], |r| Ok((kept(r)?, r.get::<_, String>(11)?))).optional()?))
         .await;
     match found {
         Ok(Some((d, experiment))) if d.reading.end.is_none() => {
@@ -444,22 +554,23 @@ fn write(experiment: &str, variant: &str, readings: &[Reading]) {
 }
 
 /// [`write`]'s points: each measure's metric a distribution (`kiln_obs::dist::series_of`), tagged with the experiment
-/// and the variant, its values at their times (those taken at one time one point of it).
+/// and the variant (and a fact's own tag, a start's kind or an outcome), its values at their times (those taken at one
+/// time one point of it).
 pub(super) fn points(experiment: &str, variant: &str, readings: &[Reading]) -> Vec<(SeriesKey, Vec<(i64, f64)>)> {
-    let tags = [("experiment", experiment), ("variant", variant)];
     let facts: Vec<Fact> = readings.iter().flat_map(Reading::facts).collect();
     let mut out = Vec::new();
     for m in Measure::ALL {
-        let mut at: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
-        for (_, t, v) in facts.iter().filter(|(fm, _, _)| *fm == m) {
-            at.entry(*t).or_default().push(*v);
+        let mut by: BTreeMap<Option<(&str, &str)>, BTreeMap<i64, Vec<f64>>> = BTreeMap::new();
+        for (_, t, v, tag) in facts.iter().filter(|(fm, ..)| *fm == m) {
+            by.entry(*tag).or_default().entry(*t).or_default().push(*v);
         }
-        if at.is_empty() {
-            continue;
-        }
-        match kiln_obs::dist::series_of(m.metric(), &tags, &at.into_iter().collect::<Vec<_>>()) {
-            Ok(s) => out.extend(s),
-            Err(e) => tracing::warn!(metric = m.metric(), error = %e, "an experiment's session metric wasn't written"),
+        for (tag, at) in by {
+            let mut tags = vec![("experiment", experiment), ("variant", variant)];
+            tags.extend(tag);
+            match kiln_obs::dist::series_of(m.metric(), &tags, &at.into_iter().collect::<Vec<_>>()) {
+                Ok(s) => out.extend(s),
+                Err(e) => tracing::warn!(metric = m.metric(), error = %e, "an experiment's session metric wasn't written"),
+            }
         }
     }
     out
@@ -474,11 +585,16 @@ mod tests {
     const DAY: i64 = DAY_MS;
 
     fn warm(at: i64, ms: f64) -> Reading {
-        Reading { warm: Some(Warm { at, ms }), end: None }
+        Reading { warm: Some(Warm { at, ms }), ..Reading::default() }
+    }
+
+    /// An end as `end_of` reads one: failed or ended, its peak `peak` bytes, nothing else measured.
+    fn end(at: i64, failed: bool, peak: Option<u64>) -> End {
+        End { at, failed, peak, steady: None, cpu_ns: None, outcome: if failed { Outcome::Failed } else { Outcome::Ended } }
     }
 
     fn ended(at: i64, failed: bool, peak_gib: f64) -> Reading {
-        Reading { warm: None, end: Some(End { at, failed, peak: Some((peak_gib * GIB) as u64) }) }
+        Reading { end: Some(end(at, failed, Some((peak_gib * GIB) as u64))), ..Reading::default() }
     }
 
     /// A microVM start at `at` that Shards says started `from`, timed `us`, its peak `peak` bytes.
@@ -494,22 +610,26 @@ mod tests {
     fn p7_1_a_sessions_facts_are_read_from_its_starts_and_its_end() {
         let mut i = Info { id: "s".into(), status: Status::Running, starts: vec![start(1_000, "warm", 4_500, Some(2 << 30)), start(9_000, "booted", 300_000, Some(3 << 30))], ..Info::default() };
         let running = Reading::of(&i, 50_000);
-        assert_eq!(running, Reading { warm: Some(Warm { at: 1_000, ms: 4.5 }), end: None });
-        assert_eq!(Reading::over(&i, 50_000).end, Some(End { at: 50_000, failed: false, peak: Some(3 << 30) }), "going while it runs: over then");
+        assert_eq!(running, Reading { warm: Some(Warm { at: 1_000, ms: 4.5 }), first: Some(First { at: 1_000, ms: 4.5, kind: "warm" }), end: None });
+        assert_eq!(Reading::over(&i, 50_000).end, Some(end(50_000, false, Some(3 << 30))), "going while it runs: over then");
         i.status = Status::Exited;
         i.exit = Some(ExitInfo { at: 40_000, error: Some("claude exited with 1".into()), ..ExitInfo::default() });
-        assert_eq!(Reading::of(&i, 50_000).end, Some(End { at: 40_000, failed: true, peak: Some(3 << 30) }));
+        assert_eq!(Reading::of(&i, 50_000).end, Some(end(40_000, true, Some(3 << 30))));
         i.exit = Some(ExitInfo::default());
         if let Some(s) = i.starts.last_mut() {
             s.ended = Some(Ended { at: 30_000, code: Some(0) });
         }
-        assert_eq!(Reading::of(&i, 50_000).end, Some(End { at: 30_000, failed: false, peak: Some(3 << 30) }), "no time of its exit's: its last start's end");
+        assert_eq!(Reading::of(&i, 50_000).end, Some(end(30_000, false, Some(3 << 30))), "no time of its exit's: its last start's end");
         let cold = Info { id: "c".into(), status: Status::Exited, starts: vec![start(1_000, "booted", 250_000, None)], ..Info::default() };
-        assert_eq!(Reading::of(&cold, 5_000), Reading { warm: None, end: Some(End { at: 5_000, failed: false, peak: None }) }, "a cold first start is no warm start");
+        assert_eq!(
+            Reading::of(&cold, 5_000),
+            Reading { warm: None, first: Some(First { at: 1_000, ms: 250.0, kind: "cold" }), end: Some(end(5_000, false, None)) },
+            "a cold first start is no warm start, and is its first"
+        );
         let never = Info { id: "n".into(), status: Status::Exited, ..Info::default() };
         assert!(Reading::of(&never, 5_000).end.is_some_and(|e| e.failed), "one that never ran failed");
-        let kept = running.and(Reading { warm: Some(Warm { at: 7, ms: 1.0 }), end: Some(End { at: 60_000, failed: false, peak: None }) });
-        assert_eq!(kept, Reading { warm: Some(Warm { at: 1_000, ms: 4.5 }), end: Some(End { at: 60_000, failed: false, peak: None }) }, "a kept fact stays");
+        let kept = running.and(Reading { warm: Some(Warm { at: 7, ms: 1.0 }), first: None, end: Some(end(60_000, false, None)) });
+        assert_eq!(kept, Reading { warm: Some(Warm { at: 1_000, ms: 4.5 }), first: running.first, end: Some(end(60_000, false, None)) }, "a kept fact stays");
     }
 
     /// P7.1: a variant's measures are its 95% confidence sequences, `[low, mid, high]`: the median of its warm starts and
@@ -572,6 +692,41 @@ mod tests {
         anyhow::ensure!(metric("kiln.session.failed_pct.sum") == vec![(5_000, 100.0)], "{read:?}");
         anyhow::ensure!(metric("kiln.session.warm_ms.sum") == vec![(1_000, 4.0)], "{read:?}");
         anyhow::ensure!(metric("kiln.session.peak_memory_gib.max") == vec![(5_000, 2.0)], "{read:?}");
+        Ok(())
+    }
+
+    /// P7.1's deployment measures beside the Agents page's three ("start cold/template/warm, footprint peak and steady,
+    /// host CPU, failures, session outcome"): a session's first start of any kind, tagged with its kind; its steady
+    /// footprint (its last start's); the host CPU of all its starts; its outcome, tagged; each a point of its
+    /// distribution, so a criterion reads them by variant (`p50:kiln.session.start_ms{experiment:e,start:cold} by
+    /// {variant}`, `count:kiln.session.outcome{experiment:e,outcome:refused} by {variant}`).
+    #[test]
+    fn p7_1_deployment_measures_are_points_tagged_by_kind_and_outcome() -> anyhow::Result<()> {
+        let mut first = start(1_000, "restored", 80_000, Some(3 << 30));
+        let mut second = start(9_000, "booted", 300_000, Some(2 << 30));
+        for (s, steady, cpu) in [(&mut first, 1u64 << 30, 2_000_000_000u64), (&mut second, 1 << 29, 500_000_000)] {
+            if let Some(m) = s.measured.as_mut() {
+                m.footprint_steady_bytes = Some(steady);
+                m.cpu_ns = Some(cpu);
+            }
+        }
+        let i = Info { id: "s".into(), status: Status::Exited, starts: vec![first, second], exit: Some(ExitInfo { at: 20_000, ..ExitInfo::default() }), ..Info::default() };
+        let r = Reading::of(&i, 30_000);
+        anyhow::ensure!(r.first == Some(First { at: 1_000, ms: 80.0, kind: "template" }) && r.warm.is_none(), "{r:?}");
+        let e = r.end.ok_or_else(|| anyhow::anyhow!("it ended"))?;
+        anyhow::ensure!(e.steady == Some(1 << 29) && e.cpu_ns == Some(2_500_000_000) && e.peak == Some(3 << 30) && e.outcome == Outcome::Ended, "{e:?}");
+        let mut read = Vec::new();
+        for (k, p) in &points("e", "v", &[r, Reading::refused(40_000)]) {
+            let key = kiln_obs::batch::parse_key(&k.key).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let tag = |name: &str| key.tags.iter().find(|(t, _)| *t == name).map(|(_, v)| (*v).to_owned());
+            read.push((key.metric.to_owned(), tag("start"), tag("outcome"), p.clone()));
+        }
+        let of = |metric: &str| read.iter().filter(|(m, ..)| m == metric).cloned().collect::<Vec<_>>();
+        anyhow::ensure!(of("kiln.session.start_ms.sum").iter().any(|(_, kind, _, p)| kind.as_deref() == Some("template") && *p == vec![(1_000, 80.0)]), "{read:?}");
+        anyhow::ensure!(of("kiln.session.steady_memory_gib.max").iter().any(|(.., p)| *p == vec![(20_000, 0.5)]), "{read:?}");
+        anyhow::ensure!(of("kiln.session.cpu_ms.sum").iter().any(|(.., p)| *p == vec![(20_000, 2_500.0)]), "{read:?}");
+        let outcomes: Vec<(Option<String>, Vec<(i64, f64)>)> = of("kiln.session.outcome.count").into_iter().map(|(_, _, o, p)| (o, p)).collect();
+        anyhow::ensure!(outcomes.contains(&(Some("ended".into()), vec![(20_000, 1.0)])) && outcomes.contains(&(Some("refused".into()), vec![(40_000, 1.0)])), "{outcomes:?}");
         Ok(())
     }
 
