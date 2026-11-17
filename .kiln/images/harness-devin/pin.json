@@ -1,12 +1,12 @@
 {
   "harness": "devin",
-  "version": "3000.12.43",
-  "verified": "sha256 from Cognition's versioned manifest over HTTPS; current/ named 3000.12.57 when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403 or 404)",
+  "version": "3000.13.4",
+  "verified": "sha256 from Cognition's versioned manifest over HTTPS, equal to current/ when pinned; Cognition publishes no signature (.sig, .asc, .sha256, SHA256SUMS and .sigstore.json answer 403 or 404)",
   "manifest": {
-    "url": "https://static.devin.ai/cli/3000.12.43/manifest.json",
-    "sha256": "093e9492b3227bfc7be8a57114448611bf8af6573af7ac3866d3ff85abadb1c1"
+    "url": "https://static.devin.ai/cli/3000.13.4/manifest.json",
+    "sha256": "95abdcbabe86d2acce1986aa2434c6340e5e042a01fdfa17507d0e14af7acbde"
   },
-  "read_at": "2026-11-12T22:05:20Z",
+  "read_at": "2026-11-17T16:32:11Z",
   "base": {
     "ref": "buildpack-deps:trixie-scm",
     "digest": "sha256:4f34e1d673fdb65371de9f88bdd32c4e30152fe692b35604aef5c0b3c0e6da10"
@@ -16,15 +16,15 @@
       "platform": "linux/amd64",
       "files": [
         {
-          "url": "https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-x86_64-unknown-linux.tar.gz",
-          "sha256": "6a19997b5fc2d6ba1a8c341d4e2b12f1b78cad5d415ee9c0ca413a8d52a99562",
-          "size": 71424183,
+          "url": "https://static.devin.ai/cli/3000.13.4/devin-3000.13.4-x86_64-unknown-linux.tar.gz",
+          "sha256": "e1bd618ec61f4d21069335162cf6d854d8cd2e662f2395efb06edb5796ed16e9",
+          "size": 88713470,
           "path": ".",
           "unpack": {
             "format": "tar.gz",
             "strip": 0,
-            "unpacked_bytes": 210206170,
-            "entries": 250
+            "unpacked_bytes": 257855245,
+            "entries": 263
           }
         }
       ]
@@ -33,15 +33,15 @@
       "platform": "linux/arm64",
       "files": [
         {
-          "url": "https://static.devin.ai/cli/3000.12.43/devin-3000.12.43-aarch64-unknown-linux.tar.gz",
-          "sha256": "1eaa07d2181ed26f5789cf6b3617d39a2459c25f1bc5a51cc5cc703db7f95274",
-          "size": 67806876,
+          "url": "https://static.devin.ai/cli/3000.13.4/devin-3000.13.4-aarch64-unknown-linux.tar.gz",
+          "sha256": "725a7b1eb6d2a57dd99d6ab6e632330dc639f2382776241cf75a6c0b3e04d337",
+          "size": 82579528,
           "path": ".",
           "unpack": {
             "format": "tar.gz",
             "strip": 0,
-            "unpacked_bytes": 192507154,
-            "entries": 250
+            "unpacked_bytes": 230952133,
+            "entries": 263
           }
         }
       ]
