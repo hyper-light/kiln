@@ -8,7 +8,9 @@
 //!   [`HexVms::launch_as`].
 //! - **Its spec** is `ClassSpec::ShardsImage`: the image pinned by its digest; one `Grant::Egress` by TCP for each
 //!   destination its launch names (`host:port`, to its harness member); its harness member, given the launch's
-//!   environment, folder and arguments; the launch's shares, and its folder at its own path, writable.
+//!   environment, folder and arguments; the launch's shares, each given as they start to the members it names
+//!   (Shards' share member scope, D277: its harness, the one member a launch types; a share given to another is
+//!   refused), and its folder at its own path, writable, its harness's.
 //! - **Its size** is its session's isolation's where it gives one (vCPUs and memory, plan step 32, as a deployment
 //!   experiment's variant sizes it: P7.1), else the least Shards boots (`shards_api::envelope` of no vCPU and no
 //!   memory: one vCPU and shards-vmm's least memory for this architecture), as an allocation that envelope keeps:
@@ -64,13 +66,14 @@ use kiln_ci::place::holder::BoxName;
 use kiln_seams::Records;
 use kiln_seams::records::{Tx, Write};
 use serde::{Deserialize, Serialize};
-use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Pool, Refusal, Run, Sandbox, Signal};
+use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Pool, Refusal, Run, Sandbox, Share, Signal};
 
 /// What a box of Hex's holds its run to: no egress, egress to named destinations (each by TCP, to its harness
-/// member), folders shared at any path, read-only or not (`ShardsImage::shares`), and signals to its harness member
-/// (`Runtime::signal_member`, Shards' agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or
-/// refused fork of an image VM's guest: its `usage_of`), or weights. Credentials it holds where its runtime leases
-/// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none.
+/// member), folders shared at any path, read-only or not, each given to its harness member as it starts or to its run's
+/// root alone (`ShardsImage::shares`), and signals to its harness member (`Runtime::signal_member`, Shards'
+/// agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or refused fork of an image VM's
+/// guest: its `usage_of`), or weights. Credentials it holds where its runtime leases them ([`HexVms::leasing`], its
+/// [`Sandbox::holds`]); these say none.
 pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
@@ -361,13 +364,14 @@ impl HexVms {
 
     /// `image` booted in a box its namer names, `command` its run's own command (`ShardsImage::command`, as `shards run
     /// IMAGE COMMAND` runs one), no member of it driven (its members start as its image declares them, their stdin the
-    /// null device): `shares` its folders (each its command's, where no `VOLUME` of its image declares its path), no
-    /// grant, so nothing passes its VM (Hex's grants are default deny), no credential, and its size as
-    /// [`HexVms::launch_as`] sizes one. Created and started, or refused, typed, with no box left behind.
+    /// null device): `shares` its folders (each its command's, where no `VOLUME` of its image declares its path; one
+    /// given to a member refused, as it drives none: `mount_of`), no grant, so nothing passes its VM (Hex's grants
+    /// are default deny), no credential, and its size as [`HexVms::launch_as`] sizes one. Created and started, or
+    /// refused, typed, with no box left behind.
     pub async fn boot_command(&self, image: &str, command: Vec<String>, shares: &[kiln_seams::sandbox::Share], size: Option<(u32, u64)>) -> Result<Commanded, Refusal> {
         let name = (self.names)().ok_or_else(|| Refusal::Unsupported(UNNAMED.into()))?;
         let id = name.id().map_err(seam)?;
-        let shares = shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
+        let shares = shares.iter().map(|s| mount_of(s, None)).collect::<Result<Vec<Mount>, Refusal>>()?;
         let class = ShardsImage { command: Some(command), shares, ..ShardsImage::new(image) };
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
         let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: id.to_string(), member: None, last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
@@ -412,11 +416,13 @@ impl HexVms {
         let grants = grants_of(&member, &launch.egress)?;
         let credentials = credentials_of(&member, &launch.credentials);
         let sign_ins = sign_ins_of(&member, sign_ins);
-        let mut shares: Vec<Mount> = launch.shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
+        let mut shares = launch.shares.iter().map(|s| mount_of(s, Some(&member))).collect::<Result<Vec<Mount>, Refusal>>()?;
+        // Its harness works in it from its first instruction: given to no member, it would reach its run's root alone,
+        // and its harness's start would fail entering it (Shards' D277).
         if let Some(folder) = &launch.folder
             && !shares.iter().any(|s| &s.destination == folder)
         {
-            shares.push(Mount { source: PathBuf::from(folder), destination: folder.clone(), read_only: false });
+            shares.push(Mount { source: PathBuf::from(folder), destination: folder.clone(), read_only: false, members: vec![member.clone()] });
         }
         // Its MCP bridge (Shards D254): nothing of it is a grant or an address.
         let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone(), mcp: true };
@@ -481,6 +487,23 @@ impl Sandbox for HexVms {
 
 /// Why a box's image keeps no warm pool here yet.
 pub const NO_POOLS: &str = "a warm pool kept for its launches: the Hex kiln vendors keeps none yet, its image class booting each box on Shards' ImageShards rather than its ImagePools (kiln plan 01a1dd2e…, P3.1)";
+
+/// `share` as Hex mounts it into its box (`ShardsImage::shares`): its host folder at its path, read-only where it isn't
+/// writable, and given as they start to the members it names, which see it from their first instruction (Shards'
+/// share member scope, D277; `hex_api::Mount::members`): none, its run's root alone. Hex names a member by its kind
+/// and its name, and a launch types the harness it drives (`driven`) alone, so a share given to any other member is
+/// refused, never mounted where that member doesn't see it.
+fn mount_of(share: &Share, driven: Option<&Member>) -> Result<Mount, Refusal> {
+    let members = share
+        .members
+        .iter()
+        .map(|named| match driven {
+            Some(member) if member.name == named.0 => Ok(member.clone()),
+            _ => Err(Refusal::Unsupported(format!("a folder at {:?} given to {:?} as it starts, a member of its image it doesn't drive: Hex names each member by its kind, and a launch types the harness it drives alone", share.at, named.0))),
+        })
+        .collect::<Result<Vec<Member>, Refusal>>()?;
+    Ok(Mount { source: PathBuf::from(&share.host), destination: share.at.clone(), read_only: !share.writable, members })
+}
 
 /// `granted`'s credentials as Hex grants them to `member`: by reference alone, toward each host lowercased as its
 /// egress grants name it ([`grants_of`]; RFC 4343), each once. Hex checks them against its grants as the box is made.
@@ -1668,6 +1691,44 @@ pub(crate) mod tests {
             let refused = unleased.launch_sized(reaching(), None, &[sign_in]).await.err();
             anyhow::ensure!(matches!(&refused, Some(Refusal::Unsupported(why)) if why == super::NO_BROKER), "{refused:?}");
             assert_eq!(sim.list()?, [], "a refused launch leaves no box");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1cd8e…, P1.4 (Shards' D277, through Hex's member scope on `Mount`): a launch's shares reach Hex given
+    /// to the members they name, its harness by its kind, and one given to none to its run's root alone; its folder, which
+    /// none of them shares, is given to its harness, which works in it from its first instruction. A share given to a
+    /// member it doesn't drive is refused, typed, as is a share a command's boot gives any member: neither asks Hex for a
+    /// box.
+    #[test]
+    fn p1_4_a_launchs_shares_reach_hex_given_to_their_members_and_its_folder_to_its_harness() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{Member as Who, Share};
+        crate::rt::block_on(async {
+            let (rt, _records, vms) = metered();
+            let share = |host: &str, at: &str, writable: bool, members: &[&str]| Share { host: host.into(), at: at.into(), writable, members: members.iter().map(|m| Who((*m).to_owned())).collect() };
+            let shares = vec![share("/Users/ada/proj", "/work/proj", true, &["claude"]), share("/Users/ada/plugins", "/plugins/a", false, &["claude"]), share("/Users/ada/cache", "/cache", true, &[])];
+            let run = vms.launch(Launch { shares, ..launch(Egress::Only(Vec::new())) }).await?;
+            let specs = rt.specs.lock().clone();
+            let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
+            let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
+            let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
+            let mount = |source: &str, destination: &str, read_only: bool, members: Vec<Member>| hex_api::Mount { source: source.into(), destination: destination.into(), read_only, members };
+            let given = [
+                mount("/Users/ada/proj", "/work/proj", false, vec![harness.clone()]),
+                mount("/Users/ada/plugins", "/plugins/a", true, vec![harness.clone()]),
+                mount("/Users/ada/cache", "/cache", false, Vec::new()),
+                mount("/work/project", "/work/project", false, vec![harness.clone()]),
+            ];
+            assert_eq!(image.shares, given, "each share given to the members it names, and its folder to its harness");
+            let elsewhere = vec![share("/Users/ada/data", "/data", true, &["claude", "helper"])];
+            let refused = vms.launch(Launch { shares: elsewhere, ..launch(Egress::Only(Vec::new())) }).await.err();
+            assert!(matches!(&refused, Some(Refusal::Unsupported(why)) if why.contains("\"helper\"")), "{refused:?}");
+            let refused = vms.boot_command(SIM_IMAGE, vec!["/bin/sh".into()], &[share("/Users/ada/data", "/data", true, &["claude"])], None).await.err();
+            assert!(matches!(&refused, Some(Refusal::Unsupported(why)) if why.contains("\"claude\"")), "{refused:?}");
+            assert_eq!(rt.specs.lock().len(), 1, "a refused launch or boot asks Hex for no box");
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
             anyhow::Ok(())
         })
     }
