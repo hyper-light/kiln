@@ -83,7 +83,7 @@ can come, or where the fixture's own server or runner ended. Each refusal prints
 each of its messages' delivery, and its timeline. A drive refused part way ends the sessions it started.
 As it runs it says where it stands, so a run ended from outside shows it: `DRIVE:` (a harness and its
 image), `WAIT:` (each wait as it begins: the harness's step, its session, its window or none), `FAILED:`
-(`step35::rest::`, each failure as it comes) and `ENDED:` (a session a refused drive left).
+(`step35::rest::` and `step35::mcp::`, each failure as it comes) and `ENDED:` (a session a refused drive left).
 
 On a busy host kiln holds a queued message in its own queue until the machine has room (docs/headroom.md),
 and the drive's turns then wait there. The test's own runner has its headroom off; turn ROOT's runner's off

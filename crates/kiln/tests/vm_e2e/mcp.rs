@@ -86,7 +86,8 @@ fn nonce() -> String {
 /// interrupted, ended, and its conversation taken up again by a new agent (`resume`) from the same
 /// Agentfile, which is ended too. Its first turn's checks of where it ran are the REST drive's
 /// ([`vm_e2e::in_microvm`]). A vendor's CLI takes ROOT's task alone: the caller holds it back first
-/// ([`super::untasked`]).
+/// ([`super::untasked`]). Refused part way, it ends the agents it started ([`vm_e2e::Ends`]), as the REST
+/// drive does, so none runs on into the next drive on the runner.
 pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> anyhow::Result<()> {
     let marker = std::env::var("VM_E2E_DONE_MARKER").unwrap_or_else(|_| vm_e2e::STUB_DONE.to_owned());
     let stub = marker == vm_e2e::STUB_DONE;
@@ -95,9 +96,12 @@ pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> a
     let what = format!("{kind} from {image} through {}", via.through());
     let done = |i: &Value, e: &[Value]| vm_e2e::status(i) == "idle" && vm_e2e::said_marker(&vm_e2e::said(e), &marker);
     let mut pace = vm_e2e::Pace::default();
+    let mut ends = vm_e2e::Ends::new(f);
+    eprintln!("DRIVE: {kind} from {image} in a microVM on {} through {}", f.machine, via.through());
 
     // Start, naming its Agentfile and the runner that starts microVMs.
     let id = started(&call(f, via, "agents.start", json!({"kind": kind, "on": f.machine, "cwd": project, "prompt": prompt, "image": image}))?)?;
+    ends.started(&id);
     let (info, _) = pace.until(f, &id, vm_e2e::Asked::Opening, &format!("{what}: its first turn"), done)?;
     anyhow::ensure!(
         info.pointer("/isolation/kind").and_then(Value::as_str) == Some("microvm") && info.pointer("/isolation/image").and_then(Value::as_str) == Some(image),
@@ -131,21 +135,25 @@ pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> a
     let ended = call(f, via, "agents.stop", json!({"agent": id, "children": true}))?;
     anyhow::ensure!(ended.get("ended").and_then(Value::as_array).is_some_and(|a| a.iter().any(|x| x.as_str() == Some(id.as_str()))), "{what}: agents.stop said {ended}");
     pace.unlisted(f, &id, &format!("{what}: {id} still listed after agents.stop"))?;
+    ends.ended(&id);
 
     // Resume: a new agent takes the conversation up again, in a microVM from the same Agentfile.
     let again = vm_e2e::task("VM_E2E_RESUMED_PROMPT", kind, &n, format!("do the task again {n}"));
     let resumed = started(&call(f, via, "agents.start", json!({"kind": kind, "on": f.machine, "cwd": project, "prompt": again, "image": image, "resume": hs}))?)?;
+    ends.started(&resumed);
     let (i, _) = pace.until(f, &resumed, vm_e2e::Asked::Opening, &format!("{what}: taking its conversation up again"), done)?;
     anyhow::ensure!(i.get("harness_session").and_then(Value::as_str) == Some(hs.as_str()), "{what}: the resumed agent's harness session is {}, not {hs}", i.get("harness_session").unwrap_or(&Value::Null));
     anyhow::ensure!(i.pointer("/isolation/image").and_then(Value::as_str) == Some(image), "{what}: resumed outside its Agentfile: {}", i.get("isolation").unwrap_or(&Value::Null));
     call(f, via, "agents.stop", json!({"agent": resumed, "children": true}))?;
+    ends.ended(&resumed);
     Ok(())
 }
 
 /// Each harness through kiln's MCP server `via` its tools or code mode, from kiln's Agentfile and from a
-/// person's own; every failure said at the end. The stand-in's image (`VM_E2E_IMAGE_<KIND>=stub`) is kept
-/// in kiln for its harness's drives and booted as `agentfile:<id>` ([`vm_e2e::boots`]), as the REST
-/// drive boots it.
+/// person's own; every failure said as it comes and again at the end, so a run ended from outside shows
+/// where each drive stood. Its drives share one runner, whose answers to the first bound the later ones'
+/// cold starts (`vm_e2e::Learned`). The stand-in's image (`VM_E2E_IMAGE_<KIND>=stub`) is kept in kiln for
+/// its harness's drives and booted as `agentfile:<id>` ([`vm_e2e::boots`]), as the REST drive boots it.
 fn every_harness(via: Via) -> anyhow::Result<()> {
     let gaps = super::gaps()?;
     let dir = tempfile::tempdir()?;
@@ -170,7 +178,7 @@ fn every_harness(via: Via) -> anyhow::Result<()> {
         let (_stand_in, kilns) = match vm_e2e::boots(&f, kind, &vm_e2e::builtin_image(kind)) {
             Ok(booted) => booted,
             Err(e) => {
-                failed.push(format!("{kind}: keeping the stand-in's Agentfile: {e:#}"));
+                super::failed_now(&mut failed, format!("{kind}: keeping the stand-in's Agentfile: {e:#}"));
                 continue;
             }
         };
@@ -178,11 +186,11 @@ fn every_harness(via: Via) -> anyhow::Result<()> {
         match super::rest::users_own(&f, kind) {
             Ok(Some(own)) => images.push(own),
             Ok(None) => eprintln!("SKIP: {kind} from a person's own Agentfile through {}: the stand-in's image is asked for and no text of a person's is named", via.through()),
-            Err(e) => failed.push(format!("{kind}: keeping a person's own Agentfile: {e:#}")),
+            Err(e) => super::failed_now(&mut failed, format!("{kind}: keeping a person's own Agentfile: {e:#}")),
         }
         for image in images {
             if let Err(e) = drive(&f, via, kind, &image, &project) {
-                failed.push(format!("{e:#}"));
+                super::failed_now(&mut failed, format!("{e:#}"));
             }
         }
     }

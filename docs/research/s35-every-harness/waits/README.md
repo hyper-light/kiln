@@ -122,6 +122,15 @@ written over the carrier's `=== TIMEOUT` line: the test writes the log at the of
 unknown. Every wait of the drive's that had no window then could hold for good: its first turn's (a drive's cold
 start) and its steered turn (`Asked::Steered`). Neither looked at the fixture's processes either.
 
+The same run's `step35::mcp::` began at 02:43:36Z under a 2400 s bound, code mode's test first, and ended at
+03:24:38Z with exit 143. Its log has code mode's claude, codex and gemini "person's own" SKIP lines and nothing
+after them. The MCP drive says each SKIP before its harness's drives, so claude's and codex's drives returned,
+and the third, gemini's, was in a wait until the bound. Whether the first two passed is unknown: the MCP drive
+said its failures only at its end, which never came. It also ended none of the agents a refused drive started,
+and said no `DRIVE:`. Its waits are `Pace::until` and `Pace::unlisted` (`mcp::drive`), so what follows bounds
+and judges them as it does the REST drive's, and the MCP drive now ends what it started and says where it
+stands as the REST drive does.
+
 - **A run's later drives are bounded where its first was not.** A fixture keeps what its runner answered in this
   run (`Learned`): its slowest start of a session to its first turn's end (`Asked::Opening`), and its slowest
   turn asked to be long (`Asked::Steered`), each a whole wait from the ask to its answer. A drive's cold start is
@@ -135,19 +144,22 @@ start) and its steered turn (`Asked::Steered`). Neither looked at the fixture's 
   start is refused only where its build and boot, with no word, outlast a whole earlier start (build, boot and
   turn). A later steered turn is refused only where it is silent for a whole earlier steered turn. Its own
   silences (`STEERED_GAP`) are a part of one. The drives of `step35::rest::s35_every_harness…` share one runner,
-  so its second to tenth are bounded. `s35_two_antigravity…`'s second agent is bounded by its first.
+  so its second to tenth are bounded, and so are each of `step35::mcp::`'s two tests' (code mode's and its
+  tools'), each on a runner of its own. `s35_two_antigravity…`'s second agent is bounded by its first.
 - **Every session wait follows the fixture's processes** (`Pace::until`, `Pace::unlisted`): where its own
   server or runner ended (`Fixture::ended`), the wait is refused at once, typed (`Stall::Party`), with the
   runner's log. A wait with no window still looks again when its runner goes, since kiln marks that runner's
   sessions `Disconnected` (`harness/registry.rs`) and the change comes down the session's socket.
 - **A drive refused part way ends what it started** (`Ends`): the session, the agent it started from inside,
-  and the resumed session, each by the API's DELETE as `Pace::stop` asks it. Its microVMs no longer run on
+  and the resumed session, each by the API's DELETE as `Pace::stop` asks it. The MCP drive's: the agent
+  `agents.start` started and the one that took its conversation up again. Its microVMs no longer run on
   into the next drive on the same runner.
 - **Where each wait stands is said as it begins**, so a run ended from outside shows it: `DRIVE: <harness>
-  from <image> in a microVM on <runner>`, then `WAIT: <harness's step> (session <id>): refused after <window>
-  without progress` or `… no window, its parties' liveness and kiln's word alone`. Setup waits say `WAIT:`
-  too. `step35::rest::` says each drive's failure as it comes (`FAILED: `) as well as at its end. A session
-  a refused drive left is said as it's ended (`ENDED: `).
+  from <image> in a microVM on <runner>` (the MCP drive's ends `through <its tools or code mode>`), then
+  `WAIT: <harness's step> (session <id>): refused after <window> without progress` or `… no window, its
+  parties' liveness and kiln's word alone`. Setup waits say `WAIT:` too. `step35::rest::` and `step35::mcp::`
+  say each drive's failure as it comes (`FAILED: `) as well as at their end. A session a refused drive left
+  is said as it's ended (`ENDED: `).
 
 ## What a wait wakes on
 
