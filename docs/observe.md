@@ -470,11 +470,12 @@ The functions are Datadog's, every one its pages list, by its categories:
 | Arithmetic | `abs`, `round(q[, places])`, `ceil`, `floor`, `pow(a, b)` (each a query or a number), `log2`, `log10`, `cumsum`, `integral`; `+ - * /` between queries and numbers, spaces or none (`a*100/(b+c)`); `max(a, b, ...)`, `min(...)` (`maximum`, `minimum`, as Datadog's querying page names them) of queries and numbers: at each point the largest (least) value present, a group only some arguments have keeping theirs (Datadog's own dashboards take `max(default_zero(otel), default_zero(agent))` for one figure under either name) |
 | Count | `count_nonzero`, `count_not_null` |
 | Exclusion | `exclude_null`, `clamp_min(q, n)`, `clamp_max(q, n)`, `cutoff_min(q, n)`, `cutoff_max(q, n)`; kiln's `clamp(q, lo, hi)` |
-| Interpolation | `.fill(null\|zero\|linear\|last[, seconds])` (`.fill(0)` is zero), `default_zero` |
+| Interpolation | `.fill(null\|zero\|linear\|last[, seconds])` (`.fill(0)` is zero), `default_zero`; a query's sources aligned before they combine (below) |
 | Rank | `top(q, n, 'mean'\|'min'\|'max'\|'sum'\|'last'\|'area'\|'l2norm', 'desc'\|'asc')`, `bottom`; the shortcuts `[top\|bottom][5\|10\|15\|20][_mean\|_min\|_max\|_last\|_area\|_l2norm]` |
 | Rate | `per_second`, `per_minute`, `per_hour`, `dt`, `diff`, `monotonic_diff`, `derivative`, `rate`, `throughput` |
 | Regression | `robust_trend`, `trend_line`, `piecewise_constant` |
-| Rollup | `.rollup(…)`, `moving_rollup(q, seconds[, 'avg'\|'sum'\|'min'\|'max'\|'count'])` |
+| Rollup | `.rollup(…)`, `moving_rollup(q, seconds[, 'avg'\|'sum'\|'min'\|'max'\|'count'\|'median'\|'pXX'\|'stddev'][, 'lookback'])` |
+| Nested queries | another layer of time aggregation, `rollup(q, 'avg'\|'sum'\|'min'\|'max'\|'count'\|'pXX'\|'stddev'[, seconds])`; of space aggregation, `avg(q, {tags})`, `sum`, `min`, `max`, `stddev`, and `percentile(q, 'pXX', {tags})`; the boolean remaps `is_greater(q, x)`, `is_less(q, x)`, `is_between(q, lo, hi)` |
 | Smoothing | `autosmooth`, `ewma(q[, span])` and `ewma_3\|5\|10\|20` (and 1, 7), `median_3\|5\|7\|9`, `rollingavg_5\|13\|21\|29` (Datadog's beta) |
 | Timeshift | `hour_before`, `day_before`, `week_before`, `month_before`, `timeshift(q, seconds)`, `calendar_shift(q, '-1d'\|'-2w'\|'-1mo'[, timezone])` |
 
@@ -610,29 +611,44 @@ spans' alike). Spans are searched as Datadog's trace explorer searches them (`pa
 same, and `resource_name:` (or `resource:`) the span's name, and `@duration` (ns, as stored) with a
 unit (`@duration:>250ms`, `@duration:[1s TO 5s]`: ns, us, µs, ms, s, m, h).
 
-**Datadog's syntax kiln does not read, and why.** Of what Datadog's pages state for a metric
-monitor's query, kiln leaves out only what has no written form or no meaning here:
+**Nested queries** are Datadog's (its page's JSON tab's formulas, a query in place of its `query1`):
+`rollup(avg:cpu{*} by {env,team}.rollup(avg, 300), 'p95', 1800)` reads its query at the query's own
+rollup (the range's step where it names none) and aggregates each of its buckets of 1800 s over the
+query's buckets that begin within it; `max(q, { env })` combines `q`'s series into the groups of the
+tags named (`N/A` where a series has none), `percentile(q, 'p95', {env})` the same at a percentile;
+`stddev` is the population's. `moving_rollup(q, 600, 'max', 'lookback')` reads its window before the
+range too, so its first buckets are whole, and lookback rollups nest
+(`moving_rollup(moving_rollup(q, 600, 'max', 'lookback'), 7200, 'stddev', 'lookback')`).
+`is_greater(q, 30)` is 1 where `q` is past 30 and 0 where not; `is_between`'s bounds are left out
+(Datadog's "exclusive"). A nested rollup reads buckets: not on a monitor's sum of `.as_count()`
+queries or its percentile, nor with a calendar rollup (§9).
 
-- *Cumulative time windows* (a monitor's current hour, day or month): Datadog's monitor
-  configuration page describes them in its editor and gives no query form, so there is none to read.
-- *Nested queries* (multilayer aggregation: a time or space aggregation of an aggregated query,
-  `stddev`, and the boolean remaps `is_greater`, `is_less`, `is_between`): Datadog's page shows them
-  only in pictures of its editor, never as query text, and does not say that monitors take them.
+**A query's sources aligned** (Datadog's "Interpolation and the Fill Modifier"): where more than one
+series answers a query (or its `.fill()` says), each is aligned before its group combines it, as
+Datadog's are: a gauge, and any other kind read without `.as_count()` or `.as_rate()`, interpolated
+linearly over a gap of up to 300 s (its `.fill()` saying otherwise; `.fill(null)` none); a count read
+`.as_count()` or `.as_rate()` "always aligned as 0" (its `default_zero()`'s page), so where another
+of its group's sources has a value in a bucket, it counts 0 there. `default_zero()` interpolates a
+gauge's points forward up to its limit first (the page's single point "interpolated five minutes
+forward"), then fills the rest with 0. `diff()` of a metric query is "done after applying time
+aggregation and before space aggregation": each series' change, then the group's; of anything else
+(a formula, a distribution), after.
+
+**Datadog's syntax kiln does not read, and why.** Of what Datadog's pages state for a metric
+monitor's query, kiln leaves out only what has no meaning here:
+
 - *Telemetry Source* functions: they choose among Datadog's own sources of a metric.
 - Other products' monitor queries in Datadog's API (cost, data jobs, network path, database
   monitoring, CI pipelines and tests, audit, processes, `"check".over(…)` service checks): data kiln
   does not keep (kiln's service checks are §9.4's).
 
-**Where kiln still reads Datadog's syntax otherwise.** Datadog aligns a group's sources before it
-combines them, interpolating each linearly up to five minutes after a real sample ("Interpolation
-occurs when more than one source corresponds to your graph query"; `.fill()` sets how; gauges only,
-once `.as_count()` or `.as_rate()` is said), and its `default_zero()` interpolates a gauge so before
-it fills the rest with zeros; kiln combines a group's series as they are, and fills after combining
-them. Datadog's `diff()` is "done after applying time aggregation and before space aggregation";
-kiln's after both. Datadog refuses `autosmooth()` in monitors (its span, chosen anew, could make a
-monitor flap); kiln takes it. Datadog's limits kiln does not keep: `top()` counts besides 5, 10, 25,
-50 and 100; a `.fill()` limit past 600 s; `!` and `,` beside `AND`, `OR` or `NOT` in one filter; a
-threshold under one without its leading zero; a monitor's `last` aggregation.
+**Where kiln still reads Datadog's syntax otherwise.** Datadog refuses `autosmooth()` in monitors (its
+span, chosen anew, could make a monitor flap); kiln takes it. Datadog's limits kiln does not keep:
+`top()` counts besides 5, 10, 25, 50 and 100; a `.fill()` limit past 600 s; `!` and `,` beside `AND`,
+`OR` or `NOT` in one filter; a threshold under one without its leading zero; a monitor's `last`
+aggregation; `moving_rollup`'s aggregators beyond its five outside lookback mode. Not yet read
+(§9's list): a dynamic threshold (`> threshold` with `critical_query`, in Datadog's preview), an
+anomaly monitor's `threshold_windows`, and a log or span monitor's `median` and `pcXX` measures.
 
 ## 7. API
 
@@ -1850,6 +1866,15 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   or `spans(...)`; §8.7). A string's `\"` is a quote within it, as Datadog's monitor API has it
   (`logs("\"connection refused\"")`). A window is whole buckets of a step that divides it, aligned
   to the step. A threshold is a finite number.
+- **Cumulative windows** are Datadog's `current_1h`, `current_1d` and `current_1mo` (its API's own
+  `avg(current_1mo):avg:system.load.5{*} > 0.5`): the hour, day or month so far, from where it began
+  to the evaluation's last whole step of it, a minute of an hour's, ten of a day's, half an hour of a
+  month's (Datadog's evaluation frequency for a window of that length), so a period's first step
+  has no value yet. It begins where the monitor's `scheduling_options.evaluation_window` says, held
+  to Datadog's rules for it: `hour_starts` (a minute) alone for an hour; `day_starts` (`04:00`),
+  `month_starts` (1) and `timezone` for a day and a month; unless it says, at the hour, midnight UTC
+  and the 1st. Metric monitors alone take them, and not `anomalies()` or `outliers()`, which read a
+  rolling window.
 - **Evaluation paths** are Datadog's (its guide "as_count() in Monitor Evaluations"). A metric
   monitor reads its window bucket by bucket, its time aggregation of the values its formula gives
   (the classic path). `sum` of a query read `.as_count()` sums each of its queries over the window
@@ -1869,7 +1894,10 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   after a timeframe when asked; groups silent a day are forgotten.
 - **Options**: thresholds (critical, warning, recoveries), `notify_no_data` and its timeframe,
   `renotify_interval`, `evaluation_delay` (late data counts), `every` (60 s unless it says, 10 s
-  at the most often); mute until a time or unmuted.
+  at the most often), `scheduling_options.evaluation_window` (a cumulative window's start, above);
+  mute until a time or unmuted. Not yet read: an anomaly monitor's `threshold_windows`
+  (`trigger_window`, `recovery_window`), a dynamic threshold (`> threshold` with
+  `thresholds.critical_query`, Datadog's preview), `require_full_window`.
 - **Messages** are Datadog's templates (`{{value}}`, `{{threshold}}`, `{{host.name}}`,
   `{{#is_alert}}…{{/is_alert}}`, `{{^is_recovery}}`, …), their `@slack-<name>`,
   `@discord-<name>`, `@teams-<name>`, `@pagerduty-<name>`, `@webhook-<name>` mentions naming

@@ -170,11 +170,14 @@ pub struct Request<'a> {
     /// The present (ms): a `forecast()` forecasts the buckets after its series' last point, and
     /// reads history for those after this. None: the range's end (nothing ahead).
     pub now: Option<i64>,
+    /// Whether the grid begins at `from` itself rather than at the step at or before it: a monitor's
+    /// cumulative window (`current_1h`, …), whose buckets count from its start.
+    pub anchored: bool,
 }
 
 impl<'a> Request<'a> {
     pub fn new(query: &'a str, from: i64, to: i64) -> Self {
-        Self { query, from, to, step: None, points: DEFAULT_POINTS, max_series: DEFAULT_MAX_SERIES, now: None }
+        Self { query, from, to, step: None, points: DEFAULT_POINTS, max_series: DEFAULT_MAX_SERIES, now: None, anchored: false }
     }
 }
 
@@ -356,6 +359,8 @@ enum Value {
     Set(Vec<Series>),
     /// A named argument (`forecast()`'s).
     Named(String, String),
+    /// A nested query's group of tags (`{env}`).
+    Group(Vec<String>),
 }
 
 /// Evaluates a query, its caller holding the store throughout.
@@ -457,16 +462,36 @@ fn eval_path(lease: &Lease<'_>, req: &Request<'_>, path: Path) -> Result<Answer,
     if req.to <= req.from {
         return Err(QueryError::EmptyRange);
     }
+    let nested = Nested::of(&ast);
+    if nested.any() && path != Path::Buckets {
+        return Err(QueryError::Invalid("a nested query's rollup() and moving_rollup(…, 'lookback') read buckets: not under a monitor's sum of .as_count() queries, nor its percentile".into()));
+    }
     let grid = match path {
         Path::Whole => Grid::uniform(req.from, req.to - req.from, 1),
-        Path::Buckets | Path::Summed => grid_for(&ast, req)?,
+        Path::Buckets | Path::Summed => grid_for(&ast, req, &nested)?,
     };
+    if nested.any() && grid.calendar.is_some() {
+        return Err(QueryError::Invalid("a nested query's rollup() is in seconds: not with a calendar rollup".into()));
+    }
     // A sum's formula reads one bucket of all of the grid.
     let whole = Grid::uniform(grid.from, grid.time(grid.n).saturating_sub(grid.from).max(1), 1);
     let shifts = shifts(&ast)?;
     let ext = extensions(&ast, grid, req.now);
-    // A node's grid: the answer's, begun `ext` buckets earlier beneath `anomalies()`.
-    let at = |e: usize| grid.earlier(e);
+    let fine = nested.steps(&ast, grid.step, base_step(req));
+    // A node's grid: the answer's, begun `ext` buckets earlier beneath `anomalies()`, a forecast and
+    // a lookback, and at its own step beneath a nested `rollup()`.
+    let node_grid = |id: usize| -> Result<Grid, QueryError> { refined(grid.earlier(ext.get(id).copied().unwrap_or(0)), fine.get(id).copied().flatten()) };
+    // Metric queries `diff()` reads before their space aggregation (Datadog's); then, those it did.
+    let mut diffed = vec![false; ast.nodes.len()];
+    for node in &ast.nodes {
+        if let Node::Call(Func::Diff, a) = node
+            && let Some(&x) = a.first()
+            && matches!(ast.nodes.get(x), Some(Node::Metric(_)))
+            && let Some(slot) = diffed.get_mut(x)
+        {
+            *slot = true;
+        }
+    }
     let mut values: Vec<Option<Value>> = vec![None; ast.nodes.len()];
     let mut scanned = (0u64, 0u64);
     let mut scratch = Scratch::default();
@@ -476,21 +501,31 @@ fn eval_path(lease: &Lease<'_>, req: &Request<'_>, path: Path) -> Result<Answer,
             Node::Num(n) => Value::Scalar(*n),
             Node::Str(s) => Value::Str(s.clone()),
             Node::Named(k, v) => Value::Named(k.clone(), v.clone()),
+            Node::Group(tags) => Value::Group(tags.clone()),
             Node::Metric(q) => {
-                if path == Path::Whole && distribution_of(&*lease.hold()?, q).is_none() {
+                // Whether it is a distribution, where that decides its reading: a percentile's, and a
+                // `diff()`'s before its space aggregation (a distribution's after its parts combine).
+                let wants = path == Path::Whole || diffed.get(id).copied().unwrap_or(false);
+                let dist = wants && distribution_of(&*lease.hold()?, q).is_some();
+                if path == Path::Whole && !dist {
                     let (NameMatch::Exact(name) | NameMatch::Glob(name)) = &q.metric;
                     return Err(QueryError::Invalid(format!("percentile(…) reads a distribution's values over the window: {name} is none")));
                 }
-                let g = at(ext.get(id).copied().unwrap_or(0));
+                let g = node_grid(id)?;
                 let edges = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
-                let set = metric(lease, q, g, Spans::new(g, edges.0, edges.1.as_deref()), req.max_series, &mut scratch, &mut scanned)?;
+                let diff = !dist && diffed.get(id).copied().unwrap_or(false);
+                if let Some(d) = diffed.get_mut(id) {
+                    *d = diff;
+                }
+                let before = Before { diff, align: true };
+                let set = metric(lease, q, g, Spans::new(g, edges.0, edges.1.as_deref()), req.max_series, &mut scratch, &mut scanned, Some(before))?;
                 Value::Set(if path == Path::Summed { summed(set) } else { set })
             }
             Node::Records(r) => {
                 if path == Path::Whole {
                     return Err(QueryError::Invalid("percentile(…) reads a distribution's values over the window: a log, span or event query has none".into()));
                 }
-                let g = at(ext.get(id).copied().unwrap_or(0));
+                let g = node_grid(id)?;
                 let (off, edges) = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
                 if edges.is_some() {
                     return Err(QueryError::Invalid("a log, span or event query is read in even buckets: no calendar rollup or calendar shift of one".into()));
@@ -508,7 +543,7 @@ fn eval_path(lease: &Lease<'_>, req: &Request<'_>, path: Path) -> Result<Answer,
                     }
                     Value::Set(s)
                 }
-                Value::Str(_) | Value::Named(..) => return Err(QueryError::Invalid("a string has no sign".into())),
+                Value::Str(_) | Value::Named(..) | Value::Group(_) => return Err(QueryError::Invalid("a string has no sign".into())),
             },
             Node::Bin(op, l, r) => {
                 let (a, b) = (take(&mut values, *l)?, take(&mut values, *r)?);
@@ -519,28 +554,59 @@ fn eval_path(lease: &Lease<'_>, req: &Request<'_>, path: Path) -> Result<Answer,
                 for &a in args {
                     taken.push(take(&mut values, a)?);
                 }
-                let own = ext.get(id).copied().unwrap_or(0);
+                let own = node_grid(id)?;
+                // The grid of the query beneath: earlier (a history, a lookback) or finer (a nested
+                // rollup's) than this node's own.
+                let child = match args.first() {
+                    Some(&a) => node_grid(a)?,
+                    None => own,
+                };
                 if path != Path::Buckets && matches!(f, Func::Anomalies | Func::Forecast | Func::Outliers) {
                     return Err(QueryError::Invalid("anomalies(), forecast() and outliers() read their query bucket by bucket: not under a monitor's sum of .as_count() queries, nor its percentile".into()));
                 }
-                if *f == Func::Anomalies {
-                    let inner = args.first().and_then(|&a| ext.get(a)).copied().unwrap_or(own);
-                    // Datadog's `count_default_zero` speaks of counts: a query read `.as_count()`.
-                    let counts = args.first().and_then(|&a| ast.nodes.get(a)).is_some_and(|n| matches!(n, Node::Metric(m) if m.mode == Some(CountMode::Count)));
-                    anomalies(taken, inner.saturating_sub(own), at(own), counts)?
-                } else if *f == Func::Forecast {
-                    forecast(taken, at(own))?
-                } else if *f == Func::Pow {
-                    let mut it = taken.into_iter();
-                    let (Some(a), Some(b)) = (it.next(), it.next()) else { return Err(QueryError::Invalid("pow(a, b)".into())) };
-                    binary(BinOp::Pow, a, b)?
-                } else if let Func::Max | Func::Min = f {
-                    extreme(*f == Func::Max, taken)?
-                } else {
-                    if taken.iter().any(|v| matches!(v, Value::Named(..))) {
-                        return Err(QueryError::Invalid(format!("{f:?} takes no named arguments (forecast() and anomalies() do)")));
+                match f {
+                    Func::Anomalies => {
+                        // Datadog's `count_default_zero` speaks of counts: a query read `.as_count()`.
+                        let counts = args.first().and_then(|&a| ast.nodes.get(a)).is_some_and(|n| matches!(n, Node::Metric(m) if m.mode == Some(CountMode::Count)));
+                        anomalies(taken, child.n.saturating_sub(own.n), own, counts)?
                     }
-                    call(*f, taken, if path == Path::Summed { whole } else { at(own) })?
+                    Func::Forecast => forecast(taken, own)?,
+                    Func::Pow => {
+                        let mut it = taken.into_iter();
+                        let (Some(a), Some(b)) = (it.next(), it.next()) else { return Err(QueryError::Invalid("pow(a, b)".into())) };
+                        binary(BinOp::Pow, a, b)?
+                    }
+                    Func::Max | Func::Min if taken.iter().any(|v| matches!(v, Value::Group(_))) => regroup(*f, taken)?,
+                    Func::Max | Func::Min => extreme(*f == Func::Max, taken)?,
+                    Func::Rollup => rerolled(taken, child, own)?,
+                    // Read before its space aggregation: as it is.
+                    Func::Diff if args.first().is_some_and(|&a| diffed.get(a).copied().unwrap_or(false)) => taken.into_iter().next().ok_or_else(|| QueryError::Invalid("diff(query)".into()))?,
+                    Func::DefaultZero => {
+                        // Datadog's: "fills empty time intervals using the value 0 or, if interpolation is
+                        // enabled, with interpolation", a gauge's interpolated forward first.
+                        let ahead = match args.first().and_then(|&a| ast.nodes.get(a)) {
+                            Some(Node::Metric(q)) if interpolates(&*lease.hold()?, q) => Some(fill_limit(q.fill)),
+                            _ => None,
+                        };
+                        call(*f, forward(taken, ahead, own), own)?
+                    }
+                    _ => {
+                        if taken.iter().any(|v| matches!(v, Value::Named(..))) {
+                            return Err(QueryError::Invalid(format!("{f:?} takes no named arguments (forecast() and anomalies() do)")));
+                        }
+                        let grid = if path == Path::Summed { whole } else { child };
+                        let mut v = call(*f, taken, grid)?;
+                        // A lookback's history read beneath it, left off.
+                        if let Value::Set(set) = &mut v
+                            && child.n > own.n
+                        {
+                            let drop = child.n - own.n;
+                            for s in set.iter_mut() {
+                                s.values.drain(..drop.min(s.values.len()));
+                            }
+                        }
+                        v
+                    }
                 }
             }
         };
@@ -552,7 +618,7 @@ fn eval_path(lease: &Lease<'_>, req: &Request<'_>, path: Path) -> Result<Answer,
     let (series, scalar) = match root {
         Value::Set(s) => (s, None),
         Value::Scalar(x) => (Vec::new(), Some(x)),
-        Value::Str(_) | Value::Named(..) => return Err(QueryError::Invalid("a query's result is a string".into())),
+        Value::Str(_) | Value::Named(..) | Value::Group(_) => return Err(QueryError::Invalid("a query's result is a string".into())),
     };
     if series.len() > req.max_series {
         return Err(QueryError::TooManySeries(series.len(), req.max_series));
@@ -572,9 +638,22 @@ fn summed(set: Vec<Series>) -> Vec<Series> {
         .collect()
 }
 
+/// The step a request's range reads at with no rollup named: the step asked, or the smallest nice
+/// step that fits the range in the points asked.
+fn base_step(req: &Request<'_>) -> i64 {
+    match req.step {
+        Some(s) if s > 0 => s,
+        _ => {
+            let raw = req.to.saturating_sub(req.from) / (req.points.max(1) as i64);
+            STEPS.iter().map(|s| s * 1000).find(|&s| s >= raw).unwrap_or(raw.max(1000)).max(1000)
+        }
+    }
+}
+
 /// The grid: the step asked, or the smallest nice step that fits the range in the points asked,
-/// and never finer than a rollup the query names; `from` aligned down to it.
-fn grid_for(ast: &Ast, req: &Request<'_>) -> Result<Grid, QueryError> {
+/// and never finer than a rollup the query names (a nested `rollup()`'s query's own beneath it
+/// aside); `from` aligned down to it, unless the request is anchored at its start.
+fn grid_for(ast: &Ast, req: &Request<'_>, nested: &Nested) -> Result<Grid, QueryError> {
     let mut calendars = ast.nodes.iter().filter_map(|n| match n {
         Node::Metric(m) => m.calendar,
         _ => None,
@@ -598,32 +677,126 @@ fn grid_for(ast: &Ast, req: &Request<'_>) -> Result<Grid, QueryError> {
         c.start(&tz, last + 1).ok_or_else(past)?;
         return Ok(Grid { from: c.start(&tz, first).ok_or_else(past)?, step: c.unit.nominal_ms(), n, calendar: Some((c, first)) });
     }
-    let range = req.to.saturating_sub(req.from);
     let rollup_ms = ast
         .nodes
         .iter()
-        .filter_map(|n| match n {
+        .enumerate()
+        .filter(|(id, _)| !nested.beneath(*id))
+        .filter_map(|(_, n)| match n {
             Node::Metric(m) => m.rollup.and_then(|r| r.1).map(|s| s.saturating_mul(1000)),
             // A forecast's `interval=` (seconds): Datadog's rollup of its points.
             Node::Named(k, v) if k == "interval" => v.parse::<f64>().ok().filter(|s| *s >= 1.0).map(|s| (s * 1000.0) as i64),
+            Node::Call(Func::Rollup, args) => args.get(2).and_then(|&a| constant(ast, a)).filter(|s| *s >= 1.0).map(|s| (s * 1000.0) as i64),
             _ => None,
         })
         .max()
         .unwrap_or(0);
-    let step = match req.step {
-        Some(s) if s > 0 => s.max(rollup_ms),
-        _ => {
-            let raw = range / (req.points.max(1) as i64);
-            let nice = STEPS.iter().map(|s| s * 1000).find(|&s| s >= raw).unwrap_or(raw.max(1000));
-            nice.max(rollup_ms).max(1000)
-        }
-    };
-    let from = req.from.div_euclid(step) * step;
+    let step = base_step(req).max(rollup_ms);
+    let from = if req.anchored { req.from } else { req.from.div_euclid(step) * step };
     let n = usize::try_from((req.to - from + step - 1) / step).unwrap_or(usize::MAX);
     if n > MAX_POINTS {
         return Err(QueryError::TooManyPoints(n));
     }
     Ok(Grid::uniform(from, step, n))
+}
+
+/// A query's nested rollups (Datadog's nested queries, `rollup(q, 'p95', 1800)`): of each node, the
+/// nearest `rollup()` whose query it is part of, which reads it at a step of its own.
+struct Nested {
+    owner: Vec<Option<usize>>,
+    /// Whether the query has a nested rollup or a `moving_rollup(…, 'lookback')`.
+    any: bool,
+}
+
+impl Nested {
+    fn of(ast: &Ast) -> Self {
+        let mut owner: Vec<Option<usize>> = vec![None; ast.nodes.len()];
+        let mut any = false;
+        // Parents come after their children: from the end, a parent is seen before its children.
+        for id in (0..ast.nodes.len()).rev() {
+            let here = owner.get(id).copied().flatten();
+            let (kids, rolls): (&[usize], bool) = match ast.nodes.get(id) {
+                Some(Node::Call(Func::Rollup, args)) => (args.as_slice(), true),
+                Some(Node::Call(f, args)) => {
+                    any |= *f == Func::MovingAvg && lookback(ast, args).is_some();
+                    (args.as_slice(), false)
+                }
+                Some(Node::Bin(_, l, r)) => {
+                    if let Some(o) = owner.get_mut(*l) {
+                        *o = here;
+                    }
+                    (std::slice::from_ref(r), false)
+                }
+                Some(Node::Neg(x)) => (std::slice::from_ref(x), false),
+                _ => (&[], false),
+            };
+            any |= rolls;
+            for (k, &c) in kids.iter().enumerate() {
+                if let Some(o) = owner.get_mut(c) {
+                    *o = if rolls && k == 0 { Some(id) } else { here };
+                }
+            }
+        }
+        Self { owner, any }
+    }
+
+    fn any(&self) -> bool {
+        self.any
+    }
+
+    /// Whether node `id` is part of a nested rollup's query.
+    fn beneath(&self, id: usize) -> bool {
+        self.owner.get(id).copied().flatten().is_some()
+    }
+
+    /// Each node's step where it is part of a nested rollup's query: the coarsest rollup in seconds
+    /// that query names directly (a metric query's, a deeper nested rollup's), else `base`, the
+    /// range's own; never coarser than the rollup's own buckets (`top`, the answer's, at the top).
+    fn steps(&self, ast: &Ast, top: i64, base: i64) -> Vec<Option<i64>> {
+        let n = ast.nodes.len();
+        let mut asked: Vec<Option<i64>> = vec![None; n];
+        for (id, node) in ast.nodes.iter().enumerate() {
+            let Some(o) = self.owner.get(id).copied().flatten() else { continue };
+            let ms = match node {
+                Node::Metric(m) => m.rollup.and_then(|r| r.1).map(|s| s.saturating_mul(1000)),
+                Node::Call(Func::Rollup, args) => args.get(2).and_then(|&a| constant(ast, a)).filter(|s| *s >= 1.0).map(|s| (s * 1000.0) as i64),
+                _ => None,
+            };
+            if let (Some(ms), Some(slot)) = (ms, asked.get_mut(o)) {
+                *slot = Some(slot.map_or(ms, |x| x.max(ms)));
+            }
+        }
+        // Each nested rollup's query's step, an outer rollup's (later in the arena) first.
+        let mut child: Vec<Option<i64>> = vec![None; n];
+        for id in (0..n).rev() {
+            if !matches!(ast.nodes.get(id), Some(Node::Call(Func::Rollup, _))) {
+                continue;
+            }
+            let own = self.owner.get(id).copied().flatten().and_then(|o| child.get(o).copied().flatten()).unwrap_or(top);
+            if let Some(slot) = child.get_mut(id) {
+                *slot = Some(asked.get(id).copied().flatten().unwrap_or(base).min(own).max(1000));
+            }
+        }
+        (0..n).map(|id| self.owner.get(id).copied().flatten().and_then(|o| child.get(o).copied().flatten())).collect()
+    }
+}
+
+/// `g`'s span read at step `c` (a nested rollup's query's), from `g`'s start.
+fn refined(g: Grid, c: Option<i64>) -> Result<Grid, QueryError> {
+    let Some(c) = c.filter(|&c| c > 0 && c != g.step) else { return Ok(g) };
+    let n = usize::try_from((g.time(g.n) - g.from + c - 1) / c).unwrap_or(usize::MAX);
+    if n > MAX_POINTS {
+        return Err(QueryError::TooManyPoints(n));
+    }
+    Ok(Grid::uniform(g.from, c, n))
+}
+
+/// `moving_rollup(…, 'lookback')`'s window (ms), which it reads before the range too (Datadog's
+/// nested queries' mode); none without it.
+fn lookback(ast: &Ast, args: &[usize]) -> Option<i64> {
+    let on = args.iter().skip(2).any(|&a| matches!(ast.nodes.get(a), Some(Node::Str(s)) if s.eq_ignore_ascii_case("lookback")));
+    let secs = args.get(1).and_then(|&a| constant(ast, a))?;
+    (on && secs > 0.0).then(|| (secs * 1000.0) as i64)
 }
 
 /// A shift of the reading beneath a function: fixed (`timeshift`, `hour_before` …), or a calendar's
@@ -764,6 +937,10 @@ fn extensions(ast: &Ast, grid: Grid, now: Option<i64>) -> Vec<usize> {
             }
             Some(Node::Call(Func::Anomalies, args)) => (args.get(..1).unwrap_or(&[]), history),
             Some(Node::Call(Func::Forecast, args)) => (args.get(..1).unwrap_or(&[]), forecast_history(ast, args, grid, now).min(MAX_POINTS.saturating_sub(grid.n))),
+            Some(Node::Call(Func::MovingAvg, args)) if lookback(ast, args).is_some() => {
+                let back = lookback(ast, args).map_or(0, |ms| usize::try_from((ms + step - 1) / step).unwrap_or(0));
+                (args.get(..1).unwrap_or(&[]), back.min(MAX_POINTS.saturating_sub(grid.n)))
+            }
             Some(Node::Call(_, args)) => (args.as_slice(), 0),
             _ => (&[], 0),
         };
@@ -1357,7 +1534,7 @@ fn explicit_quantile(lease: &Lease<'_>, q: &MetricQuery, bucket: &str, grid: Gri
     let mut by = q.by.clone();
     by.push("le".into());
     let part = MetricQuery { metric: NameMatch::Exact(format!("{name}{bucket}")), space: SpaceAgg::Sum, by, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, fill: None, ..q.clone() };
-    let per_le = metric(lease, &part, grid, spans, max_series.saturating_mul(64), scratch, scanned)?;
+    let per_le = metric(lease, &part, grid, spans, max_series.saturating_mul(64), scratch, scanned, None)?;
     // Each group (its tags but `le`): its bounds and their counts in each bucket of time.
     let mut groups: std::collections::BTreeMap<Vec<(String, String)>, Vec<(f64, Vec<f64>)>> = std::collections::BTreeMap::new();
     for s in per_le {
@@ -1421,8 +1598,8 @@ fn distribution(lease: &Lease<'_>, q: &MetricQuery, parts: Parts, grid: Grid, sp
         SpaceAgg::Pct(p) => p,
         SpaceAgg::CountWhere(t, x) => return threshold_counts(lease, q, name, t, x, grid, spans, max_series, scratch, scanned),
         SpaceAgg::Avg => {
-            let sums = metric(lease, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
-            let counts = metric(lease, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
+            let sums = metric(lease, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned, None)?;
+            let counts = metric(lease, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned, None)?;
             return Ok(sums
                 .into_iter()
                 .filter_map(|mut s| {
@@ -1434,11 +1611,11 @@ fn distribution(lease: &Lease<'_>, q: &MetricQuery, parts: Parts, grid: Grid, sp
                 })
                 .collect());
         }
-        SpaceAgg::Sum => return metric(lease, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
-        SpaceAgg::Count => return metric(lease, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
+        SpaceAgg::Sum => return metric(lease, &part(parts.sum, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned, None),
+        SpaceAgg::Count => return metric(lease, &part(parts.count, SpaceAgg::Sum), grid, spans, max_series, scratch, scanned, None),
         // Prometheus's histogram keeps no least or most: none to read.
-        SpaceAgg::Min => return parts.min.map_or(Ok(Vec::new()), |min| metric(lease, &MetricQuery { mode: None, ..part(min, SpaceAgg::Min) }, grid, spans, max_series, scratch, scanned)),
-        SpaceAgg::Max => return parts.max.map_or(Ok(Vec::new()), |max| metric(lease, &MetricQuery { mode: None, ..part(max, SpaceAgg::Max) }, grid, spans, max_series, scratch, scanned)),
+        SpaceAgg::Min => return parts.min.map_or(Ok(Vec::new()), |min| metric(lease, &MetricQuery { mode: None, ..part(min, SpaceAgg::Min) }, grid, spans, max_series, scratch, scanned, None)),
+        SpaceAgg::Max => return parts.max.map_or(Ok(Vec::new()), |max| metric(lease, &MetricQuery { mode: None, ..part(max, SpaceAgg::Max) }, grid, spans, max_series, scratch, scanned, None)),
     };
     // Found under a hold let go before the reading (and before an explicit histogram's).
     let groups = bucket_groups(&*lease.hold()?, q, name, max_series)?;
@@ -1776,7 +1953,7 @@ fn heatmap_with(lease: &Lease<'_>, req: &Request<'_>, rows: usize) -> Result<Hea
         _ => None,
     };
     if let Some((q, members)) = buckets {
-        let grid = grid_for(&ast, req)?;
+        let grid = grid_for(&ast, req, &Nested::of(&ast))?;
         let edges = grid.edges(0);
         let spans = Spans::new(grid, 0, edges.as_deref());
         let (mut table, mut coarser) = (DistTable::default(), DistTable::default());
@@ -1864,8 +2041,22 @@ fn records(lease: &Lease<'_>, r: &RecordQuery, grid: Grid, off: i64, max_series:
     Ok(out)
 }
 
-/// A metric query's series on the grid.
-fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+/// What a query's own series go through before its space aggregation, as Datadog's do: `diff()`
+/// ("done after applying time aggregation and before space aggregation"), and the alignment of its
+/// sources (`align`): where more than one source corresponds to it (or a `.fill()` is said), each
+/// gauge's, and each other's read without `.as_count()` or `.as_rate()`, interpolated as its
+/// `.fill()` says (linear over gaps of up to 300 s unless it says; none with `.fill(null)`), and a
+/// count's read so a 0 in a bucket another source of its group has a value in ("always aligned as
+/// 0"). Datadog's "Interpolation and the Fill Modifier" and its `default_zero()`'s page.
+#[derive(Debug, Clone, Copy, Default)]
+struct Before {
+    diff: bool,
+    align: bool,
+}
+
+/// A metric query's series on the grid; `before`, a query's own (not a distribution's parts').
+#[allow(clippy::too_many_arguments)]
+fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64), before: Option<Before>) -> Result<Vec<Series>, QueryError> {
     let dist = distribution_of(&*lease.hold()?, q);
     if let Some((_, parts)) = dist {
         return distribution(lease, q, parts, grid, spans, max_series, scratch, scanned);
@@ -1875,7 +2066,7 @@ fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_
         return Err(QueryError::Invalid(format!("count(v: …) reads a distribution's values: {name} is none")));
     }
     // Its series and their groups, found under one hold; read after, a round at a time.
-    let (ids, group_of, group_tags, mut acc) = {
+    let (ids, group_of, group_tags, mut acc, counted) = {
         let store = lease.hold()?;
         let mut ids = Vec::new();
         store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
@@ -1889,6 +2080,9 @@ fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_
         let mut group_tags: Vec<Vec<(String, String)>> = Vec::new();
         let mut acc: Vec<Acc> = Vec::new();
         let mut group_of: Vec<usize> = Vec::with_capacity(ids.len());
+        // Each group's sources read as counts (`.as_count()`, `.as_rate()`), where they align as 0.
+        let zeroed = before.is_some_and(|b| b.align) && ids.len() > 1 && q.mode.is_some() && q.fill.is_none() && !q.weighted;
+        let mut counted: Vec<usize> = Vec::new();
         for &id in &ids {
             let Some(s) = store.series(id) else {
                 group_of.push(usize::MAX);
@@ -1910,10 +2104,20 @@ fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_
                 }
             };
             group_of.push(g);
+            if zeroed && matches!(s.kind(), Kind::Count | Kind::Counter) {
+                counted.resize(counted.len().max(g + 1), 0);
+                if let Some(c) = counted.get_mut(g) {
+                    *c += 1;
+                }
+            }
         }
-        (ids, group_of, group_tags, acc)
+        (ids, group_of, group_tags, acc, counted)
     };
     let (from, end) = (spans.start(0), spans.start(grid.n));
+    let before = before.unwrap_or_default();
+    // A weighted gauge's share of each bucket stands for its interpolation: its fill after.
+    let aligned = before.align && !q.weighted;
+    let interp = (aligned && q.fill != Some(Fill::Null) && (ids.len() > 1 || q.fill.is_some())).then(|| q.fill.unwrap_or(Fill::Linear(None)));
     // A grid of whole windows of a tier is read window by window (`crate::rollup`): from rollups
     // where a block holds them.
     let tier = if q.weighted { None } else { tier_for(spans) };
@@ -1943,6 +2147,9 @@ fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_
             scanned.0 += 1;
             scanned.1 += ts.len() as u64;
             rollup(kind, q, spans, &ts, &vs, &mut buckets, if weighted { Some(&mut counts) } else { None });
+            if before.diff {
+                diff_in_place(&mut buckets);
+            }
             let Some(a) = acc.get_mut(g) else { continue };
             if !weighted {
                 a.add(&buckets, None);
@@ -1959,7 +2166,7 @@ fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_
             }
         }
     } else {
-        let at = Reading { lease, q, grid, spans, tier, from, end };
+        let at = Reading { lease, q, grid, spans, tier, from, end, interp, diff: before.diff };
         let mut reader = Reader::new(&at, std::mem::take(scratch));
         let read = read_groups(&at, &ids, &group_of, &mut acc, &mut reader, scanned);
         *scratch = reader.scratch;
@@ -1981,9 +2188,12 @@ fn metric(lease: &Lease<'_>, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_
         }
     }
     let mut out = Vec::with_capacity(acc.len());
-    for (tags, a) in group_tags.into_iter().zip(acc) {
-        let mut values = a.finish();
-        if let Some(fill) = q.fill {
+    for (g, (tags, a)) in group_tags.into_iter().zip(acc).enumerate() {
+        let mut values = a.finish(counted.get(g).copied().unwrap_or(0));
+        // Filled as its sources were, before they were combined; else here.
+        if let Some(fill) = q.fill
+            && !aligned
+        {
             apply_fill(fill, grid, &mut values);
         }
         out.push(Series { tags, values, bounds: None , outlier: None });
@@ -2003,6 +2213,9 @@ struct Reading<'a> {
     tier: Option<i64>,
     from: i64,
     end: i64,
+    /// Each series' interpolation before it is combined ([`Before`]), and its `diff()`.
+    interp: Option<Fill>,
+    diff: bool,
 }
 
 /// Bytes of heads a snapshot of a query's series copies at the most ([`Lease::snapshot`]), under its
@@ -2094,17 +2307,28 @@ impl Reader {
         self.vs.clear();
         // A counter's increase into the first bucket needs the sample before it.
         let lookback = if kind == Kind::Counter { at.grid.step } else { 0 };
-        if let Some(width) = at.tier {
+        let samples = if let Some(width) = at.tier {
             self.rolled.clear();
             let roll = Roll { width, from: at.from, to: at.end, kind, cols: columns_for(kind, at.q) };
             src.read_rolled(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &roll, &mut self.scratch, &mut self.ts, &mut self.vs, &mut self.rolled)?;
             rollup_windows(kind, at.q, at.spans, width, &self.ts, &self.vs, &self.rolled, &mut self.buckets, &mut self.window_n);
-            Ok(Some(self.ts.len() as u64 + self.rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>()))
+            self.ts.len() as u64 + self.rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>()
         } else {
             src.read_with(id, at.from.saturating_sub(lookback), at.end.saturating_sub(1), &mut self.scratch, &mut self.ts, &mut self.vs)?;
             rollup(kind, at.q, at.spans, &self.ts, &self.vs, &mut self.buckets, None);
-            Ok(Some(self.ts.len() as u64))
+            self.ts.len() as u64
+        };
+        // Interpolated where it is (a gauge's always; another kind's unless read as counts, or a
+        // fill asked), then its `diff()`: both before its group combines it.
+        if let Some(fill) = at.interp
+            && (kind == Kind::Gauge || at.q.mode.is_none() || at.q.fill.is_some())
+        {
+            apply_fill(fill, at.grid, &mut self.buckets);
         }
+        if at.diff {
+            diff_in_place(&mut self.buckets);
+        }
+        Ok(Some(samples))
     }
 }
 
@@ -2767,20 +2991,25 @@ impl Acc {
         }
     }
 
-    fn finish(self) -> Vec<f64> {
+    /// Its values a bucket; with `sources` (counts aligned as 0, [`Before`]), each source without a
+    /// value in a bucket another has one in a 0 there.
+    fn finish(self, sources: usize) -> Vec<f64> {
+        let zeros = |present: f64| if present > 0.0 { (sources as f64 - present).max(0.0) } else { 0.0 };
         match self {
             Self::Moments { kind, a, n } => a
                 .into_iter()
                 .zip(n)
                 .map(|(x, c)| match kind {
-                    SpaceAgg::Avg if c > 0.0 => x / c,
+                    SpaceAgg::Avg if c > 0.0 => x / (c + zeros(c)),
                     SpaceAgg::Count => {
                         if c > 0.0 {
-                            c
+                            c + zeros(c)
                         } else {
                             f64::NAN
                         }
                     }
+                    SpaceAgg::Min if zeros(c) > 0.0 => x.min(0.0),
+                    SpaceAgg::Max if zeros(c) > 0.0 => x.max(0.0),
                     _ => x,
                 })
                 .collect(),
@@ -2794,7 +3023,10 @@ impl Acc {
                         i += 1;
                     }
                     if let (Some(slot), Some(run)) = (out.get_mut(b as usize), v.get(start..i)) {
-                        *slot = percentile_sorted(run.iter().map(|x| x.1), run.len(), pct);
+                        // Its zeros in their place among the sorted values.
+                        let z = sources.saturating_sub(run.len());
+                        let sorted = run.iter().map(|x| x.1).filter(|v| *v < 0.0).chain(std::iter::repeat_n(0.0, z)).chain(run.iter().map(|x| x.1).filter(|v| *v >= 0.0));
+                        *slot = percentile_sorted(sorted, run.len() + z, pct);
                     }
                 }
                 out
@@ -2823,6 +3055,18 @@ fn percentile_sorted(mut sorted: impl Iterator<Item = f64>, n: usize, p: f64) ->
     }
     let b = sorted.next().unwrap_or(a);
     a + (b - a) * (h - lo as f64)
+}
+
+/// `diff()` of a series' buckets: each the change from the last bucket before it with a value.
+fn diff_in_place(v: &mut [f64]) {
+    let mut prev = f64::NAN;
+    for x in v.iter_mut() {
+        let cur = *x;
+        *x = cur - prev;
+        if !cur.is_nan() {
+            prev = cur;
+        }
+    }
 }
 
 fn apply_fill(fill: Fill, grid: Grid, v: &mut [f64]) {
@@ -2998,7 +3242,7 @@ fn extreme(max: bool, args: Vec<Value>) -> Result<Value, QueryError> {
                     lone = s.into_iter().next();
                 }
             }
-            Value::Str(_) | Value::Named(..) => return Err(QueryError::Invalid("max() and min() take queries and numbers".into())),
+            Value::Str(_) | Value::Named(..) | Value::Group(_) => return Err(QueryError::Invalid("max() and min() take queries and numbers; a group of tags, alone with one query".into())),
         }
     }
     if !sets {
@@ -3031,6 +3275,11 @@ fn extreme(max: bool, args: Vec<Value>) -> Result<Value, QueryError> {
 }
 
 fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> {
+    match f {
+        Func::IsGreater | Func::IsLess | Func::IsBetween => return remap(f, args),
+        Func::Avg | Func::Sum | Func::Stddev | Func::Percentile => return regroup(f, args),
+        _ => {}
+    }
     // A bucket's width: the step's, or a calendar period's own (a month's days, a day's hours where
     // the clocks change).
     let edges = grid.edges(0);
@@ -3110,7 +3359,25 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
         }
         // Evaluated apart (`anomalies`, `forecast`: they read their query's history; the shifts:
         // they move their query's reading; `pow`, `max`, `min`: any argument a query or a number).
-        Func::Timeshift | Func::Anomalies | Func::Forecast | Func::Pow | Func::Max | Func::Min | Func::HourBefore | Func::DayBefore | Func::WeekBefore | Func::MonthBefore | Func::CalendarShift => {}
+        Func::Timeshift
+        | Func::Anomalies
+        | Func::Forecast
+        | Func::Pow
+        | Func::Max
+        | Func::Min
+        | Func::HourBefore
+        | Func::DayBefore
+        | Func::WeekBefore
+        | Func::MonthBefore
+        | Func::CalendarShift
+        | Func::Rollup
+        | Func::Avg
+        | Func::Sum
+        | Func::Stddev
+        | Func::Percentile
+        | Func::IsGreater
+        | Func::IsLess
+        | Func::IsBetween => {}
         Func::Round => {
             let places = match args.first() {
                 Some(v) => num(Some(v), "the decimal places")?,
@@ -3268,27 +3535,26 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
             }
         }
         Func::MovingAvg => {
-            // `moving_rollup(query, seconds, aggregator)`: the last seconds' points combined.
+            // `moving_rollup(query, seconds[, aggregator][, 'lookback'])`: the last seconds' points
+            // combined; with `'lookback'` its query was read that far before the range too
+            // (`extensions`), which its caller leaves off.
             let secs = num(args.first(), "the window's seconds")?;
-            let how = text(args.get(1), "avg");
-            if !matches!(how.as_str(), "avg" | "sum" | "min" | "max" | "count") {
-                return Err(QueryError::Invalid(format!("moving_rollup's aggregator: {how} (avg, sum, min, max, count)")));
-            }
+            let how = args.iter().skip(1).find_map(|a| match a {
+                Value::Str(s) if !s.eq_ignore_ascii_case("lookback") => Some(s.to_ascii_lowercase()),
+                _ => None,
+            });
+            let how = how.unwrap_or_else(|| "avg".to_owned());
+            let layer = Layer::parse(&how).ok_or_else(|| QueryError::Invalid(format!("moving_rollup's aggregator: {how} (avg, sum, min, max, count, median, pXX, stddev)")))?;
             let k = ((secs * 1000.0 / grid.step as f64).round() as usize).max(1);
+            // A window wider than the series holds it all: no more room than that.
+            let mut win = Vec::with_capacity(k.min(grid.n));
             for s in &mut set {
                 let src = s.values.clone();
                 for (i, v) in s.values.iter_mut().enumerate() {
-                    let win = src.get(i.saturating_sub(k - 1)..=i).unwrap_or(&[]).iter().copied().filter(|x| !x.is_nan());
-                    *v = match how.as_str() {
-                        "sum" => win.fold(None, |a: Option<f64>, x| Some(a.unwrap_or(0.0) + x)).unwrap_or(f64::NAN),
-                        "min" => win.reduce(f64::min).unwrap_or(f64::NAN),
-                        "max" => win.reduce(f64::max).unwrap_or(f64::NAN),
-                        "count" => win.count() as f64,
-                        _ => {
-                            let (sum, c) = win.fold((0.0, 0u32), |(s, c), x| (s + x, c + 1));
-                            if c == 0 { f64::NAN } else { sum / f64::from(c) }
-                        }
-                    };
+                    win.clear();
+                    win.extend(src.get(i.saturating_sub(k - 1)..=i).unwrap_or(&[]).iter().copied().filter(|x| !x.is_nan()));
+                    // A count of a window without points is 0.
+                    *v = if layer == Layer::Count { win.len() as f64 } else { layer.fold(&mut win) };
                 }
             }
         }
@@ -3316,6 +3582,266 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
         }
     }
     Ok(Value::Set(set))
+}
+
+/// A layer of aggregation of a nested query (`rollup()`'s, a group's) and of `moving_rollup()`:
+/// Datadog's `avg`, `sum`, `min`, `max`, `count`, `median`, `pXX` (0–100) and `stddev`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Layer {
+    Avg,
+    Sum,
+    Min,
+    Max,
+    Count,
+    Pct(f64),
+    Stddev,
+}
+
+impl Layer {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "avg" | "mean" => Self::Avg,
+            "sum" => Self::Sum,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            "count" => Self::Count,
+            "median" => Self::Pct(50.0),
+            "stddev" => Self::Stddev,
+            p => {
+                let v: f64 = p.strip_prefix('p')?.parse().ok()?;
+                if !(0.0..=100.0).contains(&v) {
+                    return None;
+                }
+                Self::Pct(v)
+            }
+        })
+    }
+
+    /// Of `vals` (finite; reordered): none of none.
+    fn fold(self, vals: &mut [f64]) -> f64 {
+        if vals.is_empty() {
+            return f64::NAN;
+        }
+        let n = vals.len() as f64;
+        match self {
+            Self::Avg => vals.iter().sum::<f64>() / n,
+            Self::Sum => vals.iter().sum(),
+            Self::Min => vals.iter().copied().fold(f64::INFINITY, f64::min),
+            Self::Max => vals.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            Self::Count => n,
+            Self::Pct(p) => percentile(vals, p),
+            // The population's: Datadog's page does not say which (NumPy's `std` default, ddof 0).
+            Self::Stddev => {
+                let m = vals.iter().sum::<f64>() / n;
+                (vals.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / n).sqrt()
+            }
+        }
+    }
+}
+
+/// `rollup(q, agg[, seconds])`, a nested query's further time aggregation: each bucket of this
+/// node's grid (`own`) the aggregation of `q`'s buckets (read at its own step, `child`) that begin
+/// within it.
+fn rerolled(args: Vec<Value>, child: Grid, own: Grid) -> Result<Value, QueryError> {
+    let usage = || QueryError::Invalid("rollup(query, 'avg'|'sum'|'min'|'max'|'count'|'pXX'|'stddev'[, seconds])".into());
+    let mut it = args.into_iter();
+    let set = match it.next() {
+        Some(Value::Set(s)) => s,
+        _ => return Err(usage()),
+    };
+    let layer = match it.next() {
+        Some(Value::Str(a)) => Layer::parse(&a).ok_or_else(usage)?,
+        _ => return Err(usage()),
+    };
+    if !matches!(it.next(), None | Some(Value::Scalar(_))) {
+        return Err(usage());
+    }
+    let mut vals = Vec::new();
+    let out = set
+        .into_iter()
+        .map(|mut s| {
+            let mut values = vec![f64::NAN; own.n];
+            let mut j = 0;
+            for (i, slot) in values.iter_mut().enumerate() {
+                let (lo, hi) = (own.time(i), own.time(i + 1));
+                vals.clear();
+                while j < child.n && child.time(j) < hi {
+                    if child.time(j) >= lo
+                        && let Some(&v) = s.values.get(j)
+                        && v.is_finite()
+                    {
+                        vals.push(v);
+                    }
+                    j += 1;
+                }
+                *slot = layer.fold(&mut vals);
+            }
+            s.values = values;
+            s
+        })
+        .collect();
+    Ok(Value::Set(out))
+}
+
+/// `avg(q, {tags})` (`sum`, `min`, `max`, `stddev`) and `percentile(q, 'pXX', {tags})`: a nested
+/// query's further space aggregation, `q`'s series combined a bucket at a time into the groups of
+/// the tags named (a series without one of them in its group of `N/A`).
+fn regroup(f: Func, args: Vec<Value>) -> Result<Value, QueryError> {
+    let name = format!("{f:?}").to_ascii_lowercase();
+    let usage = || QueryError::Invalid(format!("{name}(query, {}{{tag, …}})", if f == Func::Percentile { "'pXX', " } else { "" }));
+    let mut it = args.into_iter();
+    let set = match it.next() {
+        Some(Value::Set(s)) => s,
+        _ => return Err(usage()),
+    };
+    let layer = match f {
+        Func::Avg => Layer::Avg,
+        Func::Sum => Layer::Sum,
+        Func::Min => Layer::Min,
+        Func::Max => Layer::Max,
+        Func::Stddev => Layer::Stddev,
+        Func::Percentile => match it.next() {
+            Some(Value::Str(p)) => Layer::parse(&p).filter(|l| matches!(l, Layer::Pct(_))).ok_or_else(usage)?,
+            _ => return Err(usage()),
+        },
+        _ => return Err(usage()),
+    };
+    let (Some(Value::Group(by)), None) = (it.next(), it.next()) else { return Err(usage()) };
+    let n = set.iter().map(|s| s.values.len()).max().unwrap_or(0);
+    let mut groups: Vec<(Vec<(String, String)>, Vec<usize>)> = Vec::new();
+    let mut index: HashMap<Vec<(String, String)>, usize> = HashMap::new();
+    for (i, s) in set.iter().enumerate() {
+        let key: Vec<(String, String)> = by.iter().map(|k| (k.clone(), s.tags.iter().find(|(t, _)| t == k).map_or_else(|| "N/A".to_owned(), |(_, v)| v.clone()))).collect();
+        let g = match index.get(&key) {
+            Some(&g) => g,
+            None => {
+                groups.push((key.clone(), Vec::new()));
+                index.insert(key, groups.len() - 1);
+                groups.len() - 1
+            }
+        };
+        if let Some(group) = groups.get_mut(g) {
+            group.1.push(i);
+        }
+    }
+    let mut vals = Vec::new();
+    let mut out: Vec<Series> = Vec::with_capacity(groups.len());
+    for (tags, members) in groups {
+        let values = (0..n)
+            .map(|b| {
+                vals.clear();
+                vals.extend(members.iter().filter_map(|&m| set.get(m).and_then(|s| s.values.get(b)).copied()).filter(|v| v.is_finite()));
+                layer.fold(&mut vals)
+            })
+            .collect();
+        out.push(Series { tags, values, bounds: None, outlier: None });
+    }
+    out.sort_by(|a, b| a.tags.cmp(&b.tags));
+    Ok(Value::Set(out))
+}
+
+/// `is_greater(q, x)`, `is_less(q, x)`, `is_between(q, lo, hi)`: Datadog's boolean remaps, 1 where
+/// the value is past the bound (between the bounds, which are left out) and 0 where it is not; none
+/// where there is none.
+fn remap(f: Func, args: Vec<Value>) -> Result<Value, QueryError> {
+    let usage = || QueryError::Invalid("is_greater(query, x), is_less(query, x), is_between(query, lo, hi)".into());
+    let mut it = args.into_iter();
+    let first = it.next();
+    let mut bound = || match it.next() {
+        Some(Value::Scalar(x)) => Ok(x),
+        _ => Err(usage()),
+    };
+    let lo = bound()?;
+    let hi = if f == Func::IsBetween { bound()? } else { f64::NAN };
+    let hit = |v: f64| -> f64 {
+        if v.is_nan() {
+            return f64::NAN;
+        }
+        f64::from(u8::from(match f {
+            Func::IsGreater => v > lo,
+            Func::IsLess => v < lo,
+            _ => v > lo && v < hi,
+        }))
+    };
+    Ok(match first {
+        Some(Value::Scalar(x)) => Value::Scalar(hit(x)),
+        Some(Value::Set(mut s)) => {
+            for x in &mut s {
+                for v in &mut x.values {
+                    *v = hit(*v);
+                }
+            }
+            Value::Set(s)
+        }
+        _ => return Err(usage()),
+    })
+}
+
+/// Whether a metric query's series are interpolated: Datadog's, a gauge's always, another's unless
+/// read `.as_count()` or `.as_rate()`; none with `.fill(null)`.
+fn interpolates(store: &Store, q: &MetricQuery) -> bool {
+    if q.fill == Some(Fill::Null) {
+        return false;
+    }
+    if q.mode.is_none() {
+        return true;
+    }
+    let mut ids = Vec::new();
+    store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone(), expr: q.filter.clone() }, &mut ids);
+    !ids.is_empty() && ids.iter().all(|&id| store.series(id).is_some_and(|s| s.kind() == Kind::Gauge))
+}
+
+/// A fill's gap limit in seconds ([`super::parse::FILL_LIMIT_S`] unless it says).
+fn fill_limit(fill: Option<Fill>) -> i64 {
+    match fill {
+        Some(Fill::Zero(l) | Fill::Linear(l) | Fill::Last(l)) => l.unwrap_or(super::parse::FILL_LIMIT_S),
+        _ => super::parse::FILL_LIMIT_S,
+    }
+}
+
+/// `default_zero()`'s interpolation of its query, where it interpolates (`ahead`, seconds): between
+/// two values at most that far apart, linear; after a value with none that near, that value for
+/// that long (Datadog's page: its one point "interpolated five minutes forward", then zeros).
+fn forward(mut taken: Vec<Value>, ahead: Option<i64>, grid: Grid) -> Vec<Value> {
+    let Some(secs) = ahead else { return taken };
+    let reach = usize::try_from(secs.saturating_mul(1000) / grid.step.max(1)).unwrap_or(usize::MAX);
+    if let Some(Value::Set(set)) = taken.first_mut() {
+        for s in set.iter_mut() {
+            let v = &mut s.values;
+            let mut last: Option<(usize, f64)> = None;
+            let mut i = 0;
+            while i < v.len() {
+                if let Some(&x) = v.get(i).filter(|x| !x.is_nan()) {
+                    last = Some((i, x));
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while v.get(i).is_some_and(|x| x.is_nan()) {
+                    i += 1;
+                }
+                let Some((a, va)) = last else { continue };
+                match v.get(i).copied() {
+                    Some(vb) if i - a <= reach => {
+                        let span = (i - a) as f64;
+                        for j in start..i {
+                            if let Some(x) = v.get_mut(j) {
+                                *x = va + (vb - va) * ((j - a) as f64 / span);
+                            }
+                        }
+                    }
+                    _ => {
+                        for j in start..i.min(a.saturating_add(reach).saturating_add(1)) {
+                            if let Some(x) = v.get_mut(j) {
+                                *x = va;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    taken
 }
 
 fn pointwise(f: Func, x: f64) -> f64 {
@@ -4352,9 +4878,11 @@ mod tests {
         assert!(same(&one(&format!("floor({a} / 3)")), &[0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0]));
         assert!(same(&one(&format!("pow({a}, 2)")), &(1..=10).map(|i| f64::from(i * i)).collect::<Vec<_>>()));
         assert!(same(&one(&format!("pow(2, {a})")), &(1..=10).map(|i| 2f64.powi(i)).collect::<Vec<_>>()));
-        // Count: across the group, at each point.
-        assert!(same(&one("count_nonzero(avg:ramp{*} by {host})"), &[3.0, 1.0, 2.0, 2.0, 3.0, 1.0, 3.0, 2.0, 3.0, 2.0]));
-        assert!(same(&one("count_not_null(avg:ramp{*} by {host})"), &[3.0, 2.0, 2.0, 3.0, 3.0, 2.0, 3.0, 3.0, 3.0, 3.0]));
+        // Count: across the group, at each point (host c's gaps left as they are, `.fill(null)`; else
+        // three sources are interpolated, its gaps of two minutes and one filled).
+        assert!(same(&one("count_nonzero(avg:ramp{*} by {host}.fill(null))"), &[3.0, 1.0, 2.0, 2.0, 3.0, 1.0, 3.0, 2.0, 3.0, 2.0]));
+        assert!(same(&one("count_not_null(avg:ramp{*} by {host}.fill(null))"), &[3.0, 2.0, 2.0, 3.0, 3.0, 2.0, 3.0, 3.0, 3.0, 3.0]));
+        assert!(same(&one("count_not_null(avg:ramp{*} by {host})"), &[3.0; 10]));
         // Exclusion: missing values are the bound to a clamp; equal ones survive a cutoff.
         let c = "avg:ramp{host:c}";
         assert!(same(&one(&format!("clamp_min({c}, 6)")), &[6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 8.0, 9.0, 10.0, 11.0]));
@@ -4363,8 +4891,9 @@ mod tests {
         assert!(same(&one(&format!("cutoff_max({c}, 6)")), &[2.0, nan, nan, 5.0, 6.0, nan, nan, nan, nan, nan]));
         let by_zone = ask("exclude_null(avg:ramp{*} by {zone})", 600_000);
         assert_eq!(by_zone.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["zone:z1"], "the N/A group left out");
-        // Interpolation.
-        assert!(same(&one(&format!("default_zero({c})")), &[2.0, 0.0, 0.0, 5.0, 6.0, 0.0, 8.0, 9.0, 10.0, 11.0]));
+        // Interpolation: a gauge's gaps interpolated first (Datadog's), zeros without it.
+        assert!(same(&one(&format!("default_zero({c})")), &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]));
+        assert!(same(&one("default_zero(avg:ramp{host:c}.fill(null))"), &[2.0, 0.0, 0.0, 5.0, 6.0, 0.0, 8.0, 9.0, 10.0, 11.0]));
         // Rate.
         assert!(same(&one(&format!("dt({c})")), &[nan, nan, nan, 180.0, 60.0, nan, 120.0, 60.0, 60.0, 60.0]));
         assert!(same(&one("monotonic_diff(avg:ctr{*})"), &[nan, 5.0, 5.0, nan, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]));
@@ -4400,18 +4929,116 @@ mod tests {
         let alike = |x: &[(String, Vec<f64>)], y: &[(String, Vec<f64>)]| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.0 == q.0 && same(&p.1, &q.1));
         assert!(alike(&ask("top5_max(avg:ramp{*} by {host})", 600_000), &ask("top(avg:ramp{*} by {host}, 5, 'max', 'desc')", 600_000)));
         assert!(alike(&ask("bottom5(avg:ramp{*} by {host})", 600_000), &ask("top(avg:ramp{*} by {host}, 5, 'mean', 'asc')", 600_000)));
-        // In rank order: means b 5, a 5.5, c 51/7.
+        // In rank order, host c's gaps left as they are: means b 5, a 5.5, c 51/7.
         let order = |q: &str| -> Vec<String> {
             let mut r = Request::new(q, 0, 600_000);
             r.step = Some(60_000);
             eval(&s, &r).unwrap().series.into_iter().map(|x| x.tags.iter().map(|(k, v)| format!("{k}:{v}")).collect()).collect()
         };
-        assert_eq!(order("bottom5(avg:ramp{*} by {host})"), ["host:b", "host:a", "host:c"]);
-        assert_eq!(order("top10_mean(avg:ramp{*} by {host})"), ["host:c", "host:a", "host:b"]);
-        assert_eq!(order("top(avg:ramp{*} by {host}, 1, 'l2norm', 'desc')"), ["host:b"]);
+        assert_eq!(order("bottom5(avg:ramp{*} by {host}.fill(null))"), ["host:b", "host:a", "host:c"]);
+        assert_eq!(order("top10_mean(avg:ramp{*} by {host}.fill(null))"), ["host:c", "host:a", "host:b"]);
+        assert_eq!(order("top(avg:ramp{*} by {host}.fill(null), 1, 'l2norm', 'desc')"), ["host:b"]);
         // autosmooth: a noisy series is smoothed (a span above one), its trend kept.
         let smooth = ask("autosmooth(avg:long{*})", 240 * 60_000);
         assert_eq!(smooth.len(), 1);
+    }
+
+    /// Datadog's nested queries as its page's JSON tab writes them (`rollup(q, 'p95', 1800)`,
+    /// `max(q, { env })`, `percentile(q, 'p95', {env})`, `moving_rollup(q, 600, 'max', 'lookback')`,
+    /// `is_greater(q, 30)`), `diff()` before space aggregation, and a query's sources aligned before
+    /// they combine: gauges interpolated, counts read `.as_count()` aligned as 0.
+    #[test]
+    fn nested_queries_diff_and_alignment_do_what_datadog_s_pages_say() {
+        let mut s = Store::new(Keyed::with_keys(9, 10));
+        let mut b = Builder::new();
+        let nan = f64::NAN;
+        let series: [(&str, &[(&str, &str)], Kind, Vec<f64>); 9] = [
+            ("cpu", &[("env", "x"), ("host", "a")], Kind::Gauge, (1..=10).map(f64::from).collect()),
+            ("cpu", &[("env", "x"), ("host", "b")], Kind::Gauge, (1..=10).map(|i| f64::from(i * 10)).collect()),
+            ("cpu", &[("env", "y"), ("host", "c")], Kind::Gauge, vec![5.0; 10]),
+            // A source that joins at minute 5, beside one there all along.
+            ("joins", &[("host", "d")], Kind::Gauge, (0..10).map(|i| if i < 5 { nan } else { 100.0 + f64::from(i) }).collect()),
+            ("joins", &[("host", "e")], Kind::Gauge, (0..10).map(f64::from).collect()),
+            // A gauge reported every other minute, beside one reported every minute.
+            ("sparse", &[("host", "f")], Kind::Gauge, (0..10).map(|i| if i % 2 == 0 { f64::from(i) } else { nan }).collect()),
+            ("sparse", &[("host", "g")], Kind::Gauge, vec![1.0; 10]),
+            // Counts: one every minute, one every other.
+            ("hits", &[("host", "p")], Kind::Count, vec![4.0; 10]),
+            ("hits", &[("host", "q")], Kind::Count, (0..10).map(|i| if i % 2 == 0 { 2.0 } else { nan }).collect()),
+        ];
+        for (metric, tags, kind, values) in &series {
+            let k = SeriesKey::new(metric, tags.iter().copied(), *kind).unwrap();
+            b.define(&k);
+            let pts: Vec<(i64, f64)> = values.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, &v)| (i as i64 * 60_000, v)).collect();
+            b.run(k.fp, pts);
+        }
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str, from: i64| -> Vec<(String, Vec<f64>)> {
+            let mut r = Request::new(q, from, 600_000);
+            r.step = Some(60_000);
+            let a = eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}"));
+            let mut out: Vec<(String, Vec<f64>)> = a.series.into_iter().map(|x| (x.tags.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","), x.values)).collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        };
+        let one = |q: &str, from: i64| -> Vec<f64> {
+            let r = ask(q, from);
+            assert_eq!(r.len(), 1, "{q}: {r:?}");
+            r.into_iter().next().unwrap().1
+        };
+        let same = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x.is_nan() && y.is_nan()) || (x - y).abs() < 1e-9);
+        let times = |k: f64| (1..=10).map(|i| k * f64::from(i)).collect::<Vec<f64>>();
+        // Another layer of space aggregation: its groups the tags named, `N/A` where a series has none.
+        let by_env = |q: &str| -> Vec<(String, Vec<f64>)> { ask(q, 0) };
+        for (q, x, y) in [
+            ("max(avg:cpu{*} by {env,host}, { env })", times(10.0), vec![5.0; 10]),
+            ("min(avg:cpu{*} by {env,host}, {env})", times(1.0), vec![5.0; 10]),
+            ("sum(avg:cpu{*} by {env,host}, {env})", times(11.0), vec![5.0; 10]),
+            ("avg(avg:cpu{*} by {env,host}, {env})", times(5.5), vec![5.0; 10]),
+            ("percentile(avg:cpu{*} by {env,host}, 'p50', {env})", times(5.5), vec![5.0; 10]),
+            ("stddev(avg:cpu{*} by {env,host}, {env})", times(4.5), vec![0.0; 10]),
+        ] {
+            let got = by_env(q);
+            assert_eq!(got.iter().map(|g| g.0.as_str()).collect::<Vec<_>>(), ["env:x", "env:y"], "{q}");
+            assert!(same(&got[0].1, &x) && same(&got[1].1, &y), "{q}: {got:?}");
+        }
+        assert_eq!(by_env("max(avg:cpu{*} by {host}, {team})").iter().map(|g| g.0.as_str()).collect::<Vec<_>>(), ["team:N/A"]);
+        // Another layer of time aggregation: buckets of 300 s, each of its query's own (60 s here, the
+        // range's; 120 s where its query rolls up so).
+        let a = "avg:cpu{host:a}";
+        for (agg, want) in [("max", [5.0, 10.0]), ("min", [1.0, 6.0]), ("sum", [15.0, 40.0]), ("avg", [3.0, 8.0]), ("count", [5.0, 5.0]), ("p50", [3.0, 8.0]), ("stddev", [2f64.sqrt(), 2f64.sqrt()])] {
+            let q = format!("rollup({a}, '{agg}', 300)");
+            assert!(same(&one(&q, 0), &want), "{q}: {:?}", one(&q, 0));
+        }
+        assert!(same(&one(&format!("rollup({a}.rollup(avg, 120), 'max', 300)"), 0), &[5.5, 9.5]));
+        // Boolean remaps: 1 past the bound, 0 not; between, the bounds left out.
+        assert!(same(&one(&format!("is_greater({a}, 5)"), 0), &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]));
+        assert!(same(&one(&format!("is_less({a}, 3)"), 0), &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        assert!(same(&one(&format!("is_between({a}, 3, 6)"), 0), &[0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        // `moving_rollup` in lookback mode reads its window before the range too; nested, each layer's.
+        let from = 180_000;
+        assert!(same(&one(&format!("moving_rollup({a}, 180, 'sum', 'lookback')"), from), &[9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0]));
+        assert!(same(&one(&format!("moving_rollup({a}, 180, 'sum')"), from), &[4.0, 9.0, 15.0, 18.0, 21.0, 24.0, 27.0]));
+        assert!(same(&one(&format!("moving_rollup(moving_rollup({a}, 120, 'max', 'lookback'), 180, 'sum', 'lookback')"), from), &[9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0]));
+        assert!(same(&one(&format!("moving_rollup({a}, 180, 'p50')"), 0), &[1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]));
+        // `diff()` of a query's own series before they're summed: a source joining is no jump; of
+        // anything else (here a product), after.
+        assert!(same(&one("diff(sum:joins{*})", 0), &[nan, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0]));
+        assert!(same(&one("diff(sum:joins{*} * 1)", 0), &[nan, 1.0, 1.0, 1.0, 1.0, 106.0, 2.0, 2.0, 2.0, 2.0]));
+        // Several sources: a gauge's gaps interpolated before they're summed, not with `.fill(null)`.
+        assert!(same(&one("sum:sparse{*}", 0), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 1.0]));
+        assert!(same(&one("sum:sparse{*}.fill(null)", 0), &[1.0, 1.0, 3.0, 1.0, 5.0, 1.0, 7.0, 1.0, 9.0, 1.0]));
+        // Counts read `.as_count()`: a source without one in a bucket another has one in is a 0 there.
+        assert!(same(&one("avg:hits{*}.as_count()", 0), &[3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0]));
+        assert!(same(&one("min:hits{*}.as_count()", 0), &[2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 0.0]));
+        assert!(same(&one("avg:hits{*}.as_count().fill(null)", 0), &[3.0, 4.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]));
+        // What doesn't read as Datadog's: a group's layer without its group, a percentile without its
+        // pXX, a nested rollup under a calendar's.
+        for bad in [format!("percentile({a}, {{env}})"), format!("max({a}, {{env}}, {{host}})"), format!("rollup({a}, 'median3', 300)"), format!("rollup({a}.rollup(sum, daily), 'max', 300)")] {
+            let mut r = Request::new(&bad, 0, 600_000);
+            r.step = Some(60_000);
+            assert!(eval(&s, &r).is_err(), "{bad}");
+        }
     }
 
     /// Calendar rollups: a count of one an hour through 2026, rolled up by days, weeks and months,

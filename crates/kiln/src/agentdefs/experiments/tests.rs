@@ -538,7 +538,7 @@ fn p7_1_a_criterion_answers_each_variants_value_of_its_query() -> anyhow::Result
         let now = crate::util::now_ms();
         let mut b = kiln_obs::batch::Builder::new();
         for (variant, ms) in [(&small, 5.0), (&large, 10.0)] {
-            let readings: Vec<Reading> = (1..=4).map(|k| Reading { warm: Some(Warm { at: now - (12 + k) * 3_600_000, ms }), end: None }).collect();
+            let readings: Vec<Reading> = (1..=4).map(|k| Reading { warm: Some(Warm { at: now - (12 + k) * 3_600_000, ms }), ..Reading::default() }).collect();
             for (key, pts) in super::measures::points(&e.id, variant, &readings) {
                 b.define(&key);
                 b.run(key.fp, pts);

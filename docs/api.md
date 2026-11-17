@@ -385,9 +385,15 @@ tools `agentdefs_experiments_*`, code mode's `kiln.agentdefs.experiments.*`), an
   variant with that measure had one.
 - Each of those facts is written to kiln's observability as it's kept, at the time it happened: a value
   of a distribution tagged with `experiment` and `variant` (their ids), `kiln.session.warm_ms`,
-  `kiln.session.peak_memory_gib` and `kiln.session.failed_pct` (100 a failed session, 0 another). A
-  criterion's query reads them as it reads any of Datadog's distributions, and any of kiln's other
-  metrics besides (docs/observe.md §6). A criterion's `values` are each variant's value of its query,
+  `kiln.session.peak_memory_gib` and `kiln.session.failed_pct` (100 a failed session, 0 another); and
+  the rest of a deployment's measures: `kiln.session.start_ms` (its first start, of any kind, tagged
+  `start:cold`, `template`, `warm`, `swapped` or `other`), `kiln.session.steady_memory_gib` (its
+  microVM's footprint as its last start ended), `kiln.session.cpu_ms` (the host CPU its microVMs used)
+  and `kiln.session.outcome` (1 a session, tagged `outcome:ended`, `failed` or `refused`). A
+  criterion's query reads them as it reads any of Datadog's distributions
+  (`p50:kiln.session.start_ms{experiment:…,start:cold} by {variant}`,
+  `count:kiln.session.outcome{experiment:…,outcome:refused} by {variant}`), and any of kiln's other
+  metrics besides, in Datadog's metric monitor syntax in full (docs/observe.md §6, §9). A criterion's `values` are each variant's value of its query,
   evaluated as kiln's monitors evaluate a monitor's (its time aggregation over its window, as of now:
   §9), and whether it `passes` its bound: a value for each variant the query groups by (`by
   {variant}`); none where kiln's observability doesn't run, or the query gives no variant a value.
@@ -475,9 +481,10 @@ refused and kept out of the image as a `kiln.secret.` one is.
   `/api/join-requests`), `{type:"discovery"}` (an instance appeared, changed or left: refetch
   `/api/discovery`), `{type:"front_door", runner}` (a runner's front-door settings or status
   changed: refetch `/api/runners/:name/front-door`), `{type:"agentfile", owner, id, name, version,
-  deleted?, builds?}` (one of a person's Agentfiles was kept, changed or deleted: to its owner, and whoever
-  reaches everyone's; refetch `/api/agentfiles`; with `builds`, only where its builds ahead of its sessions
-  are moved: refetch `/api/agentfiles/:id/builds`), `{type:"experiment", repo, experiment: { id, repo,
+  deleted?}` (one of a person's Agentfiles was kept, changed or deleted, told once for each change: to its
+  owner, and whoever reaches everyone's; refetch `/api/agentfiles`), `{type:"agentfile_builds", owner, id}`
+  (its builds ahead of its sessions moved, and nothing else of it, told once for each move, to whoever hears
+  of it: refetch `/api/agentfiles/:id/builds`), `{type:"experiment", repo, experiment: { id, repo,
   state, measured?, runs?, decision?, opener?, draw?, replay? }}` (an experiment changed. A split's frame
   names its `opener`, and only they and the owner get it. `draw: { n, arm }`: a session you started was
   drawn variant `arm`, the split's draw `n` (from 0). The same draw comes again with `refused: { status,

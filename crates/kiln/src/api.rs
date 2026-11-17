@@ -5621,8 +5621,8 @@ impl AgentsSeen {
         if m.kind == "attention" {
             return crate::harness::attention::person(&self.caller).is_some_and(|who| m.person.as_deref() == Some(who.as_str()));
         }
-        // An Agentfile's change, to its owner and whoever reaches everyone's (`crate::agentfiles`).
-        if m.kind == "agentfile" {
+        // An Agentfile's change, or its builds', to its owner and whoever reaches everyone's (`crate::agentfiles`).
+        if m.kind == "agentfile" || m.kind == "agentfile_builds" {
             return m.person.as_deref().is_some_and(|owner| crate::agentfiles::hears(&self.caller, owner));
         }
         // A split's frame, to its opener and the owner, who alone read it (`crate::ci::experiments`).
@@ -5660,7 +5660,7 @@ impl Narrow {
             "resync" => return true,
             // AgentsSeen has already checked the attention event's person (attention plan 01a199e1b177752e84dad5dc990e6a15),
             // an Agentfile's owner, and a split's opener.
-            "attention" | "agentfile" => return true,
+            "attention" | "agentfile" | "agentfile_builds" => return true,
             "experiment" if m.person.is_some() => return true,
             "inbox" => return m.person.as_deref() == Some(self.person.as_str()),
             _ => {}

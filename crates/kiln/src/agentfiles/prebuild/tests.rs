@@ -94,6 +94,27 @@ async fn word(hub: &Hub, runner: &str, id: &str, version: i64, how: How) -> anyh
     Ok(())
 }
 
+/// What the events `events` hold now tell of Agentfile `id`: how many times its version (`agentfile`), and how many its
+/// builds (`agentfile_builds`).
+fn frames(
+    events: &mut crate::memory::lanes::Reader<Arc<str>>,
+    id: &str,
+) -> anyhow::Result<(usize, usize)> {
+    let (mut versions, mut builds) = (0, 0);
+    while let Ok(t) = events.try_recv() {
+        let v: Value = serde_json::from_str(&t)?;
+        if v.get("id") != Some(&json!(id)) {
+            continue;
+        }
+        match v.get("type").and_then(Value::as_str) {
+            Some("agentfile") => versions += 1,
+            Some("agentfile_builds") => builds += 1,
+            _ => {}
+        }
+    }
+    Ok((versions, builds))
+}
+
 /// An Agentfile is built for each of kiln's harnesses its sessions run: those it declares, and its agent definitions',
 /// each once; a name that isn't one of kiln's harnesses, none.
 #[test]
@@ -144,6 +165,7 @@ fn p4_5_a_save_queues_its_build_on_each_microvm_runner_and_their_words_move_it()
         hub.put_agent(runner("away", true, false));
         hub.put_agent(runner("host", false, true));
         let owner = Caller::owner();
+        let mut events = hub.subscribe_events()?;
         let made = op(
             &hub,
             &owner,
@@ -164,6 +186,10 @@ fn p4_5_a_save_queues_its_build_on_each_microvm_runner_and_their_words_move_it()
             ],
             "{got:?}"
         );
+        // Each change told once, each as its own kind: its version by the save, its builds as their rows were written
+        // (a save that writes none tells none: agentfiles::tests::step30_versions_restore_and_delete).
+        let said = frames(&mut events, &id)?;
+        anyhow::ensure!(said == (1, 1), "(versions, builds) told: {said:?}");
 
         word(&hub, "mac", &id, 1, How::Building).await?;
         let got = rows(&hub, &id).await?;
@@ -212,6 +238,9 @@ fn p4_5_a_save_queues_its_build_on_each_microvm_runner_and_their_words_move_it()
             ],
             "{got:?}"
         );
+        // The two words that moved a row told its builds, once each; the three that moved none, nothing.
+        let said = frames(&mut events, &id)?;
+        anyhow::ensure!(said == (0, 2), "(versions, builds) told: {said:?}");
         let read = op(&hub, &owner, "agentfiles.builds", json!({"id": id})).await?;
         anyhow::ensure!(
             read.pointer("/builds/0/state") == Some(&json!("queued"))
@@ -288,6 +317,34 @@ fn p4_5_a_save_queues_its_build_on_each_microvm_runner_and_their_words_move_it()
 
         op(&hub, &owner, "agentfiles.delete", json!({"id": id})).await?;
         anyhow::ensure!(rows(&hub, &id).await?.is_empty(), "its builds went with it");
+        Ok(())
+    })
+}
+
+/// A save that writes no build (its person has no runner that builds Agentfiles: one whose engine is host) tells its
+/// version alone: its builds didn't move.
+#[test]
+fn p4_5_a_save_that_writes_no_build_tells_none() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        hub.put_agent(runner("host", false, true));
+        let mut events = hub.subscribe_events()?;
+        let made = op(
+            &hub,
+            &Caller::owner(),
+            "agentfiles.create",
+            json!({"name": "reviewer", "text": TEXT}),
+        )
+        .await?;
+        let id = made
+            .pointer("/agentfile/id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let got = rows(&hub, &id).await?;
+        anyhow::ensure!(got.is_empty(), "{got:?}");
+        let said = frames(&mut events, &id)?;
+        anyhow::ensure!(said == (1, 0), "(versions, builds) told: {said:?}");
         Ok(())
     })
 }
