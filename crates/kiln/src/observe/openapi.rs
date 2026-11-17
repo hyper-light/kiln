@@ -555,6 +555,19 @@ fn schemas() -> Map<String, Value> {
             ("renotify_interval", describe(nullable(integer()), "minutes")),
             ("evaluation_delay", describe(nullable(integer()), "seconds")),
             ("every", describe(nullable(integer()), "seconds between evaluations")),
+            (
+                "scheduling_options",
+                describe(
+                    nullable(object(
+                        &[(
+                            "evaluation_window",
+                            nullable(object(&[("hour_starts", nullable(integer())), ("day_starts", nullable(string())), ("month_starts", nullable(integer())), ("timezone", nullable(string()))], &[])),
+                        )],
+                        &[],
+                    )),
+                    "where a cumulative window (current_1h, current_1d, current_1mo) begins: hour_starts alone (a minute), or day_starts (04:00), month_starts (1) and timezone",
+                ),
+            ),
         ],
         &[],
     );

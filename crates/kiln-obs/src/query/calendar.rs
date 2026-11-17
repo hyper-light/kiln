@@ -224,6 +224,20 @@ impl Calendar {
     }
 }
 
+/// When the month `t` (ms) is in began in `tz`, each month begun on its 1st `secs` into the day
+/// (Datadog's cumulative `current_1mo`: its `month_starts`, which can only be 1, and `day_starts`);
+/// before that instant on a 1st, the month before's. None past the years jiff holds.
+pub fn month_began(tz: &TimeZone, t: i64, secs: u32) -> Option<i64> {
+    let local = tz.to_datetime(Timestamp::from_millisecond(t).ok()?);
+    let (y, m) = (i64::from(local.year()), i64::from(local.month()));
+    let at = |y: i64, m: i64| local_ms(tz, days_from_civil(y, m, 1), i64::from(secs), 0);
+    let start = at(y, m)?;
+    if start <= t {
+        return Some(start);
+    }
+    if m == 1 { at(y - 1, 12) } else { at(y, m - 1) }
+}
+
 /// Days from the epoch (a Thursday) to the first week's start on weekday `w` (Monday 0).
 fn week_shift(w: u32) -> i64 {
     (i64::from(w) - 3).rem_euclid(7)

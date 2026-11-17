@@ -77,6 +77,28 @@ pub struct Options {
     pub evaluation_delay: Option<u32>,
     /// Seconds between evaluations.
     pub every: Option<u32>,
+    /// Datadog's: where a cumulative window (`current_1h`, `current_1d`, `current_1mo`) begins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling_options: Option<SchedulingOptions>,
+}
+
+/// Datadog's `scheduling_options` of a monitor: its `evaluation_window`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchedulingOptions {
+    pub evaluation_window: Option<EvaluationWindow>,
+}
+
+/// Where a metric monitor's cumulative window begins, as Datadog's API has it
+/// (`kiln_obs::monitor::Query::starting` holds it to Datadog's rules): `hour_starts`, the minute of
+/// the hour; `day_starts` (`04:00`) and `month_starts` (1), in `timezone`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvaluationWindow {
+    pub hour_starts: Option<u32>,
+    pub day_starts: Option<String>,
+    pub month_starts: Option<u32>,
+    pub timezone: Option<String>,
 }
 
 /// Datadog's type for a composite monitor.
@@ -213,6 +235,10 @@ impl Monitor {
             return self.compiled_check().map(|(q, t)| Compiled::Check(q, t));
         }
         let q = monitor::parse(&self.query).map_err(|e| e.to_string())?;
+        let q = match self.options.scheduling_options.as_ref().and_then(|s| s.evaluation_window.as_ref()) {
+            Some(w) => q.starting(w.hour_starts, w.day_starts.as_deref(), w.month_starts, w.timezone.as_deref()).map_err(|e| e.to_string())?,
+            None => q,
+        };
         if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) && self.options.notify_no_data {
             return Err("an Error Tracking monitor has no NO DATA: an issue without errors in its window counts none".into());
         }

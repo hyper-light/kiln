@@ -18,6 +18,7 @@
 //!           [".rollup(" '"' "count" '"' ")"] ".by(" '"' "issue.id" ["," facets] '"' ")" ".last(" '"' window '"' ")" op threshold
 //! time_aggr := avg | sum | min | max | last | percentile
 //! window := last_<n>(m|h|d|w)  (logs: <n>(m|h|d|w))
+//!         | current_1h | current_1d | current_1mo   (a metric monitor's cumulative window)
 //! op     := > | >= | < | <= | == | !=
 //! threshold := a finite number
 //! ```
@@ -27,7 +28,9 @@
 //! `.as_count()`, each query summed over the window before the formula (its `.as_count()` path);
 //! with `percentile`, a distribution's values over the whole window at its query's `pXX`. A change
 //! monitor's classic path compares each bucket with the one its shift before, then aggregates.
-//! Groups with an `N/A` tag value are left out ("`N/A` groups are not included in monitors").
+//! Groups with an `N/A` tag value are left out ("`N/A` groups are not included in monitors"). A
+//! cumulative window reads its period so far: from where the hour, day or month began
+//! ([`Cumulative`]) to the evaluation's last whole step of it.
 //!
 //! A string's `\"` is a quote within it and `\\` a backslash, as Datadog's monitor API has them:
 //! `logs("service:web \"connection refused\"")`.
@@ -45,6 +48,7 @@ use std::collections::HashMap;
 
 use crate::logs::search::Search;
 use crate::logs::store::{Facet, Measure};
+use crate::query::calendar::{Calendar, Unit, Zone};
 use crate::query::eval::{Answer, Path, Request, Series, Source};
 use crate::query::parse::{Ast, CountMode, Func, Node, SpaceAgg};
 use crate::store::{LogsAt, Store};
@@ -114,9 +118,78 @@ impl Op {
     }
 }
 
+/// The period of Datadog's cumulative evaluation windows (its monitor configuration's "Current hour",
+/// "Current day", "Current month"): `current_1h`, `current_1d`, `current_1mo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Period {
+    Hour,
+    Day,
+    Month,
+}
+
+impl Period {
+    /// The step its window is read at: Datadog's evaluation frequency for a window of its length
+    /// ("window < 24 hours: 1 minute; 24 hours <= window < 48 hours: 10 minutes; window >= 48 hours:
+    /// 30 minutes"), so each evaluation reads every whole step its period has had.
+    fn step_ms(self) -> i64 {
+        match self {
+            Self::Hour => 60_000,
+            Self::Day => 600_000,
+            Self::Month => 1_800_000,
+        }
+    }
+
+    /// Its longest: an hour; a day of 25 hours (the clocks put back); 31 days, one of them such a day.
+    fn longest_ms(self) -> i64 {
+        match self {
+            Self::Hour => 3_600_000,
+            Self::Day => 25 * 3_600_000,
+            Self::Month => (31 * 24 + 1) * 3_600_000,
+        }
+    }
+}
+
+/// A metric monitor's cumulative window: its period so far, begun where its monitor's
+/// `scheduling_options.evaluation_window` says (Datadog's): an hour at its `hour_starts` minute (UTC:
+/// Datadog takes no other field beside it); a day at `day_starts`, and a month on its 1st
+/// (`month_starts`, which can only be 1) at `day_starts`, both in its `timezone`. Unless it says, at
+/// the hour, midnight UTC and the 1st ("resets itself on the first of each month at midnight UTC").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cumulative {
+    pub period: Period,
+    /// The minute of the hour an hour begins at, 0 to 59.
+    pub hour_starts: u32,
+    /// The second of the day a day or a month begins at.
+    pub day_starts: u32,
+    pub zone: Zone,
+}
+
+impl Cumulative {
+    fn of(period: Period) -> Self {
+        Self { period, hour_starts: 0, day_starts: 0, zone: Zone::UTC }
+    }
+
+    /// When the period `t` (ms) is in began; none past the calendar's years.
+    pub fn began(self, t: i64) -> Option<i64> {
+        match self.period {
+            Period::Hour => {
+                let off = i64::from(self.hour_starts) * 60_000;
+                Some((t - off).div_euclid(3_600_000) * 3_600_000 + off)
+            }
+            Period::Day => {
+                let (c, tz) = (Calendar { unit: Unit::Daily, align: self.day_starts, zone: self.zone }, self.zone.tz());
+                c.start(&tz, c.period(&tz, t)?)
+            }
+            Period::Month => crate::query::calendar::month_began(&self.zone.tz(), t, self.day_starts),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
-    Metric { aggr: TimeAggr, window_ms: i64, query: String },
+    /// `cumulative`: its window the current hour, day or month so far (`window_ms`, that period's
+    /// longest); none: the last `window_ms`.
+    Metric { aggr: TimeAggr, window_ms: i64, query: String, cumulative: Option<Cumulative> },
     /// The value now against the value `shift_ms` before (`pct`: as a percent of it).
     Change { aggr: TimeAggr, window_ms: i64, shift_ms: i64, pct: bool, query: String },
     Logs { search: String, measure: Measure, by: Vec<Facet>, window_ms: i64 },
@@ -147,6 +220,43 @@ pub struct Query {
     pub op: Op,
     /// The threshold the query states (the critical one).
     pub threshold: f64,
+}
+
+impl Query {
+    /// Its cumulative window begun where its monitor's `scheduling_options.evaluation_window` says,
+    /// held to Datadog's rules for it: `hour_starts` (0 to 59) with `current_1h` and nothing beside
+    /// it; `day_starts` (a time of day, `04:00`), `month_starts` (1) and `timezone` (an IANA name) with
+    /// `current_1d` and `current_1mo`. A query without a cumulative window takes none of them.
+    pub fn starting(mut self, hour_starts: Option<u32>, day_starts: Option<&str>, month_starts: Option<u32>, timezone: Option<&str>) -> Result<Self, MonitorError> {
+        let Kind::Metric { cumulative: Some(c), .. } = &mut self.kind else {
+            return Err(syntax("scheduling_options.evaluation_window: for a metric monitor's cumulative window (current_1h, current_1d, current_1mo)"));
+        };
+        match c.period {
+            Period::Hour => {
+                if day_starts.is_some() || month_starts.is_some() || timezone.is_some() {
+                    return Err(syntax("current_1h's evaluation_window: hour_starts alone (Datadog's: no other field beside it)"));
+                }
+                if let Some(m) = hour_starts {
+                    c.hour_starts = Some(m).filter(|m| *m < 60).ok_or_else(|| syntax(format!("hour_starts: {m} (a minute, 0 to 59)")))?;
+                }
+            }
+            Period::Day | Period::Month => {
+                if hour_starts.is_some() {
+                    return Err(syntax("hour_starts: for current_1h (current_1d and current_1mo take day_starts, month_starts and timezone)"));
+                }
+                if let Some(m) = month_starts.filter(|m| *m != 1) {
+                    return Err(syntax(format!("month_starts: {m} (Datadog's: 1)")));
+                }
+                if let Some(d) = day_starts {
+                    c.day_starts = Unit::Daily.alignment(d).ok_or_else(|| syntax(format!("day_starts: {d} (a time of day, 04:00)")))?;
+                }
+                if let Some(z) = timezone {
+                    c.zone = Zone::named(z).map_err(syntax)?;
+                }
+            }
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -357,7 +467,10 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     } else {
         let (a, rest) = head.split_once('(').ok_or_else(|| syntax("time_aggr(window):"))?;
         let w = rest.strip_suffix(')').ok_or_else(|| syntax("time_aggr(window)'s closing parenthesis"))?;
-        Kind::Metric { aggr: aggr(a)?, window_ms: window(w, MAX_METRIC_WINDOW_MS)?, query }
+        match current(w)? {
+            Some(c) => Kind::Metric { aggr: aggr(a)?, window_ms: c.period.longest_ms(), query, cumulative: Some(c) },
+            None => Kind::Metric { aggr: aggr(a)?, window_ms: window(w, MAX_METRIC_WINDOW_MS)?, query, cumulative: None },
+        }
     };
     // The metric query must parse as one.
     let ast = crate::query::parse::parse(match &kind {
@@ -376,7 +489,24 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
             return Err(syntax("anomalies(…, alert_window=, interval=): each within the monitor's window"));
         }
     }
+    // Datadog's anomaly and outlier monitors read a rolling window (their pages': "last_…").
+    if matches!(kind, Kind::Metric { cumulative: Some(_), .. }) && ast.nodes.iter().any(|n| matches!(n, Node::Call(Func::Anomalies | Func::Outliers, _))) {
+        return Err(syntax("a cumulative window (current_…) reads its period so far: anomalies() and outliers() read a rolling one (last_…)"));
+    }
     Ok(Query { kind, op, threshold })
+}
+
+/// `current_1h`, `current_1d`, `current_1mo`: a metric monitor's cumulative window, begun where
+/// Datadog begins one unless its monitor says ([`Query::starting`]); none for another window.
+fn current(s: &str) -> Result<Option<Cumulative>, MonitorError> {
+    let Some(p) = s.trim().strip_prefix("current_") else { return Ok(None) };
+    let period = match p {
+        "1h" => Period::Hour,
+        "1d" => Period::Day,
+        "1mo" => Period::Month,
+        other => return Err(syntax(format!("a cumulative window: current_{other} (current_1h, current_1d, current_1mo)"))),
+    };
+    Ok(Some(Cumulative::of(period)))
 }
 
 /// An anomaly monitor's reading, from Datadog's named arguments of its `anomalies()`: the last part
@@ -614,10 +744,34 @@ fn not_applicable(s: &Series) -> bool {
     s.tags.iter().any(|(_, v)| v == "N/A")
 }
 
-fn metric_values(src: Source<'_>, query: &str, aggr: TimeAggr, window_ms: i64, to: i64) -> Result<Vec<Value>, MonitorError> {
+/// `query` over a cumulative window as of `to`: from where its period began to the last whole step
+/// of it before `to` ([`Period::step_ms`]), its grid begun at its start; none before a step of it
+/// has passed (no data yet, as a rolling window's last bucket waits until it is whole).
+fn read_cumulative(src: Source<'_>, query: &str, path: Path, c: Cumulative, to: i64) -> Result<Option<(Answer, i64)>, MonitorError> {
+    let began = c.began(to).ok_or_else(|| MonitorError::Eval("a cumulative window's start: past the calendar's years".into()))?;
+    let step = c.period.step_ms();
+    let end = began + (to - began).div_euclid(step) * step;
+    if end <= began {
+        return Ok(None);
+    }
+    let mut req = Request::new(query, began, end);
+    req.step = Some(step);
+    req.anchored = true;
+    let a = src.ask_path(&req, path).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    Ok(Some((a, step)))
+}
+
+fn metric_values(src: Source<'_>, query: &str, aggr: TimeAggr, window_ms: i64, cumulative: Option<Cumulative>, to: i64) -> Result<Vec<Value>, MonitorError> {
     let ast = crate::query::parse::parse(query).map_err(|e| MonitorError::Eval(e.to_string()))?;
     let anomaly = anomaly_of(&ast)?;
-    let (a, step) = read_window(src, query, path_of(aggr, &ast), anomaly, window_ms, to)?;
+    let path = path_of(aggr, &ast);
+    let (a, step) = match cumulative {
+        Some(c) => match read_cumulative(src, query, path, c, to)? {
+            Some(read) => read,
+            None => return Ok(Vec::new()),
+        },
+        None => read_window(src, query, path, anomaly, window_ms, to)?,
+    };
     // The buckets of an anomaly monitor's `alert_window`, its window's last.
     let alert = anomaly.alert_ms.map(|ms| usize::try_from(ms / step.max(1)).unwrap_or(usize::MAX).max(1));
     let mut out = Vec::new();
@@ -678,7 +832,7 @@ pub fn evaluate_shared(store: &crate::lock::RwLock<Store>, q: &Query, now: i64, 
 fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Result<Vec<Value>, MonitorError> {
     let to = now - delay_ms.max(0);
     match &q.kind {
-        Kind::Metric { aggr, window_ms, query } => metric_values(src, query, *aggr, *window_ms, to),
+        Kind::Metric { aggr, window_ms, query, cumulative } => metric_values(src, query, *aggr, *window_ms, *cumulative, to),
         Kind::Change { aggr, window_ms, shift_ms, pct, query } => {
             let changed = |now: f64, then: f64| -> Option<f64> {
                 let change = now - then;
@@ -692,8 +846,8 @@ fn evaluate_metrics(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Resu
             if path_of(*aggr, &ast) != Path::Buckets {
                 // Datadog's `.as_count()` path (and a percentile's): each window aggregated first,
                 // then the change at the window's level.
-                let now_v = metric_values(src, query, *aggr, *window_ms, to)?;
-                let then_v = metric_values(src, query, *aggr, *window_ms, to - shift_ms)?;
+                let now_v = metric_values(src, query, *aggr, *window_ms, None, to)?;
+                let then_v = metric_values(src, query, *aggr, *window_ms, None, to - shift_ms)?;
                 return Ok(now_v
                     .into_iter()
                     .filter_map(|v| {
@@ -961,7 +1115,7 @@ mod tests {
     #[test]
     fn datadog_s_monitor_queries_parse() {
         let q = parse("avg(last_5m):avg:system.cpu.user{env:prod} by {host} > 90").unwrap();
-        assert_eq!(q, Query { kind: Kind::Metric { aggr: TimeAggr::Avg, window_ms: 300_000, query: "avg:system.cpu.user{env:prod} by {host}".into() }, op: Op::Gt, threshold: 90.0 });
+        assert_eq!(q, Query { kind: Kind::Metric { aggr: TimeAggr::Avg, window_ms: 300_000, query: "avg:system.cpu.user{env:prod} by {host}".into(), cumulative: None }, op: Op::Gt, threshold: 90.0 });
         let q = parse("max(last_1h):sum:kiln.ci.jobs.finished{status:failed}.as_count() / sum:kiln.ci.jobs.finished{*}.as_count() >= 0.25").unwrap();
         assert_eq!((q.op, q.threshold), (Op::Ge, 0.25));
         let q = parse("pct_change(avg(last_5m),last_1h):avg:http.requests{*} < -50").unwrap();
@@ -1204,6 +1358,67 @@ mod tests {
         let averaged = one("avg(last_5m):p50:lat{*} > 50");
         assert!(within(averaged, 50.5), "{averaged}");
         assert!(evaluate(&s, &parse("percentile(last_5m):p50:cpu{*} > 1").unwrap(), now, 0).is_err());
+    }
+
+    /// Datadog's cumulative windows (its API client's own `avg(current_1mo):…`, its Terraform
+    /// provider's `avg(current_1h):…` with `hour_starts`): the period so far, from where it began to
+    /// its last whole step (a minute of an hour, ten of a day, half an hour of a month), begun where
+    /// `evaluation_window` says, in its timezone; nothing before a step of it has passed; held to
+    /// Datadog's rules for `evaluation_window`.
+    #[test]
+    fn a_cumulative_window_reads_its_period_so_far() {
+        let day = |y, m, d| crate::query::calendar::days_from_civil(y, m, d) * 86_400_000;
+        let mut s = Store::new(Keyed::new());
+        let mut b = Builder::new();
+        // A count of one a minute, a second into each, from 2026-02-28 through 2026-03-01 (UTC).
+        let k = SeriesKey::new("hits", [("host", "a")], SKind::Count).unwrap();
+        b.define(&k);
+        b.run(k.fp, (0..2 * 24 * 60).map(|i| (day(2026, 2, 28) + i * 60_000 + 1_000, 1.0)));
+        s.apply(&b.finish()).unwrap();
+        // 10:30:30 on the 1st of March, UTC; New York is at 05:30:30 (EST, its clocks change on the 8th).
+        let now = day(2026, 3, 1) + 10 * 3_600_000 + 30 * 60_000 + 30_000;
+        let sum = |w: &str, starts: (Option<u32>, Option<&str>, Option<u32>, Option<&str>), at: i64| -> Vec<Value> {
+            let q = parse(&format!("sum({w}):sum:hits{{*}}.as_count() > 0")).unwrap().starting(starts.0, starts.1, starts.2, starts.3).unwrap();
+            evaluate(&s, &q, at, 0).unwrap_or_else(|e| panic!("{w}: {e}"))
+        };
+        let none = (None, None, None, None);
+        let one = |w: &str, starts, at| -> f64 {
+            let v = sum(w, starts, at);
+            assert_eq!(v.len(), 1, "{w}: {v:?}");
+            v[0].value
+        };
+        assert_eq!(one("current_1h", none, now), 30.0);
+        assert_eq!(one("current_1h", (Some(45), None, None, None), now), 45.0);
+        assert_eq!(one("current_1d", none, now), 630.0);
+        assert_eq!(one("current_1d", (None, Some("04:00"), Some(1), None), now), 390.0);
+        assert_eq!(one("current_1d", (None, None, None, Some("America/New_York")), now), 330.0);
+        assert_eq!(one("current_1mo", none, now), 630.0);
+        assert_eq!(one("current_1mo", (None, Some("00:00"), Some(1), Some("America/New_York")), now), 330.0);
+        // Before its first minute is whole, an hour has no value yet.
+        assert!(sum("current_1h", none, day(2026, 3, 1) + 10 * 3_600_000 + 30_000).is_empty());
+        let q = parse("avg(current_1mo):avg:system.load.5{*} > 0.5").unwrap();
+        assert!(matches!(q.kind, Kind::Metric { cumulative: Some(Cumulative { period: Period::Month, .. }), .. }));
+        let starting = |q: &str, starts: (Option<u32>, Option<&str>, Option<u32>, Option<&str>)| parse(q).unwrap().starting(starts.0, starts.1, starts.2, starts.3);
+        assert!(starting("avg(current_1h):avg:x{*} > 1", (Some(30), None, None, None)).is_ok());
+        for (q, starts) in [
+            ("avg(last_1h):avg:x{*} > 1", (Some(0), None, None, None)),
+            ("avg(current_1h):avg:x{*} > 1", (Some(60), None, None, None)),
+            ("avg(current_1h):avg:x{*} > 1", (Some(5), Some("04:00"), Some(1), None)),
+            ("avg(current_1d):avg:x{*} > 1", (Some(5), None, None, None)),
+            ("avg(current_1mo):avg:x{*} > 1", (None, Some("04:00"), Some(2), None)),
+            ("avg(current_1d):avg:x{*} > 1", (None, Some("25:00"), Some(1), None)),
+            ("avg(current_1d):avg:x{*} > 1", (None, Some("04:00"), Some(1), Some("Mars/Olympus"))),
+        ] {
+            assert!(starting(q, starts).is_err(), "{q} {starts:?}");
+        }
+        for bad in [
+            "avg(current_1w):avg:x{*} > 1",
+            "change(avg(current_1h),1h_ago):avg:x{*} > 1",
+            "avg(current_1h):anomalies(avg:x{*}, 'basic', 2) >= 1",
+            "avg(current_1h):outliers(avg:x{*} by {host}, 'dbscan', 3) > 0",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
