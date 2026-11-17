@@ -1,4 +1,7 @@
-//! The installed Devin's catalog for the existing start dialog, before a person starts a session.
+//! The installed Devin's catalog for the existing start dialog, before a person starts a session: asked of the
+//! Devin installed on this machine only where its runner's sessions run on its host ([`sessions_on_host`]). On a
+//! runner whose sessions run in microVMs nothing of a harness runs on the host (kiln goal 3cd82843), and the
+//! catalog stays unknown until a session, in its microVM, tells it (`session`'s `note_models`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,8 +37,23 @@ impl Warmup {
     }
 }
 
+/// Whether a runner whose owner set its engine to `engine` (none: none set), its kiln carrying Shards or not
+/// (`carried`), surely runs its sessions on its host (`harness::engine`): its owner set `host`, or none was set and it
+/// can hold no microVMs. One that may run them in microVMs asks no harness on its host for anything.
+fn sessions_on_host(engine: Option<crate::harness::engine::Engine>, carried: bool) -> bool {
+    match engine {
+        Some(crate::harness::engine::Engine::Host) => true,
+        Some(crate::harness::engine::Engine::Microvm) => false,
+        None => !carried,
+    }
+}
+
 #[cfg(not(test))]
 pub(super) fn warm_models() {
+    // Asked again at each listing of kinds (`kinds::offered`): a runner set to `host` later warms it then.
+    if !sessions_on_host(crate::harness::engine::here().engine, crate::shards::carried()) {
+        return;
+    }
     static STATE: std::sync::LazyLock<parking_lot::Mutex<Warmup>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(Warmup::default()));
     if !STATE.lock().begin(Instant::now()) {
         return;
@@ -211,6 +229,18 @@ fn probe_config(user: &Path) -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// kiln goal 3cd82843: on a runner whose sessions run in microVMs, no harness on its host is asked for its
+    /// catalog; only one set to `host`, or one that can hold no microVMs, asks its installed Devin.
+    #[test]
+    fn s35_a_microvm_runner_asks_no_harness_on_its_host_for_its_catalog() {
+        use crate::harness::engine::Engine;
+        assert!(!super::sessions_on_host(Some(Engine::Microvm), true));
+        assert!(!super::sessions_on_host(Some(Engine::Microvm), false));
+        assert!(!super::sessions_on_host(None, true), "none set, its kiln carrying Shards: its sessions may run in microVMs");
+        assert!(super::sessions_on_host(Some(Engine::Host), true));
+        assert!(super::sessions_on_host(None, false));
+    }
+
     use super::*;
 
     #[test]
