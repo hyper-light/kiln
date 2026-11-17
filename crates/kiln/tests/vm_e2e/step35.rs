@@ -81,10 +81,17 @@ fn untasked(kind: &str, image: &str) -> Option<String> {
 /// What a drive held back comes to: said and skipped, or with `VM_E2E=1` a failure.
 fn held_back(why: String, failed: &mut Vec<String>) {
     if vm_e2e::isolation_required() {
-        failed.push(format!("{why} (VM_E2E=1 requires a real task)"));
+        failed_now(failed, format!("{why} (VM_E2E=1 requires a real task)"));
     } else {
         eprintln!("{why}");
     }
+}
+
+/// A drive's failure, said as it comes, so a run ended from outside (its bound, a kill) keeps what each drive
+/// before it came to, and kept for the test's end.
+fn failed_now(failed: &mut Vec<String>, why: String) {
+    eprintln!("FAILED: {why}");
+    failed.push(why);
 }
 
 // =================================================================================================
@@ -334,7 +341,8 @@ mod rest {
 
     /// Each harness in a microVM from kiln's Agentfile and from a person's own, each starting an agent
     /// from inside where kiln gives it its MCP server; every harness is driven and every failure said
-    /// at the end, so one run shows where each stands.
+    /// as it comes and again at the end, so one run shows where each stands. Its drives share one
+    /// runner, whose answers to the first bound the later ones' cold starts (`vm_e2e::Learned`).
     #[test]
     fn s35_every_harness_in_a_microvm_from_kilns_agentfile_and_a_persons_own() -> anyhow::Result<()> {
         let gaps = super::gaps()?;
@@ -357,7 +365,7 @@ mod rest {
             // kiln's own image: `in_microvm` holds it to ROOT's task itself.
             let kilns = vm_e2e::builtin_image(kind);
             if let Err(e) = vm_e2e::in_microvm(&f, kind, &kilns, &project, mcp, mcp) {
-                failed.push(format!("{kind} from {kilns}: {e:#}"));
+                super::failed_now(&mut failed, format!("{kind} from {kilns}: {e:#}"));
             }
             // A person's own: held to ROOT's task here, as an `agentfile:<id>` is a stand-in's to it.
             if let Some(why) = super::untasked(kind, "a person's own Agentfile") {
@@ -367,11 +375,11 @@ mod rest {
             match users_own(&f, kind) {
                 Ok(Some(own)) => {
                     if let Err(e) = vm_e2e::in_microvm(&f, kind, &own, &project, mcp, mcp) {
-                        failed.push(format!("{kind} from a person's own ({own}): {e:#}"));
+                        super::failed_now(&mut failed, format!("{kind} from a person's own ({own}): {e:#}"));
                     }
                 }
                 Ok(None) => eprintln!("SKIP: {kind} from a person's own Agentfile: the stand-in's image is asked for (VM_E2E_IMAGE_{}) and no text of a person's is named (VM_E2E_OWN_{})", kind.to_ascii_uppercase(), kind.to_ascii_uppercase()),
-                Err(e) => failed.push(format!("{kind}: keeping a person's own Agentfile: {e:#}")),
+                Err(e) => super::failed_now(&mut failed, format!("{kind}: keeping a person's own Agentfile: {e:#}")),
             }
         }
         anyhow::ensure!(failed.is_empty(), "{} of the drives failed:\n{}", failed.len(), failed.join("\n\n"));
@@ -420,7 +428,7 @@ mod rest {
             let prompt = vm_e2e::task("VM_E2E_PROMPT", KIND, &probe, vm_e2e::stub_prompt(KIND, true, false, &probe));
             match vm_e2e::open(&f, &json!({"kind": KIND, "cwd": project, "prompt": prompt, "isolation": {"kind": "microvm", "image": image}})) {
                 Ok(id) => agents.push((id, probe, vm_e2e::Pace::default())),
-                Err(e) => failed.push(format!("{KIND}: starting one from {image}: {e:#}")),
+                Err(e) => super::failed_now(&mut failed, format!("{KIND}: starting one from {image}: {e:#}")),
             }
         }
         let mut vms = Vec::new();
@@ -430,7 +438,7 @@ mod rest {
             let (info, events) = match first {
                 Ok(seen) => seen,
                 Err(e) => {
-                    failed.push(format!("{e:#}"));
+                    super::failed_now(&mut failed, format!("{e:#}"));
                     continue;
                 }
             };
@@ -447,13 +455,15 @@ mod rest {
                     Err(e) => checks.push(Err(format!("{e:#}"))),
                 }
             }
-            failed.extend(checks.into_iter().filter_map(Result::err).map(|e| format!("{what}: {e}")));
+            for e in checks.into_iter().filter_map(Result::err) {
+                super::failed_now(&mut failed, format!("{what}: {e}"));
+            }
             vms.push(info.pointer("/runs/vm").cloned());
         }
         // Each the one member of a microVM of its own, which is how its lane tells it from the other.
         match vms.as_slice() {
             [Some(a), Some(b)] if a != b => {}
-            [a, b] => failed.push(format!("{KIND}: the two agents' microVMs as kiln names them (runs.vm) aren't two of their own: {a:?}, {b:?}")),
+            [a, b] => super::failed_now(&mut failed, format!("{KIND}: the two agents' microVMs as kiln names them (runs.vm) aren't two of their own: {a:?}, {b:?}")),
             // Fewer than two first turns ended, each said above.
             _ => {}
         }
@@ -461,7 +471,7 @@ mod rest {
         for (id, _, pace) in &mut agents {
             let ended = super::mcp::call(&f, super::mcp::Via::Tools, "agents.stop", json!({"agent": id, "children": true})).and_then(|_| pace.unlisted(&f, id, &format!("{KIND}: {id} still listed after agents.stop")));
             if let Err(e) = ended {
-                failed.push(format!("{KIND}: ending {id}: {e:#}"));
+                super::failed_now(&mut failed, format!("{KIND}: ending {id}: {e:#}"));
             }
         }
         anyhow::ensure!(failed.is_empty(), "{} of the checks failed:\n{}", failed.len(), failed.join("\n\n"));

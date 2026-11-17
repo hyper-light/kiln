@@ -30,8 +30,10 @@ slowest answer seen."
 
 - Each drive learns one value: its harness's slowest answer, where an answer is one whole wait from
   the drive's ask to its answer (`Pace`). Nothing is picked, seeded or carried over from another run.
-- Before the first answer a wait has no time bound. It ends on its answer, or at once on kiln's own
-  word that none can come (below).
+  A run's drives on one runner also keep two of their runner's slowest answers, per kind: its slowest
+  start and its slowest turn asked to be long (`Learned`, below: "A run's later drives").
+- Before the first answer a wait has no time bound. It ends on its answer, at once on kiln's own word
+  that none can come (below), or at once where a process of the fixture's own ended (`Stall::Party`).
 - After that, a wait refuses (`Stall::Quiet`) only when nothing of the session moves for a whole
   window as long as the slowest answer. Any movement starts the window again.
 - Progress is any change in kiln's word on the session or in its timeline. kiln's word counts as its
@@ -108,6 +110,45 @@ can progress.
   wait follows the runner until its facts come, then takes their yes or no. The 60 s took facts that
   hadn't come yet for a runner that says nothing of microVMs.
 
+## A run's later drives (r637)
+
+ROOT's r637 (studio.local-2, M3 Ultra, macOS 26.4; kiln p/p14-kiln a324a2f6e with Hex 079c1d917 vendored, Shards
+f1e8a097b; the carrier `p14-ready-carrier/run.sh`) ran `step35::rest::` from 01:42:07Z under a 3600 s bound,
+ended at 02:43:36Z with exit 143. Its log has all ten "person's own" SKIP lines, and pi's GAP line is its last
+other line. Each SKIP is said after its harness's microVM drive returns, so nine drives returned and the tenth,
+pi's, was in a wait until the carrier ended the server and the runner. That released the wait, and pi's SKIP was
+written over the carrier's `=== TIMEOUT` line: the test writes the log at the offset it shares with cargo, and
+`tee -a` appends. The runner's log went with the carrier's cleanup, so which of pi's waits held, and on what, is
+unknown. Every wait of the drive's that had no window then could hold for good: its first turn's (a drive's cold
+start) and its steered turn (`Asked::Steered`). Neither looked at the fixture's processes either.
+
+- **A run's later drives are bounded where its first was not.** A fixture keeps what its runner answered in this
+  run (`Learned`): its slowest start of a session to its first turn's end (`Asked::Opening`), and its slowest
+  turn asked to be long (`Asked::Steered`), each a whole wait from the ask to its answer. A drive's cold start is
+  bounded by the first, a steered turn by the second (`Pace::window`), and a drive's own answers still bound its
+  own later waits. This is the person's ruling, "after that the bound is the slowest answer seen", taken
+  within the run. It follows Shards' D215, which learns each kind of answer apart, in the client's process: a
+  start builds an image and boots a microVM, far longer than a running harness's answer, as a boot is longer
+  than a connect there. The other kinds teach the run nothing. A run's first answer of each kind is still its
+  cold start. What a window compares is a still span, never a whole answer: kiln's word on a starting session
+  stays `starting` while its image builds and its microVM boots, and moves once its harness runs. So a later
+  start is refused only where its build and boot, with no word, outlast a whole earlier start (build, boot and
+  turn). A later steered turn is refused only where it is silent for a whole earlier steered turn. Its own
+  silences (`STEERED_GAP`) are a part of one. The drives of `step35::rest::s35_every_harness…` share one runner,
+  so its second to tenth are bounded. `s35_two_antigravity…`'s second agent is bounded by its first.
+- **Every session wait follows the fixture's processes** (`Pace::until`, `Pace::unlisted`): where its own
+  server or runner ended (`Fixture::ended`), the wait is refused at once, typed (`Stall::Party`), with the
+  runner's log. A wait with no window still looks again when its runner goes, since kiln marks that runner's
+  sessions `Disconnected` (`harness/registry.rs`) and the change comes down the session's socket.
+- **A drive refused part way ends what it started** (`Ends`): the session, the agent it started from inside,
+  and the resumed session, each by the API's DELETE as `Pace::stop` asks it. Its microVMs no longer run on
+  into the next drive on the same runner.
+- **Where each wait stands is said as it begins**, so a run ended from outside shows it: `DRIVE: <harness>
+  from <image> in a microVM on <runner>`, then `WAIT: <harness's step> (session <id>): refused after <window>
+  without progress` or `… no window, its parties' liveness and kiln's word alone`. Setup waits say `WAIT:`
+  too. `step35::rest::` says each drive's failure as it comes (`FAILED: `) as well as at its end. A session
+  a refused drive left is said as it's ended (`ENDED: `).
+
 ## What a wait wakes on
 
 No wait looks on a period of its own (the 250 ms `POLL` it had): between looks it waits for kiln's own
@@ -139,12 +180,24 @@ next change notification (`Wake`, R05).
 - **A picked bound** (the 600 s and 60 s this replaces). R03 forbids it.
 - **A cited bound for the cold start** (a harness's documented request timeout, the stand-in's declared
   delays). The person ruled out seeds of any kind.
-- **Learning per kind of ask**. One sample each: a new answer is slower than a single earlier sample
-  about half the time, so it refuses working harnesses.
+- **Learning per kind of ask** within a drive. One sample each: a new answer is slower than a single earlier
+  sample about half the time, so it refuses working harnesses. A run's record (above) differs in what it
+  compares. A later start's still span (its build and boot, kiln's word unmoved) is held against a whole
+  earlier start, which also holds a first turn. A later steered turn's silence is held against a whole
+  earlier steered turn. Neither is an answer's length held against an earlier answer's.
+- **Leaving a run's later cold starts unbounded** (as before r637): a start or a steered turn that never
+  ends, with every process alive, holds the run until something outside ends it, an hour in r637.
 - **The stand-in showing progress in its silences**. A tick of its own would be another picked number.
 
 ## Owed
 
+- A run's very first start and first steered turn are still cold, and kiln's start of an isolated session
+  judges none of its own waits. It awaits its image's build (`sandbox/image.rs`, `run`: the build's output to
+  its end, then its exit; builds take turns, `Images::building`) and its microVM's launch
+  (`sandbox/isolated.rs`, `vms.launch`), and nothing in them is bounded or judged. A build or boot that stops
+  with every process alive leaves the session `starting` for good. Judging them (Shards' D215 on the build's
+  process group and the VM process) waits on a rerun that shows a start held there (R09). Their `WAIT:` lines
+  and refusals now say so.
 - The stand-in's steered gap (`STEERED_GAP`, 2 s, what `POLL * 8` was) is its own pace, which no
   wait reads: to be derived from a measured round trip through kiln (a slice of its own).
 - ROOT's runs: five of `cargo test -p kiln --test vm_harnesses -- step35::host:: host::` under load on
