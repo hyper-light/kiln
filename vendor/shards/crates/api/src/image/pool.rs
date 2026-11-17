@@ -1292,6 +1292,60 @@ impl<W: Send> ImageGuest for Pooled<W> {
         self.guest.revoke_egress(grant, patience)
     }
 
+    fn member_egress(
+        &self,
+        member: &super::MemberName,
+        reach: Option<&wire::Reach>,
+        patience: Duration,
+    ) -> Result<wire::Narrowing, ImageRefusal> {
+        self.guest.member_egress(member, reach, patience)
+    }
+
+    fn connect(
+        &self,
+        member: &super::MemberName,
+        network: &str,
+        grant: &wire::NetworkGrant,
+        patience: Duration,
+    ) -> Result<Vec<wire::OnNetwork>, ImageRefusal> {
+        self.guest.connect(member, network, grant, patience)
+    }
+
+    fn disconnect(
+        &self,
+        member: &super::MemberName,
+        network: &str,
+        grant: &wire::NetworkGrant,
+        patience: Duration,
+    ) -> Result<Vec<wire::OnNetwork>, ImageRefusal> {
+        self.guest.disconnect(member, network, grant, patience)
+    }
+
+    fn swap(
+        &self,
+        at: &str,
+        digest: &str,
+        when: wire::SwapWhen,
+        args: Option<&[Vec<u8>]>,
+        patience: Duration,
+    ) -> Result<wire::Swapped, ImageRefusal> {
+        self.guest.swap(at, digest, when, args, patience)
+    }
+
+    fn restore(
+        &self,
+        at: &str,
+        when: wire::SwapWhen,
+        args: Option<&[Vec<u8>]>,
+        patience: Duration,
+    ) -> Result<wire::Swapped, ImageRefusal> {
+        self.guest.restore(at, when, args, patience)
+    }
+
+    fn components(&self) -> Vec<wire::ComponentAt> {
+        self.guest.components()
+    }
+
     fn control(&self) -> Option<&wire::ControlAt> {
         self.guest.control()
     }
@@ -1299,30 +1353,46 @@ impl<W: Send> ImageGuest for Pooled<W> {
     fn take_output(
         &self,
         member: &super::MemberName,
+        generation: u32,
         channel: wire::Channel,
     ) -> Result<std::io::PipeReader, ImageRefusal> {
-        self.guest.take_output(member, channel)
+        self.guest.take_output(member, generation, channel)
     }
 
-    fn take_input(&self, member: &super::MemberName) -> Result<std::io::PipeWriter, ImageRefusal> {
-        self.guest.take_input(member)
+    fn take_input(
+        &self,
+        member: &super::MemberName,
+        generation: u32,
+    ) -> Result<std::io::PipeWriter, ImageRefusal> {
+        self.guest.take_input(member, generation)
     }
 
     fn wait_member(
         &self,
         member: &super::MemberName,
+        generation: u32,
         timeout: Duration,
     ) -> Result<Option<super::MemberEnd>, ImageRefusal> {
-        self.guest.wait_member(member, timeout)
+        self.guest.wait_member(member, generation, timeout)
+    }
+
+    fn restart(
+        &self,
+        member: &super::MemberName,
+        args: &[Vec<u8>],
+        patience: Duration,
+    ) -> Result<u32, ImageRefusal> {
+        self.guest.restart(member, args, patience)
     }
 
     fn wait_channel(
         &self,
         member: &super::MemberName,
+        generation: u32,
         channel: wire::Channel,
         timeout: Duration,
     ) -> Result<Option<super::ChannelEnd>, ImageRefusal> {
-        self.guest.wait_channel(member, channel, timeout)
+        self.guest.wait_channel(member, generation, channel, timeout)
     }
 
     fn stats(&self, scope: wire::StatsScope, patience: Duration) -> Result<wire::Stats, ImageRefusal> {
@@ -1541,29 +1611,74 @@ mod tests {
         ) -> Result<wire::Narrowing, ImageRefusal> {
             none()
         }
+        fn member_egress(
+            &self,
+            _: &super::super::MemberName,
+            _: Option<&wire::Reach>,
+            _: Duration,
+        ) -> Result<wire::Narrowing, ImageRefusal> {
+            none()
+        }
+        fn swap(
+            &self,
+            _: &str,
+            _: &str,
+            _: wire::SwapWhen,
+            _: Option<&[Vec<u8>]>,
+            _: Duration,
+        ) -> Result<wire::Swapped, ImageRefusal> {
+            none()
+        }
+        fn restore(
+            &self,
+            _: &str,
+            _: wire::SwapWhen,
+            _: Option<&[Vec<u8>]>,
+            _: Duration,
+        ) -> Result<wire::Swapped, ImageRefusal> {
+            none()
+        }
+        fn components(&self) -> Vec<wire::ComponentAt> {
+            Vec::new()
+        }
         fn control(&self) -> Option<&wire::ControlAt> {
             None
         }
         fn take_output(
             &self,
             _: &super::super::MemberName,
+            _: u32,
             _: wire::Channel,
         ) -> Result<std::io::PipeReader, ImageRefusal> {
             none()
         }
-        fn take_input(&self, _: &super::super::MemberName) -> Result<std::io::PipeWriter, ImageRefusal> {
+        fn take_input(
+            &self,
+            _: &super::super::MemberName,
+            _: u32,
+        ) -> Result<std::io::PipeWriter, ImageRefusal> {
             none()
         }
         fn wait_member(
             &self,
             _: &super::super::MemberName,
+            _: u32,
             _: Duration,
         ) -> Result<Option<super::super::MemberEnd>, ImageRefusal> {
+            none()
+        }
+        fn restart(
+            &self,
+            _: &super::super::MemberName,
+            _: &[Vec<u8>],
+            _: Duration,
+        ) -> Result<u32, ImageRefusal> {
             none()
         }
         fn wait_channel(
             &self,
             _: &super::super::MemberName,
+            _: u32,
             _: wire::Channel,
             _: Duration,
         ) -> Result<Option<super::super::ChannelEnd>, ImageRefusal> {
@@ -1840,6 +1955,7 @@ mod tests {
             sign_ins: Vec::new(),
             upstream_roots: Vec::new(),
             plug_roots: Vec::new(),
+            egress_ceiling: Vec::new(),
             gpu_report: None,
         }
     }
@@ -1862,6 +1978,7 @@ mod tests {
             sign_ins: Vec::new(),
             upstream_roots: Vec::new(),
             plug_roots: Vec::new(),
+            egress_ceiling: Vec::new(),
             gpu_report: None,
         }
     }

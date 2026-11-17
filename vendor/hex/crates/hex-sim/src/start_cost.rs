@@ -193,8 +193,8 @@ impl Measured {
 pub(crate) struct Costs {
     nodes: Vec<Measured>,
     priors: [Mean; 3],
-    starts: Vec<[Observation; 3]>,
-    start_priors: [Mean; 3],
+    starts: Vec<[Observation; Class::COUNT]>,
+    start_priors: [Mean; Class::COUNT],
 }
 
 pub(crate) struct Prepared<'a> {
@@ -226,8 +226,8 @@ impl Costs {
         Self {
             nodes: vec![Measured::of(Rates::default()); nodes],
             priors: [Mean::default(); 3],
-            starts: vec![[Observation::default(); 3]; nodes],
-            start_priors: [Mean::default(); 3],
+            starts: vec![[Observation::default(); Class::COUNT]; nodes],
+            start_priors: [Mean::default(); Class::COUNT],
         }
     }
 
@@ -274,7 +274,7 @@ impl Costs {
             let Ok(node) = u32::try_from(at) else {
                 continue;
             };
-            for class in [Class::Oci, Class::Firecracker, Class::Shards] {
+            for class in Class::ALL {
                 if let Some(start) = starts.get(class.index()).filter(|s| s.n != 0) {
                     out.push(StartObservation {
                         node: NodeId(node),
@@ -289,15 +289,15 @@ impl Costs {
     }
 
     pub(crate) fn restore(&mut self, rows: &[StartObservation]) -> Result<(), SimError> {
-        let bound = self.nodes.len().saturating_mul(3);
+        let bound = self.nodes.len().saturating_mul(Class::COUNT);
         if rows.len() > bound {
             return Err(SimError::Full {
                 what: "start observation aggregates",
                 bound,
             });
         }
-        let mut starts = vec![[Observation::default(); 3]; self.nodes.len()];
-        let mut priors = [Mean::default(); 3];
+        let mut starts = vec![[Observation::default(); Class::COUNT]; self.nodes.len()];
+        let mut priors = [Mean::default(); Class::COUNT];
         for row in rows {
             let at = usize::try_from(row.node.0).map_err(|_| SimError::UnknownNode(row.node))?;
             let slot = starts

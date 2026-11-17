@@ -3,11 +3,11 @@ Why: Hex's shards-gpu entry names the files its scripts/shards-gpu/build.sh rebu
 Kiln-only: kiln's copy leaves out what only Hex's own scripts build
 
 diff --git a/vendor/MANIFEST.toml b/vendor/MANIFEST.toml
-index 838cf871b5e329dde84d41a69df4fc0bd228dde2..297dd895ce52b62c01b76923666633aed08140e3 100644
+index 9480ea6f0b8775a1f3e4def67d4c31d49c934564..eb92688c4155c5b373cb0249b4b29a99acb0004b 100644
 --- a/vendor/MANIFEST.toml
 +++ b/vendor/MANIFEST.toml
 @@ -121,24 +121,6 @@ path = "vendor/shards"
- take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/dns", "crates/ipc", "crates/remote", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/borrowed-no-clock/focused.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
+ take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/apple", "crates/dns", "crates/ipc", "crates/remote", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/borrowed-no-clock/focused.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
  own = ["Cargo.toml", "UPSTREAM.md"]
  
 -# Hex's `shards` build (hyper-light): the `shards` binary a node boots its Shards guests and image VMs with
@@ -19,7 +19,7 @@ index 838cf871b5e329dde84d41a69df4fc0bd228dde2..297dd895ce52b62c01b76923666633ae
 -[projects.shards-gpu]
 -kind = "git"
 -repository = "https://github.com/hyper-light/shards"
--commit = "9975d1f551f8210a08fb744a04250767c72ead34"
+-commit = "8d6029e4d69392d93640135c8fa781239e92a769"
 -path = "vendor/shards-gpu"
 -take = [
 -    "LICENSE",

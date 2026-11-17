@@ -1186,19 +1186,22 @@ impl<D: crate::containers::Disk> Daemon<D> {
                     .map(|(id, _, pid)| {
                         pid.map(|_| {
                             let paused = paused.contains(id);
-                            scope.spawn(move || {
-                                if paused {
-                                    lock(&LAST_USAGE).get(id).cloned()
-                                } else {
-                                    self.usage_of(id)
-                                }
-                            })
+                            super::DaemonThread::new()
+                                .name("stats".into())
+                                .spawn_scoped(scope, move || {
+                                    if paused {
+                                        lock(&LAST_USAGE).get(id).cloned()
+                                    } else {
+                                        self.usage_of(id)
+                                    }
+                                })
                         })
                     })
                     .collect();
+                // One whose thread was not made has no sample, as one whose sample failed.
                 asked
                     .into_iter()
-                    .map(|h| h.and_then(|h| h.join().ok().flatten()))
+                    .map(|h| h.and_then(|h| h.ok()?.join().ok().flatten()))
                     .collect()
             })
         };
@@ -2029,7 +2032,9 @@ impl<D: crate::containers::Disk> Daemon<D> {
     /// from one loop: the signal, then SIGKILL once its grace is up, then its VM once its
     /// guest's teardown has gone on no more for a slice, then giving up once the killed VM
     /// process has gone on with its end no more for a slice, each slice this host's own
-    /// and each end heard kept by it ([`super::ends`], D217). A signal that cannot be sent
+    /// and each end heard learned by it, timed as the loop woke for it, and kept in the home
+    /// once, after the last ([`super::ends`], D217): no end waits on the record's flush, nor
+    /// counts the loop's work on the ends before it as its own. A signal that cannot be sent
     /// kills its VM at once: its guest can be told nothing, nor tell its end. Each end is heard on a socket of its
     /// own, registered before anything is sent, so none is missed; `done` hears each
     /// index once, with whether it ended, as it does.
@@ -2063,7 +2068,7 @@ impl<D: crate::containers::Disk> Daemon<D> {
             /// When it was sent SIGKILL, or its VM killed: how long its end took.
             since: Instant,
             /// Its grace, kept while it is signalled.
-            grace: Option<super::Grace>,
+            grace: Option<super::Deadline>,
         }
         let after = |d: Duration| Instant::now().checked_add(d);
         let mut going = Vec::with_capacity(targets.len());
@@ -2089,7 +2094,8 @@ impl<D: crate::containers::Disk> Daemon<D> {
                 (Phase::Killed, wait.and_then(after), teardown, None)
             } else if self.signal(&id, linux) {
                 let dir = lock(&self.containers).dir(&id);
-                let kept = grace.and_then(|grace| super::Grace::begin(&dir, grace));
+                let kept =
+                    grace.and_then(|grace| super::Deadline::begin(&dir, shards_ipc::GRACE, grace, None));
                 (Phase::Signalled, grace.and_then(after), Followed::of(None), kept)
             } else {
                 (Phase::Killed, after(Duration::ZERO), Followed::of(None), None)
@@ -2127,6 +2133,8 @@ impl<D: crate::containers::Disk> Daemon<D> {
             }
         };
         let mut ready = Vec::new();
+        // Whether an end was learned, for the home to keep once all have ended.
+        let mut learned = false;
         while !going.is_empty() {
             // Escalate whatever is due.
             let now = Instant::now();
@@ -2204,9 +2212,8 @@ impl<D: crate::containers::Disk> Daemon<D> {
                             let mut byte = [0u8; 1];
                             let ended = matches!((&gone.told).read(&mut byte), Ok(1));
                             if ended {
-                                if let Err(e) = self.ends.heard(End::Exit, gone.since.elapsed()) {
-                                    super::log(e);
-                                }
+                                self.ends.learn(End::Exit, gone.since.elapsed());
+                                learned = true;
                             } else {
                                 super::log(format!(
                                     "microVM {}: no end heard {:?} after it was killed, its process gone on with nothing of its end for {:?}: {}",
@@ -2241,6 +2248,8 @@ impl<D: crate::containers::Disk> Daemon<D> {
                 }
                 break;
             }
+            // When these ends were heard: taking those before one is no part of its end.
+            let woke = Instant::now();
             // Those whose end came.
             for &token in &ready {
                 let Some(k) = going.iter().position(|e| e.index as u64 == token) else {
@@ -2253,15 +2262,16 @@ impl<D: crate::containers::Disk> Daemon<D> {
                 if !ended {
                     self.forget_waiter(&gone.id, gone.waiter);
                 }
-                // What this host's ends take, kept for the next (D217).
-                let kept = match gone.phase {
-                    _ if !ended => Ok(()),
-                    Phase::Killed | Phase::Escalated => self.ends.heard(End::Teardown, gone.since.elapsed()),
-                    Phase::VmKilled => self.ends.heard(End::Exit, gone.since.elapsed()),
-                    Phase::Signalled => Ok(()),
+                // What this host's ends take, learned for the next (D217).
+                let kind = match gone.phase {
+                    _ if !ended => None,
+                    Phase::Killed | Phase::Escalated => Some(End::Teardown),
+                    Phase::VmKilled => Some(End::Exit),
+                    Phase::Signalled => None,
                 };
-                if let Err(e) = kept {
-                    super::log(e);
+                if let Some(kind) = kind {
+                    self.ends.learn(kind, woke.saturating_duration_since(gone.since));
+                    learned = true;
                 }
                 done(
                     gone.index,
@@ -2269,6 +2279,9 @@ impl<D: crate::containers::Disk> Daemon<D> {
                     if ended { how(&gone.phase) } else { How::Lost },
                 );
             }
+        }
+        if learned && let Err(e) = self.ends.keep() {
+            super::log(e);
         }
     }
 
@@ -3244,12 +3257,12 @@ mod tests {
         let (told, answer) = std::sync::mpsc::channel();
         let busy = AtomicBool::new(true);
         let said = std::thread::scope(|s| {
-            s.spawn(|| {
+            crate::daemon::party::spawn_in(s, || {
                 while busy.load(Ordering::Relaxed) {
                     std::hint::black_box(std::time::Instant::now());
                 }
             });
-            s.spawn(move || {
+            crate::daemon::party::spawn_in(s, move || {
                 std::thread::sleep(Duration::from_millis(10_500));
                 let _ = told.send(Ok(shards_vmm::vm::GuestTimes::default()));
             });
@@ -3292,7 +3305,7 @@ mod tests {
         let vm = idle.id();
         std::thread::scope(|s| {
             let record = &record;
-            s.spawn(move || {
+            crate::daemon::party::spawn_in(s, move || {
                 let _ = done.send(super::guest_timed(&answer, vm, record));
             });
             let said = finished.recv_timeout(Duration::from_secs(10));
@@ -3411,7 +3424,7 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         // Read as it is sent: more than a socket's buffer goes.
-        let reading = std::thread::spawn(move || {
+        let reading = crate::daemon::party::spawn_member(move || {
             let mut got = Vec::new();
             let mut out = Vec::new();
             while let Some(m) = shards_ipc::recv(&theirs).unwrap() {

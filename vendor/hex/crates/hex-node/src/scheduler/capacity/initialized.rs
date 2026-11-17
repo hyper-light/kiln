@@ -37,6 +37,7 @@ fn class(form: hex_api::Class) -> Class {
         hex_api::Class::Process | hex_api::Class::Oci => Class::Oci,
         hex_api::Class::Shards => Class::Shards,
         hex_api::Class::Firecracker => Class::Firecracker,
+        hex_api::Class::ShardsImage => Class::ShardsImage,
     }
 }
 
@@ -1074,6 +1075,113 @@ mod tests {
         assert_eq!(
             index.route(NodeId(0), &demand).unwrap().unwrap().backing,
             Some(current)
+        );
+    }
+
+    /// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2; docs/design/shards-image-class.md §11): a node's image class reaches the
+    /// scheduler as a route of its own at its per-box cost, beside its native routes on the same plane. Do normalize a
+    /// node's native OCI report and its image class's report, then ask its index for an image VM, for one past its
+    /// room, and for one that names no platform. Expect the node to list the image class; the VM admitted on the image
+    /// route, its allocation what the class's cost gives its demand; the larger one refused for room; and the one
+    /// naming no platform refused for it.
+    #[test]
+    fn p2_2_an_image_class_route_admits_its_vm_at_the_class_cost_where_there_is_room() {
+        use hex_sim::index::{FitIndex, Verdict};
+        let cost = RuntimeCost {
+            id: [0x73; 32],
+            floor: CapacityResources {
+                cpu_milli: 1_000,
+                mem_bytes: 128 << 20,
+                disk_bytes: 0,
+            },
+            ceiling: room(),
+            quantum: CapacityResources {
+                cpu_milli: 1_000,
+                mem_bytes: 2 << 20,
+                disk_bytes: 1,
+            },
+            guest_overhead: CapacityResources::default(),
+            overhead: CapacityResources::default(),
+        };
+        let image = RouteOffer {
+            key: RouteKey {
+                class: hex_api::Class::ShardsImage,
+                image: ImagePlatform {
+                    os: ImageOs::Linux,
+                    arch: ImageArch::Amd64,
+                },
+                execution: Execution::ShardsDedicated,
+                gpu: GpuEligibility::None,
+            },
+            cost: Some(cost),
+            backing: None,
+        };
+        let node = normalize(vec![
+            (
+                Class::Oci,
+                Some(report(
+                    vec![route(
+                        hex_api::Class::Oci,
+                        Execution::Native,
+                        GpuEligibility::Any,
+                    )],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )),
+            ),
+            (
+                Class::ShardsImage,
+                Some(report(vec![image], Vec::new(), Vec::new(), Vec::new())),
+            ),
+        ])
+        .unwrap();
+        assert!(node.classes.has(Class::ShardsImage));
+        let index = FitIndex::new(&[node]).unwrap();
+        let vm = |cpu_milli: u64, platform: bool| hex_sim::model::Demand {
+            class: Class::ShardsImage,
+            kind: hex_sim::model::Kind::Plain,
+            need: Resources {
+                cpu_milli,
+                mem_bytes: 256 << 20,
+                ..Resources::default()
+            },
+            ask: hex_sim::model::Ask {
+                runtime_class: Some(hex_api::Class::ShardsImage),
+                os: if platform { Some(Os::Linux) } else { None },
+                arch: if platform {
+                    Some(hex_sim::model::Arch::X86_64)
+                } else {
+                    None
+                },
+                ..hex_sim::model::Ask::default()
+            },
+        };
+        let fits = vm(2_000, true);
+        assert_eq!(index.verdict(NodeId(0), &fits).unwrap(), Verdict::Admits);
+        assert_eq!(
+            index.route(NodeId(0), &fits).unwrap(),
+            Some(hex_api::RouteReceipt {
+                key: image.key,
+                backing: None,
+            })
+        );
+        assert_eq!(
+            index.allocation(NodeId(0), &fits).unwrap(),
+            Some(
+                cost.allocate(hex_sim::model::capacity_resources(fits.need))
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            index
+                .verdict(NodeId(0), &vm(room().cpu_milli + 1_000, true))
+                .unwrap(),
+            Verdict::NoRoom
+        );
+        assert_eq!(
+            index.verdict(NodeId(0), &vm(2_000, false)).unwrap(),
+            Verdict::NoPlatform
         );
     }
 }

@@ -402,6 +402,7 @@ fn bind_path(source: &Path, destination: &str, read_only: bool) -> Mount {
         source: source.to_path_buf(),
         destination: destination.to_owned(),
         read_only,
+        members: Vec::new(),
     }
 }
 

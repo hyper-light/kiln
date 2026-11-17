@@ -859,14 +859,38 @@ impl<D: Disk> Daemon<D> {
             let _ = read_only;
             return Ok((self.ask_device(id, &step, &[end.as_fd()])?, None));
         }
+        // A bounded volume's share held to its bound (D281).
+        let mut bounds = Vec::new();
         let dir = if Path::new(source).is_absolute() {
             PathBuf::from(source)
         } else {
+            // Held before its files are opened, and kept with what its run mounts until the
+            // run ends (D281): no clearing removes them under it.
             let store = crate::volumes::Store::new(&self.home);
-            store
-                .get(source)
+            let mut held = crate::volumes::Holds::default();
+            let volume = held.found(&store, source)?
                 .ok_or_else(|| format!("no volume {source}: a volume is made first, or a host directory given by its absolute path"))?;
-            store.data(source)
+            let data = store.data(source);
+            // Counted with its run, its first holder walking it; its bound, a named one's alone.
+            if !volume.is_anonymous() {
+                if let Some((limit, count)) = held
+                    .count(&store, source, &data, None)
+                    .map_err(|e| e.to_string())?
+                {
+                    bounds.push(crate::volumes::Bounded {
+                        share: 0,
+                        limit,
+                        count,
+                    });
+                }
+            } else if volume.bound()?.is_some() {
+                return Err(format!(
+                    "volume {source}: a bound (size) is held for a named volume alone"
+                ));
+            }
+            let inbox = self.inbox_of(id).ok_or_else(|| format!("{id} is not running"))?;
+            lock(&inbox).volumes.extend(held);
+            data
         };
         // A directory opens on Windows only with backup semantics (`platform::open_dir`).
         let opened = shards_vmm::platform::open_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -893,7 +917,8 @@ impl<D: Disk> Daemon<D> {
         )];
         let parent = self.parent_of(id).unwrap_or_default();
         let tags = [tag.to_string()];
-        let (ends, child, notices) = self.started_shares(threads, &dirs, &parent, false, Some(&tags))?;
+        let (ends, child, notices) =
+            self.started_shares(threads, &dirs, &bounds, &parent, false, Some(&tags))?;
         // On Windows none where the share is a client's; this one is the machine's.
         #[cfg(unix)]
         let child = Some(child);
@@ -1466,7 +1491,7 @@ mod tests {
         let (go, until_go) = mpsc::channel::<()>();
         let (b_done, larger_done) = mpsc::channel();
         std::thread::scope(|s| {
-            let smaller = s.spawn(|| {
+            let smaller = crate::daemon::party::spawn_in(s, || {
                 CHECKED.with(|c| {
                     *c.borrow_mut() = Some(Box::new(move || {
                         paused.send(()).unwrap();
@@ -1476,7 +1501,7 @@ mod tests {
                 grow_disk(&steps, "vm", 128 * MIB, || Ok(disk_at(&file)), |_| Ok(()))
             });
             at_pause.recv().unwrap();
-            let larger = s.spawn(|| {
+            let larger = crate::daemon::party::spawn_in(s, || {
                 let grown = grow_disk(
                     &steps,
                     "vm",
@@ -1550,7 +1575,7 @@ mod tests {
         let held = steps.hold("a");
         drop(steps.hold("b"));
         std::thread::scope(|s| {
-            let next = s.spawn(|| drop(steps.hold("a")));
+            let next = crate::daemon::party::spawn_in(s, || drop(steps.hold("a")));
             while steps.waiting() == 0 {
                 std::thread::yield_now();
             }

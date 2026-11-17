@@ -87,7 +87,8 @@ impl Needs {
                 "oci" => Class::Oci,
                 "firecracker" => Class::Firecracker,
                 "shards" => Class::Shards,
-                _ => return Err("no such class (oci, firecracker, shards)".into()),
+                "shards-image" => Class::ShardsImage,
+                _ => return Err("no such class (oci, firecracker, shards, shards-image)".into()),
             });
             return Ok(());
         }
@@ -316,7 +317,7 @@ mod tests {
             ("tool:cargo", "tool:cargo: no such need (class:)"),
             (
                 "class:kata",
-                "class:kata: no such class (oci, firecracker, shards)",
+                "class:kata: no such class (oci, firecracker, shards, shards-image)",
             ),
             (
                 "cpu.cores>=8",

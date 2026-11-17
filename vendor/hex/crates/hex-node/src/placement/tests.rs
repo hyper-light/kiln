@@ -254,6 +254,141 @@ fn dedicated_vm_driver_preserves_original_payload_and_effective_charge_on_reboot
     );
 }
 
+/// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2; docs/design/shards-image-class.md §11): the scheduler admits a Shards image
+/// VM where its node lists the class and has room, deriving its allocation from the class's per-box cost. Do submit an
+/// image VM's payload, which names no allocation, to a node listing the class at a cost with room for it; then to one
+/// with too little CPU, and to one that lists no image class. Expect the first started, its VM made of the class with
+/// the allocation the cost gives its demand, its caps unchanged and its node's ledger booking it; at the others it
+/// waits, nothing made.
+#[test]
+fn p2_2_the_scheduler_admits_an_image_vm_where_its_node_lists_the_class_and_has_room() {
+    let cost = hex_api::RuntimeCost {
+        id: [13; 32], // Synthetic interface fixture, never a measured runtime default.
+        floor: hex_api::CapacityResources {
+            cpu_milli: 1_000,
+            mem_bytes: 128 << 20,
+            disk_bytes: 0,
+        },
+        ceiling: hex_api::CapacityResources {
+            cpu_milli: 4_000,
+            mem_bytes: 1 << 30,
+            disk_bytes: 1 << 30,
+        },
+        quantum: hex_api::CapacityResources {
+            cpu_milli: 1_000,
+            mem_bytes: 2 << 20,
+            disk_bytes: 1,
+        },
+        guest_overhead: hex_api::CapacityResources::default(),
+        overhead: hex_api::CapacityResources::default(),
+    };
+    let need = Resources {
+        cpu_milli: 2_000,
+        mem_bytes: 256 << 20,
+        ..Resources::default()
+    };
+    let demand = Demand {
+        need,
+        kind: Kind::Plain,
+        class: Class::ShardsImage,
+        ask: Ask::default(),
+    };
+    let payload = Payload {
+        spec: BoxSpec {
+            route: None,
+            allocation: None,
+            devices: Vec::new(),
+            id: BoxId::new("caller-image").unwrap(),
+            bounds: Bounds {
+                cpu_max_milli: Some(2_000),
+                memory_max: Some(need.mem_bytes),
+                ..Bounds::default()
+            },
+            class: ClassSpec::ShardsImage(Box::new(hex_api::ShardsImage::new(
+                hex_api::sim::SIM_IMAGE,
+            ))),
+            owner: None,
+            band: 0,
+        },
+        start: false,
+    };
+    assert_eq!(validate(&demand, &payload), Ok(()));
+    let node = |cpu_milli: u64, classes: hex_sim::model::Classes| {
+        let mut node = NodeSpec::new(
+            NodeId(0),
+            Resources {
+                cpu_milli,
+                mem_bytes: 1 << 30,
+                ..Resources::default()
+            },
+        );
+        node.classes = classes;
+        node.costs[Class::ShardsImage.index()] = Some(cost);
+        node
+    };
+    let open = |dir: &Path, spec: &NodeSpec, runtime: &Arc<hex_api::sim::SimRuntime>| {
+        Driver::boot_in(
+            Identity {
+                node: NodeId(0),
+                namespace: TEST_NAMESPACE,
+            },
+            std::slice::from_ref(spec),
+            &[],
+            Budget { owned: 4, ran: 4 },
+            Pick::default(),
+            dir,
+            Runtimes::new([(Class::ShardsImage, Arc::clone(runtime) as Arc<dyn Runtime>)]).unwrap(),
+        )
+        .unwrap()
+    };
+    let image = || {
+        Arc::new(hex_api::sim::SimRuntime::for_backend(
+            hex_api::Class::ShardsImage,
+        ))
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = image();
+    let driver = open(
+        dir.path(),
+        &node(4_000, hex_sim::model::Classes::ALL),
+        &runtime,
+    );
+    let (key, step) = driver.submit(demand, payload.clone()).unwrap();
+    let done = local(&driver, step);
+    assert!(done.notices.contains(&Notice::Started {
+        key,
+        node: NodeId(0)
+    }));
+    let info = runtime.inspect(&driver.physical_id(key).unwrap()).unwrap();
+    let receipt = cost
+        .allocate(hex_sim::model::capacity_resources(need))
+        .unwrap();
+    assert_eq!(info.class, hex_api::Class::ShardsImage);
+    assert_eq!(info.allocation, Some(receipt));
+    assert_eq!(info.bounds, payload.spec.bounds);
+    assert_eq!(
+        driver.lock().unwrap().node.admitted(),
+        [2_000, 256 << 20, 0, 0]
+    );
+
+    let no_class = hex_sim::model::Classes::NONE
+        .with(Class::Oci)
+        .with(Class::Shards);
+    for waits in [
+        node(1_000, hex_sim::model::Classes::ALL),
+        node(4_000, no_class),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = image();
+        let driver = open(dir.path(), &waits, &runtime);
+        let (_, step) = driver.submit(demand, payload.clone()).unwrap();
+        assert!(step.send.is_empty(), "{:?}", step.send);
+        local(&driver, step);
+        assert!(runtime.list().unwrap().is_empty());
+    }
+}
+
 fn boot(dir: &Path, runtime: Arc<Counting>) -> Driver {
     try_boot(dir, runtime).unwrap()
 }

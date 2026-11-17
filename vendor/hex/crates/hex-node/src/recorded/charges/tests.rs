@@ -1457,9 +1457,10 @@ fn w14_a_census_free_class_starts_cold_and_learns_its_vmm_overhead() {
     );
 }
 
-/// Joint plan step 14 (AC-T7.4.1), C8: a class's capacity answer carries the holding of each VM its learner learns, a
-/// Shards image VM's as a managed VM's. Do run a window of a managed VM and an image VM, then answer for the class from
-/// the node's records. Expect both VMs' holdings on the answer.
+/// Joint plan step 14 (AC-T7.4.1), C8: a class's capacity answer carries the holding of each VM its learner learns in
+/// it, a Shards image VM's in its own class's (P2.2) as a managed VM's in the Shards class's. Do run a window of a
+/// managed VM and an image VM, then answer for each class from the node's records. Expect each VM's holding on its
+/// own class's answer alone.
 #[test]
 fn w14_an_answer_carries_each_learned_vms_holding_an_image_vms_too() {
     let io = Record::default();
@@ -1485,37 +1486,35 @@ fn w14_an_answer_carries_each_learned_vms_holding_an_image_vms_too() {
             Instant::now(),
         )
         .unwrap();
-    let mut capacity = hex_api::Capacity {
-        own: Default::default(),
-        id: "shards".into(),
-        total: res(32_000, 64 * GIB),
-        free: CapacityResources::default(),
-        devices: Vec::new(),
-        cost: Some(cost()),
-        routes: Vec::new(),
-        device_routes: Vec::new(),
-        backings: Vec::new(),
-        unavailable: Vec::new(),
-        learned: None,
-        node_vms: Vec::new(),
-        unlearned: None,
+    let held = |class| {
+        let mut capacity = hex_api::Capacity {
+            own: Default::default(),
+            id: "shards".into(),
+            total: res(32_000, 64 * GIB),
+            free: CapacityResources::default(),
+            devices: Vec::new(),
+            cost: Some(cost()),
+            routes: Vec::new(),
+            device_routes: Vec::new(),
+            backings: Vec::new(),
+            unavailable: Vec::new(),
+            learned: None,
+            node_vms: Vec::new(),
+            unlearned: None,
+        };
+        learner
+            .answer(class, &mut capacity, records.iter().map(Holder::Box))
+            .unwrap();
+        capacity
+            .learned
+            .unwrap()
+            .holdings
+            .iter()
+            .map(|holding| box_of(&holding.id).to_owned())
+            .collect::<Vec<String>>()
     };
-    learner
-        .answer(
-            Class::Shards,
-            &mut capacity,
-            records.iter().map(Holder::Box),
-        )
-        .unwrap();
-    let mut held: Vec<String> = capacity
-        .learned
-        .unwrap()
-        .holdings
-        .iter()
-        .map(|holding| box_of(&holding.id).to_owned())
-        .collect();
-    held.sort();
-    assert_eq!(held, ["img-1", "vm-1"]);
+    assert_eq!(held(Class::Shards), ["vm-1"]);
+    assert_eq!(held(Class::ShardsImage), ["img-1"]);
 }
 
 /// Joint plan step 14 (C4; AC-T7.4.1): a window books off the fleet's budget every box it doesn't learn. Do sort a
@@ -3688,8 +3687,9 @@ fn w39_an_intent_the_last_resort_couldnt_write_is_told_typed() {
 /// whole, and its class's answer names it, a box and a node VM alike, with its refusal's words; and a guest whose room
 /// can't be told is named with what that awaits, as its runtime answers it. Do run a window of a managed Shards VM it
 /// reads, whose guest's room its runtime answers awaiting GuestRoom, an image VM whose run's period can't be read and a
-/// node VM whose host use can't be, then answer the Shards class. Expect the image VM and the node VM named unread, by
-/// their holders, each with its refusal's words, the managed VM not; and the managed VM named awaiting GuestRoom.
+/// node VM whose host use can't be, then answer the Shards class and the image VMs' own (P2.2). Expect each unread VM
+/// named on its class's answer, by its holder, with its refusal's words: the node VM on the Shards class's, the image VM
+/// on its own class's, the managed VM on neither; and the managed VM named awaiting GuestRoom.
 #[test]
 fn w39_an_answer_names_each_vm_its_window_couldnt_read_and_why() {
     let io = Record::default();
@@ -3711,28 +3711,34 @@ fn w39_an_answer_names_each_vm_its_window_couldnt_read_and_why() {
     learner
         .window(&io, &running, res(24_000, 64 * GIB), Instant::now())
         .unwrap();
+    let told = |class| {
+        learner
+            .learned(class, &[cost()], &running)
+            .unwrap()
+            .unwrap()
+            .unread
+            .iter()
+            .map(|unread| (holder_name(&unread.id), unread.why.clone()))
+            .collect::<Vec<(String, String)>>()
+    };
+    assert_eq!(
+        told(Class::Shards),
+        [(
+            "node-7".to_owned(),
+            Refusal::Broken("no such VM".into()).to_string()
+        )]
+    );
+    assert_eq!(
+        told(Class::ShardsImage),
+        [(
+            "img-1".to_owned(),
+            Refusal::Broken("its run's period unread".into()).to_string()
+        )]
+    );
     let learned = learner
         .learned(Class::Shards, &[cost()], &running)
         .unwrap()
         .unwrap();
-    let told: Vec<(String, String)> = learned
-        .unread
-        .iter()
-        .map(|unread| (holder_name(&unread.id), unread.why.clone()))
-        .collect();
-    assert_eq!(
-        told,
-        [
-            (
-                "img-1".to_owned(),
-                Refusal::Broken("its run's period unread".into()).to_string()
-            ),
-            (
-                "node-7".to_owned(),
-                Refusal::Broken("no such VM".into()).to_string()
-            ),
-        ]
-    );
     let awaited: Vec<(String, Upstream)> = learned
         .awaits
         .iter()

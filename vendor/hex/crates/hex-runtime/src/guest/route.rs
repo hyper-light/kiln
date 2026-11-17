@@ -91,9 +91,12 @@ pub(super) fn guest_spec(spec: &BoxSpec) -> Result<(), Refusal> {
             "the committed execution belongs to another backend",
         ));
     }
-    if !matches!(spec.class.class(), Class::Oci | Class::Shards) {
+    if !matches!(
+        spec.class.class(),
+        Class::Oci | Class::Shards | Class::ShardsImage
+    ) {
         return Err(invalid(
-            "the Shards guest requires an OCI or Shards workload",
+            "the Shards guest requires an OCI, Shards or Shards image workload",
         ));
     }
     Ok(())

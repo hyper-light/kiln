@@ -221,8 +221,8 @@ impl Held {
         self.run.pause(on).await
     }
 
-    /// The link its stdio rides into its boundary, as each end says it negotiated, once it's made;
-    /// none where its stdio ride none.
+    /// The agent-control link it is driven over into its boundary, as each end says it negotiated,
+    /// once it's made; none where it is driven over none.
     pub async fn linked(&self) -> Option<Link> {
         self.run.link().await
     }

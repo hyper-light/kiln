@@ -310,12 +310,35 @@ pub(crate) struct Hosts<'a> {
     /// The heads of its DAX windows a snapshot kept (D189), which a restore maps privately;
     /// none for a boot's, whose are its own memory.
     pub window_heads: Option<&'a std::fs::File>,
+    /// Each component's image a restore plugs back (D270 slice 5), by its key: one for each
+    /// its snapshot holds. None for a boot.
+    pub components: &'a [(String, std::fs::File)],
 }
 
-/// A snapshot's vsock and network devices, and the restore's host sides for them, come
-/// together or not at all.
+/// A snapshot's vsock and network devices and its components, and the restore's host sides
+/// and images for them, come together or not at all.
 #[cfg(hv)]
 fn check_hosts(snap: &crate::snapshot::Snapshot, hosts: Hosts<'_>) -> Result<(), String> {
+    // Each component it holds, given its image; none given that it holds not (D270 slice 5).
+    if let Some(k) = snap
+        .components
+        .iter()
+        .find(|k| !hosts.components.iter().any(|(key, _)| *key == k.key))
+    {
+        return Err(format!(
+            "the snapshot holds component {}: the restore gives no image of it",
+            k.key
+        ));
+    }
+    if let Some((key, _)) = hosts
+        .components
+        .iter()
+        .find(|(key, _)| !snap.components.iter().any(|k| k.key == *key))
+    {
+        return Err(format!(
+            "the restore gives component {key}'s image, which the snapshot holds none of"
+        ));
+    }
     match (snap.config.vsock, hosts.vsock) {
         (true, None) => {
             return Err(
@@ -564,6 +587,32 @@ fn restored_memory(
     }
 }
 
+/// Each component `snap` holds plugged back from its image in `images`, by its key, where the
+/// snapshot kept it (D270 slice 5): its range of the components' window and its place on the
+/// bus, before the devices' state is put back on its function ([`check_hosts`] has each image).
+#[cfg(hv)]
+fn replug_components(
+    control: &Arc<crate::devices::control::Control>,
+    memory: &Arc<GuestMemory>,
+    snap: &crate::snapshot::Snapshot,
+    images: &[(String, std::fs::File)],
+) -> Result<(), String> {
+    for kept in &snap.components {
+        let (_, image) = images.iter().find(|(key, _)| *key == kept.key).ok_or_else(|| {
+            format!(
+                "the snapshot holds component {}: the restore gives no image of it",
+                kept.key
+            )
+        })?;
+        let file = image
+            .try_clone()
+            .map_err(|e| format!("component {}'s image: {e}", kept.key))?;
+        runtime::plug_component(control, memory, file, &kept.key, Some(kept))
+            .map_err(|e| format!("component {} plugged back: {e}", kept.key))?;
+    }
+    Ok(())
+}
+
 /// The memory `snap`'s machine had plugged, plugged again in `memory` and read back from
 /// the snapshot's memory `file` (D176), given to the guest through `vm`'s stage 2 as a plug
 /// gives it: once the VM exists, and before any vCPU runs.
@@ -616,6 +665,11 @@ impl pmem::Slots for crate::hv::DeviceSlots {
     unsafe fn map(&self, i: u32, host: *mut u8, gpa: u64, len: usize, writable: bool) -> Result<(), String> {
         // SAFETY: forwarded caller contract.
         unsafe { crate::hv::DeviceSlots::map(self, i, host, gpa, len, writable) }.map_err(|e| e.to_string())
+    }
+
+    unsafe fn map_programs(&self, i: u32, host: *mut u8, gpa: u64, len: usize) -> Result<(), String> {
+        // SAFETY: forwarded caller contract.
+        unsafe { crate::hv::DeviceSlots::map_programs(self, i, host, gpa, len) }.map_err(|e| e.to_string())
     }
 
     fn unmap(&self, i: u32, gpa: u64, len: usize) -> Result<(), String> {
@@ -1149,12 +1203,16 @@ fn reported_renderer(
     }
 }
 
+/// What a VM process built without the GPU's renderer answers a GPU asked of it.
+#[cfg(all(hv, not(feature = "gpu")))]
+const RENDERS_NO_GPU: &str = "this VM process renders no GPU: shards' GPU VM process does, on macOS, Linux and Windows (D144, D201, D202)";
+
 #[cfg(all(hv, not(feature = "gpu")))]
 fn gpu_renderer(
     _selected: &[gpu_selection::PhysicalGpu],
     _report: Option<&mut GpuReportTo<'_>>,
 ) -> Result<(Box<dyn gpu::Renderer>, u64), String> {
-    Err("this VM process renders no GPU: shards' GPU VM process does, on macOS, Linux and Windows (D144, D201, D202)".into())
+    Err(RENDERS_NO_GPU.into())
 }
 
 /// A GPU's renderer and its window (D144, D201), at the first GiB boundary at or past
@@ -1195,7 +1253,7 @@ fn gpu_layout(
 /// The virtio-gpu device of `renderer`, its window `region` (D144, D201): no request it
 /// reads is larger than the guest's `ram`, from which no legitimate command outsizes, and
 /// a blob's place and length are whole pages of the host's.
-#[cfg(hv)]
+#[cfg(all(hv, feature = "gpu"))]
 fn gpu_device(
     vm: &crate::hv::Vm,
     renderer: Box<dyn gpu::Renderer>,
@@ -1209,9 +1267,22 @@ fn gpu_device(
     Ok(Box::new(gpu::Gpu::new(Box::new(served))))
 }
 
+/// A VM process without the GPU's renderer makes no virtio-gpu device: no renderer reaches
+/// it, [`gpu_layout`] refusing every GPU first, and so it carries none of the device's
+/// code (D36).
+#[cfg(all(hv, not(feature = "gpu")))]
+fn gpu_device(
+    _vm: &crate::hv::Vm,
+    _renderer: Box<dyn gpu::Renderer>,
+    _region: crate::devices::virtio::ShmRegion,
+    _ram: u64,
+) -> Result<Box<dyn crate::devices::virtio::VirtioDevice>, String> {
+    Err(RENDERS_NO_GPU.into())
+}
+
 /// The window a GPU's blobs are mapped into, `region` of the guest's addresses:
 /// Hypervisor.framework's stage 2, which maps each blob at its place (D144).
-#[cfg(hv = "hvf")]
+#[cfg(all(hv = "hvf", feature = "gpu"))]
 fn gpu_window(
     vm: &crate::hv::Vm,
     _region: &crate::devices::virtio::ShmRegion,
@@ -1222,7 +1293,7 @@ fn gpu_window(
 /// The window a GPU's blobs are mapped into, `region` of the guest's addresses: a range of
 /// this process reserved for it, one memslot over it, as a share's DAX window is
 /// (`dax_window`), which each blob is mapped into by its descriptor (D201).
-#[cfg(hv = "kvm")]
+#[cfg(all(hv = "kvm", feature = "gpu"))]
 fn gpu_window(
     vm: &crate::hv::Vm,
     region: &crate::devices::virtio::ShmRegion,
@@ -1241,7 +1312,7 @@ fn gpu_window(
 /// partition's mappings, each blob mapped at its place by its address, as
 /// Hypervisor.framework's stage 2 maps them; readable and writable, never executable
 /// (D202).
-#[cfg(hv = "whp")]
+#[cfg(all(hv = "whp", feature = "gpu"))]
 fn gpu_window(
     vm: &crate::hv::Vm,
     _region: &crate::devices::virtio::ShmRegion,
@@ -2543,8 +2614,10 @@ pub struct VsockHost {
     /// line on [`path`](VsockHost::path)'s socket comes here with its connection, for this
     /// process to hold the vCPUs to, or read their use, and answer on (`shards_abi::rate`).
     /// Only a dial on that socket says one: a guest's connections arrive as its packets.
-    /// None for every other machine, whose muxer closes such a dial unanswered.
-    pub rate: Option<std::sync::mpsc::Sender<(crate::platform::UnixStream, shards_abi::rate::Asked)>>,
+    /// None for every other machine, whose muxer closes such a dial unanswered. Its
+    /// connection is a host program's dial ([`crate::platform::HostStream`]): on Windows its
+    /// pipes (D272).
+    pub rate: Option<std::sync::mpsc::Sender<(crate::platform::HostStream, shards_abi::rate::Asked)>>,
 }
 
 /// What a [`ServedPort::Admitted`] port's owner did with a guest's connection: took it, or
@@ -2731,6 +2804,9 @@ pub struct RestoreConfig {
     /// The snapshot generation whose layer `layer` is a clone of, where its spawner made
     /// one (APFS, btrfs, XFS).
     pub layer_cloned: Option<String>,
+    /// Each component's image its snapshot holds (D270 slice 5), by its key, which the restore
+    /// plugs back where the snapshot kept it before its devices' state is put back.
+    pub components: Vec<(String, std::fs::File)>,
 }
 
 #[derive(Debug, Clone)]
@@ -3190,6 +3266,7 @@ mod tests {
         let snap = |vsock, net| Snapshot {
             config: machine(vsock, net),
             plugged: Vec::new(),
+            components: Vec::new(),
             data: None,
             arch: Vec::new(),
             devices: Vec::new(),
@@ -3204,6 +3281,7 @@ mod tests {
             io: None,
             layer: None,
             window_heads: None,
+            components: &[],
         };
         let mac = Some([2, 0, 0, 0, 0, 1]);
         for (has_vsock, has_net) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -3224,6 +3302,47 @@ mod tests {
         assert!(e.contains("--vsock PATH"), "{e}");
         let e = check_hosts(&snap(false, mac), hosts(false, false)).unwrap_err();
         assert!(e.contains("its own network process"), "{e}");
+    }
+
+    /// A restore gives each component its snapshot holds its image, by its key, and none that
+    /// it holds not (D270 slice 5): one missing, or one more, is refused, naming it.
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_gives_each_component_its_snapshot_holds_and_no_other() {
+        fn hosts(components: &[(String, std::fs::File)]) -> Hosts<'_> {
+            Hosts {
+                vsock: None,
+                net: None,
+                shares: &[],
+                join: None,
+                join_share: None,
+                io: None,
+                layer: None,
+                window_heads: None,
+                components,
+            }
+        }
+        let key = |c: char| c.to_string().repeat(64);
+        let image = || std::fs::File::open("/dev/null").unwrap();
+        let snap = Snapshot {
+            config: machine(false, None),
+            plugged: Vec::new(),
+            components: vec![crate::devices::virtio::pmem::Kept {
+                devfn: 3 << 3,
+                gpa: 1 << 32,
+                len: 2 << 20,
+                key: key('a'),
+            }],
+            data: None,
+            arch: Vec::new(),
+            devices: Vec::new(),
+            init: None,
+        };
+        check_hosts(&snap, hosts(&[(key('a'), image())])).unwrap();
+        let e = check_hosts(&snap, hosts(&[])).unwrap_err();
+        assert!(e.contains(&key('a')) && e.contains("gives no image"), "{e}");
+        let e = check_hosts(&snap, hosts(&[(key('a'), image()), (key('b'), image())])).unwrap_err();
+        assert!(e.contains(&key('b')) && e.contains("holds none of"), "{e}");
     }
 
     /// Each share's DAX window and the join share's (D189), at GiB boundaries from where
@@ -3348,6 +3467,7 @@ mod tests {
             io: None,
             layer: None,
             window_heads: None,
+            components: &[],
         };
         let e = virtio_devices(&config, &regions, None, &[], None, hosts, Vec::new(), 4)
             .err()
@@ -3390,6 +3510,7 @@ mod tests {
             io: None,
             layer: None,
             window_heads: None,
+            components: &[],
         };
         let e = virtio_devices(&config, &regions, None, &[], None, missing, Vec::new(), 5)
             .err()
@@ -3404,6 +3525,7 @@ mod tests {
             io: None,
             layer: None,
             window_heads: None,
+            components: &[],
         };
         let e = virtio_devices(&config, &regions, None, &[], None, missing, Vec::new(), 5)
             .err()

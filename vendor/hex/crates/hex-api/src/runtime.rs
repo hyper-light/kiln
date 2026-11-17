@@ -64,7 +64,8 @@ pub trait Runtime: Send + Sync {
     fn start(&self, id: &BoxId) -> Result<(), Refusal>;
 
     /// Runs `program` in box `id` with `stdio`: a host process in a `process` box, a process in the
-    /// container's namespaces in an `oci` box.
+    /// container's namespaces in an `oci` box. A Shards image VM runs a program in one of its members alone,
+    /// which [`Runtime::exec_member`] names: its `exec` is refused `Invalid` naming exec.
     fn exec(&self, id: &BoxId, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, Refusal>;
 
     /// Makes a `process` box from `spec` and runs `program` in it with `stdio`, as one call: the box a
@@ -111,6 +112,33 @@ pub trait Runtime: Send + Sync {
         })
     }
 
+    /// Runs `program` in member `member` of running Shards image box `id` (Shards' D243), on a lane of its own of its
+    /// run's agent-control endpoint (D238), with `stdio` as [`Runtime::exec`] takes it. It runs as its member does: its
+    /// user, confinement, namespaces and cgroup the member's own, so `program` names no user; its environment the
+    /// member's with `program`'s variables over it; its working directory `program`'s, else the member's; pipes, no
+    /// terminal. Any member its run declares that runs a program, driven by its caller or not. Its end is its status as
+    /// Shards tells it once its outputs have finished (`Exit::Code`, 128 plus a signal's number where one ended it), or
+    /// `Signal(9)` where its own kill ended it; it is no process of this host. Its start is waited for as decision 9 has a
+    /// wait follow its party. Refused, typed: `Invalid` for a program that can't be started, names a user, or is past
+    /// what the lane carries, and for a member its run declares not; as `mcp` is for a box that isn't running;
+    /// `NotRunning` where the member runs no program, refused it (it has ended, or its confinement refused what it
+    /// asked) or the run's connection ended first. A class whose boxes have no members refuses it, naming the class.
+    fn exec_member(
+        &self,
+        id: &BoxId,
+        member: &crate::Member,
+        program: Program,
+        stdio: Stdio,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        let _ = (member, program, stdio);
+        Err(Refusal::Invalid {
+            what: "member",
+            why: format!(
+                "box {id} isn't a Shards image box: only one has members a program runs in"
+            ),
+        })
+    }
+
     /// The next connection member `member`'s harness makes to its MCP bridge (D254) in running Shards image box `id`,
     /// whose spec asks the bridge of it ([`crate::ImageMember::mcp`]; goal 2's item 3), as a program: its stdout what the
     /// harness sends, its stdin what it is sent, given once ([`Proc::streams`]), and no stderr; its end the connection's
@@ -151,6 +179,25 @@ pub trait Runtime: Send + Sync {
         })
     }
 
+    /// The agent-control link of running Shards image box `id` (Shards' D238, D239, D252; kiln plan step 35's
+    /// `/runs/control`), as both its ends say it ([`ControlLink`]): what each end's TLS 1.3 handshake negotiated, its
+    /// controller's (this runtime's) and its endpoint's (the run's own, in its VM), and every lane its controller was
+    /// granted on it, by Shards' names, `mcp:N` among them for each member whose MCP bridge the run serves (D254). Its
+    /// controller is dialed where none is yet, as a member's signal dials it, and its endpoint's report is waited for
+    /// until it comes or the run's agent-control connection ends: decision 9's W* is where the census is told a run-out,
+    /// never where the wait ends. Asked again, it answers the same while its run is the same. Refused, typed: by a class
+    /// whose boxes have no agent-control link, naming the class; Pending while it boots, held, and `NotRunning(id,
+    /// "link")` before its start and once its stop has begun; `NotRunning(id, "link: its run ended")` where its
+    /// connection ends before its endpoint reports; and any other of Shards' faults `Os`, in its words.
+    fn link(&self, id: &BoxId) -> Result<ControlLink, Refusal> {
+        Err(Refusal::Invalid {
+            what: "link",
+            why: format!(
+                "box {id} isn't a Shards image box: only its run has an agent-control link"
+            ),
+        })
+    }
+
     /// Tells box `id`'s guest the room its caller's budget leaves it (D188; Shards' D241; joint plan step 14, C7): the
     /// caller's budget-left for the box, everything the VM holds coming out of it, in bytes past what the box holds now,
     /// negative where the budget is short of that (its guest then reclaims its file pages); none lifts the hold.
@@ -187,13 +234,16 @@ pub trait Runtime: Send + Sync {
     /// plan steps 12 and 14, C1): counters since the VM booted, so a reader's window is between two of its reads.
     /// Refused, typed, for a part its run host didn't read, never read as none, for a box not running, and by a class
     /// whose boxes run no VM process of their own, naming the class.
-    /// Deletes box `id` as [`Runtime::delete`] does, answering what its VM cost its host over its whole run, read as its
-    /// run ended (goal 54's change 3: a Shards image VM's final [`HostUse`], its window the whole run): `None` where the
-    /// box has no VM process of its own or its run never started (docs/design/shards-image-class.md §3: kiln charges
-    /// nothing then). A run that started answers its use or is refused, typed, the box left as it was (the review's
-    /// B-5): its read's own refusal where that read is refused, and [`Refusal::NotRunning`] where its run had ended, or
-    /// was being stopped, before its delete, a run's use being read only as it runs. A box already gone is refused
-    /// `NoSuchBox`, never answered with a use made up.
+    /// Deletes box `id` as [`Runtime::delete`] does, answering what its VM cost its host over its whole run (goal 54's
+    /// change 3: a Shards image VM's final [`HostUse`], its window the whole run): a run up at its delete read as it
+    /// runs, just before its delete's stop; a run that ended on its own before it, the final use its VM read once its
+    /// machine was down (Shards' D260), kept with its end until its delete, its window ending where its node first saw
+    /// that end. `None` where the box has no VM process of its own or its run never started
+    /// (docs/design/shards-image-class.md §3: kiln charges nothing then). A run that started answers its use or is
+    /// refused, typed, the box left as it was (the review's B-5): its read's own refusal where that read is refused, and
+    /// [`Refusal::NotRunning`] where its run ended with none kept (stopped before its delete, its use gone with its VM,
+    /// or its VM telling none whole at its end). A box already gone is refused `NoSuchBox`, never answered with a use
+    /// made up.
     fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, Refusal> {
         self.delete(id).map(|()| None)
     }
@@ -227,6 +277,76 @@ pub trait Runtime: Send + Sync {
             why: "this runtime runs no charge learner to take kiln's reservations".to_owned(),
         })
     }
+
+    /// Keeps a warm pool for `pool`'s Shards image VMs from now on (kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1;
+    /// Shards' D253): each box of its image and size then boots on a warm host of it where one is ready, Shards' demand
+    /// rule keeping as many warm as the room its runtime was given admits, each charged to that room before it starts.
+    /// Answered at once, no host started: a pool warms from its first box on. One kept already is kept. Refused
+    /// [`Refusal::no_warm_room`] by a runtime given no room (every runtime but a Shards image class given one),
+    /// `Invalid` for a pool [`WarmPool::check`] refuses or a size Shards boots otherwise, and `Full` past its most pools.
+    fn keep_pool(&self, pool: &WarmPool) -> Result<(), Refusal> {
+        let _ = pool;
+        Err(Refusal::no_warm_room())
+    }
+
+    /// Lets `pool` go: its warm and starting hosts end, each followed to its end and its room given back, before it
+    /// returns, but while a boot under way holds the pool, whose own end then ends them; a box booted from it runs on.
+    /// One it doesn't keep is let go already. Refused as [`Runtime::keep_pool`] is by a runtime given no room.
+    fn let_go_pool(&self, pool: &WarmPool) -> Result<(), Refusal> {
+        let _ = pool;
+        Err(Refusal::no_warm_room())
+    }
+
+    /// The warm pools it keeps now, and what each holds; none where it keeps none.
+    fn pools(&self) -> Result<Vec<WarmHeld>, Refusal> {
+        Ok(Vec::new())
+    }
+
+    /// Every volume of the Shards home its Shards image VMs' volumes are kept in (Shards' D281; kiln plan 01a1dd2e…,
+    /// P6.2: an agent's volumes as its person sees them, and what an admission reads), by name, as Shards' store reads
+    /// them as it is asked: each volume's files walked, a cost for a page or an admission, never for a start. A runtime
+    /// that boots no Shards image VM refuses it, naming why.
+    fn volumes(&self) -> Result<Vec<HomeVolume>, Refusal> {
+        Err(Refusal::Invalid {
+            what: "volumes",
+            why: "this runtime boots no Shards image VM, so it keeps no Shards home's volumes"
+                .to_owned(),
+        })
+    }
+
+    /// Volume `name` of that home removed with its files (Shards' D281), so that the next run given it finds it empty,
+    /// once no run holds it: each run given it holds it from its start's plug to its end, a daemon's run as an image
+    /// box's. Refused at once, never waited for: [`VolumeCause::InUse`] where a run holds it, its files kept, and
+    /// [`VolumeCause::Unknown`] where the home has none of that name, each [`Refusal::Volume`] in Shards' words;
+    /// `Invalid` for a name the store takes no volume by; `Os` where its files were not all removed. A runtime that
+    /// boots no Shards image VM refuses it, naming why.
+    fn clear_volume(&self, name: &str) -> Result<(), Refusal> {
+        let _ = name;
+        Err(Refusal::Invalid {
+            what: "clear_volume",
+            why: "this runtime boots no Shards image VM, so it keeps no Shards home's volumes"
+                .to_owned(),
+        })
+    }
+}
+
+/// A volume of a node's Shards home ([`Runtime::volumes`]), as Shards' store reads it (D281).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeVolume {
+    pub name: String,
+    /// The bytes its files take, as `system df` counts a volume's (each file's length, a hard link's once); none where
+    /// its files could not all be read.
+    pub bytes: Option<u64>,
+    /// The most its files may take ([`crate::ImageVolume::bound`]); none where it has none, its host's room alone
+    /// bounding it.
+    pub bound: Option<u64>,
+    /// What its files take by its bound's measure, which an admission holds to its bound: the count its servers share
+    /// while a run holds it bounded, else walked as it is asked; none where its files could not all be read.
+    pub charge: Option<u64>,
+    /// When it was made, in nanoseconds since the Unix epoch.
+    pub created_ns: u64,
+    /// Made for one run alone, for an image's `VOLUME` no share stands in for, and gone with it: no agent's.
+    pub anonymous: bool,
 }
 
 /// Whether a VM process's CPU time holds its vCPUs' guest time (Shards' D265), as that process learned it from its own
@@ -234,7 +354,8 @@ pub trait Runtime: Send + Sync {
 /// less its vCPUs'; where its hypervisor runs them apart from its threads (WHP's under the classic and core schedulers,
 /// every Windows Server's), its CPU is its own and its vCPUs' time is beside it. Not yet told, it is read as apart, so a
 /// VM is never charged less than it ran.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Charged {
     #[default]
     Unknown,
@@ -254,8 +375,9 @@ impl Charged {
 }
 
 /// What a box's VM costs its host beside its guest (Shards' D241, `Stats::microvm`; joint plan steps 12 and 14), each
-/// a counter since the VM booted, as its run host read its VM process.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// a counter since the VM booted, as its run host read its VM process. A run's final use, which a box's record keeps
+/// until its delete where its run ended on its own (Shards' D260), is kept in this form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostUse {
     /// Its VM process's CPU time, user and system together, in nanoseconds: its vCPUs' guest time among it, read just
     /// before it, where `charged` says its OS counts it there ([`Charged::own`] its VMM's own).
@@ -267,10 +389,36 @@ pub struct HostUse {
     /// Nanoseconds each vCPU has run the guest, by vCPU index, one for each vCPU of the VM's size.
     pub guest_ns: Vec<u64>,
     /// The time these counters span: from the VM's run's start, as its boot answered, to this read (goal 54's change
-    /// 3: kiln learns the overhead a VM costs its host over its window, at usage and at its delete).
+    /// 3: kiln learns the overhead a VM costs its host over its window, at usage and at its delete); for a final use its
+    /// VM read once its machine was down (Shards' D260), to where its node first saw that run's end.
     pub window: Duration,
     /// Whether `cpu_ns` holds the vCPUs' guest time (D265). Appended after the other fields.
     pub charged: Charged,
+}
+
+/// A Shards image box's agent-control link as both its ends say it ([`Runtime::link`]; Shards' D238, D239): what each
+/// end's TLS 1.3 handshake negotiated, and every lane its controller was granted on it by Shards' names (`control`,
+/// `exec`, `log:run`, `mcp:N`: `shards_api::control::Granted::name`), in the order its endpoint's report gives them:
+/// the lanes its controller's subscriptions name, then, where it may ask for execs, the MCP bridge of each member its
+/// run serves one of (D254), ascending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlLink {
+    /// Its controller's, the runtime's own, as its TLS state says it.
+    pub controller: Negotiated,
+    /// Its endpoint's, the run's own in its VM, as its report on the link's control lane says it.
+    pub endpoint: Negotiated,
+    pub lanes: Vec<String>,
+}
+
+/// What one end of a TLS 1.3 handshake negotiated, by IANA's codes: its cipher suite (RFC 8446 §4.1.3; a Shards link
+/// takes TLS13_AES_256_GCM_SHA384 alone, D239) and its key exchange group (§4.2.7), each with its name as rustls says
+/// it, none for a code rustls doesn't know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Negotiated {
+    pub suite: u16,
+    pub suite_name: Option<&'static str>,
+    pub group: u16,
+    pub group_name: Option<&'static str>,
 }
 
 /// CPU milli, memory bytes and writable-volume bytes; devices are not inferred from a pool.
@@ -427,6 +575,11 @@ impl RouteKey {
             (crate::Class::Shards, Execution::ShardsDedicated)
             | (crate::Class::Firecracker, Execution::Firecracker) => {
                 self.image.os == ImageOs::Linux
+            }
+            // An image VM is a microVM of its own that Shards boots under shards-init, of a Linux image, attaching no
+            // device (D231): its route is that execution alone (docs/design/shards-image-class.md §11).
+            (crate::Class::ShardsImage, Execution::ShardsDedicated) => {
+                self.image.os == ImageOs::Linux && self.gpu == GpuEligibility::None
             }
             _ => false,
         };
@@ -1133,11 +1286,40 @@ impl Allocation {
 }
 
 /// A microVM's size ([`Allocation::vm_size`]): its vCPUs and its memory in MiB.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VmSize {
     pub vcpus: u32,
     pub memory_mib: u64,
 }
+
+/// A warm pool of Shards image VMs ([`Runtime::keep_pool`]; kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1): its
+/// boxes' image, pinned by its digest, and their size, as each of them is admitted ([`Allocation::vm_size`]). kiln names
+/// the pools; how many hosts each keeps warm is Shards' demand rule's (D26), within its runtime's room.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WarmPool {
+    pub image: String,
+    pub size: VmSize,
+}
+
+impl WarmPool {
+    /// Whether a runtime can be asked to keep it: its image pinned by a digest, as a box's is
+    /// ([`crate::check_pinned`]), refused `Invalid` naming `warm pool`. Its size is its runtime's to hold to what Shards
+    /// boots, as a box's is.
+    pub fn check(&self) -> Result<(), Refusal> {
+        crate::check_pinned("warm pool", &self.image)
+    }
+}
+
+/// What a kept warm pool holds now ([`Runtime::pools`]): its hosts warm, each ready for a box of it, and those starting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WarmHeld {
+    pub pool: WarmPool,
+    pub warm: usize,
+    pub starting: usize,
+}
+
+/// What [`Refusal::no_warm_room`] names: the room a runtime charges its warm hosts to, its owner's.
+pub const WARM_ROOM: &str = "warm room";
 
 /// The most priors one class's capacity answer carries: one for its own cost profile and one for each route's
 /// (joint plan step 14).
@@ -2834,6 +3016,30 @@ pub enum Refusal {
         op: &'static str,
         failure: GuestFailure,
     },
+    /// A volume of its node's Shards home (Shards' D281) refused by what holds it, `cause`, in Shards' words, `why`,
+    /// which name it: a start's plug of a volume its box is given ([`crate::ShardsImage::volumes`]), or a clearing
+    /// ([`Runtime::clear_volume`]). After `Guest` (append-only).
+    #[error("a Shards home's volume, {cause}: {why}")]
+    Volume { cause: VolumeCause, why: String },
+}
+
+/// What held a volume of a node's Shards home from a start or a clearing ([`Refusal::Volume`]; Shards' D281), each by
+/// its own retry. The node's wire tags each by its place here, so append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum VolumeCause {
+    /// Asked with another bound than the one the runs holding it serve it with: its bound changes only while no run
+    /// holds it, so a start that asks it again once none does is given the bound it asks.
+    #[error("asked with another bound than the runs holding it serve it with")]
+    Bound,
+    /// A clearing holds it alone: asked again once that clearing has answered, it is made anew, empty.
+    #[error("being cleared")]
+    Clearing,
+    /// A run holds it, each run given it holding it until it ends: its files are kept.
+    #[error("held by a run")]
+    InUse,
+    /// The home has none of that name.
+    #[error("not in its home")]
+    Unknown,
 }
 
 /// How a Shards guest failed a call ([`Refusal::Guest`]): each of Shards' kinds by itself (Shards R04), so a caller
@@ -2891,7 +3097,9 @@ pub enum Upstream {
     /// has no field for it (Shards e82b9403).
     GuestCpuTimePerVcpu,
     /// A program started in a member of a Shards microVM: the exec of Shards' agent-control
-    /// endpoint.
+    /// endpoint. Given at Shards 9975d1f55, Hex's vendor point (D238's exec lanes, `Execs::exec`, D243's member exec): a
+    /// program runs in a member on a lane of its own, in process (`Runtime::exec_member`), so no call awaits it now. Its
+    /// tag stays, the wire being append-only.
     MemberExec,
     /// A microVM member's UDP flows to a host's name: Shards' destinations (D236) reach a name by TCP
     /// alone.
@@ -2956,11 +3164,16 @@ pub enum Upstream {
     /// its VM says it with each rate's answer since image channel version 31, which the charge learner reads each window
     /// (joint plan step 14, C1), so no call awaits it now. Its tag stays, the wire being append-only.
     RatePeriod,
+    /// A signal to a program run in a Shards member once its outputs have finished: Shards' exec lane tells its exit
+    /// after them, and its controller's one handle of it (`ExecControl`, at 9975d1f55) steers nothing while that exit is
+    /// waited for, where a member's own lane gives its steering and its end apart (`MemberSteering`, `MemberEnd`). An
+    /// exec's kill rides its lane while its outputs are open (`Runtime::exec_member`).
+    ExecSignalAfterOutput,
 }
 
 impl Upstream {
     /// Every capability, in the order the node's wire tags them.
-    pub const ALL: [Upstream; 17] = [
+    pub const ALL: [Upstream; 18] = [
         Upstream::GuestCpuTimePerVcpu,
         Upstream::MemberExec,
         Upstream::MemberGrantsByName,
@@ -2978,6 +3191,7 @@ impl Upstream {
         Upstream::MemberDestinations,
         Upstream::NestedChannel,
         Upstream::RatePeriod,
+        Upstream::ExecSignalAfterOutput,
     ];
 }
 
@@ -3022,6 +3236,10 @@ impl std::fmt::Display for Upstream {
             }
             Self::RatePeriod => {
                 "the period a Shards VM's rate holds over (D191's governor; given by D247's ImageGuest::rate_period)"
+            }
+            Self::ExecSignalAfterOutput => {
+                "a signal to a program run in a Shards member once its outputs have finished (its exec lane's \
+                 ExecControl steers nothing while its exit is waited for)"
             }
         })
     }
@@ -3168,6 +3386,16 @@ impl Refusal {
         Self::Os {
             op,
             why: err.to_string(),
+        }
+    }
+
+    /// A warm pool's refusal by a runtime given no room to charge its hosts to ([`Runtime::keep_pool`]): its
+    /// configuration's, as the same runtime given a room keeps one. Its caller matches [`WARM_ROOM`].
+    pub fn no_warm_room() -> Self {
+        Self::Unconfigured {
+            what: WARM_ROOM,
+            why: "a warm pool's hosts are each charged to their owner's room before they start, and it was given none"
+                .to_owned(),
         }
     }
 }
@@ -3575,6 +3803,84 @@ mod route_tests {
             serde_json::to_value(Execution::NodeVm).unwrap(),
             serde_json::json!("node-vm")
         );
+    }
+
+    /// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2; shards-image-class.md §11): an image VM's route is a microVM of its own
+    /// that Shards boots, of a Linux image, attaching no device. Do check image route keys, an offer of one and a
+    /// receipt committing to it, and charge a workload through it. Expect the dedicated key of a Linux image with no GPU
+    /// accepted and every other image key refused; its backend class Shards', as its box's is; the offer accepted with a
+    /// cost and refused without one; the receipt held to its class; and its charge its allocation's, none refused.
+    #[test]
+    fn p2_2_an_image_vms_route_is_its_own_microvm_charged_its_allocation() {
+        let image = |os: ImageOs, execution: Execution, gpu: GpuEligibility| RouteKey {
+            class: crate::Class::ShardsImage,
+            ..key(os, execution, gpu)
+        };
+        let dedicated = image(
+            ImageOs::Linux,
+            Execution::ShardsDedicated,
+            GpuEligibility::None,
+        );
+        assert!(dedicated.check().is_ok(), "{:?}", dedicated.check());
+        for bad in [
+            image(
+                ImageOs::Linux,
+                Execution::ShardsDedicated,
+                GpuEligibility::Required,
+            ),
+            image(
+                ImageOs::Linux,
+                Execution::ShardsDedicated,
+                GpuEligibility::Any,
+            ),
+            image(
+                ImageOs::Windows,
+                Execution::ShardsDedicated,
+                GpuEligibility::None,
+            ),
+            image(ImageOs::Linux, Execution::Native, GpuEligibility::None),
+            image(
+                ImageOs::Linux,
+                Execution::ShardsShared,
+                GpuEligibility::None,
+            ),
+            image(ImageOs::Linux, Execution::NodeVm, GpuEligibility::None),
+            image(ImageOs::Linux, Execution::Firecracker, GpuEligibility::None),
+        ] {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
+        assert_eq!(dedicated.backend_class(), crate::Class::Shards);
+        let offer = RouteOffer {
+            key: dedicated,
+            cost: Some(cost()),
+            backing: None,
+        };
+        assert!(offer.check().is_ok(), "{:?}", offer.check());
+        assert!(
+            RouteOffer {
+                cost: None,
+                ..offer
+            }
+            .check()
+            .is_err()
+        );
+        let receipt = RouteReceipt {
+            key: dedicated,
+            backing: None,
+        };
+        assert!(receipt.check(crate::Class::ShardsImage, false).is_ok());
+        assert!(receipt.check(crate::Class::Shards, false).is_err());
+        let workload = CapacityResources {
+            cpu_milli: 1_000,
+            mem_bytes: crate::MIN_MEMORY,
+            disk_bytes: 0,
+        };
+        let allocation = cost().allocate(workload).unwrap();
+        assert_eq!(
+            receipt.charged(workload, Some(allocation)),
+            Ok(allocation.booking())
+        );
+        assert!(receipt.charged(workload, None).is_err());
     }
 
     fn key(os: ImageOs, execution: Execution, gpu: GpuEligibility) -> RouteKey {

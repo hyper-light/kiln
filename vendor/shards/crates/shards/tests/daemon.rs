@@ -100,11 +100,12 @@ fn spawn_run(home: &Path, args: &[&str]) -> Child {
 }
 
 /// Waits for a child, a client of `home`'s daemon, failing the test rather than hanging it:
-/// for as long as its daemon and microVMs progress ([`Patience`], its kind its caller's
-/// call site).
+/// for as long as it, its daemon and microVMs progress ([`Patience::client`], its kind its
+/// caller's call site): once its daemon has died or stopped, its own end is all that goes on
+/// (containers.rs' `exit`).
 #[track_caller]
 fn wait(child: &mut Child, home: &Path) -> Option<i32> {
-    let mut patience = Patience::of(home);
+    let mut patience = Patience::client(child.id(), home);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             patience.done();
@@ -112,7 +113,7 @@ fn wait(child: &mut Child, home: &Path) -> Option<i32> {
         }
         if !patience.holds() {
             let _ = child.kill();
-            panic!("shards run did not exit, its daemon and microVMs no longer progressing");
+            panic!("shards run did not exit, it, its daemon and microVMs no longer progressing");
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -146,6 +147,33 @@ fn exits(home: &Path, daemon: i32, what: &str) {
         std::thread::sleep(patience.next_look());
     }
     patience.done();
+}
+
+/// Waits until no process's command line names `named`, each one's end waited for while it
+/// goes on (`common::Wait` on its process, its kind its caller's call site), those that
+/// outlive it named: a home's VM processes once its daemon has gone. A [`Patience`] of the
+/// home follows what descends from its daemon, and so none of them once it has gone, their
+/// party gone at its first look (CI 43968984258, x86_64 musl: `a_dead_daemons_waiting_vms_end`
+/// refused 3.0 ms and `a_restored_microvm_ends_with_its_home` 1.8 ms in, "its members now:
+/// none followed").
+#[track_caller]
+fn all_end(named: &str, what: &str) {
+    let kind = WaitKind::at(std::panic::Location::caller());
+    for (vm, _) in commands_with(named) {
+        let mut ending = Wait::begin(kind, vm, None, "a VM process's end, its daemon gone");
+        while alive(i32::try_from(vm).unwrap()) {
+            if let Err(stall) = ending.look(false) {
+                panic!("{what}: {:?}: {}", commands_with(named), ending.refused(&stall));
+            }
+            std::thread::sleep(ending.next_look());
+        }
+        ending.answered();
+    }
+    assert!(
+        commands_with(named).is_empty(),
+        "{what}: {:?}",
+        commands_with(named)
+    );
 }
 
 fn daemon_pid(home: &Path) -> Option<i32> {
@@ -836,9 +864,7 @@ fn stop_ends_runs_and_waiting_vms() {
         Some(128 + 15),
         "the run was not stopped by SIGTERM"
     );
-    eventually(&home, "VMs outlived the daemon's stop", || {
-        processes_with(&templates).is_empty()
-    });
+    all_end(&templates, "VMs outlived the daemon's stop");
 }
 
 /// `daemon stop` stops each run as `stop vm` would (D26): with its own stop signal, and
@@ -1029,9 +1055,7 @@ fn a_dead_daemons_waiting_vms_end() {
     });
     let daemon = daemon_pid(&home).expect("a daemon pid");
     kill_now(daemon);
-    eventually(&home, "warm VMs outlived their daemon", || {
-        processes_with(&templates).is_empty()
-    });
+    all_end(&templates, "warm VMs outlived their daemon");
 }
 
 /// A client from another build replaces the daemon, and its run is served, its stdin whole:
@@ -2898,15 +2922,26 @@ fn pools_keep_what_their_runs_need_while_they_come() {
     }
     let (image, _) = served();
     let home = home_with("daemon-demand");
-    // The keep-alive outlasts the spacing of runs well apart below, which a loaded host
-    // stretches.
-    const KEEP: Duration = Duration::from_secs(15);
-    let keep = KEEP.as_secs().to_string();
-    let env: [(&str, &OsStr); 3] = [
-        ("SHARDS_HOME", home.as_os_str()),
-        ("SHARDS_POOL", "3".as_ref()),
-        ("SHARDS_POOL_KEEP", keep.as_ref()),
-    ];
+    // Its keep-alive is D26's own (SHARDS_POOL_KEEP unset) while runs come apart. Then, so
+    // that the pool is seen to empty past it, its daemon starts again with one as long as the
+    // window it said (below): no keep-alive of the test's own (R03). A fixed one of 15 s was
+    // under a loaded host's refill window (CI 43968984258, x86_64 musl: runs 16 s apart were
+    // still one burst).
+    let env: [(&str, &OsStr); 2] = [("SHARDS_HOME", home.as_os_str()), ("SHARDS_POOL", "3".as_ref())];
+    let log = home.join("daemon.log");
+    // The burst window its daemon said at each refill it timed, oldest first: SRTT +
+    // 4·RTTVAR of its refills from start to ready (RFC 6298, as shards_api::demand keeps
+    // it), which the daemon alone measures.
+    let windows = || -> Vec<Duration> {
+        let said = std::fs::read_to_string(&log).unwrap_or_default();
+        said.lines()
+            .filter_map(|line| {
+                let (_, rest) = line.split_once("; runs within ")?;
+                let (us, _) = rest.split_once(" us of each other are one burst")?;
+                us.parse().ok().map(Duration::from_micros)
+            })
+            .collect()
+    };
     let templates = home.join("templates");
     let templates_named = templates.to_string_lossy().into_owned();
     // Its VMs: the template's processes, but for the runs' own VMs the burst learns
@@ -2951,39 +2986,55 @@ fn pools_keep_what_their_runs_need_while_they_come() {
         );
     };
     let args = [image.as_str(), "exit", "0"];
-    let run = || {
-        let run = run_shards_env(&["run"], &args, &env);
+    let run = |env: &[(&str, &OsStr)]| {
+        let run = run_shards_env(&["run"], &args, env);
         assert_eq!(run.status, Some(0), "{}", run.stderr);
     };
-    // Runs well apart: each is served by the one VM refilled for the run before. "Apart"
-    // is past the pool's refill window, SRTT + 4·RTTVAR of its refills from start to ready
-    // (RFC 6298, as shards_api::demand keeps it), which the daemon alone sees: a loaded host's
-    // refills are slow to say they are ready, and two runs it judges one burst keep the
-    // pool at two for the keep-alive. So the spacing starts at a second and doubles while
-    // the pool keeps two, each try beginning again past the keep-alive, when the burst it
-    // saw is gone.
-    // Whether it keeps one is what it keeps once its refill is said: a pool that keeps two
-    // for a burst keeps them until its keep-alive, so one look tells (no window of the
-    // test's own, D209).
-    let mut apart = Duration::from_secs(1);
-    let mut kept_one = 0;
-    while kept_one < 4 {
-        run();
+    // A refill, once its daemon has said it: its window then the newest said.
+    let refilled = |said: usize| {
+        eventually(&home, "the pool's refill said", || windows().len() > said);
         settled(Patience::of(&home), "a refill", &|n| n >= 1);
-        if warm() == 1 {
-            kept_one += 1;
-            std::thread::sleep(apart);
-            continue;
-        }
-        apart *= 2;
-        assert!(
-            apart < KEEP,
-            "runs {apart:?} apart are still one burst to the pool: its refills leave no room under the keep-alive"
+    };
+    // Its first run boots its image and saves the template its pool refills from (D25).
+    let said = windows().len();
+    run(&env);
+    refilled(said);
+    // Runs apart: each begun once the window its daemon said at the refill before it has
+    // passed since the run before ended, so its claim comes more than one refill window
+    // after that run's, and it is served by the one VM refilled for the run before. A pool
+    // that judged two runs one burst keeps two until its keep-alive, so one look, once the
+    // refill is said, tells (no window of the test's own, D209). Each run's own VM is learned
+    // ([`Held`]): ended, it takes its time to go, and is no VM the pool keeps.
+    for n in 0..4 {
+        let window = windows().last().copied().unwrap();
+        std::thread::sleep(window);
+        let said = windows().len();
+        let mut apart = Held::start(&image, &format!("apart-{n}"), &env);
+        let vm = apart.vm(&env, &templates_named);
+        runs_own.borrow_mut().push(vm);
+        assert_eq!(apart.end(&home), Some(0), "a run apart");
+        refilled(said);
+        assert_eq!(
+            warm(),
+            1,
+            "runs begun {window:?} apart, the window their daemon said, were one burst to the pool:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
         );
-        kept_one = 0;
-        // Past the keep-alive: waited for as the pool empties.
-        settled(Patience::of(&home), "past the keep-alive", &|n| n == 0);
     }
+    // Its daemon again, its keep-alive the window it said last (whole seconds, as
+    // SHARDS_POOL_KEEP takes it): by its daemon's own estimate a refill comes within it, so a
+    // burst's refills come before its pool is idle past it.
+    let window = windows().last().copied().unwrap();
+    let keep = (window.as_secs() + u64::from(window.subsec_nanos() > 0)).to_string();
+    let stopped = run_shards_env(&["daemon"], &["stop"], &env);
+    assert_eq!(stopped.status, Some(0), "{stopped}");
+    // Its VMs end with it: none is counted as the next daemon's pool's.
+    all_end(&templates_named, "the first daemon's VMs, past its stop");
+    let env: [(&str, &OsStr); 3] = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_POOL", "3".as_ref()),
+        ("SHARDS_POOL_KEEP", keep.as_ref()),
+    ];
     // Three at once: the pool keeps more for the next burst, never past its most. Each
     // run held under way until all three are served, for its VM to be learned: what the
     // pool keeps is the template's processes but those, which go in their own time once
@@ -3022,7 +3073,7 @@ fn pools_keep_what_their_runs_need_while_they_come() {
         commands_with(&templates.to_string_lossy()),
         std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default()
     );
-    run();
+    run(&env);
     settled(Patience::of(&home), "after the keep-alive", &|n| n >= 1);
     let stopped = run_shards_env(&["daemon"], &["stop"], &env);
     assert_eq!(stopped.status, Some(0), "{stopped}");
@@ -3204,9 +3255,7 @@ fn a_daemon_whose_home_is_removed_exits_without_making_it_again() {
         matches!(std::fs::remove_dir_all(&path), Ok(())) || !path.exists()
     });
     exits(&home, daemon, "the daemon outlived its home");
-    eventually(&home, "VMs outlived their home", || {
-        processes_with(&named).is_empty()
-    });
+    all_end(&named, "VMs outlived their home");
     // Nothing that could make it again lives: looked at now, no window standing for "never"
     // (D209).
     let made: Vec<_> = std::fs::read_dir(&path)
@@ -3275,9 +3324,7 @@ fn a_restored_microvm_ends_with_its_home() {
         std::thread::sleep(ending.next_look());
     }
     ending.answered();
-    eventually(&home, "a restored VM outlived its home", || {
-        processes_with(&named).is_empty()
-    });
+    all_end(&named, "a restored VM outlived its home");
 }
 
 /// A daemon killed outright takes its runs with it: each VM, told how its run stops
@@ -3309,24 +3356,53 @@ fn a_killed_daemons_runs_end_with_it() {
     let named = home.to_string_lossy().into_owned();
     let daemon = daemon_pid(&home).expect("a daemon pid");
     kill_now(daemon);
-    // Each one's end waited for while it goes on (`common::Wait` on its process, its daemon
-    // gone), and those that outlive it named, for a failure to say which.
-    let kind = WaitKind::at(std::panic::Location::caller());
-    for (vm, _) in commands_with(&named) {
-        let mut ending = Wait::begin(kind, vm, None, "a run's end with its killed daemon");
-        while alive(i32::try_from(vm).unwrap()) {
-            if let Err(stall) = ending.look(false) {
-                panic!(
-                    "runs outlived their killed daemon: {:?}: {}",
-                    commands_with(&named),
-                    ending.refused(&stall)
-                );
-            }
-            std::thread::sleep(ending.next_look());
-        }
-        ending.answered();
+    all_end(&named, "runs outlived their killed daemon");
+}
+
+/// A daemon killed outright takes its microVMs' joiners (D119) with them: a microVM whose own
+/// command the daemon's going stops, and one whose own command had ended already, its joiner
+/// going on in it, each end once their daemon has gone. Before, a joiner held its microVM up
+/// with nothing left to reach it: the stop order a VM keeps (`STOP_ORDER`) ends its own command
+/// alone, and the machine's end was its guest's, which serves its joiners past that command.
+#[test]
+fn a_killed_daemons_joined_microvms_end_with_it() {
+    if cannot_run_vms() {
+        return;
     }
-    assert!(commands_with(&named).is_empty(), "{:?}", commands_with(&named));
+    let (image, _) = served();
+    let home = home("daemon-killed-joined", &image);
+    let env = [("SHARDS_HOME", home.as_os_str())];
+    let shards = |args: &[&str]| run_shards_env(&[], args, &env);
+    for provider in ["going", "past"] {
+        let up = shards(&[
+            "run", "vm", "-d", "--name", provider, "--pull", "never", &image, "sleep",
+        ]);
+        assert_eq!(up.status, Some(0), "{}", up.stderr);
+        let (joiner, network) = (format!("{provider}-joiner"), format!("container:{provider}"));
+        let joined = shards(&[
+            "run",
+            "vm",
+            "-d",
+            "--name",
+            &joiner,
+            "--network",
+            &network,
+            "--pull",
+            "never",
+            &image,
+            "sleep",
+        ]);
+        assert_eq!(joined.status, Some(0), "{}", joined.stderr);
+    }
+    // `past`'s own command ended, its joiner going on in its microVM.
+    let killed = shards(&["kill", "vm", "past"]);
+    assert_eq!(killed.status, Some(0), "{}", killed.stderr);
+    let waited = shards(&["wait", "vm", "past"]);
+    assert_eq!(waited.status, Some(0), "{}", waited.stderr);
+    let named = home.to_string_lossy().into_owned();
+    let daemon = daemon_pid(&home).expect("a daemon pid");
+    kill_now(daemon);
+    all_end(&named, "joined microVMs outlived their killed daemon");
 }
 
 /// A home named relatively is one home, wherever it is named from, however long, with

@@ -105,6 +105,13 @@ pub struct BoxRecord {
     /// covers it. Added within version 1, so a record without it reads as `None` (append-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_for: Option<hex_api::LifecycleCause>,
+    /// What its Shards image VM used of its host in all, where its run ended on its own (Shards' D260's final use, read
+    /// by its VM once its machine was down; joint plan step 12, kiln's P7.1b): written with its end, a fact as its exit
+    /// is, and answered by its delete with its host use, across the node's restarts. None where its VM told none whole,
+    /// and for every run its node stopped, whose use its delete reads as it runs. Outside the spec, so no native
+    /// commitment covers it. Added within version 1, so a record without it reads as `None` (append-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_use: Option<hex_api::HostUse>,
 }
 
 /// The host's boot session as its kernel names it, a new one each boot: Linux's
@@ -291,6 +298,7 @@ impl BoxRecord {
             started_from: None,
             diagnostics: None,
             retired_for: None,
+            final_use: None,
         }
     }
 

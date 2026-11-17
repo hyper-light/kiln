@@ -73,14 +73,18 @@ every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words 
 | `VM_E2E_SHARDS_STORE` | a Shards home holding the bases the run's images are built from, pulled once for the whole run: each test's runner starts with a copy of its image store's blobs and references in its own Shards home, so a build takes its digest-pinned base from there (Shards' D78) and asks no registry for it (no Docker Hub pull per test, which the LAN's pull budget and its DNS can't bear). Seed it with the carried `shards`: `SHARDS_HOME=<dir> DOCKER_CONFIG=<an empty dir> target/shards-carried/<host>/shards pull <each ARG BASE of .kiln/images/*/Agentfile>`, then `shards stop daemon` with the same home; unset: each runner's home starts empty |
 | `VM_E2E_SERVER`, `VM_E2E_TOKEN`, `VM_E2E_MACHINE`, `VM_E2E_RUNNER_PID`, `VM_E2E_RUNNER_LOG` | ROOT's own kiln (one with the sign-ins and credentials real tasks need) at `http://127.0.0.1:<port>`, its admin token (from a file, never on a command line or in a log), its runner's machine id, that runner's pid and its log (where it writes each call of kiln's MCP over a lane); unset: a server and a runner of the test's own, its headroom off |
 
-No wait has a time of its own (`vm_e2e::Pace`; docs/research/s35-every-harness/waits/README.md). Until a
-harness gives its first answer in a drive, and while it works on a turn the drive asked to be long, a wait
-is bounded by what the run's earlier drives on the same runner answered of that kind (`vm_e2e::Learned`:
-its slowest start, its slowest steered turn); before the run's first of that kind it follows its liveness
-and progress alone. After that, the slowest answer the harness has given in the drive bounds how long it
-may go without progress. A wait ends at once, typed and saying why, where kiln's own word says no answer
-can come, or where the fixture's own server or runner ended. Each refusal prints the session's state,
-each of its messages' delivery, and its timeline. A drive refused part way ends the sessions it started.
+No wait has a time of its own (`vm_e2e::Pace`; docs/research/s35-every-harness/waits/README.md), and no
+drive is judged by another's: each harness's image, stand-in and build are its own, so another drive's
+answers bound none of its waits (r707: claude's first turn bounded codex's, refused while codex's image was
+still building). Until a harness gives its first answer in a drive, and while it works on a turn the drive
+asked to be long, a wait follows its own parties' liveness and progress alone. After that, the slowest
+answer the harness has given in the drive bounds how long it may go without progress. What progresses is
+kiln's word on the session and its timeline, and, while the session starts (kiln's word on it unmoving as
+its image builds and its microVM boots), the drive's own processes on the host (`vm_e2e::Own`: those its
+runner's trees gained since the drive began, its build's and its microVM's) and the CPU they use. A wait
+ends at once, typed and saying why, where kiln's own word says no answer can come, or where the fixture's
+own server or runner ended. Each refusal prints the session's state, each of its messages' delivery, its
+timeline, and the drive's own processes as last read. A drive refused part way ends the sessions it started.
 As it runs it says where it stands, so a run ended from outside shows it: `DRIVE:` (a harness and its
 image), `WAIT:` (each wait as it begins: the harness's step, its session, its window or none), `FAILED:`
 (`step35::rest::` and `step35::mcp::`, each failure as it comes) and `ENDED:` (a session a refused drive left).
@@ -183,14 +187,11 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    Shards slice, as its agent names them: `/runs/in`, `/runs/vm`, `/runs/image`, `/runs/host_pid`,
    `/runs/control/{controller,endpoint}/{suite,group}`, `/runs/control/lanes` and `/starts`. Read from
    `GET /api/harness/sessions/<id>`, through `VM_E2E_LINKS`' `agent-control` entry, and by
-   `check_no_host_pid` and `check_starts`. The link's ends and lanes say nothing until Hex reports the
-   link (2026-11-16): kiln's runner holds its microVMs through Hex's image runtime, whose `Runtime` (Hex
-   1969a423e, as kiln vendors it) signals the member and takes kiln's MCP lane over that link but has no
-   call that reports it, so `HexRun::link` answers none and `/runs/control` is absent. Owed: the Hex
-   lead's `Runtime` call answering both ends' suite and group and the link's lanes, `mcp:<member>` among
-   them (on a Shards that lists them); then kiln re-vendors Hex and maps `HexRun::link` to it. Until then
-   `in_microvm` checks the links after every other check and fails them by that name (`vm_e2e::LinkGap`,
-   gaps.json's `link_report` gaps). Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
+   `check_no_host_pid` and `check_starts`. On a Hex-held run the link's ends and lanes are Hex's report
+   of it (`Runtime::link`, on Shards' `Linked::report`, 8c9c03cc4; in the Hex kiln vendors since
+   992c5a33a), which `HexRun::link` maps; that link carries none of its stdio, which Hex takes from the
+   image channel. `in_microvm` checks the links after every other check and fails missing ones by that
+   name (`vm_e2e::LinkGap`, gaps.json's `link_report` gaps). Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
    `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch
    (`p/s17-launch-seam-v1`, 64dfab21f) reads its process's `host_pid()` inside (`session.rs` 4328 and
    4724) and says none of it; Shards' `control::Controller` (`crates/remote/src/control/drive.rs`)
@@ -247,8 +248,8 @@ a server and a runner of its own (never ROOT's: it writes the person's home in t
   reads it). `/runs/reach` must be `{"as": "narrowed", "uses": ["anthropic"], "hosts": […]}`, the
   hosts kiln's table keeps for it (`BY_USE`). Inside, the stand-in's `CONNECT=api.anthropic.com:443`
   connects, and `CONNECT=api.groq.com:443` is refused by the microVM's network: its resolver answers
-  REFUSED, RCODE 5 (Shards' D236), said `CONNECT_REFUSED api.groq.com:443 dns rcode 5`. No notice
-  says it isn't narrowed.
+  NXDOMAIN, RCODE 3, at once (Shards' D46 and D278, amended 2026-11-16, where it answered REFUSED,
+  RCODE 5), said `CONNECT_REFUSED api.groq.com:443 dns rcode 3`. No notice says it isn't narrowed.
 - **Whole, and said.** With the person's config unreadable (a folder at its path), `/runs/reach` is
   `{"as": "whole", "why": {"unread": {"file": "<its path in the microVM>", …}}}`, a warning notice
   says the network isn't narrowed and why, and both hosts connect: every destination the image names.

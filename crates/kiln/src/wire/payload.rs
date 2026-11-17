@@ -1153,6 +1153,9 @@ pub enum FromServer {
     RunnerEngine(crate::harness::engine::Asked),
     /// `AdoptPolicy`: the room a hand-over's spool leaves on this runner's volume (CP-T3.2).
     AdoptPolicy(crate::harness::moving::stream::Told),
+    /// `Volumes`: the agent volumes its microVMs' store keeps of the names asked, or one cleared (kiln plan 01a1dd2e…,
+    /// P6.2).
+    Volumes { req: u64, ask: crate::agentdefs::volumes::Ask },
 }
 
 impl Carries for ServerMsg {
@@ -1226,6 +1229,7 @@ impl Carries for ServerMsg {
             ServerMsg::Replay { req, .. } => {
                 return Err(Box::new(Unreadable { of: "Replay", what: "Replay".into(), code: Code::Unknown, why: "replays were withdrawn from experiments: no runner runs one".into(), session: None, waits: Some(Waits::Asking(req)) }));
             }
+            ServerMsg::Volumes { req, json } => FromServer::Volumes { req, ask: payload(W, "Volumes", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
             m @ (ServerMsg::Welcome { .. }
             | ServerMsg::Refused { .. }
             | ServerMsg::Assign(_)

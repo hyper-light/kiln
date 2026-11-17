@@ -944,6 +944,7 @@ fn bind(source: &str, destination: &str) -> Mount {
         source: PathBuf::from(source),
         destination: destination.to_owned(),
         read_only: true,
+        members: Vec::new(),
     }
 }
 

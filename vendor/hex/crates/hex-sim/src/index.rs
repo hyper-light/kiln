@@ -400,7 +400,7 @@ impl Slot {
         // Process asks retain host meaning; an actual routed OCI/VM offer names its image.
         let image_os = match class {
             Class::Oci => os,
-            Class::Shards | Class::Firecracker => crate::model::Os::Linux,
+            Class::Shards | Class::Firecracker | Class::ShardsImage => crate::model::Os::Linux,
         };
         if choice.is_none()
             && (ask.os.is_some_and(|o| o != image_os)
@@ -411,7 +411,8 @@ impl Slot {
         let exposed_class = match choice.map(|choice| choice.offer.key.backend_class()) {
             Some(hex_api::Class::Shards) => Class::Shards,
             Some(hex_api::Class::Firecracker) => Class::Firecracker,
-            _ => class,
+            Some(hex_api::Class::Process | hex_api::Class::Oci | hex_api::Class::ShardsImage)
+            | None => class,
         };
         let gpus_only = crate::model::Ask {
             vfio: 0,
@@ -1744,7 +1745,7 @@ impl FitIndex {
             })
             .unwrap_or(match class {
                 Class::Oci => os,
-                Class::Shards | Class::Firecracker => crate::model::Os::Linux,
+                Class::Shards | Class::Firecracker | Class::ShardsImage => crate::model::Os::Linux,
             });
         let image_arch = receipt
             .map(|receipt| match receipt.key.image.arch {
@@ -2114,6 +2115,54 @@ mod tests {
         };
         assert_eq!(index.verdict(NodeId(0), &native).unwrap(), Verdict::Admits);
         assert_eq!(demand.need, need, "original workload remains unchanged");
+    }
+
+    /// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2): an image box is placed only on a node listing the Shards image class. Do:
+    /// two nodes alike, each costing both Shards classes, the first listing Hex's Shards class alone and the second the
+    /// image class beside it; place an image VM's demand, then a Shards guest's of the same need. Expect: the image VM
+    /// refused NoClass on the first and admitted on the second, where the walk lands it; the guest admitted on both.
+    #[test]
+    fn p2_2_an_image_box_lands_only_on_the_node_listing_the_image_class() {
+        let node = |id, classes| {
+            let mut spec = NodeSpec::new(
+                NodeId(id),
+                Resources {
+                    cpu_milli: 4_000,
+                    mem_bytes: 4_000,
+                    ..Resources::default()
+                },
+            );
+            spec.classes = classes;
+            spec.costs[Class::Shards.index()] = Some(explicit_fixture_cost(1_000));
+            spec.costs[Class::ShardsImage.index()] = Some(explicit_fixture_cost(1_000));
+            spec
+        };
+        let guests = Classes::NONE.with(Class::Shards);
+        let index =
+            FitIndex::new(&[node(0, guests), node(1, guests.with(Class::ShardsImage))]).unwrap();
+        let image = Demand {
+            need: Resources {
+                cpu_milli: 100,
+                mem_bytes: 10,
+                ..Resources::default()
+            },
+            class: Class::ShardsImage,
+            kind: Kind::Plain,
+            ask: crate::model::Ask::default(),
+        };
+        assert_eq!(index.verdict(NodeId(0), &image).unwrap(), Verdict::NoClass);
+        assert_eq!(index.verdict(NodeId(1), &image).unwrap(), Verdict::Admits);
+        assert_eq!(
+            index.fit(&image, &Pick::default()).best.map(|key| key.node),
+            Some(NodeId(1))
+        );
+        let guest = Demand {
+            class: Class::Shards,
+            ..image
+        };
+        for id in [0, 1] {
+            assert_eq!(index.verdict(NodeId(id), &guest).unwrap(), Verdict::Admits);
+        }
     }
 
     /// AC-T7.4.1: profile refresh affects new work; recovery and release use the old exact receipt.

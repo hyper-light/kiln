@@ -55,6 +55,9 @@ pub struct Microvms {
     state: Option<std::path::PathBuf>,
     /// The warm pools kiln names on them, from the starts launched here (kiln plan 01a1dd2e…, P3.2).
     pub pools: Arc<pools::Pools>,
+    /// Hex's image runtime they're held in, where [`held_in`] held them: its node, whose listing of the class its
+    /// image VMs run as their facts say (kiln plan 01a1dd2e…, P2.4; [`facts_of`]).
+    node: Option<Arc<hex_node::images::ImageRuntime>>,
 }
 
 /// One connection a run's harness made to its MCP bridge in its microVM (Shards D254, `Execs::mcp`'s
@@ -82,7 +85,7 @@ impl Microvms {
     /// Runs in `sandbox`, booting `images`: a stand-in's, launched as the seam launches.
     pub fn new(sandbox: Arc<dyn Sandbox>, images: image::Images) -> Self {
         let pools = pools::Pools::new(Arc::clone(&sandbox), crate::rt::clock());
-        Self { sandbox, images, hex: None, shards: None, lanes: None, state: None, pools }
+        Self { sandbox, images, hex: None, shards: None, lanes: None, state: None, pools, node: None }
     }
 
     /// kiln's state they're held beneath, where [`held_in`] held them.
@@ -170,8 +173,9 @@ pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Opti
     }
     .map_err(|r| anyhow::anyhow!("Hex's image runtime under {}: {r}", state.display()))?;
     let images = image::Images::new(shards, shards_home(&state), state.join("shards-builds"));
+    let node = Arc::clone(&runtime);
     let hex = hexvm::HexVms::new(runtime, box_name);
-    Ok(Microvms { state: Some(state), ..of_hex(if leases { hex.leasing() } else { hex }, images, ledger) })
+    Ok(Microvms { state: Some(state), node: Some(node), ..of_hex(if leases { hex.leasing() } else { hex }, images, ledger) })
 }
 
 /// The machine's microVMs as `hex` holds them, booting `images`: each run's charge kept in `ledger` as it ends (the
@@ -183,7 +187,7 @@ pub fn of_hex(hex: hexvm::HexVms, images: image::Images, ledger: Option<Arc<dyn 
     });
     let sandbox = Arc::clone(&hex) as Arc<dyn Sandbox>;
     let pools = pools::Pools::new(Arc::clone(&sandbox), crate::rt::clock());
-    Microvms { sandbox, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None, state: None, pools }
+    Microvms { sandbox, images, lanes: Some(Arc::clone(&hex) as Arc<dyn Lanes>), hex: Some(hex), shards: None, state: None, pools, node: None }
 }
 
 /// The group placement reads run `run`'s use from, launched in `vms`: its VM's meter, where Hex holds it
@@ -256,13 +260,32 @@ pub fn facts(kvm: bool) -> Facts {
 /// ([`hold`]), they're what Shards' own check of this host says now (`shards_api::host_check`, Shards' D262: the check
 /// its VM process makes before it boots, made without booting one, by one launch of the carried `shards`), so a runner
 /// whose hypervisor can't run microVMs says so in Shards' words, and its engine is `host` (kiln plan 01a1dd2e…, P2.3).
-/// A stand-in's ([`Microvms::new`], [`held_in`] alone) carries no `shards` to ask. Blocking.
+/// A stand-in's ([`Microvms::new`], [`held_in`] alone) carries no `shards` to ask. Held through Hex, they say whether its
+/// node lists the class its image VMs run as, as that node says at each probe ([`image_class`], P2.4). Blocking.
 pub fn facts_of(kvm: bool, held: Option<&Microvms>) -> Facts {
     let hypervisor = hypervisor(kvm);
-    match held.map(|vms| vms.shards.as_ref()) {
+    let mut facts = match held.map(|vms| vms.shards.as_ref()) {
         Some(Some(carried)) => checked(hypervisor, shards_api::host_check(Some(carried.shards.as_path()))),
-        Some(None) => Facts { available: true, hypervisor, why_not: None, engine: None },
-        None => Facts { available: false, hypervisor, why_not: Some(NO_MICROVM.to_owned()), engine: None },
+        Some(None) => Facts { available: true, hypervisor, why_not: None, engine: None, image_class: None },
+        None => Facts { available: false, hypervisor, why_not: Some(NO_MICROVM.to_owned()), engine: None, image_class: None },
+    };
+    facts.image_class = held.and_then(|vms| vms.node.as_deref()).map(image_class);
+    facts
+}
+
+/// Why a node that lists no class for its image VMs gives none (Hex's own listing and its image class disagreeing).
+const UNLISTED: &str = "its Hex node lists no `shards-image` class, and its image class says it serves";
+
+/// Whether Hex's image runtime `node` lists the class its image VMs run as (Hex's `shards-image`; kiln plan 01a1dd2e…,
+/// P2.2 and P2.4): from its own listing (`Runtime::classes`), and where it lists none, why, in Hex's words (its image
+/// class's refusal: Shards' check of this host, held for the runtime's life, or an image boot unconfigured).
+fn image_class(node: &hex_node::images::ImageRuntime) -> kiln_ci::facts::NodeImageClass {
+    use hex_api::Runtime as _;
+    use kiln_ci::facts::NodeImageClass;
+    match (node.classes().contains(&hex_api::Class::ShardsImage), node.class().serves()) {
+        (true, _) => NodeImageClass::Listed,
+        (false, Err(why)) => NodeImageClass::Unlisted { why: why.to_string() },
+        (false, Ok(())) => NodeImageClass::Unlisted { why: UNLISTED.to_owned() },
     }
 }
 
@@ -275,9 +298,9 @@ pub const UNCHECKED: &str = "this machine's Shards couldn't say whether it runs 
 /// probe found.
 fn checked(hypervisor: Option<String>, answer: Result<shards_api::HostCheck, shards_api::CheckRefusal>) -> Facts {
     match answer {
-        Ok(shards_api::HostCheck::Usable(backend)) => Facts { available: true, hypervisor: Some(hypervisor_of(backend).to_owned()), why_not: None, engine: None },
-        Ok(shards_api::HostCheck::Unusable { why, .. }) => Facts { available: false, hypervisor, why_not: Some(why.to_string()), engine: None },
-        Err(e) => Facts { available: false, hypervisor, why_not: Some(format!("{UNCHECKED}: {e}")), engine: None },
+        Ok(shards_api::HostCheck::Usable(backend)) => Facts { available: true, hypervisor: Some(hypervisor_of(backend).to_owned()), why_not: None, engine: None, image_class: None },
+        Ok(shards_api::HostCheck::Unusable { why, .. }) => Facts { available: false, hypervisor, why_not: Some(why.to_string()), engine: None, image_class: None },
+        Err(e) => Facts { available: false, hypervisor, why_not: Some(format!("{UNCHECKED}: {e}")), engine: None, image_class: None },
     }
 }
 
@@ -483,6 +506,25 @@ mod tests {
         let unasked = super::checked(Some("KVM".into()), Err(CheckRefusal::Ended { status: Some(3), said: "shards: no such command: api-check".into() }));
         assert!(!unasked.available && unasked.hypervisor.as_deref() == Some("KVM"), "{unasked:?}");
         assert!(unasked.why_not.as_deref().is_some_and(|w| w.starts_with(super::UNCHECKED) && w.contains("no such command")), "{unasked:?}");
+    }
+
+    /// Kiln plan 01a1dd2e…, P2.4 (on Hex's P2.2): a machine holding its microVMs through Hex says whether its node lists
+    /// the class its image VMs run as, as its node says it, and why not in Hex's words. Do read the facts of microVMs held
+    /// through Hex whose `shards` can't be asked (none is here, so Shards' check of this host never answers), of a
+    /// stand-in's, and of none. Expect the first to say its node lists no `shards-image` class, with Hex's why; the
+    /// others to say nothing of a node. Written, not run (the person's rule of 2026-11-16).
+    #[test]
+    fn p2_4_a_runner_says_whether_its_hex_node_lists_the_image_class() -> anyhow::Result<()> {
+        use kiln_ci::facts::NodeImageClass;
+        let state = tempfile::tempdir()?;
+        let hex = super::held_in(state.path(), state.path().join("shards"), None, None)?;
+        let facts = super::facts_of(false, Some(&hex));
+        anyhow::ensure!(matches!(&facts.image_class, Some(NodeImageClass::Unlisted { why }) if !why.is_empty()), "{facts:?}");
+        let images = super::image::Images::new(state.path().join("shards"), state.path().join("home"), state.path().join("builds"));
+        let stand_in = super::Microvms::new(std::sync::Arc::new(kiln_seams::sandbox::SimSandbox::new()), images);
+        anyhow::ensure!(super::facts_of(false, Some(&stand_in)).image_class.is_none(), "a stand-in's");
+        anyhow::ensure!(super::facts_of(false, None).image_class.is_none(), "none held");
+        Ok(())
     }
 
     /// #75 step 3 (Shards D254): a machine's microVMs say whether their runs carry kiln's MCP lane, typed: those held

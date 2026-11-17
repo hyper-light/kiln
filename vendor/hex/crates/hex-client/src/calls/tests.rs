@@ -47,6 +47,7 @@ impl Transport for Memory {
             class_waits!("test.refusal", "oci", measuring),
             class_waits!("test.refusal", "firecracker", measuring),
             class_waits!("test.refusal", "shards", measuring),
+            class_waits!("test.refusal", "shards-image", measuring),
         ];
         by_class(&CLASS_ANSWERS, class)
     }
@@ -1161,7 +1162,7 @@ mod release_frame {
 #[test]
 fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
     let waits = <Memory as Transport>::answers();
-    assert_eq!((KINDS, BOX_KINDS, CLASSES), (21, 14, 4));
+    assert_eq!((KINDS, BOX_KINDS, CLASSES), (21, 14, 5));
     for (request, index) in [
         (
             Request::Hello {
@@ -1354,6 +1355,7 @@ fn every_kind_and_class_has_its_own_census_name() {
             Class::Oci,
             Class::Firecracker,
             Class::Shards,
+            Class::ShardsImage,
         ] {
             for (kind, wait) in kinds.iter().zip(T::class_answers(class)) {
                 assert_eq!(wait.name(), format!("{prefix}.{kind}.{}", class.name()));
@@ -1677,5 +1679,35 @@ fn b6_a_client_follows_started_on_its_node_and_refuses_delete_with_host_use_unse
     assert!(
         matches!(&request, Request::Call(Call::Started(got)) if *got == id),
         "{request:?}"
+    );
+}
+
+/// Kiln plan step 35's `/runs/control` (AC-T7.4.1): a box's agent-control link is read in the process holding its run's
+/// controller, and the node's wire has no call for it yet, so a remote node's client refuses it, typed, naming the call
+/// and what its wire lacks, before anything is sent: never the trait's default, which says the box isn't a Shards image
+/// box. Do: ask a client for a box's link. Expect: `Invalid`, naming `link` and the wire's lack; nothing sent.
+#[test]
+fn s35_a_client_refuses_a_boxs_link_unsent() {
+    let client = client();
+    let id = BoxId::new("s35-remote").unwrap();
+    let link = client.link(&id);
+    assert!(
+        matches!(
+            &link,
+            Err(Refusal::Invalid { what: "link", why })
+                if why.contains("the node's wire carries no link call yet")
+        ),
+        "{link:?}"
+    );
+    assert!(
+        client
+            .conn
+            .shared
+            .transport
+            .outbound
+            .lock()
+            .unwrap()
+            .is_empty(),
+        "nothing is sent"
     );
 }

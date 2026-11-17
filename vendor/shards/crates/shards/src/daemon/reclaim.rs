@@ -14,7 +14,7 @@ use shards_vmm::platform::PressureWatches;
 use super::health::{Quiet, Wait};
 use super::{Daemon, RunState, Threads, lock, log};
 use crate::containers::Disk;
-use crate::pressure::{Pressure, Saying};
+use crate::pressure::{Pressure, Saying, TOLD, Word};
 
 /// What the daemon's memory pressure watcher watches besides the host and its own cgroup:
 /// each scope its microVMs are made in under a user's slice (D183), which may hold them to
@@ -52,12 +52,6 @@ struct Unsaid {
     passes: u32,
     saying: Saying,
 }
-/// Where it names a FIFO (on Windows, a named pipe), the daemon's memory pressure is what
-/// is written to it, each line its host's word that it is short of memory, in place of its
-/// kernel's: so that a test tells it where no unprivileged process may raise the system's
-/// pressure (macOS, Windows), as a build's is told (`SHARDS_BUILD_PRESSURE`).
-const TOLD: &str = "SHARDS_PRESSURE";
-
 impl<D: Disk> Daemon<D> {
     /// Watches the host's memory pressure on a thread of its own, where its kernel lets
     /// this process watch it; says what it watches, or why it watches nothing.
@@ -78,7 +72,7 @@ impl<D: Disk> Daemon<D> {
             "watching the host's memory pressure: {}",
             pressure.describe()
         ));
-        if let Err(e) = std::thread::Builder::new()
+        if let Err(e) = crate::daemon::DaemonThread::new()
             .name("pressure".into())
             .spawn_scoped(threads, move || self.watch_pressure(threads, pressure))
         {
@@ -120,18 +114,30 @@ impl<D: Disk> Daemon<D> {
             // With no microVM running, none is asked to give back anything: the host's
             // pressure, which its kernel says again each window while it lasts, is not
             // listened to until one runs, so that an idle daemon wakes for nothing. A
-            // trigger fired meanwhile is heard as the first runs (psi.c, psi_trigger_poll).
+            // trigger fired meanwhile is heard as the first runs (psi.c, psi_trigger_poll);
+            // a told pipe's lines wait in it so, its `available` words too (D252).
             if !self.await_a_microvm() {
                 return;
             }
             if let Some(took) = *lock(&self.watching.acted) {
                 pressure.acted(took);
             }
-            if let Err(e) = pressure.wait() {
-                log(format!(
-                    "watching the host's memory pressure: {e}; nothing more is given back at it"
-                ));
-                return;
+            match pressure.wait() {
+                Ok(Word::Short) => {}
+                // What its host has available, told in place of its kernel's count: every
+                // charge is held to it from now on (D252), said for its test to wait on.
+                Ok(Word::Available(bytes)) => {
+                    log(format!(
+                        "told the host has {bytes} bytes of memory available: every run's charge is held to that"
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    log(format!(
+                        "watching the host's memory pressure: {e}; nothing more is given back at it"
+                    ));
+                    return;
+                }
             }
             if self.closed.load(Ordering::SeqCst) {
                 return;
@@ -188,23 +194,22 @@ impl<D: Disk> Daemon<D> {
             }
             asked = true;
             let gone = vm.clone();
-            let spawned =
-                std::thread::Builder::new()
-                    .name("give-back".into())
-                    .spawn_scoped(threads, move || {
-                        let before = super::budget::resident_file(pid);
-                        let asked = Instant::now();
-                        let gave = self.give_back_of(&id, pid);
-                        self.given_back(&vm);
-                        if let Some(gave) = gave {
-                            *lock(&self.watching.acted) = Some(asked.elapsed());
-                            self.budgets.gave_back(pid, before, gave.freed);
-                            self.budgets.gave_at_pressure(pid, gave);
-                            self.gave(gave);
-                        }
-                        // What it gave back its budget may let it have again (D188).
-                        self.tell_room(threads, pid);
-                    });
+            let spawned = crate::daemon::DaemonThread::new()
+                .name("give-back".into())
+                .spawn_scoped(threads, move || {
+                    let before = super::budget::resident_file(pid);
+                    let asked = Instant::now();
+                    let gave = self.give_back_of(&id, pid);
+                    self.given_back(&vm);
+                    if let Some(gave) = gave {
+                        *lock(&self.watching.acted) = Some(asked.elapsed());
+                        self.budgets.gave_back(pid, before, gave.freed);
+                        self.budgets.gave_at_pressure(pid, gave);
+                        self.gave(gave);
+                    }
+                    // What it gave back its budget may let it have again (D188).
+                    self.tell_room(threads, pid);
+                });
             if let Err(e) = spawned {
                 self.given_back(&gone);
                 log(format!(

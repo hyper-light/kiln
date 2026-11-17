@@ -522,13 +522,7 @@ impl super::Lanes {
     /// An ask read whole: refused alone for another run or generation, or past the run's
     /// admitted most; else handed to the host.
     fn admit_socket(&mut self, run: RunId, generation: u64, name: String, at: usize) -> Result<(), Reason> {
-        let (ours, our_generation) = self.execs.run;
-        if run != ours {
-            return Err(Reason::Scope);
-        }
-        if generation != our_generation {
-            return Err(Reason::Stale);
-        }
+        self.in_scope(run, generation)?;
         let admission = self.sockets.admission.ok_or(Reason::Scope)?;
         let open = self
             .sockets
@@ -640,7 +634,7 @@ impl super::Lanes {
         let socket = match reply {
             Reply::Unreached(errno) => {
                 self.sockets.lanes.swap_remove(at);
-                self.answer(io, conn, stream, &unreached(errno));
+                self.answer(io, conn, stream, &unreached(errno), false);
                 return;
             }
             Reply::Connected(socket) => socket,
@@ -976,6 +970,7 @@ mod tests {
                 inputs: &[],
                 execs: None,
                 sockets: Some(sockets),
+                bridges: &[],
             },
         )
         .unwrap();
@@ -1139,16 +1134,24 @@ mod tests {
             let listener = listener.try_clone().unwrap();
             move || drop(listener.accept().unwrap())
         });
-        let mut lane = answered!(sockets.connect("files.sock")).unwrap();
+        // A cut promises no byte before it (D251), its `Connected` among them: the workload's
+        // hang-up reaches the controller as its connect's answer where the cut came first (CI
+        // 43950458285, aarch64 musl), else on its lane.
+        let connected = answered!(sockets.connect("files.sock"));
         closer.join().unwrap();
-        let sent = pattern(admission(4).window);
-        let wrote = lane.write_all(&sent).and_then(|()| lane.flush());
-        let mut rest = Vec::new();
-        let read = lane.read_to_end(&mut rest);
-        assert!(
-            wrote.is_err() || read.is_err(),
-            "a workload gone while the controller sent read as an orderly end: wrote {wrote:?}, read {read:?}"
-        );
+        match connected {
+            Err(cut) => assert_eq!(cut, Fault::Revoked),
+            Ok(mut lane) => {
+                let sent = pattern(admission(4).window);
+                let wrote = lane.write_all(&sent).and_then(|()| lane.flush());
+                let mut rest = Vec::new();
+                let read = lane.read_to_end(&mut rest);
+                assert!(
+                    wrote.is_err() || read.is_err(),
+                    "a workload gone while the controller sent read as an orderly end: wrote {wrote:?}, read {read:?}"
+                );
+            }
+        }
 
         let reader = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
@@ -1503,6 +1506,7 @@ mod tests {
                 inputs: &[],
                 execs: Some(exec_admissions(RECORD)),
                 sockets: Some(admission(1)),
+                bridges: &[],
             },
         )
         .unwrap();
@@ -1728,6 +1732,7 @@ mod tests {
                 inputs: &[],
                 execs: None,
                 sockets: None,
+                bridges: &[],
             },
         )
         .unwrap();

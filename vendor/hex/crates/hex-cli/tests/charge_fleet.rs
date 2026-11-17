@@ -505,7 +505,9 @@ impl Kind {
 
     fn class(self) -> Class {
         match self {
-            Self::Image | Self::Shards => Class::Shards,
+            // P2.2: image VMs are booked and learned in their own class.
+            Self::Image => Class::ShardsImage,
+            Self::Shards => Class::Shards,
             Self::Firecracker => Class::Firecracker,
         }
     }

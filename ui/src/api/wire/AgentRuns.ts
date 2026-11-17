@@ -24,8 +24,8 @@ image: string,
  */
 host_pid: number | null, 
 /**
- * The agent-control link its stdio rides into the microVM, as each end says it negotiated
- * (Shards' `control::Link`, step 11), once it rides one: none before.
+ * The agent-control link its run is driven over into the microVM, as each end says it
+ * negotiated (Shards' `control::LinkReport`, step 11), once it's made: none before.
  */
 control?: AgentLink, 
 /**

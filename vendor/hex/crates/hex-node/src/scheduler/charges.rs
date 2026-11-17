@@ -33,7 +33,7 @@ pub(super) fn learned(
 /// then its routes') whose VMs have warmed, as the answer for that profile and its ceiling says it.
 pub(super) fn apply(local: &mut NodeSpec, learned: &[(Class, Learned)]) -> Result<(), Refusal> {
     let mut profiles: Vec<(Class, hex_api::RuntimeCost)> = Vec::new();
-    for class in [Class::Shards, Class::Firecracker] {
+    for class in [Class::Shards, Class::Firecracker, Class::ShardsImage] {
         if let Some(cost) = local.costs.get(class.index()).copied().flatten() {
             profiles.push((class, cost));
         }
@@ -43,6 +43,7 @@ pub(super) fn apply(local: &mut NodeSpec, learned: &[(Class, Learned)]) -> Resul
             let class = match offer.key.class {
                 hex_api::Class::Shards => Class::Shards,
                 hex_api::Class::Firecracker => Class::Firecracker,
+                hex_api::Class::ShardsImage => Class::ShardsImage,
                 hex_api::Class::Process | hex_api::Class::Oci => continue,
             };
             if let Some(cost) = offer.cost {

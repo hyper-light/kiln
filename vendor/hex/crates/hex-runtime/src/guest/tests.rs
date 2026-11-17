@@ -130,6 +130,7 @@ fn mount(source: &str, destination: &str, read_only: bool) -> Mount {
         source: PathBuf::from(source),
         destination: destination.to_owned(),
         read_only,
+        members: Vec::new(),
     }
 }
 
@@ -872,15 +873,17 @@ impl shards_api::Stream for Looped {
     fn into_socket(self: Box<Self>) -> shards_api::OwnedSocket {
         #[cfg(unix)]
         return std::os::fd::OwnedFd::from(self.0);
+        // Shards' stream on Windows is two pipes (D272), which a loopback stand-in has none of: Hex bridges a Shards
+        // stream there and never takes them.
         #[cfg(windows)]
-        std::os::windows::io::OwnedSocket::from(self.0)
+        panic!("a loopback stand-in has no pipes to give: Hex bridges a Shards stream on Windows")
     }
 
     fn handle(&self) -> shards_api::Handle<'_> {
         #[cfg(unix)]
         return std::os::fd::AsFd::as_fd(&self.0);
         #[cfg(windows)]
-        std::os::windows::io::AsSocket::as_socket(&self.0)
+        panic!("a loopback stand-in has no pipe to wait on: Hex bridges a Shards stream on Windows")
     }
 
     fn set_nonblocking(&self, on: bool) -> std::io::Result<()> {

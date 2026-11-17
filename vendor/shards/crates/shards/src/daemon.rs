@@ -415,9 +415,10 @@ pub(crate) fn log(message: impl std::fmt::Display) {
 }
 
 /// A daemon thread's timed wait, held for its length (#77): under test, its deadline
-/// registered ([`DEADLINES`]), by which a test's judged wait knows that a thread asleep
-/// until then has not stalled, its next progress scheduled; elsewhere nothing. None, a wait
-/// with no deadline, registers none.
+/// registered ([`DEADLINES`]) under the party of the thread that waits ([`party`]), by
+/// which a test's judged wait knows that a thread of its own asleep until then has not
+/// stalled, its next progress scheduled; elsewhere nothing. None, a wait with no deadline,
+/// registers none.
 #[must_use]
 struct Waiting(#[cfg(test)] Option<u64>);
 
@@ -427,7 +428,7 @@ impl Waiting {
         #[cfg(test)]
         return Waiting(timeout.and_then(|t| Instant::now().checked_add(t)).map(|until| {
             let key = NEXT_DEADLINE.fetch_add(1, Ordering::Relaxed);
-            lock(&DEADLINES).push((key, until));
+            lock(&DEADLINES).push((key, until, party::current()));
             key
         }));
         #[cfg(not(test))]
@@ -439,7 +440,257 @@ impl Waiting {
 impl Drop for Waiting {
     fn drop(&mut self) {
         if let Some(key) = self.0 {
-            lock(&DEADLINES).retain(|(k, _)| *k != key);
+            lock(&DEADLINES).retain(|(k, _, _)| *k != key);
+        }
+    }
+}
+
+/// A thread of the daemon's, made as std's [`std::thread::Builder`] makes one. Under test it
+/// is of the party of the thread that makes it ([`party`]), so that a test's judged wait
+/// counts its own threads alone (D215); elsewhere it is std's builder and nothing more.
+#[derive(Debug)]
+struct DaemonThread(std::thread::Builder);
+
+impl DaemonThread {
+    fn new() -> DaemonThread {
+        DaemonThread(std::thread::Builder::new())
+    }
+
+    fn name(self, name: String) -> DaemonThread {
+        DaemonThread(self.0.name(name))
+    }
+
+    fn spawn_scoped<'scope, 'env, F, T>(
+        self,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        f: F,
+    ) -> io::Result<std::thread::ScopedJoinHandle<'scope, T>>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        #[cfg(test)]
+        let f = party::carried(f);
+        self.0.spawn_scoped(scope, f)
+    }
+
+    fn spawn<F, T>(self, f: F) -> io::Result<std::thread::JoinHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        #[cfg(test)]
+        let f = party::carried(f);
+        self.0.spawn(f)
+    }
+}
+
+/// A test's party (D215, #77): its test's own thread, and every thread made from one of its
+/// party's, by the daemon ([`DaemonThread`]) or by the test ([`spawn_in`](party::spawn_in),
+/// [`spawn_member`](party::spawn_member)), each made a member as it starts, of the party of
+/// the thread that made it. A test's judged wait counts what its party's members ran, and
+/// the deadlines its party's threads wait until, alone: no other test's threads in this
+/// process, nor what a test that ended left running (CI 43990298220, aarch64-apple-darwin: a
+/// removal test's wait that could not end was held 21 minutes by what the binary's other
+/// tests, all ended, had left; run alone it was refused in 81 ms, ROOT's r669). As a test's
+/// wait on a home counts its home's daemon and what descends from it (tests/common
+/// `Patience`), never the test's process. A thread of no party (made by another crate, or by
+/// std itself) counts for no party's wait, and a wait on a thread of none counts this
+/// process's threads, as before parties were.
+#[cfg(test)]
+mod party {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    thread_local! {
+        /// The party this thread is of (0: none), and whether it is one of its members, made
+        /// by one of its party's threads, rather than its test's own.
+        static PARTY: Cell<(u64, bool)> = const { Cell::new((0, false)) };
+    }
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static NEXT_MEMBER: AtomicU64 = AtomicU64::new(0);
+
+    /// A party: its members living, by a key of each one's; what those that ended ran; and
+    /// what those of them that waited in a judged wait ran as they waited.
+    #[derive(Default)]
+    struct Party {
+        members: BTreeMap<u64, Clock>,
+        ended: u64,
+        waited: u64,
+    }
+
+    static PARTIES: Mutex<BTreeMap<u64, Party>> = Mutex::new(BTreeMap::new());
+
+    fn parties() -> MutexGuard<'static, BTreeMap<u64, Party>> {
+        PARTIES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The party of this thread, a test's: a new one where it is of none yet, as a test's
+    /// thread is as it begins (libtest runs each test on a thread of its own).
+    pub(super) fn of_test() -> u64 {
+        PARTY.with(|party| {
+            let (id, member) = party.get();
+            if id != 0 {
+                return id;
+            }
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            party.set((id, member));
+            id
+        })
+    }
+
+    /// The party of this thread; 0 where it is of none.
+    pub(super) fn current() -> u64 {
+        PARTY.with(|party| party.get().0)
+    }
+
+    /// `f`, to run on a thread being made: a member, as it runs, of this thread's party.
+    pub(super) fn carried<'a, F, T>(f: F) -> impl FnOnce() -> T + Send + 'a
+    where
+        F: FnOnce() -> T + Send + 'a,
+        T: 'a,
+    {
+        let party = current();
+        move || {
+            let _member = Member::join(party);
+            f()
+        }
+    }
+
+    /// `scope.spawn(f)`, its thread a member of this thread's party.
+    pub(super) fn spawn_in<'scope, 'env, F, T>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        f: F,
+    ) -> std::thread::ScopedJoinHandle<'scope, T>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        scope.spawn(carried(f))
+    }
+
+    /// `std::thread::spawn(f)`, its thread a member of this thread's party.
+    pub(super) fn spawn_member<F, T>(f: F) -> std::thread::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        std::thread::spawn(carried(f))
+    }
+
+    /// What party `id`'s members ran, the living and those that ended, less what they ran
+    /// as they waited, in the tests' units of CPU (`tests::cpu`: nanoseconds on Unix, cycles
+    /// on Windows).
+    pub(super) fn ran(id: u64) -> i128 {
+        let parties = parties();
+        let Some(party) = parties.get(&id) else {
+            return 0;
+        };
+        let living = party
+            .members
+            .values()
+            .filter_map(Clock::ran)
+            .fold(0, u64::saturating_add);
+        i128::from(living.saturating_add(party.ended)) - i128::from(party.waited)
+    }
+
+    /// This thread, waiting judged on party `id`, ran `cpu` more as it waited: none of its
+    /// party's run, where it is one of its members (its test's own thread is none).
+    pub(super) fn waited(id: u64, cpu: u64) {
+        if PARTY.with(Cell::get) == (id, true)
+            && let Some(party) = parties().get_mut(&id)
+        {
+            party.waited = party.waited.saturating_add(cpu);
+        }
+    }
+
+    /// This thread as a member of party `party`, from its start to its end, when it adds
+    /// what it ran to what its party's members that ended ran.
+    struct Member {
+        party: u64,
+        key: u64,
+    }
+
+    impl Member {
+        fn join(party: u64) -> Option<Member> {
+            if party == 0 {
+                return None;
+            }
+            // Of its party whatever its clock: the threads it makes are too.
+            PARTY.with(|of| of.set((party, false)));
+            let clock = Clock::own()?;
+            let key = NEXT_MEMBER.fetch_add(1, Ordering::Relaxed);
+            parties().entry(party).or_default().members.insert(key, clock);
+            PARTY.with(|of| of.set((party, true)));
+            Some(Member { party, key })
+        }
+    }
+
+    impl Drop for Member {
+        fn drop(&mut self) {
+            let mut parties = parties();
+            if let Some(party) = parties.get_mut(&self.party)
+                && let Some(clock) = party.members.remove(&self.key)
+            {
+                party.ended = party.ended.saturating_add(clock.ran().unwrap_or(0));
+            }
+        }
+    }
+
+    /// A member's CPU clock, which another thread reads while the member lives, in the tests'
+    /// units of CPU (`tests::cpu`): on Unix its thread's CPU clock in nanoseconds
+    /// ([`ThreadClock`](shards_vmm::platform::ThreadClock), D191); on Windows the cycles its
+    /// thread used (QueryThreadCycleTime), as `ThreadClock` there reads GetThreadTimes, whose
+    /// count moves in its clock's ticks (15.625 ms), coarser than a W*.
+    #[cfg(unix)]
+    struct Clock(shards_vmm::platform::ThreadClock);
+
+    #[cfg(windows)]
+    struct Clock(windows_sys::Win32::Foundation::HANDLE);
+
+    #[cfg(windows)]
+    // SAFETY: a thread handle any thread may use; this one is read, and closed, under the
+    // parties' lock alone.
+    unsafe impl Send for Clock {}
+
+    #[cfg(unix)]
+    impl Clock {
+        fn own() -> Option<Clock> {
+            shards_vmm::platform::ThreadClock::current().ok().map(Clock)
+        }
+
+        fn ran(&self) -> Option<u64> {
+            self.0.read().ok()
+        }
+    }
+
+    #[cfg(windows)]
+    impl Clock {
+        fn own() -> Option<Clock> {
+            use windows_sys::Win32::System::Threading::{
+                GetCurrentThreadId, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+            };
+            // SAFETY: a handle to this thread, by its own ID, closed as its clock goes.
+            let handle = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, GetCurrentThreadId()) };
+            (!handle.is_null()).then_some(Clock(handle))
+        }
+
+        fn ran(&self) -> Option<u64> {
+            use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+            let mut cycles = 0u64;
+            // SAFETY: one count into a local, of a handle this clock holds open.
+            (unsafe { QueryThreadCycleTime(self.0, &raw mut cycles) } != 0).then_some(cycles)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            // SAFETY: the handle OpenThread gave this clock, closed once.
+            let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
         }
     }
 }
@@ -462,16 +713,26 @@ fn poll_timeout(ms: libc::c_int) -> Option<Duration> {
 }
 
 /// The deadlines daemon threads of this test process wait until ([`Waiting`]), each under
-/// its key.
+/// its key, with the party of the thread that waits ([`party`]; 0: none).
 #[cfg(test)]
-static DEADLINES: Mutex<Vec<(u64, Instant)>> = Mutex::new(Vec::new());
+static DEADLINES: Mutex<Vec<(u64, Instant, u64)>> = Mutex::new(Vec::new());
 #[cfg(test)]
 static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(0);
 
 /// The latest deadline a daemon thread of this test process waits until now.
 #[cfg(test)]
 fn latest_deadline() -> Option<Instant> {
-    lock(&DEADLINES).iter().map(|(_, until)| *until).max()
+    lock(&DEADLINES).iter().map(|(_, until, _)| *until).max()
+}
+
+/// The latest deadline a thread of party `party` waits until now.
+#[cfg(test)]
+fn latest_deadline_of(party: u64) -> Option<Instant> {
+    lock(&DEADLINES)
+        .iter()
+        .filter(|(_, _, of)| *of == party)
+        .map(|(_, until, _)| *until)
+        .max()
 }
 
 /// The lines the daemons of a test process have logged ([`log`]), which tests count.
@@ -1009,6 +1270,8 @@ struct Keep<'a> {
     link_local: Vec<std::net::IpAddr>,
     /// Its microVM's own engine (D181), where its run has one.
     engine: Option<OwnEngine>,
+    /// The named volumes it mounts, held since they were opened (D281): its [`Inbox`]'s.
+    volumes: crate::volumes::Holds,
 }
 
 /// A run in progress: its VM's socket, to signal the command, and the VM itself.
@@ -1183,6 +1446,9 @@ struct Inbox {
     /// The streams its guest's NOTICE built-ins are told on, one for each share process
     /// that tells what its host changes (D235): held while it runs.
     notices: Vec<shards_ipc::Stream>,
+    /// The named volumes it mounts and those plugged into it (D281), held until it ends, so
+    /// that no clearing of them through shards-api removes their files under it.
+    volumes: crate::volumes::Holds,
 }
 
 /// A part of the working set run `id`'s VM recorded (`kind::WORKING_SET`), which the
@@ -1291,26 +1557,28 @@ struct Stop {
     /// Its command's teardown once it is sent SIGKILL.
     killed: Option<ends::Followed>,
     /// Its grace, kept while it runs.
-    grace: Option<Grace>,
+    grace: Option<Deadline>,
 }
 
-/// A run's stop grace, kept in its directory (`shards_ipc::GRACE`) from its stop signal
-/// until its SIGKILL or its end, which drop it: so that a wait on the daemon can tell the
-/// grace from a stall, as nothing need run in it (D209).
-struct Grace(PathBuf);
+/// A deadline of the daemon's own, kept in a run's directory until it is dropped: the run's
+/// stop grace (`shards_ipc::GRACE`), from its stop signal until its SIGKILL or its end; and
+/// its log's shipper's next try (`shards_ipc::RETRY`), through the pause before it, naming
+/// the destination it holds up. So a wait on the daemon, or on that delivery, can tell the
+/// deadline from a stall, as nothing need run before it (D209).
+struct Deadline(PathBuf);
 
-impl Grace {
-    /// The grace of the run whose directory is `dir`, `grace` from now; none where it
-    /// cannot be kept, which the log says.
-    fn begin(dir: &Path, grace: Duration) -> Option<Grace> {
-        let file = dir.join(shards_ipc::GRACE);
+impl Deadline {
+    /// The deadline `name` of the run whose directory is `dir`, `after` from now, of `of`
+    /// where it names what it holds up; none where it cannot be kept, which the log says.
+    fn begin(dir: &Path, name: &str, after: Duration, of: Option<&str>) -> Option<Deadline> {
+        let file = dir.join(name);
         let kept = std::time::SystemTime::now()
-            .checked_add(grace)
-            .and_then(shards_ipc::grace_text)
+            .checked_add(after)
+            .and_then(|until| shards_ipc::deadline_text(until, of))
             .ok_or_else(|| io::Error::other("its end past the system clock's reach"))
             .and_then(|text| keep_whole(&file, text.as_bytes()));
         match kept {
-            Ok(()) => Some(Grace(file)),
+            Ok(()) => Some(Deadline(file)),
             Err(e) => {
                 log(format!("{}: {e}", file.display()));
                 None
@@ -1319,7 +1587,7 @@ impl Grace {
     }
 }
 
-impl Drop for Grace {
+impl Drop for Deadline {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
@@ -1507,8 +1775,13 @@ struct Daemon<D: Disk = Real> {
     /// ends.
     joiner_links: Mutex<HashMap<String, (String, UnixStream)>>,
     /// Each user network's members, by its ID: the endpoints of its running microVMs
-    /// (D46).
-    members: Mutex<std::collections::BTreeMap<String, Vec<networks::Member>>>,
+    /// (D46), their addresses' leases and the network's pairing (D285).
+    members: Mutex<std::collections::BTreeMap<String, networks::Joined>>,
+    /// Its runs' links and names told one member's at a time (D46), so that each network
+    /// process has its tables in the order members came and went: held across their
+    /// answers, and so never with the home's networks lock, which no process holds across
+    /// another's answer (D285).
+    telling: Mutex<()>,
     /// A microVM's ID, directory and log, made ahead of the run that takes them.
     spare: Mutex<Spare>,
     /// Numbers the templates a run saves before they become the template.
@@ -2410,6 +2683,7 @@ impl<D: Disk> Daemon<D> {
             noticing: Mutex::default(),
             joiner_links: Mutex::default(),
             members: Mutex::default(),
+            telling: Mutex::default(),
             events,
             settling: Mutex::default(),
             settled: Condvar::new(),
@@ -2547,6 +2821,8 @@ impl<D: Disk> Daemon<D> {
         let mut relays = relay::Relays::default();
         let mut contexts_changed = true;
         let mut spare = no_reserve();
+        // What a closed daemon's exit last waited on, as its stages say it (`stage!`).
+        let mut exit_waits: Option<String> = None;
         loop {
             let closing = self.closed.load(Ordering::SeqCst);
             // A daemon whose home is gone has nothing left to serve, and its runs' microVMs
@@ -2616,6 +2892,24 @@ impl<D: Disk> Daemon<D> {
                 && !held
                 && lock(&self.runs).is_empty()
                 && self.engine.open.load(Ordering::SeqCst) == 0;
+            if closed && shards_vmm::log::enabled(shards_vmm::log::Level::Info) {
+                let waits = format!(
+                    "{} requests in hand, its slots {}, {} runs, {} engine connections, {}",
+                    self.busy.load(Ordering::SeqCst),
+                    if held { "held" } else { "let go of" },
+                    lock(&self.runs).len(),
+                    self.engine.open.load(Ordering::SeqCst),
+                    if relays.is_empty() {
+                        "no relays"
+                    } else {
+                        "relays open"
+                    }
+                );
+                if exit_waits.as_ref() != Some(&waits) {
+                    shards_vmm::stage!("daemon closed, its exit waiting on {waits}");
+                    exit_waits = Some(waits);
+                }
+            }
             let idle = quiet && lock(&self.last).elapsed() >= self.idle;
             if !closed && (self.stopping.load(Ordering::SeqCst) || idle) {
                 self.close();
@@ -2628,6 +2922,7 @@ impl<D: Disk> Daemon<D> {
                 if !relays.is_empty() {
                     continue;
                 }
+                shards_vmm::stage!("daemon closed and quiet: exiting");
                 self.leave_slots();
                 self.exit();
             }
@@ -2907,7 +3202,7 @@ impl<D: Disk> Daemon<D> {
         let conn = Arc::new(conn);
         lock(&self.unread).insert(number);
         lock(&self.clients).insert(number, conn.clone());
-        let spawned = std::thread::Builder::new()
+        let spawned = DaemonThread::new()
             .name("run".into())
             .spawn_scoped(threads, move || {
                 // A run handed over is registered before the client stops counting as
@@ -2995,7 +3290,7 @@ impl<D: Disk> Daemon<D> {
             let ended = done.try_clone()?;
             let watched = conn.try_clone()?;
             let cancel = cancel.clone();
-            let thread = std::thread::Builder::new().name("hangup".into()).spawn(move || {
+            let thread = DaemonThread::new().name("hangup".into()).spawn(move || {
                 let watch = watch_client(&watched, &ended);
                 if watch != Watched::Stayed {
                     cancel.cancel();
@@ -3029,7 +3324,9 @@ impl<D: Disk> Daemon<D> {
     /// kernel would close it on exit, but in no order this could rely on (XNU closes a
     /// process's descriptors from the highest down, kern_descrip.c fdt_invalidate).
     fn finish(&self) {
+        shards_vmm::stage!("daemon finishing");
         self.managed.close();
+        shards_vmm::stage!("daemon finishing: its managed runs closed");
         let _ = std::fs::remove_file(self.home.join(shards_ipc::PID));
         let _ = std::fs::remove_file(self.home.join(shards_ipc::STOPPING));
         let state = lock(&self.state);
@@ -3042,11 +3339,15 @@ impl<D: Disk> Daemon<D> {
         // next to delete (musl CI 39297260869). Then what it last knew of its microVMs is
         // what the next daemon reads, and the files its runs asked for are made.
         self.await_removals();
+        shards_vmm::stage!("daemon finishing: its removals done");
         self.await_recorded();
+        shards_vmm::stage!("daemon finishing: its records written");
         self.await_made();
+        shards_vmm::stage!("daemon finishing: the files its runs asked for made");
         // Each parent's spawner ended, and the leaves made in delegated cgroups removed
         // once empty (D183, slice 2).
         self.parents.close();
+        shards_vmm::stage!("daemon finishing: its parents' spawners ended");
         log("exiting");
         // A home being removed is removed whole, once nothing more is written in it: what
         // this daemon made in it as the removal went kept it before (rmdir(2): ENOTEMPTY),
@@ -3078,6 +3379,7 @@ impl<D: Disk> Daemon<D> {
             let _ = held.unlock();
         }
         let _ = std::fs::remove_file(self.home.join(shards_ipc::STOPPING_LOCK));
+        shards_vmm::stage!("daemon finished: its home and its stopping lock let go of");
         lock(&self.stoppers).clear();
     }
 
@@ -3956,6 +4258,8 @@ impl<D: Disk> Daemon<D> {
             (Some((_, name)), true) if !run.engine_nets.is_empty() => Some(name.clone()),
             _ => None,
         };
+        // Its named volumes, held from before their files are opened until it ends (D281).
+        let mut volumes = crate::volumes::Holds::default();
         let shared = cdi_points
             .and_then(|more| {
                 points.extend(more);
@@ -3970,7 +4274,8 @@ impl<D: Disk> Daemon<D> {
                 };
                 crate::volumes::open_for(&points, first, &crate::volumes::Store::new(&self.home), &access)
             })
-            .and_then(|opened| {
+            .and_then(|mut opened| {
+                volumes = std::mem::take(&mut opened.held);
                 let cdi = prepared.cdi.as_ref().ok().and_then(Option::as_ref);
                 prepared.spec.setup =
                     crate::setup::setup(&run, &opened.mounts, cdi, Some(self.microvm_shm(&id, &run).map_err(|e| e.to_string())?))?;
@@ -4180,6 +4485,12 @@ impl<D: Disk> Daemon<D> {
                     );
                 }
                 if joining {
+                    // A join share holds no bound (D281): its volumes are its servers' alone.
+                    if !opened.bounds.is_empty() {
+                        return Err(
+                            "a bounded volume is served to no run joining another's network (--network container:NAME): its microVM's join share holds no bound".into(),
+                        );
+                    }
                     let names = opened
                         .dirs
                         .iter()
@@ -4193,14 +4504,27 @@ impl<D: Disk> Daemon<D> {
                 crate::spec::fits(&prepared.spec)?;
                 // Copies of the volumes a microVM moved here was saved with (D176 part 6).
                 let moved = lock(&self.containers).made(&id).is_some_and(|c| c.moved);
-                let link = self.start_shares(threads, &id, &opened.dirs, &prepared.parent, moved, true)?;
+                let link = self.start_shares(
+                    threads,
+                    &id,
+                    &opened.dirs,
+                    &opened.bounds,
+                    &prepared.parent,
+                    moved,
+                    true,
+                )?;
                 prepared.shares = u32::try_from(opened.dirs.len()).map_err(|_| "too many shares")?;
                 Ok(link)
             });
         let shares = match shared {
             Ok(link) => link,
+            // A start already refused keeps that refusal, which the setup's follows from:
+            // `--network container:NAME` of none is "No such container", not the setup's
+            // word on that container's shared memory (ad8308bb8, CI run 43876891053).
             Err(e) => {
-                start = network::Start::Fails(e);
+                if !matches!(start, network::Start::Fails(_)) {
+                    start = network::Start::Fails(e);
+                }
                 None
             }
         };
@@ -4563,6 +4887,7 @@ impl<D: Disk> Daemon<D> {
                     token,
                     registry_env: run.registry_env.clone(),
                 }),
+                volumes,
             },
             || match &start {
                 // A joiner's I/O is the microVM's it joins (D119), whose run's limits it takes
@@ -5075,12 +5400,15 @@ impl<D: Disk> Daemon<D> {
     /// Starts the share process (share.rs) serving `dirs`: the VM's connection to it, none
     /// for none. It is reaped on the followers' loop, and ends as its VM's connections
     /// close. A run's (`noticed`) tells its guest what its host changes beneath them once
-    /// it starts (D235); a visit's, which runs nothing, tells nothing.
+    /// it starts (D235); a visit's, which runs nothing, tells nothing. Each of `bounds` holds
+    /// a bounded volume's share to its bound (D281).
+    #[allow(clippy::too_many_arguments)]
     fn start_shares<'s, 'e>(
         &'s self,
         threads: &'s Threads<'s, 'e>,
         id: &str,
         dirs: &[(OwnedFd, bool, OsString)],
+        bounds: &[crate::volumes::Bounded],
         parent: &str,
         moved: bool,
         noticed: bool,
@@ -5091,7 +5419,7 @@ impl<D: Disk> Daemon<D> {
         // Each share's tag, as the VM's devices are named (vm::Config, `shards{i}`).
         let tags: Vec<String> = (0..dirs.len()).map(|i| format!("shards{i}")).collect();
         let tags = noticed.then_some(tags.as_slice());
-        let (ends, child, notices) = self.started_shares(threads, dirs, parent, moved, tags)?;
+        let (ends, child, notices) = self.started_shares(threads, dirs, bounds, parent, moved, tags)?;
         if let Some(notices) = notices {
             lock(&self.noticing).insert(id.to_string(), vec![notices]);
         }
@@ -5133,6 +5461,7 @@ impl<D: Disk> Daemon<D> {
         &'s self,
         threads: &'s Threads<'s, 'e>,
         dirs: &[(OwnedFd, bool, OsString)],
+        bounds: &[crate::volumes::Bounded],
         parent: &str,
         moved: bool,
         tags: Option<&[String]>,
@@ -5143,6 +5472,8 @@ impl<D: Disk> Daemon<D> {
         let mut served = Vec::new();
         // The tags of those served here, whose notices it tells (D235).
         let mut served_tags: Vec<&str> = Vec::new();
+        // Each served share's place in `dirs`, by which a bound names it (D281).
+        let mut places: Vec<usize> = Vec::new();
         for (i, (dir, read_only, only)) in dirs.iter().enumerate() {
             if is_pipe(dir) {
                 ends.push(Some(
@@ -5151,6 +5482,7 @@ impl<D: Disk> Daemon<D> {
             } else {
                 ends.push(None);
                 served.push((dir, *read_only, only));
+                places.push(i);
                 if let Some(tag) = tags.and_then(|t| t.get(i)) {
                     served_tags.push(tag);
                 }
@@ -5183,6 +5515,14 @@ impl<D: Disk> Daemon<D> {
         } else {
             None
         };
+        // Each bounded volume's share held to its bound (D281), by its place among those
+        // served here.
+        let bounded = crate::share::bound_args(
+            bounds
+                .iter()
+                .filter_map(|b| Some((places.iter().position(|p| *p == b.share)?, b))),
+        );
+        args.extend(bounded.iter().map(OsString::as_os_str));
         for (_, read_only, only) in &served {
             args.push(OsStr::new(if *read_only { "ro" } else { "rw" }));
             args.push(only.as_os_str());
@@ -5225,6 +5565,7 @@ impl<D: Disk> Daemon<D> {
         &'s self,
         threads: &'s Threads<'s, 'e>,
         dirs: &[(OwnedFd, bool, OsString)],
+        bounds: &[crate::volumes::Bounded],
         parent: &str,
         moved: bool,
         tags: Option<&[String]>,
@@ -5246,6 +5587,9 @@ impl<D: Disk> Daemon<D> {
             }
             _ => None,
         };
+        // Each bounded volume's share held to its bound (D281), by its place in `dirs`.
+        let bounded = crate::share::bound_args(bounds.iter().map(|b| (b.share, b)));
+        args.extend(bounded.iter().map(OsString::as_os_str));
         for (_, read_only, only) in dirs {
             args.push(OsStr::new(if *read_only { "ro" } else { "rw" }));
             args.push(only.as_os_str());
@@ -5797,13 +6141,26 @@ impl<D: Disk> Daemon<D> {
     }
 
     /// [`set_aside`](Self::set_aside), then [`complete`](Self::complete), of a batch: one
-    /// sync of their directory makes every removal set aside before it durable.
+    /// sync of their directory makes every removal set aside before it durable, and a batch
+    /// of `--rm` ones alone needs none (`Removal::sync_all`).
     fn complete_batch(&self, batch: &[Removal]) {
         let aside: Vec<&Removal> = batch.iter().filter(|r| self.set_aside(r).is_ok()).collect();
-        let Some(first) = aside.first() else {
+        if aside.is_empty() {
             return;
+        }
+        let ids = || {
+            aside
+                .iter()
+                .map(|r| r.container.id.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
         };
-        let synced = first.sync(&self.disk);
+        shards_vmm::stage!("the removal of {}: set aside", ids());
+        let synced = Removal::sync_all(&aside, &self.disk);
+        shards_vmm::stage!(
+            "the removal of {}: their directory synced where needed: {synced:?}",
+            ids()
+        );
         for removal in &aside {
             let id = &removal.container.id;
             match &synced {
@@ -5817,9 +6174,11 @@ impl<D: Disk> Daemon<D> {
             self.end_shares(&removal.container.id);
         }
         self.delete_aside(&aside);
+        shards_vmm::stage!("the removal of {}: their files deleted", ids());
         for removal in aside.iter().filter(|r| r.container.auto_remove) {
             self.drop_anonymous(&removal.container);
         }
+        shards_vmm::stage!("the removal of {}: done", ids());
     }
 
     /// Deletes what `removals` set aside, on Windows once no record of them is being
@@ -6026,6 +6385,7 @@ impl<D: Disk> Daemon<D> {
             mac: _,
             link_local: _,
             engine,
+            volumes,
         } = keep;
         // A pool's run keeps its pool in use until it ends (`shards_api::demand`).
         if let Some(key) = &ready.pool
@@ -6117,6 +6477,7 @@ impl<D: Disk> Daemon<D> {
             saved_as: None,
             engine,
             notices: Vec::new(),
+            volumes,
         }));
         let tracked = Tracked {
             base: Arc::new(Base {
@@ -6687,7 +7048,7 @@ impl<D: Disk> Daemon<D> {
         }
         let (reader, writer) = io::pipe().map_err(|e| format!("a pipe for it: {e}"))?;
         let shown = id.get(..12).unwrap_or(id).to_string();
-        std::thread::Builder::new()
+        DaemonThread::new()
             .name("layer".into())
             .spawn_scoped(threads, move || {
                 // Its reader gone, a write fails, and the pack ends.
@@ -7079,6 +7440,14 @@ impl<D: Disk> Daemon<D> {
 
     /// Run `id` ended: `done` is its DONE, or `None` for a VM that ended without one.
     fn run_ended(&self, id: &str, inbox: &mut Inbox, done: Option<&[u8]>) {
+        shards_vmm::stage!(
+            "container {id}: its end heard, {}",
+            if done.is_some() {
+                "its DONE"
+            } else {
+                "its VM ended with none"
+            }
+        );
         // Its owners' channels end now; what the daemon drains of its members goes on to its
         // capture's end, which its end is told after (D240).
         let capturing = self.managed.end(id);
@@ -7094,6 +7463,8 @@ impl<D: Disk> Daemon<D> {
         // microVM's join share ends with its VM, the daemon's connection to it let go (D119).
         lock(&self.joiner_links).remove(id);
         lock(&self.join_shares).remove(id);
+        // Its named volumes let go of (D281): their clearing is refused no more for its sake.
+        inbox.volumes = crate::volumes::Holds::default();
         // On the host's network (D124): the host's ports of its guest's binds let go, but
         // its joiners', which go as each of them ends (D119).
         if inbox.joiners == 0 {
@@ -7215,6 +7586,7 @@ impl<D: Disk> Daemon<D> {
                 }
             });
             lock(&self.runs).remove(id);
+            shards_vmm::stage!("container {id}: its end told, out of the daemon's runs");
             lock(&self.health).remove(id);
             lock(&self.paused).remove(id);
             // What it held of its budget the others it held are told is theirs (D188).
@@ -7460,6 +7832,7 @@ impl<D: Disk> Daemon<D> {
     /// 3c2e3cd3's CI).
     fn step_aside<'s, 'e>(&'s self, threads: &'s Threads<'s, 'e>, why: &str) {
         log(format!("stepping aside: {why}"));
+        shards_vmm::stage!("daemon stepping aside: {why}");
         self.close();
         self.stopping.store(true, Ordering::SeqCst);
         for (_, booting) in lock(&self.booting).drain() {
@@ -7470,6 +7843,10 @@ impl<D: Disk> Daemon<D> {
         // Runs waiting their turn to boot look at `stopping` again.
         self.boots.wake();
         self.stop_runs(threads);
+        shards_vmm::stage!(
+            "daemon closed, the stop of its {} runs begun",
+            lock(&self.runs).len()
+        );
         self.end_clients();
         // Runs waiting for a warm VM look at `stopping` again; the lock orders the wakeup
         // after their last look.
@@ -7490,7 +7867,7 @@ impl<D: Disk> Daemon<D> {
                 return;
             }
         }
-        let stopping = std::thread::Builder::new()
+        let stopping = DaemonThread::new()
             .name("stop".into())
             .spawn_scoped(threads, move || self.stop_each());
         if let Err(e) = stopping {
@@ -7554,12 +7931,16 @@ impl<D: Disk> Daemon<D> {
                         let dir = lock(&self.containers).dir(&id);
                         (
                             grace.and_then(|grace| now.checked_add(grace)),
-                            grace.and_then(|grace| Grace::begin(&dir, grace)),
+                            grace.and_then(|grace| Deadline::begin(&dir, shards_ipc::GRACE, grace, None)),
                         )
                     }
                     // A signal Linux has no number for cannot be sent: SIGKILL at once.
                     (None, _) => (Some(now), None),
                 };
+                shards_vmm::stage!(
+                    "container {id}: its stop begun as the daemon stops, its SIGKILL due in {:?}",
+                    kill.map(|at| at.saturating_duration_since(now))
+                );
                 stops.insert(
                     id,
                     Stop {
@@ -7579,6 +7960,7 @@ impl<D: Disk> Daemon<D> {
                     Some(teardown) => {
                         if teardown.goes_on().is_some() {
                             // Its guest still at its end: another slice.
+                            shards_vmm::stage!("container {id}: its guest's teardown goes on: another slice");
                             stop.next = self
                                 .ends
                                 .slice(ends::End::Teardown)
@@ -7605,6 +7987,7 @@ impl<D: Disk> Daemon<D> {
                             .socket
                             .send(&self.answers.run_send, kind::SIGNAL, &9u32.to_be_bytes(), &[])
                             .is_ok();
+                        shards_vmm::stage!("container {id}: SIGKILL sent as the daemon stops: {sent}");
                         let wait = if sent {
                             self.ends.slice(ends::End::Teardown)
                         } else {
@@ -8543,7 +8926,7 @@ impl<D: Disk> Daemon<D> {
 
     /// Starts the collector's thread.
     fn start_collector<'s, 'e>(&'s self, threads: &'s Threads<'s, 'e>) {
-        if let Err(e) = std::thread::Builder::new()
+        if let Err(e) = DaemonThread::new()
             .name("collector".into())
             .spawn_scoped(threads, move || self.collect_all())
         {
@@ -8965,7 +9348,7 @@ impl<D: Disk> Daemon<D> {
             net: net_process,
             ends: &self.ends,
         };
-        let watching = std::thread::Builder::new()
+        let watching = DaemonThread::new()
             .name("warm vm".into())
             .spawn_scoped(threads, move || {
                 let net_process = unwatched.watched();
@@ -9053,7 +9436,16 @@ impl<D: Disk> Daemon<D> {
                 match ready {
                     Ok(()) => {
                         pool.failures = 0;
-                        pool.demand.refilled(began.elapsed());
+                        let took = began.elapsed();
+                        pool.demand.refilled(took);
+                        // Said, as the daemon alone times its refills: the window a reader
+                        // of its pools spaces runs and sizes a keep-alive by (D26).
+                        log(format!(
+                            "pool of {}: a refill ready in {} us; runs within {} us of each other are one burst",
+                            key.dir.display(),
+                            took.as_micros(),
+                            pool.demand.window().as_micros()
+                        ));
                         // Its working set, where it records one, goes with its template,
                         // within what the refiller read the template's guest can hold.
                         let records = pool.working_set_limit.flatten().map(|limit| Records {
@@ -9790,7 +10182,7 @@ fn sample(home: &Path, pid: u32, sent: usize, quiet: Duration) -> String {
     match spawned {
         // Reaped where it ends, on a thread of its own, so that no zombie is left.
         Ok(child) => {
-            let _ = std::thread::Builder::new()
+            let _ = DaemonThread::new()
                 .name("sample".into())
                 .spawn(move || child.wait());
         }
@@ -10030,7 +10422,7 @@ mod tests {
             let hold = || {
                 let (went, gone) = mpsc::channel();
                 let (end, ended) = mpsc::channel::<()>();
-                let thread = s.spawn(move || {
+                let thread = party::spawn_in(s, move || {
                     let turn = b.turn(4, st);
                     let _ = went.send(turn.is_ok());
                     let _ = ended.recv();
@@ -10091,7 +10483,7 @@ mod tests {
         std::sync::mpsc::Receiver<()>,
     ) {
         let (went, gone) = std::sync::mpsc::channel();
-        let thread = s.spawn(move || {
+        let thread = party::spawn_in(s, move || {
             let turn = boots.turn(vcpus, stopping).map(drop);
             let _ = went.send(());
             turn
@@ -10110,7 +10502,7 @@ mod tests {
         std::thread::scope(|scope| {
             for sender in 0u8..4 {
                 let (socket, record) = (&socket, &record);
-                scope.spawn(move || {
+                party::spawn_in(scope, move || {
                     let message = vec![sender; 64 << 10];
                     for _ in 0..16 {
                         socket.send(record, kind::SIGNAL, &message, &[]).unwrap();
@@ -10158,12 +10550,12 @@ mod tests {
         let busy = AtomicBool::new(true);
         let payload = vec![7u8; shards_ipc::MAX_PAYLOAD];
         std::thread::scope(|s| {
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 while busy.load(Ordering::Relaxed) {
                     std::hint::black_box(Instant::now());
                 }
             });
-            let reader = s.spawn(|| {
+            let reader = party::spawn_in(s, || {
                 std::thread::sleep(Duration::from_millis(10_500));
                 shards_ipc::recv(&theirs).unwrap().unwrap()
             });
@@ -10190,7 +10582,7 @@ mod tests {
         let (done, finished) = mpsc::channel();
         let t0 = Instant::now();
         std::thread::scope(|s| {
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 let payload = vec![0u8; shards_ipc::MAX_PAYLOAD];
                 let _ = done.send(socket.send(&record, kind::SIGNAL, &payload, &[]));
             });
@@ -10212,18 +10604,42 @@ mod tests {
     }
 
     /// A process that does nothing for `secs` seconds and ends, standing in for a VM or a
-    /// network process: `sleep` on Unix; on Windows cmd's pings of the loopback, a second
-    /// apart (`ping -n`'s first answers at once).
+    /// network process: `sleep` on Unix; on Windows this test binary running `asleep` alone.
+    /// cmd's pings of the loopback stood in there before, and ping wakes its thread pool
+    /// between its echoes: a judge's looks a W* of 100 ms apart found its cycles grown, and
+    /// its pool's threads switched, in every other window, so a handoff or a join share
+    /// waiting on it went unrefused for 10 s and a network process of it unended (CI runs
+    /// 43748291795 and 43876891053, x86_64 Windows, `SHARDS_JUDGE_TRACE`).
     fn sleeper(secs: u64) -> shards_ipc::Child {
+        let secs = secs.to_string();
         #[cfg(unix)]
-        let (program, args) = (PathBuf::from("/bin/sleep"), vec![secs.to_string()]);
+        let started = shards_ipc::spawn(Path::new("/bin/sleep"), &[OsStr::new(&secs)], &[], false);
         #[cfg(windows)]
-        let (program, args) = (
-            Path::new(&std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe"),
-            vec!["/c".to_string(), format!("ping -n {} 127.0.0.1 >nul", secs + 1)],
+        let started = shards_ipc::spawn_with(
+            &std::env::current_exe().unwrap(),
+            &[
+                "daemon::tests::asleep",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ]
+            .map(OsStr::new),
+            &[],
+            false,
+            &[("SHARDS_ASLEEP", OsStr::new(&secs))],
         );
-        let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
-        shards_ipc::spawn(&program, &args, &[], false).unwrap()
+        started.unwrap()
+    }
+
+    /// [`sleeper`]'s process on Windows: asleep for the seconds its `SHARDS_ASLEEP` says.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "a process of its own for sleeper, which runs it"]
+    fn asleep() {
+        let Some(secs) = std::env::var("SHARDS_ASLEEP").ok().and_then(|s| s.parse().ok()) else {
+            return;
+        };
+        std::thread::sleep(Duration::from_secs(secs));
     }
 
     /// A starting VM progresses by more CPU than an idle microVM takes in as long (PM M357):
@@ -10286,7 +10702,7 @@ mod tests {
         .unwrap();
         let (ours, theirs) = UnixStream::pair().unwrap();
         std::thread::scope(|s| {
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 std::thread::sleep(late);
                 shards_ipc::send(&theirs, kind::READY, &[], &[]).unwrap();
             });
@@ -10347,7 +10763,7 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let (told, said) = mpsc::channel::<String>();
         let refused = std::thread::scope(|s| {
-            let granting = s.spawn({
+            let granting = party::spawn_in(s, {
                 let (home, ours, launches, grants, pid) = (&home, &ours, &launches, &grants, asleep.id());
                 move || {
                     let tell = |line: &str| {
@@ -10560,7 +10976,7 @@ mod tests {
             }
         }
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            party::spawn_in(scope, || {
                 while !done.load(Ordering::Relaxed) {
                     drop(UnixStream::pair().unwrap());
                     std::thread::sleep(Duration::from_micros(50));
@@ -10570,7 +10986,7 @@ mod tests {
             for _ in 0..20 {
                 let (daemon, vm) = UnixStream::pair().unwrap();
                 let (mut client, conn) = UnixStream::pair().unwrap();
-                let warm = std::thread::spawn(move || {
+                let warm = party::spawn_member(move || {
                     // Slow to take it: collections run while it is in flight.
                     std::thread::sleep(Duration::from_millis(2));
                     let run = shards_ipc::recv(&vm).unwrap().unwrap();
@@ -10600,7 +11016,7 @@ mod tests {
     fn a_vm_that_ends_before_taking_a_run_fails_the_hand_over() {
         let (daemon, vm) = UnixStream::pair().unwrap();
         let (_client, conn) = UnixStream::pair().unwrap();
-        let warm = std::thread::spawn(move || drop(shards_ipc::recv(&vm)));
+        let warm = party::spawn_member(move || drop(shards_ipc::recv(&vm)));
         let e = handed_over(
             &daemon,
             b"run",
@@ -10618,7 +11034,7 @@ mod tests {
     fn a_vm_that_answers_otherwise_may_have_taken_the_run() {
         let (daemon, vm) = UnixStream::pair().unwrap();
         let (_client, conn) = UnixStream::pair().unwrap();
-        let warm = std::thread::spawn(move || {
+        let warm = party::spawn_member(move || {
             drop(shards_ipc::recv(&vm));
             shards_ipc::send(&vm, kind::STARTED, &[], &[]).unwrap();
             vm
@@ -10646,7 +11062,7 @@ mod tests {
     }
 
     /// What this process has learned of its tests' waits on their daemons (D215's record):
-    /// one kind, as every one waits on the same party, this process's own threads.
+    /// one kind, as every one waits on a party alike, its own test's threads ([`Counted`]).
     static WAITS: Record = Record::new();
 
     /// The CPU the threads waiting in a [`Wait`] have run while they waited, in [`cpu`]'s
@@ -10700,12 +11116,62 @@ mod tests {
         i128::from(cpu(true)) - i128::from(WAITERS.load(Ordering::Relaxed))
     }
 
+    /// Whose run and deadlines a [`Wait`] counts as its party's (D215): its test's own
+    /// threads ([`party`]), where the thread that waits is of a test's party; this process's,
+    /// where it is of none; or a test's stand-in.
+    #[derive(Clone, Copy)]
+    enum Counted {
+        Party(u64),
+        Process,
+        StandIn {
+            ran: fn() -> i128,
+            until: fn() -> Option<Instant>,
+        },
+    }
+
+    impl Counted {
+        /// The party of the thread that asks, or this process where it is of none.
+        fn here() -> Counted {
+            match party::current() {
+                0 => Counted::Process,
+                id => Counted::Party(id),
+            }
+        }
+
+        /// What it has run.
+        fn ran(self) -> i128 {
+            match self {
+                Counted::Party(id) => party::ran(id),
+                Counted::Process => others(),
+                Counted::StandIn { ran, .. } => ran(),
+            }
+        }
+
+        /// The latest deadline it waits until.
+        fn until(self) -> Option<Instant> {
+            match self {
+                Counted::Party(id) => latest_deadline_of(id),
+                Counted::Process => latest_deadline(),
+                Counted::StandIn { until, .. } => until(),
+            }
+        }
+
+        /// A thread waiting on it ran `cpu` more as it waited: no run of a party's.
+        fn waited(self, cpu: u64) {
+            WAITERS.fetch_add(cpu, Ordering::Relaxed);
+            if let Counted::Party(id) = self {
+                party::waited(id, cpu);
+            }
+        }
+    }
+
     /// A test's wait on its daemon, whose threads run in this process: judged as D215 judges
-    /// a wait on a VM process (#77), its party this process. Past the slowest wait of its
-    /// tests seen ([`WAITS`], W*), it looks once each W*, and gives up only where no thread
-    /// of this process but its waiters has run for a whole W* its host did not hold it in,
-    /// counted from no earlier than the latest deadline a daemon thread waits until
-    /// ([`Waiting`]): a party asleep on a deadline of its own has not stalled before it.
+    /// a wait on a VM process (#77), its party its test's own threads ([`Counted`],
+    /// [`party`]). Past the slowest wait of its tests seen ([`WAITS`], W*), it looks once
+    /// each W*, and gives up only where no thread of its party but its waiters has run for a
+    /// whole W* its host did not hold it in, counted from no earlier than the latest deadline
+    /// a thread of its party waits until ([`Waiting`]): a party asleep on a deadline of its
+    /// own has not stalled before it.
     /// Before the first answer it follows this process's liveness alone, and is judged from
     /// the first that comes.
     ///
@@ -10715,8 +11181,8 @@ mod tests {
     /// holds its waiter, and a stretch of it so held is no stretch its daemon could run in.
     struct Wait<'r> {
         record: &'r Record,
-        /// What its party has run ([`others`]; a test's stand-in).
-        party: fn() -> i128,
+        /// Whose run and deadlines it counts.
+        party: Counted,
         judge: Judge<'r>,
         began: Instant,
         /// What its party had run as it began (Unix: Windows keeps no rate in cycles), and at
@@ -10730,14 +11196,11 @@ mod tests {
         /// long its host has held it since.
         since: Instant,
         held: Duration,
-        /// The latest deadline its party waits until ([`latest_deadline`]; a test's
-        /// stand-in).
-        deadline: fn() -> Option<Instant>,
     }
 
     impl<'r> Wait<'r> {
-        fn on(record: &'r Record, party: fn() -> i128, deadline: fn() -> Option<Instant>) -> Wait<'r> {
-            let (began, mine, others) = (Instant::now(), cpu(false), party());
+        fn on(record: &'r Record, party: Counted) -> Wait<'r> {
+            let (began, mine, others) = (Instant::now(), cpu(false), party.ran());
             Wait {
                 record,
                 party,
@@ -10749,7 +11212,6 @@ mod tests {
                 mine,
                 since: began,
                 held: Duration::ZERO,
-                deadline,
             }
         }
 
@@ -10774,14 +11236,14 @@ mod tests {
         /// the latest deadline it waits until.
         fn look(&mut self) -> Result<(), Stall> {
             let mine = cpu(false);
-            WAITERS.fetch_add(mine.saturating_sub(self.mine), Ordering::Relaxed);
+            self.party.waited(mine.saturating_sub(self.mine));
             self.mine = mine;
             let now = Instant::now();
             let Some(due) = self.judge.due() else {
                 // Begun before its kind's first answer: judged from the first.
                 if matches!(self.record.seen(), Seen::Learned { .. }) {
                     self.judge = Judge::begin(self.record);
-                    (self.others, self.since, self.held) = ((self.party)(), now, Duration::ZERO);
+                    (self.others, self.since, self.held) = (self.party.ran(), now, Duration::ZERO);
                 }
                 return Ok(());
             };
@@ -10791,12 +11253,15 @@ mod tests {
             if now < due {
                 return Ok(());
             }
-            let others = (self.party)();
+            let others = self.party.ran();
             let ran = others > std::mem::replace(&mut self.others, others);
             if ran {
                 (self.since, self.held) = (now, Duration::ZERO);
             }
-            let from = (self.deadline)().map_or(self.since, |until| until.max(self.since));
+            let from = self
+                .party
+                .until()
+                .map_or(self.since, |until| until.max(self.since));
             let free = now.saturating_duration_since(from).saturating_sub(self.held);
             self.judge.found(if ran {
                 Found::Progressed
@@ -10811,7 +11276,7 @@ mod tests {
         /// threads ran meanwhile its work.
         fn answered(&self) {
             #[cfg(unix)]
-            let work = Duration::from_nanos(u64::try_from((self.party)() - self.from).unwrap_or(0));
+            let work = Duration::from_nanos(u64::try_from(self.party.ran() - self.from).unwrap_or(0));
             // Cycles, which no rate of D215's is kept in: R* is a refusal's diagnosis alone.
             #[cfg(windows)]
             let work = Duration::ZERO;
@@ -10822,7 +11287,7 @@ mod tests {
     /// What a test says of a [`Wait`] it gave up on, after what it waited for.
     fn stalled(stall: &Stall) -> String {
         format!(
-            "no thread of this process ran for {:?} its host did not hold it in, {:?} into the \
+            "no thread of its party ran for {:?} its host did not hold it in, {:?} into the \
              wait, the slowest of its tests' waits seen {:?} (D215)",
             stall.over(),
             stall.waited(),
@@ -10832,13 +11297,8 @@ mod tests {
 
     /// Waits until `f` holds, polled as the tests poll, `party` judged on `record`'s
     /// judgment ([`Wait`]).
-    fn waited_on(
-        record: &Record,
-        party: fn() -> i128,
-        deadline: fn() -> Option<Instant>,
-        mut f: impl FnMut() -> bool,
-    ) -> Result<(), Stall> {
-        let mut wait = Wait::on(record, party, deadline);
+    fn waited_on(record: &Record, party: Counted, mut f: impl FnMut() -> bool) -> Result<(), Stall> {
+        let mut wait = Wait::on(record, party);
         loop {
             if f() {
                 wait.answered();
@@ -10853,7 +11313,7 @@ mod tests {
 
     /// Waits until `f` holds ([`Wait`]).
     fn waited(f: impl FnMut() -> bool) -> Result<(), Stall> {
-        waited_on(&WAITS, others, latest_deadline, f)
+        waited_on(&WAITS, Counted::here(), f)
     }
 
     /// Waits until `f` holds ([`Wait`]); a wait given up on fails the test, saying `what`.
@@ -10873,7 +11333,7 @@ mod tests {
 
     /// What `rx` gives, waited for ([`Wait`]).
     fn received<T>(rx: &mpsc::Receiver<T>) -> Result<T, Unreceived> {
-        let mut wait = Wait::on(&WAITS, others, latest_deadline);
+        let mut wait = Wait::on(&WAITS, Counted::here());
         loop {
             let (asked, began) = (wait.slice(), Instant::now());
             match rx.recv_timeout(asked) {
@@ -10921,7 +11381,7 @@ mod tests {
     ) -> T {
         let socket = socket.try_clone().unwrap();
         let (sent, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        DaemonThread::new()
             .name("reader".into())
             .spawn(move || {
                 let value = f(&socket);
@@ -10959,7 +11419,11 @@ mod tests {
         }
         let still = || 0;
         let none = || None;
-        let stall = waited_on(&STOPPED, still, none, || false).unwrap_err();
+        let stopped = Counted::StandIn {
+            ran: still,
+            until: none,
+        };
+        let stall = waited_on(&STOPPED, stopped, || false).unwrap_err();
         assert!(stall.waited() >= slowest, "{stall:?}");
 
         // Asleep until 10 W* from now: waited on to its deadline, then a whole W* more.
@@ -10967,26 +11431,100 @@ mod tests {
         let asleep = || UNTIL.get().copied();
         let began = Instant::now();
         assert_eq!(
-            waited_on(&ASLEEP, still, asleep, || began.elapsed() >= slowest * 5),
+            waited_on(
+                &ASLEEP,
+                Counted::StandIn {
+                    ran: still,
+                    until: asleep
+                },
+                || { began.elapsed() >= slowest * 5 }
+            ),
             Ok(())
         );
-        let stall = waited_on(&WOKE_TO_NOTHING, still, asleep, || false).unwrap_err();
+        let woke = Counted::StandIn {
+            ran: still,
+            until: asleep,
+        };
+        let stall = waited_on(&WOKE_TO_NOTHING, woke, || false).unwrap_err();
         assert!(Instant::now() >= until + slowest, "{stall:?}");
 
         let runs = || i128::from(RUN.load(Ordering::Relaxed));
         let done = AtomicBool::new(false);
         let began = Instant::now();
         std::thread::scope(|s| {
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 while !done.load(Ordering::Relaxed) {
                     RUN.fetch_add(1, Ordering::Relaxed);
                     std::thread::yield_now();
                 }
             });
-            let waited = waited_on(&SLOW, runs, none, || began.elapsed() >= slowest * 25);
+            let slow = Counted::StandIn {
+                ran: runs,
+                until: none,
+            };
+            let waited = waited_on(&SLOW, slow, || began.elapsed() >= slowest * 25);
             done.store(true, Ordering::Relaxed);
             assert_eq!(waited, Ok(()));
         });
+    }
+
+    /// A test's wait counts its own test's threads alone ([`party`], D215): a party whose
+    /// threads stopped is given up on while another test's party beside it in this process
+    /// runs on, and then sleeps until a deadline of its own. Each party is made as a test's is
+    /// ([`party::of_test`]), its members by [`party::spawn_member`], the record taught a W* of
+    /// 20 ms. Red where a wait counts this process's threads and deadlines (`Counted::here`
+    /// as `Counted::Process`): the stopped party's wait is held by the other's run, then by
+    /// its deadline, and given up on long after the other stopped running (CI 43990298220,
+    /// aarch64-apple-darwin: a removal test's wait that could not end was held 21 minutes by
+    /// what the binary's other tests, all ended, had left; run alone it was refused in 81 ms,
+    /// ROOT's r669).
+    #[test]
+    fn a_waits_party_is_its_own_tests_threads_alone() {
+        static STOPPED: Record = Record::new();
+        let slowest = Duration::from_millis(20);
+        STOPPED.teach(slowest, Duration::ZERO);
+        // Another test's party, made first: a thread of none, which makes its own, and a member
+        // of it that runs until this test's wait has ended, or for 250 W*, and then sleeps,
+        // its deadline 500 W* from its start, until this test's wait has ended.
+        let (stop, stopping) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel::<()>();
+        let other = party::spawn_member(move || {
+            party::of_test();
+            party::spawn_member(move || {
+                let began = Instant::now();
+                let _asleep = Waiting::of(Some(slowest * 500));
+                started.send(()).unwrap();
+                let mut told = false;
+                while !told && began.elapsed() < slowest * 250 {
+                    told = stopping.try_recv().is_ok();
+                    std::hint::spin_loop();
+                }
+                let spun = began.elapsed();
+                if !told {
+                    let _ = stopping.recv();
+                }
+                spun
+            })
+            .join()
+            .unwrap()
+        });
+        running.recv().unwrap();
+        // This test's party: a member waiting on nothing that comes.
+        let mine = party::of_test();
+        let (never, idle) = mpsc::channel::<()>();
+        let idler = party::spawn_member(move || drop(idle.recv()));
+        let began = Instant::now();
+        let stall = waited_on(&STOPPED, Counted::here(), || false).unwrap_err();
+        let given_up = began.elapsed();
+        stop.send(()).unwrap();
+        let spun = other.join().unwrap();
+        assert!(
+            given_up < spun,
+            "party {mine}'s wait was given up on {given_up:?} in, the other party having stopped \
+             running {spun:?} after it began: {stall:?}"
+        );
+        drop(never);
+        idler.join().unwrap();
     }
 
     /// A thread's handle, scoped or not, for [`joined`].
@@ -11091,6 +11629,8 @@ mod tests {
         /// `t.daemon.disk`.
         fn on(tag: &str, disk: D) -> Test<D> {
             keep_panics();
+            // Its test's party, before its daemon makes any thread: its waits count its own.
+            party::of_test();
             // A home of its own: a daemon's refill thread may still make a spare record
             // as its test ends, and must not make it in another test's home.
             static HOMES: AtomicUsize = AtomicUsize::new(0);
@@ -11293,7 +11833,7 @@ mod tests {
             let (warm, offered) = mpsc::channel::<Ready>();
             let (ask, asks) = mpsc::channel::<()>();
             let (daemon, threads, id) = (&self.t.daemon, self.threads, id.to_string());
-            let run = threads.spawn(move || {
+            let run = party::spawn_in(threads, move || {
                 let null = File::open(crate::os::NULL).unwrap();
                 // As long as its test holds the run's `Starting`, however long the host
                 // takes to make the VM the test plays: a test that gives none lets its
@@ -11327,6 +11867,7 @@ mod tests {
                         mac: None,
                         link_local: Vec::new(),
                         engine: None,
+                        volumes: Default::default(),
                     },
                     acquire,
                 )?;
@@ -11346,7 +11887,7 @@ mod tests {
         fn asking(&self, args: &[&str]) -> std::thread::ScopedJoinHandle<'s, (u8, String, String)> {
             let daemon = &self.t.daemon;
             let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-            self.threads.spawn(move || {
+            party::spawn_in(self.threads, move || {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 ask(daemon, &args)
             })
@@ -11369,8 +11910,8 @@ mod tests {
             daemon.recording.end();
             daemon.followers.end();
             // What its VMs said as the test ended, which the followers' loop may have ended
-            // before it took (a loaded host's): taken, so that each run that ended lets go of
-            // the exec connections it held for its VM (M24), whose askers wait on them.
+            // before it took (a loaded host's): taken, and each run it left lets go of the
+            // exec connections it held for its VM (M24), whose askers wait on them.
             daemon.take_left();
             // A run's thread waiting for its end, which no follower takes now, returns.
             drop(lock(&daemon.runs));
@@ -11407,7 +11948,7 @@ mod tests {
                 // Waited on while this process's threads run ([`Wait`]): the runs a failing
                 // test leaves end saying so ("ended before its command did"), and a slow
                 // host's daemon ending sixty of them is not a thread stuck.
-                let _ = std::thread::Builder::new()
+                let _ = DaemonThread::new()
                     .name("watchdog".into())
                     .spawn(move || {
                         if let Err(Unreceived::Stalled(stall)) = received(&joining) {
@@ -11752,7 +12293,7 @@ mod tests {
             let (daemon, threads, id2) = (&t.t.daemon, t.threads, id.clone());
             // Its run started, and not followed: nothing takes what its VM sends but the
             // command that asks.
-            let running = threads.spawn(move || {
+            let running = party::spawn_in(threads, move || {
                 let null = File::open(crate::os::NULL).unwrap();
                 daemon
                     .start_run(
@@ -11780,6 +12321,7 @@ mod tests {
                             mac: None,
                             link_local: Vec::new(),
                             engine: None,
+                            volumes: Default::default(),
                         },
                         || received(&offered).map_err(|e| format!("no warm VM: {e:?}")),
                     )
@@ -11939,8 +12481,10 @@ mod tests {
     /// SIGTERM all hear it before any hears SIGKILL, and all are stopped one grace after,
     /// where docker/cli's 50 at a time would take two; the answers in the order asked. The
     /// grace is long beside what sending 60 signals takes a busy host (2.8 s once, where
-    /// the bound was 0.9 s), so that its bounds, the grace's own, tell one grace from two
-    /// whatever the host's load.
+    /// the bound was 0.9 s), and beside hearing their ends, whose record the stop keeps in
+    /// its home once, as it ends (D217): kept as each was heard, two flushes each on macOS,
+    /// sixty took 25.9 s once on a loaded host (6f5755ae1). So its bounds, the grace's own,
+    /// tell one grace from two whatever the host's load.
     #[test]
     fn stop_ends_every_container_at_once() {
         const N: usize = 60;
@@ -11958,8 +12502,12 @@ mod tests {
                 assert_eq!(heard(vm), signal(15));
             }
             let terms = t0.elapsed();
+            // When each SIGKILL was heard: a failure says whether its time went before
+            // them, the escalation late, or after them, the ends heard late.
+            let mut kills = Vec::with_capacity(N);
             for (_, _, vm) in &vms {
                 assert_eq!(heard(vm), signal(9));
+                kills.push(t0.elapsed());
                 say(vm, kind::DONE, &[137]);
             }
             let (status, out, err) = joined(asked);
@@ -11968,8 +12516,53 @@ mod tests {
             assert_eq!(out, names.iter().map(|n| format!("{n}\n")).collect::<String>());
             // A second round of 50 would start a grace after the first.
             assert!(terms < GRACE, "SIGTERM to all took {terms:?}, a grace or more");
-            assert!(took >= GRACE && took < 2 * GRACE, "one grace, not two: {took:?}");
+            assert!(
+                took >= GRACE && took < 2 * GRACE,
+                "one grace, not two: {took:?}; SIGTERMs heard by {terms:?}, SIGKILLs from {:?} to {:?}",
+                kills.first(),
+                kills.last()
+            );
             for (_, starting, _) in vms {
+                let _ = joined(starting.run);
+            }
+        });
+    }
+
+    /// A stop answers each end as it hears it, and keeps the ends in its home once, after
+    /// the last (D217): with the home's record of ends held, as a run's host keeping its own
+    /// holds it, both ends of a kill are answered. Red with a keep of each end as it is
+    /// heard, which held up every end after it behind the record (two flushes each on
+    /// macOS; `stop_ends_every_container_at_once`'s 25.9 s at 6f5755ae1).
+    #[test]
+    fn a_stop_answers_each_end_while_its_homes_record_is_held() {
+        let t = Test::new("kill-held");
+        t.run(|t| {
+            // Names a client may give: two characters or more, as Docker's rule has it
+            // (`containers::valid_name`), which refused "a" at its create (ROOT's r652).
+            let names = ["first", "second"];
+            let runs = names.map(|name| running(t, name));
+            let held = shards_image::store::Locked::exclusive(&t.daemon.home.join("ends.lock")).unwrap();
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            let daemon = &t.t.daemon;
+            let asked = party::spawn_in(t.threads, move || {
+                let argv = ["kill", names[0], names[1]].map(String::from);
+                daemon.command(&argv, &asker(), &commands::Reply(&ours))
+            });
+            for (_, _, vm) in &runs {
+                assert_eq!(heard(vm), signal(9));
+                say(vm, kind::DONE, &[137]);
+            }
+            for name in names {
+                let m = read("an end of the kill not answered", &theirs, |c| {
+                    shards_ipc::recv(c)
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!((m.kind, m.payload), (kind::OUT, format!("{name}\n").into_bytes()));
+            }
+            drop(held);
+            assert_eq!(joined(asked), 0);
+            for (_, starting, _) in runs {
                 let _ = joined(starting.run);
             }
         });
@@ -12111,7 +12704,9 @@ mod tests {
                 "invalid capture record header",
             ));
             std::thread::scope(|s| {
-                let stopping = s.spawn(|| t.daemon.capture_failed(&id, "its members' output", &refused));
+                let stopping = party::spawn_in(s, || {
+                    t.daemon.capture_failed(&id, "its members' output", &refused)
+                });
                 assert_eq!(
                     heard(&vm),
                     signal(15),
@@ -12194,7 +12789,7 @@ mod tests {
         home: &'s Path,
     ) -> std::sync::mpsc::Receiver<Result<Option<File>, String>> {
         let (send, taken) = std::sync::mpsc::channel();
-        s.spawn(move || send.send(take_lock(home)).unwrap());
+        party::spawn_in(s, move || send.send(take_lock(home)).unwrap());
         taken
     }
 
@@ -12331,7 +12926,7 @@ mod tests {
             "not held once closed"
         );
         std::thread::scope(|s| {
-            let had = s.spawn(|| {
+            let had = party::spawn_in(s, || {
                 waiter.lock_shared().unwrap();
                 let home = File::open(&home_lock).unwrap();
                 let free = home.try_lock().is_ok();
@@ -12514,7 +13109,7 @@ mod tests {
             // closes the close-on-exec ones, and a flock lasts as long as any holder.
             let lease = crate::pull::store(&t.home).unwrap().lease().unwrap();
             let daemon = &t.t.daemon;
-            let collecting = t.threads.spawn(move || daemon.collect_garbage());
+            let collecting = party::spawn_in(t.threads, move || daemon.collect_garbage());
             std::thread::sleep(Duration::from_millis(100));
             assert!(!collecting.is_finished(), "collected under a lease");
             assert!(left.exists() && unknown.exists());
@@ -12703,7 +13298,7 @@ mod tests {
             let (client, ours) = shards_ipc::slots::joined().unwrap();
             let answer = vec![b'x'; 1 << 20];
             std::thread::scope(|s| {
-                let writer = s.spawn(|| living.answer(&ours, kind::ERR, &answer));
+                let writer = party::spawn_in(s, || living.answer(&ours, kind::ERR, &answer));
                 t.until("a client that takes nothing held its closed daemon", |d| {
                     !d.slots_hold().0
                 });
@@ -12728,7 +13323,7 @@ mod tests {
             let (client, ours) = shards_ipc::slots::joined().unwrap();
             let answer = vec![b'x'; 1 << 20];
             std::thread::scope(|s| {
-                let writer = s.spawn(|| living.answer(&ours, kind::ERR, &answer));
+                let writer = party::spawn_in(s, || living.answer(&ours, kind::ERR, &answer));
                 t.until("its writer did not wait on its client", |d| {
                     lock(&d.live).values().any(|l| l.waiting.is_some())
                 });
@@ -12761,7 +13356,7 @@ mod tests {
             let (mut client, ours) = shards_ipc::slots::joined().unwrap();
             let answer = vec![b'x'; 1 << 20];
             std::thread::scope(|s| {
-                let writer = s.spawn(|| living.answer(&ours, kind::ERR, &answer));
+                let writer = party::spawn_in(s, || living.answer(&ours, kind::ERR, &answer));
                 // 16 KiB every 60 ms: the whole answer in about 3.9 s, past a request's time,
                 // each piece of it in about 240 ms.
                 let mut piece = vec![0; 16 << 10];
@@ -12872,7 +13467,7 @@ mod tests {
             (says, hears, session)
         };
         let heard = std::thread::scope(|s| {
-            let passing = s.spawn(|| t.daemon.pass_on(Ok(()), asked, &ours, session, &living));
+            let passing = party::spawn_in(s, || t.daemon.pass_on(Ok(()), asked, &ours, session, &living));
             for &kind in said {
                 shards_ipc::send(&theirs, kind, &[0], &[]).unwrap();
             }
@@ -12880,7 +13475,7 @@ mod tests {
             drop(theirs);
             let (heard, hearing) = mpsc::channel();
             let hears = &hears;
-            s.spawn(move || {
+            party::spawn_in(s, move || {
                 let mut kinds = Vec::new();
                 while let Ok(Some(f)) = read_frame(hears) {
                     kinds.push(f.kind);
@@ -13133,7 +13728,7 @@ mod tests {
             let watched = vm.clone();
             let (daemon, threads) = (&t.t.daemon, t.threads);
             let watching = dir.clone();
-            threads.spawn(move || {
+            party::spawn_in(threads, move || {
                 daemon.watch(
                     threads,
                     watched,
@@ -13562,7 +14157,7 @@ mod tests {
                 let (ours, theirs) = UnixStream::pair().unwrap();
                 let daemon = &t.t.daemon;
                 let argv: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-                let asking = t.threads.spawn(move || {
+                let asking = party::spawn_in(t.threads, move || {
                     let asker = commands::Asker {
                         client: 0,
                         registry_env: Vec::new(),
@@ -13605,7 +14200,7 @@ mod tests {
     /// stdout and stderr, as bytes.
     fn ask_bytes<D: Disk>(daemon: &Daemon<D>, args: &[&str]) -> (u8, Vec<u8>, Vec<u8>) {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        let reader = std::thread::spawn(move || {
+        let reader = party::spawn_member(move || {
             let (mut out, mut err) = (Vec::new(), Vec::new());
             while let Ok(Some(m)) = shards_ipc::recv(&theirs) {
                 match m.kind {
@@ -13747,7 +14342,7 @@ mod tests {
             // A client that hangs up after one message.
             let (ours, theirs) = UnixStream::pair().unwrap();
             let daemon = &t.t.daemon;
-            let asking = t.threads.spawn(move || {
+            let asking = party::spawn_in(t.threads, move || {
                 let argv = vec!["logs".to_string(), "racer".to_string()];
                 let asker = commands::Asker {
                     client: 0,
@@ -13793,7 +14388,7 @@ mod tests {
     ) -> (T, bool) {
         let answered = AtomicBool::new(false);
         let (got, before_end) = std::thread::scope(|s| {
-            let asking = s.spawn(|| {
+            let asking = party::spawn_in(s, || {
                 let got = ask();
                 answered.store(true, Ordering::SeqCst);
                 got
@@ -13865,7 +14460,7 @@ mod tests {
             let (_stop, stopped) = UnixStream::pair().unwrap();
             // Its run ended once it has answered or follows: one that followed it ends Ok.
             let (shipped, _) = asked_while_running(t, &id, &vm, starting, || {
-                t.daemon.ship(&id, &dir, &mut Taking, true, &stopped)
+                t.daemon.ship(&id, &dir, "taking", &mut Taking, true, &stopped)
             });
             let Err(e) = shipped else {
                 panic!("a shipper followed its log unwatched");
@@ -13989,18 +14584,15 @@ mod tests {
                 drop(asked);
                 t.until("its answer taken", |d| !d.watching.giving(&answers));
             };
-            // What the daemon learns of a give-back's answer, from its own answers alone: pass
-            // after pass until one has taught it. This stand-in answers as it reads the ask, so
-            // its answer can be there before the daemon's wait begins (`exec_followed` spawns
-            // its output's reader first), and such a pass teaches nothing (D222, health.rs
-            // `await_exit`): two passes, both beaten so, left it cold (CI 43496145972, x86_64
-            // gnu and musl, Windows arm64).
-            let slowest = loop {
-                if let shards_api::Seen::Learned { slowest, .. } = t.t.daemon.answers.reclaim.seen() {
-                    break slowest;
-                }
-                t.t.daemon.give_back_cold(t.threads);
-                answered(t);
+            // What the daemon learns of a give-back's answer, from its own answers alone: one
+            // pass teaches it, though this stand-in answers as it reads the ask, as the daemon's
+            // wait begins before it asks (D188, amended by ci-fixes: health.rs `Begun`). Begun
+            // after, a pass whose answer came first taught nothing: two left it cold (CI
+            // 43496145972), and on Windows arm64 ~24k passes in a row (CI 43968984258).
+            t.t.daemon.give_back_cold(t.threads);
+            answered(t);
+            let shards_api::Seen::Learned { slowest, .. } = t.t.daemon.answers.reclaim.seen() else {
+                panic!("a give-back answered taught its kind nothing");
             };
             let (stalled, _stalled, vm) = running(t, "stalled");
             let t0 = Instant::now();
@@ -14147,6 +14739,27 @@ mod tests {
         }
     }
 
+    /// Says, as its test fails, what its daemon's groups' thread and its members' words
+    /// heard and did, in order (`Groups::trace`): its rounds, each opened, answered and
+    /// judged. On this process's stderr, as the daemon logs, so that neither the capture of
+    /// a failing test's output nor an abort of the tests loses it.
+    #[cfg(any(target_os = "macos", windows))]
+    struct Traced<'a>(&'a Daemon<Real>);
+
+    #[cfg(any(target_os = "macos", windows))]
+    impl Drop for Traced<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let test = std::thread::current().name().unwrap_or("a test").to_string();
+                let said = format!(
+                    "{test}: its groups' thread and words heard and did:\n{}\n",
+                    self.0.groups.trace()
+                );
+                let _ = io::stderr().write_all(said.as_bytes());
+            }
+        }
+    }
+
     /// A group's member whose guest never answers holds up no other member's words and no
     /// group's verdict (D183, slice 3): each member is told its room and asked to give back
     /// on a thread of its own, its wait judged as D215's judge judges one, and the groups'
@@ -14191,8 +14804,8 @@ mod tests {
             };
             std::thread::scope(|s| {
                 let _done = Done(&done);
-                s.spawn(|| answering(&answers_vm, &done));
-                s.spawn(|| answering(&other_vm, &done));
+                party::spawn_in(s, || answering(&answers_vm, &done));
+                party::spawn_in(s, || answering(&other_vm, &done));
                 t.until(
                     "group two's member, past its memory.max, was never stopped",
                     stopped(&other),
@@ -14209,15 +14822,100 @@ mod tests {
     /// its kill acknowledged, and whose give-back then follows its VM's liveness (the
     /// give-back's kind cold) is still asked by the round opened next, not counted as one
     /// that gave nothing. Here `a` (600 MiB, under a high of 500 and a max of 1000) has its
-    /// room refused in round 1 and its give-back held; `b` (500 MiB) joins, opening round 2,
-    /// and gives nothing; `a` then gives 1 MiB back in round 2. Red with the room's refusal
-    /// left standing through the give-back: round 2 counted `a` as nothing given, its group
-    /// past its max, and OOM-killed `a` before its round-2 word came.
+    /// room refused in round 1 and its give-back held, and the pass after round 1's verdict
+    /// opens round 2; `b` (500 MiB) joins, its group past its max, and gives nothing
+    /// whenever asked (a round asks the members it began with: one joining it is told its
+    /// room at each pass until the round after asks it); `a` then gives 100 MiB back in
+    /// round 2, its group within its max again, so the round after, its room to `a`
+    /// unanswered, stops nothing. Red with the room's refusal left standing through the
+    /// give-back: round 2 counted `a` as nothing given, its group past its max, and
+    /// OOM-killed `a` before its round-2 word came. A failure says its rounds ([`Traced`]).
     #[cfg(any(target_os = "macos", windows))]
     #[test]
     fn a_refused_room_is_not_the_next_rounds_verdict() {
         let t = Test::new("group-stale");
         t.run(|t| {
+            let _traced = Traced(&t.daemon);
+            t.daemon
+                .answers
+                .room
+                .teach(Duration::from_millis(20), Duration::ZERO);
+            let mib = |n: u64| n << 20;
+            let dir = groups::made(&t.daemon.home, "g").unwrap();
+            std::fs::write(dir.join("memory.high"), format!("{}\n", mib(500))).unwrap();
+            std::fs::write(dir.join("memory.max"), format!("{}\n", mib(1000))).unwrap();
+            t.t.daemon.start_groups(t.threads);
+            let builtin = |m: &shards_ipc::Message| {
+                assert_eq!(m.kind, kind::EXEC_RUN, "asked {} where an exec was due", m.kind);
+                m.payload
+                    .get(9..)
+                    .and_then(shards_abi::run::Spec::decode)
+                    .unwrap()
+                    .builtin
+            };
+            let (a, _a_run, a_vm, a_pid) = running_under(t, "first", "g", mib(600));
+            // Round 1: its room never answered, refused by its own judge, the kill answered.
+            let room = heard_whole(&a_vm);
+            assert_eq!(builtin(&room), shards_abi::run::builtin::ROOM);
+            let conn = stream_of(&room.fds[0]);
+            let killed = shards_ipc::recv(&conn).unwrap().unwrap();
+            assert_eq!((killed.kind, killed.payload), signal(9));
+            shards_ipc::send(&conn, kind::EXIT, &[137], &[]).unwrap();
+            drop((conn, room));
+            // Its give-back of round 1, held: its kind cold, it follows liveness alone.
+            let give = heard_whole(&a_vm);
+            assert_eq!(builtin(&give), shards_abi::run::builtin::RECLAIM);
+            let (_, _b_run, b_vm, _) = running_under(t, "second", "g", mib(500));
+            let _ends = Ends {
+                held: None,
+                vms: vec![(&a_vm, 0), (&b_vm, 0)],
+            };
+            // b's room, told at the pass that took it in: its group past its max before a's
+            // give-back is answered. Its words from there on a thread that plays its guest.
+            let room = heard_whole(&b_vm);
+            assert_eq!(builtin(&room), shards_abi::run::builtin::ROOM);
+            answer_exec(&room, b"0", 0);
+            drop(room);
+            let done = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let _done = Done(&done);
+                party::spawn_in(s, || answering(&b_vm, &done));
+                // a's give-back of round 1 answered, then its words of round 2: 100 MiB given
+                // back, which its VM process holds no more.
+                t.daemon.groups.play(a_pid, mib(500));
+                answer_exec(&give, b"0 0\n", 0);
+                drop(give);
+                for (said, what) in [
+                    (&b"0"[..], shards_abi::run::builtin::ROOM),
+                    (b"104857600 0\n", shards_abi::run::builtin::RECLAIM),
+                ] {
+                    let m = heard_whole(&a_vm);
+                    assert_eq!(builtin(&m), what, "a was not asked its round-2 word");
+                    answer_exec(&m, said, 0);
+                }
+                t.until("a's give-back taken", |d| !d.watching.giving(&a));
+                assert!(
+                    !lock(&t.daemon.containers).get(&a).is_some_and(|c| c.oom_killed),
+                    "a, asked in round 2 and giving back, was OOM-killed"
+                );
+            });
+        });
+    }
+
+    /// A round is judged with the members its group had as its last answer came (D183,
+    /// R04), however late the groups' thread looks: `a` (600 MiB, under a high of 500 and a
+    /// max of 1000) has its room of round 1 refused while the thread is held in a pass, as a
+    /// loaded host holds it, and `b` (500 MiB) joins before it looks again. Round 1 asked
+    /// `a` alone, and gave nothing with its group within its max: it stops nothing, and the
+    /// pass after asks `b` its room. Red with a wake's joins taken in before its answers:
+    /// round 1 judged with `b`, its group past its max, and `a` OOM-killed, the cause read
+    /// for `a_refused_room_is_not_the_next_rounds_verdict`'s 1 of 24 under load (6f5755ae1).
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_round_is_judged_with_the_members_its_group_had_as_its_last_answer_came() {
+        let t = Test::new("group-order");
+        t.run(|t| {
+            let _traced = Traced(&t.daemon);
             t.daemon
                 .answers
                 .room
@@ -14236,48 +14934,32 @@ mod tests {
                     .builtin
             };
             let (a, _a_run, a_vm, _) = running_under(t, "first", "g", mib(600));
-            // Round 1: its room never answered, refused by its own judge, the kill answered.
+            // Round 1 asks a its room; the thread is held from its next pass on.
             let room = heard_whole(&a_vm);
             assert_eq!(builtin(&room), shards_abi::run::builtin::ROOM);
+            let held = t.daemon.groups.hold_passes();
+            // a's room refused by its own judge, the kill answered, its give-back held.
             let conn = stream_of(&room.fds[0]);
             let killed = shards_ipc::recv(&conn).unwrap().unwrap();
             assert_eq!((killed.kind, killed.payload), signal(9));
             shards_ipc::send(&conn, kind::EXIT, &[137], &[]).unwrap();
             drop((conn, room));
-            // Its give-back of round 1, held: its kind cold, it follows liveness alone.
             let give = heard_whole(&a_vm);
             assert_eq!(builtin(&give), shards_abi::run::builtin::RECLAIM);
-            let (b, _b_run, b_vm, _) = running_under(t, "second", "g", mib(500));
+            let (_, _b_run, b_vm, _) = running_under(t, "second", "g", mib(500));
             let _ends = Ends {
                 held: None,
                 vms: vec![(&a_vm, 0), (&b_vm, 0)],
             };
-            // Round 2: b gives nothing.
-            for (said, what) in [
-                (&b"0"[..], shards_abi::run::builtin::ROOM),
-                (b"0 0\n", shards_abi::run::builtin::RECLAIM),
-            ] {
-                let m = heard_whole(&b_vm);
-                assert_eq!(builtin(&m), what);
-                answer_exec(&m, said, 0);
-            }
-            t.until("b's give-back taken", |d| !d.watching.giving(&b));
-            // a's give-back of round 1 answered, then its words of round 2: 1 MiB given back.
-            answer_exec(&give, b"0 0\n", 0);
-            drop(give);
-            for (said, what) in [
-                (&b"0"[..], shards_abi::run::builtin::ROOM),
-                (b"1048576 0\n", shards_abi::run::builtin::RECLAIM),
-            ] {
-                let m = heard_whole(&a_vm);
-                assert_eq!(builtin(&m), what, "a was not asked its round-2 word");
-                answer_exec(&m, said, 0);
-            }
-            t.until("a's give-back taken", |d| !d.watching.giving(&a));
+            drop(held);
+            // b's room, told by the pass after round 1's verdict.
+            let told = heard_whole(&b_vm);
+            assert_eq!(builtin(&told), shards_abi::run::builtin::ROOM);
             assert!(
                 !lock(&t.daemon.containers).get(&a).is_some_and(|c| c.oom_killed),
-                "a, asked in round 2 and giving back, was OOM-killed"
+                "round 1, which asked a alone, was judged with b, which joined after its last answer"
             );
+            drop((told, give));
         });
     }
 
@@ -14330,7 +15012,7 @@ mod tests {
             let done = AtomicBool::new(false);
             std::thread::scope(|s| {
                 let _done = Done(&done);
-                s.spawn(|| answering(&b_vm, &done));
+                party::spawn_in(s, || answering(&b_vm, &done));
                 // Its room read as it held 400 MiB; it grows to 600 before the word comes.
                 let first = heard_whole(&a_vm);
                 t.daemon.groups.play(a_pid, mib(600));
@@ -14401,7 +15083,7 @@ mod tests {
                 let _done = Done(&done);
                 let done = &done;
                 for vm in [&p_vm, &j_vm, &m_vm] {
-                    s.spawn(move || answering(vm, done));
+                    party::spawn_in(s, move || answering(vm, done));
                 }
                 // Once its last microVM is summed: its own 100 MiB in it, after the joiner's.
                 t.until("its group never summed its last microVM", |_| {
@@ -14429,17 +15111,19 @@ mod tests {
         });
     }
 
-    /// A run whose end its followers' loop had not taken as it ended, with its test, ends
-    /// then as the loop would have ended it: the daemon lets go of the exec connection it
-    /// handed its VM and held until taken (M24), and the thread waiting on the exec returns.
-    /// Red with a test's end that left the run followed by none: the daemon's copy held the
-    /// exec's connection open, its asker waited on, and the tests' watchdog aborted them, as
-    /// a group's word to a member whose played VM answered no more did under load
-    /// (a_joiner_and_its_provider_in_one_group_count_their_vm_process_once, CI 43496145972).
+    /// A run whose end its followers' loop had not taken as it ended lets go, with its test,
+    /// of the exec connection the daemon handed its VM and held until taken (M24), and the
+    /// thread waiting on the exec returns, whether its VM's end has come or not: here its
+    /// VM's socket outlives the test, as a copy of it does in a child another test's thread
+    /// spawns, until that child's exec (PM M134). Red with a test's end that left the run
+    /// followed by none: the daemon's copy held the exec's connection open, its asker waited
+    /// on, and the tests' watchdog aborted them, as a group's word to a member whose played
+    /// VM answered no more did under load (CI 43496145972); and again where its end was looked
+    /// for once, as the test ended, and such a copy hid it (the whole suite, b240f4322).
     #[test]
     fn a_run_its_followers_left_lets_go_of_the_execs_handed_its_vm() {
         let t = Test::new("left-run");
-        t.run(|t| {
+        let _held = t.run(|t| {
             let id = t.create("left");
             let starting = t.start(&id);
             let (ready, vm) = t.warm_vm(None);
@@ -14453,7 +15137,7 @@ mod tests {
                     .is_some_and(|c| c.state == Life::Running)
             });
             let (daemon, exec_id) = (&t.t.daemon, id.clone());
-            t.threads.spawn(move || {
+            party::spawn_in(t.threads, move || {
                 let spec = shards_abi::run::Spec {
                     argv: vec![b"true".to_vec()],
                     ..Default::default()
@@ -14466,7 +15150,7 @@ mod tests {
             // Its followers' loop ends before its VM's end comes.
             t.daemon.followers.end();
             t.until("its followers' loop woke to end", |d| d.followers.ended_awake());
-            drop(vm);
+            vm
         });
     }
 
@@ -14579,7 +15263,7 @@ mod tests {
             lock(&t.daemon.runs).insert("quiet".into(), handing(&quiet));
             let (answered, settled) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
-                scope.spawn(|| {
+                party::spawn_in(scope, || {
                     t.daemon.settle();
                     answered.send(()).unwrap();
                 });
@@ -14595,7 +15279,7 @@ mod tests {
             lock(&t.daemon.runs).insert("taken".into(), handing(&taken));
             let (answered, settled) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
-                scope.spawn(|| {
+                party::spawn_in(scope, || {
                     t.daemon.settle();
                     answered.send(()).unwrap();
                 });
@@ -14623,7 +15307,7 @@ mod tests {
             let id = t.reserve("racer");
             let (answered, settled) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
-                scope.spawn(|| {
+                party::spawn_in(scope, || {
                     t.daemon.settle();
                     answered.send(()).unwrap();
                 });
@@ -14649,7 +15333,7 @@ mod tests {
             let id = t.reserve("racer");
             let (answered, found) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
-                scope.spawn(|| {
+                party::spawn_in(scope, || {
                     answered.send(t.daemon.resolve("racer")).unwrap();
                 });
                 let early = found.recv_timeout(Duration::from_millis(200));
@@ -14855,7 +15539,7 @@ mod tests {
             let starting = t.start(&id);
             let (answered, settled) = mpsc::channel();
             std::thread::scope(|scope| {
-                scope.spawn(|| {
+                party::spawn_in(scope, || {
                     t.daemon.settle();
                     answered.send(()).unwrap();
                 });
@@ -14992,10 +15676,10 @@ mod tests {
             let (ps_said, ps) = mpsc::channel();
             let (inspect_said, inspect) = mpsc::channel();
             std::thread::scope(|s| {
-                s.spawn(move || {
+                party::spawn_in(s, move || {
                     let _ = ps_said.send(t.ask(&["ps", "-a"]));
                 });
-                s.spawn(move || {
+                party::spawn_in(s, move || {
                     let _ = inspect_said.send(t.ask(&["image", "inspect", "nothing"]));
                 });
                 let inspected = inspect.recv_timeout(Duration::from_secs(2));
@@ -15029,7 +15713,7 @@ mod tests {
             (&vm).write_all(&frame[..3]).unwrap();
             let (asked, answer) = mpsc::channel();
             std::thread::scope(|s| {
-                s.spawn(|| {
+                party::spawn_in(s, || {
                     let _ = asked.send(t.ask(&["ps"]));
                 });
                 let listed = answer.recv_timeout(Duration::from_secs(5));
@@ -15063,7 +15747,7 @@ mod tests {
         let (done, finished) = mpsc::channel();
         let t0 = Instant::now();
         std::thread::scope(|s| {
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 let mut judged = health::Judged::of(idle.id(), &record);
                 let _ = done.send(hand_over(&daemon, &mut judged, &payload, &[], &[]));
             });
@@ -15092,12 +15776,12 @@ mod tests {
         record.teach(slowest, slowest / 1000);
         let busy = AtomicBool::new(true);
         std::thread::scope(|s| {
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 while busy.load(Ordering::Relaxed) {
                     std::hint::black_box(Instant::now());
                 }
             });
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 std::thread::sleep(Duration::from_millis(10_500));
                 let run = shards_ipc::recv(&vm).unwrap().unwrap();
                 assert_eq!(run.kind, kind::RUN);
@@ -15126,12 +15810,12 @@ mod tests {
         let dir = shards_vmm::platform::open_dir(Path::new(".")).unwrap();
         let busy = AtomicBool::new(true);
         std::thread::scope(|s| {
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 while busy.load(Ordering::Relaxed) {
                     std::hint::black_box(Instant::now());
                 }
             });
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 let volume = shards_ipc::recv(&share).unwrap().unwrap();
                 assert_eq!(volume.kind, kind::JOIN_VOLUME);
                 std::thread::sleep(Duration::from_millis(10_500));
@@ -15158,7 +15842,7 @@ mod tests {
         let (done, finished) = mpsc::channel();
         let t0 = Instant::now();
         std::thread::scope(|s| {
-            s.spawn(|| {
+            party::spawn_in(s, || {
                 let mut judged = health::Judged::of(idle.id(), &record);
                 let _ = done.send(give_join_volume(&daemon, &mut judged, b"v\0rw\0", dir.as_fd()));
             });
@@ -15278,7 +15962,7 @@ mod tests {
             pooled: None,
         };
         let (daemon, threads, id) = (&t.t.daemon, t.threads, id.to_string());
-        let run = threads.spawn(move || {
+        let run = party::spawn_in(threads, move || {
             let null = File::open(crate::os::NULL).unwrap();
             let mut ready = Some(ready);
             let inbox = daemon.start_run(
@@ -15306,6 +15990,7 @@ mod tests {
                     mac: None,
                     link_local: Vec::new(),
                     engine: None,
+                    volumes: Default::default(),
                 },
                 || ready.take().ok_or_else(|| "no warm VM".to_string()),
             )?;
@@ -15428,13 +16113,14 @@ mod tests {
                 mac: None,
                 link_local: Vec::new(),
                 engine: None,
+                volumes: Default::default(),
             };
             let _inbox = t.daemon.register(ready, &id, keep);
             say(&vm, kind::STARTED, &[]);
             assert_eq!(t.daemon.in_use(at, publish::TCP), publish::InUse::Allocated);
             say(&vm, kind::DONE, &[0]);
             std::thread::scope(|scope| {
-                scope.spawn(|| {
+                party::spawn_in(scope, || {
                     t.until("the run did not end", |d| {
                         !matches!(lock(&d.runs).get(&id), Some(RunState::Tracked(_)))
                     });
@@ -15480,6 +16166,7 @@ mod tests {
                 mac: None,
                 link_local: Vec::new(),
                 engine: None,
+                volumes: Default::default(),
             };
             let _inbox = t.daemon.register(ready, &id, keep);
             say(&vm, kind::STARTED, &[]);
@@ -15495,6 +16182,92 @@ mod tests {
             );
             say(&vm, kind::DONE, &[0]);
             assert_eq!(ask(), Ok(()));
+        });
+    }
+
+    /// The daemon's runs on a network have their addresses leased from the home's records,
+    /// held while each runs, and the network paired by the daemon from its first run's join
+    /// to its last's leaving (D285): a network another process pairs refuses them by that
+    /// cause, and the daemon's pairing refuses that process.
+    #[test]
+    fn a_networks_runs_are_leased_and_paired_by_one_process() {
+        use crate::networks::leases::{Leases, Refused, hold};
+        let t = Test::new("net-leases");
+        t.run(|t| {
+            let made = t.ask(&["network", "create", "--subnet", "10.78.4.0/24", "n"]);
+            assert_eq!(made.0, 0, "{made:?}");
+            let network = t.daemon.user_network("n").unwrap();
+            let leases = Leases::of(&t.daemon.home, &network.id).unwrap();
+            // Another process's pairing, the home's lock let go before the daemon asks.
+            let held = hold(&t.daemon.home).unwrap();
+            let elsewhere = leases.pair(&held).unwrap();
+            drop(held);
+            let id = t.create("member");
+            assert_eq!(
+                t.daemon.join_network(&id, "n", "", "", &[], "m").unwrap_err(),
+                "failed to set up container networking: network n: another process links its members"
+            );
+            drop(elsewhere);
+            let (_, member) = t.daemon.join_network(&id, "n", "", "", &[], "m").unwrap();
+            assert_eq!(member.ip, std::net::Ipv4Addr::new(10, 78, 4, 2));
+            let held = hold(&t.daemon.home).unwrap();
+            assert_eq!(
+                leases.addresses(&held).unwrap(),
+                vec![(member.ip, Some(id.clone()))]
+            );
+            assert_eq!(leases.pair(&held).unwrap_err(), Refused::PairedElsewhere);
+            drop(held);
+            t.daemon.leave_network(&id);
+            let held = hold(&t.daemon.home).unwrap();
+            assert!(
+                leases.addresses(&held).unwrap().is_empty(),
+                "its address was kept"
+            );
+            assert!(leases.pair(&held).is_ok(), "the daemon kept the network paired");
+        });
+    }
+
+    /// A network another process's run holds an address of (D285) is in use, as one of the
+    /// daemon's runs keeps it: `network rm` refuses it by that cause and inspect lists that
+    /// run by its ID and address; its lease let go, the network and its leases go.
+    #[test]
+    fn a_network_with_another_processs_run_on_it_stays() {
+        use crate::networks::leases::{Leases, hold};
+        let t = Test::new("net-elsewhere");
+        t.run(|t| {
+            let made = t.ask(&["network", "create", "--subnet", "10.78.5.0/24", "n"]);
+            assert_eq!(made.0, 0, "{made:?}");
+            let network = t.daemon.user_network("n").unwrap();
+            let leases = Leases::of(&t.daemon.home, &network.id).unwrap();
+            let other = "c".repeat(64);
+            let held = hold(&t.daemon.home).unwrap();
+            let lease = leases
+                .take(&held, network.pools.first().unwrap(), None, &other)
+                .unwrap();
+            drop(held);
+            let removed = t.ask(&["network", "rm", "n"]);
+            assert_eq!(removed.0, 1, "{removed:?}");
+            assert!(
+                removed
+                    .2
+                    .contains("shards: cannot remove network n: another process's runs are on it"),
+                "{removed:?}"
+            );
+            let inspected = t.ask(&["network", "inspect", "n"]);
+            assert!(
+                inspected.1.contains(&other) && inspected.1.contains("10.78.5.2/24"),
+                "{inspected:?}"
+            );
+            drop(lease);
+            let removed = t.ask(&["network", "rm", "n"]);
+            assert_eq!(removed.0, 0, "{removed:?}");
+            assert!(
+                !t.daemon
+                    .home
+                    .join("networks")
+                    .join(format!("{}.leases", network.id))
+                    .exists()
+            );
         });
     }
 
@@ -15549,7 +16322,7 @@ mod tests {
             starting.warm.send(ready).unwrap();
             assert_eq!(heard(&vm).0, kind::RUN);
             std::thread::scope(|scope| {
-                let asked = scope.spawn(|| t.daemon.in_use(at, publish::TCP));
+                let asked = party::spawn_in(scope, || t.daemon.in_use(at, publish::TCP));
                 std::thread::sleep(Duration::from_millis(100));
                 assert!(!asked.is_finished(), "answered before the handoff was through");
                 // In one write, as the name's test says them: three writes let the asker
@@ -15704,13 +16477,61 @@ mod tests {
     fn a_builtin_ask_is_waited_for_while_its_microvm_runs() {
         let t = Test::new("answered");
         t.run(|t| {
-            let stat = shards_abi::run::builtin::STAT;
-            let record = t.daemon.answers.builtins.get(usize::from(stat)).unwrap();
+            let stat = shards_abi::run::Spec {
+                builtin: shards_abi::run::builtin::STAT,
+                ..Default::default()
+            };
+            let record = t.daemon.answers.builtins.get(usize::from(stat.builtin)).unwrap();
             assert!(matches!(
-                t.daemon.answered_wait(Some(7), stat),
+                t.daemon.answered_wait(Some(7), &stat),
                 health::Wait::WhileRuns(7, judged) if std::ptr::eq(judged, record)
             ));
-            assert!(matches!(t.daemon.answered_wait(None, stat), health::Wait::Ending));
+            assert!(matches!(
+                t.daemon.answered_wait(None, &stat),
+                health::Wait::Ending
+            ));
+        });
+    }
+
+    /// A network's switch is judged by each verb's own record (D215, ROOT's ruling of
+    /// 2026-11-17): a `make`'s quick answers are no `connect`'s slowest. Red with the
+    /// builtin's one record for every verb, under which a member's connect was ended 5.7 ms
+    /// into a stillness, past makes' 3.0 ms (CI 43968984258, engine.rs
+    /// `a_running_member_is_connected_and_disconnected_at_once`).
+    #[test]
+    fn a_networks_verbs_are_judged_each_by_its_own_record() {
+        let t = Test::new("answered-net");
+        t.run(|t| {
+            let network = shards_abi::run::builtin::NETWORK;
+            let judged = |verb: &str| {
+                let asked = shards_abi::run::Spec {
+                    builtin: network,
+                    argv: vec![verb.as_bytes().to_vec()],
+                    ..Default::default()
+                };
+                match t.daemon.answered_wait(Some(7), &asked) {
+                    health::Wait::WhileRuns(7, record) => std::ptr::from_ref(record),
+                    _ => panic!("{verb}: not judged while its microVM runs"),
+                }
+            };
+            let records: Vec<_> = health::NETWORK_VERBS.iter().map(|verb| judged(verb)).collect();
+            for (i, record) in records.iter().enumerate() {
+                assert_eq!(
+                    records.iter().filter(|other| *other == record).count(),
+                    1,
+                    "{} shares its record",
+                    health::NETWORK_VERBS[i]
+                );
+            }
+            assert!(
+                std::ptr::eq(judged("connect"), judged("connect")),
+                "one verb, one kind"
+            );
+            let builtin = t.daemon.answers.builtins.get(usize::from(network)).unwrap();
+            assert!(
+                std::ptr::eq(judged("no verb of its"), builtin),
+                "a verb init has not is the builtin's"
+            );
         });
     }
 
@@ -16204,6 +17025,7 @@ mod tests {
                     mac: None,
                     link_local: Vec::new(),
                     engine: engine.clone(),
+                    volumes: Default::default(),
                 };
                 let _inbox = t.daemon.register(ready, &id, keep);
                 say(&vm, kind::STARTED, &[]);
@@ -16279,6 +17101,7 @@ mod tests {
                 mac: None,
                 link_local: Vec::new(),
                 engine: None,
+                volumes: Default::default(),
             };
             let _inbox = t.daemon.register(ready, &id, keep);
             say(&vm, kind::STARTED, &[]);
@@ -16550,7 +17373,7 @@ mod tests {
             starting.warm.send(ready).unwrap();
             assert_eq!(heard(&vm).0, kind::RUN);
             std::thread::scope(|scope| {
-                let again = scope.spawn(|| t.reserve("handing"));
+                let again = party::spawn_in(scope, || t.reserve("handing"));
                 std::thread::sleep(Duration::from_millis(100));
                 assert!(!again.is_finished(), "answered before the handoff was through");
                 say_together(
@@ -16564,32 +17387,34 @@ mod tests {
         });
     }
 
-    /// `--rm` microVMs that end together are made durable together: the removals that
-    /// queue while one sync waits take one more, for them all.
+    /// Removals that end together are made durable together: those that queue while one
+    /// sync waits take one more, for them all. Each is a `--rm` run's that ended before
+    /// its record was written, taken out of its reservation: one whose record says `--rm`
+    /// needs no sync (D215's amendment of 2026-11-16, `Removal::needs_sync`).
     #[test]
     fn removals_ending_together_take_one_sync() {
         let t = Test::on("rm-batch", Held::default());
         t.run(|t| {
             t.t.daemon.start_completer(t.threads);
+            t.daemon.disk.holding_writes.store(true, Ordering::SeqCst);
             let runs: Vec<_> = (0..3)
                 .map(|i| {
                     let id = t.reserve_with(&format!("batch{i}"), None, true);
-                    t.t.daemon.await_arrival(&id);
                     let starting = t.start(&id);
                     let (ready, vm) = t.warm_vm(None);
                     starting.warm.send(ready).unwrap();
                     assert_eq!(heard(&vm).0, kind::RUN);
+                    // Its command never starts: nothing asks for its record after the first.
                     say(&vm, kind::TAKEN, &[]);
-                    say(&vm, kind::STARTED, &[]);
                     (starting, vm)
                 })
                 .collect();
-            say(&runs[0].1, kind::DONE, &[0]);
+            say(&runs[0].1, kind::DONE, &[127]);
             t.until("the first removal's sync waits", |d| {
                 d.disk.syncing.load(Ordering::SeqCst)
             });
-            say(&runs[1].1, kind::DONE, &[0]);
-            say(&runs[2].1, kind::DONE, &[0]);
+            say(&runs[1].1, kind::DONE, &[127]);
+            say(&runs[2].1, kind::DONE, &[127]);
             t.until("the others queued", |d| lock(&d.completing.pending).len() == 2);
             t.daemon.disk.let_through();
             for (starting, _) in runs {
@@ -16606,6 +17431,55 @@ mod tests {
                 d.disk.syncs.load(Ordering::SeqCst) >= syncs
             });
             assert_eq!(t.daemon.disk.syncs.load(Ordering::SeqCst), syncs);
+        });
+    }
+
+    /// `--rm` runs whose records say `--rm` take no sync as they end together (D215's
+    /// amendment of 2026-11-16, `Removal::needs_sync`): one a power loss brings back goes
+    /// as the next start opens. Their names go and what they set aside is deleted, on
+    /// Windows with no sync of its deletion either.
+    #[test]
+    fn rm_runs_ending_together_take_no_sync() {
+        let t = Test::on("rm-unsynced", Held::default());
+        t.run(|t| {
+            t.t.daemon.start_completer(t.threads);
+            // A sync begun is counted, not held.
+            t.daemon.disk.let_through();
+            let runs: Vec<_> = (0..3)
+                .map(|i| {
+                    let id = t.reserve_with(&format!("unsynced{i}"), None, true);
+                    t.t.daemon.await_arrival(&id);
+                    let starting = t.start(&id);
+                    let (ready, vm) = t.warm_vm(None);
+                    starting.warm.send(ready).unwrap();
+                    assert_eq!(heard(&vm).0, kind::RUN);
+                    say(&vm, kind::TAKEN, &[]);
+                    say(&vm, kind::STARTED, &[]);
+                    (id, starting, vm)
+                })
+                .collect();
+            for (_, _, vm) in &runs {
+                say(vm, kind::DONE, &[0]);
+            }
+            let ids: Vec<String> = runs.iter().map(|(id, ..)| id.clone()).collect();
+            for (_, starting, _) in runs {
+                joined(starting.run).unwrap();
+            }
+            t.until("every name let go", |d| {
+                let registry = lock(&d.containers);
+                (0..3).all(|i| registry.name_taken(&format!("unsynced{i}")).is_none())
+            });
+            let containers = t.home.join("containers");
+            t.until("what was set aside was not deleted", |_| {
+                ids.iter().all(|id| {
+                    !containers.join(id).exists() && !containers.join(format!(".{id}.removing")).exists()
+                })
+            });
+            assert_eq!(
+                t.daemon.disk.syncs.load(Ordering::SeqCst),
+                0,
+                "a --rm run's removal synced"
+            );
         });
     }
 
@@ -16637,7 +17511,7 @@ mod tests {
             let removal = lock(&t.daemon.containers).take_out(&id).unwrap();
             t.daemon.set_aside(&removal).unwrap();
             std::thread::scope(|scope| {
-                let completing = scope.spawn(|| t.daemon.complete(&removal));
+                let completing = party::spawn_in(scope, || t.daemon.complete(&removal));
                 let _ = waited(|| held.syncing.load(Ordering::SeqCst));
                 let syncing = held.syncing.load(Ordering::SeqCst);
                 let seen = lock(&t.daemon.containers).get(&id).is_some();
@@ -16678,7 +17552,7 @@ mod tests {
             };
             let removal = removal.expect("a --rm container is taken out as its run ends");
             std::thread::scope(|scope| {
-                let waiting = scope.spawn(|| t.daemon.await_removals());
+                let waiting = party::spawn_in(scope, || t.daemon.await_removals());
                 std::thread::sleep(Duration::from_millis(50));
                 let early = waiting.is_finished();
                 t.daemon.complete_soon(removal);
@@ -16761,7 +17635,7 @@ mod tests {
             let start = std::sync::Barrier::new(8);
             std::thread::scope(|s| {
                 for _ in 0..8 {
-                    s.spawn(|| {
+                    party::spawn_in(s, || {
                         start.wait();
                         t.daemon.make_spare();
                     });
@@ -16825,7 +17699,7 @@ mod tests {
             t.daemon.make_soon(files::Job::Hold(last));
             let (finished, waited) = mpsc::channel();
             std::thread::scope(|scope| {
-                scope.spawn(|| {
+                party::spawn_in(scope, || {
                     t.daemon.finish();
                     finished.send(()).unwrap();
                 });
@@ -17352,14 +18226,14 @@ mod tests {
             let dir = lock(&t.daemon.containers).dir(&id);
             std::fs::write(dir.join(REQUEST), Run::default().encode()).unwrap();
             std::thread::scope(|s| {
-                s.spawn(|| {
+                party::spawn_in(s, || {
                     for shares in 2..2 + ROUNDS {
                         let (status, _, err) =
                             t.ask(&["update", "--cpu-shares", &shares.to_string(), "both"]);
                         assert_eq!(status, 0, "{err}");
                     }
                 });
-                s.spawn(|| {
+                party::spawn_in(s, || {
                     for round in 0..ROUNDS {
                         let (status, _, err) = t.ask(&["network", "connect", &format!("n{round}"), "both"]);
                         assert_eq!(status, 0, "{err}");
@@ -17391,7 +18265,7 @@ mod tests {
             let ids: Vec<String> = std::thread::scope(|s| {
                 let asked: Vec<_> = (0..callers)
                     .map(|_| {
-                        s.spawn(|| {
+                        party::spawn_in(s, || {
                             start.wait();
                             crate::networks::engine_id(&t.daemon.home)
                         })
@@ -17446,7 +18320,7 @@ mod tests {
         let (path, writing) = (&path, &writing);
         let (failed, reads, torn) = std::thread::scope(|s| {
             let writers = [&updated, &disconnected].map(|request| {
-                s.spawn(move || {
+                party::spawn_in(s, move || {
                     let failed: Vec<String> = (0..WRITES)
                         .filter_map(|_| keep_whole(path, request).err().map(|e| e.to_string()))
                         .collect();
@@ -17510,7 +18384,7 @@ mod tests {
     ) -> std::thread::ScopedJoinHandle<'s, (u8, String)> {
         let daemon = &t.t.daemon;
         let (name, out) = (name.to_string(), File::create(out).unwrap());
-        t.threads.spawn(move || {
+        party::spawn_in(t.threads, move || {
             let (ours, theirs) = UnixStream::pair().unwrap();
             let asker = commands::Asker {
                 client: 0,
@@ -17525,7 +18399,7 @@ mod tests {
                 whose: String::new(),
             };
             std::thread::scope(|s| {
-                let errors = s.spawn(|| {
+                let errors = party::spawn_in(s, || {
                     let mut said = Vec::new();
                     while let Ok(Some(m)) = shards_ipc::recv(&theirs) {
                         if m.kind == kind::ERR {
@@ -17652,7 +18526,7 @@ mod tests {
             let mut errors = File::from(exec.fds.into_iter().nth(3).unwrap());
             // Past any pipe's buffer: Linux's 64 KiB (pipe(7)), and macOS's at most.
             let said = vec![b'e'; 1 << 20];
-            let writer = t.threads.spawn(move || errors.write_all(&said));
+            let writer = party::spawn_in(t.threads, move || errors.write_all(&said));
             let written = finishes(&writer);
             // Ended: had its errors waited for its end, read now.
             say(&conn, kind::EXIT, &[0]);

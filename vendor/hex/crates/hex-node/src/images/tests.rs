@@ -94,6 +94,14 @@ impl ImageGuest for Held {
     ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
         Err(unasked())
     }
+    fn member_egress(
+        &self,
+        _: &MemberName,
+        _: Option<&shards_api::image::Reach>,
+        _: Duration,
+    ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
+        Err(unasked())
+    }
 
     fn publish(
         &self,
@@ -128,14 +136,50 @@ impl ImageGuest for Held {
     fn started_from(&self) -> StartedFrom {
         StartedFrom::Booted
     }
-    fn take_output(&self, _: &MemberName, _: Channel) -> Result<std::io::PipeReader, ImageRefusal> {
+    fn take_output(
+        &self,
+        _: &MemberName,
+        _: u32,
+        _: Channel,
+    ) -> Result<std::io::PipeReader, ImageRefusal> {
         Err(unasked())
     }
-    fn take_input(&self, _: &MemberName) -> Result<std::io::PipeWriter, ImageRefusal> {
+    fn take_input(&self, _: &MemberName, _: u32) -> Result<std::io::PipeWriter, ImageRefusal> {
         Err(unasked())
     }
-    fn wait_member(&self, _: &MemberName, _: Duration) -> Result<Option<MemberEnd>, ImageRefusal> {
+    fn wait_member(
+        &self,
+        _: &MemberName,
+        _: u32,
+        _: Duration,
+    ) -> Result<Option<MemberEnd>, ImageRefusal> {
         Err(unasked())
+    }
+    fn restart(&self, _: &MemberName, _: &[Vec<u8>], _: Duration) -> Result<u32, ImageRefusal> {
+        Err(unasked())
+    }
+    fn swap(
+        &self,
+        _: &str,
+        _: &str,
+        _: shards_api::image::SwapWhen,
+        _: Option<&[Vec<u8>]>,
+        _: Duration,
+    ) -> Result<shards_api::image::Swapped, ImageRefusal> {
+        Err(unasked())
+    }
+    fn restore(
+        &self,
+        _: &str,
+        _: shards_api::image::SwapWhen,
+        _: Option<&[Vec<u8>]>,
+        _: Duration,
+    ) -> Result<shards_api::image::Swapped, ImageRefusal> {
+        Err(unasked())
+    }
+    /// None swapped: it runs its image's own.
+    fn components(&self) -> Vec<shards_api::image::ComponentAt> {
+        Vec::new()
     }
     fn stats(&self, _: StatsScope, _: Duration) -> Result<Stats, ImageRefusal> {
         Err(unasked())
@@ -183,6 +227,7 @@ impl ImageGuest for Held {
     fn wait_channel(
         &self,
         _: &MemberName,
+        _: u32,
         _: Channel,
         _: Duration,
     ) -> Result<Option<ChannelEnd>, ImageRefusal> {
@@ -229,6 +274,40 @@ fn runtime(dir: &Path, model: &Arc<Model>) -> Arc<ImageRuntime> {
     .unwrap()
 }
 
+/// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2): kiln's node, an image runtime, lists the Shards image class only where it
+/// boots image VMs, and one that can't carries Shards' why. Do: open an image runtime over the model's image boot, and
+/// one over the refusal `host_images` makes where Shards' check says this host runs no microVM; create an image VM on
+/// each. Expect: the first lists shards-image alone and makes it, of that class; the second lists none, says why as its
+/// class serves none, and refuses the create Platform in Shards' words, keeping no record and asking no boot.
+#[test]
+fn p2_2_an_image_runtime_lists_its_class_only_where_it_boots_image_vms() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Model::default());
+    let serving = runtime(&dir.path().join("serving"), &model);
+    assert_eq!(serving.classes(), vec![Class::ShardsImage]);
+    assert_eq!(serving.class().serves(), Ok(()));
+    let made = serving.create(image_box("served")).unwrap();
+    assert_eq!(made.class, Class::ShardsImage);
+    let why = Refusal::Platform {
+        what: "Shards image VMs",
+        platform: std::env::consts::OS,
+        why: shards_api::Unusable::KvmDenied.to_string(),
+    };
+    let unserved = ImageRuntime::with_images(
+        dir.path().join("shards"),
+        shards_api::RuntimePaths::new(dir.path().join("cache"), dir.path().join("home")).unwrap(),
+        &dir.path().join("unserved"),
+        Err(why.clone()),
+        Ok(ImageWaits::new()),
+    )
+    .unwrap();
+    assert_eq!(unserved.classes(), Vec::<Class>::new());
+    assert_eq!(unserved.class().serves(), Err(why.clone()));
+    assert_eq!(unserved.create(image_box("refused")), Err(why));
+    assert_eq!(unserved.list().unwrap(), Vec::new());
+    assert!(model.asked.lock().unwrap().is_empty());
+}
+
 /// The second box shown Running once its held boot is let go: this test's fact alone.
 static SHOWN: hex_core::patience::Patience =
     hex_core::patience::Patience::measuring("test.hex_node.image_start_shown");
@@ -248,7 +327,7 @@ fn w12_an_image_runtime_serves_the_image_class_alone_on_a_store_of_its_own() {
     let dir = tempfile::tempdir().unwrap();
     let model = Arc::new(Model::default());
     let images = runtime(dir.path(), &model);
-    assert_eq!(images.classes(), vec![Class::Shards]);
+    assert_eq!(images.classes(), vec![Class::ShardsImage]);
     let mut process = image_box("process-box");
     process.class = ClassSpec::Process;
     process.allocation = None;
@@ -449,8 +528,9 @@ fn credentialed(id: &str) -> BoxSpec {
 
 /// AC-T7.7.2, joint plan step 33 (C3; Shards' D242; kiln's vendor patch 0005, taken upstream): an orchestrator linking
 /// hex-node gives its image runtime the lessors over its broker. Do: over a broker holding `anthropic/ada`, make a runtime
-/// with `ImageRuntime::new` and another with `ImageRuntime::leasing`, each over records of its own, and create a VM
-/// granting that credential in each; then, in a runtime built as `leasing` builds one but over the model's boot, create
+/// as `ImageRuntime::new` makes one and another as `ImageRuntime::leasing` does on a host whose Shards check says it runs
+/// microVMs (their boot Shards' own, as `host_images` gives it there: P2.2), each over records of its own, and create a
+/// VM granting that credential in each; then, in a runtime built as `leasing` builds one but over the model's boot, create
 /// and start such a VM and lease the credential through the lessor its boot was given. Expect: `new`'s create refused
 /// `Unconfigured` before any record; `leasing`'s made, its record holding the grant; and the boot given the box's
 /// credential and a lessor whose lease is the broker's value, held there.
@@ -462,11 +542,17 @@ fn w33_a_runtime_made_leasing_leases_its_vms_credentials_and_one_made_new_refuse
     let paths =
         |dir: &Path| shards_api::RuntimePaths::new(dir.join("cache"), dir.join("home")).unwrap();
 
+    // Shards' image boot, as `host_images` gives it where the host's check passes; `new` and `leasing` ask that
+    // check of their `shards` (P2.2: its own tests), which these paths don't name.
+    let serving = || Ok(Arc::new(shards_api::image::ImageShards::new()) as Arc<dyn Images>);
+
     let plain = tempfile::tempdir().unwrap();
-    let unleased = ImageRuntime::new(
+    let unleased = ImageRuntime::with_images(
         plain.path().join("shards"),
         paths(plain.path()),
         &plain.path().join("records"),
+        serving(),
+        Ok(ImageWaits::new()),
     )
     .unwrap();
     assert!(matches!(
@@ -476,11 +562,13 @@ fn w33_a_runtime_made_leasing_leases_its_vms_credentials_and_one_made_new_refuse
     assert!(Books::records(unleased.as_ref()).unwrap().is_empty());
 
     let leased_dir = tempfile::tempdir().unwrap();
-    let leasing = ImageRuntime::leasing(
+    let leasing = ImageRuntime::built(
         leased_dir.path().join("shards"),
         paths(leased_dir.path()),
         &leased_dir.path().join("records"),
-        Arc::new(broker.clone()),
+        serving(),
+        Ok(ImageWaits::new()),
+        Some(Arc::new(broker.clone())),
     )
     .unwrap();
     let spec = credentialed("kiln-r1-1");
@@ -631,5 +719,173 @@ fn reads2_b14_one_boxs_transaction_leaves_anothers_turn_free() {
         b_free,
         Some(true),
         "box b's turn taken while box a's transaction held"
+    );
+}
+
+/// A warm room refusing every claim (kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1): no pool of it starts a host.
+struct NoRoom;
+
+impl WarmRoom for NoRoom {
+    fn claim(&self, _: &shards_api::image::WarmHost) -> bool {
+        false
+    }
+
+    fn give(&self, _: &shards_api::image::WarmHost, _: shards_api::image::Gave) {}
+}
+
+/// Kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1 (CP-T7.2; HEX-IMG-9), kiln's call: do hold an image runtime made
+/// as kiln makes it to the pools' case, then bind it a warm room and hold it to the case again. Expect: before its room
+/// it keeps none, a keep and a let-go refused `Unconfigured` naming the warm room; once given one, it keeps, lists and
+/// lets go of pools as its class does.
+#[test]
+fn p3_1_an_image_runtime_keeps_warm_pools_once_its_owner_binds_their_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Model::default());
+    let runtime = runtime(dir.path(), &model);
+    let case = hex_api::conformance::IMAGE_CASES
+        .iter()
+        .find(|case| case.id == "HEX-IMG-9")
+        .unwrap();
+    let pool = hex_api::WarmPool {
+        image: hex_api::sim::SIM_IMAGE.to_owned(),
+        size: allocation().vm_size().unwrap(),
+    };
+    assert_eq!(runtime.keep_pool(&pool), Err(Refusal::no_warm_room()));
+    case.check(runtime.as_ref(), &hex_api::sim::SimFixture::ShardsImage)
+        .unwrap();
+    runtime.bind_room(Arc::new(NoRoom)).unwrap();
+    case.check(runtime.as_ref(), &hex_api::sim::SimFixture::ShardsImage)
+        .unwrap();
+    runtime.keep_pool(&pool).unwrap();
+    assert_eq!(
+        runtime.pools(),
+        Ok(vec![hex_api::WarmHeld {
+            pool,
+            warm: 0,
+            starting: 0
+        }])
+    );
+}
+
+/// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1; Shards' D281): a person sees an agent's volumes and clears one through the
+/// runtime kiln holds, which asks its own `shards` binary in its own Shards home, as it starts its run hosts. Do list
+/// the home's volumes and clear two through a runtime whose `shards` answers as `shards api-volumes` does, in that home
+/// alone: the listing two volumes, an agent's and a run's anonymous one, the clearing of one a run holds refused, of
+/// another done. Expect both listed whole, by name, bytes, bound, charge, time and kind; the held one refused `Volume {
+/// InUse }` in Shards' words; the other cleared.
+#[cfg(unix)]
+#[test]
+fn p6_2_a_homes_volumes_are_listed_and_cleared_through_its_own_shards() {
+    use shards_api::volumes::{ClearCause, HomeVolume as Listed, cleared, listed};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = shards_api::RuntimePaths::new(dir.path().join("cache"), dir.path().join("home"))
+        .unwrap()
+        .home()
+        .to_owned();
+    let volumes = vec![
+        Listed {
+            name: "kiln-agent-cache".to_owned(),
+            bytes: Some(3 << 20),
+            bound: Some(1 << 30),
+            charge: Some((3 << 20) + (4 << 10)),
+            created_ns: 1_794_712_180_000_000_000,
+            anonymous: false,
+        },
+        Listed {
+            name: "0f".repeat(32),
+            bytes: None,
+            bound: None,
+            charge: None,
+            created_ns: 0,
+            anonymous: true,
+        },
+    ];
+    let held = "volume kiln-agent-cache is held by a run that plugged it";
+    // Each frame as printf(1) writes its bytes back.
+    let printf = |frame: Vec<u8>| {
+        let octal: String = frame.iter().map(|b| format!("\\{b:03o}")).collect();
+        format!("printf '{octal}'")
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = api-volumes ] && [ \"$SHARDS_HOME\" = '{}' ] || exit 9\n\
+         case \"$2\" in\n\
+         list) {} ;;\n\
+         clear) [ \"$3\" = kiln-agent-cache ] && {} || {} ;;\n\
+         esac\n",
+        home.display(),
+        printf(listed(&volumes).unwrap()),
+        printf(cleared(&Err((ClearCause::InUse, held.to_owned()))).unwrap()),
+        printf(cleared(&Ok(())).unwrap()),
+    );
+    std::fs::write(dir.path().join("shards"), script).unwrap();
+    std::fs::set_permissions(
+        dir.path().join("shards"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let images = runtime(dir.path(), &Arc::new(Model::default()));
+    let seen: Vec<_> = images
+        .volumes()
+        .unwrap()
+        .into_iter()
+        .map(|v| {
+            (
+                v.name,
+                v.bytes,
+                v.bound,
+                v.charge,
+                v.created_ns,
+                v.anonymous,
+            )
+        })
+        .collect();
+    let asked: Vec<_> = volumes
+        .into_iter()
+        .map(|v| {
+            (
+                v.name,
+                v.bytes,
+                v.bound,
+                v.charge,
+                v.created_ns,
+                v.anonymous,
+            )
+        })
+        .collect();
+    assert_eq!(seen, asked);
+    assert_eq!(
+        images.clear_volume("kiln-agent-cache"),
+        Err(Refusal::Volume {
+            cause: hex_api::VolumeCause::InUse,
+            why: held.to_owned()
+        })
+    );
+    assert_eq!(images.clear_volume("kiln-agent-notes"), Ok(()));
+}
+
+/// Kiln plan step 35's `/runs/control` (AC-T7.4.1): kiln holds the image runtime in process and reads its runs'
+/// agent-control links through it, so the runtime passes `link` to its class, never answering the trait's default, which
+/// says a box isn't a Shards image box. Do: ask the link of a box it holds none of, of an image VM created and not
+/// started, and of one running, whose model run tells no agent-control endpoint. Expect: `NoSuchBox`; `NotRunning(id,
+/// "link")` before its start; and, once it runs, `Broken`, the class finding no endpoint its run told.
+#[test]
+fn s35_the_image_runtime_passes_a_boxs_link_to_its_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = runtime(dir.path(), &Arc::new(Model::default()));
+    let unknown = BoxId::new("kiln-s35-none").unwrap();
+    assert!(matches!(images.link(&unknown), Err(Refusal::NoSuchBox(_))));
+    let id = images.create(image_box("kiln-s35-link")).unwrap().id;
+    assert_eq!(
+        images.link(&id),
+        Err(Refusal::NotRunning(id.clone(), "link"))
+    );
+    images.start(&id).unwrap();
+    let running = images.link(&id);
+    assert!(
+        matches!(&running, Err(Refusal::Broken(why)) if why.contains("told no agent-control endpoint")),
+        "{running:?}"
     );
 }

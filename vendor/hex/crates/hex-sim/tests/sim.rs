@@ -875,6 +875,7 @@ fn the_hard_filters_keep_every_placement_in_bounds() {
                 Class::Oci => 0,
                 Class::Firecracker => 1,
                 Class::Shards => 2,
+                Class::ShardsImage => panic!("the generator draws no Shards image VM"),
             };
             match w.kind {
                 Kind::Benchmark => benchmarks[at] += 1,
@@ -1002,7 +1003,16 @@ fn replays_the_same_twice(model: &str, nodes: usize, cluster: &Cluster) {
         0,
         "{model}"
     );
-    let every_node_runs_every_kind = cluster.nodes.iter().all(|n| n.classes == Classes::ALL);
+    // Every kind the day launches (none is the Shards image class's, P2.2).
+    let kinds = cluster
+        .workloads
+        .iter()
+        .fold(Classes::NONE, |kinds, w| kinds.with(w.class));
+    let every_node_runs_every_kind = cluster.nodes.iter().all(|n| {
+        Class::ALL
+            .into_iter()
+            .all(|c| !kinds.has(c) || n.classes.has(c))
+    });
     assert_eq!(
         a.report.refused.class == 0,
         every_node_runs_every_kind,

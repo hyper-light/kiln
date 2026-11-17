@@ -791,6 +791,18 @@ fn not_ready(kind: &str, target: &str, known: Option<&crate::accounts::Account>,
     (super::elsewhere::fullest(&limits, now) >= 100.0).then(|| format!("the account {kind} uses there is at its limit"))
 }
 
+/// Whether one of `runners` is connected, its newest process having said it speaks named features
+/// ([`crate::proto::CAP_FEATURES`]) and not yet which ([`crate::proto::AgentMsg::Features`], which follows its
+/// connection: hub.rs): its word on whether it places agents is on its way. A runner from before named features is
+/// never waited for.
+fn features_coming(hub: &Hub, runners: &[String]) -> bool {
+    let (agents, instances) = (hub.agents.load(), hub.instances.load());
+    runners.iter().any(|n| {
+        agents.get(n).is_some_and(|a| a.connected)
+            && instances.newest(n).and_then(|p| instances.get(p)).is_some_and(|i| i.wide & crate::proto::CAP_FEATURES != 0 && i.features.is_empty())
+    })
+}
+
 /// Where each of `count` agents of harness `kind` starts for `on`, with its claim there (AUDIT M4,
 /// docs/needs.md E5): placed as a runner's owner places its runs, by the runners' own admission,
 /// in the same ledger as CI legs and commands (G1). Among the machines that can run it
@@ -804,8 +816,10 @@ fn not_ready(kind: &str, target: &str, known: Option<&crate::accounts::Account>,
 /// An isolated agent (`isolation`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32) asks its
 /// microVM's own vCPUs and memory of runners that start microVMs ([`session_needs`]), and is placed
 /// by the balancer or not at all: where none of the runners that place agents could place it, it's
-/// refused, never picked as before, so every one holds a claim for its microVM's life.
-async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, (isolation, want): (Option<&Isolation>, Option<Engine>), queued: &Queued) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
+/// refused, never picked as before, so every one holds a claim for its microVM's life. Its agent's
+/// `volumes` (P6.2) are asked of a machine's disk for what they may still grow by there
+/// ([`session_needs`], `agentdefs::volumes::held_on`).
+async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize, (isolation, want, volumes): (Option<&Isolation>, Option<Engine>, &[crate::agentdefs::volumes::Given]), queued: &Queued) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
     use crate::reach::place::{SessionAsk, SessionWord};
     let default = parent.map(target_of);
     let targets = may_start_on(hub, on, kind, default.as_deref(), isolation.is_some())?;
@@ -830,8 +844,25 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
         i.of(n).iter().any(|p| speaking.contains(p))
     };
     let draw = |names: Vec<String>| names.get(usize::try_from(rand::random::<u64>().checked_rem(u64::try_from(names.len()).unwrap_or(0)).unwrap_or(0)).unwrap_or(0)).cloned();
-    let connected: Vec<String> = hub.agents.load().values().filter(|a| a.connected && !a.outpost && !a.ephemeral).map(|a| a.name.clone()).collect();
-    let owner = parent.and_then(|p| p.target.strip_prefix("agent:")).filter(|n| places(n)).map(str::to_owned).or_else(|| draw(runners.iter().filter(|n| places(n)).cloned().collect())).or_else(|| draw(connected.into_iter().filter(|n| places(n)).collect()));
+    let owner_now = || {
+        let connected: Vec<String> = hub.agents.load().values().filter(|a| a.connected && !a.outpost && !a.ephemeral).map(|a| a.name.clone()).collect();
+        parent.and_then(|p| p.target.strip_prefix("agent:")).filter(|n| places(n)).map(str::to_owned).or_else(|| draw(runners.iter().filter(|n| places(n)).cloned().collect())).or_else(|| draw(connected.into_iter().filter(|n| places(n)).collect()))
+    };
+    // An isolated agent is placed by a runner's owner or not at all: where none places agents yet but one of its
+    // runners is connected and its word on what it speaks is on its way, that word is waited for, as long as the
+    // runner's connection lives (kiln goal 3cd82843, r708: a start asked between a Windows runner's connection and
+    // its `AgentMsg::Features` was refused). Listened for before each look (`rt::Changed`): the word's coming, or
+    // the runner's going, ends the wait.
+    let owner = loop {
+        let changed = hub.runners.listen();
+        if let Some(owner) = owner_now() {
+            break Some(owner);
+        }
+        if isolation.is_none() || !features_coming(hub, &runners) {
+            break None;
+        }
+        changed.await;
+    };
     let Some(owner) = owner else {
         if isolation.is_some() {
             return Err(unplaced("no runner that places agents is connected"));
@@ -841,7 +872,11 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
     };
     // What it needs of a machine beyond where it may go, as `on` spells it (`cpus=4`, `+gpu`); an
     // isolated agent's, its microVM's own (step 32).
-    let needs = session_needs(requested(hub, on), isolation).map_err(bad)?;
+    let held = match isolation {
+        Some(_) => crate::agentdefs::volumes::held_on(hub, &runners, volumes).await,
+        None => 0,
+    };
+    let needs = session_needs(requested(hub, on), isolation, held).map_err(bad)?;
     let actor = parent.map_or_else(|| "person".to_owned(), |p| p.id.clone());
     let mut out = Vec::new();
     for _ in 0..count {
@@ -906,16 +941,19 @@ pub fn sized(mut isolation: Isolation, asked: &kiln_ci::sched::state::Resources)
 /// What an agent's placement asks of a machine (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32):
 /// what its start asks (`asked`, as `on` spells it); for an isolated agent, its microVM's own vCPUs
 /// and memory in place of any its start asked of the machine for a process, and a runner that starts
-/// microVMs (`microvm`); and of its machine's disk, the bytes its agent's volumes may hold (P6.2,
-/// `Isolation::disk`) past any its start asked. Its claim holds exactly that, from its start to its
-/// end: what its microVM uses past it is charged as it's measured (`crate::reach::place::vm_group`).
-/// A microVM its start gave no size asks none, and is charged what it's measured using alone. A
-/// volume already on a machine is asked in whole again: its bytes there are among the disk's used.
-pub fn session_needs(mut asked: kiln_ci::sched::needs::Needs, isolation: Option<&Isolation>) -> Result<kiln_ci::sched::needs::Needs, String> {
+/// microVMs (`microvm`); and of its machine's disk, past any its start asked, what its agent's volumes
+/// may still grow by (P6.2): their bounds together (`Isolation::disk`) less the bytes they hold
+/// already on every machine it may go to (`held`, `agentdefs::volumes::held_on`), which a disk counts
+/// as used, so none is asked twice (ROOT's decision on Hex's P6.2 question, 2026-11-16). Its claim
+/// holds exactly that, from its start to its end: what its microVM uses past it is charged as it's
+/// measured (`crate::reach::place::vm_group`). A microVM its start gave no size asks none, and is
+/// charged what it's measured using alone.
+pub fn session_needs(mut asked: kiln_ci::sched::needs::Needs, isolation: Option<&Isolation>, held: u64) -> Result<kiln_ci::sched::needs::Needs, String> {
     let Some(i) = isolation else { return Ok(asked) };
     asked.request.cpu = i.cpus.unwrap_or_default();
     asked.request.mem = i.memory.unwrap_or(0);
-    asked.request.disk = asked.request.disk.checked_add(i.disk.unwrap_or(0)).ok_or("its volumes and the disk its start asks for together pass 2^64 bytes")?;
+    let growth = i.disk.unwrap_or(0).saturating_sub(held);
+    asked.request.disk = asked.request.disk.checked_add(growth).ok_or("its volumes and the disk its start asks for together pass 2^64 bytes")?;
     asked.add("microvm")?;
     Ok(asked)
 }
@@ -927,7 +965,7 @@ pub fn session_needs(mut asked: kiln_ci::sched::needs::Needs, isolation: Option<
 pub async fn place_on(hub: &Hub, target: &str, spec: &Spec, count: usize, parent: Option<&Info>) -> Result<Vec<crate::reach::place::Claim>, Refused> {
     let want = named(hub, target).unwrap_or_else(|| Ok(target.to_owned()))?;
     let engine = spec.isolation.as_ref().map(|_| Engine::Microvm);
-    let placed = place_agents(hub, parent, Some(target), &spec.kind, count, (spec.isolation.as_ref(), engine), &Queued::default()).await?;
+    let placed = place_agents(hub, parent, Some(target), &spec.kind, count, (spec.isolation.as_ref(), engine, &spec.volumes), &Queued::default()).await?;
     let mut claims = Vec::new();
     for (t, c) in &placed {
         match c {
@@ -944,7 +982,7 @@ pub async fn place_on(hub: &Hub, target: &str, spec: &Spec, count: usize, parent
 /// [`place_agents`], for reach's doors tests to drive with their lab's runners (docs/ci.md W05-R03).
 #[cfg(all(test, unix))]
 pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: &str, count: usize) -> Result<Vec<(String, Option<crate::reach::place::Claim>)>, Refused> {
-    place_agents(hub, parent, on, kind, count, (None, None), &Queued::default()).await
+    place_agents(hub, parent, on, kind, count, (None, None, &[]), &Queued::default()).await
 }
 
 /// An agent start's placement as [`start_as`] makes it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -954,7 +992,7 @@ pub(crate) async fn place_agents_for_tests(hub: &Hub, parent: Option<&Info>, on:
 pub(crate) async fn place_start_for_tests(hub: &Hub, parent: Option<&Info>, ask: &Ask) -> Result<(Option<Isolation>, Vec<(String, Option<crate::reach::place::Claim>)>), Refused> {
     let isolation = start_isolation(hub, parent, ask, None, ask.on.as_deref())?;
     let want = wanted(ask.isolation.as_deref(), isolation.as_ref());
-    let placed = place_agents(hub, parent, ask.on.as_deref(), &ask.kind, ask.count.unwrap_or(1), (isolation.as_ref(), want), &Queued::default()).await?;
+    let placed = place_agents(hub, parent, ask.on.as_deref(), &ask.kind, ask.count.unwrap_or(1), (isolation.as_ref(), want, &[]), &Queued::default()).await?;
     Ok((isolation, placed))
 }
 
@@ -1129,8 +1167,12 @@ fn on_engine(hub: &Hub, targets: Vec<String>, want: Option<Engine>) -> Result<Ve
     for t in targets {
         let shown = t.strip_prefix("agent:").map_or_else(|| "the kiln server (`local`)".to_owned(), |m| hub.shown(m));
         match engine_at(hub, &t) {
-            // Its Hex node must list image VMs' class too, once kiln's Hex has one (P2.2).
-            Ok(Engine::Microvm) if want == Engine::Microvm && images_at(hub, &t) == crate::harness::engine::NodeImages::NotListed => why.push(format!("{shown}'s Hex node lists no `shards-image` class")),
+            // Its Hex node must list image VMs' class too (P2.2): one whose node lists none is refused, in Hex's words; one
+            // whose runner doesn't say goes by its engine alone.
+            Ok(Engine::Microvm) if want == Engine::Microvm => match images_at(hub, &t) {
+                crate::harness::engine::NodeImages::NotListed { why: unlisted } => why.push(format!("{shown}'s Hex node lists no `shards-image` class: {unlisted}")),
+                crate::harness::engine::NodeImages::Listed | crate::harness::engine::NodeImages::Unknown => kept.push(t),
+            },
             Ok(e) if e == want => kept.push(t),
             Ok(Engine::Host) => why.push(format!("{shown} runs its sessions on its host (its engine is host)")),
             Ok(Engine::Microvm) => why.push(format!("{shown} runs its sessions in microVMs (its engine is microvm)")),
@@ -1647,13 +1689,16 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         Some(bytes) => Some(bytes),
         None => return Err(bad("its agent's volumes' bounds together pass 2^64 bytes")),
     };
+    // Its person's own on each machine, by their names there: what its placement finds of them on the machines it may
+    // go to, and what its microVM is given.
+    let given = ask.definition.as_ref().map(|d| crate::agentdefs::volumes::given(person.as_deref().unwrap_or_default(), &d.id, &volumes)).unwrap_or_default();
     let isolation = isolation.map(|i| Isolation { disk, ..i });
     let want = wanted(ask.isolation.as_deref(), isolation.as_ref());
     // The engine settings its boundary is decided under, as they are before it's placed: a runner set
     // again since refuses it (kiln plan 01a1dd2e…, P2.3).
     let settings = hub.engines.now();
     let decided_under = |target: &str| target.strip_prefix("agent:").map(|m| settings.get(m).map_or(0, |a| a.version));
-    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, (isolation.as_ref(), want), &ask.queued).await?;
+    let placed = place_agents(hub, by.parent.as_ref(), on.as_deref(), kind.id, count, (isolation.as_ref(), want, &given), &ask.queued).await?;
     // Each one's boundary (kiln plan 01a1dd2e…, P2.3): as it asked, or else its runner's engine's.
     // A conversation taken up (`resume`) stays where its harness keeps it.
     let boundary = |target: &str| isolation.clone().or_else(|| (want.is_none() && resume.is_none() && engine_at(hub, target) == Ok(Engine::Microvm)).then(|| sized(Isolation { disk, ..Isolation::microvm() }, &requested(hub, on.as_deref()).request)));
@@ -1731,7 +1776,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         agentfile: kept.text,
         build_secrets: kept.secrets,
         // Its agent's volumes, its person's own on each machine (P6.2).
-        volumes: ask.definition.as_ref().map(|d| crate::agentdefs::volumes::given(person.as_deref().unwrap_or_default(), &d.id, &volumes)).unwrap_or_default(),
+        volumes: given.clone(),
         // Whose its opening prompt is: its input admits it as theirs (step 35).
         opener: person.clone(),
         ..Spec::default()
@@ -1947,29 +1992,35 @@ mod tests {
         assert_eq!(sized(vm.clone(), &parse("cpus=1,mem=2g")?.request), Isolation { cpus: Some(Cpus::whole(1)), memory: Some(2 * GIB), ..vm.clone() });
         assert_eq!(sized(vm.clone(), &parse("linux/amd64,+gpu")?.request), vm, "nothing asked of its size: as it was");
         assert_eq!(sized(Isolation::microvm(), &parse("mem=8g")?.request), Isolation { memory: Some(8 * GIB), ..Isolation::microvm() });
-        let host = session_needs(parse("cpus=8,+gpu")?, None)?;
+        let host = session_needs(parse("cpus=8,+gpu")?, None, 0)?;
         assert_eq!((host.request.cpu, host.requires.clone()), (Cpus::whole(8), vec!["label gpu".to_owned()]), "a process's: as asked");
-        let isolated = session_needs(parse("cpus=8,mem=32g,linux/amd64")?, Some(&vm))?;
+        let isolated = session_needs(parse("cpus=8,mem=32g,linux/amd64")?, Some(&vm), 0)?;
         assert_eq!((isolated.request.cpu, isolated.request.mem), (Cpus::whole(2), 4 * GIB), "its microVM's, never a process's");
         assert_eq!(isolated.requires, ["os == linux", "arch == x86_64", "virt.microvm"], "its other needs kept, and a runner that starts microVMs");
-        let bare = session_needs(Needs::default(), Some(&Isolation::microvm()))?;
+        let bare = session_needs(Needs::default(), Some(&Isolation::microvm()), 0)?;
         assert_eq!((bare.request.cpu, bare.request.mem, bare.requires), (Cpus::ZERO, 0, vec!["virt.microvm".to_owned()]));
         Ok(())
     }
 
     /// P6.2: an agent's volumes are asked of its machine's disk, past what its start asks of it, so
-    /// it's placed only where the disk has room for them; an agent with none asks none.
+    /// it's placed only where the disk has room for them; an agent with none asks none. What they hold
+    /// already on every machine it may go to is asked no more (ROOT's decision on Hex's P6.2 question):
+    /// the disk counts it as used, so only what they may still grow by is asked, and none of it where
+    /// they hold their bounds whole.
     #[test]
     fn p6_2_an_agents_volumes_are_asked_of_its_machines_disk() -> Result<(), String> {
         use kiln_ci::sched::needs::Needs;
         const GIB: u64 = 1 << 30;
         let vm = Isolation { disk: Some(10 * GIB), ..Isolation::microvm() };
-        assert_eq!(session_needs(Needs::default(), Some(&vm))?.request.disk, 10 * GIB, "its volumes' bounds");
+        assert_eq!(session_needs(Needs::default(), Some(&vm), 0)?.request.disk, 10 * GIB, "its volumes' bounds");
         let mut asked = Needs::default();
         asked.request.disk = 5 * GIB;
-        assert_eq!(session_needs(asked.clone(), Some(&vm))?.request.disk, 15 * GIB, "past the disk its start asks");
-        assert_eq!(session_needs(Needs::default(), Some(&Isolation::microvm()))?.request.disk, 0, "no volumes, no disk");
-        assert!(session_needs(asked, Some(&Isolation { disk: Some(u64::MAX), ..Isolation::microvm() })).is_err(), "never wrapped");
+        assert_eq!(session_needs(asked.clone(), Some(&vm), 0)?.request.disk, 15 * GIB, "past the disk its start asks");
+        assert_eq!(session_needs(Needs::default(), Some(&vm), 4 * GIB)?.request.disk, 6 * GIB, "less what they hold already");
+        assert_eq!(session_needs(asked.clone(), Some(&vm), 4 * GIB)?.request.disk, 11 * GIB, "past the disk its start asks, less what they hold");
+        assert_eq!(session_needs(Needs::default(), Some(&vm), 10 * GIB)?.request.disk, 0, "holding their bounds whole, they grow no more");
+        assert_eq!(session_needs(Needs::default(), Some(&Isolation::microvm()), 0)?.request.disk, 0, "no volumes, no disk");
+        assert!(session_needs(asked, Some(&Isolation { disk: Some(u64::MAX), ..Isolation::microvm() }), 0).is_err(), "never wrapped");
         Ok(())
     }
 
@@ -2038,6 +2089,33 @@ mod tests {
         })
     }
 
+    /// Kiln plan 01a1dd2e…, P2.4 (on Hex's P2.2): a session that needs a microVM is kept to `microvm` runners whose Hex
+    /// node lists the class its image VMs run as, as each runner said of its node. Do place one among a runner whose node
+    /// lists it, one whose node lists none (Shards' check of its host said no), and one that says nothing of its node;
+    /// then on the second alone. Expect the first and the last kept; the second alone refused, named, in Hex's words.
+    /// Written, not run (the person's rule of 2026-11-16).
+    #[test]
+    fn p2_4_a_microvm_start_is_kept_to_runners_whose_hex_node_lists_the_image_class() -> anyhow::Result<()> {
+        use kiln_ci::facts::NodeImageClass;
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let runner = |name: &str, class: Option<NodeImageClass>| {
+                let mut facts = kiln_ci::facts::RunnerFacts { isolation: Some(kiln_ci::facts::Isolation { available: true, image_class: class, ..Default::default() }), ..Default::default() };
+                crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked::default());
+                crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
+            };
+            let why = "Shards image VMs on linux: cannot open /dev/kvm: permission denied";
+            hub.put_agent(runner("listed", Some(NodeImageClass::Listed)));
+            hub.put_agent(runner("unlisted", Some(NodeImageClass::Unlisted { why: why.to_owned() })));
+            hub.put_agent(runner("unsaid", None));
+            let all = ["agent:listed", "agent:unlisted", "agent:unsaid"].map(str::to_owned).to_vec();
+            assert_eq!(on_engine(&hub, all, Some(Engine::Microvm)).map_err(|e| e.1), Ok(vec!["agent:listed".to_owned(), "agent:unsaid".to_owned()]));
+            let refused = on_engine(&hub, vec!["agent:unlisted".to_owned()], Some(Engine::Microvm)).err().map(|e| e.1).unwrap_or_default();
+            anyhow::ensure!(refused.contains("unlisted's Hex node lists no `shards-image` class") && refused.contains(why), "{refused}");
+            Ok(())
+        })
+    }
+
     /// Step 17: a runner that says why it holds no isolated agent (its facts' `isolation.why_not`) is
     /// refused in its own words; one from before those facts, in kiln's.
     #[test]
@@ -2049,7 +2127,7 @@ mod tests {
                 facts: Some(Box::new(kiln_ci::facts::RunnerFacts { isolation, ..Default::default() })),
                 ..crate::hub::tests::live_runner(name, "linux", "x86_64")
             };
-            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()), engine: None })));
+            hub.put_agent(said("no-hypervisor", Some(kiln_ci::facts::Isolation { available: false, hypervisor: None, why_not: Some(why.to_owned()), engine: None, image_class: None })));
             hub.put_agent(said("older", None));
             let refused = isolation_on(&hub, "agent:no-hypervisor").err().unwrap_or_default();
             anyhow::ensure!(refused.ends_with(why), "the runner's own reason: {refused}");

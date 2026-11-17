@@ -136,22 +136,26 @@ pub fn of(facts: &RunnerFacts) -> Option<Engine> {
 }
 
 /// Whether a runner's Hex node lists the class image VMs run as (Hex's `shards-image`, P2.2), as its
-/// facts say. The kiln Hex vendors today has no such class (an image box is `Class::Shards`), so every
-/// node that can hold microVMs runs them: this answers `Unknown` and placement goes by the engine
-/// alone. Once kiln vendors that Hex, the runner's facts carry its node's classes and this reads them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// facts say (`isolation.image_class`, which its runner reads from its node: `crate::sandbox::facts_of`).
+/// A `microvm` runner whose node lists none is refused a session that needs a microVM, in Hex's words.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeImages {
     /// Its node lists the class.
     Listed,
-    /// Its node lists the classes, and not that one.
-    NotListed,
-    /// Its kiln's Hex has no such class to list.
+    /// Its node lists no such class, `why` in Hex's words.
+    NotListed { why: String },
+    /// Its facts don't say: a runner holding no microVMs through Hex, or one from before the class,
+    /// placed by its engine alone.
     Unknown,
 }
 
 /// What `facts` say of their node's image class ([`NodeImages`]).
-pub fn node_images(_facts: &RunnerFacts) -> NodeImages {
-    NodeImages::Unknown
+pub fn node_images(facts: &RunnerFacts) -> NodeImages {
+    match facts.isolation.as_ref().and_then(|i| i.image_class.as_ref()) {
+        Some(kiln_ci::facts::NodeImageClass::Listed) => NodeImages::Listed,
+        Some(kiln_ci::facts::NodeImageClass::Unlisted { why }) => NodeImages::NotListed { why: why.clone() },
+        None => NodeImages::Unknown,
+    }
 }
 
 // ------------------------------------------------------------------------------ on the runner
@@ -534,11 +538,11 @@ mod tests {
     }
 
     fn able() -> Isolation {
-        Isolation { available: true, hypervisor: Some("Hypervisor.framework".into()), why_not: None, engine: None }
+        Isolation { available: true, hypervisor: Some("Hypervisor.framework".into()), why_not: None, engine: None, image_class: None }
     }
 
     fn unable(why: &str) -> Isolation {
-        Isolation { available: false, hypervisor: None, why_not: Some(why.into()), engine: None }
+        Isolation { available: false, hypervisor: None, why_not: Some(why.into()), engine: None, image_class: None }
     }
 
     /// P2.3 AC2 (the person's decision 3): a runner that can hold microVMs defaults to `microvm`; one
@@ -578,7 +582,22 @@ mod tests {
         overlay(&mut g, Asked { engine: Some(Engine::Microvm), version: 0 });
         assert_eq!((g.virt.microvm, of(&g)), (false, Some(Engine::Host)));
         assert_eq!(of(&facts(None)), Some(Engine::Host), "a runner from before microVMs runs its sessions on its host");
-        assert_eq!(node_images(&f), NodeImages::Unknown, "no shards-image class in the Hex kiln vendors");
+        assert_eq!(node_images(&f), NodeImages::Unknown, "facts that say nothing of the node's image class");
+    }
+
+    /// P2.4 (on Hex's P2.2): placement reads whether a runner's Hex node lists the class image VMs run as from what its
+    /// runner said of its node (`isolation.image_class`). Do read facts saying it's listed, that it isn't and why, that
+    /// say nothing of it, and none at all. Expect it listed; not listed, in Hex's words; and unknown for the last two,
+    /// whose runners are placed by their engine alone.
+    #[test]
+    fn p2_4_node_images_is_what_the_runner_said_of_its_hex_node() {
+        use kiln_ci::facts::NodeImageClass;
+        let said = |class: Option<NodeImageClass>| facts(Some(Isolation { image_class: class, ..able() }));
+        assert_eq!(node_images(&said(Some(NodeImageClass::Listed))), NodeImages::Listed);
+        let why = "Shards image VMs on linux: cannot open /dev/kvm: permission denied";
+        assert_eq!(node_images(&said(Some(NodeImageClass::Unlisted { why: why.into() }))), NodeImages::NotListed { why: why.into() });
+        assert_eq!(node_images(&said(None)), NodeImages::Unknown);
+        assert_eq!(node_images(&facts(None)), NodeImages::Unknown, "a runner from before microVMs");
     }
 
     /// A start placed under one setting of its runner's engine is refused by the runner once another

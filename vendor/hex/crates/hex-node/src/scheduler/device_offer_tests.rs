@@ -603,16 +603,25 @@ fn backend_aliases_share_one_slot_and_require_exact_class_capability() {
     let (mut facts, mut reports) = inputs();
     facts.classes = Classes::ALL;
     facts.virt.kvm = true;
+    // The adapters that can hold a GPU here: every class but the Shards image class, whose boot attaches no
+    // physical device (P2.2).
+    let adapters: Vec<Route> = Route::ALL
+        .into_iter()
+        .filter(|class| class.exposes(facts.os, DeviceKind::Gpu))
+        .collect();
+    let aliased = adapters
+        .iter()
+        .fold(Classes::NONE, |classes, class| classes.with(*class));
     let mut native = reports[0].1.as_ref().unwrap().try_clone().unwrap();
     native.devices.truncate(1);
-    reports = Route::ALL
-        .into_iter()
-        .map(|class| (class, Some(native.try_clone().unwrap())))
+    reports = adapters
+        .iter()
+        .map(|class| (*class, Some(native.try_clone().unwrap())))
         .collect();
     let mut cluster = service_cluster(&facts);
     let devices = offered(&reports, &facts, &mut cluster);
     assert_eq!(devices.len(), 1);
-    assert_eq!(devices[0].classes, Classes::ALL);
+    assert_eq!(devices[0].classes, aliased);
     let mut node = cluster.nodes[0].clone();
     node.devices = devices;
     node.capacity.gpus = 1;
@@ -625,7 +634,7 @@ fn backend_aliases_share_one_slot_and_require_exact_class_capability() {
     };
     assert_eq!(index.verdict(NodeId(0), &demand).unwrap(), Verdict::Admits);
     index.take(NodeId(0), WorkloadId(0), &demand).unwrap();
-    for class in Route::ALL {
+    for class in adapters {
         demand.class = class;
         assert_eq!(index.verdict(NodeId(0), &demand).unwrap(), Verdict::NoRoom);
     }

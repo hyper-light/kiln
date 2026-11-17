@@ -59,6 +59,7 @@ pub fn main() -> ! {
         "cat" => cat(),
         "plugged" => crate::plugged::main(args.get(1..).unwrap_or_default()),
         "plugged-volumes" => crate::plugged::volumes(args.get(1..).unwrap_or_default()),
+        "plugged-bound" => crate::plugged::bound(args.get(1..).unwrap_or_default()),
         "inotify" => crate::watch::main(arg(1)),
         // The steps of names differing in case alone in DIR, each its result (D235).
         "case" => {
@@ -476,6 +477,7 @@ pub fn main() -> ! {
             arg(3) == "escape",
         ),
         "trap" => trap(arg(1)),
+        "say-trap" => say_trap(arg(1), arg(2)),
         "ignore" => ignore(arg(1)),
         "tty" => tty(arg(1)),
         "vsock" => vsock(args.get(1..).unwrap_or_default()),
@@ -489,6 +491,7 @@ pub fn main() -> ! {
         "addrs" => addrs(),
         "neighbors" => neighbors(),
         "spawn" => spawn(args.get(1..).unwrap_or_default()),
+        "run-when" => run_when(args.get(1..).unwrap_or_default()),
         "spawns" => spawns(arg(1).parse().unwrap_or(1), args.get(2..).unwrap_or_default()),
         "tcp" => tcp(arg(1)),
         "reach-each" => reach_each(arg(1)),
@@ -507,11 +510,27 @@ pub fn main() -> ! {
         "bulk-emit" => crate::engine_bulk::emit(arg(1).parse().unwrap_or(0)),
         "bulk-sum" => crate::engine_bulk::sum(),
         "api-bulk" => crate::engine_bulk::api_bulk(args.get(1..).unwrap_or_default()),
-        "ask" => ask(arg(1), arg(2).parse().ok()),
+        "ask" => ask(arg(1), arg(2).parse().ok(), arg(3)),
+        // `ask`, then holds its generation until SIGTERM as `trap TERM` does: a check whose
+        // member is started again for the next (D270 slice 3b, D285 slice 6).
+        "ask-trap" => {
+            let _ = ask(arg(1), arg(2).parse().ok(), arg(3));
+            trap("TERM")
+        }
         "resolve" => resolve(arg(1)),
+        // `resolve`, then `took MS`, the C library's lookup's time by the guest's clock: an
+        // answer's, or a stub's timeout's (D46, D278).
+        "resolve-took" => {
+            let started = std::time::Instant::now();
+            let code = resolve(arg(1));
+            let _ = writeln!(io::stdout(), "took {}", started.elapsed().as_millis());
+            code
+        }
         "dnsttl" => dnsttl(arg(1)),
+        "dnsttl-each" => dnsttl_each(arg(1)),
         "dnsrtt" => dnsrtt(arg(1), arg(2).parse().unwrap_or(1000)),
         "udp" => udp(arg(1)),
+        "udp-each" => udp_each(arg(1), arg(2)),
         "serve" => serve(arg(1), arg(2).parse().unwrap_or(1)),
         "listen" => listen(arg(1), arg(2).parse().unwrap_or(1)),
         "rebind" => rebind(arg(1), arg(2).parse().unwrap_or(1)),
@@ -1430,9 +1449,10 @@ fn report() -> i32 {
 }
 
 /// Connects to `addr` (HOST:PORT, a name resolved as the C library resolves it), within
-/// `within` milliseconds where given, says nothing, its side closed, and prints what comes
-/// back until the far end closes: `ask BYTES`, or `ask error E`.
-fn ask(addr: &str, within: Option<u64>) -> i32 {
+/// `within` milliseconds where given, says `say` (nothing where it is empty), its side
+/// closed, and prints what comes back until the far end closes: `ask BYTES`, or `ask error
+/// E`.
+fn ask(addr: &str, within: Option<u64>, say: &str) -> i32 {
     use std::io::Read as _;
     use std::net::ToSocketAddrs as _;
     let mut got = Vec::new();
@@ -1446,6 +1466,7 @@ fn ask(addr: &str, within: Option<u64>) -> i32 {
         }),
     };
     let asked = connected.and_then(|mut s| {
+        s.write_all(say.as_bytes())?;
         s.shutdown(std::net::Shutdown::Write)?;
         s.read_to_end(&mut got)
     });
@@ -1458,6 +1479,40 @@ fn ask(addr: &str, within: Option<u64>) -> i32 {
             let _ = writeln!(io::stdout(), "ask error {e}");
             1
         }
+    }
+}
+
+/// `dnsttl NAME` again and again, each its own question, a tenth of a second apart as
+/// `reach-each` dials, until it is ended: a name's answers as its grants and its peers change
+/// (D285 slice 6).
+fn dnsttl_each(name: &str) -> i32 {
+    loop {
+        let _ = dnsttl(name);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// `udp ADDR` again and again, each from a socket of its own and given a second, a tenth of a
+/// second apart, saying how each went (`udp N`, its answer's length, or `udp error E`), until
+/// it is ended: a datagram lost on its way is followed by the next, as a client asks again
+/// (D285 slice 6). Each datagram holds `held`, `?` where it is empty, so that its receiver's
+/// `datagram from ADDR LEN` tells one asker's datagrams from another's.
+fn udp_each(addr: &str, held: &str) -> i32 {
+    let held = if held.is_empty() { "?" } else { held };
+    loop {
+        let answered = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| {
+            s.connect(addr)?;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+            s.send(held.as_bytes())?;
+            let mut buf = [0u8; 512];
+            s.recv(&mut buf)
+        });
+        let said = match answered {
+            Ok(n) => format!("udp {n}"),
+            Err(e) => format!("udp error {e}"),
+        };
+        let _ = writeln!(io::stdout(), "{said}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -2728,6 +2783,30 @@ fn spawn(args: &[String]) -> i32 {
     }
 }
 
+/// Runs each program of `paths`, in order, once it is there (D279's test: a share's, given its
+/// member as it starts, then a plug's, once plugged), as the test guest's own `exit 0`, saying
+/// how each went: `ran CODE`, or `run errno E` where exec(2) refused it (EACCES, 13, from a
+/// `noexec` mount); `never there PATH` past a minute without it.
+fn run_when(paths: &[String]) -> i32 {
+    for path in paths {
+        let mut looks = 0u32;
+        while std::fs::symlink_metadata(path).is_err() {
+            looks += 1;
+            if looks > 3000 {
+                let _ = writeln!(io::stdout(), "never there {path}");
+                return 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let said = match std::process::Command::new(path).args(["exit", "0"]).status() {
+            Ok(status) => format!("ran {}", status.code().unwrap_or(-1)),
+            Err(e) => format!("run errno {}", e.raw_os_error().unwrap_or(0)),
+        };
+        let _ = writeln!(io::stdout(), "{said}");
+    }
+    0
+}
+
 /// Runs `/bin/testguest ARGS I` as a child `n` times, one after another, I its round, each
 /// waited for: as many forks, execs and exits, each process over at once and reaped by its
 /// parent, for a record of processes to hold whole (D123); `spawned N` once all have.
@@ -3113,6 +3192,13 @@ fn fs(ops: &[String]) -> i32 {
                 .parse::<u64>()
                 .map_err(io::Error::other)
                 .map(|ms| std::thread::sleep(std::time::Duration::from_millis(ms))),
+            // `trap:SIG`: waits for SIG as [`trap`] does, once the operations before it are done:
+            // a member's generation that changed what its next will find, waiting for its restart
+            // (D277).
+            "trap" => match trap(rest) {
+                0 => Ok(()),
+                _ => Err(io::Error::other("trap:INT|TERM|USR1")),
+            },
             // sync(2): what was written committed to its file systems' journals.
             "sync" => {
                 // SAFETY: sync(2) takes no arguments and cannot fail.
@@ -4411,6 +4497,15 @@ fn ignore(name: &str) -> i32 {
         // SAFETY: blocks until a signal arrives.
         unsafe { libc::pause() };
     }
+}
+
+/// `say-trap PATH SIG`: says file `PATH`'s text, trimmed, or `none` where it cannot be read,
+/// then waits for `SIG` as [`trap`] does: what a member's generation finds at its path, a
+/// component swapped in or its image's own (D270 slice 4).
+fn say_trap(path: &str, name: &str) -> i32 {
+    let said = std::fs::read_to_string(path).map_or_else(|_| "none".to_string(), |t| t.trim().to_string());
+    let _ = writeln!(io::stdout(), "{said}");
+    trap(name)
 }
 
 fn trap(name: &str) -> i32 {

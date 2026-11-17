@@ -96,6 +96,10 @@ impl GuestRuntime {
             )?,
             None,
         )?;
+        // The image class's route, which its capacity answer offers where this node boots image VMs (P2.2).
+        if self.images.serves().is_ok() {
+            projection.retain(super::image::route_key()?, None)?;
+        }
         for pool in pools {
             if !matches!(
                 pool.execution,
@@ -319,6 +323,11 @@ impl GuestRuntime {
         }
         let spec = &record.spec;
         route::guest_spec(spec)?;
+        // An image VM is the image class's (D231): sized by an allocation under its own cost and run by its run host,
+        // with no selected guest of Hex's (docs/design/shards-image-class.md §11).
+        if let hex_api::ClassSpec::ShardsImage(_) = &spec.class {
+            return super::image::preflight(record);
+        }
         match spec.route_execution() {
             Some(Execution::ShardsShared) => {
                 let key = spec.route.and_then(|receipt| receipt.backing).ok_or(

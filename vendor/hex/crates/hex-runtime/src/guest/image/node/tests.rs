@@ -95,6 +95,15 @@ impl ImageGuest for Run {
         Err(unasked())
     }
 
+    fn member_egress(
+        &self,
+        _: &MemberName,
+        _: Option<&shards_api::image::Reach>,
+        _: Duration,
+    ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
+        Err(unasked())
+    }
+
     fn publish(
         &self,
         _: shards_api::image::Publish,
@@ -124,16 +133,56 @@ impl ImageGuest for Run {
         shards_api::image::StartedFrom::Booted
     }
 
-    fn take_output(&self, _: &MemberName, _: Channel) -> Result<std::io::PipeReader, ImageRefusal> {
+    fn take_output(
+        &self,
+        _: &MemberName,
+        _: u32,
+        _: Channel,
+    ) -> Result<std::io::PipeReader, ImageRefusal> {
         Err(unasked())
     }
 
-    fn take_input(&self, _: &MemberName) -> Result<std::io::PipeWriter, ImageRefusal> {
+    fn take_input(&self, _: &MemberName, _: u32) -> Result<std::io::PipeWriter, ImageRefusal> {
         Err(unasked())
     }
 
-    fn wait_member(&self, _: &MemberName, _: Duration) -> Result<Option<MemberEnd>, ImageRefusal> {
+    fn wait_member(
+        &self,
+        _: &MemberName,
+        _: u32,
+        _: Duration,
+    ) -> Result<Option<MemberEnd>, ImageRefusal> {
         Err(unasked())
+    }
+
+    fn restart(&self, _: &MemberName, _: &[Vec<u8>], _: Duration) -> Result<u32, ImageRefusal> {
+        Err(unasked())
+    }
+
+    fn swap(
+        &self,
+        _: &str,
+        _: &str,
+        _: shards_api::image::SwapWhen,
+        _: Option<&[Vec<u8>]>,
+        _: Duration,
+    ) -> Result<shards_api::image::Swapped, ImageRefusal> {
+        Err(unasked())
+    }
+
+    fn restore(
+        &self,
+        _: &str,
+        _: shards_api::image::SwapWhen,
+        _: Option<&[Vec<u8>]>,
+        _: Duration,
+    ) -> Result<shards_api::image::Swapped, ImageRefusal> {
+        Err(unasked())
+    }
+
+    /// None swapped: a node VM runs its image's own.
+    fn components(&self) -> Vec<shards_api::image::ComponentAt> {
+        Vec::new()
     }
 
     fn stats(&self, scope: StatsScope, patience: Duration) -> Result<Stats, ImageRefusal> {
@@ -235,6 +284,7 @@ impl ImageGuest for Run {
     fn wait_channel(
         &self,
         _: &MemberName,
+        _: u32,
         _: Channel,
         _: Duration,
     ) -> Result<Option<ChannelEnd>, ImageRefusal> {
@@ -384,8 +434,10 @@ fn a_passed_deadline_is_waited_past_to_its_late_ready() {
 }
 
 /// AC-T7.4.1 (§4): Shards' refusals are typed by what they refused. Do map an image the store lacks, a grant the image
-/// doesn't give, no backend, and a run host that failed. Expect the image's and the grant's as the node image's
-/// Invalid, no backend as Platform naming the OS, and the run host's as Os.
+/// doesn't give, no backend, a run host that failed, its budget with no room for the run's endpoint (Shards' D252), and a
+/// member that could not enter its working directory (D277). Expect the image's, the grant's and the working
+/// directory's as the node image's Invalid, no backend as Platform naming the OS, and the run host's and its budget's
+/// as Os.
 #[test]
 fn shards_refusals_are_typed_by_what_they_refused() {
     assert!(matches!(
@@ -418,5 +470,19 @@ fn shards_refusals_are_typed_by_what_they_refused() {
     assert!(matches!(
         refused(BOOTING, ImageRefusal::Host("it ended".to_owned())),
         Refusal::Os { .. }
+    ));
+    assert!(matches!(
+        refused(BOOTING, ImageRefusal::Capacity("no room".to_owned())),
+        Refusal::Os { .. }
+    ));
+    assert!(matches!(
+        refused(
+            BOOTING,
+            ImageRefusal::Workdir("Harness h: /w: errno 2".to_owned())
+        ),
+        Refusal::Invalid {
+            what: "the node image (HEX_GUEST_IMAGE)",
+            ..
+        }
     ));
 }

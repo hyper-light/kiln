@@ -348,8 +348,9 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
     let (done, verdicts) = mpsc::channel();
     std::thread::spawn(move || {
         let client = Client::connect(&socket).unwrap();
+        // P2.2: a node that boots image VMs lists their class (its host check said it runs microVMs).
         assert!(
-            client.classes().contains(&Class::Shards),
+            client.classes().contains(&Class::ShardsImage),
             "{:?}",
             client.classes()
         );

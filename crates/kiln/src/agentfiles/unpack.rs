@@ -292,11 +292,69 @@ fn unpack_tree(archive: &Path, tree: &Tree, root: &Path, at: &Path) -> Result<()
         .map_err(io_fault)
         .and_then(|()| fill(archive, tree, skip, &inner, at))
         .and_then(|dirs| modes(&staging, &under, &dirs))
-        .and_then(|()| fs::rename(&staging, &unit).map_err(io_fault));
+        .and_then(|()| rename_in_use(&staging, &unit).map_err(io_fault));
     if done.is_err() {
         discard(&staging);
     }
     done
+}
+
+/// `from` renamed to `to`, both in directories this process made. On Windows a rename fails while another process
+/// holds what it moves open without sharing its deletion: MoveFileExW's ERROR_ACCESS_DENIED for a directory with a
+/// file open in it, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION for a file (a scanner reading what was just
+/// written: kiln goal 3cd82843, r708's `context\amp-amd64` and cursor's tree, "Access is denied", now and then). That
+/// class alone is asked again, each try after as long again as it has waited (the first, its failed try's own time:
+/// no figure of ours), until it goes; once this process has seen one clear, no longer than the slowest it saw
+/// (`CLEARED`), past which it fails, and the next waits as the first did (D222's run-out). Kiln holds no handle in
+/// what it renames (`Arriving::done`, `fill`). Elsewhere a rename moves past open files.
+#[cfg(not(windows))]
+pub(crate) fn rename_in_use(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// [`rename_in_use`] on Windows.
+#[cfg(windows)]
+pub(crate) fn rename_in_use(from: &Path, to: &Path) -> io::Result<()> {
+    {
+        let began = std::time::Instant::now();
+        let slowest = *CLEARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut asked_again = false;
+        loop {
+            let tried = std::time::Instant::now();
+            match fs::rename(from, to) {
+                Ok(()) => {
+                    if asked_again {
+                        let mut cleared = CLEARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *cleared = Some(cleared.map_or(began.elapsed(), |s| s.max(began.elapsed())));
+                    }
+                    return Ok(());
+                }
+                Err(e) if in_use(&e) => {
+                    let waited = began.elapsed();
+                    if let Some(s) = slowest.filter(|s| waited > *s) {
+                        *CLEARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                        return Err(io::Error::new(e.kind(), format!("{}: still held open by another process after {waited:?}, past the slowest this process saw let go ({s:?}): {e}", from.display())));
+                    }
+                    // (c) an external system with no notification: Windows says nothing as another process lets go.
+                    std::thread::sleep(waited.max(tried.elapsed()));
+                    asked_again = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// The longest a rename held up by another process's handle took to go through, as this process has seen
+/// ([`rename_in_use`]); none before the first, and none again after one ran out.
+#[cfg(windows)]
+static CLEARED: std::sync::Mutex<Option<std::time::Duration>> = std::sync::Mutex::new(None);
+
+/// A rename refused because what it moves is in use (winerror.h: ERROR_ACCESS_DENIED 5, ERROR_SHARING_VIOLATION 32,
+/// ERROR_LOCK_VIOLATION 33).
+#[cfg(windows)]
+fn in_use(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(5 | 32 | 33))
 }
 
 /// The first directory on the way from `root` to `root/at` that isn't there, and the rest of the way

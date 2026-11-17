@@ -974,7 +974,7 @@ impl Node {
                 _ => self.oci_boxes.get(id),
             },
             Class::Process => self.root.get(id),
-            Class::Firecracker | Class::Shards => None,
+            Class::Firecracker | Class::Shards | Class::ShardsImage => None,
         }
     }
 
@@ -2247,6 +2247,29 @@ impl Runtime for Node {
         })
     }
 
+    /// A VM box's backend runs a program in its member (Shards' D243); any other box has none, refused as the trait
+    /// refuses it.
+    fn exec_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        program: Program,
+        stdio: Stdio,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.exec_member(id, member, program, stdio);
+        }
+        if self.cgroup(id).is_none() {
+            return Err(Refusal::NoSuchBox(id.clone()));
+        }
+        Err(Refusal::Invalid {
+            what: "member",
+            why: format!(
+                "box {id} isn't a Shards image box: only one has members a program runs in"
+            ),
+        })
+    }
+
     /// A VM box's backend gives its member's next MCP connection (goal 2's item 3); any other box has none, refused as the
     /// trait refuses it.
     fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
@@ -2260,6 +2283,23 @@ impl Runtime for Node {
             what: "mcp",
             why: format!(
                 "box {id} isn't a Shards image box: only one has members with an MCP bridge"
+            ),
+        })
+    }
+
+    /// A VM box's backend answers its agent-control link (kiln plan step 35); any other box has none, refused as the
+    /// trait refuses it.
+    fn link(&self, id: &BoxId) -> Result<hex_api::ControlLink, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.link(id);
+        }
+        if self.cgroup(id).is_none() {
+            return Err(Refusal::NoSuchBox(id.clone()));
+        }
+        Err(Refusal::Invalid {
+            what: "link",
+            why: format!(
+                "box {id} isn't a Shards image box: only its run has an agent-control link"
             ),
         })
     }
@@ -3567,6 +3607,7 @@ mod rendered {
                     source: "/srv/data".into(),
                     destination: "/data".to_owned(),
                     read_only: true,
+                    members: Vec::new(),
                 }],
                 hostname: Some("box".to_owned()),
                 network,

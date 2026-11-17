@@ -261,6 +261,7 @@ fn mounts_replace_first_match_and_sort_stably_by_linux_cleaned_depth() {
             source: source.into(),
             destination: "/duplicate".into(),
             read_only: false,
+            members: Vec::new(),
         });
     }
     let got = config(&spec, &edits, &[]);

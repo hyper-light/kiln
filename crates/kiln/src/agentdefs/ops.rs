@@ -21,7 +21,20 @@ pub(crate) fn fail(e: Error) -> Fail {
         e @ Error::ReadOnly(_) => (StatusCode::FORBIDDEN, e.to_string()),
         Error::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
         e @ Error::Diverged(_) => (StatusCode::CONFLICT, e.to_string()),
+        Error::Volume { cause, why } => (volume_status(cause), why),
         Error::Other(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+/// A volume's refusal as its route answers it, by its cause (kiln plan 01a1dd2e…, P6.2): held (by a session, by one
+/// with another bound, by a clearing) or on a machine that keeps none, a conflict; not there, none; its machine's store
+/// failing, the machine's fault, as a gateway's.
+fn volume_status(cause: super::volumes::Cause) -> StatusCode {
+    use super::volumes::Cause;
+    match cause {
+        Cause::InUse | Cause::Bound | Cause::Clearing | Cause::Unsupported => StatusCode::CONFLICT,
+        Cause::Unknown => StatusCode::NOT_FOUND,
+        Cause::Failed => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -215,6 +228,23 @@ async fn sessions(cx: Cx, v: Value) -> Out {
     .map_err(fail)
 }
 
+/// The caller's volumes of one of their agent definitions, or of one of kiln's own, on each machine that keeps any (kiln
+/// plan 01a1dd2e…, P6.2).
+async fn volumes(cx: Cx, v: Value) -> Out {
+    let machine = field::<Option<String>>(&v, "machine")?.flatten();
+    let listed = super::volumes::list(&cx.hub, &who(&cx)?, &id_of(&v)?, machine.as_deref()).await.map_err(fail)?;
+    json_of(&listed)
+}
+
+/// One of the caller's volumes of one of their agent definitions, or of one of kiln's own, cleared on a machine (kiln
+/// plan 01a1dd2e…, P6.2): audited.
+async fn volumes_clear(cx: Cx, v: Value) -> Out {
+    let (id, name, machine) = (id_of(&v)?, crate::ops::text(&v, "name")?, crate::ops::text(&v, "machine")?);
+    super::volumes::clear(&cx.hub, &who(&cx)?, &id, &machine, &name).await.map_err(fail)?;
+    cx.hub.store.audit(cx.caller.name.clone(), "agentdef.volume.clear".into(), format!("volume {name} of {id} on {machine}")).await;
+    Ok(json!({"cleared": true}))
+}
+
 /// The operations, in the order they are listed: their experiments' last (`super::experiments::ops`).
 pub fn list_ops() -> Vec<Op> {
     let mut ops = vec![
@@ -328,6 +358,24 @@ pub fn list_ops() -> Vec<Op> {
                 None => Ok((Method::GET, path(&["api", "agentdef-sessions"]))),
             },
             run: |cx, v| Box::pin(sessions(cx, v)),
+        },
+        Op {
+            name: "agentdefs.volumes",
+            summary: "Your volumes of one of your agent definitions (or of one of kiln's own, `kiln:<name>`, as your sessions keep them) on each machine that keeps any: each by its `name` in the definition, with the `bytes` its files take, its `charge` (what they take by its bound's own measure, which its bound holds it to) against its `bound`, and when it was made (`created_ms`), for every volume any version of the definition declared. `machine`: that machine's alone. A machine that couldn't say (its kiln older, away, its store failing) is under `unheard`, saying why. A volume is yours alone: nobody else's is shown, an admin's view included.",
+            read_only: true,
+            destructive: false,
+            input: Input::of::<input::AgentdefsVolumes>(),
+            route: |v| Ok((Method::GET, path(&["api", "agentdefs", &id_of(v)?, "volumes"]))),
+            run: |cx, v| Box::pin(volumes(cx, v)),
+        },
+        Op {
+            name: "agentdefs.volumes.clear",
+            summary: "Clear one of your volumes of one of your agent definitions (or of one of kiln's own) on one `machine`, by its `name` in the definition: its files are removed there, so the agent's next session there finds it empty. Refused while a session of the agent there holds it (409, its files kept), where that machine has none of that name (404: cleared already, or never made there), where the machine keeps no agent's volumes (409), and where its store couldn't clear it (502).",
+            read_only: false,
+            destructive: true,
+            input: Input::of::<input::AgentdefsVolumesClear>(),
+            route: |v| Ok((Method::POST, path(&["api", "agentdefs", &id_of(v)?, "volumes", "clear"]))),
+            run: |cx, v| Box::pin(volumes_clear(cx, v)),
         },
     ];
     ops.extend(super::experiments::ops::list_ops());
@@ -512,5 +560,25 @@ pub mod input {
         pub cwd: Option<String>,
         /// Its name; by default the definition's.
         pub name: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentdefsVolumes {
+        /// The agent definition's id: one of yours, or one of kiln's own (`kiln:<name>`).
+        pub id: String,
+        /// A machine's name: its volumes alone. Left out: every machine's.
+        pub machine: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentdefsVolumesClear {
+        /// The agent definition's id: one of yours, or one of kiln's own (`kiln:<name>`).
+        pub id: String,
+        /// The volume's name in the definition.
+        pub name: String,
+        /// The machine it's cleared on.
+        pub machine: String,
     }
 }

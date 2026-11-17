@@ -8,7 +8,9 @@
 //!   [`HexVms::launch_as`].
 //! - **Its spec** is `ClassSpec::ShardsImage`: the image pinned by its digest; one `Grant::Egress` by TCP for each
 //!   destination its launch names (`host:port`, to its harness member); its harness member, given the launch's
-//!   environment, folder and arguments; the launch's shares, and its folder at its own path, writable.
+//!   environment, folder and arguments; the launch's shares, each given as they start to the members it names
+//!   (Shards' share member scope, D277: its harness, the one member a launch types; a share given to another is
+//!   refused), and its folder at its own path, writable, its harness's.
 //! - **Its size** is its session's isolation's where it gives one (vCPUs and memory, plan step 32, as a deployment
 //!   experiment's variant sizes it: P7.1), else the least Shards boots (`shards_api::envelope` of no vCPU and no
 //!   memory: one vCPU and shards-vmm's least memory for this architecture), as an allocation that envelope keeps:
@@ -23,9 +25,13 @@
 //! - **Its use** (#73 part 7 slice 3; plan step 32's charge) is read while it runs through Hex's `host_use`. Hex
 //!   answers that on no event, so kiln reads it on its own charge cadence: placement's measures read a run's
 //!   [`Meter`] as its group (`reach::place::Group::Hex`). As the run ends, what it cost is kept in kiln's records
-//!   ([`USE`], [`HexVms::with_ledger`]) before anything acts on that end. The charge is Hex's final use (its
-//!   window the whole run, read with its end), or the use last read where the delete answers none or
-//!   `NoSuchBox`. A run never read and given no final use (it never started) is charged nothing.
+//!   ([`USE`], [`HexVms::with_ledger`]) before anything acts on that end. The charge is Hex's final use, which the
+//!   delete answers: read just before the delete's stop where the run still runs, its window the whole run; or, where
+//!   the run ended on its own first, the use its VM told as it went down (Shards' D260),
+//!   which Hex keeps with that end until the delete, its window ending where Hex first saw the end. The use last
+//!   read is charged where the delete answers none, `NoSuchBox`, or `NotRunning`: a run that ended with no final use
+//!   kept (its VM told none, as one whose process was killed tells none, or it was stopped before the delete), whose
+//!   box then goes by a plain delete. A run never read and given no final use (it never started) is charged nothing.
 //! - **Its credentials** (plan step 33, Shards' D242) are granted by reference: each of its launch's grants one of
 //!   `ShardsImage::credentials`, to its harness member, toward the hosts it names, the reference the secret's name in
 //!   kiln's store and never its value. Hex leases each value as the VM's egress first needs it, through the lessors
@@ -49,6 +55,16 @@
 //!   process. Nothing of it is a grant or an address in the microVM.
 //! - **Its signals** (Shards D238; #73 part 7) reach its harness member alone, on its own lane of its run's
 //!   agent-control endpoint (`Runtime::signal_member`): its VM runs on, and its kill is still its box's delete.
+//! - **Its volumes** (kiln plan 01a1dd2e…, P6.2; Shards' D271, D281): its launch's volumes of the node's Shards home,
+//!   in its box's spec (`ShardsImage::volumes`), each to its harness member, which Hex plugs as its run starts and holds
+//!   to its bound; and its box admitted with their bounds together as its disk (`disk_bytes`), which Hex draws each
+//!   bound from. The home's volumes are listed and cleared through Hex (`Runtime::volumes`, `Runtime::clear_volume`),
+//!   each on the blocking pool (each starts the node's `shards`, and a listing walks every volume's files); a refusal
+//!   of a volume's is typed by its cause (`Refusal::Volume`).
+//! - **Its link** (kiln plan step 35's `/runs/control`) is the agent-control link Hex's controller drives its run over
+//!   (`Runtime::link`, Shards' `Linked::report`): each end's TLS as each says it, and every lane Hex was granted on it,
+//!   `mcp:<member>` among them where its harness member's bridge is asked. Its stdio ride none of it: they are its run
+//!   host's member streams.
 
 use std::io::{BufRead as _, Write as _};
 use std::collections::HashMap;
@@ -59,19 +75,21 @@ use std::time::Duration;
 
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ShardsImage};
+use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, ImageVolume, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ShardsImage};
 use kiln_ci::place::holder::BoxName;
 use kiln_seams::Records;
 use kiln_seams::records::{Tx, Write};
 use serde::{Deserialize, Serialize};
-use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Pool, Refusal, Run, Sandbox, Signal};
+use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, KeptVolume, Launch, Link, Output, Pool, Refusal, Run, Sandbox, Share, Signal, VolumeCause};
 
 /// What a box of Hex's holds its run to: no egress, egress to named destinations (each by TCP, to its harness
-/// member), folders shared at any path, read-only or not (`ShardsImage::shares`), and signals to its harness member
-/// (`Runtime::signal_member`, Shards' agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or
-/// refused fork of an image VM's guest: its `usage_of`), or weights. Credentials it holds where its runtime leases
-/// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false };
+/// member), folders shared at any path, read-only or not, each given to its harness member as it starts or to its run's
+/// root alone (`ShardsImage::shares`), and signals to its harness member (`Runtime::signal_member`, Shards'
+/// agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or refused fork of an image VM's
+/// guest: its `usage_of`), or weights. Credentials it holds where its runtime leases them ([`HexVms::leasing`], its
+/// [`Sandbox::holds`]); these say none. Volumes of its node's Shards home given to a launch, listed and cleared (kiln
+/// plan 01a1dd2e…, P6.2: module docs).
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false, volumes: true };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
 pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (its server's broker didn't open, or this runner has no link to its server to ask it over), and a run granted one is never run without it (Shards' D242)";
@@ -100,8 +118,9 @@ pub struct HexVms {
 /// [`Charged`] in JSON.
 pub const USE: &str = "hex.use";
 
-/// Which use a run was charged: Hex's final one, read with its end, its window the whole run; or the last one read
-/// while it ran, where its delete answered none or found it gone.
+/// Which use a run was charged: Hex's final one, which its delete answered (read just before its stop, or told by its
+/// VM with an end that came first and kept until then); or the last one read while it ran, where its delete answered
+/// none, found it gone, or found it ended with none kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Charge {
@@ -233,9 +252,11 @@ impl Vm {
 }
 
 /// Deletes `vm`'s box and keeps what it cost before anything acts on its end (module docs).
-/// - Where its delete answers a final use, that use is charged.
-/// - Where it answers none (its end unread) or `NoSuchBox` (an earlier delete ended it and its answer was lost), the
-///   use last read is charged. Where none was ever read (a run that never started), nothing is.
+/// - Where its delete answers a final use, that use is charged: its run's, whether it still ran at the delete or had
+///   ended on its own before it.
+/// - Where it answers none (its end unread), `NoSuchBox` (an earlier delete ended it and its answer was lost) or
+///   `NotRunning` (its run ended with no final use kept, its box left as it was and then deleted plainly), the use last
+///   read is charged. Where none was ever read (a run that never started), nothing is.
 ///
 /// An error where its box may still be there or its charge wasn't kept, so a later delete asks again.
 async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
@@ -247,9 +268,9 @@ async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
             *vm.last.lock() = Some((used, Charge::Final));
         }
         Ok(None) | Err(hex_api::Refusal::NoSuchBox(_)) => {}
-        // Its run ended on its own before this delete (its VM failed, or its member's run ended): Hex reads no use of a
-        // run that has ended and leaves its box as it was (`NotRunning`), so it goes by a plain delete, charged the use
-        // last read.
+        // The fallback where Hex kept no final use: its run ended before this delete and its VM told none (as one
+        // whose process was killed tells none), or it was stopped first. Hex leaves its box as it was (`NotRunning`),
+        // so it goes by a plain delete, charged the use last read.
         Err(hex_api::Refusal::NotRunning(..)) => {
             let (runtime, id) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(|e| e.to_string())?);
             match crate::rt::blocking(move || runtime.delete(&id)).await.map_err(|e| format!("its delete didn't run: {e:#}"))? {
@@ -333,17 +354,22 @@ impl HexVms {
         let grants = grants_of(&member, &launch.egress)?;
         let credentials = credentials_of(&member, &launch.credentials);
         let sign_ins = sign_ins_of(&member, sign_ins);
-        let mut shares: Vec<Mount> = launch.shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
+        let mut shares = launch.shares.iter().map(|s| mount_of(s, &member)).collect::<Result<Vec<Mount>, Refusal>>()?;
+        // Its harness works in it from its first instruction: given to no member, it would reach its run's root alone,
+        // and its harness's start would fail entering it (Shards' D277).
         if let Some(folder) = &launch.folder
             && !shares.iter().any(|s| &s.destination == folder)
         {
-            shares.push(Mount { source: PathBuf::from(folder), destination: folder.clone(), read_only: false });
+            shares.push(Mount { source: PathBuf::from(folder), destination: folder.clone(), read_only: false, members: vec![member.clone()] });
         }
         // Its MCP bridge (Shards D254): nothing of it is a grant or an address.
         let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone(), mcp: true };
-        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, ..ShardsImage::new(image) };
+        // Its volumes (P6.2), plugged by Hex as its run starts, each bound drawn from the disk its box is admitted with.
+        let disk = disk_of(&launch.volumes)?;
+        let volumes = volumes_of(&member, &launch.volumes)?;
+        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, volumes, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
-        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
+        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size, disk)?), route: None, band: 0 };
         let name = id.to_string();
         let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), member: member.clone(), last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
         let runtime = Arc::clone(&self.runtime);
@@ -398,10 +424,44 @@ impl Sandbox for HexVms {
         drop(pool);
         Box::pin(async { Err(Refusal::Unsupported(NO_POOLS.to_owned())) })
     }
+
+    // A run's own anonymous volumes, made for one run alone and gone with it, are no launch's to be given: not listed.
+    fn volumes(&self) -> BoxFuture<'_, Result<Vec<KeptVolume>, Refusal>> {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let listed = crate::rt::blocking(move || runtime.volumes()).await.map_err(|e| Refusal::Invalid { what: "its volumes", why: format!("{e:#}") })?;
+            Ok(listed.map_err(seam)?.into_iter().filter(|v| !v.anonymous).map(|v| KeptVolume { name: v.name, bytes: v.bytes, bound: v.bound, charge: v.charge, created_ns: v.created_ns }).collect())
+        })
+    }
+
+    fn clear_volume(&self, name: String) -> BoxFuture<'_, Result<(), Refusal>> {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move { crate::rt::blocking(move || runtime.clear_volume(&name)).await.map_err(|e| Refusal::Invalid { what: "its volumes", why: format!("{e:#}") })?.map_err(seam) })
+    }
 }
 
 /// Why a box's image keeps no warm pool here yet.
 pub const NO_POOLS: &str = "a warm pool kept for its launches: the Hex kiln vendors keeps none yet, its image class booting each box on Shards' ImageShards rather than its ImagePools (kiln plan 01a1dd2e…, P3.1)";
+
+/// `share` as Hex mounts it into its box (`ShardsImage::shares`): its host folder at its path, read-only where it isn't
+/// writable, and given as they start to the members it names, which see it from their first instruction (Shards'
+/// share member scope, D277; `hex_api::Mount::members`): none, its run's root alone. Hex names a member by its kind
+/// and its name, and a launch types the harness it drives (`driven`) alone, so a share given to any other member is
+/// refused, never mounted where that member doesn't see it.
+fn mount_of(share: &Share, driven: &Member) -> Result<Mount, Refusal> {
+    let members = share
+        .members
+        .iter()
+        .map(|named| {
+            if driven.name == named.0 {
+                Ok(driven.clone())
+            } else {
+                Err(Refusal::Unsupported(format!("a folder at {:?} given to {:?} as it starts, a member of its image it doesn't drive: Hex names each member by its kind, and a launch types the harness it drives alone", share.at, named.0)))
+            }
+        })
+        .collect::<Result<Vec<Member>, Refusal>>()?;
+    Ok(Mount { source: PathBuf::from(&share.host), destination: share.at.clone(), read_only: !share.writable, members })
+}
 
 /// `granted`'s credentials as Hex grants them to `member`: by reference alone, toward each host lowercased as its
 /// egress grants name it ([`grants_of`]; RFC 4343), each once. Hex checks them against its grants as the box is made.
@@ -499,15 +559,15 @@ fn grants_of(member: &Member, egress: &Egress) -> Result<Vec<Grant>, Refusal> {
 
 /// The VM `asked` (vCPUs, MiB; none: Shards' least on this architecture, module docs) as an allocation its envelope
 /// keeps: whole vCPUs and MiB, in the units Hex's `Allocation::vm_size` reads them (1,000 CPU milli a vCPU, 2^20
-/// bytes a MiB).
-fn allocation(asked: Option<(u32, u64)>) -> Result<Allocation, Refusal> {
+/// bytes a MiB), and `disk` bytes of its node's disk, its volumes' bounds together ([`disk_of`]), byte by byte.
+fn allocation(asked: Option<(u32, u64)>, disk: u64) -> Result<Allocation, Refusal> {
     let size = |why: String| Refusal::Invalid { what: "its microVM's size", why };
     let (cpus, memory) = asked.unwrap_or((0, 0));
     let (vcpus, mib) = shards_api::envelope(std::env::consts::ARCH, cpus, memory).map_err(|e| size(format!("{e:?}")))?;
     let guest = CapacityResources {
         cpu_milli: u64::from(vcpus).checked_mul(1000).ok_or_else(|| size(format!("{vcpus} vCPUs")))?,
         mem_bytes: mib.checked_mul(1 << 20).ok_or_else(|| size(format!("{mib} MiB")))?,
-        disk_bytes: 0,
+        disk_bytes: disk,
     };
     let quantum = CapacityResources { cpu_milli: 1000, mem_bytes: 1 << 20, disk_bytes: 1 };
     let cost = RuntimeCost { id: PROFILE, floor: CapacityResources::default(), ceiling: guest, quantum, guest_overhead: CapacityResources::default(), overhead: CapacityResources::default() };
@@ -540,8 +600,50 @@ fn seam(r: hex_api::Refusal) -> Refusal {
         H::Unconfigured { what, why } => Refusal::Unsupported(format!("{what}: {why}")),
         H::Full(limit) | H::Exhausted { bound: limit, .. } => Refusal::Full { limit },
         H::NoSuchBox(_) | H::NotRunning(..) => Refusal::Ended,
+        H::Volume { cause, why } => Refusal::Volume { cause: volume_cause(cause), why },
         other => Refusal::Invalid { what: "its microVM", why: other.to_string() },
     }
+}
+
+/// What held one of Hex's volumes, as the seam says it: each cause by name.
+fn volume_cause(cause: hex_api::VolumeCause) -> VolumeCause {
+    match cause {
+        hex_api::VolumeCause::Bound => VolumeCause::Bound,
+        hex_api::VolumeCause::Clearing => VolumeCause::Clearing,
+        hex_api::VolumeCause::InUse => VolumeCause::InUse,
+        hex_api::VolumeCause::Unknown => VolumeCause::Unknown,
+    }
+}
+
+/// `given`, a launch's volumes, as Hex gives them to its harness `member` (`ShardsImage::volumes`; kiln plan
+/// 01a1dd2e…, P6.2): each by its name in the node's Shards home, its bound, its place and read-only or not. One given to
+/// a member the launch doesn't drive is refused, as Hex drives none other.
+fn volumes_of(member: &Member, given: &[kiln_seams::sandbox::Volume]) -> Result<Vec<ImageVolume>, Refusal> {
+    let mut volumes = Vec::with_capacity(given.len());
+    for (i, v) in given.iter().enumerate() {
+        if let Some(other) = v.members.iter().find(|m| m.0 != member.name) {
+            return Err(Refusal::Invalid { what: "a volume", why: format!("volumes[{i}] is given to {}, a member this launch doesn't drive (its harness is {})", other.0, member.name) });
+        }
+        volumes.push(ImageVolume { name: v.name.clone(), bound: v.bound, at: v.at.clone(), members: vec![member.clone()], read_only: v.read_only });
+    }
+    Ok(volumes)
+}
+
+/// The disk a box is admitted with for `volumes`: their bounds together, which Hex draws each one's bound from (its
+/// `disk_bytes`), so each byte its volumes may hold is charged once. Refused past what a u64 counts.
+fn disk_of(volumes: &[kiln_seams::sandbox::Volume]) -> Result<u64, Refusal> {
+    volumes.iter().try_fold(0u64, |all, v| all.checked_add(v.bound.get())).ok_or_else(|| Refusal::Invalid { what: "its volumes", why: "their bounds together pass 2^64 bytes".into() })
+}
+
+/// Hex's word on a run's agent-control link (`Runtime::link`) as the seam's: each end's TLS by the names rustls gives
+/// its suite and its group, or by its IANA code where rustls names none (`kiln_ci::facts::Negotiated`), and its lanes
+/// by Shards' names, as Hex gives them.
+fn link_of(link: hex_api::ControlLink) -> Link {
+    let said = |end: hex_api::Negotiated| {
+        let named = |name: Option<&str>, code: u16| name.map_or_else(|| format!("{code:#06x}"), str::to_owned);
+        kiln_ci::facts::Negotiated { suite: named(end.suite_name, end.suite), group: named(end.group_name, end.group) }
+    };
+    Link { controller: said(link.controller), endpoint: said(link.endpoint), lanes: link.lanes }
 }
 
 /// What a run's threads say to its `next`: its output, then its member's end.
@@ -754,9 +856,28 @@ impl Run for HexRun {
         Some(self.vm.name.clone())
     }
 
-    // Its stdio ride the member's streams from its run host, no link of Shards' agent control.
+    // The agent-control link Hex's controller drives its run over (Hex's `Runtime::link`, which waits for its endpoint's
+    // report; module docs). None where its run ended before that link was made, and none, warned, where Hex refuses it
+    // otherwise.
     fn link(&self) -> BoxFuture<'_, Option<Link>> {
-        Box::pin(async { None })
+        Box::pin(async move {
+            let (runtime, id) = (Arc::clone(&self.vm.runtime), self.vm.id.try_clone().ok()?);
+            match crate::rt::blocking(move || runtime.link(&id)).await {
+                Ok(Ok(link)) => Some(link_of(link)),
+                Ok(Err(why @ (hex_api::Refusal::NoSuchBox(_) | hex_api::Refusal::NotRunning(..)))) => {
+                    tracing::debug!(vm = %self.vm.name, why = %why, "its run ended before its agent-control link was made");
+                    None
+                }
+                Ok(Err(why)) => {
+                    tracing::warn!(vm = %self.vm.name, error = %why, "its microVM's agent-control link wasn't read");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(vm = %self.vm.name, error = %format!("{e:#}"), "its microVM's agent-control link wasn't read");
+                    None
+                }
+            }
+        })
     }
 
     // None live yet (`HOLDS.live`): Hex's wire calls for a running box's network and folders (kiln plan 01a1dd2e…,
@@ -812,7 +933,7 @@ pub(crate) mod tests {
     use kiln_ci::place::holder::BoxName;
     use kiln_seams::Records as _;
     use kiln_seams::records::{Consistency, SimRecords};
-    use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Output, Refusal, Run, Sandbox as _, Signal};
+    use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Link, Output, Refusal, Run, Sandbox as _, Signal};
 
     use super::{Charge, Charged, HexVms, USE, Used, host_cpu_ns};
 
@@ -1263,10 +1384,14 @@ pub(crate) mod tests {
     /// Hex's simulator with a VM's host use as Hex's image runtime answers it (`host_use`, and the final use
     /// `delete_with_host_use` answers, its window the whole run, `None` for a box never started), which the
     /// simulator doesn't model. Read `n` is `use_at(n)`. Its first delete may lose its answer (the box deleted,
-    /// an error said), and its start may be refused. Its credentials as Hex's image class leases them (plan step 33),
-    /// which the simulator doesn't model either: a box granting one refused `Unconfigured` as it is created where it
-    /// was given no lessors (`ImageClass::can_lease`), else its run's lessor asked of them as it starts
-    /// (`ImageClass::run_lessor`) and kept by box; and each spec it was asked to create kept as its wire writes it.
+    /// an error said), and its start may be refused. Its started runs may be taken to have ended on their own with
+    /// no final use told (Shards' D260: a VM whose process was killed tells none), each delete with its use then
+    /// refused `NotRunning` and its box left as it was, as Hex's image class refuses it; otherwise a run that ended
+    /// on its own is answered its final use, as one still running is. Its credentials as Hex's image class leases
+    /// them (plan step 33), which the simulator doesn't model either: a box granting one refused `Unconfigured` as
+    /// it is created where it was given no lessors (`ImageClass::can_lease`), else its run's lessor asked of them as
+    /// it starts (`ImageClass::run_lessor`) and kept by box; and each spec it was asked to create kept as its wire
+    /// writes it.
     #[derive(Default)]
     pub(crate) struct Metered {
         sim: SimRuntime,
@@ -1275,6 +1400,7 @@ pub(crate) mod tests {
         deletes: AtomicU64,
         lose_first_answer: AtomicBool,
         refuse_start: AtomicBool,
+        ended_untold: AtomicBool,
         lessors: parking_lot::Mutex<Option<Arc<dyn hex_api::lease::Lessors>>>,
         lessees: parking_lot::Mutex<Vec<(String, Arc<dyn hex_api::lease::Lessor>)>>,
         specs: parking_lot::Mutex<Vec<String>>,
@@ -1283,6 +1409,9 @@ pub(crate) mod tests {
         harnesses: parking_lot::Mutex<std::collections::VecDeque<String>>,
         /// The harness's end of each connection handed out: what it was sent.
         answered: parking_lot::Mutex<Vec<std::io::PipeReader>>,
+        /// What `link` answers for a box it holds, as Hex's image class reports a run's link; none, refused as a run
+        /// whose connection ended before its endpoint reported is.
+        links: parking_lot::Mutex<Option<hex_api::ControlLink>>,
     }
 
     /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
@@ -1376,8 +1505,17 @@ pub(crate) mod tests {
             self.answered.lock().push(sent);
             Ok(Box::new(bridge))
         }
+        /// As Hex's image class answers it: `NoSuchBox` once its box is gone; else [`Metered::links`]'s.
+        fn link(&self, id: &BoxId) -> Result<hex_api::ControlLink, H> {
+            self.sim.inspect(id)?;
+            self.links.lock().clone().ok_or_else(|| H::NotRunning(id.clone(), "link: its run ended"))
+        }
         fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, H> {
             self.deletes.fetch_add(1, Ordering::AcqRel);
+            if self.ended_untold.load(Ordering::Acquire) && self.started.lock().contains(id.as_str()) {
+                self.sim.inspect(id)?;
+                return Err(H::NotRunning(id.clone(), "delete with its host use: its run ended on its own, its VM telling none of its use"));
+            }
             self.sim.delete(id)?;
             let started = self.started.lock().remove(id.as_str());
             if self.lose_first_answer.swap(false, Ordering::AcqRel) {
@@ -1389,6 +1527,52 @@ pub(crate) mod tests {
             self.sim.inspect(id)?;
             Ok(use_at(self.reads.fetch_add(1, Ordering::AcqRel) + 1))
         }
+        fn volumes(&self) -> Result<Vec<hex_api::HomeVolume>, H> {
+            self.sim.volumes()
+        }
+        fn clear_volume(&self, name: &str) -> Result<(), H> {
+            self.sim.clear_volume(name)
+        }
+    }
+
+    /// Kiln plan 01a1dd2e…, P6.2 (Shards' D271, D281, through Hex's P6.2): a launch's volumes reach Hex in its box's
+    /// spec, each to its harness member by its name in the node's Shards home, with its bound, and its box is admitted
+    /// with their bounds together as its disk, from which Hex draws each bound. The home lists them with their bounds;
+    /// a clearing is refused `Volume { InUse }` while its run holds one, its files kept; once its run has ended it's
+    /// cleared, and cleared again it's `Volume { Unknown }`. A volume given to a member the launch doesn't drive is
+    /// refused, and leaves no box.
+    #[test]
+    fn p6_2_a_launchs_volumes_reach_hex_in_its_spec_with_their_bounds_as_its_disk() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{KeptVolume, Member as Who, Volume, VolumeCause};
+        let (gib, mib) = (std::num::NonZeroU64::MIN.saturating_add((1 << 30) - 1), std::num::NonZeroU64::MIN.saturating_add((1 << 20) - 1));
+        let volume = |name: &str, bound: std::num::NonZeroU64, to: &str| Volume { name: name.into(), bound, at: format!("/volumes/{name}"), members: vec![Who(to.into())], read_only: false };
+        let (rt, _records, hex) = metered();
+        crate::rt::block_on(async move {
+            let given = vec![volume("kiln-agent-a", gib, "claude"), volume("kiln-agent-b", mib, "claude")];
+            let run = hex.launch(Launch { volumes: given, ..launch(Egress::Only(Vec::new())) }).await?;
+            let specs = rt.specs.lock().clone();
+            let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
+            assert_eq!(spec.allocation.as_ref().map(|a| a.resources.disk_bytes), Some(gib.get() + mib.get()), "its volumes' bounds together, as its disk");
+            let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
+            let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
+            let want = |name: &str, bound| hex_api::ImageVolume { name: name.into(), bound, at: format!("/volumes/{name}"), members: vec![harness.clone()], read_only: false };
+            assert_eq!(image.volumes, [want("kiln-agent-a", gib), want("kiln-agent-b", mib)], "each to its harness member, by its name in the home");
+            let bounds = |kept: Vec<KeptVolume>| kept.into_iter().map(|k| (k.name, k.bound)).collect::<Vec<_>>();
+            assert_eq!(bounds(hex.volumes().await?), [("kiln-agent-a".to_owned(), Some(gib.get())), ("kiln-agent-b".to_owned(), Some(mib.get()))]);
+            let held = hex.clear_volume("kiln-agent-a".into()).await;
+            assert!(matches!(held, Err(Refusal::Volume { cause: VolumeCause::InUse, .. })), "{held:?}");
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
+            assert_eq!(hex.clear_volume("kiln-agent-a".into()).await, Ok(()), "once its run has ended");
+            assert_eq!(bounds(hex.volumes().await?), [("kiln-agent-b".to_owned(), Some(mib.get()))]);
+            let gone = hex.clear_volume("kiln-agent-a".into()).await;
+            assert!(matches!(gone, Err(Refusal::Volume { cause: VolumeCause::Unknown, .. })), "{gone:?}");
+            let others = hex.launch(Launch { volumes: vec![volume("kiln-agent-c", mib, "codex")], ..launch(Egress::Only(Vec::new())) }).await.err();
+            assert!(matches!(&others, Some(Refusal::Invalid { what: "a volume", why }) if why.contains("codex")), "{others:?}");
+            assert_eq!(rt.sim.list()?, [], "a refused launch leaves no box");
+            anyhow::Ok(())
+        })
     }
 
     /// The sandbox over [`Metered`], its charges kept in records of its own.
@@ -1475,6 +1659,27 @@ pub(crate) mod tests {
             assert_eq!(rt.sim.list()?, []);
             assert_eq!(charged(&records, "kiln-z7-0").await?, None, "charged nothing");
             assert!(vms.meter("kiln-z7-0").is_none());
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln goal af2998eb, Phase 7: a run that ended before its delete with no final use told (as a VM whose process
+    /// was killed tells none) is refused `NotRunning` by Hex's delete with its use, which leaves its box as it was;
+    /// kiln then deletes it plainly and charges the use last read, kept before its end is said. (A box whose VM told
+    /// its final use is charged it, `Charge::Final`, as the tests above hold.)
+    #[test]
+    fn p7_a_run_ended_with_no_final_use_told_goes_by_a_plain_delete_charged_its_last_read() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, records, vms) = metered();
+            rt.ended_untold.store(true, Ordering::Release);
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            vms.meter("kiln-z7-0").ok_or_else(|| anyhow::anyhow!("a live run has its meter"))?.read()?;
+            run.kill();
+            let (end, kept) = charged_as_it_ends(run.as_ref(), &records, "kiln-z7-0").await?;
+            assert_eq!(end, Exit::Killed);
+            assert_eq!(kept, Some(Charged::of(&use_at(1), Charge::LastRead)), "charged the use last read");
+            assert_eq!(rt.deletes.load(Ordering::Acquire), 1, "asked for its use once, then deleted plainly");
+            assert_eq!(rt.sim.list()?, [], "its box gone");
             anyhow::Ok(())
         })
     }
@@ -1588,6 +1793,68 @@ pub(crate) mod tests {
             let refused = unleased.launch_sized(reaching(), None, &[sign_in]).await.err();
             anyhow::ensure!(matches!(&refused, Some(Refusal::Unsupported(why)) if why == super::NO_BROKER), "{refused:?}");
             assert_eq!(sim.list()?, [], "a refused launch leaves no box");
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1cd8e…, P1.4 (Shards' D277, through Hex's member scope on `Mount`): a launch's shares reach Hex given
+    /// to the members they name, its harness by its kind, and one given to none to its run's root alone; its folder, which
+    /// none of them shares, is given to its harness, which works in it from its first instruction. A share given to a
+    /// member it doesn't drive is refused, typed, asking Hex for no box.
+    #[test]
+    fn p1_4_a_launchs_shares_reach_hex_given_to_their_members_and_its_folder_to_its_harness() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{Member as Who, Share};
+        crate::rt::block_on(async {
+            let (rt, _records, vms) = metered();
+            let share = |host: &str, at: &str, writable: bool, members: &[&str]| Share { host: host.into(), at: at.into(), writable, members: members.iter().map(|m| Who((*m).to_owned())).collect() };
+            let shares = vec![share("/Users/ada/proj", "/work/proj", true, &["claude"]), share("/Users/ada/plugins", "/plugins/a", false, &["claude"]), share("/Users/ada/cache", "/cache", true, &[])];
+            let run = vms.launch(Launch { shares, ..launch(Egress::Only(Vec::new())) }).await?;
+            let specs = rt.specs.lock().clone();
+            let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
+            let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
+            let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
+            let mount = |source: &str, destination: &str, read_only: bool, members: Vec<Member>| hex_api::Mount { source: source.into(), destination: destination.into(), read_only, members };
+            let given = [
+                mount("/Users/ada/proj", "/work/proj", false, vec![harness.clone()]),
+                mount("/Users/ada/plugins", "/plugins/a", true, vec![harness.clone()]),
+                mount("/Users/ada/cache", "/cache", false, Vec::new()),
+                mount("/work/project", "/work/project", false, vec![harness.clone()]),
+            ];
+            assert_eq!(image.shares, given, "each share given to the members it names, and its folder to its harness");
+            let elsewhere = vec![share("/Users/ada/data", "/data", true, &["claude", "helper"])];
+            let refused = vms.launch(Launch { shares: elsewhere, ..launch(Egress::Only(Vec::new())) }).await.err();
+            assert!(matches!(&refused, Some(Refusal::Unsupported(why)) if why.contains("\"helper\"")), "{refused:?}");
+            assert_eq!(rt.specs.lock().len(), 1, "a refused launch asks Hex for no box");
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan step 35's `/runs/control`: a run's link is Hex's agent-control link to its microVM (`Runtime::link`),
+    /// each end's TLS said by the names rustls gives it, or by its IANA code where rustls names none, and its lanes as
+    /// Hex gives them, `mcp:0` among them; the same each time it's asked. A link Hex refuses is none.
+    #[test]
+    fn s35_a_runs_link_is_hexs_agent_control_link_its_ends_by_rustls_names_or_iana_codes() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, _records, vms) = metered();
+            let end = |suite_name, group_name| hex_api::Negotiated { suite: 0x1302, suite_name, group: 0x11ec, group_name };
+            let lanes: Vec<String> = ["control", "exec", "log:run", "mcp:0"].map(String::from).into();
+            *rt.links.lock() = Some(hex_api::ControlLink { controller: end(Some("TLS13_AES_256_GCM_SHA384"), Some("X25519MLKEM768")), endpoint: end(None, None), lanes: lanes.clone() });
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            let said = |suite: &str, group: &str| kiln_ci::facts::Negotiated { suite: suite.into(), group: group.into() };
+            let want = Link { controller: said("TLS13_AES_256_GCM_SHA384", "X25519MLKEM768"), endpoint: said("0x1302", "0x11ec"), lanes };
+            assert_eq!(run.link().await, Some(want.clone()));
+            assert_eq!(run.link().await, Some(want), "the same each time it's asked");
+            *rt.links.lock() = None;
+            let unlinked = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            assert_eq!(unlinked.link().await, None, "a link Hex refuses is none");
+            for run in [run, unlinked] {
+                run.kill();
+                let (_, ends) = drain(run.as_ref()).await;
+                assert_eq!(ends, [Exit::Killed]);
+            }
             anyhow::Ok(())
         })
     }

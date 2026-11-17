@@ -16,7 +16,7 @@ export type AgentStart = {
  */
 at: number, 
 /**
- * Where it ran, as `runs` said as it started (the link its stdio comes to ride is `runs`').
+ * Where it ran, as `runs` said as it started (the link it comes to be driven over is `runs`').
  */
 runs: AgentRuns, 
 /**

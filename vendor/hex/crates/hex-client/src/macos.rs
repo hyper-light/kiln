@@ -73,6 +73,7 @@ static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
             measuring, measuring, measuring,
         ]
     ),
+    class_waits!("client.answer", "shards-image", measuring),
 ];
 
 /// A node agent, reached through its socket.

@@ -234,7 +234,7 @@ fn switch() -> io::Result<&'static crate::links::Switch> {
     if let Some(s) = crate::domains::SWITCH.get() {
         return Ok(s);
     }
-    let made = crate::links::Switch::new(&[], &[], &[], &[], None, false, 0, &[])?;
+    let made = crate::links::Switch::new(&[], &[], &[], &[], &[], None, false, 0, &[])?;
     Ok(crate::domains::SWITCH.get_or_init(|| made))
 }
 
@@ -561,12 +561,17 @@ pub fn join(id: u32, asked: &Asked, published: &[Egress]) -> Result<Joined, Stri
             Reach::Nowhere => Vec::new(),
             _ => crate::links::EVERY_PORT.to_vec(),
         },
+        wide: match reach {
+            Reach::Nowhere => Vec::new(),
+            _ => crate::links::EVERY_PORT.to_vec(),
+        },
         ingress: Vec::new(),
         dns,
         named: Vec::new(),
         connects: false,
         accepts: false,
         unix: Vec::new(),
+        granted: crate::netplan::Granted::default(),
     };
     e.members.push(kept);
     let joined = (|| {

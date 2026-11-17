@@ -108,14 +108,16 @@ the machine's network) is replaced by an Agentfile image's members.
   "host_pid": null, "control": {"controller": {"suite", "group"}, "endpoint": {"suite", "group"},
   "lanes": ["control", "stdout:0", "stderr:0", "stdin:0", "exec", "socket", "mcp:0" …]}}`.
   `host_pid` is read from its run's handle and always said, so a check reads it rather than an
-  absence. `control` is the link its stdio rides into the microVM, as each end says its TLS 1.3
-  handshake negotiated (rustls's names, or the IANA code where rustls has none): the controller's on
-  the machine and the endpoint's own report from inside (Shards' agent control, step 11), and the
-  lanes its controller was granted on it as it dialed (`Dialed::lanes`, Shards' names). It's
-  absent until that link is made (`Run::link`, awaited once, never polled), and today's stdio are
-  Shards' run pipes, which ride no link: an orchestrator's run binds its agent-control endpoint with
-  no member stream (Shards' D252, `api_run.rs` `bind_control`), so Hex takes its members' stdio from
-  the image channel (`take_input`, `take_output`) and `HexRun::link` says none.
+  absence. `control` is the agent-control link its run is driven over into the microVM, as each end
+  says its TLS 1.3 handshake negotiated (rustls's names, or the IANA code where rustls has none): the
+  controller's on the machine and the endpoint's own report from inside (Shards' agent control, step
+  11), and every lane its controller was granted on it, by Shards' names (`Linked::report`'s lanes,
+  `Granted::name`), `mcp:<member>` among them for each member whose MCP bridge the run serves (D254).
+  It's absent until that link is made (`Run::link`, awaited once, never polled). A Hex-held run's is
+  Hex's controller's (`HexRun::link`, Hex's `Runtime::link`): Hex drives its members' signals and MCP
+  lanes over it and takes their stdio from the image channel (`take_input`, `take_output`), asking its
+  endpoint for no member stream (Shards' D252), so its lanes are `control`, `exec`, `log:run` and each
+  `mcp:<member>`, none of its stdio.
 - **kiln's record of what it started for it** (`starts`): each start of its harness, when (`at`),
   where (`runs`, as it was as it started) and how it ended (`ended`: when, and its exit code where it
   was seen), kept with the session and handed to kiln's next image with it. A harness that ran and
@@ -194,8 +196,10 @@ its own through Hex (`sandbox::hexvm`).
   (a conversation taken up, `resume`, stays where its harness keeps it). One
   that asks `microvm`, names an Agentfile or has an isolated parent needs a `microvm` runner; one that asks
   `none` needs a `host` runner. Each is refused where nothing fits, the engine named. The server itself
-  (`local`) runs sessions on its host. Once kiln vendors Hex's `shards-image` class (P2.2), a `microvm` runner
-  must also list it (`engine::node_images`).
+  (`local`) runs sessions on its host. A `microvm` runner's Hex node must also list Hex's `shards-image`
+  class (P2.2), as its runner said of it (`isolation.image_class`, below; `engine::node_images`): one whose
+  node lists none is refused, named, in Hex's words, and one whose runner doesn't say (from before the
+  class) is placed by its engine alone.
 - **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view, each
   of them in `draining_sessions`, with the switch they drain for, `switch`: what was set before, what it was set
   to, and when), and new sessions take the new one. While they drain (ROOT's decision 8 of the design):
@@ -211,12 +215,12 @@ its own through Hex (`sandbox::hexvm`).
   against starts on the runner's link (a barrier).
 - **Its real-VM test** (`vm_harnesses` `engine::p2_3_…`) has the microVM session answer a turn in its microVM
   before the switch and another after it, as it drains, each waited for on its harness's liveness (step 35's
-  waits), so a harness that never ran there fails at once in kiln's word on it. It can't pass on the Hex kiln
-  vendors (1969a423e, on Shards 9975d1f55): its image class gives a start share to the run's root alone, so a
-  harness never starts in its project (Shards D277: `Setup (entering its working directory): errno 2`), its run
-  ends failed, and kiln says exit -1. The switch ends nothing; the session ended before it. It passes once Hex
-  vendors Shards with D277 and gives a share its members (`hex_api::Mount`), and kiln maps `Share::members` in
-  `sandbox::hexvm` (P1.4).
+  waits), so a harness that never ran there fails at once in kiln's word on it. It couldn't pass on the Hex
+  kiln vendored before (1969a423e, on Shards 9975d1f55): its image class gave a start share to the run's root alone,
+  so a harness never started in its project (Shards D277: `Setup (entering its working directory): errno 2`), its
+  run ended failed, and kiln said exit -1; the switch ended nothing, the session having ended before it. The Hex
+  kiln vendors now (992c5a33a, on Shards 8d6029e4d) gives a share its members (`hex_api::Mount`), and kiln maps
+  `Share::members` in `sandbox::hexvm` (P1.4); its run on that Hex is owed.
 
 ## Live overrides
 
@@ -241,23 +245,50 @@ in its own words, kept on the override (`took: refused`): Hex's microVMs do unti
 
 ## An agent's volumes
 
-kiln plan 01a1dd2e959772a1b17bc49026448e8a, P6.2 (`agentdefs::volumes`; Shards' D281). An agent definition names
-what it keeps from one of its sessions to the next on a machine, its caches, toolchains and package stores: each
-volume a `name` and the most `bytes` it may hold (`agentdefs.create`, `update`, `check`). Each session started from
-it (`Ask::definition`: `agentdefs.run`, a UI agent a person's definition stands in for, a split's agent) is given
-them, as the definition was at the version it started from: its placement asks their bytes together of its
-machine's disk past what its start asks (`Isolation::disk`, `lineage::session_needs`), so it starts only where the
-disk has room for them; and as its harness starts, before its session hands it a turn, each is plugged into its
-harness, read-write, at `/volumes/<name>`, by its name in its machine's Shards store (`Change::Plug` of
-`PlugSource::Volume`), which Shards makes where it isn't there and keeps past the session (D271, D281), so the
-agent's next session on that machine finds it. Its store's name is `kiln-agent-` and the SHA-256 of its person,
-definition and name (`volumes::store_name`): a person's own, never another's. Volumes stay per machine (the
-person, 2026-11-14): a session elsewhere has that machine's. Refused, rather than started without them: a session
-of such an agent on its machine's host, and one whose microVMs take no folder live (`Holds::live`; Hex's, until
-P6b.3), before anything boots. Owed: listing a machine's volumes with their bytes and clearing one, through
-Shards' `shards_api::volumes` (D281) once kiln vendors a Shards that carries it; a volume's bound held as it's
-written (D281's "Not built"); Hex admitting the box's `disk_bytes`; and a switch of harness (P6c.5) giving the
-swapped-in harness its agent's volumes, unchecked on a real microVM.
+kiln plan 01a1dd2e959772a1b17bc49026448e8a, P6.2 (`agentdefs::volumes`; Shards' D271, D281; Hex's P6.2). An agent
+definition names what it keeps from one of its sessions to the next on a machine, its caches, toolchains and package
+stores: each volume a `name` and the most `bytes` it may hold (`agentdefs.create`, `update`, `check`). Each session
+started from it (`Ask::definition`: `agentdefs.run`, a UI agent a person's definition stands in for, a split's agent)
+is given them, as the definition was at the version it started from. Its store's name is `kiln-agent-` and the
+SHA-256 of its person, definition and name (`volumes::store_name`): a person's own, never another's. Volumes stay per
+machine (the person, 2026-11-14): a session elsewhere has that machine's.
+
+- **Given as its microVM starts.** Its launch carries them (the seam's `Launch::volumes`, `isolated::launch_of`):
+  each by its store name, with its bound, at `/volumes/<name>`, to its harness, read-write. Hex puts them in its box's
+  spec (`ShardsImage::volumes`) and plugs each as the run starts, before the boot answers and so before the session
+  hands its harness a turn; Shards makes one where it isn't there, keeps it past the session, and holds its files to
+  its bound (a write past it is refused ENOSPC). Its box is admitted with their bounds together as its disk
+  (`disk_bytes`, `hexvm::disk_of`), which Hex draws each bound from, so each byte a volume may hold is charged once.
+  Nothing is plugged after the start.
+- **Refused, rather than started without them:** a session of such an agent on its machine's host, before it
+  starts; a launch on microVMs that keep no volumes (`Holds::volumes`), before anything boots; a volume with no
+  bound (from a server older than bounds); and a start Hex refuses for one of them, typed by its cause
+  (`Refusal::Volume`): `Bound` where another session of the agent there holds it with another bound (it changes
+  only once none does), `Clearing` while a clearing holds it. Its words say when to start it again; kiln doesn't
+  start it again on its own.
+- **Placed where its volumes fit.** Its placement asks a machine's disk for what its volumes may still grow by
+  there: their bounds together (`Isolation::disk`) less what they hold already (`lineage::session_needs`). A
+  machine's free disk counts a volume's files as used, so asking a volume's whole bound of it would count those
+  bytes twice (ROOT's decision on Hex's P6.2 question, 2026-11-16; Hex keeps admitting each box's whole bounds,
+  which never over-admits). What they hold is read from the machines it may go to as it's placed
+  (`volumes::held_on`): on each, each volume's charge (what its files take by its bound's own measure, which its
+  bound holds it to), at most its bound, together; the least of those over every machine it may go to, so none is
+  asked less than its volumes may still take there. A machine that can't say (its kiln older, away, its store
+  failing) holds none of them as far as placement knows. Each listing walks its machine's volumes' files, which a
+  start of an agent with volumes waits on, at most as long as a person's command waits for its runner
+  (`hub::COMMAND_WITHIN`); a start of an agent with none asks nothing.
+- **Seen and cleared by its person.** `agentdefs.volumes` (`GET /api/agentdefs/{id}/volumes`) shows the caller's
+  volumes of a definition of theirs, or of one of kiln's, on each machine that keeps any, for every name any of its
+  versions declared: each one's bytes, its charge against its bound, and when it was made. The server asks each
+  machine's runner (`ServerMsg::Volumes`, named feature `agents.volumes`) for those of the store names it asks
+  alone, so no other person's volume leaves its machine; the runner reads its microVMs' store (`Sandbox::volumes`,
+  Hex's `Runtime::volumes` through `shards_api::volumes`). `agentdefs.volumes.clear` removes one on a machine with its
+  files (`Sandbox::clear_volume`), refused at once while a session holds it (Shards' holder locks: 409, its files
+  kept) and where that machine has none of that name (404). Whose a volume is is its store name's: an admin who
+  reaches everyone's definitions sees and clears their own volumes alone.
+
+Owed: a switch of harness (P6c.5) giving the swapped-in harness its agent's volumes, unchecked on a real microVM (Hex
+swaps none yet).
 
 ## Warm pools
 
@@ -296,6 +327,10 @@ launch of the carried `shards`): `available` where the host runs them, its backe
 `why_not` in Shards' words (`/dev/kvm` missing or not this user's to open, a platform Shards has no backend
 for, a VM given no nested virtualization), or that Shards couldn't say, and why (`sandbox::UNCHECKED`).
 `harness::lineage::isolation_on` refuses an isolated start on a runner that says no, in the runner's own words.
+One holding them through Hex also says whether its node lists the class its image VMs run as (`image_class`:
+`{"is": "listed"}`, or `{"is": "unlisted", "why": ...}` in Hex's words), read from its node at each probe:
+`hex_node::images::ImageRuntime`'s classes, and where it lists none, its image class's refusal (Shards' check
+of the host, asked once as the node starts, or an image boot unconfigured; Hex's `ImageClass::serves`).
 
 ## What the microVMs are, and what's owed
 
@@ -322,12 +357,18 @@ Built, each where it is:
 - **A member's run-time arguments** (Shards' D256, `MemberSpec::args`; Hex's `ImageMember::args`): its
   command line is its image's command, then the session's flags (`--resume`, `--model`).
 - **The project at its host path as the harness starts**: its folder shared at its own path as its box is
-  made (Hex's `ShardsImage::shares`), and its working directory there.
+  made (Hex's `ShardsImage::shares`), and its working directory there. Each start share is given to its harness
+  member as it starts (Shards' D277, Hex's `Mount::members`, `hexvm::mount_of`), so its harness works in its
+  project from its first instruction; one given to a member a launch doesn't drive is refused, typed.
 - **A member's signals** (Shards' D238, Hex's `Runtime::signal_member`): interrupt and stop reach the member
   alone on its own lane of its run's agent-control endpoint; its kill is its box's delete.
 - **kiln's MCP from inside** (Shards' D254, Hex's `ImageMember::mcp` and `Runtime::mcp`): above.
 - **The microVM's group, charged** (step 32): placed and charged through the balancer (`hexvm::USE`,
-  `reach::place::Group::Hex`).
+  `reach::place::Group::Hex`). As its run ends, it's charged what its VM cost its host over the run, which Hex
+  answers as the box is deleted: read just before the delete stops a run that still runs, or, where the run
+  ended on its own first, what its VM told of itself as it went down, which Hex keeps with that end until the
+  delete (Shards' D260). Where Hex has none of it (a VM whose process was killed tells none), the box goes by a
+  plain delete and is charged the use last read while it ran.
 - **Its configuration on a volume kiln reads on the host** (step 18): its shares are its project at its own
   path, then each of its person's volumes for its harness at its path in the microVM, as kiln's Agentfile or
   the person's own lays them out, made before it starts; and beside them kiln notes where its harness keeps
@@ -382,15 +423,19 @@ instead (`harness/session.rs:4953`). Hex delivers a member's own signal (`Runtim
 - `cargo test -p kiln --lib sandbox::hexvm`: the seam over Hex's simulator: a member's run (its stdin
   in order, back on its stdout, its end, its box gone), interrupt and stop reaching the member alone
   (`s17_p7_interrupt_and_stop_reach_the_member_and_its_box_goes`), kill and drop deleting its box, its
-  charge kept before its end is said, credentials granted by reference with their placeholders, and its
-  harness member's MCP bridge asked and its connections taken through Hex
-  (`s35_mcp_a_launch_asks_its_members_bridge_and_its_lane_takes_its_connections`).
+  charge kept before its end is said, a run that ended on its own with no final use Hex kept deleted plainly and
+  charged its use last read
+  (`p7_a_run_ended_with_no_final_use_told_goes_by_a_plain_delete_charged_its_last_read`), credentials granted by
+  reference with their placeholders, and its harness member's MCP bridge asked and its connections taken through
+  Hex (`s35_mcp_a_launch_asks_its_members_bridge_and_its_lane_takes_its_connections`).
 - The real launch, on a machine whose kiln carries Shards (`ci/shards/pack.sh`) and has a hypervisor, the
   stand-in in each harness's place (`crates/kiln/tests/vm_e2e/README.md`, "Without a vendor's turn"):
   `VM_E2E=1 VM_E2E_IMAGE_<KIND>=stub cargo test -p kiln --test vm_harnesses step35::rest::` and
   `step35::mcp::`, and `VM_E2E=1 cargo test -p kiln --test vm_harnesses narrowed::`: a session launched
   through Hex into a Shards microVM, its stdio, kiln's MCP from inside, interrupt, stop and kill, and its
   box gone after.
+- `VM_E2E=1 cargo test -p kiln --test vm_harnesses ended:: -- --test-threads 1` (Unix), on such a machine: a
+  session's microVM whose VM process was killed, which told no final use, deleted and charged its use last read.
 - `cargo test -p kiln --lib sandbox::image`: each image's build planned from its content (platform,
   its harness's build, its tag), with a stand-in `shards`: a built-in built once and pinned by digest,
   found in the store without a build after, a changed Agentfile built again, starts at once waiting

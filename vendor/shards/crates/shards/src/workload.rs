@@ -280,6 +280,9 @@ pub struct Asked<'a> {
     /// Given each member's end, where the run asked to hear them (D231): its
     /// `MEMBER_ENDED` payload.
     pub members: Option<&'a Records<'a>>,
+    /// Given what came of each member's next generation its owner asked for (D270 slice 3b):
+    /// its `MEMBER_STARTED` payload.
+    pub restarted: Option<&'a Records<'a>>,
     /// Given each move of its command's readiness under the nesting grant (D234): its
     /// `READY` payload.
     pub readiness: Option<&'a Records<'a>>,
@@ -487,6 +490,10 @@ pub struct Ended {
     /// limit: what its cgroup was allowed and held, and how many (D193); none where none
     /// was.
     pub pids: Option<Vec<u8>>,
+    /// What its init said of a member that could not enter its working directory as it
+    /// started, which failed its run (D277): `run::members::Unentered`'s bytes; none where
+    /// none was.
+    pub unentered: Option<Vec<u8>>,
 }
 
 /// Keeps a microVM's output in its log ([`Writer`], log_writer.rs): each record at once,
@@ -738,6 +745,7 @@ pub fn serve(
         kept,
         processes,
         members,
+        restarted,
         readiness,
         host_net,
         resumed,
@@ -757,6 +765,7 @@ pub fn serve(
             kept: None,
             processes: None,
             members: None,
+            restarted: None,
             readiness: None,
             host_net: None,
             resumed: None,
@@ -849,6 +858,7 @@ pub fn serve(
     let records = RunRecords {
         processes,
         members,
+        restarted,
         readiness,
         host_net,
     };
@@ -857,6 +867,9 @@ pub fn serve(
     // unannounced, ended the run's connection here, which its relay failed for: why, in
     // place of that end (capture.rs `ENDED_RUN`).
     let status = status.map_err(|e| capture::ended_run().unwrap_or(e));
+    if status.is_err() {
+        capture::guest_failed();
+    }
     // A save waiting for the guest to go quiet waits no more: its command has ended.
     quiescing().end();
     QUIET.notify_all();
@@ -891,9 +904,11 @@ pub fn serve(
     // they are an ext4 file system in a file of their own (D190), they stay there, its
     // journal written in place, for its host to read once the microVM has gone, unless
     // joiners of its network go on in it past the run (D119): their files are
-    // its, and a microVM that goes on keeps it in use.
+    // its, and a microVM that goes on keeps it in use. Any joiner it ever had may have
+    // outlived the command in its guest's count, which then takes `SAVE` alone
+    // (`warm::joined`).
     if let (Ok(_), Some(out)) = (&status, layer_out) {
-        if crate::vm_run::layered() && !crate::warm::joining() {
+        if crate::vm_run::layered() && !crate::warm::joined() {
             match keep_layer_from(&conn, &mut reader, &mut beyond) {
                 Ok(used) => {
                     if let Some(kept) = kept {
@@ -917,8 +932,9 @@ pub fn serve(
     // connection, and what waits for the guest, stay theirs; and what the guest says on
     // the run's connection is passed on until it closes it, as it powers off. The host
     // says it asks no more of it (no layer, or its layer had), and the guest takes that
-    // as its end of asking.
-    let joined = crate::warm::joining();
+    // as its end of asking. Its run's end is had here: where its daemon has gone, its
+    // machine ends now, and nothing its guest goes on with is served (D26, `warm::run_over`).
+    let joined = !crate::warm::run_over() && crate::warm::joining();
     if joined {
         let _ = conn.shutdown(std::net::Shutdown::Write);
         drain(&mut reader, &mut beyond);
@@ -969,6 +985,7 @@ fn relay(
 struct RunRecords<'a> {
     processes: Option<&'a Records<'a>>,
     members: Option<&'a Records<'a>>,
+    restarted: Option<&'a Records<'a>>,
     readiness: Option<&'a Records<'a>>,
     host_net: Option<&'a Records<'a>>,
 }
@@ -989,6 +1006,7 @@ fn relay_frames(
     let mut not_run = None;
     let mut oom = None;
     let mut pids = None;
+    let mut unentered = None;
     // As much as the guest sends at once, in one read, whatever the frames it holds
     // (review 8.20): the caller's reader, whose next part reads what this one read past
     // its end.
@@ -1048,6 +1066,13 @@ fn relay_frames(
             }
             kind::OOM => oom = Some(payload.to_vec()),
             kind::PIDS => pids = Some(payload.to_vec()),
+            // A member that could not enter its working directory (D277), well formed or the
+            // guest's protocol broken: told its owner with the run's end.
+            kind::WORKDIR_UNENTERED => {
+                run::members::Unentered::decode(payload)
+                    .ok_or("the guest sent a malformed working directory's refusal")?;
+                unentered = Some(payload.to_vec());
+            }
             kind::PROCESS => {
                 if let Some(processes) = records.processes {
                     processes(payload);
@@ -1058,6 +1083,15 @@ fn relay_frames(
                 run::members::Ended::decode(payload).ok_or("the guest sent a malformed member end")?;
                 if let Some(members) = records.members {
                     members(payload);
+                }
+            }
+            // What came of a member's next generation its owner asked for (D270 slice 3b), well
+            // formed or the guest's protocol broken.
+            kind::MEMBER_STARTED => {
+                run::members::StartAnswer::decode(payload)
+                    .map_err(|e| format!("the guest sent a malformed member start's answer: {e}"))?;
+                if let Some(restarted) = records.restarted {
+                    restarted(payload);
                 }
             }
             // Its command's readiness under the nesting grant (D234), as init moves it:
@@ -1091,6 +1125,7 @@ fn relay_frames(
                     dropped: 0,
                     oom,
                     pids,
+                    unentered,
                 });
             }
             _ => return Err(format!("the guest sent an unknown frame kind {which}")),
@@ -2174,6 +2209,8 @@ pub fn join(
                         dropped: 0,
                         oom: oom.take(),
                         pids: pids.take(),
+                        // A joiner runs no member of its own (D119).
+                        unentered: None,
                     });
                 }
                 _ => return Err(format!("the guest sent an unknown frame kind {which}")),
@@ -2438,6 +2475,19 @@ pub fn will_run(to: &ToGuest) {
 pub fn signal_guest(to: &ToGuest, linux: u32) -> Result<(), Unsent> {
     is_signal(linux)?;
     to_guest(to, kind::SIGNAL, &linux.to_be_bytes())
+}
+
+/// Holds a member for its next generation (D270 slice 3b), so that its current one's end keeps
+/// its server instance and its namespaces, or lets it go, as `hold` says, as [`signal_guest`]
+/// sends a signal.
+pub fn hold_member(to: &ToGuest, hold: run::members::Hold) -> Result<(), Unsent> {
+    to_guest(to, kind::MEMBER_HOLD, &hold.encode())
+}
+
+/// Gives the guest a member's next generation (D270 slice 3b), `start` as
+/// `run::members::Start` encodes it, as [`signal_guest`] sends a signal.
+pub fn start_member(to: &ToGuest, start: &[u8]) -> Result<(), Unsent> {
+    to_guest(to, kind::MEMBER_START, start)
 }
 
 /// Linux signal `linux` is one the guest delivers: `1..=NSIG`, as init checks it.
@@ -3350,6 +3400,7 @@ mod tests {
             let records = RunRecords {
                 processes: None,
                 members: None,
+                restarted: None,
                 readiness: Some(&readiness),
                 host_net: None,
             };
@@ -3368,6 +3419,54 @@ mod tests {
         assert_eq!(
             broken.err().as_deref(),
             Some("the guest sent a malformed readiness")
+        );
+    }
+
+    /// D277: a member's working directory its guest could not enter is kept for the run's end,
+    /// its bytes as told, beside the words that failed the run; one malformed breaks the run's
+    /// protocol.
+    #[test]
+    fn a_working_directory_unentered_is_kept_for_the_runs_end() {
+        let frame = |which: u8, payload: &[u8]| {
+            let mut f = run::header(which, u32::try_from(payload.len()).unwrap()).to_vec();
+            f.extend_from_slice(payload);
+            f
+        };
+        let relayed = |frames: &[Vec<u8>]| {
+            let (mut guest, host) = UnixStream::pair().unwrap();
+            for f in frames {
+                guest.write_all(f).unwrap();
+            }
+            drop(guest);
+            let mut reader = io::BufReader::new(shards_ipc::Polled(&host));
+            let records = RunRecords {
+                processes: None,
+                members: None,
+                restarted: None,
+                readiness: None,
+                host_net: None,
+            };
+            relay(&mut reader, &Timing::new(), None, None, records)
+        };
+        let told = run::members::Unentered {
+            member: 1,
+            errno: 2,
+            workdir: b"/Users/ada/proj".to_vec(),
+        }
+        .encode();
+        let words: &[u8] = b"harness codex: its launch: Setup (entering its working directory): errno 2";
+        let ended = relayed(&[
+            frame(kind::WORKDIR_UNENTERED, &told),
+            frame(kind::SYSTEM_ERR, words),
+            frame(kind::EXIT, &125u32.to_be_bytes()),
+        ])
+        .unwrap();
+        assert_eq!(ended.unentered, Some(told));
+        assert!(ended.not_run.is_some());
+        let broken = relayed(&[frame(kind::WORKDIR_UNENTERED, &[0; 8])]);
+        assert_eq!(
+            broken.err().as_deref(),
+            Some("the guest sent a malformed working directory's refusal")
         );
     }
 

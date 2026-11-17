@@ -465,7 +465,7 @@ pub trait Recover: Runtime {
     /// no init. By default an `oci` box's init went with the node.
     fn alive(&self, spec: &BoxSpec) -> Result<Option<bool>, Refusal> {
         Ok(match spec.class.class() {
-            Class::Oci | Class::Firecracker | Class::Shards => Some(false),
+            Class::Oci | Class::Firecracker | Class::Shards | Class::ShardsImage => Some(false),
             Class::Process => None,
         })
     }
@@ -2816,6 +2816,7 @@ impl Books {
     ) -> Result<(), Refusal> {
         let class = match class {
             Class::Shards => hex_sim::model::Class::Shards,
+            Class::ShardsImage => hex_sim::model::Class::ShardsImage,
             Class::Firecracker => hex_sim::model::Class::Firecracker,
             Class::Process | Class::Oci => return Ok(()),
         };
@@ -3120,6 +3121,20 @@ impl<R: Recover> Runtime for Recorded<R> {
 
     fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
         self.runtime_at(id)?.mcp(id, member)
+    }
+
+    fn exec_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        program: Program,
+        stdio: Stdio,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        self.runtime_at(id)?.exec_member(id, member, program, stdio)
+    }
+
+    fn link(&self, id: &BoxId) -> Result<hex_api::ControlLink, Refusal> {
+        self.runtime_at(id)?.link(id)
     }
 
     fn signal_member(

@@ -227,7 +227,7 @@ pub async fn materialize_with(b: &Builtin, text: &str, platforms: &[String], var
             let at = dir.join(name);
             let staging = dir.join(format!(".{name}.{}", crate::util::new_id()));
             let filled = match fill(&client, b, build, dir, &staging).await {
-                Ok(()) => std::fs::rename(&staging, &at).map_err(io(&at)),
+                Ok(()) => renamed(&staging, &at).await,
                 Err(e) => Err(e),
             };
             // A tree may hold a directory its owner may not search (0644), which `remove_dir_all` can't
@@ -282,7 +282,7 @@ async fn fill(client: &crate::http::client::Client, b: &Builtin, build: &Build, 
         if to.symlink_metadata().is_ok() {
             return Err(Error::Pin(format!("{} is pinned twice", f.path)));
         }
-        std::fs::rename(&arrived.path, &to).map_err(io(&to))?;
+        renamed(&arrived.path, &to).await?;
         if let Some(m) = mode {
             crate::os::set_mode(&to, m).map_err(io(&to))?;
         }
@@ -427,6 +427,14 @@ impl Pause {
         self.0 = Some(next);
         next
     }
+}
+
+/// `from` renamed to `to` off the runtime's threads, as long as another process holding what it moves keeps it
+/// ([`unpack::rename_in_use`]: Windows, kiln goal 3cd82843's r708).
+async fn renamed(from: &Path, to: &Path) -> Result<(), Error> {
+    let (f, t) = (from.to_owned(), to.to_owned());
+    let moved = crate::rt::blocking(move || unpack::rename_in_use(&f, &t)).await;
+    moved.map_err(|e| Error::Io { path: to.to_owned(), why: format!("{e:#}") })?.map_err(io(to))
 }
 
 /// `text` written at `path`, which mustn't be there.

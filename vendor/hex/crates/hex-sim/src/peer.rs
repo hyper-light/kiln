@@ -227,6 +227,7 @@ fn check_demand(d: &Demand, models: &[String]) -> Result<(), Stop> {
         hex_api::Class::Oci => d.class != Class::Oci,
         hex_api::Class::Firecracker => d.class != Class::Firecracker,
         hex_api::Class::Shards => d.class != Class::Shards,
+        hex_api::Class::ShardsImage => d.class != Class::ShardsImage,
     }) {
         return Err(damaged(
             "original payload form differs from its placement demand",
@@ -264,6 +265,7 @@ fn write_demand(out: &mut impl std::fmt::Write, d: &Demand, models: &[String]) -
         Class::Oci => "oci",
         Class::Firecracker => "firecracker",
         Class::Shards => "shards",
+        Class::ShardsImage => "shards-image",
     };
     let os = match d.ask.os {
         None => "-",
@@ -310,6 +312,7 @@ fn write_demand(out: &mut impl std::fmt::Write, d: &Demand, models: &[String]) -
             Some(hex_api::Class::Oci) => "oci",
             Some(hex_api::Class::Firecracker) => "firecracker",
             Some(hex_api::Class::Shards) => "shards",
+            Some(hex_api::Class::ShardsImage) => "shards-image",
             None => "-",
         };
         write!(out, " {form} {}", u8::from(d.ask.native_only))?;
@@ -337,6 +340,7 @@ fn demand_of<'a>(
         Some("oci") => Class::Oci,
         Some("firecracker") => Class::Firecracker,
         Some("shards") => Class::Shards,
+        Some("shards-image") => Class::ShardsImage,
         _ => return Err(damaged("a demand's class")),
     };
     let need = Resources {
@@ -384,6 +388,7 @@ fn demand_of<'a>(
             Some("oci") => Some(hex_api::Class::Oci),
             Some("firecracker") => Some(hex_api::Class::Firecracker),
             Some("shards") => Some(hex_api::Class::Shards),
+            Some("shards-image") => Some(hex_api::Class::ShardsImage),
             Some("-") => None,
             _ => return Err(damaged("a demand's original runtime form")),
         };
@@ -574,9 +579,10 @@ fn allocation_of<'a>(
     Ok(Some(allocation))
 }
 
-// Exact longest enum spellings plus the two fixed hexadecimal key arrays bound the receipt.
+// Exact longest enum spellings plus the two fixed hexadecimal key arrays bound the receipt; a Shards image VM's route
+// (`RouteKey::check`, P2.2) makes `shards-image` the longest class name.
 const ROUTE_BYTES: usize =
-    "r1:firecracker:windows:arm64:firecracker:required:".len() + 32 * 2 + 1 + 16 * 2;
+    "r1:shards-image:windows:arm64:firecracker:required:".len() + 32 * 2 + 1 + 16 * 2;
 
 fn write_route(
     out: &mut impl std::fmt::Write,
@@ -644,6 +650,8 @@ fn route_of<'a>(
         Some("oci") => hex_api::Class::Oci,
         Some("firecracker") => hex_api::Class::Firecracker,
         Some("shards") => hex_api::Class::Shards,
+        // P2.2: appended, so a row written before it names none of it and reads as it was written.
+        Some("shards-image") => hex_api::Class::ShardsImage,
         _ => return Err(damaged("route original class")),
     };
     let os = match fields.next() {
@@ -743,6 +751,7 @@ fn assignment(
             hex_api::Class::Process | hex_api::Class::Oci => Class::Oci,
             hex_api::Class::Firecracker => Class::Firecracker,
             hex_api::Class::Shards => Class::Shards,
+            hex_api::Class::ShardsImage => Class::ShardsImage,
         };
         if class != demand.class {
             return Err(damaged("route differs from placement class"));
@@ -950,6 +959,7 @@ fn epoch_text(epoch: u64, rows: &[StartObservation]) -> Result<String, Stop> {
             Class::Oci => "oci",
             Class::Firecracker => "firecracker",
             Class::Shards => "shards",
+            Class::ShardsImage => "shards-image",
         };
         write!(
             &mut text,
@@ -989,6 +999,7 @@ fn epoch_of(text: &str, nodes: usize) -> Result<(u64, Vec<StartObservation>), St
             Some("oci") => Class::Oci,
             Some("firecracker") => Class::Firecracker,
             Some("shards") => Class::Shards,
+            Some("shards-image") => Class::ShardsImage,
             _ => return Err(damaged("a combined launch observation's class")),
         };
         rows.push(StartObservation {
@@ -3333,6 +3344,47 @@ mod tests {
                 (demand, None, Some(route))
             );
         }
+    }
+
+    /// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2): an image VM's placement row names its route's class by its own word and
+    /// reads back. Do write an owner's row for an image VM routed to a microVM of its own, with its allocation, then
+    /// read it. Expect its route word "r1:shards-image:linux:amd64:dedicated:none:-", and the row read back to its
+    /// demand, allocation and route.
+    #[test]
+    fn p2_2_an_image_vms_placement_row_names_its_route_and_reads_back() {
+        let allocation = hex_api::sim::sim_vm_allocation().unwrap();
+        let demand = Demand {
+            need: Resources {
+                cpu_milli: 2_000,
+                mem_bytes: 256 << 20,
+                ..Resources::default()
+            },
+            kind: Kind::Plain,
+            class: Class::ShardsImage,
+            ask: Ask {
+                runtime_class: Some(hex_api::Class::ShardsImage),
+                ..Ask::default()
+            },
+        };
+        let route = hex_api::RouteReceipt {
+            key: hex_api::RouteKey {
+                class: hex_api::Class::ShardsImage,
+                image: hex_api::ImagePlatform {
+                    os: hex_api::ImageOs::Linux,
+                    arch: hex_api::ImageArch::Amd64,
+                },
+                execution: hex_api::Execution::ShardsDedicated,
+                gpu: hex_api::GpuEligibility::None,
+            },
+            backing: None,
+        };
+        let word = "r1:shards-image:linux:amd64:dedicated:none:-";
+        let row = own_text(State::Asked, &demand, &[], Some(allocation), Some(route)).unwrap();
+        assert!(row.split(' ').any(|said| said == word), "{row}");
+        assert_eq!(
+            recorded_assignment(&row, &[]).unwrap(),
+            (demand, Some(allocation), Some(route))
+        );
     }
 
     /// AC-T7.4.1: an original OCI payload keeps its actual guest route through commit, wire and

@@ -2249,6 +2249,17 @@ for line in sys.stdin:
     /// person's word, 2026-11-13).
     static SLOWEST_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// Whose move a source wait awaits: its party, the one a wait is held to (as Shards' D215 holds its
+    /// waits to the party that owes the move).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Party {
+        /// The source's own: while it owes kiln an answer, a still source is asked whether its CPU time
+        /// moved ([`source_until`]).
+        Source,
+        /// Kiln's own: its mail pump's, its goal driver's ([`kiln_until`]).
+        Kiln,
+    }
+
     /// Listen before checking both source state and durable receipts. No timer retries a predicate or
     /// grants source capacity, and none cuts a wait short: it follows its source's liveness and
     /// progress (`kiln_ci::place::keeper::Waits`, as the capacity keeper's waits do). Each move of the
@@ -2265,7 +2276,25 @@ for line in sys.stdin:
     /// what it saw. Its whole wait had a deadline of an inbox's answer (`registry::ANSWER_WAIT`,
     /// 10 s), which a loaded machine's healthy source outran: 3 of 230 tests in one parallel run
     /// beside goals:: on adas-mac-studio.local (kiln run r222, 2026-11-13).
-    pub(crate) async fn source_until<F, Fut>(hub: &Hub, id: &str, what: &str, mut check: F) -> anyhow::Result<()>
+    pub(crate) async fn source_until<F, Fut>(hub: &Hub, id: &str, what: &str, check: F) -> anyhow::Result<()>
+    where F: FnMut() -> Fut, Fut: std::future::Future<Output = anyhow::Result<bool>> {
+        until(hub, id, what, Party::Source, check).await
+    }
+
+    /// [`source_until`] for a move that is kiln's own, never its source's: a goal its driver pushed, or
+    /// a message its mail pump has yet to hand a session whose turn a test holds at its own gate. That
+    /// source owes kiln nothing, however long its turn stays under way, so its CPU time (still while it
+    /// waits at the gate) says nothing of the wait, which follows its liveness alone, as it does for
+    /// kiln's next move after a turn. Kiln runs r700 and r712 refused "one real refill goal" by its
+    /// source's CPU time, at windows of 670 ms and 10 ms, its source held at the test's result gate and
+    /// kiln's pump yet to deliver the goal.
+    pub(crate) async fn kiln_until<F, Fut>(hub: &Hub, id: &str, what: &str, check: F) -> anyhow::Result<()>
+    where F: FnMut() -> Fut, Fut: std::future::Future<Output = anyhow::Result<bool>> {
+        until(hub, id, what, Party::Kiln, check).await
+    }
+
+    /// The wait of [`source_until`] and [`kiln_until`], held to `party`.
+    async fn until<F, Fut>(hub: &Hub, id: &str, what: &str, party: Party, mut check: F) -> anyhow::Result<()>
     where F: FnMut() -> Fut, Fut: std::future::Future<Output = anyhow::Result<bool>> {
         use futures::FutureExt as _;
         use kiln_seams::Bus as _;
@@ -2276,9 +2305,9 @@ for line in sys.stdin:
         let clock = crate::rt::clock();
         let began = clock.now();
         let ms = || i64::try_from(clock.now().saturating_duration_since(began).as_millis()).unwrap_or(i64::MAX);
-        // Whether it owes kiln an answer of its own (its harness answered kiln, a turn under way), and
-        // its process's CPU time so far.
-        let owes = || hub.harness.local.get(id).is_some_and(|s| {
+        // Whether it owes kiln an answer of its own (the wait's party is the source, whose harness
+        // answered kiln, a turn under way), and its process's CPU time so far.
+        let owes = || party == Party::Source && hub.harness.local.get(id).is_some_and(|s| {
             let core = s.core.lock();
             !core.meta.version.is_empty() && core.state.status == crate::harness::model::Status::Running
         });
@@ -2711,7 +2740,9 @@ for line in sys.stdin:
             }).await?;
             source_disposition(&hub, &coordinator, &initial_id, false).await?;
             crate::goals::add(&hub, &coordinator, vec!["the lab program passes".into(), "the view loads in 300 ms".into()], true).await?;
-            source_until(&hub, &coordinator, "one real refill goal", || async {
+            // Kiln's move: the goal its driver pushed, which its mail pump hands the session, its source
+            // held at the result gate.
+            kiln_until(&hub, &coordinator, "one real refill goal", || async {
                 Ok(hub.harness.local.get(&coordinator).is_some_and(|session| session.core.lock().state.queue.len() == 1)
                     && crate::harness::mail_delivery::capacity(&hub, &coordinator).is_some_and(|capacity| capacity.admitted == 2))
             }).await?;

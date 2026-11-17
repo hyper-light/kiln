@@ -288,7 +288,8 @@ pub fn main(device: &str, template: bool) -> ! {
             crate::setup::filter_named(&spec.setup, b"domains-seccomp="),
             crate::setup::filter_named(&spec.setup, b"domains-seccomp-none="),
         ];
-        let declared = declared.map_or_else(crate::domains::read, Ok);
+        let declared = declared.map_or_else(|| crate::domains::read(&spec.setup), Ok);
+        let mut unentered = None;
         match declared.and_then(|(all, domains, pairs)| {
             workload.capture = crate::capture::Capture::prepare(
                 &spec.setup,
@@ -311,7 +312,7 @@ pub fn main(device: &str, template: bool) -> ! {
             {
                 return Err("a member's input is asked for where no managed output is".into());
             }
-            crate::domains::start(&all, &domains, &pairs, &filters, &spec.setup)
+            crate::domains::start(&all, &domains, &pairs, &filters, &spec.setup, &mut unentered)
         }) {
             Ok(domains) if domains.is_empty() => {}
             Ok(domains) => match crate::domains::Memory::watch() {
@@ -328,6 +329,11 @@ pub fn main(device: &str, template: bool) -> ! {
             Err(e) => {
                 // SAFETY: kill(2) of the workload, our own child: the run fails whole.
                 unsafe { libc::kill(workload.pid, libc::SIGKILL) };
+                // A member that could not enter its working directory, told typed before the
+                // words that fail the run (D277).
+                if let Some(told) = unentered {
+                    let _ = send(&conn, kind::WORKDIR_UNENTERED, &told.encode());
+                }
                 return Err(setup_failed(e));
             }
         }
@@ -3005,7 +3011,7 @@ impl Standby {
         // daemon refuses it: what the image declares, in the image as built (D109).
         let declared = match crate::setup::filter_named(&spec.setup, b"domains-seccomp=") {
             Some(_) if spec.builtin != run::builtin::HOLD => {
-                Some(crate::domains::read().map_err(setup_failed)?)
+                Some(crate::domains::read(&spec.setup).map_err(setup_failed)?)
             }
             _ => None,
         };
@@ -3815,17 +3821,41 @@ fn builtin(
     let (stderr_r, stderr_w) = pipe()?;
     // What a microVM's engine asks of its networks is init's own state (D181): done here,
     // and said by the child as any built-in's answer is.
-    let networked = (kind == run::builtin::NETWORK).then(|| crate::members::network(args));
+    // Each answer its text, or why not and the built-in's exit status.
+    let networked =
+        (kind == run::builtin::NETWORK).then(|| crate::members::network(args).map_err(|e| (e, 1)));
     // What a joiner listens on, read through init's `/proc` by its process, whose
     // network namespace its socket tables are (D181).
     let networked = networked.or_else(|| {
-        (kind == run::builtin::LISTENS).then(|| crate::members::listening(joiner.unwrap_or(workload)))
+        (kind == run::builtin::LISTENS)
+            .then(|| crate::members::listening(joiner.unwrap_or(workload)).map_err(|e| (e, 1)))
     });
     // The workload's device filter widened to the nodes of the host's functions plugged
     // into its microVM (D214): init's own state, as the filter it keeps, done here.
     let networked = networked.or_else(|| {
         (kind == run::builtin::DEVICE && joiner.is_none() && args.first().is_some_and(|a| a == b"allow"))
-            .then(|| crate::devices::allow(args.get(1..).unwrap_or_default(), WORKLOAD_CGROUP))
+            .then(|| {
+                crate::devices::allow(args.get(1..).unwrap_or_default(), WORKLOAD_CGROUP).map_err(|e| (e, 1))
+            })
+    });
+    // A member's grants past the microVM made as its host says (D278): init's own state, as
+    // the switch and the gates it keeps, done here; answered with nothing, or refused by its
+    // cause's status.
+    let networked = networked.or_else(|| {
+        (kind == run::builtin::EGRESS).then(|| {
+            crate::egress::change(args)
+                .map(|()| String::new())
+                .map_err(|e| (e.to_string(), failed_status(kind, &e)))
+        })
+    });
+    // The run's place on a network shared by runs and its members' grants there, as its host
+    // says (D285): init's own state, as D278's, done here likewise.
+    let networked = networked.or_else(|| {
+        (kind == run::builtin::SHARED).then(|| {
+            crate::egress::shared::change(args)
+                .map(|()| String::new())
+                .map_err(|e| (e.to_string(), failed_status(kind, &e)))
+        })
     });
     // What reads the host's stdin: unpacking an archive, and the host's notices (D235).
     let input = if matches!(kind, run::builtin::EXTRACT | run::builtin::NOTICE) {
@@ -3843,9 +3873,11 @@ fn builtin(
         if let Some(said) = networked {
             let (mut to, text, code) = match said {
                 Ok(text) => (File::from(stdout_w), text, 0),
-                Err(why) => (File::from(stderr_w), why, 1),
+                Err((why, code)) => (File::from(stderr_w), why, code),
             };
-            let _ = writeln!(to, "{text}");
+            if !(text.is_empty() && matches!(kind, run::builtin::EGRESS | run::builtin::SHARED)) {
+                let _ = writeln!(to, "{text}");
+            }
             // SAFETY: _exit(2) ends the child without running init's exit paths.
             unsafe { libc::_exit(code) }
         }
@@ -4009,6 +4041,9 @@ fn builtin(
             run::builtin::RESIZE => resize_member(args, domains),
             // A member's command signalled (D238, goal 58's step 5).
             run::builtin::SIGNAL => signal_member(args, domains),
+            // A member's generation ended at once (D270): its reaper killed, its PID
+            // namespace with it.
+            run::builtin::MEMBER_KILL => kill_member(args, domains),
             // Its clock its host's, as its run goes on from a pause (D267).
             run::builtin::CLOCK => crate::linux::sync_clock(),
             run::builtin::SIZE => match &layers {
@@ -5253,6 +5288,13 @@ impl Workload {
                         .encode();
                         to_host.extend(&[&run::header(kind::MEMBER_ENDED, ended.len() as u32), &ended]);
                         d.end_told = true;
+                        // A generation no next one is held for ends its whole member, its server
+                        // instance with it, as a member's end did before generations (D270).
+                        if !d.held
+                            && let Err(e) = crate::domains::end_member(d)
+                        {
+                            let _ = writeln!(io::stderr(), "shards-init: {}'s server instance: {e}", d.label);
+                        }
                     }
                 }
             }
@@ -5285,6 +5327,8 @@ impl Workload {
                     break 'relay;
                 }
             }
+            // Let go once every channel has ended and nothing of it is in flight, but for a member
+            // held for its next generation (D270): its channels open again on this connection.
             if self
                 .capture
                 .as_ref()
@@ -5292,7 +5336,7 @@ impl Workload {
                 && self
                     .domains
                     .iter()
-                    .all(|d| d.stdout.terminal() && d.stderr.terminal())
+                    .all(|d| d.stdout.terminal() && d.stderr.terminal() && !d.held)
             {
                 self.capture = None;
             }
@@ -5881,6 +5925,9 @@ impl Workload {
                                 let pty = self.stdout.as_ref().filter(|_| self.tty).map(AsRawFd::as_raw_fd);
                                 let hosts = self.hosts.as_ref();
                                 let mut taken_for_malformed = false;
+                                // A member's next generation asked for, or held for (D270): taken
+                                // once the frames are read, as they change the members.
+                                let mut generations: Vec<(u8, Vec<u8>)> = Vec::new();
                                 let whole = each_frame(&mut from_signals, |which, payload| {
                                     let id_and = |p: &[u8]| {
                                         let (id, rest) = p.split_at_checked(4)?;
@@ -5974,9 +6021,35 @@ impl Workload {
                                                 hosts.answer(payload);
                                             }
                                         }
+                                        kind::MEMBER_START | kind::MEMBER_HOLD => {
+                                            generations.push((which, payload.to_vec()));
+                                        }
                                         _ => {}
                                     }
                                 });
+                                for (which, payload) in generations {
+                                    if which == kind::MEMBER_HOLD {
+                                        hold_member(&payload, &mut self.domains);
+                                    } else {
+                                        let answer = next_generation(
+                                            &payload,
+                                            &mut self.domains,
+                                            self.capture.as_mut(),
+                                        );
+                                        match answer.encode() {
+                                            Ok(bytes) => to_host.extend(&[
+                                                &run::header(kind::MEMBER_STARTED, bytes.len() as u32),
+                                                &bytes,
+                                            ]),
+                                            Err(e) => {
+                                                let _ = writeln!(
+                                                    io::stderr(),
+                                                    "shards-init: a member's next generation's answer: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 if !whole || taken_for_malformed {
                                     signals = None;
                                 }
@@ -6522,15 +6595,41 @@ fn resize(fd: RawFd, size: Size) {
 
 /// A built-in's exit status for its failure `e`: 1, but where its host tells the cause apart by
 /// its kind: a device in use (`DEVICE_BUSY`, D235); a member whose command has ended or that
-/// never started (`SIGNAL_ENDED`, `SIGNAL_UNKNOWN`).
+/// never started (`SIGNAL_ENDED`, `SIGNAL_UNKNOWN`); a member's grants refused (`EGRESS_*`,
+/// D278; `SHARED_*`, D285).
 fn failed_status(kind: u8, e: &io::Error) -> i32 {
     let unsignalled = e.get_ref().and_then(|inner| inner.downcast_ref::<Unsignalled>());
-    match (kind, unsignalled) {
-        (run::builtin::DEVICE, _) if e.kind() == io::ErrorKind::ResourceBusy => {
+    let refused = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<crate::egress::Refused>());
+    let unshared = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<crate::egress::shared::Refused>());
+    if let (run::builtin::SHARED, Some(why)) = (kind, unshared) {
+        use crate::egress::shared::Refused;
+        return i32::from(match why {
+            Refused::Unknown(_) => run::builtin::SHARED_UNKNOWN,
+            Refused::Past(_) => run::builtin::SHARED_PAST,
+            Refused::Readdressed(_) => run::builtin::SHARED_READDRESSED,
+            Refused::Overlaps(_) => run::builtin::SHARED_OVERLAPS,
+        });
+    }
+    match (kind, unsignalled, refused) {
+        (run::builtin::DEVICE, _, _) if e.kind() == io::ErrorKind::ResourceBusy => {
             i32::from(run::builtin::DEVICE_BUSY)
         }
-        (run::builtin::SIGNAL, Some(Unsignalled::Ended(_))) => i32::from(run::builtin::SIGNAL_ENDED),
-        (run::builtin::SIGNAL, Some(Unsignalled::Unknown(_))) => i32::from(run::builtin::SIGNAL_UNKNOWN),
+        (run::builtin::SIGNAL, Some(Unsignalled::Ended(_)), _) => i32::from(run::builtin::SIGNAL_ENDED),
+        (run::builtin::SIGNAL, Some(Unsignalled::Unknown(_)), _) => i32::from(run::builtin::SIGNAL_UNKNOWN),
+        // A member's grants past the microVM refused by a cause its host tells apart (D278).
+        (run::builtin::EGRESS, _, Some(crate::egress::Refused::Unknown(_))) => {
+            i32::from(run::builtin::EGRESS_UNKNOWN)
+        }
+        (run::builtin::EGRESS, _, Some(crate::egress::Refused::Past(_))) => {
+            i32::from(run::builtin::EGRESS_PAST)
+        }
+        (run::builtin::EGRESS, _, Some(crate::egress::Refused::Unheld(_))) => {
+            i32::from(run::builtin::EGRESS_UNHELD)
+        }
         _ => 1,
     }
 }
@@ -6573,7 +6672,7 @@ fn signal_member(args: &[Vec<u8>], domains: &[crate::domains::Started]) -> io::R
     // SAFETY: openat(2) of a fixed name under the cgroup directory init holds for the member.
     let procs = unsafe {
         libc::openat(
-            started.lifecycle.group().as_raw_fd(),
+            started.lifecycle.population().as_raw_fd(),
             c"cgroup.procs".as_ptr(),
             libc::O_RDONLY | libc::O_CLOEXEC,
         )
@@ -6588,6 +6687,112 @@ fn signal_member(args: &[Vec<u8>], domains: &[crate::domains::Started]) -> io::R
         true => Ok(()),
         false => Err(ended()),
     }
+}
+
+/// [`run::builtin::MEMBER_KILL`] (D270): member `args` names' generation ended at once, its
+/// reaper killed, which takes every process of its PID namespace and nothing else of the
+/// member's. Refused, as [`signal_member`] refuses, for a member that never started, and for one
+/// whose generation has ended already.
+fn kill_member(args: &[Vec<u8>], domains: &[crate::domains::Started]) -> io::Result<()> {
+    let member = run::members::parse_kill(args)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let started = domains
+        .iter()
+        .find(|d| d.member == member)
+        .ok_or_else(|| io::Error::other(Unsignalled::Unknown(member)))?;
+    if started.lifecycle.ended() {
+        return Err(io::Error::other(Unsignalled::Ended(started.label.clone())));
+    }
+    started.lifecycle.kill_reaper()
+}
+
+/// A [`kind::MEMBER_HOLD`]: its member's next generation is coming (D270), so that its current
+/// one's end keeps its server instance and its namespaces; or, its restart failed, let go: a
+/// generation that ended under the hold then ends its whole member, as an end with none does.
+/// One of no member, or malformed, is nothing: a start that follows it is refused, typed.
+fn hold_member(payload: &[u8], domains: &mut [crate::domains::Started]) {
+    let Some(hold) = run::members::Hold::decode(payload) else {
+        return;
+    };
+    let Some(d) = domains.iter_mut().find(|d| d.member == hold.member) else {
+        return;
+    };
+    // A generation that ended unheld ended its whole member: nothing of it is kept to hold.
+    if d.end_told && !d.held {
+        return;
+    }
+    d.held = hold.held;
+    if d.end_told
+        && !hold.held
+        && let Err(e) = crate::domains::end_member(d)
+    {
+        let _ = writeln!(io::stderr(), "shards-init: {}'s server instance: {e}", d.label);
+    }
+}
+
+/// A [`kind::MEMBER_START`]'s answer (D270): its member's next generation started, its channels
+/// waiting for their credit again, or why not, typed.
+fn next_generation(
+    payload: &[u8],
+    domains: &mut [crate::domains::Started],
+    capture: Option<&mut crate::capture::Capture>,
+) -> run::members::StartAnswer {
+    use run::members::{Start, StartAnswer, StartRefusal};
+    let start = match Start::decode(payload) {
+        Ok(start) => start,
+        Err(e) => {
+            let (member, generation) = (
+                payload
+                    .get(..4)
+                    .and_then(|b| b.try_into().ok())
+                    .map_or(0, u32::from_be_bytes),
+                payload
+                    .get(4..8)
+                    .and_then(|b| b.try_into().ok())
+                    .map_or(0, u32::from_be_bytes),
+            );
+            return StartAnswer {
+                member,
+                generation,
+                refused: Some((
+                    StartRefusal::Failed,
+                    format!("a malformed start: {e}").into_bytes(),
+                )),
+            };
+        }
+    };
+    let answer = |refused: Option<(StartRefusal, String)>| StartAnswer {
+        member: start.member,
+        generation: start.generation,
+        refused: refused.map(|(why, words)| (why, words.into_bytes())),
+    };
+    let Some(d) = domains.iter_mut().find(|d| d.member == start.member) else {
+        return answer(Some((
+            StartRefusal::Unknown,
+            format!("member {} did not start in this run", start.member),
+        )));
+    };
+    // One that could not enter its working directory is answered so, typed, as its first
+    // generation's is told (D277); its words, which say more of its launch, on init's stderr.
+    let mut unentered = None;
+    if let Err(refused) = crate::domains::next_generation(d, &start, &mut unentered) {
+        return match unentered {
+            Some(told) => {
+                let _ = writeln!(io::stderr(), "shards-init: {}", refused.1);
+                StartAnswer::unentered(start.generation, &told)
+            }
+            None => answer(Some(refused)),
+        };
+    }
+    let reopened = match capture {
+        Some(capture) => capture.reopen(start.member).map_err(|e| e.to_string()),
+        None => Ok(()),
+    };
+    answer(
+        reopened
+            .err()
+            .map(|e| (StartRefusal::Failed, format!("{}: its output: {e}", d.label))),
+    )
 }
 
 /// Signals the member's command among `listed`'s processes (its cgroup's, `cgroup.procs`):
@@ -7166,6 +7371,52 @@ pub(crate) fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod generation_tests {
+    use super::*;
+
+    /// A member's next generation asked of a run with no such member, or in a malformed start,
+    /// is refused typed, by the member and generation it asked for where they are read (D270);
+    /// a hold of no member is nothing; a kill of no member is refused as a signal of none is.
+    #[test]
+    fn a_start_of_no_member_or_no_start_is_refused_typed() {
+        use run::members::{Start, StartRefusal};
+        let start = Start {
+            member: 4,
+            generation: 1,
+            args: vec![b"--resume".to_vec()],
+            env: Vec::new(),
+            workdir: None,
+            components: Vec::new(),
+            input: None,
+        };
+        let mut none: Vec<crate::domains::Started> = Vec::new();
+        let answer = next_generation(&start.encode().unwrap(), &mut none, None);
+        assert_eq!((answer.member, answer.generation), (4, 1));
+        assert_eq!(answer.refused.map(|(why, _)| why), Some(StartRefusal::Unknown));
+        let mut malformed = start.encode().unwrap();
+        malformed.push(9);
+        let answer = next_generation(&malformed, &mut none, None);
+        assert_eq!((answer.member, answer.generation), (4, 1));
+        assert_eq!(answer.refused.map(|(why, _)| why), Some(StartRefusal::Failed));
+        let hold = run::members::Hold {
+            member: 4,
+            held: true,
+        };
+        hold_member(&hold.encode(), &mut none);
+        hold_member(&run::members::Hold { held: false, ..hold }.encode(), &mut none);
+        hold_member(&4u32.to_be_bytes(), &mut none);
+        hold_member(b"no", &mut none);
+        let refused = kill_member(&run::members::kill_args(4), &none).unwrap_err();
+        assert!(refused.to_string().contains('4'), "{refused}");
+        assert_eq!(
+            kill_member(&[], &none).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }
 

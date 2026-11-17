@@ -491,7 +491,7 @@ impl Console {
     /// Closes it, once its command has ended, or its client gone.
     fn close(&self) {
         if let Some(held) = super::lock(&self.0).take() {
-            let _ = std::thread::Builder::new()
+            let _ = crate::daemon::DaemonThread::new()
                 .name("console-close".into())
                 .spawn(move || drop(held));
         }
@@ -539,7 +539,7 @@ fn command(
         && !on(2)
         && let Some(mut unread) = err_shown.take()
     {
-        std::thread::Builder::new()
+        crate::daemon::DaemonThread::new()
             .name("console-drain".into())
             .spawn(move || {
                 let _ = std::io::copy(&mut unread, &mut std::io::sink());
@@ -667,9 +667,15 @@ impl Machine {
     /// owner's commands use, of the daemon's environment only what shards is set by
     /// ([`kept`]), and the client's own, which its request carries.
     fn command_env(&self, client: &str, given: Vec<(String, Vec<u8>)>) -> Vec<(String, OsString)> {
+        // Each variable set here once: the daemon's own value of one, which `kept` passes, came
+        // first in the command's environment, the one its getenv reads, so its home was the
+        // daemon's path to it, not `.`, which its copies are placed beneath (runs-02): on macOS
+        // a path through a link (`/var`), its copies' `/private/var` beneath none of it.
+        let set_here = ["SHARDS_HOME", crate::context::HERE.0, "SHARDS_CACHE"];
         let mut env: Vec<(String, OsString)> = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v)))
             .filter(|(k, _)| kept(k) && !k.eq_ignore_ascii_case(crate::client_grants::CLIENT_VAR))
+            .filter(|(k, _)| !set_here.iter().any(|s| k.eq_ignore_ascii_case(s)))
             .collect();
         env.extend([
             ("SHARDS_HOME".to_string(), self.home.clone().into_os_string()),
@@ -711,7 +717,7 @@ impl Machine {
         let (err_r, mut err_w) = pipe()?;
         let (done, status) = std::sync::mpsc::channel();
         let home = self.home.clone();
-        std::thread::Builder::new()
+        crate::daemon::DaemonThread::new()
             .name("context-sign".into())
             .spawn(move || {
                 let status = match crate::agent::sign_step(&home, &args, &mut in_r, &mut out_w) {
@@ -876,7 +882,7 @@ impl Machine {
         let registry = Arc::clone(&self.agents);
         let ours = Arc::clone(&building);
         let whose = client.to_string();
-        std::thread::Builder::new()
+        crate::daemon::DaemonThread::new()
             .name("context-step".into())
             .spawn(move || {
                 let ran = (|| -> Result<i32, String> {
@@ -975,7 +981,7 @@ impl Machine {
                                 writers.push((w, secret));
                             }
                             if !writers.is_empty() {
-                                std::thread::Builder::new()
+                                crate::daemon::DaemonThread::new()
                                     .name("context-secrets".into())
                                     .spawn(move || {
                                         for (mut w, secret) in writers {
@@ -1005,7 +1011,7 @@ impl Machine {
                             let framed = crate::synced::Framed::new(&mut out_w);
                             let status = std::thread::scope(|scope| -> Result<i32, String> {
                                 let framed = &framed;
-                                let saying = std::thread::Builder::new()
+                                let saying = crate::daemon::DaemonThread::new()
                                     .name("context-said".into())
                                     .spawn_scoped(scope, move || crate::synced::say(said_r, framed))
                                     .map_err(|e| format!("a thread for the build's output: {e}"))?;
@@ -1029,7 +1035,7 @@ impl Machine {
                                     }
                                     #[cfg(unix)]
                                     let _ = child;
-                                    let thread = std::thread::Builder::new()
+                                    let thread = crate::daemon::DaemonThread::new()
                                         .name("context-agents".into())
                                         .spawn_scoped(scope, move || {
                                             serve_agents(asking, stop_r, framed, whose, registry)
@@ -1117,7 +1123,7 @@ impl Machine {
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
         let (done, status) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
+        crate::daemon::DaemonThread::new()
             .name("copy-step".into())
             .spawn(move || {
                 let (code, out, err) = {
@@ -1482,7 +1488,7 @@ fn serve_agents<W: Write + Send>(
         let answering: Vec<_> = asking
             .iter()
             .filter_map(|(id, socket)| {
-                std::thread::Builder::new()
+                crate::daemon::DaemonThread::new()
                     .name("context-agent".into())
                     .spawn_scoped(scope, move || {
                         let (mut told, mut sent) = (Vec::new(), std::collections::VecDeque::new());
@@ -1800,13 +1806,13 @@ pub(super) fn listen(
         agents: Arc::default(),
     };
     let watched = home.clone();
-    std::thread::Builder::new()
+    crate::daemon::DaemonThread::new()
         .name("remote".into())
         .spawn(move || {
             let served = server::serve(&identity, at, machine, |bound, stopper| {
                 // The daemon ends with its process, the listener with it: it is not stopped.
                 let _ = tx.send(Ok(bound));
-                let revoking = std::thread::Builder::new()
+                let revoking = crate::daemon::DaemonThread::new()
                     .name("remote-revoke".into())
                     .spawn(move || {
                         if let Err(e) = revoke_as_removed(&watched, &stopper) {
@@ -2011,7 +2017,7 @@ mod tests {
         // All `reader` reads to its end, which must come.
         fn read_all(mut reader: impl Read + Send + 'static) -> Vec<u8> {
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
+            crate::daemon::party::spawn_member(move || {
                 let mut read = Vec::new();
                 let _ = tx.send(reader.read_to_end(&mut read).map(|_| read));
             });
@@ -2185,7 +2191,9 @@ mod tests {
         let registry = std::sync::Mutex::new(std::collections::HashMap::new());
         let asking = vec![("default".to_string(), ours)];
         let told = std::thread::scope(|scope| {
-            let serving = scope.spawn(|| serve_agents(&asking, &stop_r, &framed, "client", &registry));
+            let serving = crate::daemon::party::spawn_in(scope, || {
+                serve_agents(&asking, &stop_r, &framed, "client", &registry)
+            });
             shards_ipc::send(&build, kind::DIAL, &[], &[]).unwrap();
             let answer = shards_ipc::recv(&build).unwrap().unwrap();
             assert_eq!(answer.kind, kind::GRANTED);

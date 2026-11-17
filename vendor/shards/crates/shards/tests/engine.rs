@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use common::{
@@ -116,11 +116,87 @@ struct Api {
 /// comes when the daemon has it, and one from a daemon that makes no progress over a whole
 /// window past the slowest answer seen fails its test. Its kind is the site of the call it
 /// reads the answer of (`site`, which each of [`Api`]'s calls sets as it sends): a `_ping`'s
-/// answer and a container's wait's are no one kind.
+/// answer and a container's wait's are no one kind. Nor are an answer's head and its body
+/// ([`Part`]).
 struct Patient {
     conn: UnixStream,
     home: std::path::PathBuf,
     site: &'static std::panic::Location<'static>,
+    part: Part,
+    /// The end its asker gave the answer (its query's `until`): before it, its daemon may
+    /// sleep by the asker's own word. None where the call gives none.
+    due: Option<SystemTime>,
+}
+
+/// The part of an answer a read is of. Its head comes as the daemon takes the call. Its body
+/// comes when what it answers comes: a container's end, or the end its asker gave an events
+/// stream. CI 43968984258's x86_64 musl job taught each body's wait its head's W* and refused
+/// it while its party slept until then (this file's lines 595, 841, 1039 and 1425 at
+/// fe83503c2).
+#[derive(Clone, Copy)]
+enum Part {
+    Head,
+    Body,
+}
+
+/// What a read of an answer's body awaits, the key of its kind ([`Part`]).
+const BODY: &str = "its answer's body";
+
+impl Part {
+    /// What a read of it awaits: a head [`common::Patience::at`]'s own kind, its records kept.
+    fn awaited(self) -> &'static str {
+        match self {
+            Part::Head => common::STATE,
+            Part::Body => BODY,
+        }
+    }
+}
+
+/// The end the asker of the call to `path` gave its answer: its query's `until`, in whole
+/// seconds since the epoch, as these tests give it. None where it gives none.
+fn until_of(path: &str) -> Option<SystemTime> {
+    let (_, query) = path.split_once('?')?;
+    let secs = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("until="))?
+        .parse()
+        .ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
+}
+
+/// Whether `conn` has something to read, or has ended, within `wait`, so that a read then
+/// does not wait: poll(2)'s answer, its wait in whole milliseconds rounded up so that it
+/// never ends before its time, as the daemon's own `readable_within` waits; on Windows its
+/// pipe's (`shards_ipc::Stream::wait_readable`). It sets no option of the socket's. macOS
+/// refuses any, EINVAL, once its peer has closed, though what the peer sent first is still
+/// to be read. That is how ROOT's r664 (HVF) failed: an exec's whole answer and its close
+/// came between a look that found nothing and the read's timeout being set.
+fn readable_within(conn: &UnixStream, wait: Duration) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let mut polled = libc::pollfd {
+            fd: conn.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = i32::try_from(wait.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
+        loop {
+            // SAFETY: poll(2) of one pollfd of ours, whose descriptor `conn` holds open.
+            let ready = unsafe { libc::poll(&raw mut polled, 1, ms) };
+            if ready >= 0 {
+                return Ok(ready > 0);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        conn.wait_readable(None, std::time::Instant::now().checked_add(wait))
+    }
 }
 
 impl Read for Patient {
@@ -128,31 +204,27 @@ impl Read for Patient {
         // What its daemon has sent already is read without waiting: no answer waited for,
         // which would teach its kind a W* of one read (#77: engine.rs' `head`, refused "its
         // daemon made no progress" by a kind such reads taught).
-        self.conn.set_nonblocking(true)?;
-        let read = self.conn.read(buf);
-        self.conn.set_nonblocking(false)?;
-        match read {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            read => return read,
+        if readable_within(&self.conn, Duration::ZERO)? {
+            return self.conn.read(buf);
         }
-        let mut patience = common::Patience::at(&self.home, self.site);
+        // Until the end its asker gave the answer, its daemon owes it nothing: what comes
+        // before then is read as it comes, unjudged, and teaches its kind nothing (D209).
+        let left = self
+            .due
+            .and_then(|due| due.duration_since(SystemTime::now()).ok());
+        if let Some(left) = left
+            && readable_within(&self.conn, left)?
+        {
+            return self.conn.read(buf);
+        }
+        let mut patience = common::Patience::awaiting(&self.home, self.site, self.part.awaited());
         loop {
-            let left = patience.next_look();
-            if !left.is_zero() {
-                self.conn.set_read_timeout(Some(left))?;
-                match self.conn.read(buf) {
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    read => {
-                        if read.is_ok() {
-                            patience.done();
-                        }
-                        return read;
-                    }
+            if readable_within(&self.conn, patience.next_look())? {
+                let read = self.conn.read(buf);
+                if read.is_ok() {
+                    patience.done();
                 }
+                return read;
             }
             if !patience.holds() {
                 return Err(std::io::Error::new(
@@ -196,13 +268,23 @@ impl Api {
             conn: conn.try_clone().unwrap(),
             home: home.to_path_buf(),
             site: std::panic::Location::caller(),
+            part: Part::Head,
+            due: None,
         });
         Api { conn, reader }
     }
 
+    /// A call to `path` from the caller's site, whose answer its reads wait for.
+    #[track_caller]
+    fn asks(&mut self, path: &str) {
+        let patient = self.reader.get_mut();
+        patient.site = std::panic::Location::caller();
+        patient.due = until_of(path);
+    }
+
     #[track_caller]
     fn send(&mut self, method: &str, path: &str, body: Option<&Value>, fields: &[(&str, &str)]) {
-        self.reader.get_mut().site = std::panic::Location::caller();
+        self.asks(path);
         let body = body.map(|b| b.to_string()).unwrap_or_default();
         let mut out = format!("{method} {path} HTTP/1.1\r\nHost: api\r\n");
         for (k, v) in fields {
@@ -219,8 +301,9 @@ impl Api {
         self.conn.write_all(out.as_bytes()).unwrap();
     }
 
-    /// An answer's status and fields.
+    /// An answer's status and fields; what is read after them is its body ([`Part`]).
     fn head(&mut self) -> (u16, Vec<(String, String)>) {
+        self.reader.get_mut().part = Part::Head;
         let mut line = String::new();
         self.reader.read_line(&mut line).unwrap();
         let status = line
@@ -234,6 +317,7 @@ impl Api {
             self.reader.read_line(&mut line).unwrap();
             let line = line.trim_end();
             if line.is_empty() {
+                self.reader.get_mut().part = Part::Body;
                 return (status, fields);
             }
             let (k, v) = line.split_once(':').unwrap();
@@ -274,7 +358,7 @@ impl Api {
     /// A call whose body is `bytes` of `kind`, and its answer.
     #[track_caller]
     fn upload(&mut self, method: &str, path: &str, kind: &str, bytes: &[u8]) -> Answered {
-        self.reader.get_mut().site = std::panic::Location::caller();
+        self.asks(path);
         let head = format!(
             "{method} {path} HTTP/1.1\r\nHost: api\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n",
             bytes.len()

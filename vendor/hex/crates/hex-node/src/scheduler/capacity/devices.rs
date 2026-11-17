@@ -76,6 +76,7 @@ fn collect_offers(
                             hex_api::Class::Process | hex_api::Class::Oci => Class::Oci,
                             hex_api::Class::Firecracker => Class::Firecracker,
                             hex_api::Class::Shards => Class::Shards,
+                            hex_api::Class::ShardsImage => Class::ShardsImage,
                         });
                     }
                 }

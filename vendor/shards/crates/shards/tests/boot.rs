@@ -265,16 +265,25 @@ fn brings_up_every_vcpu() {
     }
 }
 
+/// Hypervisor.framework gives a process one VM at a time (`hv_vm_create` refuses a second,
+/// HV_EXISTS, hv/hvf/sys.rs): this binary's tests that run a machine in its own process take
+/// turns, each holding its turn until its machine has ended.
+static MACHINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn machine_turn() -> std::sync::MutexGuard<'static, ()> {
+    MACHINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Two vCPUs booted in this process, unconfined, to their end: the kernel panics for want
 /// of a root and resets, as `panic=-1` has it. The control for the SMP boots above, which
-/// run in a confined VM process. The one VM this binary makes in its own process
-/// (Hypervisor.framework allows one a process).
+/// run in a confined VM process.
 #[test]
 fn two_vcpus_boot_to_their_end_in_this_process() {
     use shards_vmm::vm::{self, Config, Console, ExitReason};
     if cannot_run_vms() {
         return;
     }
+    let _turn = machine_turn();
     let mut cfg = Config::new(kernel().to_path_buf(), None);
     cfg.vcpus = 2;
     cfg.memory_mib = 512;
@@ -297,38 +306,117 @@ fn two_vcpus_boot_to_their_end_in_this_process() {
 }
 
 /// The host's most vCPUs: the guest brings up as many as its kernel was built for, and is
-/// shown the rest, which its kernel names as it refuses them. Watched until its CPUs are
-/// up, then stopped: the rest of a boot of 64 vCPUs on a host of 4 took a CI runner's
-/// nested WHP 40 s and more.
+/// shown the rest, which its kernel names as it refuses them. Booted in this process and
+/// watched until its kernel says its CPUs are up, then stopped, judged by its own progress
+/// (D261): each line its kernel logs, read from its printk ring while its console has said
+/// nothing (from subsys_initcall, which publishes the ring's place, where hvc0 registers only
+/// at device_initcall: on a CI runner's nested WHP of 4 CPUs a 255-vCPU guest did not get
+/// there in 53 minutes), and from its console after. Its wait is refused only once the guest
+/// says nothing new for longer than the slowest gap between lines that passes of it saw on
+/// this host, and then says each line it said and when. On Windows each line is said as it
+/// comes, with its time.
+///
+/// On an Intel host's KVM, D261's A/B: the boot as it is, then, never beside it, one whose
+/// kernel brings its APs up one at a time (`cpuhp.parallel=0`), each arm's outcome said as it
+/// ends, so that one CI run says whether VMX's error 7 on its nested Intel runners comes of
+/// parallel bring-up's burst. The test fails as the boot as it is fails, else as the other.
 #[test]
 fn boots_the_hosts_maximum_vcpu_count() {
     if cannot_run_vms() {
         return;
     }
     let max = shards_vmm::vm::max_vcpus().unwrap();
-    let k = kernel();
-    let cpus = max.to_string();
-    let mut vm = common::Vm::spawn(&[
-        "run".as_ref(),
-        "--kernel".as_ref(),
-        k.as_os_str(),
-        "--cpus".as_ref(),
-        cpus.as_ref(),
-        "--memory".as_ref(),
-        "1024".as_ref(),
-        "--cmdline".as_ref(),
-        "console=hvc0 panic=-1".as_ref(),
-    ]);
+    if !kvm_on_intel() {
+        brings_up_the_most(max, "");
+        return;
+    }
+    let arms = [
+        bring_up_arm(max, "parallel", ""),
+        bring_up_arm(max, "one at a time", " cpuhp.parallel=0"),
+    ];
+    for arm in arms {
+        if let Err(failed) = arm {
+            std::panic::resume_unwind(failed);
+        }
+    }
+}
+
+/// Whether this host's KVM runs on Intel's CPUs, as Linux names its first processor's vendor
+/// (`/proc/cpuinfo`'s `vendor_id`, which `scripts/ci/kvm-host` logs): only VMX fails an entry
+/// with a VM-instruction error, which CI's 255-vCPU boots met (D261).
+fn kvm_on_intel() -> bool {
+    cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        && std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| {
+            info.lines()
+                .find_map(|l| l.split_once(':').filter(|(key, _)| key.trim() == "vendor_id"))
+                .is_some_and(|(_, vendor)| vendor.trim() == "GenuineIntel")
+        })
+}
+
+/// One arm of D261's A/B, [`brings_up_the_most`] told `also`: its outcome said on stderr as
+/// it ends, in a line of its own that CI's log keeps whether the test passes or not (`D261
+/// A/B arm`): brought up, the failed VM entry its machine ended with, or another failure,
+/// which its panic said above it; and its time from its start. What failed it is kept for its
+/// test to end with.
+fn bring_up_arm(max: u32, arm: &str, also: &str) -> std::thread::Result<()> {
+    use std::io::Write as _;
+    let start = std::time::Instant::now();
+    let ran = std::panic::catch_unwind(|| brings_up_the_most(max, also));
+    let failed = ran.as_ref().err().map(|failed| {
+        let said = failed
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failed.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        said.lines()
+            .find(|l| l.contains("VM entry failed"))
+            .map_or("failed otherwise, as its panic above says", str::trim)
+            .to_string()
+    });
+    let _ = writeln!(
+        std::io::stderr(),
+        "D261 A/B arm {arm} ({BRINGS_UP}{also}): {}; {:?} from its start",
+        failed.as_deref().unwrap_or("brought up"),
+        start.elapsed()
+    );
+    ran
+}
+
+/// [`brings_up_the_most`]'s command line. Its console at the kernel's own default level
+/// (`loglevel=7`: CONFIG_CONSOLE_LOGLEVEL_DEFAULT in the pinned kernels' base configs, which
+/// shards' leave), as `run --kernel` booted it with its console on stdout. Told no level, a
+/// machine whose console no one reads is told `quiet` (`vm::kernel_cmdline`), which keeps the
+/// bring-up off hvc0: a host whose ring is not read would never see it (D261).
+const BRINGS_UP: &str = "console=hvc0 panic=-1 loglevel=7";
+
+/// [`boots_the_hosts_maximum_vcpu_count`]'s boot of `max` vCPUs in this process, its kernel
+/// told `also` past [`BRINGS_UP`], which keys its waits apart beside their call site, so that
+/// one arm's answers judge no other's.
+fn brings_up_the_most(max: u32, also: &str) {
+    use shards_vmm::vm::{self, Config, Console};
+    let _turn = machine_turn();
+    let mut cfg = Config::new(kernel().to_path_buf(), None);
+    cfg.vcpus = max;
+    cfg.memory_mib = 1024;
+    cfg.cmdline = format!("{BRINGS_UP}{also}");
+    cfg.console = Console::Discard;
+    // Its whole console kept, and with it its kernel's whole ring while its console has said
+    // nothing: this test reads them as it goes (D12, D261).
+    cfg.said = usize::MAX;
+    let (handle, running) = vm::start(&cfg).unwrap_or_else(|e| panic!("{e}"));
+    let (tx, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(running.wait());
+    });
+    let tag = cfg!(windows).then_some("D261 WHP boot");
+    let (said, lines) = common::machine_says(&handle, &ended, "smp: Brought up", also, max, tag)
+        .unwrap_or_else(|failed| panic!("{failed}"));
     let configured = kernel_nr_cpus();
     let up = max.min(configured);
     let plural = if up == 1 { "" } else { "s" };
     let brought = format!("smp: Brought up 1 node, {up} CPU{plural}");
-    // A count other than the one asked for fails at once, with what the guest said. While it
-    // says something new: of more vCPUs than its host has CPUs, its VM process's CPU time
-    // counts only before its first line (`Heard::streaming`).
-    let said = vm.wait_for_any_streamed(&["smp: Brought up"], None);
-    vm.kill();
-    let seen = vm.seen.join("\n");
+    let seen = lines.timed();
+    // A count other than the one asked for fails at once, with what the guest said.
     assert!(said.contains(&brought), "{seen}");
     if max > configured {
         let refused = match common::ARCH {
@@ -337,7 +425,7 @@ fn boots_the_hosts_maximum_vcpu_count() {
             // arch/arm64/kernel/smp.c
             _ => format!("Number of cores ({max}) exceeds configured maximum of {configured}"),
         };
-        assert!(seen.contains(&refused), "{seen}");
+        assert!(lines.text().contains(&refused), "{seen}");
     }
 }
 
@@ -362,6 +450,26 @@ fn runs_init_as_pid_1_and_powers_off() {
         r.exit_us().expect("exit time"),
     );
     assert!(init_us < exit_us, "{r}");
+}
+
+/// PID 1 runs where its kernel opened it no console: a command line naming a console the
+/// machine has none of leaves PID 1's descriptors 0-2 closed (init/main.c
+/// `console_on_rootfs`), which Rust's runtime reopens on the initramfs's `/dev/null` before
+/// init's `main`, or aborts, ending PID 1 (D261). `hvc1` names none on any machine (the
+/// console has one port); `ttyS0`, Hex's guests' line, none on arm64, whose 8250 driver has
+/// no legacy port (x86-64's asm/serial.h gives it 0x3f8, UART or not).
+#[test]
+fn runs_init_where_its_kernel_opened_no_console() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (k, init) = (kernel().to_str().unwrap(), guest_init().to_str().unwrap());
+    for console in ["console=hvc1", "console=ttyS0"] {
+        let line = format!("{console} quiet panic=-1");
+        let r = vm_run(&["--kernel", k, "--init", init, "--cmdline", line.as_str()]);
+        assert_eq!(r.status, Some(0), "{console}: {r}");
+        assert!(r.marker_us(1).is_some(), "{console}: {r}");
+    }
 }
 
 #[test]
@@ -1042,7 +1150,7 @@ fn snapshot_tests_pass_on_a_kvm_host_of_this_architecture() {
     // take them, whose MSIs its GICv2m frame does not isolate (D154; iommufd/device.c,
     // iommufd_device_bind, refused a node's bind with EPERM without it).
     let pci_tests = std::env::var("SHARDS_L1_PCI_TESTS").ok();
-    let outer = |initrd: &std::path::Path, cpus: &str, memory: &str, cmdline: &str| {
+    let outer = |initrd: &std::path::Path, cpus: &str, memory: &str, cmdline: &str, more: &[&str]| {
         let unsafe_msis = match &pci_tests {
             Some(_) => " vfio_iommu_type1.allow_unsafe_interrupts=1 iommufd.allow_unsafe_interrupts=1",
             None => "",
@@ -1064,12 +1172,13 @@ fn snapshot_tests_pass_on_a_kvm_host_of_this_architecture() {
         if let Some(places) = &pci_tests {
             args.extend(["--pci-tests", places.as_str()]);
         }
+        args.extend_from_slice(more);
         vm_run(&args)
     };
     // Whether this host gives a guest EL2, before the tests are built for one.
     let probe = dir.join("probe.cpio");
     std::fs::write(&probe, shards_vmm::initramfs::with_init(&read(test_guest()))).unwrap();
-    let probed = outer(&probe, "1", "256", "shards_test=kmsg");
+    let probed = outer(&probe, "1", "256", "shards_test=kmsg", &[]);
     if probed.stderr.contains("gives a guest no EL2") {
         eprintln!("SKIP: this host gives a guest no EL2");
         return;
@@ -1186,8 +1295,10 @@ fn snapshot_tests_pass_on_a_kvm_host_of_this_architecture() {
         run.push_str(&format!("/{name} --test-threads=1 {args}\n"));
         names.push(name);
     }
+    // SHARDS_L1_OUT is where the guest mounts this host's share (`--share`, the test guest's
+    // e2e mode): what a test leaves there, this host reads once the guest is gone.
     let mut env = String::from(
-        "HOME=/tmp\nPATH=/e2e/bin\nTMPDIR=/tmp\nXDG_CACHE_HOME=/tmp/cache\nRUST_BACKTRACE=1\nSHARDS_REQUIRE_VMS=1\nSHARDS_TEST_GUESTS=/e2e/guests\n",
+        "HOME=/tmp\nPATH=/e2e/bin\nTMPDIR=/tmp\nXDG_CACHE_HOME=/tmp/cache\nRUST_BACKTRACE=1\nSHARDS_REQUIRE_VMS=1\nSHARDS_TEST_GUESTS=/e2e/guests\nSHARDS_L1_OUT=/e2e/out\n",
     );
     if let Ok(level) = std::env::var("SHARDS_L1_LOG") {
         env.push_str(&format!("SHARDS_LOG={level}\n"));
@@ -1208,7 +1319,15 @@ fn snapshot_tests_pass_on_a_kvm_host_of_this_architecture() {
         .file("e2e/env", 0o644, env.as_bytes());
     let initrd = dir.join("l1.cpio");
     std::fs::write(&initrd, cpio.finish()).unwrap();
-    let ran = outer(&initrd, "8", "24576", "shards_test=e2e");
+    let out = dir.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let ran = outer(
+        &initrd,
+        "8",
+        "24576",
+        "shards_test=e2e",
+        &["--share", out.to_str().unwrap()],
+    );
     // SHARDS_L1_CONSOLE names a file its console is written to, passing or failing, for
     // what the tests in it say of themselves.
     if let Some(console) = std::env::var_os("SHARDS_L1_CONSOLE") {
@@ -1228,6 +1347,9 @@ fn snapshot_tests_pass_on_a_kvm_host_of_this_architecture() {
         "{ran}"
     );
     assert_eq!(ran.status, Some(0), "{ran}");
+    // A run's save a test left to scan (api_image's, D259), judged here as that test judges
+    // one in place: the guest has no Python.
+    common::judge_left_leak_scan(&out);
 }
 
 /// A snapshot of a guest with memory to plug, none of it plugged (D148): the VM that
@@ -1326,17 +1448,20 @@ fn a_guest_grows_and_gives_back_its_memory() {
     if cannot_run_vms() {
         return;
     }
-    let mut child = common::command()
-        .env("SHARDS_TIMING", "1")
-        .args(["run", "--kernel", kernel().to_str().unwrap()])
-        .args(["--init", test_guest().to_str().unwrap()])
-        .args(["--memory", "256", "--memory-max", "1280", "--cmdline"])
-        .arg("console=hvc0 panic=-1 shards_test=hotplug shards_plug_mib=1024 memhp_default_state=online_movable")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    // Killed as it drops, as this test's panic unwinds too: its guest waits on its stdin.
+    let mut child = common::Reaped(
+        common::command()
+            .env("SHARDS_TIMING", "1")
+            .args(["run", "--kernel", kernel().to_str().unwrap()])
+            .args(["--init", test_guest().to_str().unwrap()])
+            .args(["--memory", "256", "--memory-max", "1280", "--cmdline"])
+            .arg("console=hvc0 panic=-1 shards_test=hotplug shards_plug_mib=1024 memhp_default_state=online_movable")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     // `shards run --kernel` becomes the VM process on Unix, the same pid; on Windows it
     // starts the VM process, its child, found once the guest has said it plugged.
     let front = child.id();
@@ -2190,13 +2315,107 @@ fn shards_api_shares_a_directory_and_a_read_only_one() {
     assert!(!ro.join("from-guest").exists());
 }
 
+/// Waits until VM `child`'s vsock socket accepts, which it does once its VM process has made its
+/// device and listens. On macOS its spawner binds the path first and a client is refused until
+/// the VM listens, so the path's being there says nothing: a dial that connects does. On
+/// Windows its spawner makes its pipes and names them at the path first (D272): a dial opens
+/// them at once, its connection taken as the device comes up, and the next dial waits for the
+/// device's next pair. Waited for while its VM process lives, each dial paced as shards-api
+/// paces its own (`shards_api::pause`), with no clock of the test's (WHP at 0a3dde0db: a dial
+/// as the path appeared was refused, WSAECONNREFUSED).
+fn listening(socket: &std::path::Path, child: &mut common::Reaped) {
+    let began = std::time::Instant::now();
+    loop {
+        let dialed = std::time::Instant::now();
+        if socket.exists() {
+            match common::vsock_dial(socket) {
+                Ok(_) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                Err(e) => panic!("dialing {}: {e}", socket.display()),
+            }
+        }
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "its VM ended before it listened"
+        );
+        std::thread::sleep(shards_api::pause(
+            dialed.elapsed(),
+            began.elapsed(),
+            Duration::MAX,
+        ));
+    }
+}
+
+/// A VM a failing test boots ends with that test: its panic unwinds through the
+/// [`common::Reaped`] it holds, which ends the VM process as it drops. Before, a bare child ran
+/// on past its test and its binary (CI 43968984258, x86_64 gnu: the rate test's guest, told to
+/// spin ten minutes, ran 6.5 minutes past boot.rs's end). Its guest serves and does nothing
+/// else, so that a VM left running is one whose wait for its end sees no progress.
+#[test]
+fn a_failing_tests_vm_ends_with_it() {
+    if cannot_run_vms() {
+        return;
+    }
+    let dir = common::TempDir::new("reaped");
+    let socket = dir.join("v");
+    let mut vm = 0;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut child = common::Reaped(
+            common::command()
+                .args(["run", "--kernel", kernel().to_str().unwrap()])
+                .args(["--init", test_guest().to_str().unwrap()])
+                .args(["--cpus", "1", "--memory", "256", "--no-console", "--vsock"])
+                .arg(&socket)
+                .args(["--cmdline", "console=hvc0 panic=-1 quiet shards_test=echo"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        listening(&socket, &mut child);
+        // `run --kernel` becomes the VM process on Unix; on Windows it starts it.
+        #[cfg(unix)]
+        {
+            vm = child.id();
+        }
+        #[cfg(windows)]
+        {
+            let found = common::vm_processes(child.id());
+            assert_eq!(found.len(), 1, "shards {}'s VM processes: {found:?}", child.id());
+            vm = found[0];
+        }
+        panic!("a test failing with its VM running");
+    }));
+    assert!(failed.is_err(), "the test went on past its failure");
+    assert_ne!(vm, 0, "no VM process found");
+    let mut ending = common::Wait::begin(
+        common::WaitKind::at(std::panic::Location::caller()),
+        vm,
+        None,
+        "a failed test's VM process",
+    );
+    while common::alive(i32::try_from(vm).unwrap()) {
+        if let Err(stall) = ending.look(false) {
+            panic!(
+                "VM process {vm} outlived its failed test: {}",
+                ending.refused(&stall)
+            );
+        }
+        std::thread::sleep(ending.next_look());
+    }
+    ending.answered();
+}
+
 /// A managed guest's rate (D255): a guest booted `--host-managed`, spinning its one vCPU, is
 /// held by its VM's governor to the quarter CPU a client asks on its vsock socket (`RATE`,
 /// `shards_abi::rate`), as `ManagedGuest::rate` asks it. Its vCPU runs its guest no more than
 /// a quarter of the time passing, two of its governor's periods (its share where the window
 /// and the periods do not line up, and what its vCPU overruns before the governor reads, at
 /// the window's two ends) and one step of its guest time's count (`guest_time_step`), read
-/// by `USE`: the hold holds its vCPUs, never its VM process's governor or devices, whose CPU
+/// by `USE`; or, where that count is KVM's scheduler ticks, its VM process's CPU time, read
+/// by the same `USE`, runs no more than the first two (D265, amended by ci-fixes): the hold
+/// holds its vCPUs, never its VM process's governor or devices, whose CPU
 /// is shards' own (D191). Its vCPU's whole CPU holds nothing, and
 /// none lifts its hold; each answer says the period its VM derives from g as it knows it then,
 /// 4g held to a quarter and g let be (D191). Its use
@@ -2223,46 +2442,21 @@ fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
         if managed {
             cmd.arg("--host-managed");
         }
-        cmd.arg("--cmdline")
-            .arg("console=hvc0 panic=-1 quiet shards_test=spin shards_spin_ms=600000 shards_idle_ms=0")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap()
-    };
-    // Its socket accepts once its VM process has made its device and listens. On macOS and
-    // Windows its spawner binds the path first and a client is refused until the VM listens
-    // (grant_answer.rs `bound`), so the path's being there says nothing: a dial that connects
-    // does. Waited for while its VM process lives, each dial paced as shards-api paces its
-    // own (`shards_api::pause`), with no clock of the test's (WHP at 0a3dde0db: a dial as the
-    // path appeared was refused, WSAECONNREFUSED).
-    let listening = |socket: &std::path::Path, child: &mut std::process::Child| {
-        let began = Instant::now();
-        loop {
-            let dialed = Instant::now();
-            if socket.exists() {
-                match shards_vmm::platform::UnixStream::connect(socket) {
-                    Ok(_) => return,
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
-                    Err(e) => panic!("dialing {}: {e}", socket.display()),
-                }
-            }
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "its VM ended before it listened"
-            );
-            std::thread::sleep(shards_api::pause(
-                dialed.elapsed(),
-                began.elapsed(),
-                Duration::MAX,
-            ));
-        }
+        // Killed as it drops, as this test's panic unwinds too: its guest spins ten minutes.
+        common::Reaped(
+            cmd.arg("--cmdline")
+                .arg("console=hvc0 panic=-1 quiet shards_test=spin shards_spin_ms=600000 shards_idle_ms=0")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
     };
     // One ask, and the line its VM answers before it closes the ask: none where it closes it
     // unanswered.
     let asked = |socket: &std::path::Path, milli: u64| {
-        let mut s = shards_vmm::platform::UnixStream::connect(socket).unwrap();
+        let mut s = common::vsock_dial(socket).unwrap();
         s.write_all(ask(milli).as_bytes()).unwrap();
         let mut line = String::new();
         s.read_to_string(&mut line).unwrap();
@@ -2272,7 +2466,7 @@ fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
     let mut child = boot(&socket, true);
     listening(&socket, &mut child);
     let used = |socket: &std::path::Path| {
-        let mut s = shards_vmm::platform::UnixStream::connect(socket).unwrap();
+        let mut s = common::vsock_dial(socket).unwrap();
         s.write_all(shards_abi::rate::USE_ASK).unwrap();
         let mut answer = Vec::new();
         s.read_to_end(&mut answer).unwrap();
@@ -2298,14 +2492,29 @@ fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
     );
     // Its window from before the first read is asked until the second is answered: the
     // reads fall within it.
-    let (start, before) = (Instant::now(), read(&used(&socket)).0.total_ns());
+    let start = Instant::now();
+    let before = read(&used(&socket));
     std::thread::sleep(Duration::from_secs(2));
-    let ran = read(&used(&socket)).0.total_ns() - before;
+    let after = read(&used(&socket));
+    let ran = after.0.total_ns() - before.0.total_ns();
     let wall = u64::try_from(start.elapsed().as_nanos()).unwrap();
-    let most = wall / 4 + 2 * period_ns.get() + step;
+    let most = wall / 4 + 2 * period_ns.get();
+    // KVM counts guest time in whole scheduler ticks, each charged to what its vCPU's thread
+    // ran as it landed (`thread_guest_ns`): a vCPU let run once a period is counted a tick more
+    // or less each time, so over hundreds of periods its count may pass what it ran by more
+    // than a step, by as much as no tick says (CI 43968984258: 2.37 ms past). Its VM process's
+    // CPU time, which Linux counts to the nanosecond (`task_sched_runtime`) and which holds
+    // its vCPU's guest time (D265's `ToThread`), witnesses the hold there: within `most`, its
+    // vCPU ran no more, whatever its ticks say.
+    let own = after.1.cpu_ns - before.1.cpu_ns;
     assert!(
-        ran <= most,
-        "{ran} ns of guest in {wall} ns, held to a quarter CPU over {period_ns} ns, read in {step} ns steps"
+        ran <= most + step || (cfg!(target_os = "linux") && own <= most),
+        "{ran} ns of guest in {wall} ns, held to a quarter CPU over {period_ns} ns (at most {most} ns), read in {step} ns steps; its VM process ran {own} ns of CPU meanwhile, {}",
+        if own > most {
+            "past what its vCPU may run: its governor let its vCPU overrun, or its own threads ran the rest"
+        } else {
+            "within it: its guest time's count passed what its vCPU ran"
+        }
     );
     assert!(
         ran >= wall / 20,

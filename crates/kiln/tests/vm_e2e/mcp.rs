@@ -95,7 +95,8 @@ pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> a
     let prompt = vm_e2e::task("VM_E2E_PROMPT", kind, &n, format!("do the task {n}"));
     let what = format!("{kind} from {image} through {}", via.through());
     let done = |i: &Value, e: &[Value]| vm_e2e::status(i) == "idle" && vm_e2e::said_marker(&vm_e2e::said(e), &marker);
-    let mut pace = vm_e2e::Pace::default();
+    // Its waits follow its own answers and, while a session of it starts, its own processes on the host.
+    let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?;
     let mut ends = vm_e2e::Ends::new(f);
     eprintln!("DRIVE: {kind} from {image} in a microVM on {} through {}", f.machine, via.through());
 
@@ -151,8 +152,8 @@ pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> a
 
 /// Each harness through kiln's MCP server `via` its tools or code mode, from kiln's Agentfile and from a
 /// person's own; every failure said as it comes and again at the end, so a run ended from outside shows
-/// where each drive stood. Its drives share one runner, whose answers to the first bound the later ones'
-/// cold starts (`vm_e2e::Learned`). The stand-in's image (`VM_E2E_IMAGE_<KIND>=stub`) is kept in kiln for
+/// where each drive stood. Its drives share one runner, and each is judged by its own answers and its own
+/// processes alone ([`vm_e2e::Pace`]). The stand-in's image (`VM_E2E_IMAGE_<KIND>=stub`) is kept in kiln for
 /// its harness's drives and booted as `agentfile:<id>` ([`vm_e2e::boots`]), as the REST drive boots it.
 fn every_harness(via: Via) -> anyhow::Result<()> {
     let gaps = super::gaps()?;

@@ -1406,6 +1406,21 @@ mod tests {
         (port, served)
     }
 
+    /// An asking of a [`serving`] script's: its client's waits follow their connections'
+    /// liveness alone, as the registry's clients of scripted servers' do (shards-registry
+    /// `testing::client`). A client that learns cuts a lookup's answer past the slowest its
+    /// path has shown and asks again at once (D222), on a connection the script never
+    /// answers: a fresh path's second answer is its slowest with chance 1/2 where their
+    /// times are alike (Glick 1978), and CI 43968984258's darwin job cut the re-ask after
+    /// the cut body so, its third connection refused.
+    fn scripted() -> Asking {
+        let Asking { client, dropped } = Asking::new(&Cancel::new(), None).unwrap();
+        Asking {
+            client: client.following_liveness(),
+            dropped,
+        }
+    }
+
     /// An advertisement's body the network cut short, 10 of its 32 bytes come, is fetched
     /// again, the asking said in the step's log, and read whole (D276).
     #[test]
@@ -1419,7 +1434,7 @@ mod tests {
             answer.extend_from_slice(if n == 0 { &WHOLE[..10] } else { &WHOLE[..] });
             answer
         });
-        let asking = Asking::new(&Cancel::new(), None).unwrap();
+        let asking = scripted();
         let said = RefCell::new(Vec::new());
         let url = format!("http://127.0.0.1:{port}/repo.git");
         let got = ridden(&asking, &|line| said.borrow_mut().push(line.to_string()), || {
@@ -1471,6 +1486,54 @@ mod tests {
                 )),
             "{e}"
         );
+    }
+
+    /// A Git source's fetch over smart HTTP is held to its directive's grant (D54, P4.3): its
+    /// advertisement redirected to another origin is refused before anything is sent there,
+    /// naming both origins, and followed once `--redirect` grants that origin.
+    #[test]
+    fn a_git_sources_redirect_elsewhere_is_refused_until_granted() {
+        let (elsewhere, seen_elsewhere) = super::super::http::serve(|_| {
+            (
+                format!("HTTP/1.1 200 OK\r\nContent-Type: {ADVERTISEMENT_TYPE}"),
+                b"0000".to_vec(),
+            )
+        });
+        let (first, _) = super::super::http::serve(move |_| {
+            (
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{elsewhere}/repo.git/info/refs?service=git-upload-pack"
+                ),
+                Vec::new(),
+            )
+        });
+        let url = format!("http://127.0.0.1:{first}/repo.git");
+        let asking = Asking::new(&Cancel::new(), None).unwrap();
+        let advertised = |grant: &super::super::grant::Redirects| {
+            let http = Http::new(&url, &asking, None, Some((url.as_str(), grant)))?;
+            let mut body = Vec::new();
+            http.advertise()?
+                .read_to_end(&mut body)
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(body)
+        };
+        assert_eq!(
+            advertised(&super::super::grant::Redirects::default()),
+            Err(format!(
+                "unable to access 'http://127.0.0.1:{first}/repo.git/': redirected from http://127.0.0.1:{first} to http://127.0.0.1:{elsewhere}, which the source does not grant: name it with --redirect=HOST[:PORT]"
+            ))
+        );
+        assert!(
+            seen_elsewhere.lock().unwrap().is_empty(),
+            "nothing reached the origin refused"
+        );
+        let granted = super::super::grant::of(&BTreeMap::from([(
+            b"shards.grant".to_vec(),
+            format!("127.0.0.1:{elsewhere}").into_bytes(),
+        )]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(advertised(&granted), Ok(b"0000".to_vec()));
     }
 
     #[test]

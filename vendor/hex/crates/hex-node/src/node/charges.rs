@@ -88,7 +88,10 @@ impl Cgroups for Kernel<'_> {
             Some(Err(why)) => return Err(Refusal::Broken(format!("box {id}'s record: {why}"))),
             None => return Err(Refusal::NoSuchBox(id.try_clone()?)),
         };
-        if record.spec.class.class() != hex_api::Class::Shards {
+        if !matches!(
+            record.spec.class.class(),
+            hex_api::Class::Shards | hex_api::Class::ShardsImage
+        ) {
             return unheld("a Firecracker VM's process answers no use");
         }
         guest.managed_guest_time(&record)
@@ -301,8 +304,8 @@ fn budget_of(max: Option<&str>, machine: u64) -> u64 {
 /// VMM's cgroup alone holding it.
 fn room_awaits(class: Class) -> &'static [Upstream] {
     match class {
-        Class::Shards => &[Upstream::GuestRoom],
-        _ => &[],
+        Class::Shards | Class::ShardsImage => &[Upstream::GuestRoom],
+        Class::Oci | Class::Firecracker => &[],
     }
 }
 
@@ -1525,6 +1528,8 @@ impl Node {
             };
             let class = match record.spec.class.class() {
                 hex_api::Class::Shards => Class::Shards,
+                // Its own class (P2.2): its windows never raise a Hex guest's prior, nor theirs its.
+                hex_api::Class::ShardsImage => Class::ShardsImage,
                 hex_api::Class::Firecracker => Class::Firecracker,
                 hex_api::Class::Process | hex_api::Class::Oci => return Ok(None),
             };
@@ -1571,6 +1576,7 @@ impl Node {
     ) -> Result<(), Refusal> {
         let class = match class {
             hex_api::Class::Shards => Class::Shards,
+            hex_api::Class::ShardsImage => Class::ShardsImage,
             hex_api::Class::Firecracker => Class::Firecracker,
             hex_api::Class::Process | hex_api::Class::Oci => return Ok(()),
         };

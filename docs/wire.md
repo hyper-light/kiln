@@ -700,6 +700,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   (`ServerMsg::Prebuild`; kiln plan 01a1dd2e…, P4.5), as a session of its harness there builds it,
   and says where each build is (`AgentMsg::Prebuilt`); a runner that didn't name it is asked nothing,
   and its sessions build their images as they start.
+  `agentfiles.prebuild.end`: the runner ends a build it runs ahead where no one waits for it: an older
+  version's as its Agentfile's next version is asked, and every one of an Agentfile the server says
+  was deleted (`ServerMsg::Prebuild` with `{"end": <id>}`, sent only to a runner that named this);
+  a build ended drops its `shards build` and all it started (kiln goal 3cd82843).
   `secrets.leases`: the server answers its runners' runs' credential leases and sign-ins from its
   run-lease broker (`ReachAsk`'s `lessor`; plan step 33, Shards' D242); a runner asks them only of a
   server that named it, and grants its isolated harnesses no sign-in until one has. Its launches
@@ -711,6 +715,11 @@ run out, and two lines can't take the same one by accident as they could a bit.
   them and their frames (`net::Out::Wiped`); the server wipes every `ReachAsk` it reads and every
   `lessor` answer it sends, and reads a `lessor` ask, which kiln writes beginning `{"op":"lessor",`,
   without copying it to look for unknown fields.
+  `agents.volumes`: the runner lists the agent volumes its microVMs' store keeps, those of the names
+  the server asks alone, and clears one once no session holds it (`ServerMsg::Volumes`; kiln plan
+  01a1dd2e…, P6.2), answering each refusal by its cause; a runner that didn't name it isn't asked: a
+  person's view of their volumes says so, and a start's placement counts none of their bytes as held
+  there.
 
 ## Registry
 
@@ -776,7 +785,8 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 81 | `RunnerEngine` | | main (kiln plan 01a1dd2e…, P2.3): a runner's engine as its owner set it, JSON, to a runner that named `runner.engine` |
 | `ServerMsg` | 82 | `AdoptPolicy` | | main (CP-T3.2): the room a hand-over's spool leaves on a runner's volume, JSON, to a runner that named `reach.adopt-policy` |
 | `ServerMsg` | 83 | `Replay` | | main, withdrawn (kiln plan 01a1dd2e…, P7.1b: replays were never part of experiments): its place kept, as `Prebuild` follows it; no server sends it, and a runner refuses it as a kind it doesn't know, its `req` answered why |
-| `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild` |
+| `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild`; `{"end": <id>}`, a deleted Agentfile's builds to end, to one that named `agentfiles.prebuild.end` |
+| `ServerMsg` | 85 | `Volumes` | | this line (kiln plan 01a1dd2e…, P6.2): agent volumes of a runner's microVMs' store listed by their names, or one cleared, JSON, to a runner that named `agents.volumes` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -1039,6 +1049,7 @@ Four edges are left, and the lab steers clear of each:
 | `AdoptPolicy` | state | The room a hand-over's spool leaves on this runner's volume (`harness::moving::stream::Told`, JSON: `{disk_floor}`, the operator's `[ci.scheduler.admission] disk_free` in bytes, or null for none set): its reach node takes sessions over from other machines under it (docs/reach.md §8), and forgets it as its server drops. Until it knows it, it refuses every hand-over. The newest wins. | New: to runners that named `reach.adopt-policy`, as they name it (each time they connect). |
 | `Replay` | ask | Withdrawn (P7.1b): sent by no server; a runner refuses it as a kind it doesn't know, answering its `req` why. | As its class says. |
 | `Prebuild` | command, parked | Build an Agentfile ahead of its sessions (`agentfiles::prebuild::Ask`, JSON: `{agentfile, version, harness, text, secrets?}`): its text at a version, beside kiln's harness directory for one of kiln's harnesses, given the secrets it names (P4.7), into the store the runner's microVMs boot from, as a session of that harness builds it there, so the session that starts after it builds nothing. Answered by `Prebuilt` as it goes. | New: to the newest process of a runner that named `agentfiles.prebuild`, at each save of the Agentfile (or of an agent definition naming it), and again for those not done or failed each time one of its processes names the feature. |
+| `Volumes` | ask | An agent's volumes on the runner's microVMs (`agentdefs::volumes::Ask`, JSON: `{"list": {stores}}`, the store names asked, or `{"clear": {store}}`): those of the names asked that its store keeps, each with the bytes its files take, its bound, its charge and when it was made, or one cleared once no session holds it. Answered by `Answer` (`agentdefs::volumes::Answer`: `listed`, `cleared`, or `refused` with its cause: `in_use`, `unknown`, `bound`, `clearing`, `unsupported` where the machine keeps none, `failed`). | New: to runners that named `agents.volumes`; a runner that didn't isn't asked. |
 
 ## Commands to a session: `Command`
 

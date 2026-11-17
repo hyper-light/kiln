@@ -32,11 +32,55 @@ pub enum Step {
 pub struct Failure {
     pub step: Step,
     pub errno: i32,
+    /// What its setup was doing, where the member's process told it ([`report_doing`]).
+    pub doing: Option<Doing>,
 }
 
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: errno {}", self.step, self.errno)
+        match self.doing {
+            Some(doing) => write!(
+                f,
+                "{:?} ({}): errno {}",
+                self.step,
+                doing.what().to_string_lossy(),
+                self.errno
+            ),
+            None => write!(f, "{:?}: errno {}", self.step, self.errno),
+        }
+    }
+}
+
+/// What a member's process was doing as a step of its setup failed: one of its settings, or
+/// of its confinement (domains.rs `child` and `exec_child`). Told beside the step's errno, so
+/// the launch's error names it as the member's output does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Doing {
+    Setting(crate::domains::Setting),
+    Confining(crate::domains::Confining),
+}
+
+impl Doing {
+    pub fn what(self) -> &'static std::ffi::CStr {
+        match self {
+            Doing::Setting(s) => s.what(),
+            Doing::Confining(c) => c.what(),
+        }
+    }
+
+    fn encode(self) -> [u8; 2] {
+        match self {
+            Doing::Setting(s) => [1, s as u8],
+            Doing::Confining(c) => [2, c as u8],
+        }
+    }
+
+    fn decode([kind, code]: [u8; 2]) -> Option<Doing> {
+        match kind {
+            1 => crate::domains::Setting::of(code).map(Doing::Setting),
+            2 => crate::domains::Confining::of(code).map(Doing::Confining),
+            _ => None,
+        }
     }
 }
 
@@ -95,6 +139,7 @@ impl Failure {
         Self {
             step,
             errno: libc::EPROTO,
+            doing: None,
         }
     }
 
@@ -117,6 +162,7 @@ impl Failure {
                 _ => return None,
             },
             errno,
+            doing: None,
         })
     }
 }
@@ -220,6 +266,10 @@ pub struct Owned {
     pid: libc::pid_t,
     pidfd: OwnedFd,
     _group: std::fs::File,
+    /// Its generation's own cgroup, `gen/` beneath its member's (D270): its reaper, command and
+    /// every command run in it, whose `cgroup.kill` and `cgroup.events` are its population's;
+    /// its member's limits are `_group`'s, over this and its server instance's `server/`.
+    population: std::fs::File,
     kill: std::fs::File,
     events: std::fs::File,
     owner: Option<OwnedFd>,
@@ -234,6 +284,7 @@ pub struct Owned {
 /// All inherited descriptors exist before clone3; neither child allocates before exec.
 pub struct Launch {
     binary: OwnedFd,
+    population: std::fs::File,
     events: std::fs::File,
     kill: std::fs::File,
     owner: (OwnedFd, OwnedFd),
@@ -256,6 +307,8 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 impl Launch {
+    /// A launch into `group`, its generation's own cgroup (D270, `gen/`), whose population its
+    /// lifecycle follows and kills.
     pub fn new(last_cap: u32, group: &std::fs::File) -> io::Result<Self> {
         // SAFETY: open(2) of init's own executable, before entering an actor root.
         let binary = unsafe { libc::open(c"/proc/self/exe".as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
@@ -268,6 +321,7 @@ impl Launch {
         std::fs::File::from(owner.1.try_clone()?).write_all(&last_cap.to_be_bytes())?;
         Ok(Self {
             binary,
+            population: group.try_clone()?,
             events: open_at(group, c"cgroup.events", libc::O_RDONLY)?,
             kill: open_at(group, c"cgroup.kill", libc::O_WRONLY)?,
             owner,
@@ -281,6 +335,21 @@ impl Launch {
 
     /// Only the actor branch returns; the namespace init immediately execs fresh code.
     pub fn child(&self) -> RawFd {
+        self.child_into(None, None)
+    }
+
+    /// [`child`](Self::child), the actor entering `mounts`, the mount namespace its member's
+    /// earlier generations had (D270), where given, rather than a copy of its reaper's; and
+    /// both entering `cgroup`, their cgroup namespace, where given, joined here, in its leaf,
+    /// since a clone into a cgroup from inside it is refused under `nsdelegate` (its failure
+    /// said on the ready pipe, as the helper's are).
+    pub fn child_into(&self, mounts: Option<RawFd>, cgroup: Option<RawFd>) -> RawFd {
+        if let Some(fd) = cgroup {
+            // SAFETY: setns(2) of a namespace descriptor, from the namespace's single thread.
+            if unsafe { libc::setns(fd, libc::CLONE_NEWCGROUP) } != 0 {
+                raw_fail(self.ready.1.as_raw_fd(), Step::Helper);
+            }
+        }
         // SAFETY: raw clone as fork, from the namespace's single thread. No Rust runtime
         // or allocator is entered in either branch before its exec.
         let actor = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) };
@@ -303,7 +372,11 @@ impl Launch {
                 ] {
                     libc::close(fd);
                 }
-                if libc::unshare(libc::CLONE_NEWNS) != 0 || !raw_write(self.split.1.as_raw_fd(), &[SPLIT]) {
+                let separated = match mounts {
+                    None => libc::unshare(libc::CLONE_NEWNS),
+                    Some(fd) => libc::setns(fd, libc::CLONE_NEWNS),
+                };
+                if separated != 0 || !raw_write(self.split.1.as_raw_fd(), &[SPLIT]) {
                     raw_fail(self.setup.1.as_raw_fd(), Step::Setup);
                 }
                 libc::close(self.split.1.as_raw_fd());
@@ -383,10 +456,18 @@ impl Launch {
         }
         // SAFETY: CLONE_PIDFD stored a new descriptor into this slot in the parent.
         let pidfd = unsafe { OwnedFd::from_raw_fd(self.pidfd) };
+        self.parent_of(pid, pidfd, group)
+    }
+
+    /// [`parent`](Self::parent) of a reaper cloned by another process, its pidfd opened here
+    /// (pidfd_open(2)), as a later generation's is (D270): its cloner gives it this process as
+    /// its parent (`CLONE_PARENT`), so that its PID is no other's until this process reaps it.
+    pub fn parent_of(self, pid: libc::pid_t, pidfd: OwnedFd, group: std::fs::File) -> io::Result<Owned> {
         let owned = Owned {
             pid,
             pidfd,
             _group: group,
+            population: self.population,
             kill: self.kill,
             events: self.events,
             owner: Some(self.owner.1),
@@ -402,6 +483,46 @@ impl Launch {
 impl Owned {
     pub fn group(&self) -> &std::fs::File {
         &self._group
+    }
+
+    /// Its generation's own cgroup (D270, `gen/`): where its processes are listed.
+    pub fn population(&self) -> &std::fs::File {
+        &self.population
+    }
+
+    /// How its reaper ended, where it has, read without reaping it: what a launch whose reaper
+    /// said nothing ([`Failure`]'s EPROTO) adds to its words.
+    pub fn reaper_end(&self) -> Option<String> {
+        // SAFETY: a zeroed siginfo_t is a valid one for waitid(2) to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let id = libc::id_t::try_from(self.pidfd.as_raw_fd()).ok()?;
+        // SAFETY: waitid(2) of its reaper by its pidfd, neither reaping it (WNOWAIT) nor waiting
+        // for it (WNOHANG), into the siginfo_t above.
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                id,
+                &raw mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // SAFETY: si_pid and si_status of a siginfo_t waitid(2) filled for a child's end.
+        let (pid, status) = unsafe { (info.si_pid(), info.si_status()) };
+        if waited != 0 || pid == 0 {
+            return None;
+        }
+        Some(match info.si_code {
+            libc::CLD_EXITED => format!("its reaper exited {status}"),
+            libc::CLD_KILLED | libc::CLD_DUMPED => format!("its reaper was killed by signal {status}"),
+            code => format!("its reaper ended, code {code}, status {status}"),
+        })
+    }
+
+    /// Its generation ended at once (D270, `builtin::MEMBER_KILL`): SIGKILL to its reaper, its
+    /// PID namespace's init, which takes every process of that namespace with it and nothing
+    /// of its member's beside them. One reaped already is ended already.
+    pub fn kill_reaper(&self) -> io::Result<()> {
+        signal_stop(&self.pidfd)
     }
 
     /// Its reaper's PID in init's namespace: the parent of its command ([`ACTOR`] in its own).
@@ -641,7 +762,16 @@ fn actor_exec(fd: OwnedFd) -> Result<(), Failure> {
             .map_err(|_| Failure::protocol(Step::Setup))?;
         let [a, b, c, d] = rest;
         let [first] = first;
-        return Err(Failure::decode([first, a, b, c, d]).unwrap_or(Failure::protocol(Step::Setup)));
+        let Some(failure) = Failure::decode([first, a, b, c, d]) else {
+            return Err(Failure::protocol(Step::Setup));
+        };
+        // What it was doing, where it told it in the same write; none where it ended there.
+        let mut told = [0; 2];
+        let doing = setup
+            .read_exact(&mut told)
+            .ok()
+            .and_then(|()| Doing::decode(told));
+        return Err(Failure { doing, ..failure });
     }
     Ok(())
 }
@@ -731,9 +861,24 @@ pub fn report_failure(fd: RawFd, step: Step, errno: i32) {
     let word = Failure {
         step,
         errno: if errno == 0 { libc::EIO } else { errno },
+        doing: None,
     }
     .encode();
     let _ = raw_write(fd, &word);
+}
+
+/// As [`report_failure`], with what its setup was doing after the word, in one write: a pipe
+/// takes a write of no more than `PIPE_BUF` whole (pipe(7)), so its launch reads all of it or
+/// none.
+pub fn report_doing(fd: RawFd, step: Step, errno: i32, doing: Doing) {
+    let [s, a, b, c, d] = Failure {
+        step,
+        errno: if errno == 0 { libc::EIO } else { errno },
+        doing: None,
+    }
+    .encode();
+    let [kind, code] = doing.encode();
+    let _ = raw_write(fd, &[s, a, b, c, d, kind, code]);
 }
 
 fn raw_read(fd: RawFd, mut bytes: &mut [u8]) -> bool {
@@ -1036,6 +1181,7 @@ mod tests {
         let error = Failure {
             step: Step::Helper,
             errno: libc::EPERM,
+            doing: None,
         };
         assert_eq!(ready_of(&error.encode()), Err(error));
     }
@@ -1055,6 +1201,7 @@ mod tests {
             let error = Failure {
                 step,
                 errno: libc::ENOENT,
+                doing: None,
             };
             assert_eq!(actor_exec(written(&error.encode())), Err(error));
             for cut in 1..error.encode().len() {
@@ -1063,6 +1210,39 @@ mod tests {
                     Err(Failure::protocol(Step::Setup))
                 );
             }
+        }
+    }
+
+    /// A member's setup that failed says what it was doing (its words, as its output has
+    /// them), every setting and confining step read back as told; a told word of no setting
+    /// leaves the failure as told without it.
+    #[test]
+    fn a_setup_failure_says_what_it_was_doing() {
+        use crate::domains::{Confining, Setting};
+        let doing = Doing::Setting(Setting::Volumes);
+        let failure = Failure {
+            step: Step::Setup,
+            errno: libc::ENOENT,
+            doing: Some(doing),
+        };
+        let told = |doing: [u8; 2]| [failure.encode().as_slice(), &doing].concat();
+        assert_eq!(actor_exec(written(&told(doing.encode()))), Err(failure));
+        assert_eq!(failure.to_string(), "Setup (mounting its volumes): errno 2");
+        for doing in Setting::ALL
+            .into_iter()
+            .map(Doing::Setting)
+            .chain(Confining::ALL.into_iter().map(Doing::Confining))
+        {
+            assert_eq!(Doing::decode(doing.encode()), Some(doing));
+        }
+        for unknown in [[0, 1], [3, 1], [1, 0], [2, u8::MAX]] {
+            assert_eq!(
+                actor_exec(written(&told(unknown))),
+                Err(Failure {
+                    doing: None,
+                    ..failure
+                })
+            );
         }
     }
 
@@ -1268,6 +1448,7 @@ mod tests {
             pid,
             pidfd,
             _group: group.try_clone().unwrap(),
+            population: group.try_clone().unwrap(),
             kill,
             // Reading a private directory gives EISDIR, never a real kernel cgroup fault.
             events: group,
