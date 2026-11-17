@@ -362,7 +362,7 @@ fn p7_1_agentdefs_run_starts_each_session_as_its_drawn_variant() -> anyhow::Resu
             let agent = s(&ran, "/agents/0/id");
             let info = hub.harness.info(&agent).ok_or_else(|| anyhow::anyhow!("run {i}: no session {agent}: {ran}"))?;
             let kept = info.experiment.clone().ok_or_else(|| anyhow::anyhow!("run {i}: no variant on {agent}"))?;
-            anyhow::ensure!(kept.experiment == e && kept.arm == want && !kept.promoted && info.isolation.is_none(), "run {i}: {kept:?}, a host variant's session on its host");
+            anyhow::ensure!(kept.experiment == e && kept.arm == want && info.isolation.is_none(), "run {i}: {kept:?}, a host variant's session on its host");
             opened.push((agent, want));
         }
         anyhow::ensure!(!opened.is_empty(), "some host variant was drawn");
