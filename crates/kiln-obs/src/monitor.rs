@@ -1660,7 +1660,10 @@ mod tests {
         assert_eq!(render("{{#is_unknown}}u{{/is_unknown}}", Transition { from: State::Ok, to: State::NoData }, &Vars { unknown: true, ..v.clone() }), "u");
         assert_eq!(r("{{first_triggered_at}} {{last_triggered_at_epoch}} {{triggered_duration_sec}}"), format!("2021-05-31 14:19:00+00:00 {} 1800", at(14, 27)));
         assert_eq!(r("{{local_time 'last_triggered_at' 'Asia/Tokyo'}}"), "2021-05-31 23:27:00+09:00");
-        assert_eq!(r("{{comparator}} {{threshold}} {{warn_threshold}} {{alert_recovery_threshold}} {{warn_recovery_threshold}} {{ok_threshold}}"), "> 90 80 85 80 ");
+        // The comparator a variable, so its `>` HTML-encoded as what any variable says is (Datadog's
+        // "Character escape"); `{{{…}}}` says it raw, and the message's own text stays as written.
+        assert_eq!(r("{{comparator}} {{threshold}} {{warn_threshold}} {{alert_recovery_threshold}} {{warn_recovery_threshold}} {{ok_threshold}}"), "&gt; 90 80 85 80 ");
+        assert_eq!(r("value > {{{comparator}}} {{threshold}}"), "value > > 90");
         assert_eq!(r(r#"{{eval "last_triggered_at_epoch-15*60*1000"}}"#), (at(14, 27) - 900_000).to_string());
         assert_eq!(r(r#"{{#is_exact_match (eval "int(last_triggered_at_epoch / 3600000 % 24)") "8" "14"}}day shift{{/is_exact_match}}"#), "day shift");
         assert_eq!(

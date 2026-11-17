@@ -707,11 +707,17 @@ fn call(f: &str, a: &[Ev]) -> Option<Ev> {
         ("ceil", _) => unary(f64::ceil),
         ("floor", _) => unary(f64::floor),
         ("sgn", _) => unary(|y| if y == 0.0 { 0.0 } else { y.signum() }),
-        ("to_bool", 1) => match x(0)? {
-            y if y == 1.0 => Some(Ev::Str("true".into())),
-            y if y == 0.0 => Some(Ev::Str("false".into())),
-            _ => None,
-        },
+        // "Returns true if var = 1, Returns false if var = 0": another number is neither.
+        ("to_bool", 1) => {
+            let y = x(0)?;
+            if y == 1.0 {
+                Some(Ev::Str("true".into()))
+            } else if y == 0.0 {
+                Some(Ev::Str("false".into()))
+            } else {
+                None
+            }
+        }
         ("exp", _) => unary(f64::exp),
         ("log10", _) => unary(f64::log10),
         ("sin", _) => unary(f64::sin),
