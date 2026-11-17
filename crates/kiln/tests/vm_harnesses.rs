@@ -1416,9 +1416,9 @@ mod host {
 // carrying Shards. Skipped, in the runner's own words, where it holds none; ROOT runs them (a runner
 // that holds none is `runner_engine.rs`'s). Its sessions are the stand-in's: in a microVM from the
 // stand-in's Agentfile, on the host behind each harness's name. No vendor's CLI runs, and no prompt
-// goes to one.
+// goes to one. On every host OS kiln runs microVMs on: HVF, KVM and WHP (vm_e2e::stub_host_env's
+// Windows form puts the stand-in on the host there).
 // =================================================================================================
-#[cfg(unix)]
 mod engine {
     use serde_json::{Value, json};
 
@@ -1468,8 +1468,8 @@ mod engine {
     #[test]
     fn p2_3_a_runner_with_microvms_defaults_to_microvm_and_a_switch_to_host_starts_the_next_on_its_host() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let (path, shell) = vm_e2e::stub_host_env(dir.path())?;
-        let f = vm_e2e::up_own(dir.path(), "vm", &[("PATH", &path), ("SHELL", &shell)])?;
+        let stub = vm_e2e::stub_host_env(dir.path())?;
+        let f = vm_e2e::up_own(dir.path(), "vm", &stub.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
         if !vm_e2e::isolation_ready(&f)? {
             return Ok(());
         }

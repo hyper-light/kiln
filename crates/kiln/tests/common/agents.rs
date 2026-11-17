@@ -2,7 +2,8 @@
 //! runs (`tests/fixtures/fake-claude`: no model), and a viewer's WebSocket to the server. The runner
 //! and its PATH are Unix's (the stand-in is a Python script, its PATH `:`-joined, its system programs
 //! /usr/bin's); the server's REST and WebSocket helpers are any OS's, and `vm_e2e` drives Windows
-//! runners through them (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17).
+//! runners through them (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), with
+//! [`path_without_harnesses`]'s Windows form for its runners on the host there.
 
 use std::io::{Read as _, Write as _};
 #[cfg(unix)]
@@ -112,6 +113,17 @@ pub fn path_without_harnesses(dir: &Path) -> anyhow::Result<String> {
         }
     }
     Ok(system.to_string_lossy().into_owned())
+}
+
+/// [`path_without_harnesses`] on Windows: this process's `PATH` without any folder in which kiln finds a
+/// harness it knows, as it finds one (`kiln::os::which_in`, by `PATHEXT`): npm's global folder, with its
+/// `claude.cmd` and `codex.cmd`, on a machine with them installed. The system's folders stay (`taskkill`'s).
+#[cfg(windows)]
+pub fn path_without_harnesses(_dir: &Path) -> anyhow::Result<String> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let harnesses: Vec<&str> = kiln::harness::kinds::Kind::all().iter().map(|k| k.program).collect();
+    let kept: Vec<std::path::PathBuf> = std::env::split_paths(&path).filter(|dir| !harnesses.iter().any(|h| kiln::os::which_in(h, dir.as_os_str()).is_some())).collect();
+    Ok(std::env::join_paths(kept)?.to_string_lossy().into_owned())
 }
 
 /// Waits until the server lists runner `name` connected, known by its machine id
