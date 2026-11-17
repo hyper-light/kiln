@@ -791,6 +791,18 @@ fn not_ready(kind: &str, target: &str, known: Option<&crate::accounts::Account>,
     (super::elsewhere::fullest(&limits, now) >= 100.0).then(|| format!("the account {kind} uses there is at its limit"))
 }
 
+/// Whether one of `runners` is connected, its newest process having said it speaks named features
+/// ([`crate::proto::CAP_FEATURES`]) and not yet which ([`crate::proto::AgentMsg::Features`], which follows its
+/// connection: hub.rs): its word on whether it places agents is on its way. A runner from before named features is
+/// never waited for.
+fn features_coming(hub: &Hub, runners: &[String]) -> bool {
+    let (agents, instances) = (hub.agents.load(), hub.instances.load());
+    runners.iter().any(|n| {
+        agents.get(n).is_some_and(|a| a.connected)
+            && instances.newest(n).and_then(|p| instances.get(p)).is_some_and(|i| i.wide & crate::proto::CAP_FEATURES != 0 && i.features.is_empty())
+    })
+}
+
 /// Where each of `count` agents of harness `kind` starts for `on`, with its claim there (AUDIT M4,
 /// docs/needs.md E5): placed as a runner's owner places its runs, by the runners' own admission,
 /// in the same ledger as CI legs and commands (G1). Among the machines that can run it
@@ -832,8 +844,25 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
         i.of(n).iter().any(|p| speaking.contains(p))
     };
     let draw = |names: Vec<String>| names.get(usize::try_from(rand::random::<u64>().checked_rem(u64::try_from(names.len()).unwrap_or(0)).unwrap_or(0)).unwrap_or(0)).cloned();
-    let connected: Vec<String> = hub.agents.load().values().filter(|a| a.connected && !a.outpost && !a.ephemeral).map(|a| a.name.clone()).collect();
-    let owner = parent.and_then(|p| p.target.strip_prefix("agent:")).filter(|n| places(n)).map(str::to_owned).or_else(|| draw(runners.iter().filter(|n| places(n)).cloned().collect())).or_else(|| draw(connected.into_iter().filter(|n| places(n)).collect()));
+    let owner_now = || {
+        let connected: Vec<String> = hub.agents.load().values().filter(|a| a.connected && !a.outpost && !a.ephemeral).map(|a| a.name.clone()).collect();
+        parent.and_then(|p| p.target.strip_prefix("agent:")).filter(|n| places(n)).map(str::to_owned).or_else(|| draw(runners.iter().filter(|n| places(n)).cloned().collect())).or_else(|| draw(connected.into_iter().filter(|n| places(n)).collect()))
+    };
+    // An isolated agent is placed by a runner's owner or not at all: where none places agents yet but one of its
+    // runners is connected and its word on what it speaks is on its way, that word is waited for, as long as the
+    // runner's connection lives (kiln goal 3cd82843, r708: a start asked between a Windows runner's connection and
+    // its `AgentMsg::Features` was refused). Listened for before each look (`rt::Changed`): the word's coming, or
+    // the runner's going, ends the wait.
+    let owner = loop {
+        let changed = hub.runners.listen();
+        if let Some(owner) = owner_now() {
+            break Some(owner);
+        }
+        if isolation.is_none() || !features_coming(hub, &runners) {
+            break None;
+        }
+        changed.await;
+    };
     let Some(owner) = owner else {
         if isolation.is_some() {
             return Err(unplaced("no runner that places agents is connected"));

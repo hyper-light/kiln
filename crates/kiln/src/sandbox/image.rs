@@ -13,8 +13,11 @@
 //!   source Shards fetches, such as a stand-in with no vendor's binary). kiln's own always name one.
 //! - **Its tag is its content's digest** (`NAME:<recipe>`, `context::recipe_with`). An image the
 //!   home's store holds under it is what a build would make, so it boots without one; a content the
-//!   store holds none of is built and tagged by its build. Builds in this process take turns, so the
-//!   starts that wait for one find what it built.
+//!   store holds none of is built and tagged by its build. Builds of one image in this process take
+//!   turns, so the starts that wait for one find what it built; builds of other images go on beside it,
+//!   as Shards' store takes builds at once (its own lock files; `an_image_is_built_once_however_many_ask_at_once`),
+//!   so that one build's stall holds no other image's (kiln goal 3cd82843, r707: one stuck build held every
+//!   later start on its runner).
 //! - **A build Shards refuses** is refused in Shards' own words. What kiln made for a build goes
 //!   either way. A build runs as long as its start waits for it, and is ended, with all it started,
 //!   when its start gives up first.
@@ -105,13 +108,40 @@ pub struct Images {
     /// Where builds make their contexts, each under a name of its own, removed once it's done: big files
     /// (a harness's directory), so never under `/tmp` (AGENTS.md).
     scratch: PathBuf,
-    /// Builds in this process take turns.
-    building: futures::lock::Mutex<()>,
+    /// Each image's turn, by its tag: builds of one image in this process take turns ([`Turn`]).
+    building: Turns,
+}
+
+/// Each image's turn by its tag, while a build holds or waits for it.
+type Turns = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<futures::lock::Mutex<()>>>>;
+
+/// A build's place in its image's turn ([`Images::turn`]): its entry is let go of as its last holder goes.
+struct Turn<'i> {
+    turns: &'i Turns,
+    tag: String,
+    lock: std::sync::Arc<futures::lock::Mutex<()>>,
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut turns = self.turns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The table's still, and held by this one and the table alone: no other build holds it or waits.
+        if turns.get(&self.tag).is_some_and(|l| std::sync::Arc::ptr_eq(l, &self.lock)) && std::sync::Arc::strong_count(&self.lock) <= 2 {
+            turns.remove(&self.tag);
+        }
+    }
 }
 
 impl Images {
     pub fn new(shards: PathBuf, home: PathBuf, scratch: PathBuf) -> Self {
-        Self { shards, home, scratch, building: futures::lock::Mutex::new(()) }
+        Self { shards, home, scratch, building: Turns::default() }
+    }
+
+    /// The turn of builds of the image tagged `tag`.
+    fn turn(&self, tag: &str) -> Turn<'_> {
+        let mut turns = self.building.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lock = turns.entry(tag.to_owned()).or_insert_with(|| std::sync::Arc::new(futures::lock::Mutex::new(()))).clone();
+        Turn { turns: &self.building, tag: tag.to_owned(), lock }
     }
 
     /// `source`'s image for this machine, pinned by its digest: the one the home's store holds of its
@@ -121,7 +151,8 @@ impl Images {
         if let Some(digest) = self.held(&plan).await? {
             return Ok(Pinned { image: plan.pinned(&digest), built: None });
         }
-        let _turn = self.building.lock().await;
+        let turn = self.turn(&plan.tag);
+        let _held = turn.lock.lock().await;
         if let Some(digest) = self.held(&plan).await? {
             return Ok(Pinned { image: plan.pinned(&digest), built: None });
         }
@@ -140,12 +171,16 @@ impl Images {
         crate::rt::blocking(move || held_in(&root, &tag)).await.map_err(|e| Refusal::Store(format!("{e:#}")))?
     }
 
-    /// Builds `plan` in a folder of its own under `scratch`, removed after: its image's digest.
+    /// Builds `plan` in a folder of its own under `scratch`, removed after, and where its build is ended part way
+    /// (its start or its build ahead given up): its image's digest.
     async fn build(&self, source: Source<'_>, plan: &Plan, secrets: &[BuildSecret]) -> Result<String, Refusal> {
         let dir = self.scratch.join(format!("{}.{}", plan.recipe, crate::util::new_id()));
+        let mut scratch = Scratch(Some(dir.clone()));
         let built = self.build_in(&dir, source, plan, secrets).await;
-        // A harness's tree may hold a directory its owner may not search, which `discard` makes searchable.
-        let _ = crate::rt::blocking(move || crate::agentfiles::unpack::discard(&dir)).await;
+        if let Some(dir) = scratch.0.take() {
+            // A harness's tree may hold a directory its owner may not search, which `discard` makes searchable.
+            let _ = crate::rt::blocking(move || crate::agentfiles::unpack::discard(&dir)).await;
+        }
         built
     }
 
@@ -203,6 +238,21 @@ impl Images {
         let id = named.and_then(|r| Ok(r?)).map_err(|e| Refusal::Build(format!("it named no image (its --iidfile: {e:#})")))?;
         let digest = shards_image::reference::Digest::parse(id.trim()).map_err(|e| Refusal::Build(format!("it named its image {:?}: {e}", id.trim())))?;
         Ok(digest.to_string())
+    }
+}
+
+/// A build's folder, removed as this drops where its build was ended part way, on a thread of its own (a harness's
+/// tree is hundreds of MB); one that ran to its end removes it off the runtime's threads ([`Images::build`]).
+struct Scratch(Option<PathBuf>);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let gone = dir.clone();
+            if std::thread::Builder::new().name("kiln-scratch".into()).spawn(move || crate::agentfiles::unpack::discard(&gone)).is_err() {
+                crate::agentfiles::unpack::discard(&dir);
+            }
+        }
     }
 }
 

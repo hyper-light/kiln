@@ -23,8 +23,13 @@
 //!   ahead, where none of its sessions runs the harness named, or where one of those builds is underway.
 //! - **The runner** names [`feature::PREBUILD`]. Its newest process is sent each build (`ServerMsg::Prebuild`), and
 //!   asked again for those it hasn't said done or failed each time one of its processes names the feature (it
-//!   connected again): one already made is found in its store at once. A runner that doesn't name it is asked nothing,
-//!   and its row waits, queued.
+//!   connected again): one already made is found in its store at once, one under way goes on. A runner that doesn't
+//!   name it is asked nothing, and its row waits, queued.
+//! - **Ended where no one waits for it** (kiln goal 3cd82843, r707: a build stuck in its git fetch held every later
+//!   start on its runner): a runner ends its build of an Agentfile's older version as its next version's ask comes
+//!   (saved over), and every build of one deleted where it names [`feature::PREBUILD_END`] and the server tells it
+//!   ([`ended`]; `{"end": <id>}` in `ServerMsg::Prebuild`). Ending one drops it, its `shards build` and all that
+//!   build started with it (`crate::sandbox::image`'s `Ending`).
 
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -321,6 +326,24 @@ async fn builder(hub: &Hub, person: &str, runner: &str) -> Result<(), Refusal> {
     match takes(hub, runner) {
         Takes::Never => Err(Refusal::Older(a.shown().to_owned())),
         Takes::Now(_) | Takes::Later => Ok(()),
+    }
+}
+
+/// Agentfile `id` deleted: each of `runners` (those that had its builds) whose newest process names
+/// [`feature::PREBUILD_END`] is told to end its builds of it (`{"end": id}`); one that doesn't runs them to their
+/// ends, as before.
+pub async fn ended(hub: &Hub, id: &str, runners: &[String]) {
+    let json = serde_json::json!({ "end": id }).to_string();
+    for runner in runners {
+        let peer = {
+            let inst = hub.instances.load();
+            inst.newest(runner).filter(|p| inst.get(*p).is_some_and(|i| feature::speaks(&i.features, feature::PREBUILD_END)))
+        };
+        if let Some(peer) = peer {
+            hub.command_peers(runner, vec![peer], &ServerMsg::Prebuild { json: json.clone() })
+                .await
+                .log_when_answered(crate::hub::LOG_WITHIN);
+        }
     }
 }
 
@@ -681,23 +704,70 @@ pub async fn rebuild(
 
 // ------------------------------------------------------------------------------ on the runner
 
+/// What [`ServerMsg::Prebuild`] asks of a runner: a build ([`Ask`]), or, of a runner that named
+/// [`feature::PREBUILD_END`], the end of every build of an Agentfile that was deleted ([`ended`]).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Told {
+    End { end: String },
+    Build(Ask),
+}
+
+/// The builds this runner runs ahead of their sessions, by Agentfile and harness: each one's version, and the handle
+/// that ends it ([`told`]).
+type Underway = std::collections::BTreeMap<(String, String), (i64, futures::future::AbortHandle)>;
+
+static UNDERWAY: std::sync::Mutex<Underway> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn underway() -> std::sync::MutexGuard<'static, Underway> {
+    UNDERWAY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// [`ServerMsg::Prebuild`] on a runner: `ask`'s build, in the store its microVMs `vms` boot from, said building as it
-/// begins and done or failed as it ends (`AgentMsg::Prebuilt`). One this runner can't read is let go, said in its log.
+/// begins and done or failed as it ends (`AgentMsg::Prebuilt`), its harness's build of an older version of its
+/// Agentfile ended (saved over); one of that version, or a newer, under way already goes on alone. Or, told an
+/// Agentfile's end, each of its builds ended. One this runner can't read is let go, said in its log.
 pub fn told(json: &str, up: Uplink, vms: Option<std::sync::Arc<crate::sandbox::Microvms>>) {
-    let ask: Ask = match serde_json::from_str(json) {
-        Ok(a) => a,
+    let ask = match serde_json::from_str::<Told>(json) {
+        Ok(Told::Build(ask)) => ask,
+        Ok(Told::End { end }) => {
+            underway().retain(|(agentfile, _), (_, ending)| {
+                let goes = *agentfile == end;
+                if goes {
+                    ending.abort();
+                }
+                !goes
+            });
+            return;
+        }
         Err(e) => {
             tracing::warn!(target: "kiln.prebuild", error = %e, "a build asked ahead of its sessions this runner couldn't read");
             return;
         }
     };
-    crate::rt::spawn(async move {
+    let (key, version) = ((ask.agentfile.clone(), ask.harness.clone()), ask.version);
+    let mut builds = underway();
+    if builds.get(&key).is_some_and(|(at, _)| *at >= version) {
+        return;
+    }
+    let (making, ending) = futures::future::abortable(async move {
         say(&up, &ask, How::Building).await;
         let how = match build(vms.as_deref(), &ask).await {
             Ok(image) => How::Done { image },
             Err(why) => How::Failed { why },
         };
         say(&up, &ask, how).await;
+    });
+    if let Some((_, older)) = builds.insert(key.clone(), (version, ending)) {
+        older.abort();
+    }
+    drop(builds);
+    crate::rt::spawn(async move {
+        let _ = making.await;
+        let mut builds = underway();
+        if builds.get(&key).is_some_and(|(at, _)| *at == version) {
+            builds.remove(&key);
+        }
     });
 }
 

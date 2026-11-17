@@ -577,25 +577,30 @@ pub async fn restore(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str, version:
 pub async fn delete(hub: &Hub, blobs: &dyn Blobs, who: &Who, id: &str) -> R<Brief> {
     let a = record(hub, who, id).await?;
     let i = id.to_owned();
-    let gone: Option<Vec<String>> = hub
+    let gone: Option<(Vec<String>, Vec<String>)> = hub
         .store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let mut st = tx.prepare("SELECT digest FROM agentfile_versions WHERE agentfile_id = ?1 UNION SELECT digest FROM agentfiles WHERE id = ?1")?;
             let digests = st.query_map(params![i], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
             drop(st);
+            // The runners that had its builds, told to end them once it's gone (`prebuild::ended`).
+            let mut st = tx.prepare("SELECT DISTINCT runner FROM prebuilds WHERE agentfile_id = ?1")?;
+            let builders = st.query_map(params![i], |r| r.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            drop(st);
             let n = tx.execute("DELETE FROM agentfiles WHERE id = ?1", params![i])?;
             tx.execute("DELETE FROM agentfile_versions WHERE agentfile_id = ?1", params![i])?;
             tx.execute("DELETE FROM prebuilds WHERE agentfile_id = ?1", params![i])?;
             tx.commit()?;
-            Ok((n > 0).then_some(digests))
+            Ok((n > 0).then_some((digests, builders)))
         })
         .await?;
-    let Some(digests) = gone else { return Err(Error::Missing) };
+    let Some((digests, builders)) = gone else { return Err(Error::Missing) };
     let held = TEXTS.lock().await;
     let_go(hub, blobs, digests).await;
     drop(held);
     told(hub, &a, true);
+    prebuild::ended(hub, id, &builders).await;
     Ok(a.brief())
 }
 

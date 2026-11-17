@@ -700,6 +700,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   (`ServerMsg::Prebuild`; kiln plan 01a1dd2e…, P4.5), as a session of its harness there builds it,
   and says where each build is (`AgentMsg::Prebuilt`); a runner that didn't name it is asked nothing,
   and its sessions build their images as they start.
+  `agentfiles.prebuild.end`: the runner ends a build it runs ahead where no one waits for it: an older
+  version's as its Agentfile's next version is asked, and every one of an Agentfile the server says
+  was deleted (`ServerMsg::Prebuild` with `{"end": <id>}`, sent only to a runner that named this);
+  a build ended drops its `shards build` and all it started (kiln goal 3cd82843).
   `secrets.leases`: the server answers its runners' runs' credential leases and sign-ins from its
   run-lease broker (`ReachAsk`'s `lessor`; plan step 33, Shards' D242); a runner asks them only of a
   server that named it, and grants its isolated harnesses no sign-in until one has. Its launches
@@ -781,7 +785,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 81 | `RunnerEngine` | | main (kiln plan 01a1dd2e…, P2.3): a runner's engine as its owner set it, JSON, to a runner that named `runner.engine` |
 | `ServerMsg` | 82 | `AdoptPolicy` | | main (CP-T3.2): the room a hand-over's spool leaves on a runner's volume, JSON, to a runner that named `reach.adopt-policy` |
 | `ServerMsg` | 83 | `Replay` | | main, withdrawn (kiln plan 01a1dd2e…, P7.1b: replays were never part of experiments): its place kept, as `Prebuild` follows it; no server sends it, and a runner refuses it as a kind it doesn't know, its `req` answered why |
-| `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild` |
+| `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild`; `{"end": <id>}`, a deleted Agentfile's builds to end, to one that named `agentfiles.prebuild.end` |
 | `ServerMsg` | 85 | `Volumes` | | this line (kiln plan 01a1dd2e…, P6.2): agent volumes of a runner's microVMs' store listed by their names, or one cleared, JSON, to a runner that named `agents.volumes` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |

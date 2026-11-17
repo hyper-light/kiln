@@ -818,6 +818,13 @@ pub mod feature {
     /// ([`super::AgentMsg::Prebuilt`]); a server that names it asks, and reads the answers. A
     /// runner that didn't name it is asked nothing: its sessions build their images as they start.
     pub const PREBUILD: &str = "agentfiles.prebuild";
+    /// This runner ends a build it runs ahead of an Agentfile's sessions ([`PREBUILD`]) where no one waits for it:
+    /// its harness's build of an older version as the next version's ask comes (saved over), and every build of
+    /// an Agentfile the server says was deleted (a [`super::ServerMsg::Prebuild`] whose JSON is `{"end": <id>}`,
+    /// sent only to a runner that named this). A build ended drops its `shards build` and all it started (kiln goal
+    /// 3cd82843: r707's stuck build held every later start on its runner). A runner that didn't name it is told no
+    /// end.
+    pub const PREBUILD_END: &str = "agentfiles.prebuild.end";
     /// The server answers its runners' runs' credential leases and sign-ins from its run-lease broker
     /// (`crate::reach::Question::Lessor`, `crate::secrets::lessor::answer`; plan step 33, Shards' D242). A runner asks
     /// them only of a server that named it, and grants its isolated harnesses no sign-in until one has: they sign in
@@ -828,7 +835,7 @@ pub mod feature {
     /// runner that didn't name it isn't asked: a person's view of their volumes says it couldn't be, and a start's
     /// placement counts none of its volumes' bytes as held there.
     pub const VOLUMES: &str = "agents.volumes";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
