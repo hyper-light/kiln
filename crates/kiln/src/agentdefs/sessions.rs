@@ -145,7 +145,7 @@ fn starts(infos: &[Info]) -> Value {
 /// restore made again), `template` where it restored its image's template (`restored`), `warm` where a warm run
 /// host's microVM was ready before its run asked (`warm`), and `swapped` where its member was swapped into the
 /// microVM its session ran in (P6c.5). A word kiln doesn't know yet is a kind of its own, so no start goes uncounted.
-fn start_kind(started_from: &str) -> String {
+pub(super) fn start_kind(started_from: &str) -> String {
     match started_from {
         "booted" | "saved" | "replaced" => "cold",
         "restored" => "template",

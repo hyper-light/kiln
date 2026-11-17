@@ -369,6 +369,27 @@ tools `agentdefs_experiments_*`, code mode's `kiln.agentdefs.experiments.*`), an
   promoting a variant makes its deployment the definition's next version (`engine`, `agentfile`,
   `cpus`, `memory`, `model`), saved as `PATCH /api/agentdefs/{id}` saves one (what it shares with its
   Agentfile's `AGENT` written there first, P5.4; its Agentfile's builds asked anew, P4.5), and ends it.
+- What its sessions came to is kept with each draw, once, as kiln reads the session (as it answers the
+  experiment, and as the session goes): its warm start, where its first start was a warm one (a warm
+  host's microVM ready before it asked: Shards' `warm`), and how long it took; and once it's over,
+  whether it failed (it ended in error or never ran; a refused start fails at once) and its microVM's
+  peak memory.
+- Every answer is measured. A variant's `measures` are `warm_ms` (the median of its warm starts, in ms),
+  `peak_gib` (of its peaks, in GiB) and `failed_pct` (the percent of its sessions that failed), each
+  `[low, mid, high]`: the median or the rate within its 95% confidence sequence, so a look at any time
+  holds (Howard and Ramdas's for a median, Waudby-Smith and Ramdas's for a rate: docs/ci.md W20,
+  "Splits"). They're given once its sessions bound all three; a variant on the host has no warm start
+  or peak, so none. A variant whose `high` is below every other's `low` is clearly better on that
+  measure. Its `trend` is each measure as it stood at the end of each day (UTC), oldest first, today's
+  last, from the first day on which every variant with that measure had one.
+- Each of those facts is written to kiln's observability as it's kept, at the time it happened: a value
+  of a distribution tagged with `experiment` and `variant` (their ids), `kiln.session.warm_ms`,
+  `kiln.session.peak_memory_gib` and `kiln.session.failed_pct` (100 a failed session, 0 another). A
+  criterion's query reads them as it reads any of Datadog's distributions, and any of kiln's other
+  metrics besides (docs/observe.md §6). A criterion's `values` are each variant's value of its query,
+  evaluated as kiln's monitors evaluate a monitor's (its time aggregation over its window, as of now:
+  §9), and whether it `passes` its bound: a value for each variant the query groups by (`by
+  {variant}`); none where kiln's observability doesn't run, or the query gives no variant a value.
 
 | Method | Path | |
 |---|---|---|
@@ -388,6 +409,24 @@ tools `agentdefs_experiments_*`, code mode's `kiln.agentdefs.experiments.*`), an
 Weights, variants and promotion change only a live or paused experiment (409 once it's over); its name
 and criteria change whatever it stands at. `AgentdefExperiment`, `AgentdefVariant` and
 `AgentdefCriterion` are `ui/src/api/wire`'s.
+
+These are the Agents page's experiments. kiln has another split of a person's sessions, a deployment
+experiment's (`POST /api/experiments` with `target` and `arms`, docs/ci.md W20 "Splits"): a separate
+model, which an experiment here neither reads nor writes. Where the two meet:
+
+| Here (`agentdefs.experiments.*`) | A deployment experiment's split (`experiments.*`) |
+|---|---|
+| Several to one of your definitions, one live at a time | One running split of a target (a definition, or a harness and its Agentfile) |
+| `live`, `paused`, `stopped`, `promoted` | `running`, `paused`, `done` once decided, `cancelled` |
+| Variants renamed, reweighted (the split's next `version`), added at 0 and taken out | Arms fixed as it starts |
+| Criteria in kiln's monitoring syntax, each variant's value as kiln's monitors evaluate it | None: its results name winners |
+| `measures`: warm start, peak memory and failures, each within its 95% interval | Results: failures, starts within each kind, the kinds' mix, footprint, CPU and outcomes, each at 95% / k |
+| Promoting makes the variant the definition's next version | Deciding makes every later session of the target that variant |
+
+What they share is computed once: the draw (`kiln_ci::split`'s point of [0, 1) from the seed and the
+draw's index, laid on the weights), the confidence sequences (`kiln_ci::stats::sequence`), Shards'
+words for how a microVM started (`agentdefs.sessions`' kinds), each start's record that Hex measured
+(`Start::measured`), and kiln's monitors' query engine (`kiln_obs::monitor`).
 
 ## Your secrets
 

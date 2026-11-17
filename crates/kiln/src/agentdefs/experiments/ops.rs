@@ -42,9 +42,10 @@ fn json_of<T: serde::Serialize>(v: &T) -> Out {
     serde_json::to_value(v).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// What a change answers: the experiment as it is now, as agentdefs.experiments.list shows it.
-fn answer(e: &Experiment) -> Out {
-    Ok(json!({"experiment": json_of(e)?}))
+/// What a change answers: the experiment as it is now, measured, as agentdefs.experiments.list shows it.
+async fn answer(cx: &Cx, mut e: Experiment) -> Out {
+    super::measures::measure(&cx.hub, std::slice::from_mut(&mut e)).await;
+    Ok(json!({"experiment": json_of(&e)?}))
 }
 
 async fn audit(cx: &Cx, verb: &str, e: &Experiment, what: String) {
@@ -76,7 +77,14 @@ impl From<input::Criterion> for CriterionAsk {
 async fn list(cx: Cx, v: Value) -> Out {
     let def = v.get("id").and_then(Value::as_str).map(str::trim).filter(|d| !d.is_empty());
     let all = crate::agentdefs::ops::flag(&v, "all");
-    json_of(&super::list(&cx.hub, &who(&cx)?, def, all).await.map_err(fail)?)
+    // Measured together, each definition's then in its order again.
+    let mut es: Vec<Experiment> = super::list(&cx.hub, &who(&cx)?, def, all).await.map_err(fail)?.into_values().flatten().collect();
+    super::measures::measure(&cx.hub, &mut es).await;
+    let mut by_def: std::collections::BTreeMap<String, Vec<Experiment>> = std::collections::BTreeMap::new();
+    for e in es {
+        by_def.entry(e.agentdef.clone()).or_default().push(e);
+    }
+    json_of(&by_def)
 }
 
 async fn create(cx: Cx, v: Value) -> Out {
@@ -86,7 +94,7 @@ async fn create(cx: Cx, v: Value) -> Out {
     let made = super::create(&cx.hub, &who(&cx)?, &i.id, ask, rand::random(), &cx.caller.name).await.map_err(fail)?;
     let split: Vec<String> = made.variants.iter().map(|v| format!("{} {}%", v.name.as_deref().unwrap_or(&v.id), v.weight)).collect();
     audit(&cx, "agentdef.experiment.create", &made, split.join(", ")).await;
-    answer(&made)
+    answer(&cx, made).await
 }
 
 async fn rename(cx: Cx, v: Value) -> Out {
@@ -94,7 +102,7 @@ async fn rename(cx: Cx, v: Value) -> Out {
     let e = super::rename(&cx.hub, &who(&cx)?, &i.id, &i.experiment, i.name.as_deref(), i.variant.as_deref()).await.map_err(fail)?;
     let what = i.variant.map_or_else(String::new, |v| format!("variant {v} named {}", i.name.as_deref().unwrap_or("as it's set apart")));
     audit(&cx, "agentdef.experiment.rename", &e, what).await;
-    answer(&e)
+    answer(&cx, e).await
 }
 
 async fn weights(cx: Cx, v: Value) -> Out {
@@ -102,7 +110,7 @@ async fn weights(cx: Cx, v: Value) -> Out {
     let e = super::weights(&cx.hub, &who(&cx)?, &i.id, &i.experiment, i.weights, i.base).await.map_err(fail)?;
     let split: Vec<String> = e.variants.iter().map(|v| format!("{} {}%", v.name.as_deref().unwrap_or(&v.id), v.weight)).collect();
     audit(&cx, "agentdef.experiment.weights", &e, format!("split v{}, {}", e.version, split.join(", "))).await;
-    answer(&e)
+    answer(&cx, e).await
 }
 
 async fn add_variant(cx: Cx, v: Value) -> Out {
@@ -111,14 +119,14 @@ async fn add_variant(cx: Cx, v: Value) -> Out {
     let e = super::add_variant(&cx.hub, &who(&cx)?, &i.id, &i.experiment, ask).await.map_err(fail)?;
     let added = e.variants.last().map(|v| v.id.clone()).unwrap_or_default();
     audit(&cx, "agentdef.experiment.variant.add", &e, format!("variant {added}")).await;
-    answer(&e)
+    answer(&cx, e).await
 }
 
 async fn remove_variant(cx: Cx, v: Value) -> Out {
     let i: input::ExperimentsVariant = read(v)?;
     let e = super::remove_variant(&cx.hub, &who(&cx)?, &i.id, &i.experiment, &i.variant).await.map_err(fail)?;
     audit(&cx, "agentdef.experiment.variant.remove", &e, format!("variant {}", i.variant)).await;
-    answer(&e)
+    answer(&cx, e).await
 }
 
 async fn add_criterion(cx: Cx, v: Value) -> Out {
@@ -127,14 +135,14 @@ async fn add_criterion(cx: Cx, v: Value) -> Out {
     let e = super::add_criterion(&cx.hub, &who(&cx)?, &i.id, &i.experiment, ask).await.map_err(fail)?;
     let what = e.criteria.last().map_or_else(String::new, |c| format!("{} ({}): {} {} {}", c.name, c.id, c.query, c.op.as_str(), c.bound));
     audit(&cx, "agentdef.experiment.criterion.add", &e, what).await;
-    answer(&e)
+    answer(&cx, e).await
 }
 
 async fn remove_criterion(cx: Cx, v: Value) -> Out {
     let i: input::ExperimentsCriterion = read(v)?;
     let e = super::remove_criterion(&cx.hub, &who(&cx)?, &i.id, &i.experiment, &i.criterion).await.map_err(fail)?;
     audit(&cx, "agentdef.experiment.criterion.remove", &e, format!("criterion {}", i.criterion)).await;
-    answer(&e)
+    answer(&cx, e).await
 }
 
 async fn moved(cx: Cx, v: Value, to: Move) -> Out {
@@ -146,15 +154,16 @@ async fn moved(cx: Cx, v: Value, to: Move) -> Out {
         Move::Stop => "agentdef.experiment.stop",
     };
     audit(&cx, verb, &e, String::new()).await;
-    answer(&e)
+    answer(&cx, e).await
 }
 
 async fn promote(cx: Cx, v: Value) -> Out {
     let i: input::ExperimentsVariant = read(v)?;
-    let (e, d) = super::promote(&cx.hub, &who(&cx)?, &i.id, &i.experiment, &i.variant, &cx.caller.name).await.map_err(fail)?;
+    let (mut e, d) = super::promote(&cx.hub, &who(&cx)?, &i.id, &i.experiment, &i.variant, &cx.caller.name).await.map_err(fail)?;
     audit(&cx, "agentdef.experiment.promote", &e, format!("variant {} made {} v{}", i.variant, d.name, d.version)).await;
     // A save of the definition, as agentdefs.update's: its Agentfile's builds asked anew (P4.5).
     crate::agentdefs::ops::prebuild(&cx, &d).await;
+    super::measures::measure(&cx.hub, std::slice::from_mut(&mut e)).await;
     Ok(json!({"experiment": json_of(&e)?, "agentdef": json_of(&d)?}))
 }
 
@@ -209,7 +218,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.experiments.create",
-            summary: "Start an experiment on one of your agent definitions (`id`; kiln's own take none, 403), live at once: while it is, each new session of the definition you start (agentdefs.run, or a UI agent it stands in for) is one of its `variants`, drawn by their weights, and kept with the session. Its `name`; its 2 to 100 `variants`, each a deployment (`engine` microvm or host; a microVM's `agentfile`, `cpus` and `memory` in bytes, each left out the definition's; `model`, left out the definition's; `name`) and its `weight`, a whole percent (together 100), its first what the definition runs now; and its `criteria` (`name`, a `query` in kiln's monitoring syntax without its comparison, `op` and `bound`), which kiln's monitors must read. A variant kiln can't run is refused (422), and one at a time is live on a definition (409 while another is). Answers `{experiment}`: its `id`, `agentdef`, `name`, `state` (live, paused, promoted or stopped) and `state_at` (since when, Unix ms), its split's `version` (1, one more with each change of its weights), `sessions` (how many it drew started), `started_at` (Unix ms), `promoted` (the variant, once one was), `by`, its `criteria` (`id`, `name`, `query`, `op`, `bound`) and `variants` (`id`, `name`, `engine`, a microVM's `agentfile`, `cpus` and `memory`, `model` where it has its own, `weight`, `sessions`, and `current`: what its definition runs now).",
+            summary: "Start an experiment on one of your agent definitions (`id`; kiln's own take none, 403), live at once: while it is, each new session of the definition you start (agentdefs.run, or a UI agent it stands in for) is one of its `variants`, drawn by their weights, and kept with the session. Its `name`; its 2 to 100 `variants`, each a deployment (`engine` microvm or host; a microVM's `agentfile`, `cpus` and `memory` in bytes, each left out the definition's; `model`, left out the definition's; `name`) and its `weight`, a whole percent (together 100), its first what the definition runs now; and its `criteria` (`name`, a `query` in kiln's monitoring syntax without its comparison, `op` and `bound`), which kiln's monitors must read. A variant kiln can't run is refused (422), and one at a time is live on a definition (409 while another is). Answers `{experiment}`: its `id`, `agentdef`, `name`, `state` (live, paused, promoted or stopped) and `state_at` (since when, Unix ms), its split's `version` (1, one more with each change of its weights), `sessions` (how many it drew started), `started_at` (Unix ms), `promoted` (the variant, once one was), `by`, its `criteria` (`id`, `name`, `query`, `op`, `bound`) and `variants` (`id`, `name`, `engine`, a microVM's `agentfile`, `cpus` and `memory`, `model` where it has its own, `weight`, `sessions`, and `current`: what its definition runs now). Every answer is measured: each variant's `measures` once its sessions bound them (`warm_ms`, the median of its warm starts in ms; `peak_gib`, of its microVMs' peak memory; `failed_pct`, the percent of its sessions that failed; each `[low, mid, high]` within its 95% interval) and `trend` (each measure as it stood at the end of each day, UTC, today's last), and each criterion's `values` (each variant's value of its query as kiln's monitors evaluate it now, and whether it `passes` its bound).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::ExperimentsCreate>(),
@@ -257,7 +266,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentdefs.experiments.criteria.add",
-            summary: "Add a criterion to one of your experiments, whatever it stands at: its `name`, its `query` in kiln's monitoring syntax (Datadog's, as kiln's monitors take one) without its comparison (`avg(last_7d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`), its `op` (>, >=, ==, !=, < or <=) and `bound`, kept as you wrote them once kiln's monitors read them. Answers `{experiment}` as agentdefs.experiments.create does.",
+            summary: "Add a criterion to one of your experiments, whatever it stands at: its `name`, its `query` in kiln's monitoring syntax (Datadog's, as kiln's monitors take one) without its comparison (`avg(last_7d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`), its `op` (>, >=, ==, !=, < or <=) and `bound`, kept as you wrote them once kiln's monitors read them. Its sessions' metrics are distributions tagged with `experiment` and `variant`: `kiln.session.warm_ms`, `kiln.session.peak_memory_gib` and `kiln.session.failed_pct` (100 a failed session, 0 another); a query may read any of kiln's metrics besides, and its `values` are a variant's where it groups `by {variant}`. Answers `{experiment}` as agentdefs.experiments.create does.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::ExperimentsCriteriaAdd>(),

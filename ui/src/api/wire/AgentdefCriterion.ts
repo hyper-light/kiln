@@ -10,4 +10,9 @@ export type AgentdefCriterion = { id: string, name: string,
  * What it measures, in kiln's monitoring syntax (Datadog's, as kiln's monitors take a query), its comparison
  * apart: `avg(last_7d):avg:kiln.session.warm_ms{experiment:<id>} by {variant}`.
  */
-query: string, op: AgentdefCriterionOp, bound: number, };
+query: string, op: AgentdefCriterionOp, bound: number, 
+/**
+ * Each variant's value of its query, by the variant's id, as kiln's monitors evaluate it now, and whether it
+ * passes its bound; none where the query gives no variant a value.
+ */
+values?: { [key in string]: { value: number, passes: boolean } }, };

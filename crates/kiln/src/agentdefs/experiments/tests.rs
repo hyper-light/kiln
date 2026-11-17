@@ -1,14 +1,21 @@
 //! A person's experiments on their agent definitions (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1), through the
 //! operations as REST, MCP and code mode call them (`crate::ops::call`, the route table's check included): every
 //! operation, another person's experiments as none, and the draw, from the operation table's own (`assign`) to a
-//! session `agentdefs.run` started and what `agentdefs.sessions` says of it.
+//! session `agentdefs.run` started and what `agentdefs.sessions` says of it; and what the Agents page reads of each:
+//! its variants' measures and trends from their sessions, and its criteria's values as kiln's monitors evaluate them.
 
 use std::sync::Arc;
 
+use rusqlite::params;
 use serde_json::{Value, json};
 
-use super::{Ask, Engine, VariantAsk, assign, create, started};
+use super::measures::{Reading, Warm};
+use super::{Ask, Comparison, CriterionAsk, Draw, Engine, VariantAsk, assign, create, started};
 use crate::authz::{Caller, Grant, Rights, gate::Kind};
+use crate::harness::core::Update;
+use crate::harness::model::{ExitInfo, Status};
+use crate::harness::registry::Location;
+use crate::harness::session::{Ended, Info, Measured, Runs, Start};
 use crate::hub::Hub;
 use crate::ops::{Cx, Fail};
 
@@ -397,4 +404,202 @@ fn p7_1_each_route_is_its_operation() -> anyhow::Result<()> {
     }
     anyhow::ensure!(super::ops::op_of(&http::Method::GET, &["e1", "nothing"]).is_none());
     Ok(())
+}
+
+/// A microVM variant of kiln's Agentfile for Claude Code at `weight` percent, sized `cpus` and `gib`.
+fn sized(weight: u32, cpus: u32, gib: u64) -> VariantAsk {
+    VariantAsk { weight, agentfile: Some("harness-claude".into()), cpus: Some(cpus), memory: Some(gib * GIB), ..VariantAsk::default() }
+}
+
+/// Session `id`, drawn as `d`, as its machine says it: its one start at `at`, a warm one Hex timed `start_us`, its
+/// microVM's peak `peak` bytes; ended a second later (`Some`: whether it failed), else running.
+fn session(id: &str, d: &Draw, at: i64, start_us: u64, peak: u64, ended: Option<bool>) -> Info {
+    let measured = Measured { start_us: Some(start_us), started_from: Some("warm".into()), footprint_peak_bytes: Some(peak), ..Measured::default() };
+    let start = Start { at, runs: Runs::Host { pid: 1 }, ended: ended.map(|_| Ended { at: at + 1_000, code: Some(0) }), measured: Some(measured) };
+    Info {
+        id: id.into(),
+        kind: "claude".into(),
+        status: if ended.is_some() { Status::Exited } else { Status::Running },
+        experiment: Some(d.assigned()),
+        starts: vec![start],
+        exit: ended.map(|failed| ExitInfo { at: at + 1_000, error: failed.then(|| "it failed".to_owned()), ..ExitInfo::default() }),
+        ..Info::default()
+    }
+}
+
+/// Measure `m` of variant `k` of experiment `x` as an answer has it, `[low, mid, high]`.
+fn interval(x: &Value, k: usize, m: &str) -> Option<[f64; 3]> {
+    let a = x.pointer(&format!("/variants/{k}/measures/{m}"))?.as_array()?;
+    Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?])
+}
+
+/// P7.1, the Agents page's experiments as its calls read them: sessions drawn, started and ended (each read from kiln's
+/// sessions, its warm start, peak and outcome kept with its draw, once) give each variant its `measures` (`warm_ms`,
+/// `peak_gib`, `failed_pct`, each `[low, mid, high]` within its 95% interval: the small variant's warm starts clear the
+/// large's) and its `trend` (each measure at the end of each day, its last the middle now), on the list
+/// (`GET /api/agentdef-experiments`) and on every change's answer: renamed, a variant renamed, its weights, a variant
+/// added (none of its own) and taken out, a criterion added (no `values` where kiln's observability doesn't run) and
+/// taken out, paused, resumed, promoted. Taking `measure` out of the answers leaves them without.
+#[test]
+fn p7_1_every_ui_call_answers_its_experiment_measured() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+        let ada = person("ada", "developer")?;
+        let who = crate::agentdefs::Who::of(&ada)?;
+        let call = |name: &'static str, input: Value| op(&hub, &ada, name, input);
+        let def = s(&call("agentdefs.create", json!({"name": "reviewer", "harness": "claude"})).await.map_err(failed)?, "/id");
+        let e = create(&hub, &who, &def, Ask { name: "Right-size".into(), variants: vec![sized(50, 2, 4), sized(50, 4, 8)], criteria: Vec::new() }, 0x5EED, "ada").await?;
+        let ids: Vec<String> = e.variants.iter().map(|v| v.id.clone()).collect();
+        let (small, large) = (ids.first().cloned().unwrap_or_default(), ids.get(1).cloned().unwrap_or_default());
+        // Sixty sessions: the small's warm starts 4 to 6 ms and peaks 2 or 2.5 GiB, the large's 9 to 11 ms and 3 or
+        // 3.5 GiB; every fifth failed.
+        let there = Location::Machine("box".into());
+        let at = crate::util::now_ms();
+        for i in 0..60u64 {
+            let d = assign(&hub, &def, "user:ada").await.ok_or_else(|| anyhow::anyhow!("draw {i}: none"))?;
+            let (us, peak) = if d.variant == small { (4_000, 2 * GIB) } else { (9_000, 3 * GIB) };
+            let id = format!("m{i}");
+            let info = session(&id, &d, at, us + 1_000 * (i % 3), peak + (i % 2) * GIB / 2, Some(i % 5 == 0));
+            hub.harness.ingest(&there, &id, Update::Open { info: Box::new(info), since: None }).await;
+            anyhow::ensure!(hub.harness.info(&id).is_some(), "session {id} is kiln's");
+            started(&hub, &d, Ok(id)).await;
+        }
+        let listed = call("agentdefs.experiments.list", json!({"id": def})).await.map_err(failed)?;
+        let x = listed.pointer(&format!("/{def}/0")).cloned().ok_or_else(|| anyhow::anyhow!("not listed: {listed}"))?;
+        let both = |m: &str| Some((interval(&x, 0, m)?, interval(&x, 1, m)?));
+        let ([sw_lo, sw_mid, sw_hi], [lw_lo, lw_mid, lw_hi]) = both("warm_ms").ok_or_else(|| anyhow::anyhow!("warm starts not measured: {x}"))?;
+        anyhow::ensure!(sw_lo >= 4.0 && sw_lo <= sw_mid && sw_mid <= sw_hi && sw_hi <= 6.0 && lw_lo >= 9.0 && lw_lo <= lw_mid && lw_mid <= lw_hi && lw_hi <= 11.0, "each within its warm starts: {x}");
+        anyhow::ensure!(sw_hi < lw_lo, "the small's warm starts clear the large's: {x}");
+        let ([sp_lo, _, sp_hi], [lp_lo, _, lp_hi]) = both("peak_gib").ok_or_else(|| anyhow::anyhow!("peaks not measured: {x}"))?;
+        anyhow::ensure!(sp_lo >= 2.0 && sp_hi <= 2.5 && lp_lo >= 3.0 && lp_hi <= 3.5, "peaks in GiB: {x}");
+        let ([sf_lo, sf_mid, sf_hi], [lf_lo, lf_mid, lf_hi]) = both("failed_pct").ok_or_else(|| anyhow::anyhow!("failures not measured: {x}"))?;
+        anyhow::ensure!(0.0 <= sf_lo && sf_lo <= sf_mid && sf_mid <= sf_hi && sf_hi <= 100.0 && 0.0 <= lf_lo && lf_lo <= lf_mid && lf_mid <= lf_hi && lf_hi <= 100.0, "failures as percents: {x}");
+        for (k, mid) in [(0, sw_mid), (1, lw_mid)] {
+            let line: Vec<f64> = x.pointer(&format!("/variants/{k}/trend/warm_ms")).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+            anyhow::ensure!(line.last() == Some(&mid), "its trend's last day its middle now: {line:?} in {x}");
+        }
+        let exp = e.id.clone();
+        let kept: (i64, i64, i64) = hub
+            .store
+            .read(move |c| Ok(c.query_row("SELECT COUNT(warm_at), COUNT(ended_at), COALESCE(SUM(failed), 0) FROM agent_def_experiment_draws WHERE experiment_id = ?1", [&exp], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?))
+            .await?;
+        anyhow::ensure!(kept == (60, 60, 12), "each session's warm start and end kept with its draw, every fifth failed: {kept:?}");
+
+        // Every change answers it measured.
+        let measured = |a: &Value, what: &str| -> anyhow::Result<()> {
+            anyhow::ensure!(a.pointer("/experiment/variants/0/measures/warm_ms").is_some() && a.pointer("/experiment/variants/1/trend/peak_gib").is_some(), "{what} answers it measured: {a}");
+            Ok(())
+        };
+        let id = e.id.clone();
+        measured(&call("agentdefs.experiments.rename", json!({"id": def, "experiment": id, "name": "Sizes"})).await.map_err(failed)?, "a rename")?;
+        measured(&call("agentdefs.experiments.rename", json!({"id": def, "experiment": id, "variant": small, "name": "Small"})).await.map_err(failed)?, "a variant's rename")?;
+        measured(&call("agentdefs.experiments.weights", json!({"id": def, "experiment": id, "weights": {small.as_str(): 70, large.as_str(): 30}, "base": 1})).await.map_err(failed)?, "its weights")?;
+        let added = call("agentdefs.experiments.variants.add", json!({"id": def, "experiment": id, "engine": "host"})).await.map_err(failed)?;
+        measured(&added, "a variant added")?;
+        anyhow::ensure!(added.pointer("/experiment/variants/2/measures").is_none() && added.pointer("/experiment/variants/2/trend").is_none(), "one no session ran in measures nothing: {added}");
+        let host = s(&added, "/experiment/variants/2/id");
+        measured(&call("agentdefs.experiments.variants.remove", json!({"id": def, "experiment": id, "variant": host})).await.map_err(failed)?, "a variant taken out")?;
+        let crit = call("agentdefs.experiments.criteria.add", json!({"id": def, "experiment": id, "name": "Warm start", "query": format!("avg(last_7d):avg:kiln.session.warm_ms{{experiment:{id}}} by {{variant}}"), "op": "<=", "bound": 8})).await.map_err(failed)?;
+        measured(&crit, "a criterion added")?;
+        if crate::observe::api::get().is_none() {
+            anyhow::ensure!(crit.pointer("/experiment/criteria/0/values").is_none(), "no observability here: no values: {crit}");
+        }
+        let c = s(&crit, "/experiment/criteria/0/id");
+        measured(&call("agentdefs.experiments.criteria.remove", json!({"id": def, "experiment": id, "criterion": c})).await.map_err(failed)?, "a criterion taken out")?;
+        measured(&call("agentdefs.experiments.pause", json!({"id": def, "experiment": id})).await.map_err(failed)?, "a pause")?;
+        measured(&call("agentdefs.experiments.resume", json!({"id": def, "experiment": id})).await.map_err(failed)?, "a resume")?;
+        measured(&call("agentdefs.experiments.promote", json!({"id": def, "experiment": id, "variant": small})).await.map_err(failed)?, "a promotion")?;
+        anyhow::Ok(())
+    })
+}
+
+/// P7.1 (criteria in kiln's monitoring syntax, Datadog's, in full): an experiment's criteria are judged over kiln's
+/// observability as kiln's monitors evaluate a query, the sessions' facts there as kiln writes them (distributions tagged
+/// with the experiment and the variant): each variant its value of `avg(last_7d):avg:kiln.session.warm_ms{experiment:…}
+/// by {variant}` and whether it passes `<= 8`; a criterion whose metric has no data has no values.
+#[test]
+fn p7_1_a_criterion_answers_each_variants_value_of_its_query() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+        let ada = person("ada", "developer")?;
+        let who = crate::agentdefs::Who::of(&ada)?;
+        let def = s(&op(&hub, &ada, "agentdefs.create", json!({"name": "triage", "harness": "claude"})).await.map_err(failed)?, "/id");
+        let e = create(&hub, &who, &def, Ask { name: "Sizes".into(), variants: vec![sized(50, 2, 4), sized(50, 4, 8)], criteria: Vec::new() }, 7, "ada").await?;
+        let query = |metric: &str| format!("avg(last_7d):avg:{metric}{{experiment:{}}} by {{variant}}", e.id);
+        let warm = CriterionAsk { name: "Warm start".into(), query: query("kiln.session.warm_ms"), op: Comparison::AtMost, bound: 8.0 };
+        let failures = CriterionAsk { name: "Failed sessions".into(), query: query("kiln.session.failed_pct"), op: Comparison::Below, bound: 10.0 };
+        super::add_criterion(&hub, &who, &def, &e.id, warm).await?;
+        let e = super::add_criterion(&hub, &who, &def, &e.id, failures).await?;
+        let ids: Vec<String> = e.variants.iter().map(|v| v.id.clone()).collect();
+        let (small, large) = (ids.first().cloned().unwrap_or_default(), ids.get(1).cloned().unwrap_or_default());
+        // Each variant's warm starts as kiln writes them, an hour apart, before the window's last bucket (its step half
+        // a day, the window ending on one).
+        let now = crate::util::now_ms();
+        let mut b = kiln_obs::batch::Builder::new();
+        for (variant, ms) in [(&small, 5.0), (&large, 10.0)] {
+            let readings: Vec<Reading> = (1..=4).map(|k| Reading { warm: Some(Warm { at: now - (12 + k) * 3_600_000, ms }), end: None }).collect();
+            for (key, pts) in super::measures::points(&e.id, variant, &readings) {
+                b.define(&key);
+                b.run(key.fp, pts);
+            }
+        }
+        let mut store = kiln_obs::store::Store::new(kiln_obs::hash::Keyed::with_keys(1, 2));
+        store.apply(&b.finish()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut es = vec![e];
+        super::measures::measure_over(&hub, &mut es, Some(Arc::new(kiln_obs::lock::RwLock::new(store)))).await;
+        let got = serde_json::to_value(&es)?;
+        anyhow::ensure!(
+            got.pointer(&format!("/0/criteria/0/values/{small}")) == Some(&json!({"value": 5.0, "passes": true})) && got.pointer(&format!("/0/criteria/0/values/{large}")) == Some(&json!({"value": 10.0, "passes": false})),
+            "each variant's value of its query, and whether it passes: {got}"
+        );
+        anyhow::ensure!(got.pointer("/0/criteria/1/values").is_none(), "no data, no values: {got}");
+        anyhow::Ok(())
+    })
+}
+
+/// P7.1: what a drawn session came to is kept with its draw however it ends. A refused start is over at once, failed;
+/// a session read while it runs keeps its warm start, not yet an end; one that goes while it runs (closed: kiln can't
+/// read it again) is kept over then, not failed, on its own task as the registry lets it go. Taking the registry's
+/// `closed` call out leaves its draw without its end.
+#[test]
+fn p7_1_a_drawn_session_is_kept_over_as_it_goes() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+        let ada = person("ada", "developer")?;
+        let who = crate::agentdefs::Who::of(&ada)?;
+        let def = s(&op(&hub, &ada, "agentdefs.create", json!({"name": "goer", "harness": "claude"})).await.map_err(failed)?, "/id");
+        let e = create(&hub, &who, &def, Ask { name: "Goes".into(), variants: vec![sized(50, 2, 4), sized(50, 4, 8)], criteria: Vec::new() }, 11, "ada").await?;
+        let row = |n: i64| {
+            let (hub, exp) = (Arc::clone(&hub), e.id.clone());
+            async move {
+                hub.store
+                    .read(move |c| Ok(c.query_row("SELECT warm_ms, ended_at, failed FROM agent_def_experiment_draws WHERE experiment_id = ?1 AND draw = ?2", params![exp, n], |r| Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<bool>>(2)?)))?))
+                    .await
+            }
+        };
+        let there = Location::Machine("box".into());
+        let at = crate::util::now_ms();
+        let d = assign(&hub, &def, "user:ada").await.ok_or_else(|| anyhow::anyhow!("no draw"))?;
+        hub.harness.ingest(&there, "c1", Update::Open { info: Box::new(session("c1", &d, at, 5_000, 2 * GIB, None)), since: None }).await;
+        started(&hub, &d, Ok("c1".into())).await;
+        let turned_down = assign(&hub, &def, "user:ada").await.ok_or_else(|| anyhow::anyhow!("no second draw"))?;
+        started(&hub, &turned_down, Err("an agent can't run isolated there: box starts no microVMs".into())).await;
+        let (_, ended, failure) = row(turned_down.n).await?;
+        anyhow::ensure!(ended.is_some() && failure == Some(true), "a refused start is over at once, failed: {ended:?} {failure:?}");
+        op(&hub, &ada, "agentdefs.experiments.list", json!({"id": def})).await.map_err(failed)?;
+        let (warm, ended, _) = row(d.n).await?;
+        anyhow::ensure!(warm == Some(5.0) && ended.is_none(), "running: its warm start kept, no end yet: {warm:?} {ended:?}");
+        hub.harness.ingest(&there, "c1", Update::Closed).await;
+        let over = crate::rt::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let (_, Some(ended), failure) = row(d.n).await? {
+                    return anyhow::Ok((ended, failure));
+                }
+                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        anyhow::ensure!(over.0 >= at && over.1 == Some(false), "over as it went, not failed: {over:?}");
+        anyhow::Ok(())
+    })
 }

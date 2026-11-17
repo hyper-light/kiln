@@ -42,4 +42,15 @@ sessions: number,
 /**
  * It's its definition as it runs now: its experiment's first variant, until one is promoted, then that one.
  */
-current: boolean, };
+current: boolean, 
+/**
+ * What its sessions measure, each `[low, mid, high]`: the median of its warm starts (ms) and of its microVMs'
+ * peak memory (GiB), and the percent of its sessions that failed, each within its 95% interval; none until its
+ * sessions bound all three.
+ */
+measures?: { warm_ms: [number, number, number], peak_gib: [number, number, number], failed_pct: [number, number, number] }, 
+/**
+ * Each measure as it stood at the end of each day (UTC), oldest first, today's last; a measure none of its
+ * sessions has yet is left out.
+ */
+trend?: { warm_ms?: Array<number>, peak_gib?: Array<number>, failed_pct?: Array<number> }, };

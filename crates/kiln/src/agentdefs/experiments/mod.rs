@@ -17,10 +17,11 @@
 //!   or with why its start was refused, which is that variant's failure ([`started`]).
 //! - **Whose**: its definition's owner's, as agent definitions are ([`super::Who`]). Another's is as none, and kiln's
 //!   own definitions take none.
-//!
-//! What its sessions measure (warm start, peak memory, failures) and judging its criteria through kiln's monitors
-//! are P7.1's next part.
+//! - **What its sessions measure** ([`measures`]): each variant's warm start, peak memory and failures as intervals,
+//!   and day by day; each session's as metrics of kiln's observability, which its criteria are evaluated over, a
+//!   value a variant, as kiln's monitors evaluate a query.
 
+pub mod measures;
 pub mod ops;
 #[cfg(test)]
 mod tests;
@@ -120,7 +121,7 @@ impl Comparison {
 }
 
 /// A variant: a deployment new sessions start in, and its share of them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentdefVariant"))]
 pub struct Variant {
@@ -150,6 +151,17 @@ pub struct Variant {
     pub sessions: u64,
     /// It's its definition as it runs now: its experiment's first variant, until one is promoted, then that one.
     pub current: bool,
+    /// What its sessions measure, each `[low, mid, high]`: the median of its warm starts (ms) and of its microVMs'
+    /// peak memory (GiB), and the percent of its sessions that failed, each within its 95% interval; none until its
+    /// sessions bound all three.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "{ warm_ms: [number, number, number], peak_gib: [number, number, number], failed_pct: [number, number, number] }"))]
+    pub measures: Option<measures::Measures>,
+    /// Each measure as it stood at the end of each day (UTC), oldest first, today's last; a measure none of its
+    /// sessions has yet is left out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "{ warm_ms?: Array<number>, peak_gib?: Array<number>, failed_pct?: Array<number> }"))]
+    pub trend: Option<measures::Trend>,
 }
 
 /// A criterion: what its person judges the variants by.
@@ -164,6 +176,11 @@ pub struct Criterion {
     pub query: String,
     pub op: Comparison,
     pub bound: f64,
+    /// Each variant's value of its query, by the variant's id, as kiln's monitors evaluate it now, and whether it
+    /// passes its bound; none where the query gives no variant a value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "{ [key in string]: { value: number, passes: boolean } }"))]
+    pub values: Option<BTreeMap<String, measures::Judged>>,
 }
 
 /// An experiment, as its operations answer it.
@@ -344,7 +361,7 @@ fn criteria_in(c: &Connection, experiment: &str) -> rusqlite::Result<Vec<Criteri
         let (id, name, query, op, bound) = row?;
         // One a newer kiln wrote with a comparator this one doesn't know isn't shown as another's.
         if let Some(op) = Comparison::of(&op) {
-            out.push(Criterion { id, name, query, op, bound });
+            out.push(Criterion { id, name, query, op, bound, values: None });
         }
     }
     Ok(out)
@@ -374,6 +391,8 @@ fn whole_in(c: &Connection, h: Head) -> rusqlite::Result<Experiment> {
             memory: d.memory,
             model: d.model,
             weight,
+            measures: None,
+            trend: None,
         })
         .collect();
     let criteria = criteria_in(c, &h.id)?;
@@ -990,21 +1009,23 @@ pub async fn assign(hub: &Hub, def: &str, person: &str) -> Option<Draw> {
     }
 }
 
-/// What draw `d`'s start came to, kept as its own: its session, or why it was refused (its variant's failure).
+/// What draw `d`'s start came to, kept as its own: its session, or why it was refused, its variant's failure then (its
+/// fact written to kiln's observability, [`measures`]).
 pub async fn started(hub: &Hub, d: &Draw, came: Result<String, String>) {
-    let (experiment, n) = (d.experiment.clone(), d.n);
-    let (session, refused) = match came {
-        Ok(s) => (Some(s), None),
-        Err(why) => (None, Some(why)),
-    };
+    let (experiment, n, at, refused) = (d.experiment.clone(), d.n, crate::util::now_ms(), came.is_err());
     let kept = hub
         .store
         .call(move |c| {
-            c.execute("UPDATE agent_def_experiment_draws SET session_id = ?3, refused = ?4 WHERE experiment_id = ?1 AND draw = ?2", params![experiment, n, session, refused])?;
+            match &came {
+                Ok(session) => c.execute("UPDATE agent_def_experiment_draws SET session_id = ?3 WHERE experiment_id = ?1 AND draw = ?2", params![experiment, n, session])?,
+                Err(why) => c.execute("UPDATE agent_def_experiment_draws SET refused = ?3, ended_at = ?4, failed = 1 WHERE experiment_id = ?1 AND draw = ?2", params![experiment, n, why, at])?,
+            };
             Ok(())
         })
         .await;
-    if let Err(e) = kept {
-        tracing::warn!(experiment = %d.experiment, draw = d.n, error = %format!("{e:#}"), "what an experiment's draw came to wasn't kept");
+    match kept {
+        Ok(()) if refused => measures::refused(&d.experiment, &d.variant, at),
+        Ok(()) => {}
+        Err(e) => tracing::warn!(experiment = %d.experiment, draw = d.n, error = %format!("{e:#}"), "what an experiment's draw came to wasn't kept"),
     }
 }

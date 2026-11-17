@@ -3488,6 +3488,8 @@ impl Registry {
             Update::Closed => {
                 gone = true;
                 goals_ended(hub, id);
+                // What it came to, where a definition's experiment drew it, kept before it's gone (P7.1).
+                crate::agentdefs::experiments::measures::closed(hub, &m.info);
                 // Its identities with it (docs/ci.md W27-R01).
                 let (store, id) = (hub.store.clone(), id.to_owned());
                 drop(crate::rt::spawn(async move {
