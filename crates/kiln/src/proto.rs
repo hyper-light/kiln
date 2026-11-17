@@ -823,7 +823,12 @@ pub mod feature {
     /// them only of a server that named it, and grants its isolated harnesses no sign-in until one has: they sign in
     /// themselves, as before.
     pub const LEASES: &str = "secrets.leases";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES];
+    /// This runner lists the agent volumes its microVMs' store keeps, those of the names asked alone, and clears one
+    /// once no session holds it, as the server asks ([`super::ServerMsg::Volumes`]; kiln plan 01a1dd2e…, P6.2). A
+    /// runner that didn't name it isn't asked: a person's view of their volumes says it couldn't be, and a start's
+    /// placement counts none of its volumes' bytes as held there.
+    pub const VOLUMES: &str = "agents.volumes";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1244,6 +1249,11 @@ pub enum ServerMsg {
     /// named [`feature::PREBUILD`]. Appended last, after `Replay`: postcard encodes variants by
     /// index.
     Prebuild { json: String },
+    /// The agent volumes this runner's microVMs' store keeps (JSON `crate::agentdefs::volumes::Ask`; kiln plan
+    /// 01a1dd2e…, P6.2): those of the names asked, as its store reads them, or one cleared; answered by
+    /// [`AgentMsg::Answer`] under `req` (`crate::agentdefs::volumes::Answer`). Only to runners that named
+    /// [`feature::VOLUMES`]. Appended last, after `Prebuild`: postcard encodes variants by index.
+    Volumes { req: u64, json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2097,8 +2107,9 @@ mod tests {
         // transfer, HarnessMailTransfer, in each (72 and 79); plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5 a history
         // asked for a person, HarnessHistoryFor (80); kiln plan 01a1dd2e… P2.3 a runner's engine, RunnerEngine (81);
         // CP-T3.2 the room a hand-over's spool leaves, AdoptPolicy (82); kiln plan 01a1dd2e… P7.1b a replay, Replay (83);
-        // kiln plan 01a1dd2e… P4.5 an Agentfile's build ahead of its sessions, Prebuild (84), and where it is, Prebuilt (73).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (74, 85), "each table has every variant once");
+        // kiln plan 01a1dd2e… P4.5 an Agentfile's build ahead of its sessions, Prebuild (84), and where it is, Prebuilt (73);
+        // kiln plan 01a1dd2e… P6.2 an agent's volumes on a runner, Volumes (85).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (74, 86), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -2330,6 +2341,7 @@ mod tests {
             ("AdoptPolicy", ServerMsg::AdoptPolicy { json: "{}".into() }),
             ("Replay", ServerMsg::Replay { req: 1, json: "{}".into() }),
             ("Prebuild", ServerMsg::Prebuild { json: "{}".into() }),
+            ("Volumes", ServerMsg::Volumes { req: 1, json: "{}".into() }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

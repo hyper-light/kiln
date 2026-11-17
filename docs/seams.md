@@ -414,7 +414,7 @@ placeholder), so each implementation supplies its own.
 
 A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
 than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
-read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another, components laid over its image's own, warm pools kept for its launches. What it holds it enforces; a launch that
+read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another, components laid over its image's own, warm pools kept for its launches, volumes of its boundary's store given to a launch. What it holds it enforces; a launch that
 asks for what it doesn't hold is refused `Unsupported`, never taken and ignored, and the suite checks
 both halves.
 
@@ -442,6 +442,20 @@ kept; `let_go` ends a pool's warm hosts and gives their room back, a host a laun
 a pool it doesn't keep is let go already; `pools` lists those it keeps and what each holds, warm and
 starting. A sandbox that keeps none refuses a keep and a let-go `Unsupported`, and lists none.
 
+A sandbox that holds them gives a launch's members volumes of its boundary's own store as it starts
+(`Launch::volumes`; kiln plan 01a1dd2e…, P6.2, through Hex for Shards' D271 and D281): each by its name
+there, made empty where the store has none, at its place in the members it names, read-only or not,
+its files held to its bound, and kept past the run for the next run given it. A launch's volume has a
+name, an absolute place and a member at least, or it's refused `Invalid`. A run holds its volumes from
+its start to its end: a launch asking one it holds with another bound is refused `Volume(Bound)`.
+`volumes` lists the volumes its store keeps, as the store reads them as it's asked (each one's files
+walked: a cost for a person's view or a placement, never for a launch): each one's name, the bytes its
+files take, its bound, its charge (what its files take by its bound's own measure) and when it was
+made. `clear_volume` removes one with its files once no run holds it, refused at once, never waited
+for: `Volume(InUse)` while a run holds it, its files kept; `Volume(Unknown)` where the store has none
+of that name; and `Volume(Clearing)`, which a launch is refused too, while a clearing holds it. A
+sandbox that keeps none refuses a launch given one, a listing and a clearing `Unsupported`.
+
 - **Implementations:** `host` (today's launch, which holds none of it: `kiln::sandbox::host`), the
   microVMs kiln's isolated harnesses run in (`kiln::sandbox`: Shards' members, through Hex, kiln plan
   01a1cd8e862e7169a074db3d5fa33f3d step 17; docs/isolation.md), then Hex's classes: `process`, `oci`,
@@ -449,14 +463,15 @@ starting. A sandbox that keeps none refuses a keep and a let-go `Unsupported`, a
   that do those things on the host boundary (a container or a microVM is refused `Unsupported`),
   holding everything unless made to hold less, 1000 runs at once, 10,000 outputs unread a run (past
   it, the run is killed), keeping pools as names alone, none holding a host, one at most for each run
-  it may hold (past them, a keep is refused `Full`).
+  it may hold (past them, a keep is refused `Full`), and volumes as names alone too, none holding a
+  file, one at most for each run it may hold (past them, a launch making one is refused `Full`).
 - **Used by:** every isolated harness kiln launches (step 17), and its CI legs once CP-T7.1 lands
   them.
 - **Passed by:** the simulator, every clause, holding everything and holding nothing; `host`
   (`kiln::sandbox::host`, on Unix); the microVMs' when their implementation lands on a machine that
   runs them.
 
-Methods: `launch`, `boundaries`, `holds`, `keep`, `let_go`, `pools`.
+Methods: `launch`, `boundaries`, `holds`, `keep`, `let_go`, `pools`, `volumes`, `clear_volume`.
 
 A launch gives a `Run`: stdin given to it in order, what it says (its output, then its end, once),
 signals (refused `Unsupported` where its boundary delivers none), and a kill (its end, unless it had
@@ -522,6 +537,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, 
 - **SANDBOX-15** a run's member swapped for another in its boundary ends, its end said once, and the run it gives runs the other in the same boundary; one swapped out swaps no more; a sandbox that swaps none refuses one Unsupported, and its run goes on
 - **SANDBOX-16** a launch's components are laid for it, and a run takes a component swapped in and its image's own given back while it runs, and one after its end is refused Ended; a sandbox that holds no components refuses both Unsupported, and its run goes on
 - **SANDBOX-17** a sandbox keeps a warm pool it's asked to keep, once however often it's asked, and lists it until it's let go; a pool it doesn't keep is let go already; a sandbox that keeps no pools refuses one Unsupported, and lists none
+- **SANDBOX-18** a launch's volume is made where its store has none and held by its run: listed with its bound, refused Volume(Bound) to a launch asking another bound while the run holds it, kept past the run, and cleared only once no run holds it, a clearing refused Volume(InUse) while one does and Volume(Unknown) once it's gone; a sandbox that keeps no volumes refuses one Unsupported, and lists and clears none
 
 ## Placement
 

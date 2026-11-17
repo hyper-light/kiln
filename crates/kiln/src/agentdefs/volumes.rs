@@ -10,12 +10,19 @@
 //! - **Whose**: one person's alone, as a person's harness homes are (`harness::isolated::home`): its store's name for it
 //!   ([`store_name`]) is made from the person its session acts for, its definition and its name, so no other person's
 //!   session of that definition, and no other definition's, is given it.
-//! - **Given** to its session's harness by that name as it starts in its microVM (`sandbox::isolated::launch`: a
-//!   `Change::Plug` of `PlugSource::Volume`, which Shards makes where it isn't there, D271); a session on its machine's
-//!   host is refused (`harness::lineage`), as it has no store of Shards'.
-//! - **Admitted**: the bytes its volumes may hold ([`bytes`]) are what its placement asks of its machine's disk
-//!   (`Isolation::disk`, `harness::lineage::session_needs`), so it starts only where the disk has room for them.
+//! - **Given** to its session's harness by that name as its microVM starts, with its bound
+//!   (`sandbox::isolated::launch_of`: the seam's `Launch::volumes`, in Hex's box spec, its box admitted with their
+//!   bounds together as its disk), which Shards makes where it isn't there and holds to its bound (D271, D281); a
+//!   session on its machine's host is refused (`harness::lineage`), as it has no store of Shards'.
+//! - **Admitted**: what its volumes may still take of its machine's disk is what its placement asks of it
+//!   (`Isolation::disk`, `harness::lineage::session_needs`): their bounds together, less what they hold there already
+//!   ([`held_on`]), which the disk counts as used. Hex holds each box to their whole bounds, so none writes past them.
+//! - **Seen and cleared** by its person alone ([`list`], [`clear`]; `agentdefs.volumes`, `agentdefs.volumes.clear`):
+//!   each machine's, asked of its runner (`ServerMsg::Volumes`, [`Ask`]), which reads its microVMs' store
+//!   (`Sandbox::volumes`, Hex's `Runtime::volumes`) and clears one there once no session holds it
+//!   (`Sandbox::clear_volume`), each refusal typed by its cause ([`Cause`]).
 
+use kiln_seams::sandbox::{Refusal, VolumeCause};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -97,12 +104,16 @@ pub fn store_name(person: &str, definition: &str, name: &str) -> String {
 }
 
 /// One of an agent's volumes as a session of it is given it (`Spec::volumes`): its name, its store's name for it on
-/// the session's machine ([`store_name`]), and where its harness sees it ([`at`]).
+/// the session's machine ([`store_name`]), where its harness sees it ([`at`]), and the most bytes it may hold, its bound
+/// there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Given {
     pub name: String,
     pub store: String,
     pub at: String,
+    /// 0 from a server older than bounds, which its launch refuses rather than give it unbounded.
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 /// `volumes` of agent definition `definition` as a session acting for `person` is given them.
@@ -113,6 +124,7 @@ pub fn given(person: &str, definition: &str, volumes: &[Volume]) -> Vec<Given> {
             name: v.name.clone(),
             store: store_name(person, definition, &v.name),
             at: at(&v.name),
+            bytes: v.bytes,
         })
         .collect()
 }
@@ -142,6 +154,369 @@ pub async fn of(hub: &Hub, d: &Definition) -> R<Vec<Volume>> {
             d.id, d.version
         ))
     })
+}
+
+/// What the server asks a runner of the agent volumes its microVMs' store keeps (`ServerMsg::Volumes`,
+/// `proto::feature::VOLUMES`), each by its name in that store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ask {
+    /// Those of `stores` it keeps, as it reads them.
+    List { stores: Vec<String> },
+    /// `store` cleared.
+    Clear { store: String },
+}
+
+/// A runner's answer to an [`Ask`] (`AgentMsg::Answer`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer {
+    /// Those of the volumes asked its store keeps; none of any other.
+    Listed {
+        volumes: Vec<Held>,
+    },
+    Cleared,
+    /// Refused by `cause`, in its store's words.
+    Refused {
+        cause: Cause,
+        why: String,
+    },
+}
+
+/// A volume a runner's store keeps ([`Answer::Listed`]), as it read it: its name there; the bytes its files take; its
+/// bound; its charge, what its files take by its bound's own measure, which its bound holds it to (Shards' D281), each
+/// none where unread; and when it was made, in nanoseconds since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    pub store: String,
+    pub bytes: Option<u64>,
+    pub bound: Option<u64>,
+    pub charge: Option<u64>,
+    pub created_ns: u64,
+}
+
+/// Why a runner refused an [`Ask`], each by its own retry: the seam's volume causes, then its machine's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cause {
+    /// A session holds it until it ends: its files are kept.
+    InUse,
+    /// Its store has none of that name: cleared already, or never made there.
+    Unknown,
+    /// Asked with another bound than the sessions holding it serve it with.
+    Bound,
+    /// A clearing holds it.
+    Clearing,
+    /// Its machine keeps no agent's volumes: it holds no microVMs, or none that keep any.
+    Unsupported,
+    /// Its store couldn't read or clear it.
+    Failed,
+}
+
+impl Cause {
+    /// What it says of a volume a person asked to clear.
+    fn words(self) -> &'static str {
+        match self {
+            Cause::InUse => {
+                "is in use by a running session of this agent there, and its files are kept"
+            }
+            Cause::Unknown => "isn't there: cleared already, or never made there",
+            Cause::Bound => "is held by a session with another bound",
+            Cause::Clearing => "is being cleared already",
+            Cause::Unsupported => "can't be there: that machine keeps no agent's volumes",
+            Cause::Failed => "couldn't be cleared there",
+        }
+    }
+}
+
+/// `ask` answered on a runner from its microVMs' store (`crate::sandbox::microvm`): those of the volumes asked that it
+/// keeps, or one cleared, each refusal by its cause. Only the names asked are answered, so no other person's or
+/// agent's volume leaves its machine.
+pub async fn answer(ask: Ask) -> Answer {
+    let Some(vms) = crate::sandbox::microvm() else {
+        return Answer::Refused {
+            cause: Cause::Unsupported,
+            why: "this machine holds no microVMs, so it keeps no agent's volumes".into(),
+        };
+    };
+    match ask {
+        Ask::List { stores } => match vms.sandbox.volumes().await {
+            Ok(kept) => Answer::Listed {
+                volumes: kept
+                    .into_iter()
+                    .filter(|k| stores.contains(&k.name))
+                    .map(|k| Held {
+                        store: k.name,
+                        bytes: k.bytes,
+                        bound: k.bound,
+                        charge: k.charge,
+                        created_ns: k.created_ns,
+                    })
+                    .collect(),
+            },
+            Err(r) => refused(r),
+        },
+        Ask::Clear { store } => match vms.sandbox.clear_volume(store).await {
+            Ok(()) => Answer::Cleared,
+            Err(r) => refused(r),
+        },
+    }
+}
+
+/// The seam's refusal `r` as an answer's, by its cause. kiln names each volume by its store's grammar itself, so a
+/// refusal of anything but the volume is its store's failing.
+fn refused(r: Refusal) -> Answer {
+    let why = r.to_string();
+    let cause = match r {
+        Refusal::Volume {
+            cause: VolumeCause::InUse,
+            ..
+        } => Cause::InUse,
+        Refusal::Volume {
+            cause: VolumeCause::Unknown,
+            ..
+        } => Cause::Unknown,
+        Refusal::Volume {
+            cause: VolumeCause::Bound,
+            ..
+        } => Cause::Bound,
+        Refusal::Volume {
+            cause: VolumeCause::Clearing,
+            ..
+        } => Cause::Clearing,
+        Refusal::Unsupported(_) => Cause::Unsupported,
+        Refusal::Invalid { .. }
+        | Refusal::NoSuchProgram(_)
+        | Refusal::Full { .. }
+        | Refusal::Ended => Cause::Failed,
+    };
+    Answer::Refused { cause, why }
+}
+
+/// `ask` of machine `machine`'s runner, waited for as a person's command waits for its runner (`hub::COMMAND_WITHIN`);
+/// why not, where its runner names no `proto::feature::VOLUMES`, is away, or didn't answer in time.
+async fn ask_machine(hub: &Hub, machine: &str, ask: &Ask) -> Result<Answer, String> {
+    let json = serde_json::to_string(ask).map_err(|e| format!("its ask wasn't written: {e}"))?;
+    match hub
+        .ask_speaking::<Answer>(
+            machine,
+            crate::proto::feature::VOLUMES,
+            crate::hub::COMMAND_WITHIN,
+            move |req| crate::proto::ServerMsg::Volumes { req, json },
+        )
+        .await
+    {
+        Ok(Some(Some(answer))) => Ok(answer),
+        Ok(Some(None)) => Err(format!("{} answered nothing", hub.shown(machine))),
+        Ok(None) => Err(format!(
+            "{}'s kiln keeps no agent's volumes it can be asked about: upgrade it (System → Updates)",
+            hub.shown(machine)
+        )),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+/// The names of agent definition `id`'s volumes whose own the caller may see and clear: one of their own definitions,
+/// or one of kiln's (whose volumes are each person's own too); another's is as none whoever asks, an admin too, as a
+/// volume is its person's alone. Every name any of its versions declared, so one an older version kept is found too.
+async fn names_of(hub: &Hub, who: &Who, id: &str) -> R<Vec<String>> {
+    if let Some(b) = builtin::get(id) {
+        return Ok(b.settings.volumes.into_iter().map(|v| v.name).collect());
+    }
+    let own = Who {
+        person: who.person.clone(),
+        all: false,
+    };
+    let mut names: Vec<String> = Vec::new();
+    for version in super::versions(hub, &own, id).await? {
+        for v in version.settings.volumes {
+            if !names.contains(&v.name) {
+                names.push(v.name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// An agent's volumes as its person sees them ([`list`]): each machine's that keeps any, and the machines that
+/// couldn't say.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Listed {
+    pub machines: Vec<OnMachine>,
+    pub unheard: Vec<Unheard>,
+}
+
+/// One machine's volumes of an agent for its person ([`list`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OnMachine {
+    pub machine: String,
+    pub volumes: Vec<Shown>,
+}
+
+/// One of an agent's volumes on a machine as its person sees it: its name in the definition; the bytes its files take;
+/// its charge, what they take by its bound's own measure, which its bound holds it to; its bound, each none where its
+/// store couldn't read it; and when it was made, in ms since the Unix epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Shown {
+    pub name: String,
+    pub bytes: Option<u64>,
+    pub charge: Option<u64>,
+    pub bound: Option<u64>,
+    pub created_ms: u64,
+}
+
+/// A machine that couldn't say ([`list`]), and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Unheard {
+    pub machine: String,
+    pub why: String,
+}
+
+/// The caller's volumes of agent definition `id` ([`names_of`]) on each machine that keeps any (`machine`: that one
+/// alone), as each machine's runner reads its store, all asked at once. A machine that holds no microVMs keeps none;
+/// one that couldn't say is among `unheard`, saying why.
+pub async fn list(hub: &Hub, who: &Who, id: &str, machine: Option<&str>) -> R<Listed> {
+    let stores: Vec<(String, String)> = names_of(hub, who, id)
+        .await?
+        .into_iter()
+        .map(|n| (store_name(&who.person, id, &n), n))
+        .collect();
+    let mut listed = Listed {
+        machines: Vec::new(),
+        unheard: Vec::new(),
+    };
+    if stores.is_empty() {
+        return Ok(listed);
+    }
+    let mut machines: Vec<String> = match machine {
+        Some(m) => vec![m.to_owned()],
+        None => hub
+            .agents
+            .load()
+            .values()
+            .filter(|a| a.connected && !a.outpost && !a.ephemeral)
+            .map(|a| a.name.clone())
+            .collect(),
+    };
+    machines.sort();
+    let ask = Ask::List {
+        stores: stores.iter().map(|(store, _)| store.clone()).collect(),
+    };
+    let answers =
+        futures::future::join_all(machines.iter().map(|m| ask_machine(hub, m, &ask))).await;
+    for (machine, answer) in machines.into_iter().zip(answers) {
+        match answer {
+            Ok(Answer::Listed { volumes }) => {
+                let shown: Vec<Shown> = volumes
+                    .into_iter()
+                    .filter_map(|h| {
+                        let name = stores
+                            .iter()
+                            .find(|(store, _)| *store == h.store)
+                            .map(|(_, name)| name.clone())?;
+                        Some(Shown {
+                            name,
+                            bytes: h.bytes,
+                            charge: h.charge,
+                            bound: h.bound,
+                            created_ms: h.created_ns / 1_000_000,
+                        })
+                    })
+                    .collect();
+                if !shown.is_empty() {
+                    listed.machines.push(OnMachine {
+                        machine,
+                        volumes: shown,
+                    });
+                }
+            }
+            Ok(Answer::Refused {
+                cause: Cause::Unsupported,
+                ..
+            }) => {}
+            Ok(Answer::Refused { why, .. }) => listed.unheard.push(Unheard { machine, why }),
+            Ok(Answer::Cleared) => listed.unheard.push(Unheard {
+                machine,
+                why: "it answered a listing with a clearing".into(),
+            }),
+            Err(why) => listed.unheard.push(Unheard { machine, why }),
+        }
+    }
+    Ok(listed)
+}
+
+/// The caller's volume `name` of agent definition `id` cleared on machine `machine`: its files removed there, so the
+/// agent's next session there finds it empty. Refused, typed by its cause ([`Error::Volume`]): while a session holds
+/// it (its files kept), where that machine keeps none of that name, and where its store couldn't; `Unavailable` where
+/// that machine can't be asked.
+pub async fn clear(hub: &Hub, who: &Who, id: &str, machine: &str, name: &str) -> R<()> {
+    if let Some(why) = name_problem(name) {
+        return Err(Error::Bad(why));
+    }
+    names_of(hub, who, id).await?;
+    let ask = Ask::Clear {
+        store: store_name(&who.person, id, name),
+    };
+    match ask_machine(hub, machine, &ask)
+        .await
+        .map_err(Error::Unavailable)?
+    {
+        Answer::Cleared => Ok(()),
+        Answer::Refused { cause, why } => Err(Error::Volume {
+            cause,
+            why: format!(
+                "volume {name} on {} {}: {why}",
+                hub.shown(machine),
+                cause.words()
+            ),
+        }),
+        Answer::Listed { .. } => Err(Error::Unavailable(format!(
+            "{} answered a clearing with a listing",
+            hub.shown(machine)
+        ))),
+    }
+}
+
+/// What `given`, a session's volumes, hold already on every one of `machines`, those its placement may choose (ROOT's
+/// decision on Hex's P6.2 question, 2026-11-16): on each, each volume's charge there (what its files take by its bound's
+/// own measure, which its bound holds it to), at most its bound, together; the least of those over `machines`. A
+/// machine's free disk counts what its volumes hold as used already, so its placement asks of it only what they may
+/// still grow by, never those bytes twice; the least over every machine it may go to asks none of them less than its
+/// volumes may still take there. A machine that can't say (its kiln older, away, its store failing, a charge unread)
+/// holds none of them, as far as its placement knows. Each is asked as a person's view asks it, all at once: a listing
+/// walks its volumes' files, which a start of an agent with volumes waits on.
+pub async fn held_on(hub: &Hub, machines: &[String], given: &[Given]) -> u64 {
+    if given.is_empty() || machines.is_empty() {
+        return 0;
+    }
+    let ask = Ask::List {
+        stores: given.iter().map(|g| g.store.clone()).collect(),
+    };
+    let answers =
+        futures::future::join_all(machines.iter().map(|m| ask_machine(hub, m, &ask))).await;
+    answers
+        .into_iter()
+        .map(|a| match a {
+            Ok(Answer::Listed { volumes }) => held_in(given, &volumes),
+            Ok(Answer::Cleared | Answer::Refused { .. }) | Err(_) => 0,
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+/// What `given` hold already of their bounds in `listed`, one machine's listing ([`held_on`]): each one's charge there,
+/// at most its bound, together. One unlisted, or whose charge was unread, holds none.
+fn held_in(given: &[Given], listed: &[Held]) -> u64 {
+    given
+        .iter()
+        .map(|g| {
+            listed
+                .iter()
+                .find(|h| h.store == g.store)
+                .and_then(|h| h.charge)
+                .map_or(0, |charge| charge.min(g.bytes))
+        })
+        .fold(0, u64::saturating_add)
 }
 
 #[cfg(test)]
@@ -242,6 +617,94 @@ mod tests {
         assert!(name_problem(&one).is_none(), "Shards' grammar takes {one}");
     }
 
+    /// P6.2 (ROOT's decision on Hex's P6.2 question): what a session's volumes hold already on a machine is each one's
+    /// charge there, at most its bound, together; one unlisted there, or whose charge its store couldn't read, holds
+    /// none, and another volume of the machine's counts for none of them.
+    #[test]
+    fn p6_2_a_machine_holds_of_a_sessions_volumes_their_charges_at_most_their_bounds() {
+        let given = given(
+            "user:a",
+            "d1",
+            &[
+                volume("cache", 100),
+                volume("tools", 50),
+                volume("notes", 10),
+            ],
+        );
+        let row = |store: &str, charge: Option<u64>| Held {
+            store: store.to_owned(),
+            bytes: charge,
+            bound: None,
+            charge,
+            created_ns: 0,
+        };
+        let listed = [
+            row(&store_name("user:a", "d1", "cache"), Some(40)),
+            row(&store_name("user:a", "d1", "tools"), Some(70)),
+            row(&store_name("user:a", "d1", "notes"), None),
+            row(&store_name("user:b", "d1", "cache"), Some(1000)),
+        ];
+        assert_eq!(
+            held_in(&given, &listed),
+            40 + 50,
+            "cache's charge, tools' bound (its charge is past it), notes' none (unread), and another person's none"
+        );
+        assert_eq!(held_in(&given, &[]), 0, "a machine with none of them");
+        assert_eq!(held_in(&[], &listed), 0, "a session with no volumes");
+    }
+
+    /// P6.2: a runner's refusal of a listing or a clearing keeps its cause, the seam's volume causes by name; a machine
+    /// that keeps none says so, and anything else is its store's failing. Its ask and answer read back whole.
+    #[test]
+    fn p6_2_a_runners_refusal_keeps_its_cause() -> Result<(), serde_json::Error> {
+        let held_by = |cause| Refusal::Volume {
+            cause,
+            why: "kiln-agent-x".into(),
+        };
+        let cause_of = |a: Answer| match a {
+            Answer::Refused { cause, .. } => Some(cause),
+            Answer::Listed { .. } | Answer::Cleared => None,
+        };
+        for (r, cause) in [
+            (held_by(VolumeCause::InUse), Cause::InUse),
+            (held_by(VolumeCause::Unknown), Cause::Unknown),
+            (held_by(VolumeCause::Bound), Cause::Bound),
+            (held_by(VolumeCause::Clearing), Cause::Clearing),
+            (Refusal::Unsupported("none".into()), Cause::Unsupported),
+            (
+                Refusal::Invalid {
+                    what: "its microVM",
+                    why: "shards failed".into(),
+                },
+                Cause::Failed,
+            ),
+        ] {
+            assert_eq!(cause_of(refused(r)), Some(cause));
+        }
+        for ask in [
+            Ask::List {
+                stores: vec![store_name("user:a", "d1", "cache")],
+            },
+            Ask::Clear {
+                store: store_name("user:a", "d1", "cache"),
+            },
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Ask>(&serde_json::to_string(&ask)?)?,
+                ask
+            );
+        }
+        let answer = Answer::Refused {
+            cause: Cause::InUse,
+            why: "held".into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<Answer>(&serde_json::to_string(&answer)?)?,
+            answer
+        );
+        Ok(())
+    }
+
     #[test]
     fn p6_2_a_session_is_given_each_volume_by_its_store_name_beneath_the_live_plug_root() {
         let given = given("user:a", "d1", &[volume("cache", 1)]);
@@ -250,7 +713,8 @@ mod tests {
             [Given {
                 name: "cache".into(),
                 store: store_name("user:a", "d1", "cache"),
-                at: "/volumes/cache".into()
+                at: "/volumes/cache".into(),
+                bytes: 1
             }]
         );
     }

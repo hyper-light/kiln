@@ -1419,6 +1419,22 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         (&Method::DELETE, ["api", "agentdefs", id]) => boxed(|| own_op(&hub, &caller, "agentdefs.delete", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentdefs", id, "versions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.versions", json!({ "id": id }))).await,
         (&Method::GET, ["api", "agentdefs", id, "sessions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.sessions", json!({ "id": id }))).await,
+        // A person's own volumes of an agent on each machine, and one cleared (kiln plan 01a1dd2e…, P6.2).
+        (&Method::GET, ["api", "agentdefs", id, "volumes"]) => {
+            let mut v = query_value(&q);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "agentdefs.volumes", v)).await
+        }
+        (&Method::POST, ["api", "agentdefs", id, "volumes", "clear"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "agentdefs.volumes.clear", body)).await
+        }
         (&Method::GET, ["api", "agentdef-sessions"]) => boxed(|| own_op(&hub, &caller, "agentdefs.sessions", json!({}))).await,
         // A change over the version it was made over (`If-Match`, or `base`): refused, with what it is now, where
         // another change came first.

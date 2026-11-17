@@ -333,6 +333,7 @@ classes! {
         ServerMsg::AdoptPolicy { .. } => Class::State,
         ServerMsg::Replay { .. } => Class::Ask,
         ServerMsg::Prebuild { .. } => PARKED,
+        ServerMsg::Volumes { .. } => Class::Ask,
     }
 }
 

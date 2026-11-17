@@ -341,6 +341,37 @@ harness doesn't say what a limit counts, the limit can't be held, so the agent i
 starts, saying so (`ended`: `its token limit of 1000 tokens can't be held: Gemini CLI doesn't say
 how many tokens its sessions use (agent definition reviewer)`).
 
+### An agent definition's volumes
+
+An agent you define can keep things from one session to the next: its caches, toolchains and
+package stores. Give its definition volumes (`volumes`: each a `name` and the most `bytes` it may
+hold; docs/api.md, "Agent definitions"), and each session started from it, in a microVM of its
+own, finds each at `/volumes/<name>` as the last session on that machine left it.
+
+- **Yours alone, on each machine.** A volume is kept on the machine the session ran on, for you and
+  that agent. Another person's sessions of the same agent have their own, and a session on another
+  machine has that machine's, empty the first time.
+- **Held to its size.** A volume holds at most its `bytes`: a write past them fails in the agent as
+  on a full disk. A session starts only on a machine whose disk has room for what its volumes may
+  still grow by. What they hold there already counts as theirs, so a machine that keeps them full
+  needs no more room for them. A machine that can't say what it keeps is taken to keep none.
+- **Only in a microVM.** An agent with volumes runs isolated: starting one as a process on its
+  machine is refused, saying so.
+- **See them.** `agentdefs.volumes` (`GET /api/agentdefs/{id}/volumes`, the MCP tool
+  `agentdefs_volumes`, code mode's `kiln.agentdefs.volumes`) shows your volumes of that agent on
+  each machine that keeps any: what its files take against its size, and when it was made. Every
+  volume any version of the definition named is there, so one an older version kept shows too. A
+  machine that couldn't be asked is listed, saying why.
+- **Clear one.** `agentdefs.volumes.clear` (`POST /api/agentdefs/{id}/volumes/clear` with `name`
+  and `machine`) empties it on that machine: its files are removed, and the agent's next session
+  there finds it empty. It's refused while a session of the agent there is using it, and your files
+  are kept; and where that machine has no such volume.
+- **A start refused for a volume.** If you change a volume's size while a session using it still
+  runs, a new session on that machine is refused until that one ends; and a session started where
+  you're clearing that volume is refused until the clearing is done. Each refusal says which.
+
+Nobody else sees or clears your volumes, an admin who reaches everyone's agent definitions included.
+
 ### Crashed agents
 
 An agent reads **offline** only when its machine is: the computer is off, or its runner can't reach

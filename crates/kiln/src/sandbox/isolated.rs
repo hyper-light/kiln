@@ -37,7 +37,7 @@
 
 use std::path::Path;
 
-use kiln_seams::sandbox::{Boundary, Egress, Launch, Limits, Share};
+use kiln_seams::sandbox::{Boundary, Egress, Launch, Limits, Refusal, Share, VolumeCause};
 
 use super::Microvms;
 use super::image::{Images, Source};
@@ -115,6 +115,7 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String, kiln: &[&Path]) -> any
     // Its project's top-level directory, where a folder is plugged in live ([`launch`] adds its person's volumes' and its
     // session's root).
     let roots = plug_root_of(&project.at).into_iter().collect();
+    let volumes = volumes_of(&spec.volumes, &kiln_seams::sandbox::Member(run.member.to_owned()))?;
     Ok(Launch {
         program: run.member.to_owned(),
         args: run.args,
@@ -132,6 +133,8 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String, kiln: &[&Path]) -> any
         egress_ceiling: spec.egress_ceiling.clone(),
         // The components a person swapped into its session, laid over its image's own (kiln plan 01a1dd2e…, P6c.3).
         components: spec.components.clone(),
+        // Its agent's volumes (P6.2), there as it starts, before its session hands it a turn.
+        volumes,
     })
 }
 
@@ -240,11 +243,6 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     for share in &mut launch.shares {
         share.members = vec![member.clone()];
     }
-    // Its agent's volumes are plugged in as it starts (P6.2): where its microVMs take no plug live, refused before
-    // anything boots, never started without them.
-    if !spec.volumes.is_empty() && !vms.sandbox.holds().live {
-        anyhow::bail!("{}'s agent volumes are plugged into its microVM as it starts, and this machine's microVMs take no folder live: {}", kind.name, super::hexvm::NO_LIVE);
-    }
     let declared = crate::sandbox::held::Declared::of(&launch);
     // Its microVM's size as its isolation gives it (plan step 32; a deployment experiment's variant, P7.1): whole vCPUs
     // and MiB, rounded up.
@@ -264,16 +262,9 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
                 (Some(claim), Some(reach)) => reach.box_of(claim.clone()).await,
                 _ => None,
             };
-            (vms.launch(name, launch, size, &sign_ins).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}", kind.name))?, false)
+            (vms.launch(name, launch, size, &sign_ins).await.map_err(|r| anyhow::anyhow!("{} couldn't start in a microVM of {image}: {r}{}", kind.name, again(&r)))?, false)
         }
     };
-    // Before its session hands it a turn, so nothing it runs writes where its volume goes before it's there.
-    for (v, plug) in spec.volumes.iter().zip(volume_plugs(&spec.volumes, &member)) {
-        if let Err(why) = run.change(plug).await {
-            run.kill();
-            anyhow::bail!("{}'s agent volume {} couldn't be plugged in at {}: {why}", kind.name, v.name, v.at);
-        }
-    }
     let us = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
     let (from, meter) = match (&vms.hex, run.id()) {
         // A swap started no microVM: its start is its member's in the one it ran in (`swapped`), never that
@@ -302,11 +293,29 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     Ok(crate::proc::duplex_of_run(run, image, reach, kept_in, declared, Some(started)))
 }
 
-/// The plugs that give `member` its agent's `volumes` (P6.2): each by its name in its machine's store
-/// (`PlugSource::Volume`, made where it isn't there: Shards' D271), read-write, at its path.
-pub fn volume_plugs(volumes: &[crate::agentdefs::volumes::Given], member: &kiln_seams::sandbox::Member) -> Vec<kiln_seams::sandbox::Change> {
-    use kiln_seams::sandbox::{Change, PlugFor, PlugSource};
-    volumes.iter().map(|v| Change::Plug { source: PlugSource::Volume(v.store.clone()), to: PlugFor::Members(vec![member.clone()]), at: v.at.clone(), read_only: false }).collect()
+/// Its agent's `given` volumes as its launch gives them to its harness `member` (P6.2): each by its name in its
+/// machine's store, its bound the most its definition lets it hold, read-write at its path, there as it starts, made
+/// where it isn't and kept past its session (Shards' D271, D281). One its server named no bound for (a server older
+/// than bounds) is refused rather than given unbounded.
+pub fn volumes_of(given: &[crate::agentdefs::volumes::Given], member: &kiln_seams::sandbox::Member) -> anyhow::Result<Vec<kiln_seams::sandbox::Volume>> {
+    given
+        .iter()
+        .map(|v| {
+            let bound = std::num::NonZeroU64::new(v.bytes).ok_or_else(|| anyhow::anyhow!("its agent volume {} came with no bound (its server is older than volumes' bounds), and a volume isn't given unbounded", v.name))?;
+            Ok(kiln_seams::sandbox::Volume { name: v.store.clone(), bound, at: v.at.clone(), members: vec![member.clone()], read_only: false })
+        })
+        .collect()
+}
+
+/// When a start its machine's store refused for one of its agent's volumes (P6.2) may be asked again, by the refusal's
+/// cause: a clearing's once it has answered, a bound's once no other session of the agent there holds it. None for any
+/// other refusal.
+fn again(r: &Refusal) -> &'static str {
+    match r {
+        Refusal::Volume { cause: VolumeCause::Clearing, .. } => " (start it again once that volume's clearing has answered)",
+        Refusal::Volume { cause: VolumeCause::Bound, .. } => " (its volume's bound changed: start it again once no other session of this agent on this machine holds that volume)",
+        Refusal::Volume { cause: VolumeCause::InUse | VolumeCause::Unknown, .. } | Refusal::NoSuchProgram(_) | Refusal::Invalid { .. } | Refusal::Unsupported(_) | Refusal::Full { .. } | Refusal::Ended => "",
+    }
 }
 
 /// Serves kiln's MCP to run `vm`'s harness in this runner's own process (Shards D254; #75 step 3): each connection
@@ -838,17 +847,32 @@ pub fn egress_of(reach: &Reach, whole: Option<Vec<String>>) -> Egress {
 mod tests {
     use super::*;
 
-    /// P6.2: each of an agent's volumes is plugged into its harness alone, read-write, by its name in its machine's
-    /// store (made there where it isn't, found again by the agent's next session), strictly beneath the live plug root
-    /// every launch declares.
+    /// P6.2: each of an agent's volumes is given to its harness alone as it starts, read-write, by its name in its
+    /// machine's store (made there where it isn't, found again by the agent's next session), with the bound its
+    /// definition gives it, beneath `/volumes`. One its server named no bound for is refused, not given unbounded.
     #[test]
-    fn p6_2_an_agents_volumes_are_plugged_into_its_harness_by_their_store_names() {
-        use kiln_seams::sandbox::{Change, Member, PlugFor, PlugSource};
-        let given = crate::agentdefs::volumes::given("user:a", "d1", &[crate::agentdefs::volumes::Volume { name: "cache".into(), bytes: 1 }]);
+    fn p6_2_an_agents_volumes_are_given_to_its_harness_by_their_store_names_as_it_starts() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{Member, Volume};
+        let given = crate::agentdefs::volumes::given("user:a", "d1", &[crate::agentdefs::volumes::Volume { name: "cache".into(), bytes: 1 << 30 }]);
         let store = crate::agentdefs::volumes::store_name("user:a", "d1", "cache");
-        let plugs = volume_plugs(&given, &Member("claude".into()));
-        assert_eq!(plugs, [Change::Plug { source: PlugSource::Volume(store), to: PlugFor::Members(vec![Member("claude".into())]), at: format!("{VOLUMES}/cache"), read_only: false }]);
-        assert!(volume_plugs(&[], &Member("claude".into())).is_empty(), "an agent with none is plugged none");
+        let bound = std::num::NonZeroU64::new(1 << 30).ok_or_else(|| anyhow::anyhow!("a bound of 0"))?;
+        let volumes = volumes_of(&given, &Member("claude".into()))?;
+        assert_eq!(volumes, [Volume { name: store, bound, at: format!("{VOLUMES}/cache"), members: vec![Member("claude".into())], read_only: false }]);
+        assert!(volumes_of(&[], &Member("claude".into()))?.is_empty(), "an agent with none is given none");
+        let unbounded = crate::agentdefs::volumes::Given { bytes: 0, ..given.into_iter().next().ok_or_else(|| anyhow::anyhow!("none given"))? };
+        assert!(volumes_of(&[unbounded], &Member("claude".into())).is_err(), "a volume with no bound is refused");
+        Ok(())
+    }
+
+    /// P6.2 (Hex's P6.2 retries): a start its machine's store refused for a volume's clearing or bound says when to
+    /// start it again; any other refusal says nothing more.
+    #[test]
+    fn p6_2_a_start_refused_for_a_volume_says_when_to_start_it_again() {
+        let refused = |cause| Refusal::Volume { cause, why: "kiln-agent-x".into() };
+        assert!(again(&refused(VolumeCause::Clearing)).contains("clearing has answered"));
+        assert!(again(&refused(VolumeCause::Bound)).contains("no other session"));
+        assert_eq!(again(&refused(VolumeCause::InUse)), "");
+        assert_eq!(again(&Refusal::Ended), "");
     }
 
     /// An MCP `initialize`, numbered `id`, as a harness's client sends one first.

@@ -12,9 +12,12 @@
 //! step 6): their values are filled in at its egress, outside its boundary, toward the hosts each
 //! names alone, and never travel in a launch. A sandbox that holds them keeps warm pools for a
 //! microVM's launches as kiln names them ([`Pool`]; kiln plan 01a1dd2e…, P3.2), each sized by its
-//! boundary's own demand rule.
+//! boundary's own demand rule. One that holds them gives a launch volumes of its boundary's own store,
+//! held to their bounds and kept past its run, and lists and clears them ([`Volume`],
+//! [`Sandbox::volumes`]; kiln plan 01a1dd2e…, P6.2, Shards' D281).
 
 use std::collections::VecDeque;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -225,11 +228,15 @@ pub struct Holds {
     pub components: bool,
     /// Warm pools kept for its launches ([`Sandbox::keep`]: kiln plan 01a1dd2e…, P3.2).
     pub pools: bool,
+    /// Volumes of its boundary's own store given to a launch's members as it starts, held to their bounds and kept past
+    /// it, listed and cleared ([`Launch::volumes`], [`Sandbox::volumes`], [`Sandbox::clear_volume`]: kiln plan
+    /// 01a1dd2e…, P6.2).
+    pub volumes: bool,
 }
 
 impl Holds {
     /// Everything (the simulator's).
-    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true, swaps: true, components: true, pools: true };
+    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true, swaps: true, components: true, pools: true, volumes: true };
 
     /// `Ok` when `launch`'s weights are on their scale, its credential grants could each be filled
     /// in, and it asks only for what these hold; else its refusal, `Invalid` or `Unsupported`,
@@ -243,6 +250,9 @@ impl Holds {
         }
         for (at, grant) in launch.credentials.iter().enumerate() {
             grant.check(at, launch)?;
+        }
+        for (at, volume) in launch.volumes.iter().enumerate() {
+            volume.check(at)?;
         }
         let refuse = |what: &str| Err(Refusal::Unsupported(what.to_owned()));
         if l.memory_bytes.is_some() && !self.memory {
@@ -268,6 +278,9 @@ impl Holds {
         }
         if !launch.components.is_empty() && !self.components {
             return refuse("components laid over its image's own");
+        }
+        if !launch.volumes.is_empty() && !self.volumes {
+            return refuse("volumes of its boundary's store given as it starts");
         }
         Ok(())
     }
@@ -332,6 +345,51 @@ pub struct ComponentAt {
     pub component: Component,
 }
 
+/// A volume of its boundary's own store a launch's `members` are given as it starts (kiln plan 01a1dd2e…, P6.2;
+/// Shards' D271 and D281): by its `name` there, made empty where the store has none, at `at` in its members, read-only
+/// where it says, its files held to `bound` bytes, and kept past the run for the next run given it. A run holds it from
+/// its start to its end: no clearing removes it meanwhile ([`VolumeCause::InUse`]), and a launch asking it with another
+/// bound is refused ([`VolumeCause::Bound`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Volume {
+    pub name: String,
+    pub bound: NonZeroU64,
+    pub at: String,
+    pub members: Vec<Member>,
+    pub read_only: bool,
+}
+
+impl Volume {
+    /// `Ok` where a store could be asked for it: a name, an absolute place, and a member to give it to; else `Invalid`,
+    /// naming it by its place among its launch's volumes. The rest of its grammar is its boundary's to refuse.
+    fn check(&self, at: usize) -> Result<(), Refusal> {
+        let invalid = |why: String| Err(Refusal::Invalid { what: "a volume", why: format!("volumes[{at}] {why}") });
+        if self.name.is_empty() {
+            return invalid("has no name".into());
+        }
+        if !self.at.starts_with('/') {
+            return invalid(format!("is at {:?}, which isn't absolute", self.at));
+        }
+        if self.members.is_empty() {
+            return invalid("is given to no member".into());
+        }
+        Ok(())
+    }
+}
+
+/// A volume its boundary's store keeps ([`Sandbox::volumes`]), as the store reads it as it's asked: its name; the bytes
+/// its files take; its bound, none where it has none; its charge, what its files take by its bound's own measure, which
+/// its bound holds it to (Shards' D281); and when it was made, in nanoseconds since the Unix epoch. A measure whose
+/// files couldn't all be read is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptVolume {
+    pub name: String,
+    pub bytes: Option<u64>,
+    pub bound: Option<u64>,
+    pub charge: Option<u64>,
+    pub created_ns: u64,
+}
+
 /// A run to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
@@ -370,6 +428,9 @@ pub struct Launch {
     /// 01a1dd2e…, P6c.3; Shards' D270): those a person swapped in while it ran before, and the one a [`Run::swap`] of
     /// its member gives it. None: its image's own.
     pub components: Vec<ComponentAt>,
+    /// The volumes of its boundary's store its members are given as it starts (kiln plan 01a1dd2e…, P6.2): each held
+    /// by its run until it ends, and kept past it. None by default.
+    pub volumes: Vec<Volume>,
 }
 
 impl Launch {
@@ -388,6 +449,7 @@ impl Launch {
             plug_roots: Vec::new(),
             egress_ceiling: Vec::new(),
             components: Vec::new(),
+            volumes: Vec::new(),
         }
     }
 }
@@ -433,6 +495,29 @@ pub enum Refusal {
     Full { limit: usize },
     #[error("the run has ended")]
     Ended,
+    /// A volume of its boundary's store held from a launch or a clearing by `cause`, in its boundary's words, `why`
+    /// (kiln plan 01a1dd2e…, P6.2; Shards' D281).
+    #[error("a volume, {cause}: {why}")]
+    Volume { cause: VolumeCause, why: String },
+}
+
+/// What held a volume of a boundary's store from a launch or a clearing ([`Refusal::Volume`]; Shards' D281), each by
+/// its own retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum VolumeCause {
+    /// Asked with another bound than the runs holding it serve it with: its bound changes only once no run holds it,
+    /// so a launch asking it again then is given the bound it asks.
+    #[error("asked with another bound than the runs holding it serve it with")]
+    Bound,
+    /// A clearing holds it alone: asked again once that clearing has answered, it's made anew, empty.
+    #[error("being cleared")]
+    Clearing,
+    /// A run holds it until it ends: its files are kept.
+    #[error("held by a run")]
+    InUse,
+    /// Its store has none of that name.
+    #[error("not in its store")]
+    Unknown,
 }
 
 /// The link a run's stdio rides into its boundary (a microVM's: Shards' agent control, kiln plan
@@ -644,10 +729,26 @@ pub trait Sandbox: Send + Sync + 'static {
     fn pools(&self) -> Vec<PoolHeld> {
         Vec::new()
     }
+    /// The volumes its store keeps now, by name, as it reads them as it's asked: each one's files walked, a cost for a
+    /// person's view or a placement, never for a launch. Refused `Unsupported` where it keeps none
+    /// ([`Holds::volumes`]).
+    fn volumes(&self) -> BoxFuture<'_, Result<Vec<KeptVolume>, Refusal>> {
+        Box::pin(async { Err(Refusal::Unsupported(NO_VOLUMES.into())) })
+    }
+    /// Volume `name` of its store removed with its files, so the next launch given it finds it empty, once no run holds
+    /// it. Refused at once, never waited for: `Volume { InUse }` while a run holds it, its files kept, and
+    /// `Volume { Unknown }` where its store has none of that name. Refused `Unsupported` where it keeps none.
+    fn clear_volume(&self, name: String) -> BoxFuture<'_, Result<(), Refusal>> {
+        drop(name);
+        Box::pin(async { Err(Refusal::Unsupported(NO_VOLUMES.into())) })
+    }
 }
 
 /// What a sandbox that keeps no warm pools ([`Holds::pools`]) refuses.
 pub const NO_POOLS: &str = "a warm pool kept for its launches";
+
+/// What a sandbox that keeps no volumes ([`Holds::volumes`]) refuses.
+pub const NO_VOLUMES: &str = "volumes of its boundary's store, given to a launch and kept past it";
 
 // ---------------------------------------------------------------------------------- simulator
 
@@ -674,17 +775,27 @@ pub const SIM_PENDING: usize = 10_000;
 /// A signal ends any of them with its [`Signal::ended_code`]. It holds everything, unless made
 /// [`SimSandbox::holding`] less, as a real boundary may. The pools it keeps are names alone: it
 /// boots no microVM, so none holds a host, and it keeps at most one for each run it may hold
-/// ([`SIM_RUNS`]), refusing one past them `Full`.
+/// ([`SIM_RUNS`]), refusing one past them `Full`. The volumes it keeps are names alone too: none
+/// holds a file, so each one's bytes and charge are 0, and none says when it was made (it keeps no
+/// clock); at most one for each run it may hold, a launch making one past them refused `Full`.
 #[derive(Clone)]
 pub struct SimSandbox {
     runs: Arc<Mutex<usize>>,
     holds: Holds,
     pools: Arc<Mutex<std::collections::BTreeSet<Pool>>>,
+    volumes: Arc<Mutex<std::collections::BTreeMap<String, SimVolume>>>,
+}
+
+/// A volume a [`SimSandbox`]'s store keeps: the bound the runs holding it were given, and how many hold it.
+#[derive(Debug, Clone, Copy)]
+struct SimVolume {
+    bound: u64,
+    held: usize,
 }
 
 impl Default for SimSandbox {
     fn default() -> Self {
-        Self { runs: Arc::default(), holds: Holds::ALL, pools: Arc::default() }
+        Self { runs: Arc::default(), holds: Holds::ALL, pools: Arc::default(), volumes: Arc::default() }
     }
 }
 
@@ -696,6 +807,34 @@ impl SimSandbox {
     /// One that holds only `holds`, refusing the rest `Unsupported`.
     pub fn holding(holds: Holds) -> Self {
         Self { holds, ..Self::default() }
+    }
+
+    /// `given`, a launch's volumes, held for its run, their names answered for it to let go of as it ends: each made
+    /// where the store has none (past one for each run it may hold, refused `Full`), its bound the one asked where no
+    /// run holds it; one a run holds with another bound refused `Volume { Bound }`. Refused, it holds none of them.
+    fn hold_volumes(&self, given: &[Volume]) -> Result<Vec<String>, Refusal> {
+        let mut kept = self.volumes.lock();
+        let mut made = 0usize;
+        for v in given {
+            match kept.get(&v.name) {
+                Some(k) if k.held > 0 && k.bound != v.bound.get() => {
+                    return Err(Refusal::Volume { cause: VolumeCause::Bound, why: format!("{} is held with a bound of {} bytes, and asked with {}", v.name, k.bound, v.bound) });
+                }
+                Some(_) => {}
+                None => made = made.saturating_add(1),
+            }
+        }
+        if kept.len().saturating_add(made) > SIM_RUNS {
+            return Err(Refusal::Full { limit: SIM_RUNS });
+        }
+        for v in given {
+            let k = kept.entry(v.name.clone()).or_insert(SimVolume { bound: v.bound.get(), held: 0 });
+            if k.held == 0 {
+                k.bound = v.bound.get();
+            }
+            k.held = k.held.saturating_add(1);
+        }
+        Ok(given.iter().map(|v| v.name.clone()).collect())
     }
 }
 
@@ -709,6 +848,8 @@ struct SimRun {
     components: bool,
     /// Its sandbox, which starts a member it's swapped for ([`Run::swap`]).
     sandbox: SimSandbox,
+    /// The volumes of its sandbox's store it holds, let go of as it's dropped.
+    volumes: Vec<String>,
 }
 
 #[derive(Default)]
@@ -740,8 +881,16 @@ impl RunState {
 
 impl Drop for SimRun {
     fn drop(&mut self) {
-        let mut n = self.runs.lock();
-        *n = n.saturating_sub(1);
+        {
+            let mut n = self.runs.lock();
+            *n = n.saturating_sub(1);
+        }
+        let mut kept = self.sandbox.volumes.lock();
+        for name in &self.volumes {
+            if let Some(k) = kept.get_mut(name) {
+                k.held = k.held.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -936,8 +1085,9 @@ impl Sandbox for SimSandbox {
             if *n >= SIM_RUNS {
                 return Err(Refusal::Full { limit: SIM_RUNS });
             }
+            let volumes = self.hold_volumes(&launch.volumes)?;
             *n = n.saturating_add(1);
-            let run: Box<dyn Run> = Box::new(SimRun { state: Arc::new(Mutex::new(st)), said: Arc::new(event_listener::Event::new()), runs: Arc::clone(&self.runs), signals: self.holds.signals, live: self.holds.live, components: self.holds.components, sandbox: self.clone() });
+            let run: Box<dyn Run> = Box::new(SimRun { state: Arc::new(Mutex::new(st)), said: Arc::new(event_listener::Event::new()), runs: Arc::clone(&self.runs), signals: self.holds.signals, live: self.holds.live, components: self.holds.components, sandbox: self.clone(), volumes });
             Ok(run)
         })();
         Box::pin(async move { out })
@@ -978,6 +1128,32 @@ impl Sandbox for SimSandbox {
 
     fn pools(&self) -> Vec<PoolHeld> {
         self.pools.lock().iter().map(|pool| PoolHeld { pool: pool.clone(), warm: 0, starting: 0 }).collect()
+    }
+
+    fn volumes(&self) -> BoxFuture<'_, Result<Vec<KeptVolume>, Refusal>> {
+        let out = if self.holds.volumes {
+            Ok(self.volumes.lock().iter().map(|(name, v)| KeptVolume { name: name.clone(), bytes: Some(0), bound: Some(v.bound), charge: Some(0), created_ns: 0 }).collect())
+        } else {
+            Err(Refusal::Unsupported(NO_VOLUMES.into()))
+        };
+        Box::pin(async move { out })
+    }
+
+    fn clear_volume(&self, name: String) -> BoxFuture<'_, Result<(), Refusal>> {
+        let out = if self.holds.volumes {
+            let mut kept = self.volumes.lock();
+            match kept.get(&name).map(|v| v.held) {
+                None => Err(Refusal::Volume { cause: VolumeCause::Unknown, why: format!("no volume {name}") }),
+                Some(0) => {
+                    kept.remove(&name);
+                    Ok(())
+                }
+                Some(held) => Err(Refusal::Volume { cause: VolumeCause::InUse, why: format!("{name} is held by {held} runs") }),
+            }
+        } else {
+            Err(Refusal::Unsupported(NO_VOLUMES.into()))
+        };
+        Box::pin(async move { out })
     }
 }
 
@@ -1434,6 +1610,53 @@ fn c17<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c18<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        const NAME: &str = "conformance-volume";
+        let given = |launch: Launch, bound: NonZeroU64| {
+            let members = vec![Member(launch.program.clone())];
+            Launch { volumes: vec![Volume { name: NAME.into(), bound, at: "/volumes/conformance".into(), members, read_only: false }], ..launch }
+        };
+        let (one, two) = (NonZeroU64::MIN, NonZeroU64::MIN.saturating_add(1));
+        if !f.sandbox().holds().volumes {
+            return match f.sandbox().launch(given(f.wait(), one)).await {
+                Err(Refusal::Unsupported(_)) => match (f.sandbox().volumes().await, f.sandbox().clear_volume(NAME.into()).await) {
+                    (Err(Refusal::Unsupported(_)), Err(Refusal::Unsupported(_))) => Ok(()),
+                    other => Err(format!("a sandbox that keeps no volumes listed or cleared one: {other:?}")),
+                },
+                Err(e) => Err(format!("a launch given a volume: refused as {e:?}, not Unsupported")),
+                Ok(run) => {
+                    run.kill();
+                    Err("a launch given a volume: taken, though the sandbox says it doesn't hold it".into())
+                }
+            };
+        }
+        let bounds = |v: Result<Vec<KeptVolume>, Refusal>| v.map(|kept| kept.into_iter().filter(|k| k.name == NAME).map(|k| k.bound).collect::<Vec<_>>());
+        let refused_by = |v: Result<(), Refusal>| match v {
+            Err(Refusal::Volume { cause, .. }) => Some(cause),
+            Ok(()) | Err(_) => None,
+        };
+        let run = fine("a launch given a volume", f.sandbox().launch(given(f.wait(), one)).await)?;
+        same("its volume, listed with its bound", bounds(f.sandbox().volumes().await), Ok(vec![Some(one.get())]))?;
+        match f.sandbox().launch(given(f.wait(), two)).await {
+            Err(Refusal::Volume { cause: VolumeCause::Bound, .. }) => {}
+            Err(e) => return Err(format!("a launch asking a held volume with another bound: refused as {e:?}, not Volume {{ Bound }}")),
+            Ok(other) => {
+                other.kill();
+                return Err("a launch asking a held volume with another bound: taken".into());
+            }
+        }
+        same("a volume a run holds, cleared", refused_by(f.sandbox().clear_volume(NAME.into()).await), Some(VolumeCause::InUse))?;
+        run.kill();
+        drain(run.as_ref()).await;
+        drop(run);
+        same("its volume once its run has ended", bounds(f.sandbox().volumes().await), Ok(vec![Some(one.get())]))?;
+        fine("a volume no run holds, cleared", f.sandbox().clear_volume(NAME.into()).await)?;
+        same("the volumes once it's cleared", bounds(f.sandbox().volumes().await), Ok(Vec::new()))?;
+        same("a volume cleared again", refused_by(f.sandbox().clear_volume(NAME.into()).await), Some(VolumeCause::Unknown))
+    })
+}
+
 /// The `Sandbox` contract, clause by clause (docs/seams.md, "Sandbox").
 pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
     vec![
@@ -1498,6 +1721,11 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
             says: "a sandbox keeps a warm pool it's asked to keep, once however often it's asked, and lists it until it's let go; a pool it doesn't keep is let go already; a sandbox that keeps no pools refuses one Unsupported, and lists none",
             check: c17::<F>,
         },
+        Case {
+            id: "SANDBOX-18",
+            says: "a launch's volume is made where its store has none and held by its run: listed with its bound, refused Volume(Bound) to a launch asking another bound while the run holds it, kept past the run, and cleared only once no run holds it, a clearing refused Volume(InUse) while one does and Volume(Unknown) once it's gone; a sandbox that keeps no volumes refuses one Unsupported, and lists and clears none",
+            check: c18::<F>,
+        },
     ]
 }
 
@@ -1540,6 +1768,12 @@ mod tests {
         }
         fn pools(&self) -> Vec<PoolHeld> {
             self.0.pools()
+        }
+        fn volumes(&self) -> BoxFuture<'_, Result<Vec<KeptVolume>, Refusal>> {
+            self.0.volumes()
+        }
+        fn clear_volume(&self, name: String) -> BoxFuture<'_, Result<(), Refusal>> {
+            self.0.clear_volume(name)
         }
     }
 
@@ -1604,7 +1838,7 @@ mod tests {
         let make = || async { Holding { sim: SimSandboxFixture::default(), lies: Some(Liar(SimSandbox::new())) } };
         let report = futures::executor::block_on(run("Sandbox", &cases::<Holding>(), make));
         let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
-        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15", "SANDBOX-16", "SANDBOX-17"], "{:?}", report.failed);
+        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15", "SANDBOX-16", "SANDBOX-17", "SANDBOX-18"], "{:?}", report.failed);
         assert!(report.failed.iter().all(|(_, why)| why.contains("doesn't hold it")), "{:?}", report.failed);
     }
 
@@ -1665,6 +1899,12 @@ mod tests {
         }
         fn pools(&self) -> Vec<PoolHeld> {
             self.0.pools()
+        }
+        fn volumes(&self) -> BoxFuture<'_, Result<Vec<KeptVolume>, Refusal>> {
+            self.0.volumes()
+        }
+        fn clear_volume(&self, name: String) -> BoxFuture<'_, Result<(), Refusal>> {
+            self.0.clear_volume(name)
         }
     }
 
@@ -1769,6 +2009,38 @@ mod tests {
         let read_only = Share { writable: false, ..Share::at_its_path("/p") };
         assert_eq!(only_memory.check(&shared(read_only)), Err(Refusal::Unsupported("a folder shared at another path or read-only".into())));
         assert_eq!(Holds::ALL.check(&shared(moved)), Ok(()));
+        // Kiln plan 01a1dd2e…, P6.2: a volume given as it starts, only where volumes are held, and one that names no
+        // volume, no absolute place or no member is invalid before it's unheld.
+        let volume = Volume { name: "cache".into(), bound: NonZeroU64::MIN, at: "/volumes/cache".into(), members: vec![Member("say".into())], read_only: false };
+        let given = |v: Volume| Launch { volumes: vec![v], ..l(Limits::NONE, Egress::Any) };
+        assert_eq!(Holds::ALL.check(&given(volume.clone())), Ok(()));
+        assert_eq!(only_memory.check(&given(volume.clone())), Err(Refusal::Unsupported("volumes of its boundary's store given as it starts".into())));
+        for bad in [Volume { name: String::new(), ..volume.clone() }, Volume { at: "volumes/cache".into(), ..volume.clone() }, Volume { members: Vec::new(), ..volume.clone() }] {
+            assert!(matches!(only_memory.check(&given(bad.clone())), Err(Refusal::Invalid { what: "a volume", ref why }) if why.starts_with("volumes[0]")), "{bad:?}");
+        }
+    }
+
+    /// Kiln plan 01a1dd2e…, P6.2: a launch refused for one of its volumes holds none of them, and the simulator keeps at
+    /// most one volume for each run it may hold, a launch making one past them refused `Full` and one given a volume it
+    /// keeps taken.
+    #[test]
+    fn p6_2_a_launch_refused_for_a_volume_holds_none_and_the_simulators_volumes_are_bounded() -> Result<(), Refusal> {
+        let s = SimSandbox::new();
+        let volume = |name: &str, bound: NonZeroU64| Volume { name: name.into(), bound, at: format!("/volumes/{name}"), members: vec![Member("wait".into())], read_only: false };
+        let given = |volumes: Vec<Volume>| Launch { volumes, ..Launch::of("wait", &[]) };
+        let held = futures::executor::block_on(s.launch(given(vec![volume("b", NonZeroU64::MIN)])))?;
+        let refused = futures::executor::block_on(s.launch(given(vec![volume("a", NonZeroU64::MIN), volume("b", NonZeroU64::MIN.saturating_add(1))])));
+        assert!(matches!(refused, Err(Refusal::Volume { cause: VolumeCause::Bound, .. })), "{:?}", refused.err());
+        assert_eq!(futures::executor::block_on(s.clear_volume("a".into())), Err(Refusal::Volume { cause: VolumeCause::Unknown, why: "no volume a".into() }), "the launch refused made none");
+        drop(held);
+        assert_eq!(futures::executor::block_on(s.clear_volume("b".into())), Ok(()), "a run dropped holds its volume no more");
+        for n in 0..SIM_RUNS {
+            drop(futures::executor::block_on(s.launch(given(vec![volume(&format!("v{n}"), NonZeroU64::MIN)])))?);
+        }
+        assert!(matches!(futures::executor::block_on(s.launch(given(vec![volume("past", NonZeroU64::MIN)]))), Err(Refusal::Full { limit: SIM_RUNS })));
+        assert!(futures::executor::block_on(s.launch(given(vec![volume("v0", NonZeroU64::MIN)]))).is_ok(), "a volume it keeps is given again");
+        assert_eq!(futures::executor::block_on(s.volumes())?.len(), SIM_RUNS);
+        Ok(())
     }
 
     /// Kiln plan 01a1d2b88be57304b972761e2a5c6781 step 6 (D242): a credential grant is held to its
