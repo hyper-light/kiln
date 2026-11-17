@@ -321,6 +321,34 @@ fn p4_5_a_save_queues_its_build_on_each_microvm_runner_and_their_words_move_it()
     })
 }
 
+/// A save that writes no build (its person has no runner that builds Agentfiles: one whose engine is host) tells its
+/// version alone: its builds didn't move.
+#[test]
+fn p4_5_a_save_that_writes_no_build_tells_none() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        hub.put_agent(runner("host", false, true));
+        let mut events = hub.subscribe_events()?;
+        let made = op(
+            &hub,
+            &Caller::owner(),
+            "agentfiles.create",
+            json!({"name": "reviewer", "text": TEXT}),
+        )
+        .await?;
+        let id = made
+            .pointer("/agentfile/id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let got = rows(&hub, &id).await?;
+        anyhow::ensure!(got.is_empty(), "{got:?}");
+        let said = frames(&mut events, &id)?;
+        anyhow::ensure!(said == (1, 0), "(versions, builds) told: {said:?}");
+        Ok(())
+    })
+}
+
 /// A runner's build of an Agentfile for a harness is the one a session of that harness there makes (one tag in its
 /// store), so once it's done the session's start finds its image and builds nothing (`built` none, its start's
 /// `built_us`); a machine whose kiln holds no microVMs says why.
