@@ -2417,7 +2417,7 @@ mod tests {
             anyhow::ensure!(told.iter().take(3).all(|b| b.get("state") == Some(&json!("running"))), "drawn while it runs: {told:?}");
             let decided = told.last().cloned().unwrap_or_default();
             anyhow::ensure!(told.len() == 4 && decided.pointer("/decision/variant") == Some(&json!("host")) && decided.get("state") == Some(&json!("done")), "the decision, the split done: {told:?}");
-            let mut bo = Caller::with(crate::authz::gate::Kind::User, "user:bo", None, None);
+            let mut bo = Caller::with(crate::authz::gate::Kind::User, "user:bo", Some(crate::authz::gate::Rights::default()), None);
             bo.user = Some("bo".into());
             anyhow::ensure!(reads_split(&Caller::owner(), "user:ada") && !reads_split(&bo, "user:ada") && reads_split(&bo, "user:bo"), "a split's frames reach its opener and the owner alone");
             Ok(())
