@@ -4461,18 +4461,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         continue;
                     }
-                    // One replay of a recorded session's tool calls in a microVM of a split's variant (kiln plan
-                    // 01a1dd2e… P7.1b): run on a task of its own, its scratch beneath this runner's state, answered as
-                    // it ends.
-                    Carried::Read(FromServer::Replay { req, ask }) => {
-                        let (up, under) = (uplink.0.clone(), o.state_dir.join("replays"));
-                        drop(crate::rt::spawn(async move {
-                            let answer = crate::sandbox::replay::answer(*ask, &under).await;
-                            let json = serde_json::to_string(&answer).ok();
-                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
-                        }));
-                        continue;
-                    }
                     Carried::Read(FromServer::FrontDoor(push)) => {
                         // Settings (and certificates) are never logged: an upload carries a key.
                         if let Some(fd) = &front_door {

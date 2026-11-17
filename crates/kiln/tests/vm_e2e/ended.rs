@@ -1,15 +1,13 @@
-//! `HexVms::finish` on real microVMs (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b, a9fbded98): a box whose run
-//! ended on its own before its delete is deleted, charged the use last read. Hex alone, asked to delete such a box with
-//! its final use, answers `NotRunning` and leaves the box as it was (its image class's `ended_first`), where kiln's
-//! delete stopped before a9fbded98.
+//! `HexVms::finish` on real microVMs (a9fbded98): a box whose run ended on its own before its delete is deleted,
+//! charged the use last read. Hex alone, asked to delete such a box with its final use, answers `NotRunning` and
+//! leaves the box as it was (its image class's `ended_first`), where kiln's delete stopped before a9fbded98.
 //!
-//! - **A replay's box** (`HexVms::boot_command`): its microVM's own command ended.
-//! - **A session's box** (`HexVms::launch_as`, as an isolated session launches): its harness member's microVM failed
-//!   under it, its VM process killed here as a VM that dies is. Its end is said once its box is gone. A session whose
-//!   harness ends on its own leaves its run up (Shards' `ATTEND` holds it until it's stopped), so its delete reads its
-//!   final use as before.
+//! A session's box (`HexVms::launch_as`, as an isolated session launches): its harness member's microVM failed under
+//! it, its VM process killed here as a VM that dies is. Its end is said once its box is gone. A session whose harness
+//! ends on its own leaves its run up (Shards' `ATTEND` holds it until it's stopped), so its delete reads its final use
+//! as before.
 //!
-//! Each is held to its box gone from Hex's list, no VM process of it left, and its charge in kiln's records. The
+//! It's held to its box gone from Hex's list, no VM process of it left, and its charge in kiln's records. The
 //! stand-in harness (`tests/fixtures/vm-stub/harness`) is built from this checkout's build context into the test's own
 //! Shards home, on kiln's images' base (`VM_E2E_SHARDS_STORE`'s copy where it's given, else pulled once). It skips
 //! where this kiln carries no Shards or this host runs no microVMs; `VM_E2E=1` makes that a failure.
@@ -19,9 +17,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
-
-use hex_api::{BoxState, Refusal as H, Runtime as _};
+use hex_api::{Refusal as H, Runtime as _};
 use hex_node::images::ImageRuntime;
 use kiln::sandbox::hexvm::{Charge, Charged, HexVms, USE};
 use kiln_ci::place::holder::BoxName;
@@ -104,22 +100,6 @@ async fn listed(runtime: &Arc<ImageRuntime>, name: BoxName) -> anyhow::Result<bo
     Ok(boxes.iter().any(|b| b.id.to_string() == id))
 }
 
-/// Box `name` once its run has ended, as Hex keeps that in its record (`BoxState::Empty`). Hex has no call that waits
-/// on an image box's own end, so its record is read until it says so, each read due once as long as the last took has
-/// passed (at most half the time reading, as Hex's conformance reads a box's state and a replay its steps' ends), the
-/// test's own bound ending a run that never does.
-async fn ended(runtime: &Arc<ImageRuntime>, name: BoxName) -> anyhow::Result<hex_api::BoxInfo> {
-    loop {
-        let r = Arc::clone(runtime);
-        let read = Instant::now();
-        let info = kiln::rt::blocking(move || r.inspect(&name.id()?)).await?.map_err(hex)?;
-        if info.state == BoxState::Empty {
-            return Ok(info);
-        }
-        kiln::rt::sleep_until(kiln_seams::clock::later(Instant::now(), read.elapsed())).await;
-    }
-}
-
 /// The charge kept for box `name` in `records`, if any.
 async fn charged(records: &SimRecords, name: BoxName) -> anyhow::Result<Option<Charged>> {
     let row = records.get(USE, name.id().map_err(hex)?.to_string().as_bytes(), Consistency::Linearizable).await?;
@@ -127,7 +107,7 @@ async fn charged(records: &SimRecords, name: BoxName) -> anyhow::Result<Option<C
 }
 
 #[test]
-fn p7_1b_a_box_whose_run_ended_on_its_own_is_deleted() -> anyhow::Result<()> {
+fn a_box_whose_run_ended_on_its_own_is_deleted() -> anyhow::Result<()> {
     if !kiln::shards::carried() {
         return skip("this kiln carries no Shards: ci/shards/pack.sh builds it (docs/shards.md)");
     }
@@ -159,19 +139,6 @@ async fn check(image: String, runtime: Arc<ImageRuntime>, vm: std::path::PathBuf
     let n = AtomicU64::new(0);
     let hex_vms =
         HexVms::new(Arc::clone(&runtime) as Arc<dyn hex_api::Runtime>, move || Some(named(n.fetch_add(1, Ordering::Relaxed)))).with_ledger(Arc::clone(&records) as Arc<dyn kiln_seams::Records>);
-
-    // A replay's box: its own command ends at once.
-    let replay = hex_vms.boot_command(&image, vec!["/bin/sh".into(), "-c".into(), "exit 0".into()], &[], None).await.map_err(|e| anyhow::anyhow!("a replay's microVM didn't start: {e}"))?;
-    let info = ended(&runtime, named(0)).await?;
-    eprintln!("replay's box ended on its own: {:?}, {:?}", info.exit, info.ended);
-    let r = Arc::clone(&runtime);
-    let alone = kiln::rt::blocking(move || r.delete_with_host_use(&named(0).id()?)).await?;
-    assert!(matches!(alone, Err(H::NotRunning(..))), "Hex reads no final use of a run that ended: {alone:?}");
-    assert!(listed(&runtime, named(0)).await?, "and leaves its box as it was");
-    let lived = replay.end().await.map_err(|e| anyhow::anyhow!("its end: {e}"))?;
-    assert!(!listed(&runtime, named(0)).await?, "kiln's finish deleted the box whose run ended on its own");
-    assert_eq!((lived, charged(&records, named(0)).await?), (None, None), "never read, charged nothing");
-    assert_eq!(vm_processes(&vm)?, Vec::<u32>::new(), "no VM process of it left");
 
     // A session's box: its harness member's microVM dies under it.
     let launch = Launch { limits: Limits::NONE, egress: Egress::Only(Vec::new()), boundary: Boundary::MicroVm { image: image.clone() }, ..Launch::of(MEMBER, &[]) };

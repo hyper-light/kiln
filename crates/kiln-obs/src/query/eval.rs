@@ -686,7 +686,7 @@ fn grid_for(ast: &Ast, req: &Request<'_>, nested: &Nested) -> Result<Grid, Query
             Node::Metric(m) => m.rollup.and_then(|r| r.1).map(|s| s.saturating_mul(1000)),
             // A forecast's `interval=` (seconds): Datadog's rollup of its points.
             Node::Named(k, v) if k == "interval" => v.parse::<f64>().ok().filter(|s| *s >= 1.0).map(|s| (s * 1000.0) as i64),
-            Node::Call(Func::Rollup, args) => args.get(2).and_then(|&a| constant(ast, a)).filter(|s| *s >= 1.0).map(|s| (s * 1000.0) as i64),
+            Node::Call(Func::Rollup, args) => args.get(2).and_then(|&a| constant(ast, a)).filter(|s| *s >= 1.0).and_then(millis),
             _ => None,
         })
         .max()
@@ -759,7 +759,7 @@ impl Nested {
             let Some(o) = self.owner.get(id).copied().flatten() else { continue };
             let ms = match node {
                 Node::Metric(m) => m.rollup.and_then(|r| r.1).map(|s| s.saturating_mul(1000)),
-                Node::Call(Func::Rollup, args) => args.get(2).and_then(|&a| constant(ast, a)).filter(|s| *s >= 1.0).map(|s| (s * 1000.0) as i64),
+                Node::Call(Func::Rollup, args) => args.get(2).and_then(|&a| constant(ast, a)).filter(|s| *s >= 1.0).and_then(millis),
                 _ => None,
             };
             if let (Some(ms), Some(slot)) = (ms, asked.get_mut(o)) {
@@ -795,8 +795,20 @@ fn refined(g: Grid, c: Option<i64>) -> Result<Grid, QueryError> {
 /// nested queries' mode); none without it.
 fn lookback(ast: &Ast, args: &[usize]) -> Option<i64> {
     let on = args.iter().skip(2).any(|&a| matches!(ast.nodes.get(a), Some(Node::Str(s)) if s.eq_ignore_ascii_case("lookback")));
-    let secs = args.get(1).and_then(|&a| constant(ast, a))?;
-    (on && secs > 0.0).then(|| (secs * 1000.0) as i64)
+    let secs = args.get(1).and_then(|&a| constant(ast, a)).filter(|s| on && *s > 0.0)?;
+    millis(secs)
+}
+
+/// The longest span a query's seconds may say (ms): 20,000 Gregorian years, fifty 400-year cycles of 146,097 days,
+/// past the years −9999 to 9999 that kiln's calendar holds (jiff's), and so any time a store keeps. A longer step,
+/// rollup or lookback reads nothing a shorter one doesn't; refused, no sum of a time and a step leaves an `i64`.
+const MAX_SPAN_MS: i64 = 50 * 146_097 * 86_400_000;
+
+/// A query's `secs` seconds as whole milliseconds, at most [`MAX_SPAN_MS`]: none for more (a number the query says, so
+/// untrusted), or for one that isn't finite.
+fn millis(secs: f64) -> Option<i64> {
+    let ms = (secs * 1000.0).round();
+    (ms.is_finite() && ms.abs() <= MAX_SPAN_MS as f64).then_some(ms as i64)
 }
 
 /// A shift of the reading beneath a function: fixed (`timeshift`, `hour_before` …), or a calendar's

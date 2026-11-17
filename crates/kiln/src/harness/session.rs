@@ -200,17 +200,14 @@ pub struct Start {
     pub measured: Option<Measured>,
 }
 
-/// The variant of a deployment experiment a session runs as (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1): drawn
-/// by its variants' weights as it started, or its experiment's promoted variant once one was decided.
+/// The variant of its definition's experiment a session runs as (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1):
+/// drawn by its variants' weights as it started.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentExperiment"))]
 pub struct Assigned {
     pub experiment: String,
     pub arm: String,
-    /// Its experiment's decision promoted it: the split had ended, so no draw.
-    #[serde(default)]
-    pub promoted: bool,
 }
 
 /// What a start of a session's harness in a microVM measured (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1, a
@@ -401,8 +398,8 @@ pub struct Spec {
     /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
-    /// The deployment experiment's variant it was assigned as it started (P7.1, `ci::experiments::assign`): kept
-    /// for its life. Set by kiln, never from what was asked.
+    /// Its definition's experiment's variant it was drawn as it started (P7.1, `agentdefs::experiments::assign`):
+    /// kept for its life. Set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experiment: Option<Assigned>,
     /// What it helps with when it's a card's helper (`harness::about`: `about`, answering what a

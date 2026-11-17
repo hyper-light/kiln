@@ -19,8 +19,6 @@
 //!   loop and its adapter treat a microVM's member as they treat a process of the machine's.
 //! - [`pools`]: the warm pools kiln names on the machine's microVMs from its agents' starts, and lets
 //!   go of after their keep window (kiln plan 01a1dd2e…, P3.2), and each runner's as the server shows them.
-//! - [`replay`]: a recorded session's tool calls run in a microVM of a split's variant, and what it measured
-//!   (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b).
 
 #[cfg(test)]
 pub mod fake;
@@ -31,7 +29,6 @@ pub mod image;
 pub mod isolated;
 pub mod narrow;
 pub mod pools;
-pub mod replay;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -323,8 +323,8 @@ fn p7_1_a_live_experiment_draws_each_new_session_by_its_weights() -> anyhow::Res
 /// variant there refused, the server starting none, and kept as its draw's failure), the variant kept on the session
 /// (`experiment` on its info) and said by `agentdefs.sessions` (`experiment`, `variant`). The draws are the
 /// experiment's own sequence. Each run names the server (`on`), whose harness is the registry's stand-in program: no
-/// vendor CLI is looked for or started, so what this machine has installed decides nothing. Taking `Drawn::of`'s
-/// definition draw out of `lineage::start` starts each as the definition is.
+/// vendor CLI is looked for or started, so what this machine has installed decides nothing. Taking the definition's
+/// draw out of `lineage::start` starts each as the definition is.
 #[test]
 fn p7_1_agentdefs_run_starts_each_session_as_its_drawn_variant() -> anyhow::Result<()> {
     crate::rt::block_on(async {
@@ -362,7 +362,7 @@ fn p7_1_agentdefs_run_starts_each_session_as_its_drawn_variant() -> anyhow::Resu
             let agent = s(&ran, "/agents/0/id");
             let info = hub.harness.info(&agent).ok_or_else(|| anyhow::anyhow!("run {i}: no session {agent}: {ran}"))?;
             let kept = info.experiment.clone().ok_or_else(|| anyhow::anyhow!("run {i}: no variant on {agent}"))?;
-            anyhow::ensure!(kept.experiment == e && kept.arm == want && !kept.promoted && info.isolation.is_none(), "run {i}: {kept:?}, a host variant's session on its host");
+            anyhow::ensure!(kept.experiment == e && kept.arm == want && info.isolation.is_none(), "run {i}: {kept:?}, a host variant's session on its host");
             opened.push((agent, want));
         }
         anyhow::ensure!(!opened.is_empty(), "some host variant was drawn");

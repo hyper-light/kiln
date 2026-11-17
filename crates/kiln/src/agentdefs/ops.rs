@@ -183,12 +183,8 @@ async fn run(cx: Cx, v: Value) -> Out {
     let (name, version, d) = super::settings_of(&cx.hub, &who(&cx)?, &id).await.map_err(fail)?;
     let task = v.get("prompt").and_then(Value::as_str);
     let host = d.engine == Some(crate::harness::engine::Engine::Host);
-    // Its task apart, for a split's variant that's another agent to retell (P7.1); its definition is kiln's to say
-    // (`Ask::definition`, below), which a split matches.
+    // Its definition is kiln's to say (`Ask::definition`, below), which its live experiment draws for.
     let mut ask = json!({"kind": d.harness, "isolation": if host { "none" } else { "microvm" }, "name": v.get("name").and_then(Value::as_str).unwrap_or(&name)});
-    if let (Some(o), Some(t)) = (ask.as_object_mut(), task) {
-        o.insert("task".into(), json!(t));
-    }
     if let Some(o) = ask.as_object_mut() {
         let given = [("model", d.model.clone()), ("image", d.agentfile.clone()), ("prompt", super::first_message(&d, task))]
             .into_iter()

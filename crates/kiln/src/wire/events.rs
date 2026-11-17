@@ -554,67 +554,6 @@ pub struct ExperimentBrief {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub decision: Option<crate::ci::experiments::Decision>,
-    /// A split's opener (`owner` or `user:<id>`): the split is theirs alone, and so is its frame.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub opener: Option<String>,
-    /// A split's draw (P7.1): a session drawn one of its variants as it starts, or that start refused.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub draw: Option<ExperimentDraw>,
-    /// A split's replay that moved on (P7.1b): it started, one of its runs ended, or it ended.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub replay: Option<ExperimentReplay>,
-}
-
-/// A split's draw as its frame says it: its number among the split's draws (from 0), the variant drawn, and why its
-/// session's start was refused, where it was.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-pub struct ExperimentDraw {
-    pub n: u64,
-    pub arm: String,
-    /// Its variant's failure, counted as one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub refused: Option<ExperimentRefused>,
-}
-
-/// Why a draw's start was refused, as kiln's API refuses a start: its status (409: the machine it was placed on can't
-/// run it as its variant asks; 400: what it asks can't start; 403: its person may not start it there) and its words.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-pub struct ExperimentRefused {
-    pub status: u16,
-    pub why: String,
-}
-
-/// A split's replay as its frame says it: its number, its state (`running`, then `done`, or `cancelled` with why where
-/// its split was), how many of its runs ended (`ran`) of all it runs (`runs`: each of its variants once a round), and
-/// the run that just ended.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-pub struct ExperimentReplay {
-    pub n: u64,
-    pub state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub why: Option<String>,
-    pub ran: usize,
-    pub runs: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub run: Option<ExperimentReplayRun>,
-}
-
-/// A replay's run that ended: its variant, its round (from 0) and its conclusion (`success` or `failure`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-pub struct ExperimentReplayRun {
-    pub arm: String,
-    pub round: usize,
-    pub conclusion: String,
 }
 
 /// A commit's verdict on a lane (its workflow on its branch) that changed since it was last kept

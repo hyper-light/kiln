@@ -813,9 +813,6 @@ pub mod feature {
     /// from another machine is taken over under it. A runner that didn't name it hears it only with
     /// a transfer's offer, as before, and refuses a move until then.
     pub const ADOPT_POLICY: &str = "reach.adopt-policy";
-    /// This runner replays a recorded session's tool calls in its microVMs ([`super::ServerMsg::Replay`]; kiln plan
-    /// 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b). A runner that didn't name it isn't asked: a replay on it is refused.
-    pub const REPLAYS: &str = "experiments.replay";
     /// This runner builds an Agentfile ahead of its sessions as the server asks
     /// ([`super::ServerMsg::Prebuild`]; kiln plan 01a1dd2e…, P4.5) and says where each build is
     /// ([`super::AgentMsg::Prebuilt`]); a server that names it asks, and reads the answers. A
@@ -826,7 +823,7 @@ pub mod feature {
     /// them only of a server that named it, and grants its isolated harnesses no sign-in until one has: they sign in
     /// themselves, as before.
     pub const LEASES: &str = "secrets.leases";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS, PREBUILD, LEASES];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1235,10 +1232,10 @@ pub enum ServerMsg {
     /// [`feature::ADOPT_POLICY`], as they name it. Appended last, after `RunnerEngine`: postcard
     /// encodes variants by index.
     AdoptPolicy { json: String },
-    /// One replay of a recorded session's tool calls in a microVM of a split's variant (JSON
-    /// `crate::sandbox::replay::Ask`; kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b), answered by
-    /// [`AgentMsg::Answer`] under `req` with what it measured (`crate::sandbox::replay::Answer`). Only to runners that
-    /// named [`feature::REPLAYS`]. Appended last, after `AdoptPolicy`: postcard encodes variants by index.
+    /// Withdrawn: P7.1b's replay of a recorded session in a split's variant (the person, 2026-11-16: "Replays
+    /// weren't and never were a part of experiments"). Its place is kept, as postcard encodes variants by index and
+    /// `Prebuild` follows it; no server sends it, and a runner refuses it as a kind it doesn't know, answering its
+    /// `req` why (`crate::wire::payload`).
     Replay { req: u64, json: String },
     /// Build an Agentfile ahead of its sessions (JSON `crate::agentfiles::prebuild::Ask`; kiln plan
     /// 01a1dd2e…, P4.5): its text at a version, for one of kiln's harnesses, with the secrets its
