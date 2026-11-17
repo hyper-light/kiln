@@ -241,23 +241,50 @@ in its own words, kept on the override (`took: refused`): Hex's microVMs do unti
 
 ## An agent's volumes
 
-kiln plan 01a1dd2e959772a1b17bc49026448e8a, P6.2 (`agentdefs::volumes`; Shards' D281). An agent definition names
-what it keeps from one of its sessions to the next on a machine, its caches, toolchains and package stores: each
-volume a `name` and the most `bytes` it may hold (`agentdefs.create`, `update`, `check`). Each session started from
-it (`Ask::definition`: `agentdefs.run`, a UI agent a person's definition stands in for, a split's agent) is given
-them, as the definition was at the version it started from: its placement asks their bytes together of its
-machine's disk past what its start asks (`Isolation::disk`, `lineage::session_needs`), so it starts only where the
-disk has room for them; and as its harness starts, before its session hands it a turn, each is plugged into its
-harness, read-write, at `/volumes/<name>`, by its name in its machine's Shards store (`Change::Plug` of
-`PlugSource::Volume`), which Shards makes where it isn't there and keeps past the session (D271, D281), so the
-agent's next session on that machine finds it. Its store's name is `kiln-agent-` and the SHA-256 of its person,
-definition and name (`volumes::store_name`): a person's own, never another's. Volumes stay per machine (the
-person, 2026-11-14): a session elsewhere has that machine's. Refused, rather than started without them: a session
-of such an agent on its machine's host, and one whose microVMs take no folder live (`Holds::live`; Hex's, until
-P6b.3), before anything boots. Owed: listing a machine's volumes with their bytes and clearing one, through
-Shards' `shards_api::volumes` (D281) once kiln vendors a Shards that carries it; a volume's bound held as it's
-written (D281's "Not built"); Hex admitting the box's `disk_bytes`; and a switch of harness (P6c.5) giving the
-swapped-in harness its agent's volumes, unchecked on a real microVM.
+kiln plan 01a1dd2e959772a1b17bc49026448e8a, P6.2 (`agentdefs::volumes`; Shards' D271, D281; Hex's P6.2). An agent
+definition names what it keeps from one of its sessions to the next on a machine, its caches, toolchains and package
+stores: each volume a `name` and the most `bytes` it may hold (`agentdefs.create`, `update`, `check`). Each session
+started from it (`Ask::definition`: `agentdefs.run`, a UI agent a person's definition stands in for, a split's agent)
+is given them, as the definition was at the version it started from. Its store's name is `kiln-agent-` and the
+SHA-256 of its person, definition and name (`volumes::store_name`): a person's own, never another's. Volumes stay per
+machine (the person, 2026-11-14): a session elsewhere has that machine's.
+
+- **Given as its microVM starts.** Its launch carries them (the seam's `Launch::volumes`, `isolated::launch_of`):
+  each by its store name, with its bound, at `/volumes/<name>`, to its harness, read-write. Hex puts them in its box's
+  spec (`ShardsImage::volumes`) and plugs each as the run starts, before the boot answers and so before the session
+  hands its harness a turn; Shards makes one where it isn't there, keeps it past the session, and holds its files to
+  its bound (a write past it is refused ENOSPC). Its box is admitted with their bounds together as its disk
+  (`disk_bytes`, `hexvm::disk_of`), which Hex draws each bound from, so each byte a volume may hold is charged once.
+  Nothing is plugged after the start.
+- **Refused, rather than started without them:** a session of such an agent on its machine's host, before it
+  starts; a launch on microVMs that keep no volumes (`Holds::volumes`), before anything boots; a volume with no
+  bound (from a server older than bounds); and a start Hex refuses for one of them, typed by its cause
+  (`Refusal::Volume`): `Bound` where another session of the agent there holds it with another bound (it changes
+  only once none does), `Clearing` while a clearing holds it. Its words say when to start it again; kiln doesn't
+  start it again on its own.
+- **Placed where its volumes fit.** Its placement asks a machine's disk for what its volumes may still grow by
+  there: their bounds together (`Isolation::disk`) less what they hold already (`lineage::session_needs`). A
+  machine's free disk counts a volume's files as used, so asking a volume's whole bound of it would count those
+  bytes twice (ROOT's decision on Hex's P6.2 question, 2026-11-16; Hex keeps admitting each box's whole bounds,
+  which never over-admits). What they hold is read from the machines it may go to as it's placed
+  (`volumes::held_on`): on each, each volume's charge (what its files take by its bound's own measure, which its
+  bound holds it to), at most its bound, together; the least of those over every machine it may go to, so none is
+  asked less than its volumes may still take there. A machine that can't say (its kiln older, away, its store
+  failing) holds none of them as far as placement knows. Each listing walks its machine's volumes' files, which a
+  start of an agent with volumes waits on, at most as long as a person's command waits for its runner
+  (`hub::COMMAND_WITHIN`); a start of an agent with none asks nothing.
+- **Seen and cleared by its person.** `agentdefs.volumes` (`GET /api/agentdefs/{id}/volumes`) shows the caller's
+  volumes of a definition of theirs, or of one of kiln's, on each machine that keeps any, for every name any of its
+  versions declared: each one's bytes, its charge against its bound, and when it was made. The server asks each
+  machine's runner (`ServerMsg::Volumes`, named feature `agents.volumes`) for those of the store names it asks
+  alone, so no other person's volume leaves its machine; the runner reads its microVMs' store (`Sandbox::volumes`,
+  Hex's `Runtime::volumes` through `shards_api::volumes`). `agentdefs.volumes.clear` removes one on a machine with its
+  files (`Sandbox::clear_volume`), refused at once while a session holds it (Shards' holder locks: 409, its files
+  kept) and where that machine has none of that name (404). Whose a volume is is its store name's: an admin who
+  reaches everyone's definitions sees and clears their own volumes alone.
+
+Owed: a switch of harness (P6c.5) giving the swapped-in harness its agent's volumes, unchecked on a real microVM (Hex
+swaps none yet).
 
 ## Warm pools
 

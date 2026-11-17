@@ -1156,6 +1156,9 @@ pub enum FromServer {
     /// `Replay`: one replay of a recorded session's tool calls in a microVM of a split's variant (kiln plan
     /// 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b).
     Replay { req: u64, ask: Box<crate::sandbox::replay::Ask> },
+    /// `Volumes`: the agent volumes its microVMs' store keeps of the names asked, or one cleared (kiln plan 01a1dd2e…,
+    /// P6.2).
+    Volumes { req: u64, ask: crate::agentdefs::volumes::Ask },
 }
 
 impl Carries for ServerMsg {
@@ -1225,6 +1228,7 @@ impl Carries for ServerMsg {
             ServerMsg::RunnerEngine { json } => FromServer::RunnerEngine(payload(W, "RunnerEngine", &json)?),
             ServerMsg::AdoptPolicy { json } => FromServer::AdoptPolicy(payload(W, "AdoptPolicy", &json)?),
             ServerMsg::Replay { req, json } => FromServer::Replay { req, ask: Box::new(payload(W, "Replay", &json).map_err(|e| e.waits(Waits::Asking(req)))?) },
+            ServerMsg::Volumes { req, json } => FromServer::Volumes { req, ask: payload(W, "Volumes", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
             m @ (ServerMsg::Welcome { .. }
             | ServerMsg::Refused { .. }
             | ServerMsg::Assign(_)

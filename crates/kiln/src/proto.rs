@@ -826,7 +826,12 @@ pub mod feature {
     /// them only of a server that named it, and grants its isolated harnesses no sign-in until one has: they sign in
     /// themselves, as before.
     pub const LEASES: &str = "secrets.leases";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS, PREBUILD, LEASES];
+    /// This runner lists the agent volumes its microVMs' store keeps, those of the names asked alone, and clears one
+    /// once no session holds it, as the server asks ([`super::ServerMsg::Volumes`]; kiln plan 01a1dd2e…, P6.2). A
+    /// runner that didn't name it isn't asked: a person's view of their volumes says it couldn't be, and a start's
+    /// placement counts none of its volumes' bytes as held there.
+    pub const VOLUMES: &str = "agents.volumes";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, REPLAYS, PREBUILD, LEASES, VOLUMES];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1247,6 +1252,11 @@ pub enum ServerMsg {
     /// named [`feature::PREBUILD`]. Appended last, after `Replay`: postcard encodes variants by
     /// index.
     Prebuild { json: String },
+    /// The agent volumes this runner's microVMs' store keeps (JSON `crate::agentdefs::volumes::Ask`; kiln plan
+    /// 01a1dd2e…, P6.2): those of the names asked, as its store reads them, or one cleared; answered by
+    /// [`AgentMsg::Answer`] under `req` (`crate::agentdefs::volumes::Answer`). Only to runners that named
+    /// [`feature::VOLUMES`]. Appended last, after `Prebuild`: postcard encodes variants by index.
+    Volumes { req: u64, json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2333,6 +2343,7 @@ mod tests {
             ("AdoptPolicy", ServerMsg::AdoptPolicy { json: "{}".into() }),
             ("Replay", ServerMsg::Replay { req: 1, json: "{}".into() }),
             ("Prebuild", ServerMsg::Prebuild { json: "{}".into() }),
+            ("Volumes", ServerMsg::Volumes { req: 1, json: "{}".into() }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

@@ -527,3 +527,39 @@ fn p6_2_an_agent_definition_keeps_its_volumes_and_refuses_bad_ones() -> anyhow::
     }
     Ok(())
 }
+
+/// P6.2 (kiln plan 01a1dd2e959772a1b17bc49026448e8a): a person sees and clears their own volumes of their agent
+/// definitions, and nobody else does: Bo's view and clearing of Ada's answer as of no agent definition (404) over REST
+/// and MCP, an admin's too, though an admin reaches everyone's definitions. With no machine here holding microVMs,
+/// Ada's view lists none, over REST and as an operation; her clearing on a machine that isn't connected is refused 503,
+/// and of a name no volume has 400. Letting `volumes::names_of` reach everyone's lets the admin's view through.
+#[test]
+fn p6_2_a_persons_volumes_are_seen_and_cleared_by_them_alone() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let srv = start_env(dir.path(), &Options::default(), false, &[])?;
+    let ada = person(&srv, "ada", &["developer"])?;
+    let bo = person(&srv, "bo", &["developer"])?;
+    let root = person(&srv, "root", &["admin"])?;
+    let (st, made) = call(&srv, &ada, "POST", "/api/agentdefs", Some(json!({ "name": "builder", "harness": "claude", "volumes": [{ "name": "cargo", "bytes": 1_073_741_824_u64 }] })))?;
+    anyhow::ensure!(st == 200, "{st} {made}\n{}", srv.log());
+    let id = s(&made, "/id");
+    let (st, seen) = call(&srv, &ada, "GET", &format!("/api/agentdefs/{id}/volumes"), None)?;
+    anyhow::ensure!(st == 200 && seen.get("machines") == Some(&json!([])), "no machine here keeps any: {st} {seen}");
+    let (st, seen) = op(&srv, &ada, "agentdefs.volumes", json!({ "id": id }))?;
+    anyhow::ensure!(st == 200 && seen.get("machines") == Some(&json!([])) && seen.get("unheard").is_some(), "as an operation: {st} {seen}");
+    for (who, token) in [("bo", &bo), ("an admin", &root)] {
+        let (st, said) = call(&srv, token, "GET", &format!("/api/agentdefs/{id}/volumes"), None)?;
+        anyhow::ensure!(st == 404, "{who} sees Ada's volumes: {st} {said}");
+        let (st, said) = call(&srv, token, "POST", &format!("/api/agentdefs/{id}/volumes/clear"), Some(json!({ "name": "cargo", "machine": "nowhere" })))?;
+        anyhow::ensure!(st == 404, "{who} clears Ada's volume: {st} {said}");
+        let (failed, said) = mcp(&srv, token, "agentdefs_volumes", json!({ "id": id }))?;
+        anyhow::ensure!(failed, "{who} sees Ada's volumes over MCP: {said}");
+        let (failed, said) = mcp(&srv, token, "agentdefs_volumes_clear", json!({ "id": id, "name": "cargo", "machine": "nowhere" }))?;
+        anyhow::ensure!(failed, "{who} clears Ada's volume over MCP: {said}");
+    }
+    let (st, said) = call(&srv, &ada, "POST", &format!("/api/agentdefs/{id}/volumes/clear"), Some(json!({ "name": "cargo", "machine": "nowhere" })))?;
+    anyhow::ensure!(st == 503, "a machine that isn't connected can't be asked: {st} {said}");
+    let (st, said) = call(&srv, &ada, "POST", &format!("/api/agentdefs/{id}/volumes/clear"), Some(json!({ "name": "-cargo", "machine": "nowhere" })))?;
+    anyhow::ensure!(st == 400, "a name no volume has: {st} {said}");
+    Ok(())
+}

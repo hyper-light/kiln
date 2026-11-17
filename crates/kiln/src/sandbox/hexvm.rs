@@ -49,6 +49,12 @@
 //!   process. Nothing of it is a grant or an address in the microVM.
 //! - **Its signals** (Shards D238; #73 part 7) reach its harness member alone, on its own lane of its run's
 //!   agent-control endpoint (`Runtime::signal_member`): its VM runs on, and its kill is still its box's delete.
+//! - **Its volumes** (kiln plan 01a1dd2e…, P6.2; Shards' D271, D281): its launch's volumes of the node's Shards home,
+//!   in its box's spec (`ShardsImage::volumes`), each to its harness member, which Hex plugs as its run starts and holds
+//!   to its bound; and its box admitted with their bounds together as its disk (`disk_bytes`), which Hex draws each
+//!   bound from. The home's volumes are listed and cleared through Hex (`Runtime::volumes`, `Runtime::clear_volume`),
+//!   each on the blocking pool (each starts the node's `shards`, and a listing walks every volume's files); a refusal
+//!   of a volume's is typed by its cause (`Refusal::Volume`).
 
 use std::io::{BufRead as _, Write as _};
 use std::collections::HashMap;
@@ -59,19 +65,20 @@ use std::time::Duration;
 
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ShardsImage};
+use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, ImageVolume, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ShardsImage};
 use kiln_ci::place::holder::BoxName;
 use kiln_seams::Records;
 use kiln_seams::records::{Tx, Write};
 use serde::{Deserialize, Serialize};
-use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, Launch, Link, Output, Pool, Refusal, Run, Sandbox, Signal};
+use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, KeptVolume, Launch, Link, Output, Pool, Refusal, Run, Sandbox, Signal, VolumeCause};
 
 /// What a box of Hex's holds its run to: no egress, egress to named destinations (each by TCP, to its harness
 /// member), folders shared at any path, read-only or not (`ShardsImage::shares`), and signals to its harness member
 /// (`Runtime::signal_member`, Shards' agent-control endpoint). Not memory or process limits (Hex reads no OOM kill or
 /// refused fork of an image VM's guest: its `usage_of`), or weights. Credentials it holds where its runtime leases
-/// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false };
+/// them ([`HexVms::leasing`], its [`Sandbox::holds`]); these say none. Volumes of its node's Shards home given to a
+/// launch, listed and cleared (kiln plan 01a1dd2e…, P6.2: module docs).
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false, volumes: true };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
 pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (its server's broker didn't open, or this runner has no link to its server to ask it over), and a run granted one is never run without it (Shards' D242)";
@@ -369,7 +376,7 @@ impl HexVms {
         let id = name.id().map_err(seam)?;
         let shares = shares.iter().map(|s| Mount { source: PathBuf::from(&s.host), destination: s.at.clone(), read_only: !s.writable }).collect();
         let class = ShardsImage { command: Some(command), shares, ..ShardsImage::new(image) };
-        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
+        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size, 0)?), route: None, band: 0 };
         let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: id.to_string(), member: None, last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
         let runtime = Arc::clone(&self.runtime);
         let started = crate::rt::blocking(move || {
@@ -420,9 +427,12 @@ impl HexVms {
         }
         // Its MCP bridge (Shards D254): nothing of it is a grant or an address.
         let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone(), mcp: true };
-        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, ..ShardsImage::new(image) };
+        // Its volumes (P6.2), plugged by Hex as its run starts, each bound drawn from the disk its box is admitted with.
+        let disk = disk_of(&launch.volumes)?;
+        let volumes = volumes_of(&member, &launch.volumes)?;
+        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, volumes, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
-        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size)?), route: None, band: 0 };
+        let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size, disk)?), route: None, band: 0 };
         let name = id.to_string();
         let vm = Arc::new(Vm { runtime: Arc::clone(&self.runtime), id: id.try_clone().map_err(seam)?, name: name.clone(), member: Some(member.clone()), last: parking_lot::Mutex::new(None), peak: std::sync::atomic::AtomicU64::new(0), ledger: self.ledger.clone() });
         let runtime = Arc::clone(&self.runtime);
@@ -476,6 +486,20 @@ impl Sandbox for HexVms {
     fn let_go(&self, pool: Pool) -> BoxFuture<'_, Result<(), Refusal>> {
         drop(pool);
         Box::pin(async { Err(Refusal::Unsupported(NO_POOLS.to_owned())) })
+    }
+
+    // A run's own anonymous volumes, made for one run alone and gone with it, are no launch's to be given: not listed.
+    fn volumes(&self) -> BoxFuture<'_, Result<Vec<KeptVolume>, Refusal>> {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let listed = crate::rt::blocking(move || runtime.volumes()).await.map_err(|e| Refusal::Invalid { what: "its volumes", why: format!("{e:#}") })?;
+            Ok(listed.map_err(seam)?.into_iter().filter(|v| !v.anonymous).map(|v| KeptVolume { name: v.name, bytes: v.bytes, bound: v.bound, charge: v.charge, created_ns: v.created_ns }).collect())
+        })
+    }
+
+    fn clear_volume(&self, name: String) -> BoxFuture<'_, Result<(), Refusal>> {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move { crate::rt::blocking(move || runtime.clear_volume(&name)).await.map_err(|e| Refusal::Invalid { what: "its volumes", why: format!("{e:#}") })?.map_err(seam) })
     }
 }
 
@@ -578,15 +602,15 @@ fn grants_of(member: &Member, egress: &Egress) -> Result<Vec<Grant>, Refusal> {
 
 /// The VM `asked` (vCPUs, MiB; none: Shards' least on this architecture, module docs) as an allocation its envelope
 /// keeps: whole vCPUs and MiB, in the units Hex's `Allocation::vm_size` reads them (1,000 CPU milli a vCPU, 2^20
-/// bytes a MiB).
-fn allocation(asked: Option<(u32, u64)>) -> Result<Allocation, Refusal> {
+/// bytes a MiB), and `disk` bytes of its node's disk, its volumes' bounds together ([`disk_of`]), byte by byte.
+fn allocation(asked: Option<(u32, u64)>, disk: u64) -> Result<Allocation, Refusal> {
     let size = |why: String| Refusal::Invalid { what: "its microVM's size", why };
     let (cpus, memory) = asked.unwrap_or((0, 0));
     let (vcpus, mib) = shards_api::envelope(std::env::consts::ARCH, cpus, memory).map_err(|e| size(format!("{e:?}")))?;
     let guest = CapacityResources {
         cpu_milli: u64::from(vcpus).checked_mul(1000).ok_or_else(|| size(format!("{vcpus} vCPUs")))?,
         mem_bytes: mib.checked_mul(1 << 20).ok_or_else(|| size(format!("{mib} MiB")))?,
-        disk_bytes: 0,
+        disk_bytes: disk,
     };
     let quantum = CapacityResources { cpu_milli: 1000, mem_bytes: 1 << 20, disk_bytes: 1 };
     let cost = RuntimeCost { id: PROFILE, floor: CapacityResources::default(), ceiling: guest, quantum, guest_overhead: CapacityResources::default(), overhead: CapacityResources::default() };
@@ -619,8 +643,39 @@ fn seam(r: hex_api::Refusal) -> Refusal {
         H::Unconfigured { what, why } => Refusal::Unsupported(format!("{what}: {why}")),
         H::Full(limit) | H::Exhausted { bound: limit, .. } => Refusal::Full { limit },
         H::NoSuchBox(_) | H::NotRunning(..) => Refusal::Ended,
+        H::Volume { cause, why } => Refusal::Volume { cause: volume_cause(cause), why },
         other => Refusal::Invalid { what: "its microVM", why: other.to_string() },
     }
+}
+
+/// What held one of Hex's volumes, as the seam says it: each cause by name.
+fn volume_cause(cause: hex_api::VolumeCause) -> VolumeCause {
+    match cause {
+        hex_api::VolumeCause::Bound => VolumeCause::Bound,
+        hex_api::VolumeCause::Clearing => VolumeCause::Clearing,
+        hex_api::VolumeCause::InUse => VolumeCause::InUse,
+        hex_api::VolumeCause::Unknown => VolumeCause::Unknown,
+    }
+}
+
+/// `given`, a launch's volumes, as Hex gives them to its harness `member` (`ShardsImage::volumes`; kiln plan
+/// 01a1dd2e…, P6.2): each by its name in the node's Shards home, its bound, its place and read-only or not. One given to
+/// a member the launch doesn't drive is refused, as Hex drives none other.
+fn volumes_of(member: &Member, given: &[kiln_seams::sandbox::Volume]) -> Result<Vec<ImageVolume>, Refusal> {
+    let mut volumes = Vec::with_capacity(given.len());
+    for (i, v) in given.iter().enumerate() {
+        if let Some(other) = v.members.iter().find(|m| m.0 != member.name) {
+            return Err(Refusal::Invalid { what: "a volume", why: format!("volumes[{i}] is given to {}, a member this launch doesn't drive (its harness is {})", other.0, member.name) });
+        }
+        volumes.push(ImageVolume { name: v.name.clone(), bound: v.bound, at: v.at.clone(), members: vec![member.clone()], read_only: v.read_only });
+    }
+    Ok(volumes)
+}
+
+/// The disk a box is admitted with for `volumes`: their bounds together, which Hex draws each one's bound from (its
+/// `disk_bytes`), so each byte its volumes may hold is charged once. Refused past what a u64 counts.
+fn disk_of(volumes: &[kiln_seams::sandbox::Volume]) -> Result<u64, Refusal> {
+    volumes.iter().try_fold(0u64, |all, v| all.checked_add(v.bound.get())).ok_or_else(|| Refusal::Invalid { what: "its volumes", why: "their bounds together pass 2^64 bytes".into() })
 }
 
 /// What a run's threads say to its `next`: its output, then its member's end.
@@ -1469,6 +1524,52 @@ pub(crate) mod tests {
             self.sim.inspect(id)?;
             Ok(use_at(self.reads.fetch_add(1, Ordering::AcqRel) + 1))
         }
+        fn volumes(&self) -> Result<Vec<hex_api::HomeVolume>, H> {
+            self.sim.volumes()
+        }
+        fn clear_volume(&self, name: &str) -> Result<(), H> {
+            self.sim.clear_volume(name)
+        }
+    }
+
+    /// Kiln plan 01a1dd2e…, P6.2 (Shards' D271, D281, through Hex's P6.2): a launch's volumes reach Hex in its box's
+    /// spec, each to its harness member by its name in the node's Shards home, with its bound, and its box is admitted
+    /// with their bounds together as its disk, from which Hex draws each bound. The home lists them with their bounds;
+    /// a clearing is refused `Volume { InUse }` while its run holds one, its files kept; once its run has ended it's
+    /// cleared, and cleared again it's `Volume { Unknown }`. A volume given to a member the launch doesn't drive is
+    /// refused, and leaves no box.
+    #[test]
+    fn p6_2_a_launchs_volumes_reach_hex_in_its_spec_with_their_bounds_as_its_disk() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{KeptVolume, Member as Who, Volume, VolumeCause};
+        let (gib, mib) = (std::num::NonZeroU64::MIN.saturating_add((1 << 30) - 1), std::num::NonZeroU64::MIN.saturating_add((1 << 20) - 1));
+        let volume = |name: &str, bound: std::num::NonZeroU64, to: &str| Volume { name: name.into(), bound, at: format!("/volumes/{name}"), members: vec![Who(to.into())], read_only: false };
+        let (rt, _records, hex) = metered();
+        crate::rt::block_on(async move {
+            let given = vec![volume("kiln-agent-a", gib, "claude"), volume("kiln-agent-b", mib, "claude")];
+            let run = hex.launch(Launch { volumes: given, ..launch(Egress::Only(Vec::new())) }).await?;
+            let specs = rt.specs.lock().clone();
+            let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
+            assert_eq!(spec.allocation.as_ref().map(|a| a.resources.disk_bytes), Some(gib.get() + mib.get()), "its volumes' bounds together, as its disk");
+            let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
+            let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
+            let want = |name: &str, bound| hex_api::ImageVolume { name: name.into(), bound, at: format!("/volumes/{name}"), members: vec![harness.clone()], read_only: false };
+            assert_eq!(image.volumes, [want("kiln-agent-a", gib), want("kiln-agent-b", mib)], "each to its harness member, by its name in the home");
+            let bounds = |kept: Vec<KeptVolume>| kept.into_iter().map(|k| (k.name, k.bound)).collect::<Vec<_>>();
+            assert_eq!(bounds(hex.volumes().await?), [("kiln-agent-a".to_owned(), Some(gib.get())), ("kiln-agent-b".to_owned(), Some(mib.get()))]);
+            let held = hex.clear_volume("kiln-agent-a".into()).await;
+            assert!(matches!(held, Err(Refusal::Volume { cause: VolumeCause::InUse, .. })), "{held:?}");
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
+            assert_eq!(hex.clear_volume("kiln-agent-a".into()).await, Ok(()), "once its run has ended");
+            assert_eq!(bounds(hex.volumes().await?), [("kiln-agent-b".to_owned(), Some(mib.get()))]);
+            let gone = hex.clear_volume("kiln-agent-a".into()).await;
+            assert!(matches!(gone, Err(Refusal::Volume { cause: VolumeCause::Unknown, .. })), "{gone:?}");
+            let others = hex.launch(Launch { volumes: vec![volume("kiln-agent-c", mib, "codex")], ..launch(Egress::Only(Vec::new())) }).await.err();
+            assert!(matches!(&others, Some(Refusal::Invalid { what: "a volume", why }) if why.contains("codex")), "{others:?}");
+            assert_eq!(rt.sim.list()?, [], "a refused launch leaves no box");
+            anyhow::Ok(())
+        })
     }
 
     /// The sandbox over [`Metered`], its charges kept in records of its own.

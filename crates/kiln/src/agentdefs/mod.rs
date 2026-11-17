@@ -160,6 +160,10 @@ pub enum Error {
     /// agreed (kiln plan 01a1dd2e… P5.4): neither is changed.
     #[error("{}", sync::words(.0))]
     Diverged(Vec<sync::Diverged>),
+    /// One of a person's agent volumes on a machine refused a clearing by `cause` (kiln plan 01a1dd2e…, P6.2):
+    /// [`volumes::clear`].
+    #[error("{why}")]
+    Volume { cause: volumes::Cause, why: String },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

@@ -714,6 +714,11 @@ run out, and two lines can't take the same one by accident as they could a bit.
   them and their frames (`net::Out::Wiped`); the server wipes every `ReachAsk` it reads and every
   `lessor` answer it sends, and reads a `lessor` ask, which kiln writes beginning `{"op":"lessor",`,
   without copying it to look for unknown fields.
+  `agents.volumes`: the runner lists the agent volumes its microVMs' store keeps, those of the names
+  the server asks alone, and clears one once no session holds it (`ServerMsg::Volumes`; kiln plan
+  01a1dd2e…, P6.2), answering each refusal by its cause; a runner that didn't name it isn't asked: a
+  person's view of their volumes says so, and a start's placement counts none of their bytes as held
+  there.
 
 ## Registry
 
@@ -780,6 +785,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 82 | `AdoptPolicy` | | main (CP-T3.2): the room a hand-over's spool leaves on a runner's volume, JSON, to a runner that named `reach.adopt-policy` |
 | `ServerMsg` | 83 | `Replay` | | main (kiln plan 01a1dd2e…, P7.1b): one run of a recorded session's replay in a microVM of a split's variant, JSON, to a runner that named `experiments.replay` |
 | `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild` |
+| `ServerMsg` | 85 | `Volumes` | | this line (kiln plan 01a1dd2e…, P6.2): agent volumes of a runner's microVMs' store listed by their names, or one cleared, JSON, to a runner that named `agents.volumes` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -1042,6 +1048,7 @@ Four edges are left, and the lab steers clear of each:
 | `AdoptPolicy` | state | The room a hand-over's spool leaves on this runner's volume (`harness::moving::stream::Told`, JSON: `{disk_floor}`, the operator's `[ci.scheduler.admission] disk_free` in bytes, or null for none set): its reach node takes sessions over from other machines under it (docs/reach.md §8), and forgets it as its server drops. Until it knows it, it refuses every hand-over. The newest wins. | New: to runners that named `reach.adopt-policy`, as they name it (each time they connect). |
 | `Replay` | ask | One run of a split's replay (`sandbox::replay::Ask`, JSON: the split, the replay, its variant and round; the variant's harness, Agentfile (a person's own with its text and build secrets) and size; the session's folder; the plan of its calls; its limit): the calls run in a microVM of the variant's image as its own command, with no grant, no credential and no member driven. Answered by `Answer` (`sandbox::replay::Answer`: its conclusion, why, its measures as a session's, its steps' outcome). | New: to runners that named `experiments.replay`; a runner that didn't isn't asked. |
 | `Prebuild` | command, parked | Build an Agentfile ahead of its sessions (`agentfiles::prebuild::Ask`, JSON: `{agentfile, version, harness, text, secrets?}`): its text at a version, beside kiln's harness directory for one of kiln's harnesses, given the secrets it names (P4.7), into the store the runner's microVMs boot from, as a session of that harness builds it there, so the session that starts after it builds nothing. Answered by `Prebuilt` as it goes. | New: to the newest process of a runner that named `agentfiles.prebuild`, at each save of the Agentfile (or of an agent definition naming it), and again for those not done or failed each time one of its processes names the feature. |
+| `Volumes` | ask | An agent's volumes on the runner's microVMs (`agentdefs::volumes::Ask`, JSON: `{"list": {stores}}`, the store names asked, or `{"clear": {store}}`): those of the names asked that its store keeps, each with the bytes its files take, its bound, its charge and when it was made, or one cleared once no session holds it. Answered by `Answer` (`agentdefs::volumes::Answer`: `listed`, `cleared`, or `refused` with its cause: `in_use`, `unknown`, `bound`, `clearing`, `unsupported` where the machine keeps none, `failed`). | New: to runners that named `agents.volumes`; a runner that didn't isn't asked. |
 
 ## Commands to a session: `Command`
 

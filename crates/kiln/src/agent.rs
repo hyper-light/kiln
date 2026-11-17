@@ -4473,6 +4473,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }));
                         continue;
                     }
+                    // The agent volumes this machine's microVMs keep, listed or one cleared (kiln plan 01a1dd2e…, P6.2):
+                    // on a task of its own, as a listing walks every volume's files, answered as it ends.
+                    Carried::Read(FromServer::Volumes { req, ask }) => {
+                        let up = uplink.0.clone();
+                        drop(crate::rt::spawn(async move {
+                            let answer = crate::agentdefs::volumes::answer(ask).await;
+                            let json = serde_json::to_string(&answer).ok();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        }));
+                        continue;
+                    }
                     Carried::Read(FromServer::FrontDoor(push)) => {
                         // Settings (and certificates) are never logged: an upload carries a key.
                         if let Some(fd) = &front_door {
@@ -5678,7 +5689,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     | ServerMsg::HarnessHistoryFor { .. }
                     | ServerMsg::RunnerEngine { .. }
                     | ServerMsg::AdoptPolicy { .. }
-                    | ServerMsg::Replay { .. } => {}
+                    | ServerMsg::Replay { .. }
+                    | ServerMsg::Volumes { .. } => {}
                 }
             }
             Ev::Headroom => {
