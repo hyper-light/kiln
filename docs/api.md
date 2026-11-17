@@ -378,10 +378,11 @@ tools `agentdefs_experiments_*`, code mode's `kiln.agentdefs.experiments.*`), an
   `peak_gib` (of its peaks, in GiB) and `failed_pct` (the percent of its sessions that failed), each
   `[low, mid, high]`: the median or the rate within its 95% confidence sequence, so a look at any time
   holds (Howard and Ramdas's for a median, Waudby-Smith and Ramdas's for a rate: docs/ci.md W20,
-  "Splits"). They're given once its sessions bound all three; a variant on the host has no warm start
-  or peak, so none. A variant whose `high` is below every other's `low` is clearly better on that
-  measure. Its `trend` is each measure as it stood at the end of each day (UTC), oldest first, today's
-  last, from the first day on which every variant with that measure had one.
+  "Splits"). Each is given once its sessions bound it: a variant on the host has no warm start or peak,
+  so its failures alone, and a microVM no warm host started has no warm start. A variant whose `high`
+  is below every other's `low` is clearly better on that measure. Its `trend` is each measure as it
+  stood at the end of each day (UTC), oldest first, today's last, from the first day on which every
+  variant with that measure had one.
 - Each of those facts is written to kiln's observability as it's kept, at the time it happened: a value
   of a distribution tagged with `experiment` and `variant` (their ids), `kiln.session.warm_ms`,
   `kiln.session.peak_memory_gib` and `kiln.session.failed_pct` (100 a failed session, 0 another); and

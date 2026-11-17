@@ -253,12 +253,15 @@ fn end_of(i: &Info, now: i64) -> End {
     }
 }
 
-/// A variant's measures, each `[low, mid, high]` within its 95% interval.
+/// A variant's measures, each `[low, mid, high]` within its 95% interval, once its sessions bound it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Measures {
-    pub warm_ms: [f64; 3],
-    pub peak_gib: [f64; 3],
-    pub failed_pct: [f64; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warm_ms: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_gib: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_pct: Option<[f64; 3]>,
 }
 
 /// A variant's trend: each measure's value at the end of each day, oldest first, today's last.
@@ -291,10 +294,13 @@ pub struct Judged {
     pub passes: bool,
 }
 
-/// What `readings` (a variant's sessions, in the order they were drawn) measure: none until each measure is bounded.
+/// What `readings` (a variant's sessions, in the order they were drawn) measure: each measure once they bound it (a
+/// host's sessions have no warm start or peak, and a microVM's no warm start unless a warm host started it); none while
+/// they bound none.
 pub fn measures(readings: &[Reading]) -> Option<Measures> {
     let interval = |m: Measure| m.interval(&readings.iter().filter_map(|r| Some(m.of(r)?.1)).collect::<Vec<f64>>());
-    Some(Measures { warm_ms: interval(Measure::WarmMs)?, peak_gib: interval(Measure::PeakGib)?, failed_pct: interval(Measure::FailedPct)? })
+    let m = Measures { warm_ms: interval(Measure::WarmMs), peak_gib: interval(Measure::PeakGib), failed_pct: interval(Measure::FailedPct) };
+    if m.warm_ms.is_none() && m.peak_gib.is_none() && m.failed_pct.is_none() { None } else { Some(m) }
 }
 
 /// Each variant's trend (`variants`: each one's readings, in the order they were drawn), over the days (UTC) from its
@@ -633,8 +639,9 @@ mod tests {
     }
 
     /// P7.1: a variant's measures are its 95% confidence sequences, `[low, mid, high]`: the median of its warm starts and
-    /// of its peaks (GiB), and its failures' rate as a percent, the middle the point and the ends around it. None until
-    /// all three are bounded: too few warm starts leave the median's sequence open, and so no measures.
+    /// of its peaks (GiB), and its failures' rate as a percent, the middle the point and the ends around it. Each is given
+    /// once its sessions bound it: too few warm starts leave the median's sequence open and that measure out, the others
+    /// shown (P7.2); none while none is bounded.
     #[test]
     fn p7_1_a_variants_measures_are_bounded_intervals_of_its_sessions() -> anyhow::Result<()> {
         let mut rs = Vec::new();
@@ -643,15 +650,20 @@ mod tests {
             rs.push(warm(k * 1_000, ms).and(ended(k * 1_000 + 500, k % 10 == 0, 2.0 + (k % 3) as f64 * 0.25)));
         }
         let m = measures(&rs).ok_or_else(|| anyhow::anyhow!("200 sessions bound all three"))?;
-        let ([_, warm_mid, _], [_, peak_mid, _], [failed_low, failed_mid, failed_high]) = (m.warm_ms, m.peak_gib, m.failed_pct);
+        let (Some(w), Some(p), Some(f)) = (m.warm_ms, m.peak_gib, m.failed_pct) else { anyhow::bail!("200 sessions bound all three: {m:?}") };
+        let ([_, warm_mid, _], [_, peak_mid, _], [failed_low, failed_mid, failed_high]) = (w, p, f);
         anyhow::ensure!(warm_mid == 7.0 && peak_mid == 2.25 && (failed_mid - 10.0).abs() < 1e-9, "{m:?}");
-        for [low, mid, high] in [m.warm_ms, m.peak_gib, m.failed_pct] {
+        for [low, mid, high] in [w, p, f] {
             anyhow::ensure!(low <= mid && mid <= high, "{m:?}");
         }
         anyhow::ensure!(failed_low >= 0.0 && failed_high <= 100.0, "{m:?}");
-        anyhow::ensure!(measures(rs.get(..2).unwrap_or_default()).is_none(), "two sessions leave a median unbounded");
+        let two = measures(rs.get(..2).unwrap_or_default()).ok_or_else(|| anyhow::anyhow!("two sessions' failures are bounded"))?;
+        anyhow::ensure!(two.warm_ms.is_none() && two.peak_gib.is_none() && two.failed_pct.is_some(), "two sessions leave each median unbounded: {two:?}");
+        // No warm start (a host's sessions, or microVMs no warm host started): the rest shown as they were.
         let no_warm: Vec<Reading> = rs.iter().map(|r| Reading { warm: None, ..*r }).collect();
-        anyhow::ensure!(measures(&no_warm).is_none(), "a measure none has: none shown");
+        let rest = measures(&no_warm).ok_or_else(|| anyhow::anyhow!("its peaks and failures"))?;
+        anyhow::ensure!(rest == Measures { warm_ms: None, ..m }, "a measure none has left out, the rest shown: {rest:?}");
+        anyhow::ensure!(measures(&[]).is_none(), "no session: none");
         Ok(())
     }
 
