@@ -526,6 +526,18 @@ fn parse_run(args: impl Iterator<Item = OsString>) -> Result<Run, String> {
             }
             "--gpu-report-scope" => report_scope(&text(value("--gpu-report-scope")?)?, &mut gpu_scope)?,
             "--kernel" => kernel = Some(PathBuf::from(value("--kernel")?)),
+            // Where its host model's vCPU records are kept (D261), its user's cache's, which its
+            // spawner names and grants it (D30).
+            "--vcpu-records" => {
+                let dir = PathBuf::from(value("--vcpu-records")?);
+                if !dir.is_absolute() {
+                    return Err(format!(
+                        "--vcpu-records: {} is not an absolute path",
+                        dir.display()
+                    ));
+                }
+                cfg.vcpu_records = Some(records_at(dir));
+            }
             "--initrd" => cfg.initrd = Some(PathBuf::from(value("--initrd")?)),
             "--init" => cfg.init = Some(PathBuf::from(value("--init")?)),
             "--cmdline" => cfg.cmdline = text(value("--cmdline")?)?,
@@ -924,6 +936,11 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
         said_to: common.said_to.take(),
         gpu_report,
     })
+}
+
+/// This host model's vCPU records, kept in `dir` (`--vcpu-records`, D261).
+fn records_at(dir: PathBuf) -> shards_vmm::vm::limits::Limits {
+    shards_vmm::vm::limits::Limits::at(dir, shards_vmm::vm::limits::HostModel::here())
 }
 
 /// Whether this VM's writable layer is an ext4 file system in a file of its own (D190), its
@@ -2534,8 +2551,12 @@ fn serve_workload(
         if !warm {
             report_timing(&handle, Some(timing));
         }
-        if let ExitReason::Error(e) = &reason {
-            report(e);
+        match &reason {
+            ExitReason::Error(e) => report(e),
+            // The host's hypervisor refused to enter a vCPU (D261): said as the host's, with
+            // what its host model's records hold of its count.
+            ExitReason::Refused(refused) => report(refused),
+            _ => {}
         }
         // The guest waits for its status to be read before it powers off, so the relay
         // has finished unless the guest never ran the command.
@@ -2729,6 +2750,10 @@ fn start_reported(
     #[cfg(target_os = "linux")]
     if shards_vmm::devices::virtio::gpu::RENDERS {
         crate::confine::gpu_paths(&mut paths);
+    }
+    // Its host model's vCPU records (D261), which it keeps its outcome in.
+    if let Some(records) = &cfg.vcpu_records {
+        records_granted(&mut paths, records)?;
     }
     confine(&paths)?;
     match report_to {
@@ -3407,6 +3432,7 @@ fn granted(paths: &crate::confine::Paths) -> Result<(), String> {
         .map(|p| (Access::Read, p.clone()))
         .chain(paths.write.iter().map(|p| (Access::Write, p.clone())))
         .chain(paths.write_under.iter().map(|p| (Access::MakeDir, p.clone())))
+        .chain(paths.records.iter().map(|p| (Access::Keep, p.clone())))
         .chain(paths.vsock.iter().map(|p| (Access::Listen, p.clone())))
         .collect();
     // The last it asks for: on macOS its link closes after unless it dials (`confine`); on
@@ -3417,6 +3443,29 @@ fn granted(paths: &crate::confine::Paths) -> Result<(), String> {
     #[cfg(windows)]
     let last = ask_sealed;
     last(&wanted)
+}
+
+/// Has `records`, its host model's vCPU records (D261), which a boot keeps its outcome in,
+/// reached through what this process is granted (D30): on macOS and Windows asked of its
+/// spawner with its other files, made where they are not (`Access::Keep`); on Linux held open
+/// now, before Landlock, which gives no rule for them, so that letting go of them leaves this
+/// process none.
+fn records_granted(
+    paths: &mut crate::confine::Paths,
+    records: &shards_vmm::vm::limits::Limits,
+) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        paths.records = Some(records.file().to_path_buf());
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = paths;
+        records
+            .hold()
+            .map_err(|e| format!("{}: its vCPU records: {e}", records.file().display()))
+    }
 }
 
 /// Has the spawner dial, beside `vsock`, every host port the guest connects to: App
@@ -3672,6 +3721,11 @@ fn supervise(
             };
             report(format!("guest requested a reset{said}"));
             ExitCode::from(3)
+        }
+        // The host's hypervisor refused to enter a vCPU (D261): said as the host's.
+        ExitReason::Refused(refused) => {
+            report(refused);
+            ExitCode::FAILURE
         }
         ExitReason::Error(e) => {
             report(e);

@@ -94,9 +94,14 @@ pub fn number_compare(x: &str, y: &str) -> Ordering {
     }
     match (exact(x), exact(y)) {
         (Some(a), Some(b)) => compare_exact(&a, &b),
-        // What OPA panics on ("illegal value") never reaches here: OPA's numbers come
-        // from its lexer, JSON and to_number. Order them by text, to stay total.
-        _ => x.cmp(y),
+        // What `exact` cannot read, a JSON number whose exponent is past i64's (OPA panics
+        // on it, "illegal value"), comes after every number it reads, and by text among its
+        // own, so that the order stays total. By text against the others too, `66e<huge>`
+        // came before 7 and after 10, and Rust's sort panicked on such an array ("does not
+        // correctly implement a total order": the rego-builtins fuzz target, CI 44077430171).
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => x.cmp(y),
     }
 }
 
@@ -356,6 +361,27 @@ impl Value {
 
     pub fn set(s: BTreeSet<Value>) -> Value {
         Value::Set(Rc::new(s))
+    }
+
+    /// A set of `items`, each inserted in turn, the first of equal ones kept, as OPA's
+    /// `NewSet` adds them: never collected, as a `BTreeSet`'s `collect` sorts its items with
+    /// `slice::sort`, which may panic on OPA's order, no total order (D98).
+    pub fn set_of(items: impl IntoIterator<Item = Value>) -> BTreeSet<Value> {
+        let mut s = BTreeSet::new();
+        for item in items {
+            s.insert(item);
+        }
+        s
+    }
+
+    /// An object of `pairs`, each inserted in turn, a key's first kept with its last value,
+    /// as OPA's object inserts them: never collected ([`Value::set_of`]).
+    pub fn object_of(pairs: impl IntoIterator<Item = (Value, Value)>) -> BTreeMap<Value, Value> {
+        let mut m = BTreeMap::new();
+        for (k, v) in pairs {
+            m.insert(k, v);
+        }
+        m
     }
 
     pub fn empty_object() -> Value {
@@ -901,6 +927,111 @@ mod tests {
         assert_eq!(compares("33", "3e33333333332"), Less);
         assert_eq!(compares("3e33333333332", "33"), Greater);
         assert_eq!(compares("1202022222200000E0297138122009577", "1"), Greater);
+    }
+
+    /// CI's fuzzing (run 44077430171, rego-builtins' crash-1023800b6193): `sort` of an array
+    /// whose numbers' exponents are past i64's among others, which `exact` cannot read. By
+    /// text against the others, `66e<huge>` came before 7 and after 10, and the sort panicked.
+    /// They come after every number `exact` reads, by text among their own: every triple
+    /// orders consistently, and a sort of them answers, the unread last.
+    #[test]
+    fn numbers_past_every_exponent_order_totally_with_the_rest() {
+        let numbers = [
+            "7",
+            "10",
+            "55",
+            "-1",
+            "0",
+            "1.5",
+            "5555555555555555570666666666666666",
+            "66e66666666666666666666",
+            "-66e66666666666666666666",
+            "5e-99999999999999999999",
+            "66e666666666666666666665555",
+        ];
+        for a in numbers {
+            for b in numbers {
+                assert_eq!(
+                    number_compare(a, b),
+                    number_compare(b, a).reverse(),
+                    "{a} against {b}"
+                );
+                for c in numbers {
+                    if number_compare(a, b) != Greater && number_compare(b, c) != Greater {
+                        assert_ne!(number_compare(a, c), Greater, "{a} <= {b} <= {c}");
+                    }
+                }
+            }
+        }
+        let mut sorted = numbers.map(|n| super::Number(n.into()));
+        sorted.sort();
+        let read = |n: &super::Number| exact(n.text()).is_some();
+        let unread = sorted.iter().position(|n| !read(n)).unwrap();
+        assert!(sorted[..unread].iter().all(read) && !sorted[unread..].iter().any(read));
+    }
+
+    /// `compare::sort_by`, by a total order, sorts as `slice::sort_by` does: stably, equal
+    /// members kept in the order they came.
+    #[test]
+    fn the_sort_that_cannot_panic_is_the_stable_sort_for_a_total_order() {
+        let pairs: Vec<(u8, usize)> = (0..1000)
+            .map(|i| (u8::try_from(i * 31 % 7).unwrap(), i))
+            .collect();
+        let mut ours = pairs.clone();
+        crate::compare::sort_by(&mut ours, |a, b| a.0.cmp(&b.0));
+        let mut theirs = pairs;
+        theirs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(ours, theirs);
+        let mut none: Vec<u8> = Vec::new();
+        crate::compare::sort_by(&mut none, Ord::cmp);
+        assert!(none.is_empty());
+    }
+
+    /// OPA's trailing-zero rule makes its order no total order: `10.0` equals `1` (its
+    /// trailing `.` and `0` trimmed) and `10` (by value), and `1` comes before `10` (D98). A
+    /// large `sort` of such numbers, and a set and an object of them, answer whatever order
+    /// their comparisons meet them in, as Go's do: none panics, as Rust's `slice::sort`, and
+    /// a `BTreeSet` collected (which sorts so), may on such an order (ROOT's ruling,
+    /// 2026-11-17). The sort keeps every number it was given.
+    #[test]
+    fn a_large_sort_and_a_set_of_the_trailing_zero_rules_numbers_answer() {
+        assert_eq!(number_compare("10.0", "1"), Equal);
+        assert_eq!(number_compare("10.0", "10"), Equal);
+        assert_eq!(number_compare("1", "10"), Less);
+        let texts = [
+            "10.0", "1", "10", "100.00", "2", "20.0", "20", "1.0", "200.000", "3",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let numbers: Vec<super::Value> = (0..4096)
+            .map(|_| {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let at = state.wrapping_mul(0x2545_F491_4F6C_DD1D) % texts.len() as u64;
+                super::Value::Number(super::Number(texts[at as usize].into()))
+            })
+            .collect();
+        let sort = crate::funcs::lookup("sort").unwrap();
+        let out = sort(
+            &mut crate::funcs::Context::default(),
+            &[super::Value::array(numbers.clone())],
+        )
+        .unwrap();
+        let Some(super::Value::Array(sorted)) = &out else {
+            panic!("sort gave no array: {out:?}");
+        };
+        let count = |vs: &[super::Value], t: &str| {
+            vs.iter()
+                .filter(|v| matches!(v, super::Value::Number(n) if n.text() == t))
+                .count()
+        };
+        for t in texts {
+            assert_eq!(count(sorted, t), count(&numbers, t), "{t}");
+        }
+        let set = super::Value::set_of(numbers.iter().cloned());
+        assert!(!set.is_empty() && set.len() <= texts.len(), "{set:?}");
+        let object = super::Value::object_of(numbers.into_iter().map(|n| (n, super::Value::Null)));
+        assert!(!object.is_empty() && object.len() <= texts.len(), "{object:?}");
     }
 
     #[test]

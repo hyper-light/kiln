@@ -306,8 +306,9 @@ fn two_vcpus_boot_to_their_end_in_this_process() {
 }
 
 /// The host's most vCPUs: the guest brings up as many as its kernel was built for, and is
-/// shown the rest, which its kernel names as it refuses them. Booted in this process and
-/// watched until its kernel says its CPUs are up, then stopped, judged by its own progress
+/// shown the rest, which its kernel names as it refuses them. Booted in this process as the
+/// product boots its machines, its init bringing its CPUs online where the product's does (PM
+/// M379, [`brings_up_the_most`]), and watched until it powers off, judged by its own progress
 /// (D261): each line its kernel logs, read from its printk ring while its console has said
 /// nothing (from subsys_initcall, which publishes the ring's place, where hvc0 registers only
 /// at device_initcall: on a CI runner's nested WHP of 4 CPUs a 255-vCPU guest did not get
@@ -316,108 +317,216 @@ fn two_vcpus_boot_to_their_end_in_this_process() {
 /// this host, and then says each line it said and when. On Windows each line is said as it
 /// comes, with its time.
 ///
-/// On an Intel host's KVM, D261's A/B: the boot as it is, then, never beside it, one whose
-/// kernel brings its APs up one at a time (`cpuhp.parallel=0`), each arm's outcome said as it
-/// ends, so that one CI run says whether VMX's error 7 on its nested Intel runners comes of
-/// parallel bring-up's burst. The test fails as the boot as it is fails, else as the other.
+/// Where the host refuses to enter it (D261, ROOT's ruling of 2026-11-17: EC2's nested KVM
+/// refused machines of 64 vCPUs or more on 4 CPUs, VMX's error 7), the refusal is the host's:
+/// typed (`ExitReason::Refused`), said so, and kept with this host model's counts
+/// ([`common::vcpu_limits`], beside the judge's records CI keeps); a count this host model has
+/// only refused is refused at once, said with that evidence. The test then proves the host's
+/// known-good count: its largest never refused, or, while none is known, the refused count
+/// halved until a boot comes up, each boot's outcome kept. A host that enters the most proves
+/// it whole.
 #[test]
 fn boots_the_hosts_maximum_vcpu_count() {
+    use shards_vmm::vm::limits::Outcome;
     if cannot_run_vms() {
         return;
     }
     let max = shards_vmm::vm::max_vcpus().unwrap();
-    if !kvm_on_intel() {
-        brings_up_the_most(max, "");
-        return;
-    }
-    let arms = [
-        bring_up_arm(max, "parallel", ""),
-        bring_up_arm(max, "one at a time", " cpuhp.parallel=0"),
-    ];
-    for arm in arms {
-        if let Err(failed) = arm {
-            std::panic::resume_unwind(failed);
+    let limits = common::vcpu_limits();
+    let refused = match limits.admit(max) {
+        Ok(()) => match brings_up_the_most(max, "") {
+            Ok(()) => {
+                limits.record(max, Outcome::Ran).unwrap();
+                return;
+            }
+            Err(refused) => {
+                limits
+                    .record(max, Outcome::Refused { vcpu: refused.vcpu })
+                    .unwrap();
+                refused.to_string()
+            }
+        },
+        Err(only) => only.to_string(),
+    };
+    // The host's, said so, and kept.
+    assert!(refused.contains("the host's hypervisor ("), "{refused}");
+    assert!(
+        limits.outcomes().get(&max).is_some_and(|o| o.refused > 0),
+        "{max} vCPUs refused, and not kept: {refused}"
+    );
+    // Its known-good count, or the refused count halved until a boot comes up.
+    let mut vcpus = limits.known_good().filter(|&good| good < max).unwrap_or(max / 2);
+    loop {
+        assert!(vcpus > 0, "the host refused every count it was asked: {refused}");
+        if limits.admit(vcpus).is_ok() {
+            match brings_up_the_most(vcpus, "") {
+                Ok(()) => {
+                    limits.record(vcpus, Outcome::Ran).unwrap();
+                    return;
+                }
+                Err(again) => limits
+                    .record(vcpus, Outcome::Refused { vcpu: again.vcpu })
+                    .unwrap(),
+            }
         }
+        vcpus /= 2;
     }
 }
 
-/// Whether this host's KVM runs on Intel's CPUs, as Linux names its first processor's vendor
-/// (`/proc/cpuinfo`'s `vendor_id`, which `scripts/ci/kvm-host` logs): only VMX fails an entry
-/// with a VM-instruction error, which CI's 255-vCPU boots met (D261).
-fn kvm_on_intel() -> bool {
-    cfg!(all(target_os = "linux", target_arch = "x86_64"))
-        && std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|info| {
-            info.lines()
-                .find_map(|l| l.split_once(':').filter(|(key, _)| key.trim() == "vendor_id"))
-                .is_some_and(|(_, vendor)| vendor.trim() == "GenuineIntel")
-        })
-}
-
-/// One arm of D261's A/B, [`brings_up_the_most`] told `also`: its outcome said on stderr as
-/// it ends, in a line of its own that CI's log keeps whether the test passes or not (`D261
-/// A/B arm`): brought up, the failed VM entry its machine ended with, or another failure,
-/// which its panic said above it; and its time from its start. What failed it is kept for its
-/// test to end with.
+/// One arm of D261's experiments, [`brings_up_the_most`] told `also`: its outcome said on
+/// stderr as it ends, in a line of its own that CI's log keeps whether the test passes or not
+/// (`D261 A/B arm`): brought up, the host's refusal to enter a vCPU, or another failure, which
+/// its panic said above it; and its time from its start. What failed it is kept for its test
+/// to end with.
 fn bring_up_arm(max: u32, arm: &str, also: &str) -> std::thread::Result<()> {
     use std::io::Write as _;
     let start = std::time::Instant::now();
     let ran = std::panic::catch_unwind(|| brings_up_the_most(max, also));
-    let failed = ran.as_ref().err().map(|failed| {
-        let said = failed
+    let outcome = match &ran {
+        Ok(Ok(())) => "brought up".to_string(),
+        Ok(Err(refused)) => refused.to_string(),
+        Err(failed) => failed
             .downcast_ref::<String>()
             .map(String::as_str)
             .or_else(|| failed.downcast_ref::<&str>().copied())
-            .unwrap_or_default();
-        said.lines()
+            .unwrap_or_default()
+            .lines()
             .find(|l| l.contains("VM entry failed"))
             .map_or("failed otherwise, as its panic above says", str::trim)
-            .to_string()
-    });
+            .to_string(),
+    };
     let _ = writeln!(
         std::io::stderr(),
-        "D261 A/B arm {arm} ({BRINGS_UP}{also}): {}; {:?} from its start",
-        failed.as_deref().unwrap_or("brought up"),
+        "D261 A/B arm {arm} ({BRINGS_UP}{}{also}): {outcome}; {:?} from its start",
+        shards_vmm::vm::late_cpus_cmdline(max),
         start.elapsed()
     );
-    ran
+    match ran {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(refused)) => Err(Box::new(refused.to_string())),
+        Err(failed) => Err(failed),
+    }
 }
 
-/// [`brings_up_the_most`]'s command line. Its console at the kernel's own default level
-/// (`loglevel=7`: CONFIG_CONSOLE_LOGLEVEL_DEFAULT in the pinned kernels' base configs, which
-/// shards' leave), as `run --kernel` booted it with its console on stdout. Told no level, a
-/// machine whose console no one reads is told `quiet` (`vm::kernel_cmdline`), which keeps the
-/// bring-up off hvc0: a host whose ring is not read would never see it (D261).
+/// One arm of D261's experiments (.github/workflows/d261-intel.yml on Intel's KVM,
+/// whp-maxvcpu.yml on WHP, each arm alone, their records kept):
+/// [`boots_the_hosts_maximum_vcpu_count`]'s boot of `SHARDS_D261_VCPUS` vCPUs, its kernel told
+/// `SHARDS_D261_ALSO` besides (`cpuhp.parallel=0`, a serial bring-up's arm), its outcome said
+/// in its `D261 A/B arm` line, named `SHARDS_D261_ARM`. Ignored: the experiments alone run it.
+#[test]
+#[ignore = "D261's experiments (.github/workflows/d261-intel.yml, whp-maxvcpu.yml) run it"]
+fn a_d261_arm_boots_the_vcpus_its_experiment_asks() {
+    if cannot_run_vms() {
+        return;
+    }
+    let vcpus: u32 = std::env::var("SHARDS_D261_VCPUS").unwrap().parse().unwrap();
+    let max = shards_vmm::vm::max_vcpus().unwrap();
+    assert!(
+        (1..=max).contains(&vcpus),
+        "{vcpus} vCPUs, where this host has 1 to {max}"
+    );
+    let arm = std::env::var("SHARDS_D261_ARM").unwrap_or_else(|_| format!("{vcpus} vCPUs"));
+    let also = std::env::var("SHARDS_D261_ALSO")
+        .ok()
+        .filter(|also| !also.trim().is_empty())
+        .map(|also| format!(" {}", also.trim()))
+        .unwrap_or_default();
+    if let Err(failed) = bring_up_arm(vcpus, &arm, &also) {
+        std::panic::resume_unwind(failed);
+    }
+}
+
+/// [`brings_up_the_most`]'s command line, before what the product's boot tells its kernel. Its
+/// console at the kernel's own default level (`loglevel=7`: CONFIG_CONSOLE_LOGLEVEL_DEFAULT in
+/// the pinned kernels' base configs, which shards' leave), as `run --kernel` booted it with its
+/// console on stdout. Told no level, a machine whose console no one reads is told `quiet`
+/// (`vm::kernel_cmdline`), which keeps the bring-up off hvc0: a host whose ring is not read
+/// would never see it (D261).
 const BRINGS_UP: &str = "console=hvc0 panic=-1 loglevel=7";
 
-/// [`boots_the_hosts_maximum_vcpu_count`]'s boot of `max` vCPUs in this process, its kernel
-/// told `also` past [`BRINGS_UP`], which keys its waits apart beside their call site, so that
-/// one arm's answers judge no other's.
-fn brings_up_the_most(max: u32, also: &str) {
-    use shards_vmm::vm::{self, Config, Console};
+/// What shards-init says once its CPUs are online and its boot is done, then powering off, as
+/// a guest given no workload does (crates/init `main`).
+const INIT_RUNS: &str = "shards-init: pid 1 running";
+
+/// What its kernel says as it powers off (kernel/reboot.c `kernel_power_off`), its consoles
+/// flushed before the machine goes (`pr_flush`): every line before it, each CPU's among them,
+/// is on its console by then, as a console prints the kernel's records in their order.
+const POWERS_OFF: &str = "reboot: Power down";
+
+/// What a kernel says of each CPU its init brings online once it runs: x86-64's smpboot, once
+/// its system runs (arch/x86/kernel/smpboot.c `announce_cpu`), and arm64's
+/// (arch/arm64/kernel/smp.c `secondary_start_kernel`).
+fn brought_online() -> &'static str {
+    match common::ARCH {
+        "x86_64" => "smpboot: Booting Node ",
+        _ => "Booted secondary processor",
+    }
+}
+
+/// [`boots_the_hosts_maximum_vcpu_count`]'s boot of `max` vCPUs in this process, booted as the
+/// product boots its machines (vm_run.rs `boot_into`, build/builder.rs): shards-init its PID 1,
+/// and its kernel told [`late_cpus_cmdline`](shards_vmm::vm::late_cpus_cmdline)'s words for
+/// `max` past [`BRINGS_UP`], then `also`. Where every CPU online at boot makes each of its
+/// kernel's text patches wait for vCPUs that have no host CPU, nested Hyper-V's WHP, its
+/// kernel brings up its boot CPU alone and its init the rest (PM M379): a boot of all of them
+/// at once there is one the product never makes, and tests nothing of it (D261, ROOT's ruling
+/// of 2026-11-17). Waited for until it powers off, its init having said it runs, its CPUs
+/// online; then each is checked brought up, at boot or by its init. The late words, `also` and
+/// its count key its waits apart beside their call site, so that one arm's or count's answers
+/// judge no other's. The host's refusal to enter one of its vCPUs is its end, typed (D261); any
+/// other failure panics.
+fn brings_up_the_most(max: u32, also: &str) -> Result<(), shards_vmm::vm::limits::EntryRefused> {
+    use shards_vmm::vm::{self, Config, Console, ExitReason};
     let _turn = machine_turn();
-    let mut cfg = Config::new(kernel().to_path_buf(), None);
+    let mut cfg = Config::new(kernel().to_path_buf(), Some(guest_init().to_path_buf()));
     cfg.vcpus = max;
     cfg.memory_mib = 1024;
-    cfg.cmdline = format!("{BRINGS_UP}{also}");
+    let late = vm::late_cpus_cmdline(max);
+    cfg.cmdline = format!("{BRINGS_UP}{late}{also}");
     cfg.console = Console::Discard;
     // Its whole console kept, and with it its kernel's whole ring while its console has said
     // nothing: this test reads them as it goes (D12, D261).
     cfg.said = usize::MAX;
     let (handle, running) = vm::start(&cfg).unwrap_or_else(|e| panic!("{e}"));
     let (tx, ended) = std::sync::mpsc::channel();
+    // Its end kept beside the one its wait takes, so that a refused entry is told typed.
+    let (kept, end) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(running.wait());
+        let reason = running.wait();
+        let _ = kept.send(reason.clone());
+        let _ = tx.send(reason);
     });
     let tag = cfg!(windows).then_some("D261 WHP boot");
-    let (said, lines) = common::machine_says(&handle, &ended, "smp: Brought up", also, max, tag)
-        .unwrap_or_else(|failed| panic!("{failed}"));
+    let key = format!("{late}{also} {max} vCPUs");
+    let (_, lines) = match common::machine_says(&handle, &ended, POWERS_OFF, &key, max, tag) {
+        Ok(said) => said,
+        Err(failed) => match end.try_recv() {
+            Ok(ExitReason::Refused(refused)) => return Err(refused),
+            _ => panic!("{failed}"),
+        },
+    };
     let configured = kernel_nr_cpus();
     let up = max.min(configured);
-    let plural = if up == 1 { "" } else { "s" };
-    let brought = format!("smp: Brought up 1 node, {up} CPU{plural}");
-    let seen = lines.timed();
+    // Its kernel brought up every CPU at boot, or its boot CPU alone and its init the rest.
+    let at_boot = if late.is_empty() { up } else { 1 };
+    let plural = if at_boot == 1 { "" } else { "s" };
+    let brought = format!("smp: Brought up 1 node, {at_boot} CPU{plural}");
+    let (text, seen) = (lines.text(), lines.timed());
     // A count other than the one asked for fails at once, with what the guest said.
-    assert!(said.contains(&brought), "{seen}");
+    assert!(text.contains(&brought), "{seen}");
+    assert!(text.contains(INIT_RUNS), "{seen}");
+    if !late.is_empty() {
+        // Each of the rest brought online by its init, as its kernel says, and none refused
+        // (crates/init `bring_cpus_online`).
+        let online = text.lines().filter(|l| l.contains(brought_online())).count();
+        assert_eq!(
+            u32::try_from(online).ok(),
+            Some(up - 1),
+            "its init brought {online} CPUs online of {}:\n{seen}",
+            up - 1
+        );
+        assert!(!text.contains("not brought online"), "{seen}");
+    }
     if max > configured {
         let refused = match common::ARCH {
             // arch/x86/kernel/cpu/topology.c
@@ -425,8 +534,9 @@ fn brings_up_the_most(max: u32, also: &str) {
             // arch/arm64/kernel/smp.c
             _ => format!("Number of cores ({max}) exceeds configured maximum of {configured}"),
         };
-        assert!(lines.text().contains(&refused), "{seen}");
+        assert!(text.contains(&refused), "{seen}");
     }
+    Ok(())
 }
 
 #[test]
@@ -2407,14 +2517,44 @@ fn a_failing_tests_vm_ends_with_it() {
     ending.answered();
 }
 
+/// What VM process `vm`'s first vCPU's thread (`vcpu0`, vm/runtime.rs) has run, in ns, as Linux
+/// counts it to the nanosecond: its schedstat's first field, `sum_exec_runtime` (proc(5)),
+/// which holds its guest time, as KVM runs the guest on that thread. Another process's thread
+/// CPU clock is not this process's to read (clock_gettime(2): a thread clock's thread must be
+/// of the caller's thread group). None elsewhere, or where it is unread (a kernel built
+/// without CONFIG_SCHED_INFO keeps no schedstat).
+fn vcpu_ran(vm: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let task = std::fs::read_dir(format!("/proc/{vm}/task"))
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|task| task.path())
+            .find(|task| {
+                std::fs::read_to_string(task.join("comm")).is_ok_and(|name| name.trim_end() == "vcpu0")
+            })?;
+        std::fs::read_to_string(task.join("schedstat"))
+            .ok()?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = vm;
+        None
+    }
+}
+
 /// A managed guest's rate (D255): a guest booted `--host-managed`, spinning its one vCPU, is
 /// held by its VM's governor to the quarter CPU a client asks on its vsock socket (`RATE`,
 /// `shards_abi::rate`), as `ManagedGuest::rate` asks it. Its vCPU runs its guest no more than
 /// a quarter of the time passing, two of its governor's periods (its share where the window
 /// and the periods do not line up, and what its vCPU overruns before the governor reads, at
 /// the window's two ends) and one step of its guest time's count (`guest_time_step`), read
-/// by `USE`; or, where that count is KVM's scheduler ticks, its VM process's CPU time, read
-/// by the same `USE`, runs no more than the first two (D265, amended by ci-fixes): the hold
+/// by `USE`; or, where that count is KVM's scheduler ticks, its vCPU's thread's run time
+/// ([`vcpu_ran`]) runs no more than the first two (D265, amended by ci-fixes): the hold
 /// holds its vCPUs, never its VM process's governor or devices, whose CPU
 /// is shards' own (D191). Its vCPU's whole CPU holds nothing, and
 /// none lifts its hold; each answer says the period its VM derives from g as it knows it then,
@@ -2493,27 +2633,42 @@ fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
     // Its window from before the first read is asked until the second is answered: the
     // reads fall within it.
     let start = Instant::now();
+    let vcpu_from = vcpu_ran(child.id());
     let before = read(&used(&socket));
     std::thread::sleep(Duration::from_secs(2));
     let after = read(&used(&socket));
+    let vcpu = vcpu_ran(child.id())
+        .zip(vcpu_from)
+        .map(|(to, from)| to.saturating_sub(from));
     let ran = after.0.total_ns() - before.0.total_ns();
     let wall = u64::try_from(start.elapsed().as_nanos()).unwrap();
     let most = wall / 4 + 2 * period_ns.get();
     // KVM counts guest time in whole scheduler ticks, each charged to what its vCPU's thread
     // ran as it landed (`thread_guest_ns`): a vCPU let run once a period is counted a tick more
     // or less each time, so over hundreds of periods its count may pass what it ran by more
-    // than a step, by as much as no tick says (CI 43968984258: 2.37 ms past). Its VM process's
-    // CPU time, which Linux counts to the nanosecond (`task_sched_runtime`) and which holds
-    // its vCPU's guest time (D265's `ToThread`), witnesses the hold there: within `most`, its
-    // vCPU ran no more, whatever its ticks say.
+    // than a step, by as much as no tick says (CI 43968984258: 2.37 ms past). Its vCPU's
+    // thread's run time, which Linux counts to the nanosecond ([`vcpu_ran`]) and which holds
+    // its guest time, witnesses the hold there: within `most`, its vCPU ran no more, whatever
+    // its ticks say; read with a step, as that count moves at its kernel's ticks and switches,
+    // so a read as the thread runs lags it by up to a tick, which a count in ticks steps by at
+    // least. Not its VM process's CPU time, which holds its governor's and devices' threads
+    // too, which the hold never holds (D191): 514.04 ms of it in a `most` of 509.68 ms as its
+    // ticks passed `most` and a step by 0.32 ms (CI 44076016255, x86_64 gnu). That witnesses
+    // only where the thread's is unread.
     let own = after.1.cpu_ns - before.1.cpu_ns;
+    let witnessed = match vcpu {
+        Some(thread) => thread <= most + step,
+        None => own <= most,
+    };
     assert!(
-        ran <= most + step || (cfg!(target_os = "linux") && own <= most),
-        "{ran} ns of guest in {wall} ns, held to a quarter CPU over {period_ns} ns (at most {most} ns), read in {step} ns steps; its VM process ran {own} ns of CPU meanwhile, {}",
-        if own > most {
-            "past what its vCPU may run: its governor let its vCPU overrun, or its own threads ran the rest"
-        } else {
-            "within it: its guest time's count passed what its vCPU ran"
+        ran <= most + step || (cfg!(target_os = "linux") && witnessed),
+        "{ran} ns of guest in {wall} ns, held to a quarter CPU over {period_ns} ns (at most {most} ns), read in {step} ns steps; its vCPU's thread ran {vcpu:?} ns and its VM process {own} ns of CPU meanwhile, {}",
+        match vcpu {
+            Some(thread) if thread > most + step => "past what its vCPU may run: its governor let it overrun",
+            None if own > most => {
+                "past what its vCPU may run: its governor let its vCPU overrun, or its own threads ran the rest"
+            }
+            _ => "within it: its guest time's count passed what its vCPU ran",
         }
     );
     assert!(

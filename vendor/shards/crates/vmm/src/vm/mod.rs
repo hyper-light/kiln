@@ -229,6 +229,7 @@ impl Rated {
 }
 #[cfg(any(hv, test))]
 mod hold;
+pub mod limits;
 pub mod live;
 #[cfg(not(target_os = "linux"))]
 mod passthrough;
@@ -1599,6 +1600,12 @@ pub struct Config {
     /// one it may have): every vCPU is told the lower of this host's and the baseline's.
     /// Empty for none: the host's own.
     pub cpu_baseline: crate::arch::cpu::Id,
+    /// Its host model's vCPU records (D261), where its outcome is kept as it comes, once: ran,
+    /// as its guest's init announces itself, its CPUs online; or refused, as the host refuses
+    /// to enter a vCPU, its refusal then said with what they hold of its count
+    /// ([`limits::Evidence`]). Nothing is refused for them: every count is tried. They are let
+    /// go of as its outcome is kept. None keeps none.
+    pub vcpu_records: Option<limits::Limits>,
 }
 
 /// A device plugged into a running machine (D214): its place on bus 0 (`devfn`, device <<
@@ -2754,6 +2761,7 @@ impl Config {
             component_window_mib: 0,
             pci_slots_iommu: false,
             cpu_baseline: Vec::new(),
+            vcpu_records: None,
         }
     }
 }
@@ -2900,6 +2908,8 @@ pub enum ExitReason {
     Stopped,
     /// Stopped after writing a snapshot ([`AfterSnapshot::Stop`]).
     Snapshotted,
+    /// The host's hypervisor refused to enter a vCPU (D261): the host's, never the guest's.
+    Refused(limits::EntryRefused),
     Error(String),
 }
 
