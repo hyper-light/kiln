@@ -12,7 +12,7 @@ import type { ServerEvent } from "../src/api/types";
 const harness = (id: string, status: string, experiment?: string, measured = false) =>
   ({
     type: "harness",
-    info: { id, status, starts: measured ? [{ at: 1, runs: {}, measured: { start_us: 1 } }] : [], ...(experiment ? { experiment: { experiment, arm: "v1", promoted: false } } : {}) },
+    info: { id, status, starts: measured ? [{ at: 1, runs: {}, measured: { start_us: 1 } }] : [], ...(experiment ? { experiment: { experiment, arm: "v1" } } : {}) },
   }) as unknown as ServerEvent;
 const closed = (id: string): ServerEvent => ({ type: "harness_closed", id });
 
