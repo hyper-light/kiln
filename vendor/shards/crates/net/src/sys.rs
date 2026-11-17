@@ -348,6 +348,26 @@ pub fn entropy(buf: &mut [u8]) -> io::Result<()> {
     }
 }
 
+/// Holds `reserved` at `wanted` descriptors for a shared network's links to come (D285),
+/// each a duplicate of `held`, those past `wanted` closed: whether it holds them all. A link's
+/// socket comes beside its message (SCM_RIGHTS on Unix; on Windows its protocol info, adopted
+/// as its message is read), which a process at its limit takes cut, ending its control
+/// (MSG_CTRUNC); so its descriptor is held from the join that counts it until its message is
+/// read, never a flow's to take meanwhile. Duplicates, as a confined process opens no file
+/// (Landlock, D31) and F_DUPFD_CLOEXEC is among its seccomp filter's calls; the kernel refuses
+/// one past the limit (EMFILE; on Windows the 2^24 handles a process may hold, Microsoft,
+/// "Kernel Objects").
+pub fn reserve(held: &UnixStream, wanted: usize, reserved: &mut Vec<UnixStream>) -> bool {
+    reserved.truncate(wanted);
+    while reserved.len() < wanted {
+        match held.try_clone() {
+            Ok(copy) => reserved.push(copy),
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Asks `sock`'s send and receive buffers to be `size` bytes each (SO_SNDBUF, SO_RCVBUF);
 /// what the OS gives is its own business.
 pub fn set_buffers(sock: RawSock, size: usize) {
@@ -393,5 +413,29 @@ pub fn drain(bell: shards_netring::RawWait) {
             windows_sys::Win32::Networking::WinSock::recv(s, buf.as_mut_ptr(), buf.len() as i32, 0)
         } > 0
         {}
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Do hold three descriptors for a shared network's links to come, then one, then none
+    /// (D285). Expect: three duplicates of the held socket, then one, then none, each time
+    /// said held; and a socket's end still read by its peer once its duplicates go.
+    #[test]
+    fn a_reservation_holds_what_is_wanted_and_lets_the_rest_go() {
+        use std::io::Read as _;
+        let (held, mut peer) = UnixStream::pair().unwrap();
+        let mut reserved = Vec::new();
+        assert!(reserve(&held, 3, &mut reserved));
+        assert_eq!(reserved.len(), 3);
+        assert!(reserve(&held, 1, &mut reserved));
+        assert_eq!(reserved.len(), 1);
+        assert!(reserve(&held, 0, &mut reserved));
+        assert!(reserved.is_empty());
+        drop(held);
+        let mut rest = Vec::new();
+        assert_eq!(peer.read_to_end(&mut rest).unwrap(), 0);
     }
 }

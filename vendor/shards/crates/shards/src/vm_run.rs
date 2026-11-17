@@ -911,6 +911,9 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
         swap: None,
         layer,
         layer_cloned,
+        // Its components' images (D270 slice 5): none yet, so a snapshot holding one is
+        // refused, saying which, until its spawner gives them.
+        components: Vec::new(),
     };
     Ok(Restore {
         cfg,
@@ -1047,7 +1050,9 @@ pub fn device(payload: &[u8], fds: Vec<shards_ipc::fd::OwnedFd>) -> Result<Strin
                 .into_iter()
                 .next()
                 .ok_or_else(|| asked("a component of no file"))?;
-            let plugged = handle.plug_pmem(std::fs::File::from(file))?;
+            // Its key after its step (D270 slice 5): what a save keeps it by.
+            let key = std::str::from_utf8(rest).map_err(|_| asked("a component's key not UTF-8"))?;
+            let plugged = handle.plug_pmem(std::fs::File::from(file), key)?;
             let (gpa, len) = plugged
                 .region
                 .ok_or_else(|| Refusal::Host("a component's function plugged with no region".into()))?;
@@ -1152,7 +1157,7 @@ fn take_rates(vsock: &mut Option<VsockHost>) -> Result<(), String> {
 /// rate, with the hold [`hold_rate`] makes of it and its hold's period, or why not; its use,
 /// with [`use_answer`].
 fn serve_rates(
-    asked: &std::sync::mpsc::Receiver<(shards_vmm::platform::UnixStream, shards_abi::rate::Asked)>,
+    asked: &std::sync::mpsc::Receiver<(shards_vmm::platform::HostStream, shards_abi::rate::Asked)>,
 ) {
     use shards_abi::rate::{Answer, Asked, answer};
     for (mut stream, ask) in asked {
@@ -1165,10 +1170,14 @@ fn serve_rates(
                 shards_vmm::platform::process_usage(std::process::id())
             }),
         };
-        // Blocking: one line, which its socket takes whole, and its client waits for.
+        // Blocking: one line, which its socket takes whole, and its client waits for; on
+        // Windows its pipes' write waited for, so that it is in the pipe as they close (D272).
+        #[cfg(unix)]
         let answered = stream
             .set_nonblocking(false)
             .and_then(|()| stream.write_all(line.as_bytes()));
+        #[cfg(windows)]
+        let answered = stream.write_all_waiting(line.as_bytes());
         if let Err(e) = answered {
             shards_vmm::debug!("a host ask's answer: {e}");
         }
@@ -2228,6 +2237,7 @@ fn serve_workload(
                                 capture: None,
                                 processes: None,
                                 members: None,
+                                restarted: None,
                                 readiness: None,
                                 host_net: None,
                                 resumed: None,
@@ -2297,6 +2307,7 @@ fn serve_workload(
                         };
                         let processes = |records: &[u8]| crate::warm::processes(&link, records);
                         let members = |ended: &[u8]| crate::warm::member_ended(&link, ended);
+                        let restarted = |answer: &[u8]| crate::warm::member_started(&link, answer);
                         let readiness = |ready: &[u8]| crate::warm::workload_ready(&link, ready);
                         let host_net = |frame: &[u8]| crate::warm::host_net(&link, frame);
                         let set_up = || {
@@ -2451,6 +2462,7 @@ fn serve_workload(
                                 kept: Some(&kept),
                                 processes: Some(&processes),
                                 members: Some(&members),
+                                restarted: Some(&restarted),
                                 readiness: Some(&readiness),
                                 host_net: Some(&host_net),
                                 resumed: conns,
@@ -3431,8 +3443,9 @@ fn dial_through_spawner(vsock: &Path) -> Result<(), String> {
     }))
 }
 
-/// Has the spawner dial, beside `vsock`, every host port the guest connects to: an
-/// AppContainer dials no socket of its user's (PM M201, M203).
+/// Has the spawner dial, beside `vsock`, every host port the guest connects to, and make
+/// each next pair of its vsock listener's (D272): an AppContainer opens no pipe of its
+/// user's, and makes none its user may open (PM M603).
 #[cfg(windows)]
 fn dial_through_spawner(vsock: &Path) -> Result<(), String> {
     let prefix = format!("{}_", vsock.to_str().ok_or("a vsock path that is not UTF-8")?);
@@ -3448,6 +3461,20 @@ fn dial_through_spawner(vsock: &Path) -> Result<(), String> {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "no spawner to dial through")
         })?;
         crate::grant_ask::dial(link, port)
+    }))?;
+    let listening = vsock.to_path_buf();
+    shards_vmm::platform::set_pair_maker(Box::new(move |path: &Path| {
+        if path != listening {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not this VM's vsock path",
+            ));
+        }
+        let grants = GRANTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let link = grants.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "no spawner to ask for a pair")
+        })?;
+        crate::grant_ask::next_pair(link)
     }))
 }
 
@@ -3618,7 +3645,18 @@ fn supervise(
             report("the guest stopped before its template was saved");
             ExitCode::FAILURE
         }
-        ExitReason::PowerOff | ExitReason::Stopped => ExitCode::SUCCESS,
+        ExitReason::PowerOff | ExitReason::Stopped => {
+            // Its guest's control ended unannounced, and this VM ended it: its guest's last words
+            // are why, quoted as a reset's are.
+            if console == Console::Discard && crate::workload::capture::control_ended() {
+                let said = handle.console_said();
+                report(format!(
+                    "its guest's control ended{}",
+                    last_said(&said.lines, said.report)
+                ));
+            }
+            ExitCode::SUCCESS
+        }
         ExitReason::Reset => {
             let said = if console == Console::Discard {
                 let said = handle.console_said();
@@ -3635,6 +3673,14 @@ fn supervise(
         }
         ExitReason::Error(e) => {
             report(e);
+            // Its guest's last words, where no one read its console: why it stopped, as often as not.
+            if console == Console::Discard {
+                let said = handle.console_said();
+                report(format!(
+                    "its console's last lines{}",
+                    last_said(&said.lines, said.report)
+                ));
+            }
             ExitCode::FAILURE
         }
     }
@@ -3709,6 +3755,7 @@ mod rate_tests {
 
     /// Each rate the muxer hands over is answered on its own connection, one line, then
     /// closed; with no machine running here, its hold's refusal (D255).
+    #[cfg(unix)]
     #[test]
     fn each_rate_handed_over_is_answered_on_its_connection() {
         let (asks, asked) = std::sync::mpsc::channel();
@@ -3732,6 +3779,40 @@ mod rate_tests {
         let read = shards_abi::rate::read_used(answer.as_bytes()).unwrap();
         assert_eq!(read.guest, Err("the microVM has not started"));
         assert!(read.host.unwrap().cpu_ns > 0, "{answer}");
+    }
+
+    /// On Windows each ask the muxer hands over comes with its client's pipes (D272), answered
+    /// with a write waited for, one line, then closed: its client reads the line, then the
+    /// end; with no machine running here, its hold's refusal, and its use.
+    #[cfg(windows)]
+    #[test]
+    fn each_rate_handed_over_is_answered_on_its_pipes() {
+        let dir = shards_testdir::TempDir::new("rates").unwrap();
+        let (asks, asked) = std::sync::mpsc::channel();
+        // A client's pipes at `name`'s path, opened: ours, and its way down and way up.
+        let pair = |name: &str| {
+            let path = dir.join(name);
+            let (_, down, up) = shards_ipc::vsock_listen(&path).unwrap();
+            let (their_down, their_up) = shards_ipc::vsock_open(&path, None).unwrap();
+            let ours = shards_vmm::platform::Pipes::new(down, up).unwrap();
+            (ours, (shards_ipc::Pipe::from_handle(their_down), their_up))
+        };
+        let (ours, rated) = pair("r");
+        asks.send((ours, shards_abi::rate::Asked::Rate(250))).unwrap();
+        let (ours, used) = pair("u");
+        asks.send((ours, shards_abi::rate::Asked::Use)).unwrap();
+        drop(asks);
+        serve_rates(&asked);
+        let mut line = String::new();
+        (&rated.0).read_to_string(&mut line).unwrap();
+        assert_eq!(
+            read_answer(line.as_bytes()).unwrap(),
+            Answer::Refused("the microVM has not started")
+        );
+        let mut answer = String::new();
+        (&used.0).read_to_string(&mut answer).unwrap();
+        let read = shards_abi::rate::read_used(answer.as_bytes()).unwrap();
+        assert_eq!(read.guest, Err("the microVM has not started"));
     }
 
     /// A use's answer reads its guest's times first, then its process's use, which holds them

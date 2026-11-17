@@ -3,7 +3,7 @@ Why: kiln's copy leaves out vendor/aws-lc-rs and vendor/aws-lc-sys, Shards' byte
 Kiln-only: kiln's layout: Shards' tree holds the copies kiln's leaves out
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 8992ab8fcb6caac5dbce18d3c8658b5eba0c3608..bc953968dbd2fb97d0e77528d62efcdd91a02b87 100644
+index 078bb0970657270f2141c3a450e0b9ec318c6ac9..2d99841bca05b307993a14d7f357b485a5260fee 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -86,6 +86,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
@@ -25,10 +25,10 @@ index 8992ab8fcb6caac5dbce18d3c8658b5eba0c3608..bc953968dbd2fb97d0e77528d62efcdd
   "cc",
   "cmake",
 diff --git a/Cargo.toml b/Cargo.toml
-index f95dc83b402c32b41ae416e103e8dd8c911fdac7..41aacbacb7a4125360a6a902d15e0837c3e4e879 100644
+index 3f26a6317fa13e2a6cf388eaf443bd6f151db6f2..50575a303009b13fa9ec9c70c89b1afb1b67b262 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -92,10 +92,10 @@ string_slice = "deny"
+@@ -93,10 +93,10 @@ string_slice = "deny"
  print_stdout = "deny"
  print_stderr = "deny"
  

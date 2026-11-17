@@ -985,13 +985,20 @@ fn a_builders_memory_in_a_new_home_is_all_it_may_have() {
         .stderr(std::process::Stdio::piped());
     let mut built = cmd.spawn().unwrap();
     // What the VM process was given to boot with and to plug to, in MiB, as its spawner
-    // started it (`--memory`, `--memory-max`).
+    // started it (`--memory`, `--memory-max`): its command line from /proc on Linux, whose
+    // `ps` may be Alpine's BusyBox one, which takes no `-p` and said nothing (CI's musl
+    // jobs); as `ps` shows it elsewhere.
     let given = |vm: u32| {
-        let ps = std::process::Command::new("ps")
-            .args(["-o", "args=", "-p", &vm.to_string()])
-            .output()
-            .unwrap();
-        let args = String::from_utf8_lossy(&ps.stdout).into_owned();
+        let args = if cfg!(target_os = "linux") {
+            let line = std::fs::read(format!("/proc/{vm}/cmdline")).unwrap_or_default();
+            String::from_utf8_lossy(&line).replace('\0', " ")
+        } else {
+            let ps = std::process::Command::new("ps")
+                .args(["-o", "args=", "-p", &vm.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&ps.stdout).into_owned()
+        };
         let after = |flag: &str| {
             let words: Vec<&str> = args.split_whitespace().collect();
             words
@@ -12116,8 +12123,8 @@ fn a_remote_mcp_server_is_a_grant_of_that_server_alone() {
             "call".into(),
             "socket-raw".into(),
             "unshare-net".into(),
-            // A name its grant does not name: refused, though the resolver upstream holds it,
-            // by UDP and by TCP; its server's name, by TCP too.
+            // A name its grant does not name: none, for it, though the resolver upstream holds
+            // it, by UDP and by TCP; its server's name, by TCP too.
             "dnsprobe".into(),
             "resolver".into(),
             "dnsask".into(),
@@ -12192,21 +12199,22 @@ fn a_remote_mcp_server_is_a_grant_of_that_server_alone() {
         ("m", "confined write /etc/resolv.conf: errno 30".to_string()),
         ("m", "confined call socket-raw: errno 1".to_string()),
         ("m", "confined call unshare-net: errno 1".to_string()),
+        // A name its grant does not name: none, for it, answered at once (NXDOMAIN, D278).
         (
             "m",
-            format!("confined dnsprobe {gateway}: from {gateway}:53 rcode 5 answers 0"),
+            format!("confined dnsprobe {gateway}: from {gateway}:53 rcode 3 answers 0"),
         ),
         // g, granted any name, resolves the one m may not: the host asks it for the
         // microVM, and the agents' resolver alone keeps m from it.
         ("g", "confined resolve api.example: 0,0".to_string()),
-        // By TCP as by UDP: m's own server's name answered, the other refused.
+        // By TCP as by UDP: m's own server's name answered, the other none, for it.
         (
             "m",
             "confined dnsask tcp mcp.example: rcode 0 tc 0 answers 1".to_string(),
         ),
         (
             "m",
-            "confined dnsask tcp api.example: rcode 5 tc 0 answers 0".to_string(),
+            "confined dnsask tcp api.example: rcode 3 tc 0 answers 0".to_string(),
         ),
         // An answer too long for UDP: truncated, as the resolver sent it, then whole by
         // TCP (RFC 7766).
