@@ -249,7 +249,7 @@ runs and its runners: a definition's run is one of those agents.)
 | Method | Path | |
 |---|---|---|
 | GET | `/api/agentdefs?all=` | `{ agents: AgentDefBrief[], reaches_all, builtin: KilnAgentDef[], uses: { [kiln_id]: id } }`, newest change first |
-| POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile?, volumes?: { name, bytes }[] }` → `AgentDef` (version 1; `volumes`: what it keeps from one of its sessions to the next on each machine, docs/isolation.md "An agent's volumes"); 422 `kiln can't run this agent: <why>`, 409 a name taken |
+| POST | `/api/agentdefs` | `{ name, harness, model?, instructions?, tools?, mcp?, skills?, limits?, agentfile?, volumes?: { name, bytes }[], engine?, cpus?, memory? }` → `AgentDef` (version 1; `volumes`: what it keeps from one of its sessions to the next on each machine, docs/isolation.md "An agent's volumes"); 422 `kiln can't run this agent: <why>`, 409 a name taken |
 | POST | `/api/agentdefs/check` | the settings → `{ ok, problems: string[] }`, keeping nothing |
 | GET | `/api/agentdefs/{id}` | `AgentDef` |
 | PATCH | `/api/agentdefs/{id}` | what's given changes (null `model` or `agentfile`: back to its harness's), over `If-Match: "<version>"` or `base` (the version it's made over, as you read it) → `AgentDef`; 409 `{ error, base, current: AgentDef }` where another change moved it on from that version (nothing is written). One naming an Agentfile of yours that declares `AGENT <its name>` writes what they share (model, tools, skills, remote MCP servers) into that Agentfile first, as a new version (P5.4); 409 where a setting changed differently on both sides since they last agreed, naming it and each side's value (neither is written) |
@@ -270,7 +270,9 @@ of its own, or not exactly one of `url` and `command`; a tool or skill has no na
 `limits.tokens` is set for a harness that doesn't say how many tokens its sessions use (Claude Code,
 Codex, Antigravity and Pi do; the ACP agents don't, so give those a time limit); `limits.cents` is
 set for one that doesn't say what they cost (Claude Code and Pi do; give Codex and Antigravity a
-token limit instead, and the ACP agents a time limit).
+token limit instead, and the ACP agents a time limit); the host engine is given an Agentfile, a size
+or volumes (P6.2 keeps volumes for microVMs alone); a microVM is given 0 vCPUs, or memory that isn't a
+whole number of MiB.
 kiln ships its own, read only, listed as `builtin` (kiln plan 01a1dd2e8618733a87f2793aab1322a8
 P5.1b), each made from what kiln itself has so that none drifts from it: one per CI skill
 (`kiln-ci-*`: the skill its own, its description its instructions), one per harness (`harness-<id>`,
@@ -290,8 +292,10 @@ definition makes it kiln's own again.
 
 A run starts an agent as `agents.start` starts one, through the one start path (the caller's right
 to start agents there checked, and the start audited): the definition's harness and model, `isolation`
-`microvm`, `image` its Agentfile (left out: the start's own for its harness), and as its first
-message its instructions, then the run's `prompt`.
+`microvm` (`none` where its `engine` is `host`), `image` its Agentfile (left out: the start's own for its
+harness), its microVM sized by its `cpus` and `memory` where it gives them (kiln sizes the rest), and as
+its first message its instructions, then the run's `prompt`. While one of its experiments is live, each
+session it starts is that experiment's draw (below).
 
 Each session kiln opens from a definition keeps which, and at which version (kiln's own: 0), kiln's to
 say and never what was asked: a run's, and one of kiln's UI agents started from the person's own
@@ -307,7 +311,8 @@ definition drops what its sessions say of it.
 interface Mcp { name; url?; command?: string[] }
 interface Limits { seconds?; cents?; tokens? }
 interface AgentDef { id; owner /* "owner" | "user:<id>" */; name; version; created_at; updated_at;
-  harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
+  harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null;
+  engine?: "host" /* left out: a microVM */; cpus?; memory? /* bytes */ }
 type AgentDefBrief = Pick<AgentDef, "id"|"owner"|"name"|"harness"|"model"|"agentfile"|"version"|"created_at"|"updated_at">;
 interface KilnAgentDef { id /* "kiln:<name>" */; name; about; replaceable: boolean; brief?: string;
   harness; model: string|null; instructions; tools: string[]; mcp: Mcp[]; skills: string[]; limits: Limits; agentfile: string|null }
@@ -337,6 +342,91 @@ starts microVMs, and is refused anywhere else (400, `an agent can't run isolated
 kiln's balancer places it, asking that size, and refuses it where it can't (step 32). The console
 keeps them at `/agents/agentfiles` and chooses one as an agent starts (docs/agents.md, "From an
 Agentfile, in a microVM of its own").
+
+### Experiments
+
+A person's experiments on their own agent definitions (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1;
+`crate::agentdefs::experiments`): each splits one definition's new sessions between deployments, its
+variants, by their weights (whole percents, together 100), and is judged by its criteria. A definition
+may have several, one of them live at a time; kiln's own take none (403). The routes need `agents.run`
+and keep a person to their own (another's definition is 404, as no such definition; the server's owner
+and `agentdefs.manage` reach everyone's); each is an operation too (`agentdefs.experiments.*`, kiln's MCP
+tools `agentdefs_experiments_*`, code mode's `kiln.agentdefs.experiments.*`), and each change is audited.
+
+- A variant is a deployment: its `engine` (`microvm` or `host`); a microVM's `agentfile`
+  (`agentfile:<id>` or `harness-<harness>`), `cpus` and `memory` (bytes, a whole number of MiB), each
+  left out the definition's; its `model`, left out the definition's. Each is checked as the definition
+  would be, run so. Its first is what the definition runs now (`current`), until one is promoted.
+- A criterion is a query in kiln's monitoring syntax without its comparison, an `op` (`>`, `>=`, `==`,
+  `!=`, `<`, `<=`) and a `bound`, kept as written once kiln's monitors read the three together.
+- While one is live, each new session of the definition its person starts (`agentdefs.run`, or a UI
+  agent the definition stands in for) is one of its variants, started as that deployment: the draw is
+  `kiln_ci::split::draw_parts` of its weights, its seed (a random number made as it started) and the
+  draw's index, so the same experiment draws the same again. Each draw is kept with its split's version
+  and its session (the session's `experiment` on its info; `sessions`' `experiment` and `variant`), or
+  with why its start was refused.
+- A change of its weights is its split's next `version`. Pausing stops its draws; stopping ends it;
+  promoting a variant makes its deployment the definition's next version (`engine`, `agentfile`,
+  `cpus`, `memory`, `model`), saved as `PATCH /api/agentdefs/{id}` saves one (what it shares with its
+  Agentfile's `AGENT` written there first, P5.4; its Agentfile's builds asked anew, P4.5), and ends it.
+- What its sessions came to is kept with each draw, once, as kiln reads the session (as it answers the
+  experiment, and as the session goes): its warm start, where its first start was a warm one (a warm
+  host's microVM ready before it asked: Shards' `warm`), and how long it took; and once it's over,
+  whether it failed (it ended in error or never ran; a refused start fails at once) and its microVM's
+  peak memory.
+- Every answer is measured. A variant's `measures` are `warm_ms` (the median of its warm starts, in ms),
+  `peak_gib` (of its peaks, in GiB) and `failed_pct` (the percent of its sessions that failed), each
+  `[low, mid, high]`: the median or the rate within its 95% confidence sequence, so a look at any time
+  holds (Howard and Ramdas's for a median, Waudby-Smith and Ramdas's for a rate: docs/ci.md W20,
+  "Splits"). They're given once its sessions bound all three; a variant on the host has no warm start
+  or peak, so none. A variant whose `high` is below every other's `low` is clearly better on that
+  measure. Its `trend` is each measure as it stood at the end of each day (UTC), oldest first, today's
+  last, from the first day on which every variant with that measure had one.
+- Each of those facts is written to kiln's observability as it's kept, at the time it happened: a value
+  of a distribution tagged with `experiment` and `variant` (their ids), `kiln.session.warm_ms`,
+  `kiln.session.peak_memory_gib` and `kiln.session.failed_pct` (100 a failed session, 0 another). A
+  criterion's query reads them as it reads any of Datadog's distributions, and any of kiln's other
+  metrics besides (docs/observe.md §6). A criterion's `values` are each variant's value of its query,
+  evaluated as kiln's monitors evaluate a monitor's (its time aggregation over its window, as of now:
+  §9), and whether it `passes` its bound: a value for each variant the query groups by (`by
+  {variant}`); none where kiln's observability doesn't run, or the query gives no variant a value.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/agentdef-experiments?id=&all=` | `{ [definition id]: AgentdefExperiment[] }`, each definition's newest first; `id` one definition's (yours), `all` everyone's (the server's owner and `agentdefs.manage`; else 403) |
+| POST | `/api/agentdefs/{id}/experiments` | `{ name, variants: { weight, name?, engine?, agentfile?, cpus?, memory?, model? }[], criteria?: { name, query, op, bound }[] }` → `{ experiment }`, live; 2 to 100 variants; 422 a variant kiln can't run, 409 another of the definition's live |
+| PATCH | `/api/agentdefs/{id}/experiments/{experiment}` | `{ name }` → `{ experiment }` |
+| PATCH | `/api/agentdefs/{id}/experiments/{experiment}/variants/{variant}` | `{ name? }` → `{ experiment }` (none: back to what sets it apart) |
+| POST | `/api/agentdefs/{id}/experiments/{experiment}/weights` | `{ weights: { [variant id]: percent }, base? }` → `{ experiment }`, its split's next version (the same weights again none); 409 over a `base` another change moved on from |
+| POST | `/api/agentdefs/{id}/experiments/{experiment}/variants` | a variant as above, without `weight` → `{ experiment }`, the variant last at weight 0 |
+| DELETE | `/api/agentdefs/{id}/experiments/{experiment}/variants/{variant}` | `{ experiment }`, its share back to the others in proportion; 409 for the current one, or below 2 |
+| POST | `/api/agentdefs/{id}/experiments/{experiment}/criteria` | `{ name, query, op, bound }` → `{ experiment }`; 400 where kiln's monitors can't read it |
+| DELETE | `/api/agentdefs/{id}/experiments/{experiment}/criteria/{criterion}` | `{ experiment }` |
+| POST | `/api/agentdefs/{id}/experiments/{experiment}/pause`, `/resume`, `/stop` | `{ experiment }`; 409 once it's over, or resuming beside another live |
+| POST | `/api/agentdefs/{id}/experiments/{experiment}/promote` | `{ variant }` → `{ experiment, agentdef }`, the definition's next version |
+| DELETE | `/api/agentdefs/{id}/experiments/{experiment}` | `{ deleted: true }`, its variants, criteria and draws with it |
+
+Weights, variants and promotion change only a live or paused experiment (409 once it's over); its name
+and criteria change whatever it stands at. `AgentdefExperiment`, `AgentdefVariant` and
+`AgentdefCriterion` are `ui/src/api/wire`'s.
+
+These are the Agents page's experiments. kiln has another split of a person's sessions, a deployment
+experiment's (`POST /api/experiments` with `target` and `arms`, docs/ci.md W20 "Splits"): a separate
+model, which an experiment here neither reads nor writes. Where the two meet:
+
+| Here (`agentdefs.experiments.*`) | A deployment experiment's split (`experiments.*`) |
+|---|---|
+| Several to one of your definitions, one live at a time | One running split of a target (a definition, or a harness and its Agentfile) |
+| `live`, `paused`, `stopped`, `promoted` | `running`, `paused`, `done` once decided, `cancelled` |
+| Variants renamed, reweighted (the split's next `version`), added at 0 and taken out | Arms fixed as it starts |
+| Criteria in kiln's monitoring syntax, each variant's value as kiln's monitors evaluate it | None: its results name winners |
+| `measures`: warm start, peak memory and failures, each within its 95% interval | Results: failures, starts within each kind, the kinds' mix, footprint, CPU and outcomes, each at 95% / k |
+| Promoting makes the variant the definition's next version | Deciding makes every later session of the target that variant |
+
+What they share is computed once: the draw (`kiln_ci::split`'s point of [0, 1) from the seed and the
+draw's index, laid on the weights), the confidence sequences (`kiln_ci::stats::sequence`), Shards'
+words for how a microVM started (`agentdefs.sessions`' kinds), each start's record that Hex measured
+(`Start::measured`), and kiln's monitors' query engine (`kiln_obs::monitor`).
 
 ## Your secrets
 

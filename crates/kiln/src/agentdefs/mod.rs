@@ -11,8 +11,10 @@
 //! person's own, read only, are kiln's ([`builtin`]), which `copy` makes theirs. The same
 //! operations serve the console (`/api/agentdefs`), agents (kiln's MCP server: `agentdefs_*`) and code
 //! mode (`kiln.agentdefs.*`): [`ops`]. kiln.db keeps them: a definition is small, its settings JSON.
+//! Its person's experiments split its new sessions between deployments ([`experiments`]).
 
 pub mod builtin;
+pub mod experiments;
 pub mod limits;
 pub mod ops;
 pub mod sessions;
@@ -25,11 +27,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::authz::{Caller, Scope};
+use crate::harness::engine::Engine;
 use crate::harness::kinds::Kind;
 use crate::hub::Hub;
 
 /// What reaches everyone's agent definitions (an admin's, as the role has every capability).
 pub const MANAGE: &str = "agentdefs.manage";
+
+/// A MiB, in bytes: a microVM's memory is a whole number of them, as a start sizes it.
+pub const MIB: u64 = 1 << 20;
 
 /// An MCP server an agent has: by its URL, or by the command that starts it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -88,6 +94,29 @@ pub struct Settings {
     /// What it keeps from one of its sessions to the next on each machine ([`volumes`], P6.2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<volumes::Volume>,
+    /// Where its sessions run: `host`, its harness a process of its machine's; none, a microVM of its own made from
+    /// its Agentfile, as every definition ran before it had one. What an experiment's promoted variant makes it
+    /// (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1, [`experiments`]), as are its size's two below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<Engine>,
+    /// Its microVM's vCPUs; none: as kiln sizes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    /// Its microVM's memory, in bytes, a whole number of MiB; none: as kiln sizes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<u64>,
+}
+
+impl Settings {
+    /// The Agentfile a microVM of it is made from: its own, else kiln's for its harness where kiln ships one.
+    pub fn microvm_agentfile(&self) -> Option<String> {
+        self.agentfile.clone().or_else(|| crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == self.harness.trim()).map(|b| b.name.to_owned()))
+    }
+
+    /// The Agentfile its sessions' microVMs are made from ([`Settings::microvm_agentfile`]); none on the host.
+    pub fn agentfile_in_use(&self) -> Option<String> {
+        if self.engine == Some(Engine::Host) { None } else { self.microvm_agentfile() }
+    }
 }
 
 /// An agent definition, as kept.
@@ -259,6 +288,22 @@ pub async fn check(hub: &Hub, owner: &str, s: &Settings) -> R<Vec<String>> {
         why.push(format!("{} doesn't say what its sessions cost, so kiln can't hold a limit in `cents` to it: limit its `{instead}` instead", kind.name));
     }
     why.extend(volumes::problems(&s.volumes));
+    if s.engine == Some(Engine::Host) && (s.agentfile.is_some() || s.cpus.is_some() || s.memory.is_some()) {
+        why.push("an Agentfile and a size are a microVM's: on the host engine its harness runs as a process of its machine".into());
+    }
+    // A start on its machine's host is refused where it has volumes (P6.2, `crate::harness::lineage`'s start): so is
+    // a definition, or an experiment's variant (P7.1), on the host engine with them.
+    if s.engine == Some(Engine::Host) && !s.volumes.is_empty() {
+        why.push("its volumes are kept only for its sessions in microVMs: on the host engine its harness runs as a process of its machine".into());
+    }
+    if s.cpus == Some(0) {
+        why.push("a microVM of 0 vCPUs runs nothing: leave `cpus` out for kiln to size it".into());
+    }
+    match s.memory {
+        Some(0) => why.push("a microVM of no memory runs nothing: leave `memory` out for kiln to size it".into()),
+        Some(m) if m % MIB != 0 => why.push(format!("`memory` is in bytes, a whole number of MiB ({MIB} bytes each), not {m}")),
+        _ => {}
+    }
     Ok(why)
 }
 
@@ -282,11 +327,12 @@ async fn checked(hub: &Hub, owner: &str, s: Settings) -> R<Settings> {
     if why.is_empty() { Ok(tidy(s)) } else { Err(Error::Refused(why)) }
 }
 
-/// `s` as kept: its names and model trimmed.
+/// `s` as kept: its names and model trimmed, and a microVM, which a definition runs in by default, said as none.
 fn tidy(mut s: Settings) -> Settings {
     s.harness = s.harness.trim().to_owned();
     s.model = s.model.map(|m| m.trim().to_owned());
     s.agentfile = s.agentfile.map(|a| a.trim().to_owned());
+    s.engine = s.engine.filter(|e| *e != Engine::Microvm);
     s
 }
 
@@ -446,6 +492,11 @@ pub struct Patch {
     /// `Some(None)`: back to its harness's own.
     pub agentfile: Option<Option<String>>,
     pub volumes: Option<Vec<volumes::Volume>>,
+    /// `Some(None)`: back to a microVM of its own.
+    pub engine: Option<Option<Engine>>,
+    /// `Some(None)`: back to kiln's sizing, as the next two.
+    pub cpus: Option<Option<u32>>,
+    pub memory: Option<Option<u64>>,
 }
 
 impl Patch {
@@ -476,6 +527,15 @@ impl Patch {
         }
         if let Some(v) = self.volumes {
             s.volumes = v;
+        }
+        if let Some(v) = self.engine {
+            s.engine = v;
+        }
+        if let Some(v) = self.cpus {
+            s.cpus = v;
+        }
+        if let Some(v) = self.memory {
+            s.memory = v;
         }
         s
     }
@@ -566,6 +626,9 @@ pub async fn restore(hub: &Hub, who: &Who, id: &str, version: i64, by: &str) -> 
         limits: Some(s.limits),
         agentfile: Some(s.agentfile),
         volumes: Some(s.volumes),
+        engine: Some(s.engine),
+        cpus: Some(s.cpus),
+        memory: Some(s.memory),
         name: None,
     };
     sync::update(hub, who, id, patch, None, by).await
@@ -585,6 +648,8 @@ pub async fn delete(hub: &Hub, who: &Who, id: &str) -> R<AgentDef> {
             tx.execute("DELETE FROM agent_def_uses WHERE agent_def_id = ?1", params![i])?;
             // The sessions it started no longer say it (`sessions`).
             sessions::forget_in(&tx, &i)?;
+            // Its experiments go with it (`experiments`).
+            experiments::forget_in(&tx, &i)?;
             tx.commit()?;
             Ok(n)
         })
@@ -593,6 +658,15 @@ pub async fn delete(hub: &Hub, who: &Who, id: &str) -> R<AgentDef> {
         return Err(Error::Missing);
     }
     d.def()
+}
+
+/// What a start of `s` sizes its microVM by, as a start's size takes it (its vCPUs and MiB, either 0 for kiln's own
+/// sizing of it): none where it says neither, or runs on the host.
+pub fn size_of(s: &Settings) -> Option<(u32, u64)> {
+    if s.engine == Some(Engine::Host) || (s.cpus.is_none() && s.memory.is_none()) {
+        return None;
+    }
+    Some((s.cpus.unwrap_or(0), s.memory.map_or(0, |m| m / MIB)))
 }
 
 /// What a run of `d` is first told: its instructions, then the task, each where there's one.

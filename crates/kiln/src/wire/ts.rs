@@ -108,6 +108,9 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<crate::agentfiles::check::Check>();
     // An Agentfile's harnesses and agents as settings (`agentfiles.settings`, kiln plan 01a1dd2e… P5.3).
     c.visit::<crate::agentfiles::settings::Viewed>();
+    // Agent definitions' experiments (`agentdefs.experiments.*`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1):
+    // one as each answers it, its variants and criteria.
+    c.visit::<crate::agentdefs::experiments::Experiment>();
 }
 
 /// Every file as it should be, by its name in [`dir`], the index among them.

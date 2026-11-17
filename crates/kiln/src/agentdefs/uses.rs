@@ -86,9 +86,10 @@ pub async fn or_kilns(hub: &Hub, person: Option<&str>, kiln_agent: &str) -> R<(S
 }
 
 /// `ask`, kiln's start of its `kiln_agent` for `person` (its brief its prompt), as `person`'s own
-/// definition standing in for it makes it: that one's harness, model and Agentfile, first told its
-/// instructions and then kiln's brief, its mode `mode_for` its harness says. As it was where none does.
-/// Either way it says which definition its session started from (`Ask::definition`): theirs, or kiln's.
+/// definition standing in for it makes it: that one's harness, model and Agentfile (on the host engine,
+/// a process of its machine's; a microVM sized as it says, where it says), first told its instructions
+/// and then kiln's brief, its mode `mode_for` its harness says. As it was where none does. Either way it
+/// says which definition its session started from (`Ask::definition`): theirs, or kiln's.
 pub async fn ask_for(hub: &Hub, person: Option<&str>, kiln_agent: &str, mut ask: crate::harness::lineage::Ask, mode_for: fn(&str) -> Option<String>) -> R<crate::harness::lineage::Ask> {
     let stood_in = match person {
         Some(person) => stand_in(hub, person, kiln_agent).await?,
@@ -101,6 +102,10 @@ pub async fn ask_for(hub: &Hub, person: Option<&str>, kiln_agent: &str, mut ask:
     let s = d.settings;
     ask.prompt = super::first_message(&s, ask.prompt.as_deref());
     ask.mode = mode_for(&s.harness);
+    ask.size = super::size_of(&s);
+    if s.engine == Some(crate::harness::engine::Engine::Host) {
+        ask.isolation = Some("none".into());
+    }
     ask.kind = s.harness;
     ask.model = s.model;
     ask.image = s.agentfile;

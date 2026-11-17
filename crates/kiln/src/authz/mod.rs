@@ -762,6 +762,9 @@ pub static ROUTES: &[Rule] = &[
     any("/api/agentdefs/**", "agents.run", At::Server),
     // Every definition's sessions at once (`agentdefs.sessions` without an id): each person's own.
     r("GET", "/api/agentdef-sessions", "agents.run", At::Server),
+    // Their experiments, every one of a person's at once (`crate::agentdefs::experiments`; each change is under its
+    // definition's routes above): the handler keeps a person to their own.
+    r("GET", "/api/agentdef-experiments", "agents.run", At::Server),
     // A person's click on what their agent asked (`crate::confirms`): the handler keeps it to its person.
     any("/api/confirms", "agents.run", At::Server),
     any("/api/confirms/**", "agents.run", At::Server),

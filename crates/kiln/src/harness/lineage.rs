@@ -1391,9 +1391,9 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
 /// Start agents for `by`: checked against its parent when it's an agent, on the machine picked,
 /// each recorded with whom it acts for and who started it.
 pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refused> {
-    // A deployment experiment's split (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1): each new session of its
-    // target that its opener starts is one of its variants, drawn as it starts. A card's helper, and a conversation
-    // taken up again, start as they were.
+    // A definition's live experiment, or a deployment experiment's split (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+    // P7.1, [`Drawn`]): each new session of its definition or target that its person starts is one of its variants,
+    // drawn as it starts. A card's helper, and a conversation taken up again, start as they were.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
     let fresh = ask.helper.is_none() && ask.resume.as_deref().is_none_or(|r| r.trim().is_empty()) && ask.ids().is_empty();
     let Some(person) = person.filter(|_| fresh) else {
@@ -1404,21 +1404,20 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     let mut infos = Vec::new();
     let mut refused = None;
     for k in 0..count {
-        let starting = crate::ci::experiments::Starting { agentdef: ask.definition.as_ref().map(|d| d.id.as_str()), harness: ask.kind.trim(), agentfile: agentfile.as_deref(), person: &person };
-        let Some(draw) = crate::ci::experiments::assign(hub, &starting).await else {
+        let Some(draw) = Drawn::of(hub, &ask, agentfile.as_deref(), &person).await else {
             let rest = Ask { count: Some(count - k), ..ask.clone() };
             infos.extend(start_as(hub, by, rest, |_| {}).await?);
             return Ok(infos);
         };
-        let one = as_variant(Ask { count: Some(1), ..ask.clone() }, &draw.arm);
-        let assigned = draw.assigned.clone();
+        let one = draw.ask(Ask { count: Some(1), ..ask.clone() });
+        let assigned = draw.assigned();
         let got = start_as(hub, by, one, move |spec| spec.experiment = Some(assigned)).await;
         // A start that answered no session is kiln's own failure (RFC 9110 §15.6.1).
         let came = match &got {
             Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "no session started".to_owned())),
             Err((status, why)) => Err((*status, why.clone())),
         };
-        crate::ci::experiments::started(hub, &draw, came).await;
+        draw.started(hub, came).await;
         // A variant that can't start is its failure, kept as its draw's: the rest are drawn still.
         match got {
             Ok(i) => infos.extend(i),
@@ -1432,6 +1431,66 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
         Some(e) if infos.is_empty() => Err(e),
         _ => Ok(infos),
     }
+}
+
+/// A new session's draw (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1): its definition's live experiment's, where
+/// it starts from one of its person's own definitions that has one (`crate::agentdefs::experiments`); else a split's
+/// of its target (`crate::ci::experiments`), as before definitions had experiments.
+enum Drawn {
+    Experiment(crate::agentdefs::experiments::Draw),
+    Split(Box<crate::ci::experiments::Draw>),
+}
+
+impl Drawn {
+    /// What draws a new session of `ask` (`agentfile` its target's, [`agentfile_of`]) that `person` starts, if anything.
+    async fn of(hub: &Hub, ask: &Ask, agentfile: Option<&str>, person: &str) -> Option<Drawn> {
+        if let Some(d) = &ask.definition
+            && let Some(drawn) = crate::agentdefs::experiments::assign(hub, &d.id, person).await
+        {
+            return Some(Drawn::Experiment(drawn));
+        }
+        let starting = crate::ci::experiments::Starting { agentdef: ask.definition.as_ref().map(|d| d.id.as_str()), harness: ask.kind.trim(), agentfile, person };
+        crate::ci::experiments::assign(hub, &starting).await.map(|d| Drawn::Split(Box::new(d)))
+    }
+
+    /// `ask` as its variant starts it.
+    fn ask(&self, ask: Ask) -> Ask {
+        match self {
+            Drawn::Experiment(d) => as_deployment(ask, d),
+            Drawn::Split(d) => as_variant(ask, &d.arm),
+        }
+    }
+
+    /// As its session keeps it for its life (`Spec::experiment`).
+    fn assigned(&self) -> crate::harness::session::Assigned {
+        match self {
+            Drawn::Experiment(d) => d.assigned(),
+            Drawn::Split(d) => d.assigned.clone(),
+        }
+    }
+
+    /// What its start came to, kept as its draw's: its session, or why it was refused (its variant's failure).
+    async fn started(&self, hub: &Hub, came: Result<String, Refused>) {
+        match self {
+            Drawn::Experiment(d) => crate::agentdefs::experiments::started(hub, d, came.map_err(|(_, why)| why)).await,
+            Drawn::Split(d) => crate::ci::experiments::started(hub, d, came).await,
+        }
+    }
+}
+
+/// `ask` as a definition's experiment's variant `d` starts it (P7.1): on the host engine a process of its machine's,
+/// else in a microVM of its Agentfile and size; its own model where it has one. It's still its definition's session,
+/// at the version it's at.
+fn as_deployment(mut ask: Ask, d: &crate::agentdefs::experiments::Draw) -> Ask {
+    if d.engine == Engine::Host {
+        (ask.isolation, ask.image, ask.size) = (Some("none".into()), None, None);
+    } else {
+        (ask.isolation, ask.image, ask.size) = (Some(Isolation::MICROVM.into()), d.agentfile.clone(), d.size());
+    }
+    if let Some(m) = &d.model {
+        ask.model = Some(m.clone());
+    }
+    ask
 }
 
 /// A start's target, as a split matches it (P7.1), from its harness, the Agentfile it names and whether it's

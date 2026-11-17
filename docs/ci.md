@@ -6914,6 +6914,8 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
     - recorded on the session (`experiment` on its info) and kept for its life;
     - started as that variant's deployment, the variant's size sizing its microVM.
   - A conversation taken up again and a card's helper start as asked.
+  - A session of an agent definition whose own experiment is live (`agentdefs.experiments.*`,
+    docs/api.md "Experiments") is that experiment's draw; a split draws it only where none is.
   - A variant whose start is refused counts that start as a failure. The rest of the start's
     sessions are still drawn.
   - `experiments.pause` stops the draws and `experiments.resume` starts them again.
