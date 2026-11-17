@@ -362,7 +362,11 @@ Built, each where it is:
   alone on its own lane of its run's agent-control endpoint; its kill is its box's delete.
 - **kiln's MCP from inside** (Shards' D254, Hex's `ImageMember::mcp` and `Runtime::mcp`): above.
 - **The microVM's group, charged** (step 32): placed and charged through the balancer (`hexvm::USE`,
-  `reach::place::Group::Hex`).
+  `reach::place::Group::Hex`). As its run ends, it's charged what its VM cost its host over the run, which Hex
+  answers as the box is deleted: read just before the delete stops a run that still runs, or, where the run
+  ended on its own first, what its VM told of itself as it went down, which Hex keeps with that end until the
+  delete (Shards' D260). Where Hex has none of it (a VM whose process was killed tells none), the box goes by a
+  plain delete and is charged the use last read while it ran.
 - **Its configuration on a volume kiln reads on the host** (step 18): its shares are its project at its own
   path, then each of its person's volumes for its harness at its path in the microVM, as kiln's Agentfile or
   the person's own lays them out, made before it starts; and beside them kiln notes where its harness keeps
@@ -417,15 +421,19 @@ instead (`harness/session.rs:4953`). Hex delivers a member's own signal (`Runtim
 - `cargo test -p kiln --lib sandbox::hexvm`: the seam over Hex's simulator: a member's run (its stdin
   in order, back on its stdout, its end, its box gone), interrupt and stop reaching the member alone
   (`s17_p7_interrupt_and_stop_reach_the_member_and_its_box_goes`), kill and drop deleting its box, its
-  charge kept before its end is said, credentials granted by reference with their placeholders, and its
-  harness member's MCP bridge asked and its connections taken through Hex
-  (`s35_mcp_a_launch_asks_its_members_bridge_and_its_lane_takes_its_connections`).
+  charge kept before its end is said, a run that ended on its own with no final use Hex kept deleted plainly and
+  charged its use last read
+  (`p7_a_run_ended_with_no_final_use_told_goes_by_a_plain_delete_charged_its_last_read`), credentials granted by
+  reference with their placeholders, and its harness member's MCP bridge asked and its connections taken through
+  Hex (`s35_mcp_a_launch_asks_its_members_bridge_and_its_lane_takes_its_connections`).
 - The real launch, on a machine whose kiln carries Shards (`ci/shards/pack.sh`) and has a hypervisor, the
   stand-in in each harness's place (`crates/kiln/tests/vm_e2e/README.md`, "Without a vendor's turn"):
   `VM_E2E=1 VM_E2E_IMAGE_<KIND>=stub cargo test -p kiln --test vm_harnesses step35::rest::` and
   `step35::mcp::`, and `VM_E2E=1 cargo test -p kiln --test vm_harnesses narrowed::`: a session launched
   through Hex into a Shards microVM, its stdio, kiln's MCP from inside, interrupt, stop and kill, and its
   box gone after.
+- `VM_E2E=1 cargo test -p kiln --test vm_harnesses ended:: -- --test-threads 1` (Unix), on such a machine: a
+  session's microVM whose VM process was killed, which told no final use, deleted and charged its use last read.
 - `cargo test -p kiln --lib sandbox::image`: each image's build planned from its content (platform,
   its harness's build, its tag), with a stand-in `shards`: a built-in built once and pinned by digest,
   found in the store without a build after, a changed Agentfile built again, starts at once waiting
