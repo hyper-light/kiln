@@ -135,6 +135,7 @@ What a session does to its harness maps onto the member:
 | resume | the harness's own arguments or protocol (`--resume`, `thread/resume`, `session/load`) | the same, past its image's command |
 | stop | SIGTERM to its group, SIGKILL after its grace | `Run::signal(Terminate)`, TERM to its member alone over its run's agent-control endpoint (Hex's `Runtime::signal_member`, Shards' D238); its kill (the microVM's stop) after its grace |
 | kill | SIGKILL | the microVM's stop |
+| its CLI's own answers (its models, its version, an MCP server added or removed) | its CLI run on the host (`Effect::Run`) | never run on the host: its version is its image's pin where it boots kiln's image for its harness, anything else refused in words (`session::in_microvm_alone`; kiln goal 3cd82843, r734) |
 
 ## Refused, rather than done another way
 

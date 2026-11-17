@@ -3476,11 +3476,21 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &crate::m
             super::core::Effect::AllowBypass => s.spec.lock().allow_bypass = true,
             super::core::Effect::Run { job, args } => {
                 let mut spec = s.spec.lock().clone();
+                let tx = done.clone();
+                // Nothing of an isolated session's harness runs on this host (kiln goal 3cd82843, r734: a stand-in
+                // antigravity in a microVM had the host's `agy models` and `agy --version` run): its CLI's answer is its
+                // image's own record where that holds it, else none, said why (`in_microvm_alone`).
+                if let Some(isolation) = &spec.isolation {
+                    let (code, output) = in_microvm_alone(&spec.kind, isolation.image.as_deref(), &args);
+                    crate::rt::spawn(async move {
+                        let _ = tx.send(Done::Run { job, code, output }).await;
+                    });
+                    continue;
+                }
                 let cwd = s.core.lock().state.cwd.clone();
                 if !cwd.is_empty() {
                     spec.cwd = Some(cwd);
                 }
-                let tx = done.clone();
                 crate::rt::spawn(async move {
                     let (code, output) = match kind.cli(&spec, &args) {
                         Err(e) => (None, format!("{e:#}")),
@@ -3562,6 +3572,23 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &crate::m
         }
     }
     restart
+}
+
+/// What a session of harness `kind` isolated in a microVM booting `image` (none: kiln's own for its harness) is
+/// answered for its CLI's run with `args` ([`super::core::Effect::Run`]): never a run on this host, where nothing of its
+/// harness runs. Its version (`--version`) is its image's own record where its image is kiln's for its harness, the
+/// version its pin installs (`.kiln/images/harness-<kind>/pin.json`); anything else (its models, an MCP server added or
+/// removed, a sign-in's callback) fails, saying why, as a run that failed does: its CLI runs in its microVM alone.
+fn in_microvm_alone(kind: &str, image: Option<&str>, args: &[String]) -> (Option<i32>, String) {
+    let own = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == kind);
+    let its_own = image.is_none_or(|i| own.is_some_and(|b| i == b.name));
+    if its_own && args == ["--version"] {
+        let pinned = own.and_then(|b| serde_json::from_str::<serde_json::Value>(b.pin).ok()).and_then(|pin| pin.get("version").and_then(serde_json::Value::as_str).map(str::to_owned));
+        if let Some(version) = pinned {
+            return (Some(0), version);
+        }
+    }
+    (None, format!("{kind}'s CLI isn't run on this host for a session isolated in a microVM: it runs in its microVM alone ({})", args.join(" ")))
 }
 
 /// A path with `*` components, matched against the directories there (the most recently changed
@@ -6198,6 +6225,38 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             }
         }
         start_asked = false;
+    }
+}
+
+#[cfg(test)]
+mod in_microvm_alone_tests {
+    use super::in_microvm_alone;
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| (*a).to_owned()).collect()
+    }
+
+    /// kiln goal 3cd82843 (r734): an isolated session's CLI runs are answered without a process on the host. Its
+    /// version is its own image's pin where it boots kiln's image for its harness; its models, a person's own image's
+    /// version, and an MCP change are refused in words. Running `kind.cli` for them, as before, ran the host's binary.
+    #[test]
+    fn s35_an_isolated_sessions_cli_runs_nothing_on_the_host() -> anyhow::Result<()> {
+        let pinned = |kind: &str| -> anyhow::Result<String> {
+            let b = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == kind).ok_or_else(|| anyhow::anyhow!("no builtin for {kind}"))?;
+            let pin: serde_json::Value = serde_json::from_str(b.pin)?;
+            pin.get("version").and_then(serde_json::Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("{kind}'s pin names no version"))
+        };
+        let builtin = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "antigravity").ok_or_else(|| anyhow::anyhow!("no antigravity builtin"))?;
+        for image in [None, Some(builtin.name)] {
+            assert_eq!(in_microvm_alone("antigravity", image, &words(&["--version"])), (Some(0), pinned("antigravity")?), "{image:?}");
+        }
+        assert_eq!(in_microvm_alone("pi", None, &words(&["--version"])), (Some(0), pinned("pi")?));
+        for (kind, image, args) in [("antigravity", None, words(&["models"])), ("antigravity", Some("agentfile:01a1e8bd98d977e2bcf0300c8a63e142"), words(&["--version"])), ("claude", None, words(&["mcp", "add", "x", "--", "y"]))] {
+            let (code, said) = in_microvm_alone(kind, image, &args);
+            assert_eq!(code, None, "{kind} {args:?}");
+            assert!(said.contains("isn't run on this host") && said.contains(kind), "{said}");
+        }
+        Ok(())
     }
 }
 
