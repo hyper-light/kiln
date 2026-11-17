@@ -1377,8 +1377,15 @@ impl Node {
             }
             In::PlaceTick => {
                 self.place_at = None;
-                let outs = self.place.tick(crate::util::now_ms());
+                let now = crate::util::now_ms();
+                let outs = self.place.tick(now);
                 self.place_do(outs).await;
+                // A strain measured from the pace's stand-ins, a window on (`Placer::follow_up_due`):
+                // they're read again, and placement measures once this input's words are out.
+                if self.place.follow_up_due(now) {
+                    crate::sense::pace::read_again();
+                    self.place.machine_changed();
+                }
             }
             In::Offers(takes) => {
                 if takes && !self.hints {

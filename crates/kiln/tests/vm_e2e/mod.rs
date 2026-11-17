@@ -1238,6 +1238,22 @@ pub fn open(f: &Fixture, spec: &Value) -> anyhow::Result<String> {
     })
 }
 
+/// Session `id`, whose start kiln queued for room on the fixture's runner (`agents.start` answered
+/// `queued`, its words `queued`: "it starts there as soon as there's room"), once kiln opened it
+/// under `id` as it said it would; until then kiln has no such session (404). Followed as a setup
+/// wait is ([`setup`]): no window, its parties' liveness and kiln's word alone.
+pub fn queued_start(f: &Fixture, id: &str, what: &str, queued: &str) -> anyhow::Result<()> {
+    let path = format!("/api/harness/sessions/{id}");
+    setup_on(f, &format!("{what}: its start, queued: {queued}"), || {
+        let (code, body) = common::http(f.port, "GET", &path, &f.admin, None)?;
+        Ok(match code {
+            200 => Setup::Ready(()),
+            404 => Setup::Wait,
+            _ => server_said(code, &body),
+        })
+    })
+}
+
 /// The session as kiln lists it.
 pub fn info(f: &Fixture, id: &str) -> anyhow::Result<Value> {
     f.get(&format!("/api/harness/sessions/{id}"))

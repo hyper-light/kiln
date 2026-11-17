@@ -464,6 +464,8 @@ pub struct Placer {
     sensor: Option<crate::sense::Sensor>,
     last: Option<crate::sense::Measure>,
     strained: Option<String>,
+    /// When a strain measured from the pace's stand-ins is read again ([`follow_up_at`]).
+    follow_up_at: Option<i64>,
     /// Probes its health bars (L2), by owner and epoch: answered so, and probed once a measure
     /// shows the cause cleared.
     parked: Vec<(String, u64, std::sync::Arc<Ask>)>,
@@ -831,6 +833,23 @@ pub fn machine_of(r: &RunnerInfo) -> Machine {
     Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, syncs: feature::speaks(&r.features, feature::PLACE_SYNC), fast: feature::speaks(&r.features, feature::FAST) }
 }
 
+/// How long after a strain measured from the pace's stand-ins they're read again, ms: a PSI
+/// window, the least an unprivileged process may arm on Linux (2 s, `crate::os::pace_linux::window_us`),
+/// over which Linux's trigger reads the calm once more after a stall.
+const FOLLOW_UP_MS: i64 = 2_000;
+
+/// When a measure at `now` that found the machine `strained` has its stand-ins read again
+/// ([`Placer::follow_up_due`]). Where the kernel keeps no I/O stall time (`stall_kept` false: macOS,
+/// Windows, a Linux without PSI), strain rests on the pace's stand-ins (`crate::sense::pace::stand_ins`:
+/// the work device's utilization and swap-ins' share), which only an event reads again: on an idle
+/// machine none may come, and the strain, which takes nothing new while it stands (AUDIT L1), would
+/// stand for good (a Windows desktop's events are its power source's alone). So it's read once more
+/// [`FOLLOW_UP_MS`] on, and again while it stands. Where the kernel keeps stall times, its trigger
+/// says the end itself: none.
+fn follow_up_at(strained: bool, stall_kept: bool, now: i64) -> Option<i64> {
+    (strained && !stall_kept).then_some(now.saturating_add(FOLLOW_UP_MS))
+}
+
 impl Placer {
     /// Its hard state kept in `records` from now on (LB03): this node's own records, through
     /// kiln-seams' `Records` (a host's file of them, [`crate::records::open`]).
@@ -1043,7 +1062,7 @@ impl Placer {
         let mut owner = Owner::seeded(me, epoch, rand::random());
         owner.configure(&settings);
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), keeper: None, numbering: kiln_ci::place::holder::Numbering::new(epoch), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default(), outlived: Vec::new() }
+        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), keeper: None, numbering: kiln_ci::place::holder::Numbering::new(epoch), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, follow_up_at: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default(), outlived: Vec::new() }
     }
 
     /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
@@ -1073,7 +1092,9 @@ impl Placer {
         self.admission.measured(sample, now, said);
         let target = kiln_ci::sched::state::knee(m.cpus);
         // Over the window the decision is about (sense::window): since the load here last changed.
-        let strained = crate::sense::health::strained(window.as_ref().unwrap_or(&m), target);
+        let weighed = window.as_ref().unwrap_or(&m);
+        let strained = crate::sense::health::strained(weighed, target);
+        self.follow_up_at = follow_up_at(strained.is_some(), weighed.pressure.io.full.is_some(), now);
         if let Ok(mut h) = crate::sense::health::runner().lock() {
             h.measured(&m);
         }
@@ -1181,6 +1202,17 @@ impl Placer {
     /// Why its machine is under strain now, if it is, as its last measure said (the hint's state).
     pub fn strain(&self) -> Option<String> {
         self.strained.clone()
+    }
+
+    /// Whether the stand-ins of a strain it measured are due to be read again at `now`
+    /// (`follow_up_at`): its time taken, so the node reads them (`crate::sense::pace::read_again`)
+    /// and has it measure, which sets the next while the strain stands.
+    pub fn follow_up_due(&mut self, now: i64) -> bool {
+        if self.follow_up_at.is_some_and(|at| at <= now) {
+            self.follow_up_at = None;
+            return true;
+        }
+        false
     }
 
     /// A probe from `peer` (`epoch`): to its admission, against the last measure (W05-R26: a
@@ -1681,9 +1713,10 @@ impl Placer {
     }
 
     /// When to be told the time again: its owner's, its admission's, its budgets' and its holding's
-    /// soonest (the wait on its machine's capacity keeper ending, `holder`).
+    /// soonest (the wait on its machine's capacity keeper ending, `holder`), and a strain's stand-ins
+    /// read again ([`Self::follow_up_due`]).
     pub fn timer(&self) -> Option<i64> {
-        [self.owner.timer(), self.admission.timer(), self.budget.timer(), self.keeper_due()].into_iter().flatten().min()
+        [self.owner.timer(), self.admission.timer(), self.budget.timer(), self.keeper_due(), self.follow_up_at].into_iter().flatten().min()
     }
 
     /// The runners this node's owner has told something (to link to again).
@@ -2340,6 +2373,29 @@ mod measure_tests {
         p.machine_changed();
         let _ = p.measured(Sample::default(), 400);
         assert!(reads(&p) == before && p.measure_due(), "an event read the machine before its input was done");
+    }
+
+    /// AUDIT L1 where the kernel keeps no I/O stall time (macOS, Windows): a strain measured from the
+    /// pace's stand-ins has them read again a window on, and again while it stands, so an idle
+    /// machine's strain ends once a measure shows it has. Before, none came on a Windows desktop (its
+    /// only events its power source's), and every start placed there waited for good (kiln goal
+    /// 3cd82843's E2E, 2026-11-17: "1 machine under strain"). Where PSI keeps stall times, its trigger
+    /// says a strain's end itself.
+    #[test]
+    fn l1_a_strain_from_the_stand_ins_is_read_again_a_window_on() {
+        let at = 1_000_i64;
+        let due = at.saturating_add(FOLLOW_UP_MS);
+        assert_eq!(follow_up_at(true, false, at), Some(due));
+        assert!(follow_up_at(true, true, at).is_none(), "PSI's own trigger says a strain's end");
+        assert!(follow_up_at(false, false, at).is_none(), "nothing to read again without a strain");
+        let mut p = Placer::new("doer", 1, RunnerFacts::default(), Vec::new(), Sample::default(), Settings::default(), 0);
+        p.follow_up_at = Some(i64::MIN);
+        assert_eq!(p.timer(), Some(i64::MIN), "the node isn't told the time at the read's");
+        p.follow_up_at = follow_up_at(true, false, at);
+        assert!(!p.follow_up_due(due.saturating_sub(1)), "due before its time");
+        assert!(p.follow_up_due(due), "not due at its time");
+        assert!(!p.follow_up_due(due), "due twice for one strain's measure");
+        assert!(p.follow_up_at.is_none());
     }
 }
 
