@@ -48,7 +48,7 @@ current: boolean,
  * peak memory (GiB), and the percent of its sessions that failed, each within its 95% interval once its
  * sessions bound it; none until they bound one.
  */
-measures?: { warm_ms?: [number, number, number], peak_gib?: [number, number, number], failed_pct?: [number, number, number] },
+measures?: { warm_ms?: [number, number, number], peak_gib?: [number, number, number], failed_pct?: [number, number, number] }, 
 /**
  * Each measure as it stood at the end of each day (UTC), oldest first, today's last; a measure none of its
  * sessions has yet is left out.
