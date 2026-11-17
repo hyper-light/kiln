@@ -279,7 +279,7 @@ fn taken(name: &str) -> Error {
 /// Tells the events sockets an Agentfile changed or went: its owner's, and those of whoever reaches
 /// everyone's (`api`'s `AgentsSeen`).
 fn told(hub: &Hub, a: &Record, deleted: bool) {
-    hub.emit(&ServerEvent::Agentfile(AgentfileChange { owner: a.owner.clone(), id: a.id.clone(), name: a.name.clone(), version: a.version, deleted, builds: false }));
+    hub.emit(&ServerEvent::Agentfile(AgentfileChange { owner: a.owner.clone(), id: a.id.clone(), name: a.name.clone(), version: a.version, deleted }));
 }
 
 /// Where an Agentfile's text is kept in kiln's store of bytes: under its content's SHA-256, once for

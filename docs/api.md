@@ -480,9 +480,10 @@ refused and kept out of the image as a `kiln.secret.` one is.
   `/api/join-requests`), `{type:"discovery"}` (an instance appeared, changed or left: refetch
   `/api/discovery`), `{type:"front_door", runner}` (a runner's front-door settings or status
   changed: refetch `/api/runners/:name/front-door`), `{type:"agentfile", owner, id, name, version,
-  deleted?, builds?}` (one of a person's Agentfiles was kept, changed or deleted: to its owner, and whoever
-  reaches everyone's; refetch `/api/agentfiles`; with `builds`, only where its builds ahead of its sessions
-  are moved: refetch `/api/agentfiles/:id/builds`), `{type:"experiment", repo, experiment: { id, repo,
+  deleted?}` (one of a person's Agentfiles was kept, changed or deleted, told once for each change: to its
+  owner, and whoever reaches everyone's; refetch `/api/agentfiles`), `{type:"agentfile_builds", owner, id}`
+  (its builds ahead of its sessions moved, and nothing else of it, told once for each move, to whoever hears
+  of it: refetch `/api/agentfiles/:id/builds`), `{type:"experiment", repo, experiment: { id, repo,
   state, measured?, runs?, decision?, opener?, draw?, replay? }}` (an experiment changed. A split's frame
   names its `opener`, and only they and the owner get it. `draw: { n, arm }`: a session you started was
   drawn variant `arm`, the split's draw `n` (from 0). The same draw comes again with `refused: { status,
