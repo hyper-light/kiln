@@ -36,6 +36,7 @@ fn runner(name: &str, microvm: bool, connected: bool) -> crate::hub::AgentLive {
             hypervisor: Some("KVM".into()),
             why_not: None,
             engine: None,
+            image_class: None,
         }
     } else {
         Isolation {
@@ -43,6 +44,7 @@ fn runner(name: &str, microvm: bool, connected: bool) -> crate::hub::AgentLive {
             hypervisor: None,
             why_not: Some("no hypervisor it can use".into()),
             engine: None,
+            image_class: None,
         }
     };
     let mut facts = RunnerFacts {

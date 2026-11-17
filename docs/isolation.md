@@ -194,8 +194,10 @@ its own through Hex (`sandbox::hexvm`).
   (a conversation taken up, `resume`, stays where its harness keeps it). One
   that asks `microvm`, names an Agentfile or has an isolated parent needs a `microvm` runner; one that asks
   `none` needs a `host` runner. Each is refused where nothing fits, the engine named. The server itself
-  (`local`) runs sessions on its host. Once kiln vendors Hex's `shards-image` class (P2.2), a `microvm` runner
-  must also list it (`engine::node_images`).
+  (`local`) runs sessions on its host. A `microvm` runner's Hex node must also list Hex's `shards-image`
+  class (P2.2), as its runner said of it (`isolation.image_class`, below; `engine::node_images`): one whose
+  node lists none is refused, named, in Hex's words, and one whose runner doesn't say (from before the
+  class) is placed by its engine alone.
 - **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view, each
   of them in `draining_sessions`, with the switch they drain for, `switch`: what was set before, what it was set
   to, and when), and new sessions take the new one. While they drain (ROOT's decision 8 of the design):
@@ -296,6 +298,10 @@ launch of the carried `shards`): `available` where the host runs them, its backe
 `why_not` in Shards' words (`/dev/kvm` missing or not this user's to open, a platform Shards has no backend
 for, a VM given no nested virtualization), or that Shards couldn't say, and why (`sandbox::UNCHECKED`).
 `harness::lineage::isolation_on` refuses an isolated start on a runner that says no, in the runner's own words.
+One holding them through Hex also says whether its node lists the class its image VMs run as (`image_class`:
+`{"is": "listed"}`, or `{"is": "unlisted", "why": ...}` in Hex's words), read from its node at each probe:
+`hex_node::images::ImageRuntime`'s classes, and where it lists none, its image class's refusal (Shards' check
+of the host, asked once as the node starts, or an image boot unconfigured; Hex's `ImageClass::serves`).
 
 ## What the microVMs are, and what's owed
 

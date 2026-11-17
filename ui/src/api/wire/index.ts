@@ -181,6 +181,7 @@ export type { MovedRegistration } from "./MovedRegistration";
 export type { Negotiated } from "./Negotiated";
 export type { Net } from "./Net";
 export type { NetDrop } from "./NetDrop";
+export type { NodeImageClass } from "./NodeImageClass";
 export type { NoticeAgent } from "./NoticeAgent";
 export type { NoticeKind } from "./NoticeKind";
 export type { NoticeRun } from "./NoticeRun";
