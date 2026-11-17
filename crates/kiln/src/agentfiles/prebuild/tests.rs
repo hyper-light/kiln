@@ -96,7 +96,7 @@ async fn word(hub: &Hub, runner: &str, id: &str, version: i64, how: How) -> anyh
 
 /// What the events `events` hold now tell of Agentfile `id`: how many times its version (`agentfile`), and how many its
 /// builds (`agentfile_builds`).
-fn told(
+fn frames(
     events: &mut crate::memory::lanes::Reader<Arc<str>>,
     id: &str,
 ) -> anyhow::Result<(usize, usize)> {
@@ -188,7 +188,7 @@ fn p4_5_a_save_queues_its_build_on_each_microvm_runner_and_their_words_move_it()
         );
         // Each change told once, each as its own kind: its version by the save, its builds as their rows were written
         // (a save that writes none tells none: agentfiles::tests::step30_versions_restore_and_delete).
-        let said = told(&mut events, &id)?;
+        let said = frames(&mut events, &id)?;
         anyhow::ensure!(said == (1, 1), "(versions, builds) told: {said:?}");
 
         word(&hub, "mac", &id, 1, How::Building).await?;
@@ -239,7 +239,7 @@ fn p4_5_a_save_queues_its_build_on_each_microvm_runner_and_their_words_move_it()
             "{got:?}"
         );
         // The two words that moved a row told its builds, once each; the three that moved none, nothing.
-        let said = told(&mut events, &id)?;
+        let said = frames(&mut events, &id)?;
         anyhow::ensure!(said == (0, 2), "(versions, builds) told: {said:?}");
         let read = op(&hub, &owner, "agentfiles.builds", json!({"id": id})).await?;
         anyhow::ensure!(
