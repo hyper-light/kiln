@@ -118,8 +118,10 @@ pub enum Func {
     MovingAvg,
     Ewma,
     Clamp,
-    /// `anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below')`: the series
-    /// and its band (`crate::anomaly`).
+    /// `anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below')`, and Datadog's
+    /// anomaly monitors' named arguments (`direction=`, `alert_window=`, `interval=`,
+    /// `count_default_zero=`, `seasonality=`, `timezone=`): the series and its band
+    /// (`crate::anomaly`).
     Anomalies,
     /// `forecast(query, 'linear'|'seasonal', deviations, model=, seasonality=, history=,
     /// interval=)`: the series, and past its last point what it will do and its bounds
@@ -174,8 +176,8 @@ pub enum Func {
     CalendarShift,
     /// `top5`, `bottom10_max`, ... (`[top|bottom][5|10|15|20][_measure]`): `top` and `bottom` in one.
     Ranked { n: u8, bottom: bool, by: Rank },
-    /// `max(a, b, ...)`, `min(...)`: at each point the largest (least) value of its arguments,
-    /// queries or numbers.
+    /// `max(a, b, ...)`, `min(...)` (`maximum`, `minimum`: Datadog's querying page's names): at
+    /// each point the largest (least) value of its arguments, queries or numbers.
     Max,
     Min,
 }
@@ -256,8 +258,8 @@ impl Func {
             "week_before" => Self::WeekBefore,
             "month_before" => Self::MonthBefore,
             "calendar_shift" => Self::CalendarShift,
-            "max" => Self::Max,
-            "min" => Self::Min,
+            "max" | "maximum" => Self::Max,
+            "min" | "minimum" => Self::Min,
             other => return Self::spanned(other),
         })
     }
@@ -299,7 +301,8 @@ impl Func {
             Self::Pow | Self::ClampMin | Self::ClampMax | Self::CutoffMin | Self::CutoffMax => (2, 2),
             Self::CalendarShift => (2, 3),
             Self::Clamp => (3, 3),
-            Self::Anomalies => (1, 4),
+            // The query, its algorithm, bounds and direction; then Datadog's six named arguments.
+            Self::Anomalies => (1, 10),
             // The query and its algorithm; deviations; then named arguments.
             Self::Forecast => (2, 8),
             Self::Outliers => (1, 4),
@@ -1216,6 +1219,27 @@ mod tests {
         let ast = parse("job:http_requests:rate5m{*}").unwrap();
         assert_eq!(metric(&ast, ast.root).metric, NameMatch::Exact("job:http_requests:rate5m".into()));
         assert_eq!(metric(&ast, ast.root).space, SpaceAgg::Avg);
+    }
+
+    /// Datadog's anomaly monitors' named arguments, as its page's example writes them, after
+    /// `anomalies()`' own; its querying page's `maximum()` and `minimum()`, and a metric of that
+    /// name still a metric.
+    #[test]
+    fn anomalies_take_named_arguments_and_maximum_is_max() {
+        let ast = parse("anomalies(avg:system.cpu.system{name:cassandra}, 'basic', 3, direction='above', alert_window='last_5m', interval=20, count_default_zero='true', seasonality='weekly', timezone='UTC')").unwrap();
+        let Node::Call(Func::Anomalies, args) = &ast.nodes[ast.root] else { panic!("{:?}", ast.nodes[ast.root]) };
+        let named: Vec<(&str, &str)> = args
+            .iter()
+            .filter_map(|&a| match &ast.nodes[a] {
+                Node::Named(k, v) => Some((k.as_str(), v.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, [("direction", "above"), ("alert_window", "last_5m"), ("interval", "20"), ("count_default_zero", "true"), ("seasonality", "weekly"), ("timezone", "UTC")]);
+        let ast = parse("maximum(a{*}, b{*}) - minimum(a{*}, 1)").unwrap();
+        assert!(ast.nodes.iter().any(|n| matches!(n, Node::Call(Func::Max, a) if a.len() == 2)));
+        assert!(ast.nodes.iter().any(|n| matches!(n, Node::Call(Func::Min, a) if a.len() == 2)));
+        assert!(matches!(parse("maximum{*}").unwrap().nodes[0], Node::Metric(_)));
     }
 
     #[test]
