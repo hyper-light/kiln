@@ -377,8 +377,9 @@ tools `agentdefs_experiments_*`, code mode's `kiln.agentdefs.experiments.*`), an
 - Every answer is measured. A variant's `measures` are `warm_ms` (the median of its warm starts, in ms),
   `peak_gib` (of its peaks, in GiB) and `failed_pct` (the percent of its sessions that failed), each
   `[low, mid, high]`: the median or the rate within its 95% confidence sequence, so a look at any time
-  holds (Howard and Ramdas's for a median, Waudby-Smith and Ramdas's for a rate: docs/ci.md W20,
-  "Splits"). Each is given once its sessions bound it: a variant on the host has no warm start or peak,
+  holds (for a median, Howard and Ramdas, "Sequential estimation of quantiles with applications to
+  A/B-testing and best-arm identification", Bernoulli 2022; for a rate, Waudby-Smith and Ramdas,
+  "Estimating means of bounded random variables by betting", JRSS B 2024). Each is given once its sessions bound it: a variant on the host has no warm start or peak,
   so its failures alone, and a microVM no warm host started has no warm start. A variant whose `high`
   is below every other's `low` is clearly better on that measure. Its `trend` is each measure as it
   stood at the end of each day (UTC), oldest first, today's last, from the first day on which every
@@ -417,23 +418,9 @@ Weights, variants and promotion change only a live or paused experiment (409 onc
 and criteria change whatever it stands at. `AgentdefExperiment`, `AgentdefVariant` and
 `AgentdefCriterion` are `ui/src/api/wire`'s.
 
-These are the Agents page's experiments. kiln has another split of a person's sessions, a deployment
-experiment's (`POST /api/experiments` with `target` and `arms`, docs/ci.md W20 "Splits"): a separate
-model, which an experiment here neither reads nor writes. Where the two meet:
-
-| Here (`agentdefs.experiments.*`) | A deployment experiment's split (`experiments.*`) |
-|---|---|
-| Several to one of your definitions, one live at a time | One running split of a target (a definition, or a harness and its Agentfile) |
-| `live`, `paused`, `stopped`, `promoted` | `running`, `paused`, `done` once decided, `cancelled` |
-| Variants renamed, reweighted (the split's next `version`), added at 0 and taken out | Arms fixed as it starts |
-| Criteria in kiln's monitoring syntax, each variant's value as kiln's monitors evaluate it | None: its results name winners |
-| `measures`: warm start, peak memory and failures, each within its 95% interval | Results: failures, starts within each kind, the kinds' mix, footprint, CPU and outcomes, each at 95% / k |
-| Promoting makes the variant the definition's next version | Deciding makes every later session of the target that variant |
-
-What they share is computed once: the draw (`kiln_ci::split`'s point of [0, 1) from the seed and the
-draw's index, laid on the weights), the confidence sequences (`kiln_ci::stats::sequence`), Shards'
-words for how a microVM started (`agentdefs.sessions`' kinds), each start's record that Hex measured
-(`Start::measured`), and kiln's monitors' query engine (`kiln_obs::monitor`).
+These are the Agents page's experiments, kiln's only split of a person's sessions (`/api/experiments`
+measures options of code, docs/ci.md W20-R11). The draw is `kiln_ci::split`'s point of [0, 1) from the
+seed and the draw's index, laid on the weights; the intervals are `kiln_ci::stats::sequence`'s.
 
 ## Your secrets
 
@@ -485,16 +472,7 @@ refused and kept out of the image as a `kiln.secret.` one is.
   owner, and whoever reaches everyone's; refetch `/api/agentfiles`), `{type:"agentfile_builds", owner, id}`
   (its builds ahead of its sessions moved, and nothing else of it, told once for each move, to whoever hears
   of it: refetch `/api/agentfiles/:id/builds`), `{type:"experiment", repo, experiment: { id, repo,
-  state, measured?, runs?, decision?, opener?, draw?, replay? }}` (an experiment changed. A split's frame
-  names its `opener`, and only they and the owner get it. `draw: { n, arm }`: a session you started was
-  drawn variant `arm`, the split's draw `n` (from 0). The same draw comes again with `refused: { status,
-  why }` when its session couldn't start, a failure of that variant: `status` is the one kiln answers a
-  start with (409: the machine can't run the variant as it asks; 400: what it asks can't start; 403:
-  you may not start it there). A drawn session that did start shows in its own `harness` frames, its
-  `info.experiment` naming the split. `replay: { n, state, why?, ran, runs, run? }`: replay `n` started
-  (`ran` 0 of its `runs`, each variant once a round), one of its runs ended (`run: { arm, round,
-  conclusion }`), or it ended (`state` `done`, or `cancelled` and `why` where its split was); its measures are
-  in `GET /api/experiments/:id`'s `replays`. A decision comes with its split `done`), `{type:"ship", repo, rows: [{ row, yours?,
+  state, measured?, runs?, decision? }}` (an experiment of options changed), `{type:"ship", repo, rows: [{ row, yours?,
   whose?, dv?, base?, parts?, items? }], gone?, pace?, whole?}` (ci.md W21-R15: a repository's Ship
   rows that changed in one refresh of Ship's read model, each once, as `GET /api/ship/commits`
   renders them, for everyone and for those whose turn it is; `dv` once someone read that commit's

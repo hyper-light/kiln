@@ -598,7 +598,7 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::CiRunsBisects>(),
                 route: |v| Ok((Method::GET, match v.get("bisect").and_then(Value::as_str) { Some(b) => path(&["runs", &text(v, "run")?, "bisects", b]), None => path(&["runs", &text(v, "run")?, "bisects"]) }, HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::bisect::list(&cx.hub, &text(&v, "run")?, v.get("bisect").and_then(Value::as_str)).await).await }),
-            op!("experiments.start", "Start an experiment (W20-R11): options measured against each other and together on a base commit (the default branch's head by default). Each option is a `commit`, a `branch` or a `diff`; `strategy` makes the variants: each, all (every combination), pairs, greedy, or custom (`variants`); the baseline is one unless `baseline: false`. `criteria`: each `{name, kind: command (command) | pipeline (workflow) | metric (metric, better: lower | higher), required, threshold: {at_most | at_least | better}}`, a metric read from what the commands and pipelines write to `$KILN_METRICS` (a JSON line each: {\"name\", \"value\"}). A command runs in each variant's own worktree beside the agent that asks, on its machine, without CI; a pipeline (or a command given `runs-on`) is a CI run, and needs CI's engine. Each variant is measured `repetitions` times (3), interleaved, `max_parallel` at once (4), within `budget_seconds` (or `budget_minutes`). `decide`: ask (bring the results back) or auto (take the clear winner); the agent that asks is told. Or split your sessions (P7.1): `target` (one of your agents `{agent}`, or `{harness, agentfile?}`) and `arms`, 2 or more variants, each a deployment `{name, weight (percent, together 100), harness | agent, agentfile?, engine: microvm | host, size?: {cpus, memory_mib}}`. While it runs, each new session of the target you start is one variant, drawn by weight as it starts and kept for its life; experiments.get gives each variant's measures from its sessions (failures, start time within each start kind, the kinds' mix, footprint peak and steady, host CPU, outcomes), each with its anytime-valid 95% confidence sequence, and a winner on a measure where its sequence lies wholly below every other's. experiments.pause and .resume stop and restart the draws; experiments.decide promotes one variant for every later session.", base: "", ro: false, destructive: false,
+            op!("experiments.start", "Start an experiment (W20-R11): options measured against each other and together on a base commit (the default branch's head by default). Each option is a `commit`, a `branch` or a `diff`; `strategy` makes the variants: each, all (every combination), pairs, greedy, or custom (`variants`); the baseline is one unless `baseline: false`. `criteria`: each `{name, kind: command (command) | pipeline (workflow) | metric (metric, better: lower | higher), required, threshold: {at_most | at_least | better}}`, a metric read from what the commands and pipelines write to `$KILN_METRICS` (a JSON line each: {\"name\", \"value\"}). A command runs in each variant's own worktree beside the agent that asks, on its machine, without CI; a pipeline (or a command given `runs-on`) is a CI run, and needs CI's engine. Each variant is measured `repetitions` times (3), interleaved, `max_parallel` at once (4), within `budget_seconds` (or `budget_minutes`). `decide`: ask (bring the results back) or auto (take the clear winner); the agent that asks is told.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::ExperimentsStart>(),
                 route: |_| Ok((Method::POST, path(&["experiments"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::experiments::start(&cx.hub, &cx.caller, v).await).await }),
@@ -614,26 +614,14 @@ pub fn ops() -> &'static [Op] {
                 input: Input::of::<input::ExperimentsGet>(),
                 route: |v| Ok((Method::GET, path(&["experiments", &text(v, "experiment")?]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::experiments::show(&cx.hub, &cx.caller, &text(&v, "experiment")?).await).await }),
-            op!("experiments.decide", "Continue with one of an experiment's variants: the agent that asked is told its commit (`refs/kiln/experiments/<id>/<variant>`). A split's decision promotes its variant: every later session of its target is that one, and the split is over.", base: "", ro: false, destructive: false,
+            op!("experiments.decide", "Continue with one of an experiment's variants: the agent that asked is told its commit (`refs/kiln/experiments/<id>/<variant>`).", base: "", ro: false, destructive: false,
                 input: Input::of::<input::ExperimentsDecide>(),
                 route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "decide"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::experiments::decide(&cx.hub, &cx.caller, &text(&v, "experiment")?, &v).await).await }),
-            op!("experiments.cancel", "Stop an experiment: no more runs, and those running are cancelled. A split's draws stop, and its promoted variant, if it had one, no longer applies.", base: "", ro: false, destructive: false,
+            op!("experiments.cancel", "Stop an experiment: no more runs, and those running are cancelled.", base: "", ro: false, destructive: false,
                 input: Input::of::<input::ExperimentsCancel>(),
                 route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "cancel"]), HashMap::new())),
                 run: |cx: Cx, v: Value| async move { answer(super::experiments::cancel(&cx.hub, &cx.caller, &text(&v, "experiment")?).await).await }),
-            op!("experiments.pause", "Pause a split (P7.1): its target's new sessions start as they're asked, drawn none, until it's resumed. Its sessions so far keep their variants.", base: "", ro: false, destructive: false,
-                input: Input::of::<input::ExperimentsPause>(),
-                route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "pause"]), HashMap::new())),
-                run: |cx: Cx, v: Value| async move { answer(super::experiments::pause(&cx.hub, &cx.caller, &text(&v, "experiment")?, true).await).await }),
-            op!("experiments.resume", "Resume a paused split: its target's new sessions are drawn again.", base: "", ro: false, destructive: false,
-                input: Input::of::<input::ExperimentsPause>(),
-                route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "resume"]), HashMap::new())),
-                run: |cx: Cx, v: Value| async move { answer(super::experiments::pause(&cx.hub, &cx.caller, &text(&v, "experiment")?, false).await).await }),
-            op!("experiments.replay", "Replay one of your recorded sessions against a split's variants (P7.1b): its tool calls run offline in a microVM of each of its microVM variants, `rounds` times (3), interleaved, one run at a time on one runner (`on`; the session's machine by default). What runs is its commands and the files it wrote whole; no model, no person and nothing past the microVM, so its other calls are counted by why, not run. Each run is measured as a session is: its start (cold, from a template, warm), footprint peak and steady, host CPU, failures, and its outcome (`diverged` where a step ended otherwise than its record). `experiments.get` shows each replay under `replays`, with each variant's intervals.", base: "", ro: false, destructive: false,
-                input: Input::of::<input::ExperimentsReplay>(),
-                route: |v| Ok((Method::POST, path(&["experiments", &text(v, "experiment")?, "replay"]), HashMap::new())),
-                run: |cx: Cx, v: Value| async move { answer(super::experiments::replay(&cx.hub, &cx.caller, &text(&v, "experiment")?, &v).await).await }),
             op!("ci.store.verify", "Re-hash every chunk of the store on the server's disk (W08-R01): how many and how much, and any whose contents aren't their digest (each moved aside, so it's stored again on its next write).", ro: false, destructive: false,
                 input: Input::of::<input::CiStoreVerify>(),
                 route: |_| Ok((Method::POST, path(&["store", "verify"]), HashMap::new())),
@@ -2102,13 +2090,13 @@ pub mod input {
         pub repo: Option<String>,
         pub base: Option<String>,
         pub question: Option<String>,
-        /// The options compared (code); none in a split.
+        /// The options compared (code).
         #[serde(default)]
         pub options: Vec<ExperimentsStartOption>,
         pub strategy: Option<ExperimentsStartStrategy>,
         pub variants: Option<Vec<Vec<String>>>,
         pub baseline: Option<bool>,
-        /// How options are measured; none in a split (its measures are its sessions').
+        /// How options are measured.
         #[serde(default)]
         pub criteria: Vec<serde_json::Map<String, serde_json::Value>>,
         #[schemars(range(min = 1, max = 20))]
@@ -2123,66 +2111,6 @@ pub mod input {
         pub agent: Option<String>,
         /// Where the agents implementing options run: {kind, on?, cwd?, model?}; yours by default.
         pub harness: Option<serde_json::Map<String, serde_json::Value>>,
-        /// A split's target (P7.1): one of your agents `{agent}`, or a harness `{harness, agentfile?}`.
-        pub target: Option<ExperimentsStartTarget>,
-        /// A split's variants, each a deployment with its weight (percent; together 100).
-        pub arms: Option<Vec<ExperimentsStartArm>>,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct ExperimentsStartTarget {
-        /// One of your agent definitions, by its id.
-        pub agent: Option<String>,
-        /// A harness: claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi.
-        pub harness: Option<String>,
-        /// With `harness`: the Agentfile its sessions are made from (`harness-<harness>` or `agentfile:<id>`); every
-        /// session of the harness when left out.
-        pub agentfile: Option<String>,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct ExperimentsStartArm {
-        pub name: String,
-        /// Its share of the target's new sessions, in percent.
-        pub weight: f64,
-        /// One of kiln's harnesses, or `agent`: one of your agent definitions, by its id.
-        pub harness: Option<String>,
-        pub agent: Option<String>,
-        /// The Agentfile its microVM is made from (kiln's for its harness when left out).
-        pub agentfile: Option<String>,
-        /// `microvm` (the default) or `host`.
-        pub engine: Option<String>,
-        /// Its microVM's size: {cpus, memory_mib}.
-        pub size: Option<ExperimentsStartSize>,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct ExperimentsStartSize {
-        pub cpus: Option<u32>,
-        pub memory_mib: Option<u64>,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct ExperimentsPause {
-        pub experiment: String,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct ExperimentsReplay {
-        /// The split's id: `E12`.
-        pub experiment: String,
-        /// One of your sessions, its tool calls recorded.
-        pub session: String,
-        /// How many times each variant replays it (3 by default).
-        #[schemars(range(min = 1, max = 20))]
-        pub rounds: Option<i64>,
-        /// The runner its runs run on: the session's own machine by default.
-        pub on: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

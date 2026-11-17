@@ -80,7 +80,7 @@ pub struct Meta {
     pub repo: Option<String>,
     /// For a leg's frame: its run.
     pub job_run: Option<String>,
-    /// For an inbox's frame, an attention change's, an Agentfile's or a split's: whose.
+    /// For an inbox's frame, an attention change's, or an Agentfile's: whose.
     pub person: Option<String>,
     pub agent: Agent,
     /// Its text read as JSON.
@@ -115,8 +115,6 @@ impl Meta {
             "attention" => v.get("principal"),
             // An Agentfile's owner (`crate::agentfiles`), of a change or of its builds.
             "agentfile" | "agentfile_builds" => v.get("owner"),
-            // A split's opener (`crate::ci::experiments`): an experiment of options names none.
-            "experiment" => v.pointer("/experiment/opener"),
             _ => None,
         }
         .and_then(Value::as_str)

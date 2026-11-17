@@ -21,9 +21,8 @@
 //! - `narrowed` (`vm_e2e/narrowed.rs`): a Goose session of kiln's own Agentfile in a microVM, the
 //!   stand-in in Goose's place, reaching past it only its person's provider's hosts, and saying so; one
 //!   whose home can't be read keeps every destination, saying why (kiln plan step 17 part 6).
-//! - `ended` (`vm_e2e/ended.rs`): a microVM whose run ended on its own, a replay's and a session's, has its box
-//!   deleted and its use charged (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b; Unix: it finds and kills a VM
-//!   process with `ps` and `kill`).
+//! - `ended` (`vm_e2e/ended.rs`): a session's microVM whose run ended on its own has its box deleted and its use
+//!   charged (Unix: it finds and kills a VM process with `ps` and `kill`).
 //!
 //! No real harness and no model runs here unless ROOT points these at one (`VM_E2E_*`).
 //!

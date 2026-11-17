@@ -1153,9 +1153,6 @@ pub enum FromServer {
     RunnerEngine(crate::harness::engine::Asked),
     /// `AdoptPolicy`: the room a hand-over's spool leaves on this runner's volume (CP-T3.2).
     AdoptPolicy(crate::harness::moving::stream::Told),
-    /// `Replay`: one replay of a recorded session's tool calls in a microVM of a split's variant (kiln plan
-    /// 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b).
-    Replay { req: u64, ask: Box<crate::sandbox::replay::Ask> },
 }
 
 impl Carries for ServerMsg {
@@ -1224,7 +1221,11 @@ impl Carries for ServerMsg {
             ServerMsg::HarnessHistoryFor { req, json } => FromServer::HarnessHistoryFor { req, asked: payload(W, "HarnessHistoryFor", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
             ServerMsg::RunnerEngine { json } => FromServer::RunnerEngine(payload(W, "RunnerEngine", &json)?),
             ServerMsg::AdoptPolicy { json } => FromServer::AdoptPolicy(payload(W, "AdoptPolicy", &json)?),
-            ServerMsg::Replay { req, json } => FromServer::Replay { req, ask: Box::new(payload(W, "Replay", &json).map_err(|e| e.waits(Waits::Asking(req)))?) },
+            // P7.1b's replay, withdrawn (replays were never part of experiments): a kind this build doesn't
+            // know, its asker answered why.
+            ServerMsg::Replay { req, .. } => {
+                return Err(Box::new(Unreadable { of: "Replay", what: "Replay".into(), code: Code::Unknown, why: "replays were withdrawn from experiments: no runner runs one".into(), session: None, waits: Some(Waits::Asking(req)) }));
+            }
             m @ (ServerMsg::Welcome { .. }
             | ServerMsg::Refused { .. }
             | ServerMsg::Assign(_)

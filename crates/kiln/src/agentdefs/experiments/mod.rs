@@ -950,7 +950,7 @@ pub struct Draw {
 impl Draw {
     /// As its session keeps it (`Spec::experiment`), for its life.
     pub fn assigned(&self) -> crate::harness::session::Assigned {
-        crate::harness::session::Assigned { experiment: self.experiment.clone(), arm: self.variant.clone(), promoted: false }
+        crate::harness::session::Assigned { experiment: self.experiment.clone(), arm: self.variant.clone() }
     }
 
     /// Its microVM's size as a start takes it (vCPUs, MiB); none on the host.
