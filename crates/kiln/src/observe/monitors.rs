@@ -17,6 +17,7 @@
 //! change, so a restart neither forgets an alert nor says it again).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -27,7 +28,7 @@ use kiln_obs::monitor::composite::{self, Composite, Group};
 use kiln_obs::monitor::{self, State, Thresholds, Transition, Vars};
 use serde::{Deserialize, Serialize};
 
-use super::notify::{Integrations, Notice, Notifier};
+use super::notify::{Integration, Integrations, Notice, Notifier};
 
 /// How often a monitor is evaluated unless it says: Datadog's metric monitors' minute.
 const EVERY_S: u32 = 60;
@@ -40,6 +41,22 @@ const FORGET_MS: i64 = 86_400_000;
 /// How long a service check's group may go without a run before it is not found (and NO DATA, when
 /// asked), unless its monitor says: Datadog's default for a service check, a day.
 const CHECK_NO_DATA_MS: i64 = 86_400_000;
+/// The longest evaluation delay: Datadog's ("The maximum configurable evaluation delay is 86400
+/// seconds (24 hours)", its monitor configuration page).
+const MAX_DELAY_S: u32 = 86_400;
+/// The longest `timeout_h`: Datadog's ("The maximum allowed value is 24 hours", its API).
+const MAX_TIMEOUT_H: u32 = 24;
+/// `group_retention_duration`'s bounds, ms: Datadog's ("Minimum: one hour. Maximum: 72 hours").
+const RETENTION_MS: std::ops::RangeInclusive<i64> = 3_600_000..=72 * 3_600_000;
+/// The log samples a notification shows at the most: Datadog's ("Up to 10 log samples", its log
+/// monitor page).
+const SAMPLES: usize = 10;
+/// How long a group is unseen before it is new again (`new_group_delay`): Datadog's, "every new
+/// group (which has not been seen in the last 24 hours)", its monitor configuration page.
+const NEW_AFTER_MS: i64 = 86_400_000;
+/// The explorers' ranges (`ui/src/views/observe/parts.tsx`, `RANGES`), ms: a record link's range
+/// is the first that covers its monitor's window.
+const EXPLORER_RANGES: [(&str, i64); 6] = [("15m", 900_000), ("1h", 3_600_000), ("4h", 14_400_000), ("1d", 86_400_000), ("7d", 604_800_000), ("30d", 2_592_000_000)];
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -93,6 +110,142 @@ pub struct Options {
     /// Datadog's, a formula monitor's queries by their names ([`Variable`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub variables: Vec<Variable>,
+    /// Datadog's: the states told again each renotify interval (unsaid, with an interval, ALERT and
+    /// NO DATA: its "Defaults to `alert` and `no data` when `renotify_interval` is set").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renotify_statuses: Option<Vec<Renotify>>,
+    /// Datadog's: how many times a state is told again at the most (unsaid: no end).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renotify_occurrences: Option<u32>,
+    /// Datadog's: a template said after the message when a state is told again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_message: Option<String>,
+    /// Datadog's: hours without data after which a group in trouble resolves, 0 to 24.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_h: Option<u32>,
+    /// Datadog's, a metric monitor's: a group evaluated only once its window is full
+    /// (`kiln_obs::monitor::full_windows`). Other monitors take it and read no window so.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub require_full_window: bool,
+    /// Datadog's: seconds a group the monitor has not had is not evaluated (unsaid: none, its API's
+    /// default; its form's is 60).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_group_delay: Option<u32>,
+    /// Datadog's: whether a notification's title names its group (unsaid: it does).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_tags: Option<bool>,
+    /// Datadog's, a monitor of logs, spans, events or Error Tracking's: what a group the evaluation
+    /// finds no data of comes to ([`OnMissingData`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_missing_data: Option<OnMissingData>,
+    /// Datadog's: the message's mentions told when the monitor is made, changed or deleted.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub notify_audit: bool,
+    /// Datadog's: what notifications are by, some of the query's group tags (`*`: one for all):
+    /// such a group's state the worst of its groups', told as it changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_by: Option<Vec<String>>,
+    /// Datadog's, a monitor of logs, spans, events or Error Tracking's: how long a group without
+    /// data is kept (`60m`, `1h`, `2d`; an hour to 72), a day unless said.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_retention_duration: Option<String>,
+    /// Datadog's: what a notification shows besides its message ([`Preset`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_preset_name: Option<Preset>,
+    /// Datadog's, a log monitor's: its notifications of trouble show its group's latest logs.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enable_logs_sample: bool,
+}
+
+/// Why `on_missing_data` or `group_retention_duration` is refused of a monitor of other data.
+const RECORDS_ONLY: &str = "on_missing_data and group_retention_duration: a monitor of logs, spans, events or Error Tracking's (Datadog's: \"only available for APM Trace Analytics, Audit Trail, CI, Error Tracking, Event, Logs, and RUM monitors\"); a metric monitor's missing data is notify_no_data's";
+
+impl Options {
+    /// Datadog's bounds on what its options say, whatever the monitor.
+    fn check(&self) -> Result<(), String> {
+        if let Some(d) = self.evaluation_delay.filter(|&d| d > MAX_DELAY_S) {
+            return Err(format!("evaluation_delay {d}: {MAX_DELAY_S} seconds at the most (Datadog's)"));
+        }
+        if let Some(h) = self.timeout_h.filter(|&h| h > MAX_TIMEOUT_H) {
+            return Err(format!("timeout_h {h}: 0 to {MAX_TIMEOUT_H} hours (Datadog's)"));
+        }
+        if self.renotify_occurrences == Some(0) {
+            return Err("renotify_occurrences: 1 or more (none: no end)".into());
+        }
+        if let Some(r) = &self.group_retention_duration
+            && !duration_ms(r).is_some_and(|ms| RETENTION_MS.contains(&ms))
+        {
+            return Err(format!("group_retention_duration {r}: an hour to 72 (60m, 1h, 2d), Datadog's"));
+        }
+        if self.on_missing_data.is_some() && self.notify_no_data {
+            return Err("on_missing_data and notify_no_data: one or the other (on_missing_data says whether a group without data shows NO DATA, and whether it is told)".into());
+        }
+        if let Some(by) = &self.notify_by
+            && (by.is_empty() || by.iter().any(|t| t.trim().is_empty()) || (by.len() > 1 && by.iter().any(|t| t == "*")))
+        {
+            return Err("notify_by: some of the query's group tags, or [\"*\"] alone".into());
+        }
+        Ok(())
+    }
+}
+
+/// A state Datadog's `renotify_statuses` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Renotify {
+    #[serde(rename = "alert")]
+    Alert,
+    #[serde(rename = "warn")]
+    Warn,
+    #[serde(rename = "no data")]
+    NoData,
+}
+
+/// Datadog's `on_missing_data`: what a group comes to when an evaluation finds no data of it, at
+/// once ("the missing data window is not configurable").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMissingData {
+    /// A count's 0, compared with the thresholds; another measure's last state.
+    Default,
+    /// NO DATA, not told.
+    ShowNoData,
+    ShowAndNotifyNoData,
+    /// OK.
+    Resolve,
+}
+
+/// Datadog's `notification_preset_name`. kiln's notifications show neither the query nor the
+/// mentions (`notify::Notice::body`) and draw no snapshot: what is left to hide is the footer's
+/// link back to kiln, which `hide_all`, `hide_handles_and_footer` and `show_only_snapshot` drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Preset {
+    ShowAll,
+    HideQuery,
+    HideHandles,
+    HideAll,
+    HideQueryAndHandles,
+    ShowOnlySnapshot,
+    HideHandlesAndFooter,
+}
+
+impl Preset {
+    fn footer(self) -> bool {
+        !matches!(self, Self::HideAll | Self::HideHandlesAndFooter | Self::ShowOnlySnapshot)
+    }
+}
+
+/// `60m`, `1h`, `2d` as ms (Datadog's `group_retention_duration`).
+fn duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (n, unit) = s.split_at_checked(s.find(|c: char| !c.is_ascii_digit())?)?;
+    let per = match unit {
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    n.parse::<i64>().ok()?.checked_mul(per)
 }
 
 /// Datadog's `threshold_windows` of an anomaly monitor, timeframes (`last_15m`).
@@ -355,18 +508,35 @@ impl Monitor {
         {
             return Err(format!("evaluated every {e} s: at most every {EVERY_MIN_S}"));
         }
+        self.options.check()?;
+        let check = checks::is_check(&self.query) || self.kind.as_deref() == Some(SERVICE_CHECK);
+        if (self.is_composite() || check) && (self.options.on_missing_data.is_some() || self.options.group_retention_duration.is_some()) {
+            return Err(RECORDS_ONLY.into());
+        }
         match self.kind.as_deref() {
             Some(COMPOSITE) => return composite::parse(&self.query).map(Compiled::Composite).map_err(|e| e.to_string()),
             None => {}
             Some(t) if TYPES.contains(&t) => {}
             Some(other) => return Err(format!("a monitor's type: {other} ({COMPOSITE}, {}, or none: the query says)", TYPES.join(", "))),
         }
-        if checks::is_check(&self.query) || self.kind.as_deref() == Some(SERVICE_CHECK) {
+        if check {
             return self.compiled_check().map(|(q, t)| Compiled::Check(q, t));
         }
         let q = query_of(&self.query, &self.options)?;
         if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) && self.options.notify_no_data {
             return Err("an Error Tracking monitor has no NO DATA: an issue without errors in its window counts none".into());
+        }
+        let records = matches!(q.kind, monitor::Kind::Logs { .. } | monitor::Kind::Spans { .. } | monitor::Kind::ErrorTracking { .. } | monitor::Kind::RecordsFormula { .. });
+        if !records && (self.options.on_missing_data.is_some() || self.options.group_retention_duration.is_some()) {
+            return Err(RECORDS_ONLY.into());
+        }
+        if let Some(by) = &self.options.notify_by
+            && !by.iter().any(|t| t == "*")
+        {
+            let keys = monitor::group_keys(&q);
+            if let Some(t) = by.iter().find(|t| !keys.iter().any(|k| k.trim_start_matches('@') == t.trim().trim_start_matches('@'))) {
+                return Err(format!("notify_by {t}: not one of the query's group tags ({}): Datadog's \"must be a subset of the grouping tags in the query\"", keys.join(", ")));
+            }
         }
         let t = &self.options.thresholds;
         if q.dynamic.is_some() && (t.critical.is_some() || t.critical_recovery.is_some()) {
@@ -450,6 +620,18 @@ pub struct GroupState {
     /// nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet_recovery: bool,
+    /// Unix ms: when it last went from OK into trouble, and last went into a state of trouble
+    /// (Datadog's `{{first_triggered_at}}`, `{{last_triggered_at}}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_triggered: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_triggered: Option<i64>,
+    /// Unix ms: when the monitor first had it (`new_group_delay`); 0 for a group kept before.
+    #[serde(default)]
+    pub seen: i64,
+    /// Times its state has been told again since it changed (`renotify_occurrences`).
+    #[serde(default)]
+    pub renotified: u32,
 }
 
 /// What a monitor's messages say of its thresholds (a composite has none: NaN, null in a notice).
@@ -457,14 +639,70 @@ pub struct GroupState {
 struct Said {
     threshold: f64,
     warning: Option<f64>,
+    critical_recovery: Option<f64>,
+    warning_recovery: Option<f64>,
+    /// A service check monitor's OK runs in a row.
+    ok: Option<f64>,
+    op: Option<monitor::Op>,
+}
+
+impl Said {
+    const NONE: Self = Self { threshold: f64::NAN, warning: None, critical_recovery: None, warning_recovery: None, ok: None, op: None };
+
+    fn of_query(q: &monitor::Query, t: &Thresholds) -> Self {
+        Self { threshold: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery, ok: None, op: Some(q.op) }
+    }
+
+    fn of_check(t: &CheckThresholds) -> Self {
+        Self { threshold: f64::from(t.critical), warning: t.warning.map(f64::from), ok: Some(f64::from(t.ok)), ..Self::NONE }
+    }
 }
 
 /// What a monitor's messages say of its thresholds, as its definition has them.
 fn said_of(m: &Monitor) -> Said {
     match m.compiled() {
-        Ok(Compiled::Query(q, t)) => Said { threshold: q.threshold, warning: t.warning },
-        Ok(Compiled::Check(_, t)) => Said { threshold: f64::from(t.critical), warning: t.warning.map(f64::from) },
-        _ => Said { threshold: f64::NAN, warning: None },
+        Ok(Compiled::Query(q, t)) => Said::of_query(&q, &t),
+        Ok(Compiled::Check(_, t)) => Said::of_check(&t),
+        _ => Said::NONE,
+    }
+}
+
+/// What a group the evaluation did not find comes to (Datadog's `on_missing_data`, and before it
+/// `notify_no_data` and its timeframe).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Missing {
+    /// Its state stands, until it is forgotten.
+    Keep,
+    /// NO DATA once it has had none for `after_ms` (told unless `on_missing_data` is
+    /// `show_no_data`: `Monitors::say`).
+    NoData { after_ms: i64 },
+    /// A count of nothing: a group in trouble is moved by a value of 0.
+    Zero,
+    /// OK at once.
+    Resolve,
+}
+
+impl Missing {
+    /// A monitor of a query's: its `on_missing_data`; else NO DATA after `no_data_ms` if it asks to be
+    /// told; else, of logs, spans, events or Error Tracking, a count's 0 (Datadog's default: "Count
+    /// queries evaluate missing data as zero", its log monitor page) and another's last state.
+    fn of(o: &Options, q: &monitor::Query, no_data_ms: i64) -> Self {
+        let records = matches!(q.kind, monitor::Kind::Logs { .. } | monitor::Kind::Spans { .. } | monitor::Kind::ErrorTracking { .. } | monitor::Kind::RecordsFormula { .. });
+        let default = if monitor::counts(q) { Self::Zero } else { Self::Keep };
+        match o.on_missing_data {
+            Some(OnMissingData::ShowNoData | OnMissingData::ShowAndNotifyNoData) => Self::NoData { after_ms: 0 },
+            Some(OnMissingData::Resolve) => Self::Resolve,
+            Some(OnMissingData::Default) => default,
+            None if o.notify_no_data => Self::NoData { after_ms: no_data_ms },
+            None if records => default,
+            None => Self::Keep,
+        }
+    }
+
+    /// Of a monitor that is no query's (a service check's, a composite's): NO DATA after `no_data_ms`
+    /// if it asks to be told.
+    fn told(o: &Options, no_data_ms: i64) -> Self {
+        if o.notify_no_data { Self::NoData { after_ms: no_data_ms } } else { Self::Keep }
     }
 }
 
@@ -497,6 +735,160 @@ pub struct Monitors {
 
 fn group_key(g: &[(String, String)]) -> String {
     g.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(",")
+}
+
+/// A group's move from `prev` to `to` at `now`: since when, Datadog's triggered times (the first:
+/// from OK into trouble; the last: into any state of trouble, "independently from its previous
+/// state"), and its renotifications counted afresh.
+fn moved(g: &mut GroupState, prev: State, to: State, now: i64) {
+    g.state = to.as_str().into();
+    g.since = now;
+    g.renotified = 0;
+    if to != State::Ok {
+        if prev == State::Ok {
+            g.first_triggered = Some(now);
+        }
+        g.last_triggered = Some(now);
+    }
+}
+
+/// Whether a group that stays in `state` is told again now: Datadog's `renotify_interval` (minutes
+/// since it was last told), `renotify_statuses` (ALERT and NO DATA unless said) and
+/// `renotify_occurrences`.
+fn renotifies(o: &Options, state: State, g: &GroupState, now: i64) -> bool {
+    let Some(every) = o.renotify_interval.map(|mins| i64::from(mins) * 60_000).filter(|&r| r > 0) else { return false };
+    let status = match state {
+        State::Alert => Renotify::Alert,
+        State::Warn => Renotify::Warn,
+        State::NoData => Renotify::NoData,
+        State::Ok => return false,
+    };
+    o.renotify_statuses.as_deref().unwrap_or(&[Renotify::Alert, Renotify::NoData]).contains(&status) && now - g.notified >= every && o.renotify_occurrences.is_none_or(|n| g.renotified < n)
+}
+
+/// A group's tags of those `notify_by` names (`*`: none), its notification group's.
+fn projected(group: &[(String, String)], by: &[String]) -> Vec<(String, String)> {
+    if by.iter().any(|b| b == "*") {
+        return Vec::new();
+    }
+    group.iter().filter(|(k, _)| by.iter().any(|b| b.trim().trim_start_matches('@') == k.trim_start_matches('@'))).cloned().collect()
+}
+
+/// Datadog's `notify_by`: each notification group, by its key, its tags, the worst state of its
+/// groups (ALERT over WARN over NO DATA over OK, as composites weigh them) and a group in that
+/// state, by its key.
+fn notified_by(groups: &BTreeMap<String, GroupState>, by: &[String]) -> BTreeMap<String, (Vec<(String, String)>, State, String)> {
+    let mut out: BTreeMap<String, (Vec<(String, String)>, State, String)> = BTreeMap::new();
+    for (key, g) in groups {
+        let p = projected(&g.group, by);
+        let s = State::parse(&g.state).unwrap_or(State::Ok);
+        let e = out.entry(group_key(&p)).or_insert_with(|| (p, s, key.clone()));
+        if composite::severity(s) > composite::severity(e.1) {
+            e.1 = s;
+            e.2.clone_from(key);
+        }
+    }
+    out
+}
+
+/// The explorers' range that covers a window ([`EXPLORER_RANGES`]; past them all, the longest).
+fn explorer_range(window_ms: i64) -> &'static str {
+    EXPLORER_RANGES.iter().find(|(_, ms)| window_ms <= *ms).or(EXPLORER_RANGES.last()).map_or("30d", |&(r, _)| r)
+}
+
+/// A log, span or event monitor's group's latest records over its window (newest first, `n` at the
+/// most): the prefix a message reads them by (Datadog's matching attribute variables, `{{log.…}}`,
+/// `{{span.…}}`, `{{event.…}}`), the records (none where its search finds none), and its explorer's
+/// link to them (`{{log.link}}`: "scoped on the events matching the query"). A formula's are its
+/// first query's ("values resolve based on events extracted from the first query"). None for a
+/// monitor of other data. The store is let go before the search, as a monitor of records reads them.
+fn latest_records(store: &Shared, m: &Monitor, q: &monitor::Query, group: &[(String, String)], link_base: &str, now: i64, n: usize) -> Option<(&'static str, Vec<kiln_obs::logs::record::Record>, String)> {
+    use kiln_obs::query::parse::RecordSource;
+    let r = monitor::group_records(q, group)?;
+    let (prefix, page) = match r.of {
+        RecordSource::Logs => ("log", "logs"),
+        RecordSource::Spans => ("span", "traces"),
+        RecordSource::Events => ("event", "events"),
+    };
+    let link = format!("{link_base}/observe/{page}?q={}&range={}", monitor::template::urlencode(&r.search), explorer_range(r.window_ms));
+    let parsed = if r.of == RecordSource::Spans { kiln_obs::logs::search::parse_spans(&r.search) } else { kiln_obs::logs::search::parse(&r.search) };
+    let to = now - i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
+    let ns = |ms: i64| ms.saturating_mul(1_000_000);
+    let records = match parsed {
+        Ok(search) => {
+            let at = if r.of == RecordSource::Spans { held(store).spans_at() } else { held(store).logs_at() };
+            at.search(&search, ns(to - r.window_ms), ns(to) - 1, n).map(|f| f.records).unwrap_or_default()
+        }
+        Err(e) => {
+            tracing::debug!(monitor = %m.name, error = %e, "a monitor's group's records were not searched");
+            Vec::new()
+        }
+    };
+    Some((prefix, records, link))
+}
+
+/// A record's variables, Datadog's matching attribute variables of `prefix` (`log`, `span`, `event`;
+/// a composite's monitor's, `a.log`): each attribute (`{{log.attributes.<key>}}`, and as a tag,
+/// `{{log.tags.<key>}}`: kiln keeps a record's tags as attributes), and the reserved attributes its
+/// page lists for the kind: a log's `message`, `service`, `status`, `source`, `host`, `span_id`,
+/// `trace_id`, `timestamp`; a span's `env`, `operation_name`, `resource_name` (its name), `service`,
+/// `status` (`ok`, `error`), `type`, ids and `timestamp`; an event's `title`, `text`, `host.name`,
+/// `attributes` (an object, as the API writes one), `tags` (`key:value`, by commas) and `timestamp`;
+/// each with its `link`. Ids are hex, as kiln's API writes them; times as `{{last_triggered_at}}` is.
+fn record_vars(prefix: &str, r: &kiln_obs::logs::record::Record, link: &str) -> Vec<(String, String)> {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let attr = |k: &str| r.attrs.iter().rev().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+    let mut out: Vec<(String, String)> = Vec::with_capacity(2 * r.attrs.len() + 10);
+    for (k, v) in &r.attrs {
+        out.push((format!("{prefix}.attributes.{k}"), v.clone()));
+        out.push((format!("{prefix}.tags.{k}"), v.clone()));
+    }
+    let mut put = |k: &str, v: String| out.push((format!("{prefix}.{k}"), v));
+    put("link", link.to_owned());
+    put("timestamp", monitor::template::local_time(r.ts.div_euclid(1_000_000), kiln_obs::query::calendar::Zone::UTC).unwrap_or_default());
+    put("service", r.service.clone());
+    let ids = |put: &mut dyn FnMut(&str, String)| {
+        put("trace_id", r.trace_id.map(|t| hex(&t)).unwrap_or_default());
+        put("span_id", r.span_id.map(|s| hex(&s)).unwrap_or_default());
+    };
+    match prefix.rsplit('.').next().unwrap_or(prefix) {
+        "span" => {
+            ids(&mut put);
+            put("env", attr("env").unwrap_or_default());
+            put("operation_name", attr("operation_name").unwrap_or_else(|| r.message.clone()));
+            put("resource_name", r.message.clone());
+            put("status", if kiln_obs::logs::record::level(r.severity) == "error" { "error" } else { "ok" }.to_owned());
+            put("type", attr("span.type").unwrap_or_default());
+        }
+        "event" => {
+            let title = attr("title").unwrap_or_else(|| r.message.lines().next().unwrap_or_default().to_owned());
+            let text = r.message.strip_prefix(title.as_str()).map_or(r.message.as_str(), |t| t.trim_start_matches('\n'));
+            put("text", text.to_owned());
+            put("title", title);
+            put("host.name", r.host.clone());
+            put("attributes", serde_json::to_string(&super::api::AttrsOut(&r.attrs)).unwrap_or_default());
+            put("tags", r.attrs.iter().map(|(k, v)| if v.is_empty() { k.clone() } else { format!("{k}:{v}") }).collect::<Vec<_>>().join(","));
+        }
+        _ => {
+            ids(&mut put);
+            put("message", r.message.clone());
+            put("status", kiln_obs::logs::record::level(r.severity).to_owned());
+            put("source", r.source.clone());
+            put("host", r.host.clone());
+        }
+    }
+    out
+}
+
+/// Datadog's `enable_logs_sample`: a log monitor's notification of trouble shows its group's latest
+/// logs, each a line: its time, status, service and host, and its message's first line.
+fn samples_text(rs: &[kiln_obs::logs::record::Record]) -> String {
+    let mut out = String::from("Log samples:");
+    for r in rs {
+        let at = monitor::template::local_time(r.ts.div_euclid(1_000_000), kiln_obs::query::calendar::Zone::UTC).unwrap_or_default();
+        let _ = write!(out, "\n- {at} {} {} {}: {}", kiln_obs::logs::record::level(r.severity), r.service, r.host, r.message.lines().next().unwrap_or_default());
+    }
+    out
 }
 
 impl Monitors {
@@ -564,6 +956,7 @@ impl Monitors {
                 return Err(format!("composites read it ({}): it cannot be one", readers.join(", ")));
             }
         }
+        let made = m.id.is_empty() || !defs.contains_key(&m.id);
         if m.id.is_empty() {
             m.id = super::fresh_id("m", |id| defs.contains_key(id));
             m.created = now;
@@ -582,6 +975,7 @@ impl Monitors {
         lock(&self.due).next.remove(&m.id);
         self.changed.notify();
         self.save().map_err(|e| format!("{e:#}"))?;
+        self.tell_audit(&m, if made { "created" } else { "modified" });
         Ok(m)
     }
 
@@ -592,14 +986,17 @@ impl Monitors {
         if !readers.is_empty() {
             return Err(Refused::Read(readers));
         }
-        let had = defs.remove(id).is_some();
+        let gone = defs.remove(id);
         drop(defs);
         lock(&self.due).next.remove(id);
         self.changed.notify();
         lock(&self.states).remove(id);
         self.save().map_err(|e| Refused::Io(format!("{e:#}")))?;
         self.save_states();
-        Ok(had)
+        if let Some(m) = &gone {
+            self.tell_audit(m, "deleted");
+        }
+        Ok(gone.is_some())
     }
 
     pub fn mute(&self, id: &str, until: Option<i64>) -> Result<Option<Monitor>, String> {
@@ -732,28 +1129,32 @@ impl Monitors {
             monitor::Kind::ErrorTracking { search, new, by, window_ms } => error_values(store, search, *new, by, *window_ms, m.modified, now - delay),
             _ => monitor::evaluate_shared(store, &q, now, delay),
         };
-        let values = match values {
-            Ok(v) => v,
-            Err(e) => {
+        // Datadog's `require_full_window` (a metric monitor's): a group whose window is not full is
+        // not evaluated now, its state as it was.
+        let full = if m.options.require_full_window { monitor::full_windows(kiln_obs::query::eval::Source::Shared(store), &q, now, delay) } else { Ok(None) };
+        let (mut values, full) = match (values, full) {
+            (Ok(v), Ok(f)) => (v, f),
+            (Err(e), _) | (_, Err(e)) => {
                 tracing::debug!(monitor = %m.name, error = %e, "a monitor did not evaluate");
                 return false;
             }
         };
+        let mut not_full: HashSet<Group> = HashSet::new();
+        if let Some(full) = &full {
+            let (kept, held): (Vec<monitor::Value>, Vec<monitor::Value>) = values.into_iter().partition(|v| full.contains(&v.group));
+            not_full = held.into_iter().map(|v| v.group).collect();
+            values = kept;
+        }
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * Monitor::window_ms(&q), |mins| i64::from(mins) * 60_000);
         // What each group's state moves by besides its value (`kiln_obs::monitor::Own`).
         let owns: HashMap<Group, monitor::Own> = values.iter().map(|v| (v.group.clone(), v.own)).collect();
-        let mut found: Vec<(Group, Option<f64>, Option<State>)> = values.into_iter().map(|v| (v.group, Some(v.value), None)).collect();
-        // An Error Tracking monitor's group in trouble that it no longer finds (its issue resolved,
-        // ignored, no longer new, or without errors in the window) counts none, and recovers: a
-        // count of a group gone quiet is zero, as Datadog evaluates its event monitors' groups.
-        if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) {
-            let have: HashSet<&Group> = found.iter().map(|(g, _, _)| g).collect();
-            let gone: Vec<Group> =
-                lock(&self.states).get(&m.id).map(|gs| gs.values().filter(|g| g.state != State::Ok.as_str() && !have.contains(&g.group)).map(|g| g.group.clone()).collect()).unwrap_or_default();
-            found.extend(gone.into_iter().map(|g| (g, Some(0.0), None)));
-        }
-        let said = Said { threshold: q.threshold, warning: t.warning };
-        self.apply(store, m, now, no_data_ms, found, |group, prev, value, _| monitor::next(prev, value, owns.get(group).copied().unwrap_or_default(), q.op, &t, m.options.notify_no_data), said)
+        let found: Vec<(Group, Option<f64>, Option<State>)> = values.into_iter().map(|v| (v.group, Some(v.value), None)).collect();
+        // A group it no longer finds: an Error Tracking monitor's (its issue resolved, ignored, no
+        // longer new, or without errors in the window) counts none and recovers, as a log monitor's
+        // count does ([`Missing::of`]).
+        let missing = Missing::of(&m.options, &q, no_data_ms);
+        let notify_no_data = matches!(missing, Missing::NoData { .. });
+        self.apply(store, m, now, missing, found, &not_full, |group, prev, value, _| monitor::next(prev, value, owns.get(group).copied().unwrap_or_default(), q.op, &t, notify_no_data), Said::of_query(&q, &t))
     }
 
     /// A service check monitor's evaluation: each group moved by its last runs
@@ -766,8 +1167,7 @@ impl Monitors {
         let lookback = m.options.no_data_timeframe.map_or(CHECK_NO_DATA_MS, |mins| i64::from(mins) * 60_000);
         let groups = checks::evaluate(&held(store), q, t, now - delay, lookback);
         let found = groups.into_iter().map(|g| (g.group, Some(f64::from(g.status)), g.state)).collect();
-        let said = Said { threshold: f64::from(t.critical), warning: t.warning.map(f64::from) };
-        self.apply(store, m, now, 0, found, |_, prev, _, made| made.unwrap_or(prev), said)
+        self.apply(store, m, now, Missing::told(&m.options, 0), found, &HashSet::new(), |_, prev, _, made| made.unwrap_or(prev), Said::of_check(t))
     }
 
     /// A composite's evaluation: its groups' states from the states of the monitors it reads, as
@@ -783,66 +1183,122 @@ impl Monitors {
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * every_ms, |mins| i64::from(mins) * 60_000);
         let notify = m.options.notify_no_data;
         let found: Vec<(Group, Option<f64>, Option<State>)> = results.into_iter().map(|(g, s)| (g, None, Some(s))).collect();
-        self.apply(store, m, now, no_data_ms, found, |_, prev, _, s| s.filter(|&s| s != State::NoData || notify).unwrap_or(prev), Said { threshold: f64::NAN, warning: None })
+        self.apply(store, m, now, Missing::told(&m.options, no_data_ms), found, &HashSet::new(), |_, prev, _, s| s.filter(|&s| s != State::NoData || notify).unwrap_or(prev), Said::NONE)
     }
 
     /// What an evaluation found, applied: each group found moves from its last state to what
-    /// `next(last, its value, the state the evaluation found it in, if any)` says; groups not found go to NO DATA
-    /// after `no_data_ms` when the monitor asks to be told, and are forgotten after a day. Changes
-    /// are said, and groups in trouble said again when due. Whether any state changed.
+    /// `next(last, its value, the state the evaluation found it in, if any)` says, unless it is new
+    /// within the monitor's `new_group_delay`; a group in `held` (its window not full) stays as it
+    /// is; one not found comes to what `missing` says, a group in trouble resolves after `timeout_h`
+    /// without data, and a group is forgotten after its retention (a day unless said). Changes are
+    /// said, and groups in trouble said again when due; under `notify_by`, its notification groups'
+    /// instead. Whether any state changed.
     #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
         store: &Shared,
         m: &Monitor,
         now: i64,
-        no_data_ms: i64,
+        missing: Missing,
         found: Vec<(Group, Option<f64>, Option<State>)>,
+        held: &HashSet<Group>,
         next: impl Fn(&Group, State, Option<f64>, Option<State>) -> State,
         said: Said,
     ) -> bool {
-        let renotify_ms = m.options.renotify_interval.map(|mins| i64::from(mins) * 60_000).filter(|&r| r > 0);
+        let o = &m.options;
+        let delay_ms = i64::from(o.new_group_delay.unwrap_or(0)) * 1000;
+        let timeout_ms = o.timeout_h.map(|h| i64::from(h) * 3_600_000);
+        let forget_ms = o.group_retention_duration.as_deref().and_then(duration_ms).unwrap_or(FORGET_MS);
+        let by = o.notify_by.as_deref();
         let mut transitions: Vec<(GroupState, State)> = Vec::new();
         let mut renotify: Vec<GroupState> = Vec::new();
+        // Under `notify_by`: each notification group told, the state it came from, whether again,
+        // and its key.
+        let mut by_told: Vec<(GroupState, State, bool, String)> = Vec::new();
         let mut changed = false;
         {
             let mut all = lock(&self.states);
             let groups = all.entry(m.id.clone()).or_default();
-            let mut seen: HashSet<String> = HashSet::with_capacity(found.len());
+            let before = by.map(|b| notified_by(groups, b));
+            let mut seen: HashSet<String> = held.iter().map(|g| group_key(g)).collect();
             for (group, value, made) in found {
                 let key = group_key(&group);
                 if !groups.contains_key(&key) && groups.len() >= GROUPS {
                     continue;
                 }
                 seen.insert(key.clone());
-                let g = groups.entry(key).or_insert_with(|| GroupState { group, state: State::Ok.as_str().into(), value: None, since: now, last_data: now, notified: 0, quiet_recovery: false });
+                let g = groups.entry(key).or_insert_with(|| GroupState {
+                    group,
+                    state: State::Ok.as_str().into(),
+                    value: None,
+                    since: now,
+                    last_data: now,
+                    notified: 0,
+                    quiet_recovery: false,
+                    first_triggered: None,
+                    last_triggered: None,
+                    seen: now,
+                    renotified: 0,
+                });
                 let prev = State::parse(&g.state).unwrap_or(State::Ok);
-                let to = next(&g.group, prev, value, made);
+                // Datadog's `new_group_delay`: "Time (in seconds) to skip evaluations for new groups",
+                // a group new that "has not been seen in the last 24 hours".
+                if now - g.last_data >= NEW_AFTER_MS {
+                    g.seen = now;
+                }
+                let to = if g.seen > 0 && now - g.seen < delay_ms { prev } else { next(&g.group, prev, value, made) };
                 g.value = value;
                 g.last_data = now;
                 if to != prev {
+                    moved(g, prev, to, now);
                     transitions.push((g.clone(), prev));
-                    g.state = to.as_str().into();
-                    g.since = now;
                     changed = true;
-                } else if to != State::Ok && renotify_ms.is_some_and(|r| now - g.notified >= r) {
+                } else if by.is_none() && renotifies(o, to, g, now) {
                     renotify.push(g.clone());
                 }
             }
-            // Groups not found now: NO DATA after the timeframe, when asked; forgotten after a day.
-            groups.retain(|key, g| seen.contains(key) || now - g.last_data < FORGET_MS);
+            groups.retain(|key, g| seen.contains(key) || now - g.last_data < forget_ms);
             for (key, g) in groups.iter_mut() {
-                if seen.contains(key) || now - g.last_data < no_data_ms {
+                if seen.contains(key) {
                     continue;
                 }
                 let prev = State::parse(&g.state).unwrap_or(State::Ok);
-                let to = if m.options.notify_no_data { State::NoData } else { prev };
+                let quiet = now - g.last_data;
+                let (to, value) = match missing {
+                    // Datadog's `timeout_h`: "Hours without data before the monitor auto-resolves from
+                    // a triggered state", ALERT or WARN ("Monitors do not auto-resolve from an ALERT
+                    // or WARN state if data is still reporting"); NO DATA is the lack itself.
+                    _ if matches!(prev, State::Alert | State::Warn) && timeout_ms.is_some_and(|t| quiet >= t) => (State::Ok, g.value),
+                    Missing::NoData { after_ms, .. } if quiet >= after_ms => (State::NoData, None),
+                    // "Empty result is replaced with zero and is compared to the alert/warning
+                    // thresholds", in whatever state (a count's `< 1` alerts on its group gone quiet).
+                    Missing::Zero => (next(&g.group, prev, Some(0.0), None), Some(0.0)),
+                    Missing::Resolve => (State::Ok, g.value),
+                    Missing::Keep | Missing::NoData { .. } => (prev, g.value),
+                };
                 if to != prev {
+                    g.value = value;
+                    moved(g, prev, to, now);
                     transitions.push((g.clone(), prev));
-                    g.state = to.as_str().into();
-                    g.since = now;
-                    g.value = None;
                     changed = true;
+                }
+            }
+            if let (Some(by), Some(before)) = (by, before) {
+                // What is told is its notification groups' moves, not their groups'.
+                transitions.clear();
+                for (k, (p, to, rep)) in notified_by(groups, by) {
+                    let Some(r) = groups.get(&rep) else { continue };
+                    let mut told = r.clone();
+                    told.group = p;
+                    let was = before.get(&k).map_or(State::Ok, |b| b.1);
+                    if to != was {
+                        by_told.push((told, was, false, k));
+                        continue;
+                    }
+                    let (notified, renotified) = groups.values().filter(|g| group_key(&projected(&g.group, by)) == k).fold((0_i64, 0_u32), |(n, c), g| (n.max(g.notified), c.max(g.renotified)));
+                    if renotifies(o, to, &GroupState { notified, renotified, ..told.clone() }, now) {
+                        by_told.push((told, to, true, k));
+                    }
                 }
             }
         }
@@ -856,28 +1312,149 @@ impl Monitors {
             let s = State::parse(&g.state).unwrap_or(State::Ok);
             self.say(store, m, said, &g, s, s, now);
         }
+        if let Some(by) = by {
+            for (g, from, again, key) in by_told {
+                let to = State::parse(&g.state).unwrap_or(State::Ok);
+                // Its groups told with it (`say` keeps a group's own, where the two are one).
+                if self.say(store, m, said, &g, if again { to } else { from }, to, now)
+                    && let Some(gs) = lock(&self.states).get_mut(&m.id)
+                {
+                    let own = group_key(&g.group);
+                    for member in gs.iter_mut().filter(|(k, x)| **k != own && group_key(&projected(&x.group, by)) == key).map(|(_, x)| x) {
+                        member.notified = now;
+                        if again {
+                            member.renotified = member.renotified.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
         changed
     }
 
-    /// A group's change of state (or its renotification): its event, and, unless the monitor is
-    /// muted, its message to every integration the message mentions. An Error Tracking monitor's
-    /// group is an issue's: its message given the issue's variables, its link the issue's page,
-    /// and nothing said of it while the issue is ignored (Datadog's).
+    /// A composite's monitors' variables for its group's message (Datadog's "Composite monitor
+    /// variables"): `a`, `b`, … its monitors as its query first names them (its form letters them as
+    /// they are chosen, and its API writes the condition with their ids), each its group's that the
+    /// composite's group holds (by its tags' values, as composites match groups) or its one group:
+    /// `{{a.value}}`, `{{a.status}}` (`OK`, `Alert`, `Warn`, `No Data`), and where `texts` reads
+    /// them, its records' (`{{a.log.message}}`). Also the prefixes of the records read.
+    fn composite_vars(&self, store: &Shared, c: &Composite, group: &[(String, String)], texts: &str, now: i64) -> (Vec<(String, String)>, Vec<String>) {
+        let (mut out, mut blank) = (Vec::new(), Vec::new());
+        let values: HashSet<&str> = group.iter().map(|(_, v)| v.as_str()).collect();
+        for (id, letter) in c.ids.iter().zip('a'..='z') {
+            let found = lock(&self.states).get(id).and_then(|gs| gs.values().find(|g| g.group.iter().all(|(_, v)| values.contains(v.as_str()))).cloned());
+            let Some(g) = found else { continue };
+            let status = match State::parse(&g.state).unwrap_or(State::Ok) {
+                State::Ok => "OK",
+                State::Alert => "Alert",
+                State::Warn => "Warn",
+                State::NoData => "No Data",
+            };
+            out.push((format!("{letter}.value"), g.value.map_or_else(|| "no data".to_owned(), monitor::template::num)));
+            out.push((format!("{letter}.status"), status.to_owned()));
+            if !["log.", "span.", "event."].iter().any(|p| texts.contains(&format!("{letter}.{p}"))) {
+                continue;
+            }
+            let Some(sub) = self.get(id) else { continue };
+            let Ok(Compiled::Query(q, _)) = sub.compiled() else { continue };
+            if let Some((prefix, rs, link)) = latest_records(store, &sub, &q, &g.group, &self.link_base, now, 1) {
+                let p = format!("{letter}.{prefix}");
+                match rs.first() {
+                    Some(r) => out.extend(record_vars(&p, r, &link)),
+                    None => out.push((format!("{p}.link"), link)),
+                }
+                blank.push(p);
+            }
+        }
+        (out, blank)
+    }
+
+    /// A group's change of state (or its renotification, `from` its state still): its event, and,
+    /// unless the monitor is muted, its message to every integration the message mentions. An Error
+    /// Tracking monitor's group is an issue's: its message given the issue's variables, its link the
+    /// issue's page, and nothing said of it while the issue is ignored (Datadog's). A log, span or
+    /// event monitor's message reads the group's latest record (Datadog's `{{log.message}}`, ...),
+    /// a composite's its monitors' (`{{a.value}}`). Whether it was told.
     #[allow(clippy::too_many_arguments)]
-    fn say(&self, store: &Shared, m: &Monitor, said: Said, g: &GroupState, from: State, to: State, now: i64) {
+    fn say(&self, store: &Shared, m: &Monitor, said: Said, g: &GroupState, from: State, to: State, now: i64) -> bool {
         let issue = issue_of(m, g);
         let link = match &issue {
             Some(i) => format!("{}/observe/errors/{}", self.link_base, i.id),
             None => format!("{}/observe/monitors/{}", self.link_base, m.id),
         };
-        let extra = match (&issue, m.compiled()) {
-            (Some(i), _) => issue_vars(store, i, &m.message, now),
-            (None, Ok(Compiled::Check(q, _))) => check_vars(store, &q, &g.group, now),
+        let renotify = from == to;
+        let compiled = m.compiled();
+        // What the message and its escalation read.
+        let texts = format!("{}\n{}", m.message, m.options.escalation_message.as_deref().unwrap_or_default());
+        let mut blank: Vec<String> = Vec::new();
+        let mut extra = match (&issue, &compiled) {
+            (Some(i), _) => issue_vars(store, i, &texts, now),
+            (None, Ok(Compiled::Check(q, _))) => check_vars(store, q, &g.group, now),
+            (None, Ok(Compiled::Composite(c))) => {
+                let (vars, read) = self.composite_vars(store, c, &g.group, &texts, now);
+                blank.extend(read);
+                vars
+            }
             _ => Vec::new(),
         };
+        if issue.is_some() {
+            extra.push(("issue.link".into(), link.clone()));
+        }
+        // Datadog's `{{#is_unknown}}`: a service check's group in NO DATA by its UNKNOWN runs.
+        let unknown = to == State::NoData && extra.iter().any(|(k, v)| k == "check_status" && v == checks::name(checks::UNKNOWN));
+        // The group's latest records, searched for only where its message reads them or its
+        // notification shows them (Datadog's `enable_logs_sample`: "not displayed for recovery").
+        let samples = m.options.enable_logs_sample && matches!(to, State::Alert | State::Warn);
+        let reads = ["log.", "span.", "event."].iter().any(|p| texts.contains(p));
+        let records = match &compiled {
+            Ok(Compiled::Query(q, _)) if reads || samples => latest_records(store, m, q, &g.group, &self.link_base, now, if samples { SAMPLES } else { 1 }),
+            _ => None,
+        };
+        if let Some((prefix, rs, records_link)) = &records {
+            match rs.first() {
+                Some(r) => extra.extend(record_vars(prefix, r, records_link)),
+                None => extra.push((format!("{prefix}.link"), records_link.clone())),
+            }
+            blank.push((*prefix).to_owned());
+        }
         let tr = Transition { from, to };
-        let vars = Vars { monitor: &m.name, value: g.value, threshold: said.threshold, warn_threshold: said.warning, group: &g.group, link: &link, extra: &extra };
-        let message = monitor::render(&m.message, tr, &vars);
+        let vars = Vars {
+            monitor: &m.name,
+            value: g.value,
+            threshold: said.threshold,
+            warn_threshold: said.warning,
+            critical_recovery: said.critical_recovery,
+            warning_recovery: said.warning_recovery,
+            ok_threshold: said.ok,
+            comparator: said.op,
+            group: &g.group,
+            link: &link,
+            extra: &extra,
+            first_triggered: g.first_triggered,
+            last_triggered: g.last_triggered,
+            now,
+            priority: m.priority,
+            renotify,
+            unknown,
+            blank: &blank,
+        };
+        let rendered = monitor::render_message(&m.message, tr, &vars);
+        let mut message = rendered.text;
+        // Datadog's `escalation_message`: "Message to include with a re-notification".
+        if renotify && let Some(e) = &m.options.escalation_message {
+            let more = monitor::render(e, tr, &vars);
+            if !more.trim().is_empty() {
+                message.push_str("\n\n");
+                message.push_str(&more);
+            }
+        }
+        if samples
+            && let Some(("log", rs, _)) = &records
+            && !rs.is_empty()
+        {
+            message.push_str("\n\n");
+            message.push_str(&samples_text(rs));
+        }
         let downtime = self.downtimes.holding(&m.id, &m.tags, &g.group, now);
         // A recovery a downtime that ended asked to keep quiet: this one, once.
         let quiet = to == State::Ok && from != State::Ok && {
@@ -886,7 +1463,9 @@ impl Monitors {
             gs.is_some_and(|gs| std::mem::take(&mut gs.quiet_recovery))
         };
         let ignored = issue.as_ref().is_some_and(|i| i.status == super::errors::Status::Ignored);
-        let muted = m.muted(now) || downtime.is_some() || quiet || ignored;
+        // Datadog's `on_missing_data: show_no_data`: NO DATA shown, not told.
+        let unsaid = to == State::NoData && m.options.on_missing_data == Some(OnMissingData::ShowNoData);
+        let muted = m.muted(now) || downtime.is_some() || quiet || ignored || unsaid;
         if let Some(o) = super::api::get() {
             let mut attrs: Vec<(String, String)> = vec![
                 ("event.type".into(), format!("monitor.{}", to.as_str().to_ascii_lowercase().replace(' ', "_"))),
@@ -917,7 +1496,7 @@ impl Monitors {
             }
         }
         if muted {
-            return;
+            return false;
         }
         let notice = Notice {
             monitor_id: m.id.clone(),
@@ -930,11 +1509,14 @@ impl Monitors {
             message: message.clone(),
             link,
             at: now,
-            priority: m.priority,
+            // Datadog's `{{override_priority 'P1'}}`, else the monitor's own.
+            priority: rendered.priority.or(m.priority),
             tags: m.tags.clone(),
             event: "monitor.transition",
             headline: None,
             facts: None,
+            include_tags: m.options.include_tags.unwrap_or(true),
+            footer: m.options.notification_preset_name.is_none_or(Preset::footer),
         };
         let mentions = monitor::mentions(&message);
         let mut incident = false;
@@ -957,6 +1539,47 @@ impl Monitors {
         }
         if let Some(gs) = lock(&self.states).get_mut(&m.id).and_then(|gs| gs.get_mut(&group_key(&g.group))) {
             gs.notified = now;
+            // Datadog's `renotify_occurrences` counts what is told again.
+            if renotify {
+                gs.renotified = gs.renotified.saturating_add(1);
+            }
+        }
+        true
+    }
+
+    /// Datadog's `notify_audit`: the handles a monitor's message mentions told it was made, changed
+    /// or deleted ("tagged users are notified of changes to the monitor"). A change of definition is
+    /// no alert: told where people read (chat, email, webhooks), not paged or ticketed (PagerDuty,
+    /// Opsgenie, Jira, ServiceNow, whose every notice raises or resolves one).
+    fn tell_audit(&self, m: &Monitor, what: &str) {
+        if !m.options.notify_audit {
+            return;
+        }
+        let notice = Notice {
+            monitor_id: m.id.clone(),
+            monitor: m.name.clone(),
+            state: "",
+            previous: "",
+            group: Vec::new(),
+            value: None,
+            threshold: 0.0,
+            message: format!("{} was {what}.\n\n{}", m.name, m.query),
+            link: format!("{}/observe/monitors/{}", self.link_base, m.id),
+            at: crate::util::now_ms(),
+            priority: m.priority,
+            tags: m.tags.clone(),
+            event: "monitor.audit",
+            headline: Some(format!("[Monitor {what}] {}", m.name)),
+            facts: Some(vec![("Query".into(), m.query.clone())]),
+            include_tags: true,
+            footer: m.options.notification_preset_name.is_none_or(Preset::footer),
+        };
+        for mention in monitor::mentions(&m.message) {
+            match self.integrations.mentioned(&mention) {
+                Some((_, Integration::Pagerduty { .. } | Integration::Opsgenie { .. } | Integration::Jira { .. } | Integration::Servicenow { .. })) => {}
+                Some((name, i)) => self.notifier.send(&name, i, notice.clone()),
+                None => tracing::debug!(monitor = %m.name, %mention, "a mention names no integration"),
+            }
         }
     }
 
@@ -994,6 +1617,8 @@ impl Monitors {
             event,
             headline: Some(format!("[{word}] Incident #{}: {}", i.public_id, i.title)),
             facts: Some(vec![("Severity".into(), i.severity.clone()), ("State".into(), i.state.clone()), ("Commander".into(), i.commander.clone().unwrap_or_else(|| "none".into()))]),
+            include_tags: true,
+            footer: true,
         };
         for mention in super::incidents::mentions(&i.notification_handles) {
             match self.integrations.mentioned(&mention) {
@@ -1023,6 +1648,8 @@ impl Monitors {
             event: "monitor.transition",
             headline: None,
             facts: None,
+            include_tags: true,
+            footer: true,
         };
         self.notifier.send(name, i, notice);
         Ok(())
@@ -1243,5 +1870,196 @@ mod tests {
             shutdown.cancel();
             Ok(())
         })
+    }
+
+    fn test_store() -> Shared {
+        Arc::new(kiln_obs::lock::RwLock::new(kiln_obs::store::Store::new(kiln_obs::hash::Keyed::new())))
+    }
+
+    /// Datadog's notification options as `apply` moves and tells groups: `new_group_delay` (a new
+    /// group not evaluated within it; one unseen a day new again), `renotify_interval` with
+    /// `renotify_statuses` and `renotify_occurrences` (told again in ALERT alone, twice), the
+    /// triggered times as its variables page's table has them (WARN after ALERT moves the last, not
+    /// the first), `timeout_h` (WARN resolved after an hour without data; NO DATA, the lack itself,
+    /// not), a count's group gone quiet compared as 0 (`< 1` alerts), and `notify_by` (a service's
+    /// one notification, told as its worst group moves, not as each of its hosts does).
+    #[test]
+    fn datadog_s_notification_options_move_and_tell_groups_as_its_pages_say() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ms = Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");
+        let store = test_store();
+        let host = |h: &str| vec![("host".to_owned(), h.to_owned())];
+        // Above 1 alerts, above 0.5 warns, no value keeps the state.
+        let next = |_: &Group, prev: State, v: Option<f64>, _: Option<State>| match v {
+            Some(v) if v > 1.0 => State::Alert,
+            Some(v) if v > 0.5 => State::Warn,
+            Some(_) => State::Ok,
+            None => prev,
+        };
+        let state = |id: &str, g: &Group| lock(&ms.states).get(id).and_then(|gs| gs.get(&group_key(g)).cloned()).ok_or_else(|| anyhow::anyhow!("no group {g:?}"));
+        let (min, t0) = (60_000, 1_800_000_000_000);
+        let none: HashSet<Group> = HashSet::new();
+
+        let m = Monitor { options: Options { new_group_delay: Some(120), renotify_interval: Some(10), renotify_statuses: Some(vec![Renotify::Alert]), renotify_occurrences: Some(2), timeout_h: Some(1), ..Options::default() }, ..metric_monitor() };
+        let m = ms.put(m).map_err(anyhow::Error::msg)?;
+        let run = |at: i64, found: Vec<(Group, Option<f64>, Option<State>)>| ms.apply(&store, &m, at, Missing::Keep, found, &none, next, Said::NONE);
+        let a = host("a");
+        run(t0, vec![(a.clone(), Some(5.0), None)]);
+        anyhow::ensure!(state(&m.id, &a)?.state == "OK", "new: not evaluated within its delay");
+        run(t0 + 2 * min, vec![(a.clone(), Some(5.0), None)]);
+        let g = state(&m.id, &a)?;
+        anyhow::ensure!(g.state == "ALERT" && g.first_triggered == Some(t0 + 2 * min) && g.last_triggered == Some(t0 + 2 * min) && g.notified == t0 + 2 * min, "{g:?}");
+        for k in [12, 22, 32] {
+            run(t0 + k * min, vec![(a.clone(), Some(5.0), None)]);
+        }
+        let g = state(&m.id, &a)?;
+        anyhow::ensure!(g.renotified == 2 && g.notified == t0 + 22 * min, "told again twice, not a third time: {g:?}");
+        run(t0 + 33 * min, vec![(a.clone(), Some(0.8), None)]);
+        run(t0 + 50 * min, vec![(a.clone(), Some(0.8), None)]);
+        let g = state(&m.id, &a)?;
+        anyhow::ensure!(g.state == "WARN" && g.first_triggered == Some(t0 + 2 * min) && g.last_triggered == Some(t0 + 33 * min) && g.notified == t0 + 33 * min && g.renotified == 0, "WARN not told again: {g:?}");
+        run(t0 + 90 * min, Vec::new());
+        anyhow::ensure!(state(&m.id, &a)?.state == "WARN", "40 minutes without data: within timeout_h");
+        run(t0 + 111 * min, Vec::new());
+        let g = state(&m.id, &a)?;
+        anyhow::ensure!(g.state == "OK" && g.first_triggered == Some(t0 + 2 * min), "an hour without data: resolved, its triggered times kept: {g:?}");
+        let back = t0 + 50 * min + NEW_AFTER_MS;
+        run(back, vec![(a.clone(), Some(5.0), None)]);
+        anyhow::ensure!(state(&m.id, &a)?.state == "OK", "unseen a day: new again, its delay anew");
+        run(back + 2 * min, vec![(a.clone(), Some(5.0), None)]);
+        anyhow::ensure!(state(&m.id, &a)?.state == "ALERT");
+
+        // NO DATA (asked for after 10 minutes) is not resolved by timeout_h.
+        let n = ms.put(Monitor { name: "no data".into(), options: Options { notify_no_data: true, timeout_h: Some(1), ..Options::default() }, ..metric_monitor() }).map_err(anyhow::Error::msg)?;
+        let nd = |at: i64, found: Vec<(Group, Option<f64>, Option<State>)>| ms.apply(&store, &n, at, Missing::NoData { after_ms: 10 * min }, found, &none, next, Said::NONE);
+        nd(t0, vec![(a.clone(), Some(5.0), None)]);
+        nd(t0 + 11 * min, Vec::new());
+        nd(t0 + 120 * min, Vec::new());
+        let g = state(&n.id, &a)?;
+        anyhow::ensure!(g.state == "NO DATA" && g.last_triggered == Some(t0 + 11 * min), "{g:?}");
+
+        // A count's group gone quiet is 0, compared with the thresholds.
+        let below = |_: &Group, _: State, v: Option<f64>, _: Option<State>| if v.is_some_and(|v| v < 1.0) { State::Alert } else { State::Ok };
+        let c = ms.put(Monitor { name: "quiet".into(), ..metric_monitor() }).map_err(anyhow::Error::msg)?;
+        ms.apply(&store, &c, t0, Missing::Zero, vec![(a.clone(), Some(3.0), None)], &none, below, Said::NONE);
+        ms.apply(&store, &c, t0 + min, Missing::Zero, Vec::new(), &none, below, Said::NONE);
+        let g = state(&c.id, &a)?;
+        anyhow::ensure!(g.state == "ALERT" && g.value == Some(0.0), "{g:?}");
+
+        // notify_by service: one notification for web, as its worst host moves.
+        let svc = |h: &str| vec![("host".to_owned(), h.to_owned()), ("service".to_owned(), "web".to_owned())];
+        let b = Monitor { name: "by service".into(), query: "avg(last_5m):cpu{*} by {host,service} > 1".into(), options: Options { notify_by: Some(vec!["service".into()]), ..Options::default() }, ..metric_monitor() };
+        let b = ms.put(b).map_err(anyhow::Error::msg)?;
+        let by = |at: i64, x: f64, y: f64| ms.apply(&store, &b, at, Missing::Keep, vec![(svc("x"), Some(x), None), (svc("y"), Some(y), None)], &none, next, Said::NONE);
+        by(t0, 0.0, 0.0);
+        by(t0 + min, 5.0, 0.0);
+        by(t0 + 2 * min, 5.0, 5.0);
+        let (x, y) = (state(&b.id, &svc("x"))?, state(&b.id, &svc("y"))?);
+        anyhow::ensure!(x.state == "ALERT" && y.state == "ALERT" && x.notified == t0 + min && y.notified == t0 + min, "web told once, as x alerted: {x:?} {y:?}");
+        Ok(())
+    }
+
+    /// Datadog's bounds on its options, each refused past them (`evaluation_delay` over a day,
+    /// `timeout_h` over 24, `renotify_occurrences` of 0, `group_retention_duration` outside an hour
+    /// to 72 hours, `on_missing_data` beside `notify_no_data` or of a metric monitor, `notify_by` of
+    /// a tag the query is not grouped by or `*` beside another) and taken within them.
+    #[test]
+    fn datadog_s_option_bounds_are_held() -> anyhow::Result<()> {
+        let logs = Monitor { query: r#"logs("status:error").rollup("count").by("service").last("5m") > 10"#.into(), ..metric_monitor() };
+        let grouped = Monitor { query: "avg(last_5m):cpu{*} by {host,service} > 1".into(), ..metric_monitor() };
+        let with = |m: &Monitor, options: &Options| Monitor { options: options.clone(), ..m.clone() };
+        for (m, o) in [
+            (&grouped, Options { evaluation_delay: Some(86_401), ..Options::default() }),
+            (&grouped, Options { timeout_h: Some(25), ..Options::default() }),
+            (&grouped, Options { renotify_occurrences: Some(0), ..Options::default() }),
+            (&logs, Options { group_retention_duration: Some("30m".into()), ..Options::default() }),
+            (&logs, Options { group_retention_duration: Some("4d".into()), ..Options::default() }),
+            (&logs, Options { on_missing_data: Some(OnMissingData::Resolve), notify_no_data: true, ..Options::default() }),
+            (&grouped, Options { on_missing_data: Some(OnMissingData::ShowNoData), ..Options::default() }),
+            (&grouped, Options { notify_by: Some(vec!["region".into()]), ..Options::default() }),
+            (&grouped, Options { notify_by: Some(vec!["*".into(), "host".into()]), ..Options::default() }),
+        ] {
+            anyhow::ensure!(with(m, &o).compiled().is_err(), "{o:?} taken");
+        }
+        for (m, o) in [
+            (&grouped, Options { evaluation_delay: Some(86_400), timeout_h: Some(24), renotify_occurrences: Some(1), notify_by: Some(vec!["service".into()]), ..Options::default() }),
+            (&grouped, Options { notify_by: Some(vec!["*".into()]), ..Options::default() }),
+            (&logs, Options { group_retention_duration: Some("2d".into()), on_missing_data: Some(OnMissingData::ShowAndNotifyNoData), ..Options::default() }),
+        ] {
+            if let Err(e) = with(m, &o).compiled() {
+                anyhow::bail!("{o:?} refused: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Datadog's matching attribute variables of a log, a span and an event (a composite's monitor's,
+    /// `a.event`): attributes and tags by key, the reserved attributes its page lists for each kind,
+    /// ids in hex, times as `{{last_triggered_at}}` writes them.
+    #[test]
+    fn a_record_s_variables_are_datadog_s_matching_attribute_variables() -> anyhow::Result<()> {
+        use kiln_obs::logs::record::Record;
+        // 2021-05-31 14:22:27 UTC.
+        let log = Record {
+            ts: 1_622_470_947_000_000_000,
+            severity: 17,
+            service: "web".into(),
+            host: "h1".into(),
+            source: "nginx".into(),
+            message: "connection refused\nat x".into(),
+            attrs: vec![("error.message".into(), "refused".into()), ("env".into(), "prod".into())],
+            trace_id: Some([0xab; 16]),
+            span_id: Some([1; 8]),
+        };
+        let is = |vars: &[(String, String)], k: &str, want: &str| vars.iter().find(|(n, _)| n == k).is_some_and(|(_, v)| v == want);
+        let v = record_vars("log", &log, "L");
+        for (k, want) in [
+            ("log.message", "connection refused\nat x"),
+            ("log.status", "error"),
+            ("log.service", "web"),
+            ("log.source", "nginx"),
+            ("log.host", "h1"),
+            ("log.attributes.error.message", "refused"),
+            ("log.tags.env", "prod"),
+            ("log.timestamp", "2021-05-31 14:22:27+00:00"),
+            ("log.trace_id", "abababababababababababababababab"),
+            ("log.span_id", "0101010101010101"),
+            ("log.link", "L"),
+        ] {
+            anyhow::ensure!(is(&v, k, want), "{k}: {v:?}");
+        }
+        let span = Record { message: "GET /users".into(), attrs: vec![("operation_name".into(), "flask.request".into()), ("span.type".into(), "web".into()), ("env".into(), "prod".into())], ..log.clone() };
+        let v = record_vars("span", &span, "S");
+        for (k, want) in [("span.resource_name", "GET /users"), ("span.operation_name", "flask.request"), ("span.type", "web"), ("span.status", "error"), ("span.env", "prod"), ("span.service", "web")] {
+            anyhow::ensure!(is(&v, k, want), "{k}: {v:?}");
+        }
+        let event = Record { severity: 9, source: "kiln.event".into(), message: "Deploy\n\nweb 1.2 out".into(), attrs: vec![("title".into(), "Deploy".into()), ("dot.key.test".into(), "five".into())], trace_id: None, span_id: None, ..log };
+        let v = record_vars("a.event", &event, "E");
+        for (k, want) in [("a.event.title", "Deploy"), ("a.event.text", "web 1.2 out"), ("a.event.host.name", "h1"), ("a.event.tags.dot.key.test", "five"), ("a.event.tags", "title:Deploy,dot.key.test:five"), ("a.event.link", "E")] {
+            anyhow::ensure!(is(&v, k, want), "{k}: {v:?}");
+        }
+        anyhow::ensure!(v.iter().any(|(k, x)| k == "a.event.attributes" && x.contains(r#""dot.key.test":"five""#)), "{v:?}");
+        Ok(())
+    }
+
+    /// Datadog's composite monitor variables: each monitor it reads lettered as its query first names
+    /// it, `{{a.value}}` and `{{a.status}}` of its group the composite's holds (or of its one group).
+    #[test]
+    fn a_composite_s_message_reads_its_monitors_by_letter() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ms = Monitors::open(dir.path(), Arc::new(crate::http::client::Client::public()?), "http://kiln.test");
+        let store = test_store();
+        let cpu = ms.put(metric_monitor()).map_err(anyhow::Error::msg)?;
+        let mem = ms.put(Monitor { name: "mem".into(), ..metric_monitor() }).map_err(anyhow::Error::msg)?;
+        let host = |h: &str| vec![("host".to_owned(), h.to_owned())];
+        let none: HashSet<Group> = HashSet::new();
+        let alerting = |_: &Group, _: State, v: Option<f64>, _: Option<State>| if v.is_some_and(|v| v > 1.0) { State::Alert } else { State::Ok };
+        ms.apply(&store, &cpu, 1, Missing::Keep, vec![(host("web1"), Some(5.5), None), (host("web2"), Some(0.0), None)], &none, alerting, Said::NONE);
+        ms.apply(&store, &mem, 1, Missing::Keep, vec![(Vec::new(), Some(0.25), None)], &none, alerting, Said::NONE);
+        let c = composite::parse(&format!("{} && !{}", mem.id, cpu.id)).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let (vars, read) = ms.composite_vars(&store, &c, &host("web1"), "", 2);
+        let var = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        anyhow::ensure!(var("a.value") == Some("0.25") && var("a.status") == Some("OK") && var("b.value") == Some("5.5") && var("b.status") == Some("Alert") && read.is_empty(), "{vars:?}");
+        Ok(())
     }
 }

@@ -1935,21 +1935,97 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   `.as_count()` path (and a percentile's) it compares the two windows' values. A group with a tag
   without a value (`N/A`) is no monitor's ("`N/A` groups are not included in monitors").
 - **States** move with hysteresis: a group alerts past the critical threshold and recovers only
-  past the recovery threshold (warnings the same), so a value at a threshold does not flap; NO DATA
-  after a timeframe when asked; groups silent a day are forgotten.
-- **Options**: thresholds (critical, warning, recoveries), `notify_no_data` and its timeframe,
-  `renotify_interval`, `evaluation_delay` (late data counts), `every` (60 s unless it says, 10 s
-  at the most often), `scheduling_options.evaluation_window` (a cumulative window's start, above);
-  an anomaly monitor's `threshold_windows` (Datadog's: both, its `trigger_window` its query's
+  past the recovery threshold (warnings the same), so a value at a threshold does not flap; a group
+  the evaluation does not find comes to what its options say (NO DATA after a timeframe when asked,
+  `on_missing_data`, `timeout_h`, below), and is forgotten a day after its last data (its
+  `group_retention_duration`). A group's `{{first_triggered_at}}` is set as it goes from OK into
+  trouble (a new group's too), its `{{last_triggered_at}}` as it goes into any state of trouble
+  (WARN after ALERT too), both kept through its recovery and a renotification, as Datadog's
+  variables page's table has them.
+- **Options** are Datadog's, by its API's names and bounds (its "Monitor API Options" guide and
+  API reference, <https://docs.datadoghq.com/monitors/guide/monitor_api_options.md>):
+  thresholds (critical, warning, recoveries); `notify_no_data` and `no_data_timeframe` (minutes, two
+  windows unless it says); `renotify_interval` (minutes), `renotify_statuses` (`alert`, `warn`,
+  `no data`; with an interval and unsaid, `alert` and `no data`), `renotify_occurrences` (that many
+  times again at the most, counted afresh as the state changes) and `escalation_message` (a
+  template said after the message when a state is told again; `{{#is_renotify}}` in the message
+  is Datadog's own advice); `timeout_h` (0 to 24: a group in ALERT or WARN without data that long
+  resolves, Datadog's "auto-resolve"; NO DATA, the lack itself, stays); `new_group_delay` (seconds a
+  new group, one "not seen in the last 24 hours", is not evaluated; none unless it says, its API's
+  default, though its form offers 60); `require_full_window` (a metric monitor's: a group is
+  evaluated only once its window is full by Datadog's buckets, a minute's for a window in minutes,
+  ten minutes' in hours, an hour's in days, four hours' a month, its first bucket with data and
+  three at the most without, else its state stands, "the evaluation is canceled"; other monitors
+  take it and read nothing of it, "This setting only applies to metric monitors");
+  `evaluation_delay` (late data counts; a day at the most); `every` (60 s unless it says, 10 s at the
+  most often); `scheduling_options.evaluation_window` (a cumulative window's start, above); an
+  anomaly monitor's `threshold_windows` (Datadog's: both, its `trigger_window` its query's
   `alert_window`, its `recovery_window` the window whose share past the band its recovery
-  thresholds are of); mute until a time or unmuted. An anomaly monitor recovers once that share is
+  thresholds are of); `include_tags` (false: a notification's title without its group, its guide's
+  `[Triggered] Monitor Title`); `notification_preset_name` (kiln's notifications show no query,
+  handles or snapshot, so what `hide_all`, `hide_handles_and_footer` and `show_only_snapshot` leave
+  to drop is the footer's link back to kiln, which they drop; the others change nothing);
+  `notify_by` (some of the query's group tags, or `["*"]`, a simple alert's one: a notification a
+  set of their values, its state its groups' worst, told as that moves and again as `renotify_*`
+  say, its message reading the notification's tags and its worst group's value); `notify_audit`
+  (the handles its message mentions told it was created, modified or deleted, "tagged users": on
+  chat, email and webhooks, not PagerDuty, Opsgenie, Jira or ServiceNow, whose every notice raises
+  or resolves an alert or a ticket); and, of a monitor of logs, spans, events or Error Tracking's
+  (Datadog's: "only available for APM Trace Analytics, Audit Trail, CI, Error Tracking, Event,
+  Logs, and RUM monitors"; refused of others), `on_missing_data` (`default`: a count's empty
+  evaluation is 0 compared with the thresholds, so a count's `< 1` alerts on a group gone quiet,
+  and another measure's keeps its last state; `show_no_data`, NO DATA shown and not told;
+  `show_and_notify_no_data`; `resolve`, OK; each at once, "the missing data window is not
+  configurable"; not beside `notify_no_data`, its other answer to the same question; a count's 0
+  is also what such a monitor does unless it says) and `group_retention_duration` (`60m` to `72h`,
+  `2d`; a day unless it says), and a log monitor's `enable_logs_sample` (its notifications of
+  trouble list its group's latest logs, Datadog's "up to 10"). Mute until a time or unmuted. An anomaly monitor recovers once that share is
   at or below its recovery threshold (its page's "`warning_recovery` of 0 ... recovers ... only when
   0% of the points in the `recovery_window` are anomalous"); other monitors as Datadog's recovery
   thresholds page says (`>` recovered at or below, `>=` below, and the mirror for `<`, `<=`).
-- **Messages** are Datadog's templates (`{{value}}`, `{{threshold}}`, `{{host.name}}`,
-  `{{#is_alert}}…{{/is_alert}}`, `{{^is_recovery}}`, …), their `@slack-<name>`,
-  `@discord-<name>`, `@teams-<name>`, `@pagerduty-<name>`, `@webhook-<name>` mentions naming
-  integrations (§10).
+- **Messages** are Datadog's templates (`kiln_obs::monitor::template`; its "Variables" page,
+  <https://docs.datadoghq.com/monitors/notify/variables.md>, and "Template Variable Evaluation"
+  guide): sections `{{#is_alert}}`, `is_warning`, `is_recovery`, `is_alert_recovery`,
+  `is_warning_recovery`, `is_alert_to_warning`, `is_no_data`, `is_no_data_recovery`, `is_unknown`
+  (a service check's NO DATA by UNKNOWN runs), `is_renotify`, `is_priority 'P1'`, and `is_match` /
+  `is_exact_match` of a variable or an `(eval "…")` against strings (a number by its value), each
+  with `{{^…}}` and `{{else}}`, nested as deep as written; variables `{{value}}`, `{{threshold}}`,
+  `{{warn_threshold}}`, `{{alert_recovery_threshold}}`, `{{warn_recovery_threshold}}`,
+  `{{ok_threshold}}`, `{{comparator}}`, `{{first_triggered_at}}` and `{{last_triggered_at}}` (UTC,
+  as `local_time` writes a time, `2021-05-31 14:27:00+00:00`) and their `_epoch`s,
+  `{{triggered_duration_sec}}`, `{{monitor.name}}`, `{{group}}`, `{{link}}`, and a group's tags
+  (`{{host.name}}`, `{{[dot.key.test].name}}`, a facet's `{{@machine_id.name}}`; a tag of several
+  values says them sorted, by commas); helpers `{{eval "…"}}` (its operators and every function its
+  guide lists), `{{local_time 'last_triggered_at' 'Asia/Tokyo'}}`, `{{override_priority 'P1'}}` (the
+  notification's priority), `{{urlencode "service.name"}}`; comments and raw blocks. What a
+  variable says is HTML-encoded (`&`, `<`, `>`, `"`, `'`) and `{{{…}}}` says it raw, Datadog's
+  "Character escape" (its page shows `&` written `&amp;`, and names no other); the links kiln makes
+  (`{{link}}`, `{{log.link}}`, …) are its own URLs, said as they are. A log, span or event monitor's
+  message reads its group's latest record over its window, searched only when the message or its
+  escalation reads one (Datadog's matching attribute variables: `{{log.message}}`, `service`,
+  `status`, `source`, `host`, `trace_id`, `span_id`, `timestamp`, `{{log.attributes.<key>}}`,
+  `{{log.tags.<key>}}`; a span's `{{span.resource_name}}`, `operation_name`, `env`, `type`,
+  `status`, …; an event's `{{event.title}}`, `text`, `host.name`, `tags`, `attributes`), and
+  `{{log.link}}` (`{{span.link}}`, `{{event.link}}`), its explorer scoped to the group's search over
+  a range that covers its window; a formula's are its first query's; what the record lacks is empty
+  (Datadog's "the variable renders empty"), as is all of it when no record is found. A composite's
+  message reads its monitors (`{{a.value}}`, `{{a.status}}`: `OK`, `Alert`, `Warn`, `No Data`;
+  `{{a.log.message}}` of a monitor of logs), `a`, `b`, … as its query first names them (Datadog's
+  form letters them as they are chosen and its API writes their ids), each its group the
+  composite's group holds. A check's has `{{check_message}}`, an issue's `{{issue.attributes.error.*}}`
+  and `{{issue.link}}`. Any other variable kiln does not know is left as it was written. Its
+  `@slack-<name>`, `@discord-<name>`, `@teams-<name>`, `@pagerduty-<name>`, `@webhook-<name>`
+  mentions name integrations (§10), read from the rendered message, so a mention may be built of
+  variables (`@slack-{{service.name}}`, Datadog's dynamic handles).
+- **Messages kiln does not fill**, and why: a monitor grouped by host's host metadata
+  (`{{host.ip}}`, `{{host.metadata_agent_version}}`, `metadata_machine`, `metadata_platform`,
+  `metadata_processor`, and the host's other tags, `{{host.role.name}}`) and a service's Service
+  Catalog variables (`{{service.team}}`, `docs`, `links`, `links[Runbook]`): kiln keeps both (§10.8,
+  §10.9), but its host inventory is made asynchronously and on demand, which a monitor's
+  evaluation, on the blocking pool, does not wait on; they are left as written. Kubernetes'
+  (`{{kube_namespace.*}}`, `{{pod_name.*}}`), network devices' (`{{network_device.*}}`), RUM's,
+  CI's, audit's, Database Monitoring's and Synthetic tests' variables are of data kiln does not
+  keep. An event's `{{event.id}}` is empty: kiln's events have no id of their own.
 - The server, the leader, evaluates each on the blocking pool; each group's change is an event
   (`source:kiln.event @event.type:monitor.alert`, …) and, unless muted, its notifications; states
   are saved as they change. Each evaluation holds the store on its own (a write waits on no more
