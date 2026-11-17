@@ -322,8 +322,9 @@ fn p7_1_a_live_experiment_draws_each_new_session_by_its_weights() -> anyhow::Res
 /// variant drawn by weight, started as that variant (a host variant a process of the server's machine; a microVM
 /// variant there refused, the server starting none, and kept as its draw's failure), the variant kept on the session
 /// (`experiment` on its info) and said by `agentdefs.sessions` (`experiment`, `variant`). The draws are the
-/// experiment's own sequence. Taking `Drawn::of`'s definition draw out of `lineage::start` starts each as the
-/// definition is.
+/// experiment's own sequence. Each run names the server (`on`), whose harness is the registry's stand-in program: no
+/// vendor CLI is looked for or started, so what this machine has installed decides nothing. Taking `Drawn::of`'s
+/// definition draw out of `lineage::start` starts each as the definition is.
 #[test]
 fn p7_1_agentdefs_run_starts_each_session_as_its_drawn_variant() -> anyhow::Result<()> {
     crate::rt::block_on(async {
@@ -351,7 +352,7 @@ fn p7_1_agentdefs_run_starts_each_session_as_its_drawn_variant() -> anyhow::Resu
         let (mut opened, mut refusals) = (Vec::new(), 0usize);
         for i in 0..8u64 {
             let want = kiln_ci::split::draw_parts(&[50, 30, 20], seed, i).and_then(|k| ids.get(k).cloned()).unwrap_or_default();
-            let ran = crate::rt::timeout(std::time::Duration::from_secs(120), call("agentdefs.run", json!({"id": def, "cwd": cwd}))).await?;
+            let ran = crate::rt::timeout(std::time::Duration::from_secs(120), call("agentdefs.run", json!({"id": def, "on": "local", "cwd": cwd}))).await?;
             if want == ids.get(2).cloned().unwrap_or_default() {
                 anyhow::ensure!(matches!(&ran, Err((c, _)) if *c == http::StatusCode::CONFLICT), "run {i}, the microVM variant, is refused where no microVM starts: {ran:?}");
                 refusals += 1;
