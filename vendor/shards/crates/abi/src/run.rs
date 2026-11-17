@@ -8,6 +8,7 @@
 
 use alloc::vec::Vec;
 
+pub mod egress;
 pub mod managed;
 pub mod mcp;
 pub mod members;
@@ -16,6 +17,7 @@ pub mod notice;
 pub mod plug;
 pub mod quiesce;
 pub mod setup;
+pub mod shared;
 pub mod socket;
 pub mod trust;
 
@@ -193,7 +195,8 @@ pub mod kind {
     pub const MANAGED_CONTROL_END: u8 = 47;
     /// Guest to host, on the workload's connection, once a member's population has ended
     /// (D231): its member index and how its command ended, exited or signaled, as
-    /// [`members::Ended`](super::members::Ended) encodes them; once a member.
+    /// [`members::Ended`](super::members::Ended) encodes them; once each generation of a
+    /// member (D270), in their order, so that a member's n-th is its generation n−1's.
     pub const MEMBER_ENDED: u8 = 48;
     /// Guest to host, on the workload's connection of a run given the nesting grant (D234):
     /// its readiness moved, as [`nesting::Ready`](super::nesting::Ready) encodes it: ready,
@@ -219,6 +222,28 @@ pub mod kind {
     /// anything, as [`socket::refused`](super::socket::refused) encodes it, so that the host
     /// fails it rather than wait for its connection, as [`EXEC_FAILED`] fails an exec.
     pub const SOCKET_REFUSED: u8 = 53;
+    /// Host to guest, on the signal connection: a member's next generation (D270), as
+    /// [`members::Start`](super::members::Start) encodes it, once its last generation has
+    /// ended and its [`MEMBER_ENDED`] been told: started in the member's namespaces, which its
+    /// generations keep, in a PID namespace of its own. Init answers [`MEMBER_STARTED`].
+    pub const MEMBER_START: u8 = 54;
+    /// Guest to host, on the workload's connection: what came of a [`MEMBER_START`], as
+    /// [`members::StartAnswer`](super::members::StartAnswer) encodes it.
+    pub const MEMBER_STARTED: u8 = 55;
+    /// Host to guest, on the signal connection, as [`members::Hold`](super::members::Hold)
+    /// encodes it: member's next generation is coming (D270), so that its current one's end
+    /// keeps its server instance and its namespaces for it, as its end otherwise ends its whole
+    /// member; sent before its host ends that generation
+    /// ([`builtin::SIGNAL`](super::builtin::SIGNAL)'s SIGTERM, then
+    /// [`builtin::MEMBER_KILL`](super::builtin::MEMBER_KILL) if it stalls). Or, its restart
+    /// having failed, let go: its generation's end, or the end it had under the hold, is then
+    /// its whole member's.
+    pub const MEMBER_HOLD: u8 = 56;
+    /// Guest to host, on the workload's connection, before [`SYSTEM_ERR`]: a member whose
+    /// first generation could not enter its working directory as it started (D277), as
+    /// [`members::Unentered`](super::members::Unentered) encodes it. None of the run's members
+    /// runs: its `SYSTEM_ERR` and [`EXIT`] follow.
+    pub const WORKDIR_UNENTERED: u8 = 57;
 }
 
 /// The file at the root of a writable layer kept in its own file (D190), beside its
@@ -774,6 +799,48 @@ pub mod builtin {
     /// Its clock set to its host's (`control::HOST_TIME`), as a restored VM sets its own: asked
     /// as a paused run goes on (D267), so that a step its host's clock took meanwhile is its too.
     pub const CLOCK: u8 = 23;
+    /// A member's generation ended at once (D270), its arguments
+    /// [`members::kill_args`](super::members::kill_args)': SIGKILL to its reaper, its PID
+    /// namespace's init, which takes every process of that namespace with it
+    /// (pid_namespaces(7)) and nothing else of the member's: its server instance, its
+    /// namespaces and its cgroup are its next generation's. A host asks it of a generation it
+    /// asked to end ([`SIGNAL`]'s SIGTERM) that its judged wait found stalled. Exit status as
+    /// [`SIGNAL`]'s.
+    pub const MEMBER_KILL: u8 = 24;
+    /// A member's own grants past the microVM made what its host says as the run goes (D278;
+    /// shards-init egress.rs), its arguments [`egress::args`](super::egress::args)': its
+    /// index, then each of its grants as they are to stand, whole. Init holds them within what
+    /// the member's image and its ceiling ([`egress::CEILING_KEY`](super::egress::CEILING_KEY))
+    /// let it, and every member's as D236's `held` holds them apart; answered with nothing.
+    pub const EGRESS: u8 = 25;
+    /// [`EGRESS`]'s exit status where a grant passes what the member's image and its ceiling
+    /// let it: EACCES's number (include/uapi/asm-generic/errno-base.h), a permission refused.
+    pub const EGRESS_PAST: u8 = 13;
+    /// [`EGRESS`]'s exit status where the run's members, this one's grants made so, could not
+    /// be held apart (D236's `held`): EOPNOTSUPP's number (include/uapi/asm-generic/errno.h).
+    pub const EGRESS_UNHELD: u8 = 95;
+    /// [`EGRESS`]'s exit status where no member of that index runs linked past the microVM:
+    /// ENOENT's number (errno-base.h), as [`SIGNAL_UNKNOWN`] says it of one.
+    pub const EGRESS_UNKNOWN: u8 = 2;
+    /// The run's place on a network shared by runs and its members' grants there, whole, as
+    /// they are to stand (D285 slice 5; shards-init egress/shared.rs), its arguments
+    /// [`shared::args`](super::shared::args)', or [`shared::args_off`](super::shared::args_off)'s
+    /// once its last member leaves it: eth0's second address on it, each member's flows to and
+    /// from its peers there held by its gate, the switch and init's tables as D278 holds its
+    /// reach, and its peers' names answered it by the agents' resolver; answered with nothing.
+    pub const SHARED: u8 = 26;
+    /// [`SHARED`]'s exit status where a grant passes what its member's image and its ceiling let
+    /// it, as [`EGRESS_PAST`]'s: EACCES's number.
+    pub const SHARED_PAST: u8 = 13;
+    /// [`SHARED`]'s exit status where no member of an index runs linked in this run, as
+    /// [`EGRESS_UNKNOWN`]'s: ENOENT's number.
+    pub const SHARED_UNKNOWN: u8 = 2;
+    /// [`SHARED`]'s exit status where the run is on the network at another address, prefix or
+    /// gateway, which hold while it is on it: EEXIST's number (errno-base.h).
+    pub const SHARED_READDRESSED: u8 = 17;
+    /// [`SHARED`]'s exit status where the network's subnet shares an address with another of the
+    /// microVM's networks or links: EADDRINUSE's number (include/uapi/asm-generic/errno.h).
+    pub const SHARED_OVERLAPS: u8 = 98;
 
     /// [`STATS`]'s one argument, whose cgroup it reads (D231): none for the workload's, as
     /// `stats` reads it; [`RUN`](stats::RUN) for the run's, its command's and every

@@ -33,11 +33,12 @@ pub mod wire;
 pub use pool::{Gave, PoolHeld, PoolId, Released, WarmHost, WarmRoom};
 
 pub use wire::{
-    Bound, Captured, Channel, Charged, Cli, ControlAsk, ControlAt, CredentialGrant, Fill, FinalUse,
-    GuestTimes, HostUse, Keep, LeaseRefusal, MemberInfo, MemberKind, MemberReach, Microvm, Narrowing,
-    NetRefusal, Paused, PlugRefusal, Proto, Publish, Ready, Receiving, RunEnd, RunEnded, SaveRefusal, Secret,
-    SignInGrant, SignInRefusal, SignInTokens, SocketGrant, StartedFrom, Stats, StatsScope, Unused, UseBroken,
-    VcpuTime, decide,
+    Bound, Captured, Channel, Charged, Cli, ComponentAt, ControlAsk, ControlAt, CredentialGrant, Fill,
+    FinalUse, GuestTimes, HostUse, Keep, LeaseRefusal, MemberCeiling, MemberInfo, MemberKind, MemberReach,
+    Microvm, Narrowing, NetRefusal, NetworkGrant, OnNetwork, OnNetworkMember, Paused, PlugRefusal, Proto,
+    Publish, Reach, Ready, Receiving, RestartRefusal, RunEnd, RunEnded, SaveRefusal, Secret, SignInGrant,
+    SignInRefusal, SignInTokens, SocketGrant, StartedFrom, Stats, StatsScope, SwapRefusal, SwapWhen, Swapped,
+    Unused, UseBroken, VcpuTime, Way, decide,
 };
 
 /// A credential's lease, as a run's [`Lessor`] gives it (D242): what its release names it
@@ -160,8 +161,10 @@ pub struct MemberSpec {
     pub env: Vec<(String, Secret)>,
     pub files: Vec<MemberFile>,
     /// Its working directory, absolute and plain: the project path it works in, which must be
-    /// there as it starts (D231); none for its image's (its config's `run.workdir`, in its
-    /// directory).
+    /// there as it starts (D231), in its image or in a share given it as it starts
+    /// ([`ImageShare::members`]); one its guest cannot enter refuses its run's members
+    /// [`ImageRefusal::Workdir`] (D277). None for its image's (its config's `run.workdir`, in
+    /// its directory).
     pub workdir: Option<String>,
     /// Its stdin, a pipe the orchestrator writes ([`ImageGuest::take_input`]); else
     /// `/dev/null`, as every member's is today.
@@ -192,13 +195,24 @@ pub struct MemberSpec {
 }
 
 /// A host directory the guest sees at `at`, as `-v HOST:AT[:ro]` gives one: a member gets
-/// it where the image's `VOLUME` at `at` is for it (D109), the run's own command where no
-/// `VOLUME` declares `at`.
+/// it where the image's `VOLUME` at `at` is for it (D109), or where `members` names it
+/// (D277); the run's own command in every case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageShare {
     pub host: PathBuf,
     pub at: String,
     pub read_only: bool,
+    /// Whether its files may be run from it (D279): where not, each mount of it is `noexec`,
+    /// the run's own and each member's, so a program or library there is refused (EACCES);
+    /// an interpreter elsewhere still reads a script there as data.
+    pub exec: bool,
+    /// The members given it as they start, at `at` in each one's own root before its command
+    /// runs, so that one may work in it from its first instruction (D277): every member that
+    /// runs, or those named, each one the image declares that runs; none, the run's own root
+    /// alone (a member's default deny, D59), and a member gets it later only by a plug
+    /// ([`ImageGuest::plug`]). Its files are the member's where one member alone is given it,
+    /// as a `VOLUME … FOR` one is (D38).
+    pub members: Option<PlugFor>,
 }
 
 /// An image to boot.
@@ -263,7 +277,9 @@ pub struct ImageSpec {
     /// The run's agent-control endpoint (D238, D252), bound by its host for this run alone,
     /// its key the run's own, made after its restore and held by the endpoint alone; it takes
     /// [`ControlAsk::controller`]'s key alone, and serves lanes to the run's own command's
-    /// sockets where [`ControlAsk::sockets`] grants them (D251). None: no endpoint.
+    /// sockets where [`ControlAsk::sockets`] grants them (D251), and its members' stdio where
+    /// [`ControlAsk::stdio`] asks it (D252): then [`ImageGuest::take_output`] and
+    /// [`ImageGuest::take_input`] give none of it. None: no endpoint.
     pub control: Option<ControlAsk>,
     /// The host GPUs the run's VM renders on, each by its exact identity (D232, as
     /// [`crate::GuestSpec::gpu_devices`] names them), bound by its VM process; under the
@@ -288,6 +304,31 @@ pub struct ImageSpec {
     /// beneath one: a session's volumes are placed beneath a root granted here. Empty: the
     /// host's own and its shares' alone. Refused by field where one is no root.
     pub plug_roots: Vec<String>,
+    /// The most each member may be given past its image's grants as the run goes (D278): the
+    /// person's own policy, which the run's network process is held to beside the image's
+    /// grants and each member's guest within it ([`ImageGuest::member_egress`]). A member named
+    /// once, one its image declares and that runs, linked past its microVM (on a network that
+    /// is not internal): else refused. Empty: nothing past the image's grants. Part of what a
+    /// warm host is made for ([`ImagePools`]): its network process is held to it from its start.
+    pub egress_ceiling: Vec<MemberCeiling>,
+}
+
+/// Each member's ceiling past its microVM as its spec names them (D278): each member once,
+/// refused by field where one is named twice. What each holds, and whether its member is one
+/// the image declares and links past its microVM, its run host checks against the image.
+fn ceilings(asked: &[MemberCeiling]) -> Result<Vec<MemberCeiling>, ImageRefusal> {
+    for (i, c) in asked.iter().enumerate() {
+        if asked
+            .get(..i)
+            .is_some_and(|before| before.iter().any(|b| b.kind == c.kind && b.name == c.name))
+        {
+            return Err(ImageRefusal::Spec {
+                what: "egress_ceiling",
+                why: format!("{:?} {:?} is named twice", c.kind, c.name),
+            });
+        }
+    }
+    Ok(asked.to_vec())
 }
 
 /// A root a run's injector trusts beside the host's own ([`ImageSpec::upstream_roots`], D242).
@@ -321,8 +362,16 @@ pub enum PlugSource {
     /// A host directory, absolute: the host's files there are its members'.
     Host(PathBuf),
     /// A volume of the run's home's store, by its name, made where it is not there, as a
-    /// run's `-v NAME:PATH` makes one: its files are kept in the home past the run.
-    Volume(String),
+    /// run's `-v NAME:PATH` makes one: its files are kept in the home past the run. Its bound
+    /// (D281): the bytes its files may take, held as they are written, a write past it refused
+    /// ENOSPC in its members, as a full disk refuses one: an agent's admitted `disk_bytes`,
+    /// which the volume is made with, or set to where no run holds it, and refused
+    /// ([`PlugRefusal::Bound`]) where one does with another. None for the volume's own: none
+    /// where it was made with none.
+    Volume {
+        name: String,
+        bound: Option<std::num::NonZeroU64>,
+    },
 }
 
 /// Whom [`ImageGuest::plug`] plugs into (D271): every member of the run that runs, or those
@@ -343,6 +392,9 @@ pub struct Plug {
     /// share's top-level directory, and [`ImageSpec::plug_roots`]).
     pub at: String,
     pub read_only: bool,
+    /// Whether its files may be run from it (D279): where not, each member's mount of it is
+    /// `noexec`, as an [`ImageShare`]'s is.
+    pub exec: bool,
 }
 
 /// How a member ended.
@@ -353,6 +405,9 @@ pub enum MemberEnd {
     /// Its population ended, its command killed by this signal, its Linux number
     /// (`1..=run::NSIG`): `docker run` would report 128 plus it, which an exit can be too.
     Signaled(u32),
+    /// Its generation ended at once by its restart (D270 slice 3b), its graceful end having
+    /// outlasted the restart's patience: every process of it killed (SIGKILL).
+    Killed,
     /// The run ended first, and the member with it.
     WithRun,
 }
@@ -427,6 +482,21 @@ pub enum ImageRefusal {
     Pause(String),
     /// A change of the running run's network its host refused (D269), by what refused it.
     Net(NetRefusal, String),
+    /// A member's restart its host refused (D270 slice 3b), by why.
+    Restart(RestartRefusal, String),
+    /// A component's swap its host refused (D270 slice 4), by why.
+    Swap(SwapRefusal, String),
+    /// A member's working directory ([`MemberSpec::workdir`], else its image's) its guest
+    /// could not enter as it started (D277), so none of its run's members runs: told as they
+    /// start, after the boot, to [`ImageGuest::wait_member`]; or as its next generation started
+    /// (D270), which its [`ImageGuest::restart`] is refused with, and a swap that restarted it
+    /// now ([`ImageGuest::swap`], [`ImageGuest::restore`]), its member ended whole. Its run
+    /// host's words name the member, the directory and the errno.
+    Workdir(String),
+    /// Its run host's budget had no room for its agent-control endpoint or its members' first
+    /// stdio lanes, charged before its members start (D252): none of them ran, and it may be
+    /// booted again once its host has room. In its run host's words.
+    Capacity(String),
 }
 
 impl std::fmt::Display for ImageRefusal {
@@ -463,6 +533,10 @@ impl std::fmt::Display for ImageRefusal {
             ),
             Self::Pause(why) => write!(f, "the pause: {why}"),
             Self::Net(cause, why) => write!(f, "the run's network: {cause:?}: {why}"),
+            Self::Restart(cause, why) => write!(f, "a member's restart: {cause:?}: {why}"),
+            Self::Swap(cause, why) => write!(f, "a component's swap: {cause:?}: {why}"),
+            Self::Workdir(why) => write!(f, "a member's working directory: {why}"),
+            Self::Capacity(why) => write!(f, "the run's lanes: {why}"),
         }
     }
 }
@@ -472,10 +546,11 @@ impl std::error::Error for ImageRefusal {}
 /// What boots images.
 pub trait Images: Send + Sync {
     fn backend(&self) -> Result<crate::Backend, ImageRefusal>;
-    /// Boots `spec`'s image, returning once its members have started, or why not, waiting
-    /// at most `patience` for it (`Duration::MAX`: until the run starts or its host ends):
-    /// past it, the run's host is killed and its run refused with what it last said. It is
-    /// the caller's until it drops, which ends it.
+    /// Boots `spec`'s image, returning once its run has started in its microVM, its members
+    /// starting there (one that cannot refuses their waits, [`ImageGuest::wait_member`]), or
+    /// why not, waiting at most `patience` for it (`Duration::MAX`: until the run starts or its
+    /// host ends): past it, the run's host is killed and its run refused with what it last
+    /// said. It is the caller's until it drops, which ends it.
     fn boot(&self, spec: &ImageSpec, patience: Duration) -> Result<Box<dyn ImageGuest>, ImageRefusal>;
     /// [`boot`](Self::boot), ended by `stop` (D231's stop of a boot under way): a
     /// [`BootStop::stop`] from any thread while it boots kills the run's host and every
@@ -634,21 +709,146 @@ pub trait ImageGuest: Send + Sync {
     /// longer reach (a TCP connection its guest opened is reset, a UDP flow closed). Answers
     /// and is refused as [`grant_egress`](Self::grant_egress).
     fn revoke_egress(&self, grant: &EgressGrant, patience: Duration) -> Result<Narrowing, ImageRefusal>;
+    /// Member `member`'s own reach past its microVM made `reach`, whole, in place of what it
+    /// reached, or its image's grants back where `reach` is none (D278): held in its guest (its
+    /// gate, its switch's and init's tables, its resolver; its open TCP connections to a port it
+    /// loses reset) and by its network process (the run's grants with every member's), its
+    /// microVM in place. Within its image's grants and its ceiling ([`ImageSpec::egress_ceiling`]):
+    /// past them refused [`NetRefusal::Widening`]; members whose reach the microVM could not hold
+    /// apart so (D236), [`NetRefusal::Unheld`]; no member of that name that runs linked past its
+    /// microVM, [`NetRefusal::Unknown`]. Answers the run's grants once both hold it, waiting at
+    /// most `patience`; refused as [`ImageRefusal::Net`].
+    fn member_egress(
+        &self,
+        member: &MemberName,
+        reach: Option<&Reach>,
+        patience: Duration,
+    ) -> Result<Narrowing, ImageRefusal>;
+    /// Member `member` given `grant` on the network shared by runs named `network` (D285), its
+    /// microVM in place: on the network from its first grant there, under the grant's name,
+    /// one member's ([`NetRefusal::NameTaken`] where another's), its run given an address
+    /// there (its guest's eth0's second) and linked to each other run of this process's on it;
+    /// a flow there crossing only where its sender's grant out and its receiver's grant in both
+    /// take it, held by each run's guest and network process (default deny; kiln's
+    /// `Change::Connect`, one grant each). Names are Docker's (`_` and `.` among them; a member's
+    /// one member's, an alias shared). Within its image's grants and its ceiling
+    /// ([`ImageSpec::egress_ceiling`]), as [`member_egress`](Self::member_egress)'s reach is:
+    /// `Out` within its image's or its ceiling's port grants, or a destination either names at
+    /// the grant's peer; `In` within the ports its image's `EXPOSE` gives it coming in (D122)
+    /// or its ceiling's port grants; past them refused [`NetRefusal::Widening`]. A network is
+    /// made beforehand in the run's home, as `network create` makes one, never by a
+    /// connection; one another process's runs are on is refused
+    /// [`NetRefusal::PairedElsewhere`]. A grant held already is done already. Answers the
+    /// run's places on shared networks once its network process and its guest hold the grant,
+    /// waiting at most `patience` for each run it asks; refused as [`ImageRefusal::Net`]:
+    /// [`NetRefusal::NoSuchNetwork`], [`NetRefusal::Exhausted`], [`NetRefusal::Ipv6`],
+    /// [`NetRefusal::Overlaps`] for a subnet that meets another of its microVM's,
+    /// [`NetRefusal::Grant`] for a grant that is none, [`NetRefusal::Unknown`] for a member
+    /// that runs not, [`NetRefusal::NoNetwork`], [`NetRefusal::Network`] for its network
+    /// process's or its guest's other refusals. By default refused
+    /// [`ImageRefusal::Unsupported`], for a guest that joins no shared network.
+    fn connect(
+        &self,
+        member: &MemberName,
+        network: &str,
+        grant: &NetworkGrant,
+        patience: Duration,
+    ) -> Result<Vec<OnNetwork>, ImageRefusal> {
+        let _ = (member, network, grant, patience);
+        Err(shared_unsupported())
+    }
+    /// `grant` of member `member` on shared network `network` taken back (D285), in place: its
+    /// guest first, which shuts its gate on what it lost and resets its open TCP flows there,
+    /// then its network process, which ends each flow it no longer admits. The member off the
+    /// network with its last grant there, and the run with its last member's: its address let
+    /// go and its links dropped, each other run of this process's told its members without it.
+    /// A grant not held is done already. Answered, waiting and refused as
+    /// [`connect`](Self::connect).
+    fn disconnect(
+        &self,
+        member: &MemberName,
+        network: &str,
+        grant: &NetworkGrant,
+        patience: Duration,
+    ) -> Result<Vec<OnNetwork>, ImageRefusal> {
+        let _ = (member, network, grant, patience);
+        Err(shared_unsupported())
+    }
     /// Where the run's agent-control endpoint is bound, and its microVM's key, which its
     /// controller pins (D252), where [`ImageSpec::control`] asked for one: as the run started,
     /// unchanged until it ends. With it, the endpoint's two other sockets, its waker and its
     /// wake ([`ControlAt::sockets`], all three): every UDP socket the endpoint holds.
     fn control(&self) -> Option<&ControlAt>;
-    /// A member's channel, as a pipe's read end, its bytes exactly as the member wrote
-    /// them, ending at the channel's end; once each. What no one reads backs up into that
-    /// channel alone. Refused for a member that does not run.
-    fn take_output(&self, member: &MemberName, channel: Channel)
-    -> Result<std::io::PipeReader, ImageRefusal>;
-    /// A member's stdin, asked for at create ([`MemberSpec::stdin`]), as a pipe's write end:
-    /// its close ends the member's input.
-    fn take_input(&self, member: &MemberName) -> Result<std::io::PipeWriter, ImageRefusal>;
-    /// The member's end, waiting at most `timeout` (`Duration::MAX`: until it comes).
-    fn wait_member(&self, member: &MemberName, timeout: Duration) -> Result<Option<MemberEnd>, ImageRefusal>;
+    /// A member's generation's channel (D270: 0 its first, each restart's one more), as a
+    /// pipe's read end, its bytes exactly as the member wrote them, ending at the channel's
+    /// end; once each. What no one reads backs up into that channel alone. Refused for a member
+    /// that does not run, and for a generation it has not started.
+    fn take_output(
+        &self,
+        member: &MemberName,
+        generation: u32,
+        channel: Channel,
+    ) -> Result<std::io::PipeReader, ImageRefusal>;
+    /// A member's generation's stdin, asked for at create ([`MemberSpec::stdin`]), as a pipe's
+    /// write end: its close ends that generation's input.
+    fn take_input(&self, member: &MemberName, generation: u32) -> Result<std::io::PipeWriter, ImageRefusal>;
+    /// The member's generation's end, waiting at most `timeout` (`Duration::MAX`: until it
+    /// comes). Refused [`ImageRefusal::Workdir`] where its run's members did not start, as one
+    /// of theirs could not enter its working directory (D277).
+    fn wait_member(
+        &self,
+        member: &MemberName,
+        generation: u32,
+        timeout: Duration,
+    ) -> Result<Option<MemberEnd>, ImageRefusal>;
+    /// Starts member `member` again in its microVM (D270 slice 3b): its current generation
+    /// asked to end (SIGTERM to its command), ended at once where its graceful end outlasts
+    /// `patience`, then its next started with `args` after its image's command, in the
+    /// namespaces, server instance and volumes its generations keep, its input its own where it
+    /// has one: the generation started, whose output, input and end are taken by it. Refused
+    /// as [`ImageRefusal::Restart`]: a member that does not run, one whose restart is under
+    /// way, one that starts once (a member given a port among others, D122), and one whose next
+    /// generation's stdio lanes its run host's budget had no room for (`Capacity`, D252), that
+    /// generation never started and its member then ended whole; and as
+    /// [`ImageRefusal::Workdir`] where its next generation could not enter its working directory
+    /// (D277), its member then ended whole.
+    fn restart(&self, member: &MemberName, args: &[Vec<u8>], patience: Duration)
+    -> Result<u32, ImageRefusal>;
+    /// The member at path `at` (`/agents/NAME`, `/harness/NAME`, `/mcp/NAME`) given the OSI
+    /// artifact of manifest digest `digest` (`sha256:…`) of its run host's store as its component
+    /// there, in its running microVM in place (D270 slice 4): checked against its image (its kind
+    /// its path's, its platform the microVM's, its asks within its member's grants), its EROFS
+    /// image plugged into the microVM and mounted read-only beside its writable layer, then laid
+    /// at its path as its member starts again: at its next start, or now, its member restarted
+    /// as [`restart`](Self::restart) restarts it. That start's run-time arguments are `args`,
+    /// after its image's command, which its member keeps from then (given for its next start,
+    /// kept at once); none, the ones its host keeps: its first start's ([`MemberSpec::args`]),
+    /// then each later start's as it was given them. Answers every member's component as its
+    /// host holds them after it ([`ComponentAt`]), and, now, the member's index and the
+    /// generation started, whose output, input and end are taken by it ([`Swapped`]); refused
+    /// as [`ImageRefusal::Swap`], and, now, as [`ImageRefusal::Workdir`] where its member's next
+    /// generation could not enter its working directory (D277), its member then ended whole.
+    fn swap(
+        &self,
+        at: &str,
+        digest: &str,
+        when: SwapWhen,
+        args: Option<&[Vec<u8>]>,
+        patience: Duration,
+    ) -> Result<Swapped, ImageRefusal>;
+    /// The member at path `at` given its image's own component back (D270 slice 4), at its next
+    /// start or now, its start's arguments `args` or its kept ones, as [`swap`](Self::swap)
+    /// gives it another; answered and refused as it is.
+    fn restore(
+        &self,
+        at: &str,
+        when: SwapWhen,
+        args: Option<&[Vec<u8>]>,
+        patience: Duration,
+    ) -> Result<Swapped, ImageRefusal>;
+    /// Every member's component as its run host last said them (D270 slice 4): none where none
+    /// was swapped.
+    fn components(&self) -> Vec<ComponentAt>;
     /// How member `member`'s `channel` ended, typed, once its run's host told it, after every
     /// byte of it that host sent: its writers' close, or its capture's abort, which its pipe's
     /// EOF ([`take_output`](Self::take_output)) does not tell apart; waiting at most `timeout`
@@ -657,6 +857,7 @@ pub trait ImageGuest: Send + Sync {
     fn wait_channel(
         &self,
         member: &MemberName,
+        generation: u32,
         channel: Channel,
         timeout: Duration,
     ) -> Result<Option<ChannelEnd>, ImageRefusal>;
@@ -734,7 +935,9 @@ pub trait ImageGuest: Send + Sync {
     /// host path and a session's volumes beneath a root granted for them; each member its own
     /// device, read-only where asked. The plug grants nothing beyond its own path. A member
     /// that is files alone is refused ([`PlugRefusal::Member`]), as is one plugged at `at`
-    /// already; a plug that one member refuses is let go of by those it was given to first.
+    /// already; a plug that one member refuses is let go of by those it was given to first. A
+    /// volume a clearing holds is refused at once ([`PlugRefusal::Clearing`]), and one asked
+    /// another bound than the one its holders serve it with ([`PlugRefusal::Bound`], D281).
     /// Waits at most `patience`; refused as [`ImageRefusal::Plug`], by what refused it.
     fn plug(&self, plug: &Plug, patience: Duration) -> Result<(), ImageRefusal>;
     /// What is plugged in at `at` let go of, in each member it was plugged into: unmounted
@@ -809,6 +1012,14 @@ pub trait ImageGuest: Send + Sync {
     /// [`ImageRefusal::GpuProbe`]: `Unavailable` for a run that asked none, `ReportTaken` once
     /// taken, `Pending` past either budget, and its frame's own refusals.
     fn take_gpu_report(&self, patience: Duration) -> Result<crate::physical::GpuReport, ImageRefusal>;
+}
+
+/// What a guest that joins no network shared by runs refuses a connection with (D285).
+fn shared_unsupported() -> ImageRefusal {
+    ImageRefusal::Unsupported {
+        what: "a network shared by runs",
+        why: "this guest joins none".into(),
+    }
 }
 
 /// A run stopped before its microVM started: it used nothing of a machine.
@@ -1189,10 +1400,42 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
                 why: format!("{:?}: where the guest sees it is an absolute path", s.at),
             });
         }
+        let members = match &s.members {
+            None => None,
+            Some(PlugFor::Every) => Some(wire::ShareTo::Every),
+            Some(PlugFor::Members(named)) => {
+                let mut to: Vec<wire::ShareMember> = Vec::with_capacity(named.len());
+                for m in named {
+                    let m = wire::ShareMember {
+                        kind: m.kind,
+                        name: m.name.clone(),
+                    };
+                    if to.contains(&m) {
+                        return Err(ImageRefusal::Spec {
+                            what: "a share's members",
+                            why: format!("{}: {:?} {} named twice", s.at, m.kind, m.name),
+                        });
+                    }
+                    to.push(m);
+                }
+                if to.is_empty() {
+                    return Err(ImageRefusal::Spec {
+                        what: "a share's members",
+                        why: format!(
+                            "{}: given to members it names none of; give it to one, or to none for the run's own root alone",
+                            s.at
+                        ),
+                    });
+                }
+                Some(wire::ShareTo::Members(to))
+            }
+        };
         shares.push(wire::ShareAt {
             host: host.into(),
             at: s.at.clone(),
             read_only: s.read_only,
+            members,
+            exec: s.exec,
         });
     }
     // The instant it becomes is nanoseconds since the Unix epoch in a u64, as `ready-by=`
@@ -1331,6 +1574,7 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
         upstream_roots,
         gpu_report: spec.gpu_report,
         plug_roots: plug_roots(&spec.plug_roots)?,
+        egress_ceiling: ceilings(&spec.egress_ceiling)?,
     };
     // Past the channel's bound it would never be read; the guest's bound is the same one.
     request.encode().map_err(|e| ImageRefusal::Spec {
@@ -1376,6 +1620,8 @@ mod tests {
                 host: std::env::current_dir().unwrap(),
                 at: "/work".into(),
                 read_only: true,
+                exec: true,
+                members: None,
             }],
             nesting: false,
             ready_by: None,
@@ -1386,6 +1632,7 @@ mod tests {
             sign_ins: Vec::new(),
             upstream_roots: Vec::new(),
             plug_roots: Vec::new(),
+            egress_ceiling: Vec::new(),
             gpu_report: None,
         }
     }
@@ -1767,6 +2014,32 @@ mod tests {
         let mut s = spec();
         s.shares[0].at = "work".into();
         assert_eq!(refused(s), "a share");
+        // A share's members (D277): named none of, or one twice, refused by what; every member,
+        // or those named, carried as asked.
+        let mut s = spec();
+        s.shares[0].members = Some(PlugFor::Members(Vec::new()));
+        assert_eq!(refused(s), "a share's members");
+        let mut s = spec();
+        s.shares[0].members = Some(PlugFor::Members(vec![
+            MemberName::harness("codex"),
+            MemberName::harness("codex"),
+        ]));
+        assert_eq!(refused(s), "a share's members");
+        for (asked, carried) in [
+            (None, None),
+            (Some(PlugFor::Every), Some(wire::ShareTo::Every)),
+            (
+                Some(PlugFor::Members(vec![MemberName::harness("codex")])),
+                Some(wire::ShareTo::Members(vec![wire::ShareMember {
+                    kind: MemberKind::Harness,
+                    name: "codex".into(),
+                }])),
+            ),
+        ] {
+            let mut s = spec();
+            s.shares[0].members = asked;
+            assert_eq!(request(&s).map(|r| r.shares[0].members.clone()), Ok(carried));
+        }
         for relative_or_escaping in [
             "proj",
             "./proj",
@@ -1872,6 +2145,7 @@ mod tests {
                 lanes,
                 window,
             }),
+            stdio: false,
         };
         for (dir, lanes, window) in [
             ("run/hex/channel", 8, 65_536),
@@ -1900,6 +2174,14 @@ mod tests {
         s.control = Some(ControlAsk {
             controller: [1u8; 32],
             sockets: None,
+            stdio: false,
+        });
+        assert_eq!(request(&s).unwrap().control, s.control);
+        // Its members' stdio served as the endpoint's lanes (D252), carried whole.
+        s.control = Some(ControlAsk {
+            controller: [1u8; 32],
+            sockets: None,
+            stdio: true,
         });
         assert_eq!(request(&s).unwrap().control, s.control);
     }
@@ -1920,6 +2202,7 @@ mod tests {
         s.control = Some(ControlAsk {
             controller: [1u8; 32],
             sockets: None,
+            stdio: false,
         });
         assert!(request(&s).unwrap().members[0].mcp);
     }

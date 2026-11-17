@@ -213,7 +213,7 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "9975d1f551f8210a08fb744a04250767c72ead34"
+commit = "f1e8a097b9726b8d8d512a1d5d2c9eacb3b279e1"
 path = "vendor/shards"
 take = [
   ".cargo",

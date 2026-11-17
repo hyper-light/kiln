@@ -322,7 +322,9 @@ Built, each where it is:
 - **A member's run-time arguments** (Shards' D256, `MemberSpec::args`; Hex's `ImageMember::args`): its
   command line is its image's command, then the session's flags (`--resume`, `--model`).
 - **The project at its host path as the harness starts**: its folder shared at its own path as its box is
-  made (Hex's `ShardsImage::shares`), and its working directory there.
+  made (Hex's `ShardsImage::shares`), and its working directory there. Each start share is given to its harness
+  member as it starts (Shards' D277, Hex's `Mount::members`, `hexvm::mount_of`), so its harness works in its
+  project from its first instruction; one given to a member a launch doesn't drive is refused, typed.
 - **A member's signals** (Shards' D238, Hex's `Runtime::signal_member`): interrupt and stop reach the member
   alone on its own lane of its run's agent-control endpoint; its kill is its box's delete.
 - **kiln's MCP from inside** (Shards' D254, Hex's `ImageMember::mcp` and `Runtime::mcp`): above.

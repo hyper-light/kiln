@@ -1652,10 +1652,29 @@ fn binaries() -> &'static Path {
             // them (every mutant's and past build's copy stayed: 3.4 GiB by 2026-10-03).
             if hold(&dir) {
                 prune(&root, &name);
+                launched(&dir.join(format!("shards{}", std::env::consts::EXE_SUFFIX)));
                 return dir;
             }
         }
     })
+}
+
+/// Launches the tests' copy of `shards` once, by each test process before any of its tests
+/// runs it: a freshly written executable's first exec waits on its host's assessment of it
+/// (macOS: XProtect and syspolicyd, 1.19-1.34 s for a test-release `shards` against 4-10 ms
+/// for its next, its process running nothing of its own meanwhile, PM M611), which a judged
+/// command would take for a stall (the hot-swap land gate's first api_image test, refused
+/// 380 ms into its `shards build harness`). What it answers is nothing: a copy that cannot run
+/// fails the test that runs it.
+fn launched(shards: &Path) {
+    let mut cmd = Command::new(shards);
+    as_tests_run(&mut cmd);
+    let _ = cmd
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Copies `built` into `root`, as `name`: `shards`, which carries the rest, the VM process
@@ -2417,6 +2436,16 @@ impl Patience {
     #[track_caller]
     pub fn client(client: u32, home: &Path) -> Patience {
         Patience::on(Party::client(client, Some(home)), std::panic::Location::caller())
+    }
+
+    /// [`client`](Self::client) of several clients: a wait on what they bring about
+    /// together, as a run's client writes what a follower of its log reads.
+    #[track_caller]
+    pub fn clients(clients: &[u32], home: &Path) -> Patience {
+        Patience::on(
+            Party::with(Members::Clients(clients.to_vec()), Some(home)),
+            std::panic::Location::caller(),
+        )
     }
 
     /// Patience with this test's own microVMs, where no home's daemon serves them.
@@ -3560,9 +3589,9 @@ const VM_PROCESS: &str = "shards-vm";
 /// Whose processes a [`Party`]'s are, besides its home's daemon and what descends from it.
 #[derive(Clone)]
 enum Members {
-    /// A client and what descends from it: a command [`run_command`] runs, or a `run
+    /// Clients and what descends from them: a command [`run_command`] runs, or a `run
     /// --kernel` or `restore` (the VM process on Unix, its starter on Windows).
-    Client(u32),
+    Clients(Vec<u32>),
     /// This test's own VM processes, by the IDs their starts gave ([`OwnVm`]: `run
     /// --kernel`'s and `restore`'s [`Vm`], warm.rs' warm VM) and what descends from them: a
     /// [`Patience`]'s, and a guest's stream's ([`Following`]).
@@ -3626,7 +3655,7 @@ pub struct Looked {
 impl Party {
     /// The party of client `client`, whose home is `home` where it has one.
     pub fn client(client: u32, home: Option<&Path>) -> Party {
-        Party::with(Members::Client(client), home)
+        Party::with(Members::Clients(vec![client]), home)
     }
 
     /// The party of this test's own VM processes, and of `home`'s daemon where it has one.
@@ -3688,13 +3717,13 @@ impl Party {
     fn members(&mut self) -> (Vec<u32>, std::collections::BTreeSet<u32>) {
         let listed = match &self.members {
             Members::Machine => Vec::new(),
-            Members::Client(_) if cfg!(windows) => Vec::new(),
-            Members::Client(_) | Members::Own | Members::Started => processes(),
+            Members::Clients(_) if cfg!(windows) => Vec::new(),
+            Members::Clients(_) | Members::Own | Members::Started => processes(),
             #[cfg(unix)]
             Members::Groups(_) => processes(),
         };
         let own = match &self.members {
-            Members::Client(client) => vec![*client],
+            Members::Clients(clients) => clients.clone(),
             Members::Own => own_vms(),
             Members::Machine => Vec::new(),
             Members::Started => listed
@@ -3993,7 +4022,10 @@ impl Party {
     /// Who it is, for a wait's account of itself.
     fn named(&self) -> String {
         let who = match &self.members {
-            Members::Client(c) => format!("client {c}"),
+            Members::Clients(c) => match c.as_slice() {
+                [one] => format!("client {one}"),
+                many => format!("clients {many:?}"),
+            },
             Members::Own => "this test's own VM processes".to_string(),
             Members::Machine => "a machine of this test's process".to_string(),
             Members::Started => "the processes this test's process started".to_string(),
@@ -6758,14 +6790,171 @@ impl Drop for Vm {
     }
 }
 
+/// A host program's end of a guest's vsock stream: a Unix stream socket; on Windows its two
+/// pipes (D272, [`PipeStream`]).
+#[cfg(unix)]
+pub type VsockStream = shards_vmm::platform::UnixStream;
+#[cfg(windows)]
+pub type VsockStream = PipeStream;
+
+/// A dial of the VM's socket `sock`, no handshake said: a Unix socket's connect; on Windows
+/// the pair of pipes its file names, opened its way down first, waited for while another
+/// client holds them (D272).
+pub fn vsock_dial(sock: &Path) -> io::Result<VsockStream> {
+    #[cfg(unix)]
+    return shards_vmm::platform::UnixStream::connect(sock);
+    #[cfg(windows)]
+    PipeStream::connect(sock)
+}
+
+/// A host port's listener at `path` (`<sock>_<port>`), which the guest's dials reach: a Unix
+/// socket; on Windows a pair of pipes named at the path (D272).
+#[cfg(unix)]
+pub type HostPort = shards_vmm::platform::UnixListener;
+#[cfg(windows)]
+pub type HostPort = shards_ipc::VsockListener;
+
+/// Listens at `path` for the guest's dials to a host port.
+pub fn host_port(path: impl AsRef<Path>) -> HostPort {
+    #[cfg(unix)]
+    return shards_vmm::platform::UnixListener::bind(path).unwrap();
+    #[cfg(windows)]
+    shards_ipc::VsockListener::bind(path.as_ref()).unwrap()
+}
+
+/// The guest's next dial of `port`'s host port.
+pub fn host_port_accept(port: &mut HostPort) -> io::Result<VsockStream> {
+    #[cfg(unix)]
+    return port.accept().map(|(s, _)| s);
+    #[cfg(windows)]
+    port.accept().map(PipeStream::served)
+}
+
+/// A host program's end of a guest's vsock stream on Windows (D272): the pipe it reads and
+/// the one it writes, as `shards_api`'s client holds a guest connection and a host port's
+/// listener its client's; its read timeout its own, its reads overlapped calls waited for to
+/// it; its writes as `std` writes a file, each waited for to its end, a refused one's error
+/// the OS's own (ERROR_NO_DATA, 232, once its reader has closed its end).
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct PipeStream {
+    reads: shards_ipc::Pipe,
+    /// None once its writes are shut down, which its peer reads as their end.
+    writes: std::sync::Mutex<Option<std::fs::File>>,
+    timeout: std::sync::Mutex<Option<Duration>>,
+}
+
+#[cfg(windows)]
+impl PipeStream {
+    /// A client's end of the pair `sock`'s file names: its way down read, its way up written.
+    pub fn connect(sock: &Path) -> io::Result<PipeStream> {
+        let (down, up) = shards_ipc::vsock_open(sock, None)?;
+        Ok(PipeStream {
+            reads: shards_ipc::Pipe::from_handle(down),
+            writes: std::sync::Mutex::new(Some(std::fs::File::from(up))),
+            timeout: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// A listener's end of its client's connection: its client's way up read, its way down
+    /// written.
+    pub fn served(conn: shards_ipc::VsockConn) -> PipeStream {
+        let shards_ipc::VsockConn { down, up } = conn;
+        PipeStream {
+            reads: up,
+            writes: std::sync::Mutex::new(Some(std::fs::File::from(
+                std::os::windows::io::OwnedHandle::from(down),
+            ))),
+            timeout: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Ends its writes (`Write`, `Both`): its way written closed, which its peer reads as
+    /// their end after every byte. Its reads go on: a pipe has no half-close of its own.
+    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        if how != std::net::Shutdown::Read {
+            *self.writes.lock().unwrap() = None;
+        }
+        Ok(())
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        *self.timeout.lock().unwrap() = timeout;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Timed for PipeStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        PipeStream::set_read_timeout(self, timeout)
+    }
+
+    /// What it holds, read without waiting: WouldBlock where nothing is, its end among them,
+    /// which the timed read after finds.
+    fn read_now(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.reads.peek()? {
+            None | Some(0) => Err(io::ErrorKind::WouldBlock.into()),
+            Some(there) => {
+                let len = buf.len().min(there);
+                match self.reads.read_by(&mut buf[..len], Some(Instant::now())) {
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => Err(io::ErrorKind::WouldBlock.into()),
+                    read => read,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Read for &PipeStream {
+    /// A read to its timeout, `TimedOut` past it, as a Windows socket's says.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let timeout = *self.timeout.lock().unwrap();
+        let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+        self.reads.read_by(buf, deadline)
+    }
+}
+
+#[cfg(windows)]
+impl Read for PipeStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (&*self).read(buf)
+    }
+}
+
+#[cfg(windows)]
+impl Write for &PipeStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.writes.lock().unwrap().as_mut() {
+            Some(file) => file.write(buf),
+            None => Err(io::ErrorKind::BrokenPipe.into()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Write for PipeStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Opens a stream to guest vsock port `port` through the VM's socket `sock`: `Ok` once
 /// the guest accepted (the `OK` line was read), `Err` with what came back otherwise. Its
 /// handshake is read through [`Following`], its wait's kind its call site; the stream comes
 /// back reading with no timeout, its caller's to set.
 #[track_caller]
-pub fn vsock_connect(sock: &Path, port: u32) -> Result<shards_vmm::platform::UnixStream, String> {
-    let s =
-        shards_vmm::platform::UnixStream::connect(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
+pub fn vsock_connect(sock: &Path, port: u32) -> Result<VsockStream, String> {
+    let s = vsock_dial(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
     let mut r = Following::of(&s, None);
     vsock_handshake(&s, &mut r, port)?;
     r.answered();
@@ -6774,11 +6963,7 @@ pub fn vsock_connect(sock: &Path, port: u32) -> Result<shards_vmm::platform::Uni
 }
 
 /// Asks the VM's socket `s` for guest port `port`, reading its answer through `r`.
-fn vsock_handshake(
-    mut s: &shards_vmm::platform::UnixStream,
-    r: &mut impl Read,
-    port: u32,
-) -> Result<(), String> {
+fn vsock_handshake(mut s: impl Write, r: &mut impl Read, port: u32) -> Result<(), String> {
     s.write_all(format!("CONNECT {port}\n").as_bytes())
         .map_err(|e| format!("CONNECT: {e}"))?;
     let mut line = Vec::new();
@@ -7073,41 +7258,44 @@ pub fn echo_of(
     carried: Option<&AtomicU64>,
     size: &str,
 ) -> Result<(), String> {
-    let s =
-        shards_vmm::platform::UnixStream::connect(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
+    let s = vsock_dial(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
     let mut r = Following::sized(&s, carried, size);
     vsock_handshake(&s, &mut r, port)?;
-    let mut w = s.try_clone().map_err(|e| e.to_string())?;
-    let writer = std::thread::spawn(move || -> Result<(), String> {
+    // The writer shares the stream: a pipe's end is one handle, whose close alone is its end
+    // for its peer (D272), as a socket's shutdown is its own whatever holds it.
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| -> Result<(), String> {
+            let mut w = &s;
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut sent = 0;
+            while sent < len {
+                let n = buf.len().min(len - sent);
+                shards_testguest::fill(salt, sent as u64, &mut buf[..n]);
+                w.write_all(&buf[..n]).map_err(|e| format!("sending: {e}"))?;
+                sent += n;
+            }
+            s.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())
+        });
+        let mut got = 0usize;
         let mut buf = vec![0u8; 256 * 1024];
-        let mut sent = 0;
-        while sent < len {
-            let n = buf.len().min(len - sent);
-            shards_testguest::fill(salt, sent as u64, &mut buf[..n]);
-            w.write_all(&buf[..n]).map_err(|e| format!("sending: {e}"))?;
-            sent += n;
+        loop {
+            let n = r
+                .read(&mut buf)
+                .map_err(|e| format!("stream {salt}: after {got} bytes: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            if let Some(i) = shards_testguest::first_mismatch(salt, got as u64, &buf[..n]) {
+                return Err(format!("stream {salt}: byte {} came back wrong", got + i));
+            }
+            got += n;
         }
-        w.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())
-    });
-    let mut got = 0usize;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = r
-            .read(&mut buf)
-            .map_err(|e| format!("stream {salt}: after {got} bytes: {e}"))?;
-        if n == 0 {
-            break;
+        writer.join().map_err(|_| "the writer panicked".to_string())??;
+        if got != len {
+            return Err(format!("stream {salt}: echoed {got} of {len} bytes"));
         }
-        if let Some(i) = shards_testguest::first_mismatch(salt, got as u64, &buf[..n]) {
-            return Err(format!("stream {salt}: byte {} came back wrong", got + i));
-        }
-        got += n;
-    }
-    writer.join().map_err(|_| "the writer panicked".to_string())??;
-    if got != len {
-        return Err(format!("stream {salt}: echoed {got} of {len} bytes"));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// What a fake S3 holds: each object by its path (`/BUCKET/KEY`, path-style, decoded), with
@@ -8296,15 +8484,27 @@ impl Told {
 
     /// Its host's word that it is short of memory, once.
     pub fn say(&mut self) {
+        self.word(b"\n");
+    }
+
+    /// Its host's word that it has `bytes` of memory available, in place of its kernel's
+    /// count (D252): every charge its daemon makes of a run's buffers is held to it once its
+    /// daemon has heard it, which it says in its log (`told the host has N bytes`), as a
+    /// microVM runs (D188: its watcher listens then alone).
+    pub fn available(&mut self, bytes: u64) {
+        self.word(format!("available {bytes}\n").as_bytes());
+    }
+
+    fn word(&mut self, line: &[u8]) {
         #[cfg(unix)]
         std::fs::OpenOptions::new()
             .write(true)
             .open(&self.path)
             .unwrap()
-            .write_all(b"\n")
+            .write_all(line)
             .unwrap();
         #[cfg(windows)]
-        self.server.write_all(b"\n").unwrap();
+        self.server.write_all(line).unwrap();
     }
 }
 

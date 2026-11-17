@@ -121,6 +121,8 @@ const EXT4_IOC_RESIZE_FS: libc::c_ulong = 0x4008_6610;
 const MOUNT_ATTR_RDONLY: u64 = 0x1;
 const MOUNT_ATTR_NOSUID: u64 = 0x2;
 const MOUNT_ATTR_NODEV: u64 = 0x4;
+/// include/uapi/linux/mount.h:121 (Linux 7.2-rc4): `/* Disallow program execution */`.
+const MOUNT_ATTR_NOEXEC: u64 = 0x8;
 const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x4;
 
 /// Does what `args` ask in the microVM whose workload is process `workload` and whose
@@ -149,6 +151,12 @@ pub fn device(
         }
         ["share", addr, tag, dst, rest @ ..] => {
             let read_only = rest.contains(&"ro");
+            // Its files refused execution (D279): the mount `noexec` (fs/exec.c `path_noexec`).
+            let noexec = if rest.contains(&"noexec") {
+                MOUNT_ATTR_NOEXEC
+            } else {
+                0
+            };
             // A domain's beneath one of the run's plug roots (D235), refused before its
             // function is taken.
             let member = member_of(rest, domains)?;
@@ -169,14 +177,19 @@ pub fn device(
             // the host's notices touch through a mount of their own (D235, notice.rs), which
             // a read-only file system would refuse; its server refuses the guest's writes.
             let (Some((id, cgroup)), Some(parts)) = (member, parts) else {
-                let attrs = if read_only { MOUNT_ATTR_RDONLY } else { 0 };
+                let attrs = if read_only { MOUNT_ATTR_RDONLY } else { 0 } | noexec;
                 let mounted = fs_mount(c"virtiofs", &tag, false, attrs)?;
                 return attach(mounted, workload, dst);
             };
             // A domain's, as a volume given it is (D109): `nosuid` and `nodev`, and the
             // files the host made there its user's, which it is told while the mount is
             // still writable, as a read-only mount takes no attribute.
-            let mounted = fs_mount(c"virtiofs", &tag, false, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV)?;
+            let mounted = fs_mount(
+                c"virtiofs",
+                &tag,
+                false,
+                MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | noexec,
+            )?;
             crate::setup::name_owner_as(&format!("/proc/self/fd/{}", mounted.as_raw_fd()), id, id);
             if read_only {
                 set_attrs(&mounted, MOUNT_ATTR_RDONLY)?;
@@ -760,7 +773,8 @@ fn member_of<'a>(
     let id = crate::domains::FIRST_ID
         .checked_add(n)
         .ok_or_else(|| io::Error::other(format!("member {n}: past the domains' IDs")))?;
-    Ok(Some((id, started.cgroup.as_str())))
+    // Where its processes are (D270): its generation's leaf.
+    Ok(Some((id, started.population.as_str())))
 }
 
 /// A process's PID in a domain's PID namespace, a child of init's, from its `status`
@@ -783,6 +797,17 @@ fn domain_pid(status: &str) -> Option<u32> {
 /// namespace of its own (managed.rs), its command (PID 2 there) first. Each is held before
 /// it is checked to be the domain's still, so that a PID another process took meanwhile is
 /// never entered: one that ended once held fails setns(2), and the next is tried.
+/// The PID, in init's namespace, of the process `pidfd` names (`/proc/self/fdinfo`'s `Pid:`,
+/// proc(5)): -1 there once it has ended, which is refused.
+pub(crate) fn pid_of(pidfd: &OwnedFd) -> io::Result<libc::pid_t> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?;
+    info.lines()
+        .find_map(|l| l.strip_prefix("Pid:"))
+        .and_then(|p| p.trim().parse::<libc::pid_t>().ok())
+        .filter(|p| *p > 0)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))
+}
+
 pub(crate) fn member_process(cgroup: &str) -> io::Result<OwnedFd> {
     let procs = std::fs::read_to_string(format!("{cgroup}/cgroup.procs"))
         .map_err(|e| io::Error::new(e.kind(), format!("{cgroup}: {e}")))?;
@@ -987,6 +1012,31 @@ fn grow_ext4(dst: &str, bytes: u64) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pidfd's process is known by its PID in this namespace (D270's kept namespaces read its
+    /// `/proc`), and one of no live process is refused.
+    #[test]
+    fn a_pidfds_process_is_known_by_its_pid() {
+        // SAFETY: pidfd_open(2) of this process, with no flags; getpid(2).
+        let (fd, me) = unsafe {
+            (
+                libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32),
+                libc::getpid(),
+            )
+        };
+        // SAFETY: the descriptor pidfd_open just made, owned here alone.
+        let fd = unsafe { OwnedFd::from_raw_fd(i32::try_from(fd).unwrap()) };
+        assert_eq!(pid_of(&fd).unwrap(), me);
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        // SAFETY: as above, of the child before it is waited for.
+        let theirs = unsafe {
+            OwnedFd::from_raw_fd(i32::try_from(libc::syscall(libc::SYS_pidfd_open, pid, 0u32)).unwrap())
+        };
+        let mut child = child;
+        child.wait().unwrap();
+        assert_eq!(pid_of(&theirs).unwrap_err().raw_os_error(), Some(libc::ESRCH));
+    }
 
     /// A component is named by its digest's 64 lowercase hex digits alone (D270), so that its
     /// key names one directory beside the run's writable layer and nothing else: one that

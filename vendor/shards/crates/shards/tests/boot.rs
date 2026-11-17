@@ -364,6 +364,26 @@ fn runs_init_as_pid_1_and_powers_off() {
     assert!(init_us < exit_us, "{r}");
 }
 
+/// PID 1 runs where its kernel opened it no console: a command line naming a console the
+/// machine has none of leaves PID 1's descriptors 0-2 closed (init/main.c
+/// `console_on_rootfs`), which Rust's runtime reopens on the initramfs's `/dev/null` before
+/// init's `main`, or aborts, ending PID 1 (D261). `hvc1` names none on any machine (the
+/// console has one port); `ttyS0`, Hex's guests' line, none on arm64, whose 8250 driver has
+/// no legacy port (x86-64's asm/serial.h gives it 0x3f8, UART or not).
+#[test]
+fn runs_init_where_its_kernel_opened_no_console() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (k, init) = (kernel().to_str().unwrap(), guest_init().to_str().unwrap());
+    for console in ["console=hvc1", "console=ttyS0"] {
+        let line = format!("{console} quiet panic=-1");
+        let r = vm_run(&["--kernel", k, "--init", init, "--cmdline", line.as_str()]);
+        assert_eq!(r.status, Some(0), "{console}: {r}");
+        assert!(r.marker_us(1).is_some(), "{console}: {r}");
+    }
+}
+
 #[test]
 fn survives_back_to_back_boots() {
     if cannot_run_vms() {
@@ -2231,10 +2251,11 @@ fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
             .spawn()
             .unwrap()
     };
-    // Its socket accepts once its VM process has made its device and listens. On macOS and
-    // Windows its spawner binds the path first and a client is refused until the VM listens
-    // (grant_answer.rs `bound`), so the path's being there says nothing: a dial that connects
-    // does. Waited for while its VM process lives, each dial paced as shards-api paces its
+    // Its socket accepts once its VM process has made its device and listens. On macOS its
+    // spawner binds the path first and a client is refused until the VM listens, so the path's
+    // being there says nothing: a dial that connects does. On Windows its spawner makes its
+    // pipes and names them at the path first (D272): a dial opens them at once, its connection
+    // taken as the device comes up, and the next dial waits for the device's next pair. Waited for while its VM process lives, each dial paced as shards-api paces its
     // own (`shards_api::pause`), with no clock of the test's (WHP at 0a3dde0db: a dial as the
     // path appeared was refused, WSAECONNREFUSED).
     let listening = |socket: &std::path::Path, child: &mut std::process::Child| {
@@ -2242,7 +2263,7 @@ fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
         loop {
             let dialed = Instant::now();
             if socket.exists() {
-                match shards_vmm::platform::UnixStream::connect(socket) {
+                match common::vsock_dial(socket) {
                     Ok(_) => return,
                     Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
                     Err(e) => panic!("dialing {}: {e}", socket.display()),
@@ -2262,7 +2283,7 @@ fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
     // One ask, and the line its VM answers before it closes the ask: none where it closes it
     // unanswered.
     let asked = |socket: &std::path::Path, milli: u64| {
-        let mut s = shards_vmm::platform::UnixStream::connect(socket).unwrap();
+        let mut s = common::vsock_dial(socket).unwrap();
         s.write_all(ask(milli).as_bytes()).unwrap();
         let mut line = String::new();
         s.read_to_string(&mut line).unwrap();
@@ -2272,7 +2293,7 @@ fn a_managed_guest_is_held_to_the_rate_its_client_asks_on_its_socket() {
     let mut child = boot(&socket, true);
     listening(&socket, &mut child);
     let used = |socket: &std::path::Path| {
-        let mut s = shards_vmm::platform::UnixStream::connect(socket).unwrap();
+        let mut s = common::vsock_dial(socket).unwrap();
         s.write_all(shards_abi::rate::USE_ASK).unwrap();
         let mut answer = Vec::new();
         s.read_to_end(&mut answer).unwrap();

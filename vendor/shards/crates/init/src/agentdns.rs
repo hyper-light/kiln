@@ -6,8 +6,9 @@
 //! the question arrives on (IP_PKTINFO), which no agent chooses, and answers from the
 //! address asked. What it may ask goes to the microVM's
 //! resolver, the network process at eth0's gateway, which holds the microVM to the union
-//! of its agents' grants; the rest is REFUSED at once. Queries wait on no other query: each
-//! is sent upstream under an ID of the relay's, and answered as its answer comes.
+//! of its agents' grants; a name nothing grants it is answered at once, NXDOMAIN (D278).
+//! Queries wait on no other query: each is sent upstream under an ID of the relay's, and
+//! answered as its answer comes.
 //!
 //! It answers over TCP too, for answers too long for UDP (RFC 7766): a resolver asks again
 //! over TCP when a UDP answer comes truncated. A TCP asker is known by its address, which
@@ -54,30 +55,40 @@ pub struct Asker {
 }
 
 impl Asker {
-    /// Whether it may ask the question `q`.
-    fn may_ask(&self, q: &[u8]) -> bool {
-        self.any || query_name(q).is_some_and(|name| self.names.contains(&name))
-    }
-
     /// What question `q` of its is answered, as its grants stand.
     fn verdict(&self, q: &[u8]) -> Verdict {
         if let Some(answer) = self.local.iter().find(|t| t.holds(q)).and_then(|t| t.answer(q)) {
-            Verdict::Here(answer)
-        } else if self.may_ask(q) {
-            Verdict::Upstream
-        } else {
-            Verdict::Refused
+            return Verdict::Here(answer);
+        }
+        if self.any {
+            return Verdict::Upstream;
+        }
+        match query_name(q) {
+            Some(name) if self.names.contains(&name) => Verdict::Upstream,
+            Some(_) => answered(q, NXDOMAIN).map_or(Verdict::Refused, Verdict::Here),
+            None => Verdict::Refused,
         }
     }
 }
 
-/// What a question is answered: from its asker's names here (D181), by the microVM's
-/// resolver, or REFUSED.
+/// What a question is answered: here, from its asker's names (D181) or NXDOMAIN for a name
+/// nothing grants it (D278); by the microVM's resolver; or REFUSED, as what is no query of
+/// one question.
 enum Verdict {
     Here(Vec<u8>),
     Upstream,
     Refused,
 }
+
+/// A name nothing grants its asker has none, for it: NXDOMAIN (RFC 1035 §4.1.1), which every
+/// stub resolver takes at once, where musl's drops REFUSED ("ignore all other codes such as
+/// refusal", src/network/res_msend.c) and its lookup ends EAI_AGAIN once its timeout passes
+/// (lookup_name.c `name_from_dns`), as glibc's ends at once (resolv/res_send.c). With no SOA in
+/// it, no cache keeps it past a grant that names the name (RFC 2308 §5).
+const NXDOMAIN: u8 = 3;
+/// What is no query of one question, or comes past its asker's share of those in flight:
+/// REFUSED, by policy (RFC 1035 §4.1.1), which a stub asks again after its own interval.
+const REFUSED: u8 = 5;
 
 /// Starts the relay on `listen` (port 53 of every switch address) and `upstream`
 /// (connected to the microVM's resolver), both of the switch's namespace, in a process of
@@ -172,8 +183,16 @@ pub fn running() -> bool {
     CONTROL.get().is_some()
 }
 
-/// Has the relay keep `asker`, in place of any of its link's (D181).
+/// Has the relay keep `asker`, in place of any of its link's (D181), its names among it
+/// (D278).
 pub fn admit(asker: &Asker) -> io::Result<()> {
+    tell(&admission(asker)?)
+}
+
+/// What [`admit`] tells the relay: its link, whether it may ask any name, its addresses, each
+/// name it may ask (a length, then its bytes: a host's name is 253 at most, D236), then its
+/// tables.
+fn admission(asker: &Asker) -> io::Result<Vec<u8>> {
     let mut m = vec![b'A'];
     m.extend_from_slice(&asker.link.to_be_bytes());
     m.push(u8::from(asker.any));
@@ -183,6 +202,11 @@ pub fn admit(asker: &Asker) -> io::Result<()> {
     for a in &asker.addrs {
         m.extend_from_slice(&a.octets());
     }
+    m.push(u8::try_from(asker.names.len()).map_err(|_| io::Error::other("an asker with too many names"))?);
+    for name in &asker.names {
+        m.push(u8::try_from(name.len()).map_err(|_| io::Error::other("a name too long to ask"))?);
+        m.extend_from_slice(name.as_bytes());
+    }
     for table in &asker.local {
         let bytes = table.table();
         let len =
@@ -190,7 +214,7 @@ pub fn admit(asker: &Asker) -> io::Result<()> {
         m.extend_from_slice(&len.to_be_bytes());
         m.extend_from_slice(&bytes);
     }
-    tell(&m)
+    Ok(m)
 }
 
 /// Has the relay let the asker of link `link` go (D181).
@@ -231,8 +255,21 @@ fn apply(m: &[u8], askers: &RwLock<Vec<Asker>>) -> bool {
                 return false;
             };
             let addrs = addrs.iter().map(|c| Ipv4Addr::from(*c)).collect();
+            let Some((&count, mut rest)) = m.get(end..).and_then(<[u8]>::split_first) else {
+                return false;
+            };
+            let mut names = Vec::new();
+            for _ in 0..count {
+                let Some((&len, tail)) = rest.split_first() else {
+                    return false;
+                };
+                let Some((name, tail)) = tail.split_at_checked(usize::from(len)) else {
+                    return false;
+                };
+                names.push(String::from_utf8_lossy(name).into_owned());
+                rest = tail;
+            }
             let mut local = Vec::new();
-            let mut rest = m.get(end..).unwrap_or_default();
             while let Some((&[a, b], tail)) = rest.split_first_chunk::<2>() {
                 let len = usize::from(u16::from_be_bytes([a, b]));
                 let Some((table, tail)) = tail.split_at_checked(len) else {
@@ -252,7 +289,7 @@ fn apply(m: &[u8], askers: &RwLock<Vec<Asker>>) -> bool {
             a.push(Asker {
                 link,
                 any: any != 0,
-                names: Vec::new(),
+                names,
                 addrs,
                 local,
             });
@@ -291,11 +328,12 @@ fn query_name(q: &[u8]) -> Option<String> {
     Some(labels.join("."))
 }
 
-/// REFUSED (RCODE 5) for query `q`, its header's ID and question kept.
-fn refused(q: &[u8]) -> Option<Vec<u8>> {
+/// The answer `rcode` ([`NXDOMAIN`], [`REFUSED`]) for query `q`, its header's ID and question
+/// kept.
+fn answered(q: &[u8], rcode: u8) -> Option<Vec<u8>> {
     let mut out = q.to_vec();
     *out.get_mut(2)? |= 0x80;
-    *out.get_mut(3)? = (*out.get(3)? & 0xf0) | 5;
+    *out.get_mut(3)? = (*out.get(3)? & 0xf0) | rcode;
     // Its question alone: no answer, authority or additional records.
     for i in 6..12 {
         *out.get_mut(i)? = 0;
@@ -505,7 +543,7 @@ fn serve_connection(
                 continue;
             }
             Some(Verdict::Refused) => {
-                if let Some(no) = refused(&q) {
+                if let Some(no) = answered(&q, REFUSED) {
                     crate::dnsrelay::write_message(conn, &no)?;
                 }
                 continue;
@@ -592,28 +630,28 @@ fn relay(listen: &UdpSocket, upstream: &UdpSocket, askers: &RwLock<Vec<Asker>>, 
         flight.expire(now);
         while let Ok((n, from)) = receive(listen, &mut buf) {
             let q = buf.get(..n).unwrap_or_default();
-            // Its peers' names, answered here and never asked past the microVM (D181).
-            let here = askers
+            // Its peers' names and a name nothing grants it, answered here and never asked past
+            // the microVM (D181, D278).
+            let verdict = askers
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
                 .find(|a| a.link == from.link)
-                .and_then(|a| a.local.iter().find(|t| t.holds(q)).and_then(|t| t.answer(q)));
-            if let Some(answer) = here {
-                let _ = answer_to(listen, &answer, &from);
-                continue;
-            }
-            let granted = askers
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .find(|a| a.link == from.link)
-                .is_some_and(|a| a.may_ask(q));
-            if !granted || !flight.admits(from.link) {
-                if let Some(no) = refused(q) {
-                    let _ = answer_to(listen, &no, &from);
+                .map(|a| a.verdict(q));
+            match verdict {
+                Some(Verdict::Here(answer)) => {
+                    let _ = answer_to(listen, &answer, &from);
+                    continue;
                 }
-                continue;
+                Some(Verdict::Upstream) if flight.admits(from.link) => {}
+                // No asker of its link, no query of one question, or past its asker's share of
+                // those in flight.
+                _ => {
+                    if let Some(no) = answered(q, REFUSED) {
+                        let _ = answer_to(listen, &no, &from);
+                    }
+                    continue;
+                }
             }
             let Some(&[i0, i1]) = q.first_chunk::<2>() else {
                 continue;
@@ -652,6 +690,55 @@ fn relay(listen: &UdpSocket, upstream: &UdpSocket, askers: &RwLock<Vec<Asker>>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An asker admitted as the run goes keeps the names it may ask (D278), and its next
+    /// admission takes its link's place, what it may ask with it; one cut short is nothing.
+    #[test]
+    fn an_askers_names_are_admitted_with_it() {
+        let askers = RwLock::new(Vec::new());
+        let asker = Asker {
+            link: 9,
+            any: false,
+            names: vec!["api.example.com".into(), "chatgpt.com".into()],
+            addrs: vec![Ipv4Addr::new(10, 88, 0, 2)],
+            local: Vec::new(),
+        };
+        assert!(apply(&admission(&asker).unwrap(), &askers));
+        {
+            let a = askers.read().unwrap();
+            assert_eq!(
+                (a.len(), a[0].names.clone(), a[0].addrs.clone()),
+                (1, asker.names.clone(), asker.addrs.clone())
+            );
+            assert!(matches!(
+                a[0].verdict(&question("chatgpt.com")),
+                Verdict::Upstream
+            ));
+            // A name it is not granted: none, for it, at once (D278).
+            let Verdict::Here(no) = a[0].verdict(&question("evil.example")) else {
+                panic!("a name nothing grants it went past the microVM, or was refused");
+            };
+            assert_eq!(
+                (no[0], no[1], no[2] & 0x80, no[3] & 0x0f),
+                (0x12, 0x34, 0x80, NXDOMAIN)
+            );
+        }
+        let none = Asker {
+            names: Vec::new(),
+            ..asker
+        };
+        let told = admission(&none).unwrap();
+        assert!(apply(&told, &askers));
+        assert!(askers.read().unwrap()[0].names.is_empty(), "its names taken back");
+        assert!(!apply(&told[..told.len() - 1], &askers));
+        fn question(name: &str) -> Vec<u8> {
+            let mut q = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            q.push(u8::try_from(name.len()).unwrap());
+            q.extend_from_slice(name.as_bytes());
+            q.extend_from_slice(&[0, 0, 1, 0, 1]);
+            q
+        }
+    }
 
     #[test]
     fn an_existing_tcp_session_uses_the_members_current_names() {
@@ -695,7 +782,7 @@ mod tests {
             vec![table(&[("keeper", "192.0.2.8"), ("joined", "192.0.2.9")])];
         assert_eq!(
             ask(&mut conn, "departed")[3] & 0x0f,
-            5,
+            NXDOMAIN,
             "the old TCP session kept a departed member"
         );
         let joined = ask(&mut conn, "joined");
@@ -737,16 +824,32 @@ mod tests {
         assert_eq!(f.wait_ms(now + WAIT), -1);
     }
 
+    /// An answer made here keeps its query's ID and question, with no records; what is no query
+    /// of one question is refused, never taken for a name nothing grants.
     #[test]
     fn a_refused_query_keeps_its_id_and_question() {
         let mut q = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1];
         q.extend_from_slice(b"\x03Api\x07example\x00\x00\x01\x00\x01");
         assert_eq!(query_name(&q).as_deref(), Some("api.example"));
-        let no = refused(&q).unwrap();
-        assert_eq!((no[0], no[1], no[2] & 0x80, no[3] & 0x0f), (0xab, 0xcd, 0x80, 5));
-        assert_eq!(&no[6..12], &[0; 6]);
+        for rcode in [NXDOMAIN, REFUSED] {
+            let no = answered(&q, rcode).unwrap();
+            assert_eq!(
+                (no[0], no[1], no[2] & 0x80, no[3] & 0x0f),
+                (0xab, 0xcd, 0x80, rcode)
+            );
+            assert_eq!(&no[6..12], &[0; 6]);
+        }
         let mut answer = q.clone();
         answer[2] |= 0x80;
         assert_eq!(query_name(&answer), None);
+        let asker = Asker {
+            link: 9,
+            any: false,
+            names: Vec::new(),
+            addrs: Vec::new(),
+            local: Vec::new(),
+        };
+        assert!(matches!(asker.verdict(&answer), Verdict::Refused));
+        assert!(matches!(asker.verdict(&q), Verdict::Here(_)));
     }
 }

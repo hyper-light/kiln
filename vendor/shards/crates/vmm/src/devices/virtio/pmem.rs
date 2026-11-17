@@ -123,6 +123,13 @@ pub trait Slots: Send + Sync {
     /// VM is destroyed.
     unsafe fn map(&self, i: u32, host: *mut u8, gpa: u64, len: usize, writable: bool) -> Result<(), String>;
 
+    /// [`map`](Self::map) for programs: read-only to the guest, and executable, as a
+    /// component's image holds what its member runs (D270), mapped through DAX.
+    ///
+    /// # Safety
+    /// As for [`map`](Self::map).
+    unsafe fn map_programs(&self, i: u32, host: *mut u8, gpa: u64, len: usize) -> Result<(), String>;
+
     /// Unmaps slot `i`, mapped at `gpa` for `len` bytes.
     fn unmap(&self, i: u32, gpa: u64, len: usize) -> Result<(), String>;
 }
@@ -148,7 +155,21 @@ struct Placed {
     len: u64,
     slot: u32,
     devfn: Option<u8>,
+    /// Its component's key, as its owner names it (D270 slice 5): what a restore opens its
+    /// image again by.
+    key: String,
     _region: Arc<Region>,
+}
+
+/// A component a machine holds, as a snapshot keeps it (D270 slice 5): its function's place
+/// on the bus, its range of the window, and its key, which a restore opens its image again by
+/// and maps there again, the function plugged back where it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub devfn: u8,
+    pub gpa: u64,
+    pub len: u64,
+    pub key: String,
 }
 
 impl std::fmt::Debug for Components {
@@ -181,10 +202,21 @@ impl Components {
         })
     }
 
-    /// Maps `region` read-only at the window's first free range that holds it, through a free
-    /// slot: its guest address. Refused where every slot maps a file already, or no free
-    /// range is as long ([`Refusal::NoRoom`], with the longest there is).
-    pub fn place(&self, region: &Arc<Region>) -> Result<u64, Refusal> {
+    /// Maps `region`, component `key`'s image, read-only and executable at the window's first
+    /// free range that holds it, through a free slot: its guest address. Refused where every
+    /// slot maps a file already, or no free range is as long ([`Refusal::NoRoom`], with the
+    /// longest there is).
+    pub fn place(&self, region: &Arc<Region>, key: &str) -> Result<u64, Refusal> {
+        self.place_where(region, key, None)
+    }
+
+    /// [`place`](Self::place) at `gpa`, where a snapshot kept it (D270 slice 5): refused where
+    /// that range is not free and whole within the window.
+    pub fn place_at(&self, region: &Arc<Region>, key: &str, gpa: u64) -> Result<u64, Refusal> {
+        self.place_where(region, key, Some(gpa))
+    }
+
+    fn place_where(&self, region: &Arc<Region>, key: &str, at: Option<u64>) -> Result<u64, Refusal> {
         let asked = region.len() as u64;
         let mut placed = lock(&self.placed);
         let slot = (0..self.count)
@@ -192,20 +224,60 @@ impl Components {
             .ok_or(Refusal::NoSlots {
                 slots: u64::from(self.count),
             })?;
-        let (at, free) = first_fit(self.gpa, self.len, &placed, asked);
-        let gpa = at.ok_or(Refusal::NoRoom { asked, free })?;
+        let gpa = match at {
+            None => {
+                let (at, free) = first_fit(self.gpa, self.len, &placed, asked);
+                at.ok_or(Refusal::NoRoom { asked, free })?
+            }
+            Some(gpa) => {
+                let end = gpa.checked_add(asked.next_multiple_of(ALIGN));
+                let within = gpa >= self.gpa
+                    && gpa.is_multiple_of(ALIGN)
+                    && end.is_some_and(|e| e <= self.gpa.saturating_add(self.len));
+                let free = placed.iter().all(|p| {
+                    gpa.saturating_add(asked) <= p.gpa
+                        || p.gpa.saturating_add(p.len.next_multiple_of(ALIGN)) <= gpa
+                });
+                if !within || !free {
+                    return Err(Refusal::Host(format!(
+                        "a component's range at {gpa:#x} of {asked} bytes is not free in its window"
+                    )));
+                }
+                gpa
+            }
+        };
         // SAFETY: the region stays mapped in this process while its range is: the record
         // below holds it until `unmap` takes the range back, or the window drops after the
         // VM (`Running` drops the VM before the devices).
-        unsafe { self.slots.map(slot, region.host(), gpa, region.len(), false) }.map_err(Refusal::Host)?;
+        // Its member runs programs from it, through DAX: executable, as an image's root is.
+        unsafe { self.slots.map_programs(slot, region.host(), gpa, region.len()) }.map_err(Refusal::Host)?;
         placed.push(Placed {
             gpa,
             len: asked,
             slot,
             devfn: None,
+            key: key.to_owned(),
             _region: region.clone(),
         });
         Ok(gpa)
+    }
+
+    /// Each component the window holds for a function, as a snapshot keeps it, in the order of
+    /// their places on the bus.
+    pub fn kept(&self) -> Vec<Kept> {
+        let mut out: Vec<Kept> = lock(&self.placed)
+            .iter()
+            .filter_map(|p| {
+                Some(Kept {
+                    devfn: p.devfn?,
+                    gpa: p.gpa,
+                    len: p.len,
+                    key: p.key.clone(),
+                })
+            })
+            .collect();
+        out.sort_by_key(|k| k.devfn);
+        out
     }
 
     /// The range at `gpa` held from now on by the function plugged at `devfn`.
@@ -1599,6 +1671,10 @@ mod tests {
             Ok(())
         }
 
+        unsafe fn map_programs(&self, _: u32, _: *mut u8, _: u64, _: usize) -> Result<(), String> {
+            Ok(())
+        }
+
         fn unmap(&self, _: u32, _: u64, _: usize) -> Result<(), String> {
             Ok(())
         }
@@ -1608,20 +1684,29 @@ mod tests {
         Arc::new(SwapWindow::new(1 << 32, 8 * ALIGN, Box::new(Unmapped)).unwrap())
     }
 
-    /// Slots that keep what is mapped through them, by slot: `(guest address, length,
-    /// writable)`.
-    /// What each slot maps: its guest address, length, and whether the guest may write it.
-    type SlotMaps = std::collections::BTreeMap<u32, (u64, usize, bool)>;
+    /// What each slot maps, by slot: its guest address, its length, and what the guest may do
+    /// there (`r`, `rw`, or `rx`, programs').
+    type SlotMaps = std::collections::BTreeMap<u32, (u64, usize, &'static str)>;
 
     #[derive(Default)]
     struct Kept(Arc<Mutex<SlotMaps>>);
 
-    impl Slots for Kept {
-        unsafe fn map(&self, i: u32, _: *mut u8, gpa: u64, len: usize, writable: bool) -> Result<(), String> {
-            match lock(&self.0).insert(i, (gpa, len, writable)) {
+    impl Kept {
+        fn keep(&self, i: u32, gpa: u64, len: usize, perms: &'static str) -> Result<(), String> {
+            match lock(&self.0).insert(i, (gpa, len, perms)) {
                 None => Ok(()),
                 Some(was) => Err(format!("slot {i} mapped twice: {was:?}")),
             }
+        }
+    }
+
+    impl Slots for Kept {
+        unsafe fn map(&self, i: u32, _: *mut u8, gpa: u64, len: usize, writable: bool) -> Result<(), String> {
+            self.keep(i, gpa, len, if writable { "rw" } else { "r" })
+        }
+
+        unsafe fn map_programs(&self, i: u32, _: *mut u8, gpa: u64, len: usize) -> Result<(), String> {
+            self.keep(i, gpa, len, "rx")
         }
 
         fn unmap(&self, i: u32, gpa: u64, len: usize) -> Result<(), String> {
@@ -1638,10 +1723,12 @@ mod tests {
         Arc::new(Region::of_file(f, name).unwrap())
     }
 
-    /// A components' window (D270) maps each file read-only at its first free range,
-    /// whole 2 MiB, through a slot of its own; one released gives its range and slot back to
+    /// A components' window (D270) maps each file read-only and executable (its member runs
+    /// its programs from it) at its first free range, whole 2 MiB, through a slot of its own; one released gives its range and slot back to
     /// the next; a file longer than any free range is refused naming the longest, and one
-    /// past its slots refused as the bus refuses a function past its slots.
+    /// past its slots refused as the bus refuses a function past its slots. A restore's file is
+    /// mapped back at the range its snapshot kept where that is free and in the window, and a
+    /// save keeps each range a function holds, by its place, with its key (D270 slice 5).
     #[test]
     fn a_components_window_maps_each_file_at_a_free_range_through_a_slot_of_its_own() {
         let dir = shards_testdir::TempDir::new("components").unwrap();
@@ -1652,8 +1739,8 @@ mod tests {
         // 3 MiB is two ranges; 1 byte, one.
         let a = component(dir.as_ref(), "a", 3 << 20);
         let b = component(dir.as_ref(), "b", 1);
-        assert_eq!(window.place(&a).unwrap(), at);
-        assert_eq!(window.place(&b).unwrap(), at + 2 * ALIGN);
+        assert_eq!(window.place(&a, "a").unwrap(), at);
+        assert_eq!(window.place(&b, "b").unwrap(), at + 2 * ALIGN);
         window.held_by(at, 8);
         window.held_by(at + 2 * ALIGN, 16);
         assert_eq!(window.range_of(16), Some((at + 2 * ALIGN, ALIGN)));
@@ -1661,14 +1748,14 @@ mod tests {
         assert_eq!(
             *lock(&maps),
             std::collections::BTreeMap::from([
-                (0, (at, 2 * ALIGN as usize, false)),
-                (1, (at + 2 * ALIGN, ALIGN as usize, false))
+                (0, (at, 2 * ALIGN as usize, "rx")),
+                (1, (at + 2 * ALIGN, ALIGN as usize, "rx"))
             ])
         );
         // Five ranges are left, at the window's end: six are not there.
         let big = component(dir.as_ref(), "big", 6 * ALIGN);
         assert_eq!(
-            window.place(&big),
+            window.place(&big, "big"),
             Err(Refusal::NoRoom {
                 asked: 6 * ALIGN,
                 free: 5 * ALIGN
@@ -1678,20 +1765,46 @@ mod tests {
         window.release(8).unwrap();
         assert_eq!(
             *lock(&maps),
-            std::collections::BTreeMap::from([(1, (at + 2 * ALIGN, ALIGN as usize, false))])
+            std::collections::BTreeMap::from([(1, (at + 2 * ALIGN, ALIGN as usize, "rx"))])
         );
         let c = component(dir.as_ref(), "c", ALIGN);
-        assert_eq!(window.place(&c).unwrap(), at);
-        assert_eq!(lock(&maps).get(&0), Some(&(at, ALIGN as usize, false)));
+        assert_eq!(window.place(&c, "c").unwrap(), at);
+        assert_eq!(lock(&maps).get(&0), Some(&(at, ALIGN as usize, "rx")));
         let d = component(dir.as_ref(), "d", ALIGN);
-        assert_eq!(window.place(&d).unwrap(), at + ALIGN);
+        assert_eq!(window.place(&d, "d").unwrap(), at + ALIGN);
         // Every slot maps a file.
         let e = component(dir.as_ref(), "e", ALIGN);
-        assert_eq!(window.place(&e), Err(Refusal::NoSlots { slots: 3 }));
+        assert_eq!(window.place(&e, "e"), Err(Refusal::NoSlots { slots: 3 }));
         // A plug that failed gives its range back; a release of no component's is nothing.
         window.release_at(at + ALIGN).unwrap();
         window.release(99).unwrap();
         assert_eq!(window.mapped(), [(at, ALIGN), (at + 2 * ALIGN, ALIGN)]);
+        // A restore's place (D270 slice 5): a range kept, mapped where it is free and whole
+        // ranges within the window, else refused, nothing mapped.
+        for gpa in [at, at + ALIGN + 4096, at - ALIGN, at + 8 * ALIGN] {
+            assert!(window.place_at(&e, "e", gpa).is_err(), "at {gpa:#x}");
+        }
+        assert_eq!(window.place_at(&e, "e", at + ALIGN), Ok(at + ALIGN));
+        assert_eq!(lock(&maps).get(&2), Some(&(at + ALIGN, ALIGN as usize, "rx")));
+        // What a save keeps: each range a function holds, with its key, by the function's place.
+        window.held_by(at, 8);
+        assert_eq!(
+            window.kept(),
+            [
+                super::Kept {
+                    devfn: 8,
+                    gpa: at,
+                    len: ALIGN,
+                    key: "c".into()
+                },
+                super::Kept {
+                    devfn: 16,
+                    gpa: at + 2 * ALIGN,
+                    len: ALIGN,
+                    key: "b".into()
+                },
+            ]
+        );
         assert!(Components::new(at + 4096, ALIGN, Box::new(Unmapped), 1).is_err());
         assert!(Components::new(at, ALIGN + 4096, Box::new(Unmapped), 1).is_err());
     }

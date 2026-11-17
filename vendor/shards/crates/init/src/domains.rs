@@ -141,6 +141,12 @@ struct Share {
     main: bool,
     /// The store's own volume, which `--chown` and `--chmod` set: never a host directory.
     own: bool,
+    /// Its files refused execution (`noexec`, D279): each domain's mount of it is `noexec`.
+    noexec: bool,
+    /// The members its orchestrator gave it as they start (D277, `member=N` each, by declared
+    /// index): those alone are given it, whatever a `VOLUME` would say; none, as a `VOLUME`
+    /// says (D109).
+    members: Option<Vec<u32>>,
 }
 
 /// The shares the run gives its domains, from its setup entries.
@@ -163,6 +169,11 @@ fn shares_of(setup: &[Vec<u8>]) -> Vec<Share> {
             continue;
         }
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let members: Vec<u32> = flags
+            .iter()
+            .filter_map(|f| f.strip_prefix(b"member="))
+            .filter_map(|n| std::str::from_utf8(n).ok()?.parse().ok())
+            .collect();
         out.push(Share {
             tag: text(tag),
             dest: crate::copy::clean(std::path::Path::new(&text(dest)))
@@ -172,6 +183,8 @@ fn shares_of(setup: &[Vec<u8>]) -> Vec<Share> {
             copy: flags.contains(&&b"copy"[..]),
             main,
             own: flags.contains(&&b"own"[..]),
+            noexec: flags.contains(&&b"noexec"[..]),
+            members: (!members.is_empty()).then_some(members),
         });
     }
     out
@@ -277,6 +290,17 @@ fn given_volume(d: &Domain, dest: &str) -> bool {
     rules.is_empty() || rules.iter().any(|r| r.granted)
 }
 
+/// Whether `d` is given `share`: one its orchestrator gave members (D277) to those alone, by
+/// their declared index, and where a `VOLUME` lies there only as it says too (its run host
+/// refuses a share that would widen it); any other as [`given_volume`] says.
+fn given_share(d: &Domain, share: &Share) -> bool {
+    let named = share
+        .members
+        .as_ref()
+        .is_none_or(|members| d.id.checked_sub(FIRST_ID).is_some_and(|m| members.contains(&m)));
+    named && given_volume(d, &share.dest)
+}
+
 /// The owner `--chown` names (§12 answer 9): an agent or harness by its name, its own
 /// uid and gid; else a user and perhaps a group, by name or ID, as the image's own
 /// databases say them.
@@ -368,8 +392,9 @@ pub type Read = (
 );
 
 /// The directories of every domain the image's normalized Agentfile declares, and those
-/// domains that say how they run; nothing where the image has no Agentfile.
-pub fn read() -> Result<Read, String> {
+/// domains that say how they run, their links with the grants past the microVM the run's
+/// `setup` gives them (D278); nothing where the image has no Agentfile.
+pub fn read(setup: &[Vec<u8>]) -> Result<Read, String> {
     let none = || Ok((Vec::new(), Vec::new(), Vec::new()));
     // The image as built, never the run's root, which the run and `cp` write (D109): what
     // it declares is what the daemon read and checked against the image.
@@ -424,7 +449,26 @@ pub fn read() -> Result<Read, String> {
         let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
         (std::net::Ipv6Addr::from(u128::from(addr) & mask), prefix)
     });
-    let plan = crate::netplan::plan(&spec, &names, own, own6)?;
+    let mut plan = crate::netplan::plan(&spec, &names, own, own6)?;
+    // Each member's grants past the microVM of its own, and the most it may be given, as the
+    // run's host says them (D278).
+    {
+        let members: Vec<u32> = out.iter().map(|d| d.id.saturating_sub(FIRST_ID)).collect();
+        let labels: Vec<String> = out.iter().map(|d| d.label.clone()).collect();
+        let outward: Vec<bool> = plan
+            .links
+            .iter()
+            .map(|l| l.as_ref().is_some_and(|l| crate::netplan::outward(&spec, l)))
+            .collect();
+        crate::egress::at_start(
+            &mut plan.links,
+            &members,
+            &labels,
+            &outward,
+            setup,
+            own.map(|(_, _, gateway)| gateway),
+        )?;
+    }
     for d in &mut out {
         d.mcp = offered(&spec, d, &root);
     }
@@ -476,11 +520,11 @@ pub fn read() -> Result<Read, String> {
         }
     }
     for (d, link) in out.iter_mut().zip(plan.links) {
-        // A resolver only where a grant names one (`--dns`, a remote MCP server): the
-        // agents' resolver, at the switch's end of its gate's link (D61), which holds it to
-        // what it may ask.
+        // A resolver only where a grant names one (`--dns`, a remote MCP server) or a ceiling
+        // may (D278, D285): the agents' resolver, at the switch's end of its gate's link
+        // (D61), which holds it to what it may ask and answers each question at once.
         if let Some(l) = &link
-            && (l.dns || !l.named.is_empty())
+            && crate::egress::resolves(l)
             && !l.addresses.is_empty()
         {
             d.resolv =
@@ -751,14 +795,143 @@ fn domain(
     })
 }
 
+/// A member's leaves beneath its cgroup (D270): its generation's population, and its server
+/// instance.
+const GEN_LEAF: &str = "gen";
+const SERVER_LEAF: &str = "server";
+
+/// Leaf `name` of the cgroup `group`, made and opened: a directory of cgroupfs, which inherits
+/// nothing of its parent's limits but is bound by them (cgroup-v2.rst, "Top-down Constraint").
+fn leaf(group: &std::fs::File, name: &CStr) -> io::Result<std::fs::File> {
+    // SAFETY: mkdirat(2) of a NUL-terminated name beneath a directory init holds.
+    if unsafe { libc::mkdirat(group.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat(2) of the directory just made, its descriptor owned below.
+    let fd = unsafe {
+        libc::openat(
+            group.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor openat just made, owned here alone.
+    Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// A member's namespaces its generations keep (D270): its command's mount namespace, where its
+/// root, its mounts and what is plugged into it lie, and its reaper's network, IPC, UTS and
+/// cgroup namespaces, where its link, its peers' names and its own lie; each held by a
+/// descriptor of its namespace, which setns(2) enters.
+#[derive(Debug)]
+pub struct Kept {
+    mounts: OwnedFd,
+    net: OwnedFd,
+    ipc: OwnedFd,
+    uts: OwnedFd,
+    cgroup: OwnedFd,
+}
+
+/// The namespaces of a member whose reaper is `reaper` and whose generation's population's
+/// cgroup is `population`: its command's mount namespace ([`crate::hotplug::member_process`]'s
+/// process, held before its own is opened, and checked to live after, so that no process that
+/// took its PID meanwhile is the one read), and its reaper's others.
+fn kept(reaper: libc::pid_t, population: &str) -> io::Result<Kept> {
+    let open = |path: String| -> io::Result<OwnedFd> {
+        let c = CString::new(path).map_err(io::Error::other)?;
+        // SAFETY: open(2) of a NUL-terminated path, its descriptor owned below.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor open just made, owned here alone.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let actor = crate::hotplug::member_process(population)?;
+    let pid = crate::hotplug::pid_of(&actor)?;
+    let mounts = open(format!("/proc/{pid}/ns/mnt"))?;
+    // SAFETY: pidfd_send_signal(2) of signal 0 to the process the pidfd names: whether it
+    // still lives, which its PID is then no other's.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            actor.as_raw_fd(),
+            0,
+            std::ptr::null::<u8>(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Kept {
+        mounts,
+        net: open(format!("/proc/{reaper}/ns/net"))?,
+        ipc: open(format!("/proc/{reaper}/ns/ipc"))?,
+        uts: open(format!("/proc/{reaper}/ns/uts"))?,
+        cgroup: open(format!("/proc/{reaper}/ns/cgroup"))?,
+    })
+}
+
+/// What a member's next generation is made of (D270), kept from its first's start: its domain
+/// as declared, its seccomp filter, the network rights its Landlock ruleset handles, its
+/// volumes' rules, the run's plug roots, the sockets it receives on, the image's environment,
+/// the run's trust bundle where it is given it, whether its stdio is a terminal, the run's
+/// setup (what its owner staged for it), and the capabilities init leaves none of.
+struct Again {
+    domain: Domain,
+    filter: Filter,
+    net_handled: u64,
+    volumes: Vec<(CString, bool)>,
+    plug_roots: Vec<CString>,
+    receives: Vec<CString>,
+    image_env: Vec<String>,
+    laid: Option<crate::trust::Laid>,
+    terminal: bool,
+    setup: Vec<Vec<u8>>,
+    last_cap: u32,
+}
+
+/// A member's next generation's makings and its kept namespaces (D270).
+pub struct Restartable {
+    again: Again,
+    kept: Kept,
+}
+
+impl std::fmt::Debug for Restartable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Restartable")
+            .field("label", &self.again.domain.label)
+            .field("kept", &self.kept)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A started tenant: stable declared identity, owned lifetime and private output.
 #[derive(Debug)]
 pub struct Started {
     pub member: u32,
     pub output_control: crate::capture::OutputControl,
     pub label: String,
-    /// Its cgroup's directory.
+    /// Its cgroup's directory, which holds its limits over its two leaves (D270).
     pub cgroup: String,
+    /// Its generation's population's cgroup, `gen/` beneath [`cgroup`](Self::cgroup) (D270):
+    /// where its processes are found.
+    pub population: String,
+    /// Which of its generations runs (D270): 0 as the run starts, one past the last at each
+    /// start of its next ([`next_generation`]).
+    pub generation: u32,
+    /// Whether its owner asked for its next generation (D270, `kind::MEMBER_HOLD`): this one's
+    /// end then keeps its server instance and its namespaces for it; else its end is its whole
+    /// member's, as it was before generations, its server instance ended with it.
+    pub held: bool,
+    /// The components laid at their paths in this generation's view (D270).
+    pub components: Vec<shards_abi::run::members::Component>,
+    /// What its next generation is made of, or why it has none.
+    pub restart: Result<Box<Restartable>, String>,
     pub lifecycle: crate::managed::Owned,
     pub stdout: crate::capture::Pipe,
     pub stderr: crate::capture::Pipe,
@@ -1304,8 +1477,10 @@ impl Memory {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
         };
+        // Its generation's population's (D270): a member held for its next generation, its server
+        // instance alone left, is no generation to end.
         let populated = |d: &Started| {
-            std::fs::read_to_string(format!("{}/cgroup.events", d.cgroup))
+            std::fs::read_to_string(format!("{}/cgroup.events", d.population))
                 .is_ok_and(|e| e.lines().any(|l| l == "populated 1"))
         };
         // A domain the kernel's OOM killer ended, whole (`memory.oom.group`), once: at its
@@ -1417,12 +1592,12 @@ pub type Filter = (u32, Vec<libc::sock_filter>);
 pub(crate) static SWITCH: std::sync::OnceLock<crate::links::Switch> = std::sync::OnceLock::new();
 
 /// The chooser of the ports several domains are given (D122), for the run's life.
-static CHOOSER: std::sync::OnceLock<crate::chooser::Chooser> = std::sync::OnceLock::new();
+pub(crate) static CHOOSER: std::sync::OnceLock<crate::chooser::Chooser> = std::sync::OnceLock::new();
 
 /// What the `i`-th domain's gate lets through (D61): its addresses; to each peer a pair
 /// lets it open flows to, at the peer's addresses, the ports granted; from each that may
 /// open flows to it, likewise; its ports past the microVM; and the agents' resolver where
-/// a grant gives it names.
+/// its resolv.conf names it (`egress::resolves`).
 fn gate_of(
     domains: &[Domain],
     pairs: &[(usize, usize, Vec<crate::netplan::Egress>)],
@@ -1458,7 +1633,7 @@ fn gate_of(
         egress: link.egress.clone(),
         // Past the uplink's translation, at the domain's own ports (D122).
         ingress: link.ingress.iter().map(|&(_, at)| at).collect(),
-        dns: link.dns || !link.named.is_empty(),
+        dns: crate::egress::resolves(link),
         own6: link.addresses6.iter().map(|a| a.addr).collect(),
         opens6: pairs
             .iter()
@@ -1500,9 +1675,13 @@ fn gate_of(
 /// Whether `d`'s flows past the microVM, out or in, or its names, cross init's namespace,
 /// which the run's command shares, up the switch's link to eth0 ([`switch`]).
 pub fn uplinked(d: &Domain) -> bool {
-    d.link
-        .as_ref()
-        .is_some_and(|l| !l.egress.is_empty() || !l.ingress.is_empty() || l.dns || !l.named.is_empty())
+    d.link.as_ref().is_some_and(|l| {
+        !l.egress.is_empty()
+            || !l.ingress.is_empty()
+            || l.dns
+            || !l.named.is_empty()
+            || crate::egress::may_widen(l)
+    })
 }
 
 /// The switch `domains` link to: `pairs` of them allowed to open connections to each
@@ -1543,7 +1722,24 @@ fn switch(
         .filter(|(_, d)| d.link.as_ref().is_some_and(|l| l.dns || !l.named.is_empty()))
         .map(|(i, _)| i)
         .collect();
-    let uplink = match egress.is_empty() && ingress.is_empty() && dns.is_empty() {
+    // Each whose resolv.conf names the agents' resolver, which answers it at once whatever it
+    // is granted (D278): those `dns` names, and those a ceiling may give names.
+    let asking: Vec<usize> = domains
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.link.as_ref().is_some_and(crate::egress::resolves))
+        .map(|(i, _)| i)
+        .collect();
+    // A member that may be given a way past the microVM as the run goes has the uplink from
+    // the start (D278).
+    let widen = |six: bool| {
+        domains.iter().any(|d| {
+            d.link
+                .as_ref()
+                .is_some_and(|l| crate::egress::may_widen(l) && (!six || !l.addresses6.is_empty()))
+        })
+    };
+    let uplink = match egress.is_empty() && ingress.is_empty() && dns.is_empty() && !widen(false) {
         true => None,
         false => {
             let (addr, prefix, gateway) = crate::net::current()
@@ -1596,7 +1792,7 @@ fn switch(
                     (!from.is_empty()).then(|| (from, ranges.clone()))
                 })
                 .collect();
-            let ipv6 = match (crate::net::current6(), from_domain6.is_empty()) {
+            let ipv6 = match (crate::net::current6(), from_domain6.is_empty() && !widen(true)) {
                 (Some((eth0, _, _)), false) => {
                     let mut subnets6: Vec<(std::net::Ipv6Addr, u8)> = Vec::new();
                     for a in domains
@@ -1650,14 +1846,15 @@ fn switch(
         &egress,
         &ingress_at,
         &dns,
+        &asking,
         uplink,
         ipv6,
         domains.len(),
         &subnets,
     )?;
-    // The agents' resolver, for those granted names.
+    // The agents' resolver, for those that ask it, each held to the names it is granted.
     let mut askers: Vec<crate::agentdns::Asker> = Vec::new();
-    for &i in &dns {
+    for &i in &asking {
         let Some(l) = domains.get(i).and_then(|d| d.link.as_ref()) else {
             continue;
         };
@@ -1686,13 +1883,16 @@ fn switch(
 /// Starts each of `domains`, hiding from each the directories of `all` but its own, under
 /// the filter of `filters` it needs, which the host compiles (`domains-seccomp=`, and
 /// `domains-seccomp-none=` for `--processes=none`); none starts without it. Those with a
-/// link are linked once they exist, `pairs` of them allowed to open connections.
+/// link are linked once they exist, `pairs` of them allowed to open connections. A member
+/// that could not enter its working directory fails them all, and is told in `unentered`
+/// for its host (D277).
 pub fn start(
     all: &[Vec<u8>],
     domains: &[Domain],
     pairs: &[(usize, usize, Vec<crate::netplan::Egress>)],
     filters: &[Option<Filter>; 2],
     setup: &[Vec<u8>],
+    unentered: &mut Option<shards_abi::run::members::Unentered>,
 ) -> Result<Vec<Started>, String> {
     if domains.is_empty() {
         crate::staged::check(setup, |_| false)?;
@@ -1799,7 +1999,7 @@ pub fn start(
     // Each share staged, and where it lies in the image.
     let mut staged: Vec<(Share, String, String)> = Vec::new();
     for (k, sh) in shares_of(setup).into_iter().enumerate() {
-        if !domains.iter().any(|d| given_volume(d, &sh.dest)) {
+        if !domains.iter().any(|d| given_share(d, &sh)) {
             continue;
         }
         let fail = |why: String| format!("the volume at {}: {why}", sh.dest);
@@ -1843,10 +2043,10 @@ pub fn start(
         let scoped = domains
             .iter()
             .any(|d| d.volumes.iter().any(|r| r.path == sh.dest));
-        if (scoped || !sh.main)
+        if (scoped || !sh.main || sh.members.is_some())
             && let [only] = domains
                 .iter()
-                .filter(|d| given_volume(d, &sh.dest))
+                .filter(|d| given_share(d, &sh))
                 .collect::<Vec<_>>()
                 .as_slice()
         {
@@ -1964,7 +2164,11 @@ pub fn start(
         .flat_map(|c| c.candidates.iter().map(|(a, _)| *a))
         .collect();
     if !contests.is_empty() && CHOOSER.get().is_none() {
-        let chooser = crate::chooser::start(contests).map_err(|e| format!("the ports' chooser: {e}"))?;
+        // eth0's own address, whose flows alone it chooses among (D285): the run's, set before
+        // its domains (`address=`).
+        let (own, _, _) =
+            crate::net::current().ok_or("the ports' chooser: the microVM has no address of its own")?;
+        let chooser = crate::chooser::start(contests, own).map_err(|e| format!("the ports' chooser: {e}"))?;
         let _ = CHOOSER.set(chooser);
     }
     let notify_ops = crate::chooser::filter();
@@ -2028,7 +2232,16 @@ pub fn start(
             .prepare_child(&d.cgroup)
             .and_then(|p| p.commit(pids, d.memory))
             .map_err(|e| e.message(&d.label))?;
-        let cgroup = admitted.group();
+        // Its two leaves (D270), cgroup v2's rule that a cgroup with children holds no process
+        // of its own (cgroup-v2.rst, "No Internal Process Constraint"): `gen/`, its
+        // generation's population, its reaper, command and every command run in it, which a
+        // restart ends alone; `server/`, its in-VM server instance, whose channels to its
+        // peers outlive its generations. Its limits are its own cgroup's (memory.max,
+        // pids.max), over both together, as a cgroup's are over its descendants'.
+        let population = leaf(admitted.group(), c"gen")
+            .and_then(|population| leaf(admitted.group(), c"server").map(|_| population))
+            .map_err(|e| format!("{}: its cgroup's leaves: {e}", d.label))?;
+        let cgroup = &population;
         let filter = filters
             .get(usize::from(d.no_processes))
             .and_then(Option::as_ref)
@@ -2122,7 +2335,7 @@ pub fn start(
                 read_only: false,
             });
         }
-        for (sh, at, real) in staged.iter().filter(|(sh, _, _)| given_volume(d, &sh.dest)) {
+        for (sh, at, real) in staged.iter().filter(|(sh, _, _)| given_share(d, sh)) {
             for path in [real.as_str(), sh.dest.as_str()] {
                 mounts.push(crate::staged::MountPoint {
                     path,
@@ -2139,7 +2352,7 @@ pub fn start(
             d,
             no_processes,
             last_cap,
-            &group,
+            &format!("{group}/{SERVER_LEAF}"),
             &peers,
             scratch.as_ref().map(AsRawFd::as_raw_fd),
         )?;
@@ -2167,10 +2380,11 @@ pub fn start(
         // Its volumes, each a copy of the run's mount of it, at its mount point.
         let mut volumes = Vec::new();
         let mut volume_rules = Vec::new();
-        for (sh, at, real) in staged.iter().filter(|(sh, _, _)| given_volume(d, &sh.dest)) {
+        for (sh, at, real) in staged.iter().filter(|(sh, _, _)| given_share(d, sh)) {
             let attr = libc::MOUNT_ATTR_NOSUID
                 | libc::MOUNT_ATTR_NODEV
-                | if sh.ro { libc::MOUNT_ATTR_RDONLY } else { 0 };
+                | if sh.ro { libc::MOUNT_ATTR_RDONLY } else { 0 }
+                | if sh.noexec { libc::MOUNT_ATTR_NOEXEC } else { 0 };
             let copy =
                 copy_of(at, attr).map_err(|e| format!("{}: the volume at {}: {e}", d.label, sh.dest))?;
             volumes.push((copy.as_raw_fd(), cstr_of(real)?));
@@ -2195,6 +2409,20 @@ pub fn start(
                     | (if l.accepts { 0 } else { landlock::NET_BIND_TCP })
             }
             None => landlock::NET_BIND_TCP | landlock::NET_CONNECT_TCP,
+        };
+        // What its next generations are made of (D270), as this one was.
+        let again = Again {
+            domain: d.clone(),
+            filter: filter.clone(),
+            net_handled,
+            volumes: volume_rules.clone(),
+            plug_roots: plug_roots.clone(),
+            receives: receives.clone(),
+            image_env: image_env.clone(),
+            laid: given.cloned(),
+            terminal: terminals.contains(&member),
+            setup: setup.to_vec(),
+            last_cap,
         };
         let confinement = Confinement {
             id: d.id,
@@ -2245,6 +2473,7 @@ pub fn start(
         prepared.starter = starter_end.as_raw_fd();
         // A candidate for a port several are given: the channel its listener comes on.
         let address = d.link.as_ref().and_then(|l| l.addresses.first()).map(|a| a.addr);
+        let chooser_channel_given = address.is_some_and(|a| candidates.contains(&a));
         let chooser_channel = match address.filter(|a| candidates.contains(a)) {
             Some(addr) => {
                 let (ours, theirs) = crate::hostbind::seqpacket()
@@ -2368,11 +2597,15 @@ pub fn start(
                 None => switch(domains, pairs).map(|s| SWITCH.get_or_init(|| s)),
             };
             let gate = gate_of(domains, pairs, i, link);
+            // Its network namespace kept for its grants' changes as the run goes (D278).
             let linked = switch.and_then(|s| s.attach(i, pid as libc::pid_t, link, &gate));
-            if let Err(e) = linked {
-                // SAFETY: kill(2) of the child just made, which waits for its link.
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                return Err(format!("{}: its link: {e}", d.label));
+            match linked {
+                Ok(ns) => crate::egress::linked(member, i, &d.label, link, &gate, ns),
+                Err(e) => {
+                    // SAFETY: kill(2) of the child just made, which waits for its link.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    return Err(format!("{}: its link: {e}", d.label));
+                }
             }
             // SAFETY: write(2) of one byte to the pipe it waits on.
             if unsafe { libc::write(w.as_raw_fd(), b"g".as_ptr().cast(), 1) } != 1 {
@@ -2398,14 +2631,33 @@ pub fn start(
                 }
             }
         }
-        lifecycle
-            .launched()
-            .map_err(|e| format!("{}: its launch: {e}", d.label))?;
+        if let Err(e) = lifecycle.launched() {
+            *unentered = unentered_of(member, &e, &confinement.workdir);
+            return Err(format!("{}: its launch: {e}", d.label));
+        }
+        let population_at = format!("{group}/{GEN_LEAF}");
+        // Its namespaces, kept for its next generations (D270): none for a member given a
+        // port among others (D122), whose listener the chooser holds of this generation alone.
+        let restart = if chooser_channel_given {
+            Err(
+                "a member given a port among others (D122) starts once: its chooser holds its listener"
+                    .into(),
+            )
+        } else {
+            kept(lifecycle.pid(), &population_at)
+                .map(|kept| Box::new(Restartable { again, kept }))
+                .map_err(|e| format!("its namespaces were not kept: {e}"))
+        };
         started.push(Started {
             member,
             output_control: crate::capture::OutputControl::Active,
             label: d.label.clone(),
             cgroup: group.clone(),
+            population: population_at,
+            generation: 0,
+            held: false,
+            components: Vec::new(),
+            restart,
             lifecycle,
             stdout,
             stderr,
@@ -2428,6 +2680,423 @@ pub fn start(
         }
     }
     Ok(started)
+}
+
+/// Member `s`'s server instance ended (D270), its leaf's `cgroup.kill`: as its generation ends
+/// with no next one held for it, its whole member ends, as it did before generations.
+pub fn end_server(s: &Started) -> io::Result<()> {
+    std::fs::write(format!("{}/{SERVER_LEAF}/cgroup.kill", s.cgroup), "1")
+}
+
+/// Member `s`'s whole end (D270), once a member: its generation ended with no next one held
+/// for it, or a restart that held it let it go after its end. Its server instance ends, and
+/// what its generations kept for a next one (its namespaces, its confinement) is let go: a
+/// start asked after is refused.
+pub fn end_member(s: &mut Started) -> io::Result<()> {
+    s.restart = Err(format!(
+        "its generation {} ended with no next one held for it, and its member with it",
+        s.generation
+    ));
+    end_server(s)
+}
+
+/// Starts member `s`'s next generation (D270), `start`, in the namespaces its generations keep
+/// ([`Kept`]), in a PID namespace of its own and its generation's leaf: its last ended and its
+/// end told, `start.generation` the one past it. Its server instance, its link, its volumes and
+/// what is plugged into it are its last's; its components are `start`'s, each laid at its path
+/// ([`rechild`]); its stdio, its input and its starter are its own. Refused typed, nothing of
+/// it started; one that could not enter its working directory told in `unentered` too (D277),
+/// as its first generation's is ([`start`]).
+pub fn next_generation(
+    s: &mut Started,
+    start: &shards_abi::run::members::Start,
+    unentered: &mut Option<shards_abi::run::members::Unentered>,
+) -> Result<(), (shards_abi::run::members::StartRefusal, String)> {
+    use shards_abi::run::members::StartRefusal as R;
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let label = s.label.clone();
+    let failed = |e: String| (R::Failed, format!("{label}: {e}"));
+    let restart = s
+        .restart
+        .as_ref()
+        .map_err(|why| (R::Unsupported, format!("{label}: {why}")))?;
+    if !s.lifecycle.ended() || !s.end_told {
+        return Err((
+            R::Running,
+            format!("{label}: its generation {} has not ended", s.generation),
+        ));
+    }
+    let next = s.generation.checked_add(1).ok_or_else(|| {
+        (
+            R::Generation,
+            format!("{label}: no generation past {}", s.generation),
+        )
+    })?;
+    if start.generation != next {
+        return Err((
+            R::Generation,
+            format!(
+                "{label}: generation {} asked, where {next} is its next",
+                start.generation
+            ),
+        ));
+    }
+    let (again, kept) = (&restart.again, &restart.kept);
+    let d = &again.domain;
+    let member = s.member;
+    let cstr = |b: &[u8]| CString::new(b).map_err(|_| failed("a NUL in its start".into()));
+    // Its components, each a copy of its mount beside the run's writable layer (hotplug.rs
+    // `pmem`), read-only, put at its path; the last generation's let go.
+    let attrs = libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV;
+    let mut copies = Vec::with_capacity(start.components.len());
+    for c in &start.components {
+        let key =
+            std::str::from_utf8(&c.key).map_err(|_| failed("a component's key that is not text".into()))?;
+        let at = crate::hotplug::component_at(key).map_err(|e| failed(e.to_string()))?;
+        let copy = copy_of(&at, attrs).map_err(|e| failed(format!("component {key}: {e}")))?;
+        copies.push((copy, cstr(&c.path)?));
+    }
+    let detach = s
+        .components
+        .iter()
+        .map(|c| cstr(&c.path))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Its environment, made as its first's was: its owner's over its image's, what its run
+    // staged over that, and the run's trust bundle named where it is given it.
+    let its_dir = std::str::from_utf8(&d.dir).map_err(|_| failed("a directory that is not UTF-8".into()))?;
+    let given = start
+        .env
+        .iter()
+        .map(|e| String::from_utf8(e.clone()).map_err(|_| failed("a variable that is not UTF-8".into())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let own = harness_env(its_dir, &d.label, &again.image_env, &given)
+        .map_err(|e| (R::Failed, e))?
+        .into_iter()
+        .map(|e| CString::new(e).map_err(|_| failed("a NUL in its environment".into())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut env = crate::staged::env(&own, member, &again.setup).map_err(|e| failed(e.to_string()))?;
+    if let Some(l) = &again.laid {
+        l.name_in(&mut env).map_err(|e| failed(e.to_string()))?;
+    }
+    // Its command, its image's as its first's was, its program found only in its own view as it
+    // starts (confine-04), and its run-time arguments after it, as its first's staged ones were.
+    let domain = d.clone();
+    let args = start
+        .args
+        .iter()
+        .map(|a| cstr(a))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (explicit, paths) = executable(&domain, &env).map_err(|e| (R::Failed, e))?;
+    let program = domain.argv.first().ok_or_else(|| failed("no program".into()))?;
+    let workdir = match &start.workdir {
+        Some(w) => cstr(w)?,
+        None => d.workdir.clone(),
+    };
+    // Its confinement as its first's, but for a Landlock ruleset of its own, whose rules it lays
+    // in this generation's view, its components at their paths among them.
+    let confinement = Confinement {
+        id: d.id,
+        last_cap: again.last_cap,
+        ruleset: ruleset(again.net_handled).map_err(|e| failed(format!("its Landlock ruleset: {e}")))?,
+        volumes: again.volumes.clone(),
+        plug_roots: again.plug_roots.clone(),
+        receives: again.receives.clone(),
+        seccomp: again.filter.clone(),
+        seccomp_len: u16::try_from(again.filter.1.len())
+            .map_err(|_| failed("its seccomp filter is too long".into()))?,
+        env: env.clone(),
+        workdir,
+    };
+    // Its stdio, of its own: pipes init reads, or a terminal of its own as its first had; its
+    // stdin this generation's input where its owner gives one, else /dev/null.
+    let (stderr, stderr_write) =
+        crate::capture::Pipe::make().map_err(|e| failed(format!("its stderr pipe: {e}")))?;
+    let terminal = again
+        .terminal
+        .then(|| crate::enter::terminal(shards_abi::run::Size::default(), d.id))
+        .transpose()
+        .map_err(|e| failed(format!("its terminal: {e}")))?;
+    let (stdout, stdout_write, master) = match terminal {
+        Some((master, other)) => {
+            let kept_master = master
+                .try_clone()
+                .map_err(|e| failed(format!("its terminal: {e}")))?;
+            let read =
+                crate::capture::Pipe::master(master).map_err(|e| failed(format!("its terminal: {e}")))?;
+            (read, other, Some(kept_master))
+        }
+        None => {
+            let (read, write) =
+                crate::capture::Pipe::make().map_err(|e| failed(format!("its stdout pipe: {e}")))?;
+            (read, write, None)
+        }
+    };
+    let (input, stdin) = match (&start.input, &master) {
+        (Some(token), Some(master)) => {
+            let typed = master
+                .try_clone()
+                .and_then(|m| crate::input::Input::terminal(member, token, m))
+                .map_err(|e| failed(format!("its stdin: {e}")))?;
+            (Some(typed), None)
+        }
+        (Some(token), None) => {
+            let (input, stdin) = crate::input::Input::open(member, token)
+                .map_err(|e| failed(format!("its stdin pipe: {e}")))?;
+            (Some(input), Some(stdin))
+        }
+        (None, _) => (None, None),
+    };
+    let (starter, starter_end) =
+        crate::starter::channel().map_err(|e| failed(format!("its starter's channel: {e}")))?;
+    let prepared = Prepared {
+        shm: CString::default(),
+        root: -1,
+        sockets: Vec::new(),
+        volumes: Vec::new(),
+        scratch: None,
+        hide: Vec::new(),
+        hostname: CString::default(),
+        argv: command_line(program, &domain, &args)
+            .into_iter()
+            .map(CStr::as_ptr)
+            .chain([std::ptr::null()])
+            .collect(),
+        paths,
+        explicit,
+        envp: env.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect(),
+        hosts: None,
+        resolv: None,
+        trust: None,
+        go: None,
+        chooser: None,
+        stdin: stdin.as_ref().map(AsRawFd::as_raw_fd),
+        terminal: master.is_some(),
+        starter: starter_end.as_raw_fd(),
+    };
+    let out = if master.is_some() {
+        stdout_write.as_raw_fd()
+    } else {
+        stderr_write.as_raw_fd()
+    };
+    let swaps = Swaps {
+        detach,
+        attach: copies.iter().map(|(c, at)| (c.as_raw_fd(), at.clone())).collect(),
+    };
+    // Its launch into its generation's leaf, cloned by a helper of one thread in its kept
+    // namespaces (setns(2) of a mount namespace refuses a caller of several threads, and init
+    // has several), its parent this process (CLONE_PARENT), so that this process reaps it and
+    // its PID is no other's until then. Not cloned into its leaf (CLONE_INTO_CGROUP) but moved
+    // there by the helper (`cgroup.procs`) before it does anything: a clone into a cgroup that
+    // was ever killed (`cgroup.kill`, as its last generation's end killed this leaf) is killed
+    // at birth, the kernel comparing the caller's cgroup's kill count with the leaf's (Linux
+    // 7.2-rc4 kernel/cgroup/cgroup.c: `cgroup_css_set_fork` reads `kill_seq` before it sets
+    // `kargs->cgrp`, `cgroup_post_fork` reads the leaf's). It waits to be moved, then joins its
+    // member's cgroup namespace there: with cgroup2's `nsdelegate` (run.rs) a move into a
+    // cgroup is checked against the mover's cgroup namespace, which must see both cgroups
+    // (`cgroup_procs_write_permission`, -ENOENT), and from the member's init's is out of sight.
+    // The helper says its child's PID, or the errno that stopped it, negated.
+    let open_dir = |path: &str| -> Result<std::fs::File, (R, String)> {
+        std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| failed(format!("{path}: {e}")))
+    };
+    let population = open_dir(&s.population)?;
+    let group = open_dir(&s.cgroup)?;
+    let launch = crate::managed::Launch::new(again.last_cap, &population)
+        .map_err(|e| failed(format!("preparing its owner: {e}")))?;
+    let procs = std::fs::File::options()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(format!("{}/cgroup.procs", s.population))
+        .map_err(|e| failed(format!("its leaf's cgroup.procs: {e}")))?;
+    // Its starter is new again: its member's pids.max takes it beside what it declared, as its
+    // first start's did (`with_starter`), until it goes (`Started::starter_gone`).
+    if let Some(n) = s.pids {
+        let most =
+            with_starter(n).ok_or_else(|| failed(format!("{n} processes and its starter overflow")))?;
+        std::fs::write(format!("{}/pids.max", s.cgroup), most.to_string())
+            .map_err(|e| failed(format!("its pids.max: {e}")))?;
+    }
+    let mut placed = [0 as RawFd; 2];
+    // SAFETY: pipe2(2) into a two-element array.
+    if unsafe { libc::pipe2(placed.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(failed(format!(
+            "its placing pipe: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both descriptors were just made, and are owned here alone.
+    let (placed_r, placed_w) = unsafe { (OwnedFd::from_raw_fd(placed[0]), OwnedFd::from_raw_fd(placed[1])) };
+    let mut said = [0 as RawFd; 2];
+    // SAFETY: pipe2(2) into a two-element array.
+    if unsafe { libc::pipe2(said.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(failed(format!(
+            "its helper's pipe: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both descriptors were just made, and are owned here alone.
+    let (said_r, said_w) = unsafe { (OwnedFd::from_raw_fd(said[0]), OwnedFd::from_raw_fd(said[1])) };
+    // No exit signal of its own: clone3(2) refuses one beside CLONE_PARENT (kernel/fork.c
+    // `clone3_args_valid`: EINVAL), and its child takes the helper's, SIGCHLD to this process
+    // (`copy_process`: `current->group_leader->exit_signal`).
+    let mut args = CloneArgs {
+        flags: (libc::CLONE_PARENT | libc::CLONE_NEWNS | libc::CLONE_NEWPID) as u64,
+        exit_signal: 0,
+        ..CloneArgs::default()
+    };
+    // SAFETY: fork(2); the child calls only the kernel, on what was made above, and exits, or
+    // its child execs.
+    let helper = unsafe { libc::fork() };
+    if helper < 0 {
+        return Err(failed(format!("its helper: {}", io::Error::last_os_error())));
+    }
+    if helper == 0 {
+        // SAFETY: setns(2) and clone3(2) on descriptors and a clone_args made before the fork,
+        // in a process of one thread; write(2) and _exit(2).
+        unsafe {
+            let said = |value: libc::c_long| {
+                let bytes = value.to_be_bytes();
+                libc::write(said_w.as_raw_fd(), bytes.as_ptr().cast(), bytes.len());
+            };
+            let errno = || libc::c_long::from(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+            for (ns, kind) in [
+                (&kept.net, libc::CLONE_NEWNET),
+                (&kept.ipc, libc::CLONE_NEWIPC),
+                (&kept.uts, libc::CLONE_NEWUTS),
+            ] {
+                if libc::setns(ns.as_raw_fd(), kind) != 0 {
+                    said(-errno());
+                    libc::_exit(1);
+                }
+            }
+            let pid = libc::syscall(libc::SYS_clone3, &raw mut args, std::mem::size_of::<CloneArgs>());
+            if pid == 0 {
+                // Nothing done until it is in its leaf: the helper's word, or its end.
+                libc::close(placed_w.as_raw_fd());
+                let mut word = [0u8; 1];
+                if libc::read(placed_r.as_raw_fd(), word.as_mut_ptr().cast(), 1) != 1 {
+                    libc::_exit(126);
+                }
+                // In its leaf now: its member's cgroup namespace sees it.
+                let setup = launch.child_into(Some(kept.mounts.as_raw_fd()), Some(kept.cgroup.as_raw_fd()));
+                rechild(
+                    &prepared,
+                    &confinement,
+                    &swaps,
+                    stdout_write.as_raw_fd(),
+                    out,
+                    setup,
+                );
+            }
+            if pid < 0 {
+                said(-errno());
+                libc::_exit(1);
+            }
+            // Its PID in decimal into its leaf's cgroup.procs, then its word to go on.
+            let mut digits = [0u8; 20];
+            let mut at = digits.len();
+            let mut left = u64::try_from(pid).unwrap_or(0);
+            loop {
+                at = at.saturating_sub(1);
+                if let Some(d) = digits.get_mut(at) {
+                    *d = b'0'.saturating_add(u8::try_from(left % 10).unwrap_or(0));
+                }
+                left /= 10;
+                if left == 0 || at == 0 {
+                    break;
+                }
+            }
+            let text = digits.get(at..).unwrap_or_default();
+            let moved = libc::write(procs.as_raw_fd(), text.as_ptr().cast(), text.len());
+            if usize::try_from(moved).ok() != Some(text.len()) {
+                let why = errno();
+                // Never kill(0): its PID is clone3(2)'s, positive.
+                if let Ok(child) = libc::pid_t::try_from(pid)
+                    && child > 0
+                {
+                    libc::kill(child, libc::SIGKILL);
+                }
+                said(-why);
+                libc::_exit(1);
+            }
+            libc::write(placed_w.as_raw_fd(), [1u8].as_ptr().cast(), 1);
+            said(pid);
+            libc::_exit(0);
+        }
+    }
+    drop(said_w);
+    drop(placed_w);
+    drop(placed_r);
+    drop(procs);
+    let mut bytes = [0u8; std::mem::size_of::<libc::c_long>()];
+    let heard = std::fs::File::from(said_r).read_exact(&mut bytes);
+    let mut status = 0;
+    // SAFETY: waitpid(2) of the helper, this process's child, which exits as it has said.
+    unsafe { libc::waitpid(helper, &raw mut status, 0) };
+    heard.map_err(|e| failed(format!("its helper said nothing: {e}")))?;
+    let said = libc::c_long::from_be_bytes(bytes);
+    let pid = libc::pid_t::try_from(said)
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| {
+            let errno = i32::try_from(said.saturating_neg()).unwrap_or(libc::EIO);
+            failed(format!(
+                "its helper could not join its namespaces or clone it: {}",
+                io::Error::from_raw_os_error(errno)
+            ))
+        })?;
+    // SAFETY: pidfd_open(2) of this process's child, not yet reaped.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    let pidfd = RawFd::try_from(pidfd)
+        .ok()
+        .filter(|fd| *fd >= 0)
+        .ok_or_else(|| failed(format!("its reaper's pidfd: {}", io::Error::last_os_error())))?;
+    // SAFETY: the descriptor pidfd_open just made, owned here alone.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+    let mut lifecycle = launch
+        .parent_of(pid, pidfd, group)
+        .map_err(|e| failed(format!("retaining its owner: {e}")))?;
+    drop(stdin);
+    drop(stdout_write);
+    drop(stderr_write);
+    drop(starter_end);
+    drop(copies);
+    if let Err(e) = lifecycle.launched() {
+        *unentered = unentered_of(member, &e, &confinement.workdir);
+        let ended = lifecycle
+            .reaper_end()
+            .map(|how| format!(" ({how})"))
+            .unwrap_or_default();
+        // What its cgroup counted as it failed: an OOM kill, a fork past its pids.max.
+        let counted = |file: &str| {
+            std::fs::read_to_string(format!("{}/{file}", s.cgroup))
+                .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+                .unwrap_or_default()
+        };
+        return Err(failed(format!(
+            "its launch: {e}{ended}; its cgroup's memory.events: {}; pids.events: {}; pids.max: {}",
+            counted("memory.events"),
+            counted("pids.events"),
+            counted("pids.max")
+        )));
+    }
+    s.lifecycle = lifecycle;
+    s.stdout = stdout;
+    s.stderr = stderr;
+    s.input = input;
+    s.terminal = master;
+    s.starter = Some(starter);
+    s.confinement = confinement;
+    s.output_control = crate::capture::OutputControl::Active;
+    s.generation = next;
+    s.end_told = false;
+    s.held = false;
+    s.components = start.components.clone();
+    Ok(())
 }
 
 /// One of an instance's channels to another domain's: its end, the other's label, and
@@ -2728,10 +3397,39 @@ impl Server {
     }
 }
 
-/// Writes `shards-init: <what>: errno <n>` to `out` and exits 125, without allocating.
-fn fail(out: RawFd, setup: RawFd, step: crate::managed::Step, what: &CStr) -> ! {
+/// Member `member`'s launch that failed as `failure` says, typed for its host where its process
+/// could not enter its working directory, `workdir` (D277): what refuses its run's members to
+/// their orchestrator; none for any other failure, which its words alone say.
+fn unentered_of(
+    member: u32,
+    failure: &crate::managed::Failure,
+    workdir: &CStr,
+) -> Option<shards_abi::run::members::Unentered> {
+    let entering = crate::managed::Doing::Setting(Setting::WorkingDirectory);
+    (failure.step == crate::managed::Step::Setup && failure.doing == Some(entering)).then(|| {
+        shards_abi::run::members::Unentered {
+            member,
+            errno: failure.errno,
+            workdir: workdir.to_bytes().to_vec(),
+        }
+    })
+}
+
+/// Tells its launch on `setup` the step that failed, what it was doing (none for its exec, the
+/// step itself) and its errno; writes `shards-init: <what>: errno <n>` to `out`; exits 125,
+/// without allocating.
+fn fail(out: RawFd, setup: RawFd, step: crate::managed::Step, doing: Option<crate::managed::Doing>) -> ! {
     let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
-    crate::managed::report_failure(setup, step, errno);
+    let what = match doing {
+        Some(doing) => {
+            crate::managed::report_doing(setup, step, errno, doing);
+            doing.what()
+        }
+        None => {
+            crate::managed::report_failure(setup, step, errno);
+            c"running its command"
+        }
+    };
     let mut digits = [0u8; 12];
     let mut at = digits.len();
     let mut v = errno.unsigned_abs();
@@ -2762,7 +3460,14 @@ fn fail(out: RawFd, setup: RawFd, step: crate::managed::Step, what: &CStr) -> ! 
 
 /// A domain's first process, before its program.
 fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, setup: RawFd) -> ! {
-    let fail = |out, what| -> ! { fail(out, setup, crate::managed::Step::Setup, what) };
+    let fail = |out, s: Setting| -> ! {
+        fail(
+            out,
+            setup,
+            crate::managed::Step::Setup,
+            Some(crate::managed::Doing::Setting(s)),
+        )
+    };
     let null = std::ptr::null::<libc::c_char>();
     let nil = std::ptr::null::<libc::c_void>();
     let tmpfs = c"tmpfs".as_ptr();
@@ -2771,7 +3476,7 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
     unsafe {
         // Nothing of these mounts reaches init's namespace.
         if libc::mount(null, c"/".as_ptr(), null, libc::MS_REC | libc::MS_PRIVATE, nil) != 0 {
-            fail(out, c"making its mounts private");
+            fail(out, Setting::MountsPrivate);
         }
         // The image as built, over the system's /proc, then its root; the system's mounts
         // under it detached (pivot_root(2), NOTES).
@@ -2788,7 +3493,7 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
             || libc::umount2(c".".as_ptr(), libc::MNT_DETACH) != 0
             || libc::chdir(c"/".as_ptr()) != 0
         {
-            fail(out, c"entering the image as built");
+            fail(out, Setting::ImageRoot);
         }
         // The microVM's system, read-only, nosuid and nodev (struct mount_attr).
         let attr: [u64; 4] = [SYSTEM, 0, 0, 0];
@@ -2801,7 +3506,7 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
             std::mem::size_of_val(&attr),
         ) != 0
         {
-            fail(out, c"making the system read-only");
+            fail(out, Setting::SystemReadOnly);
         }
         let shut = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
         let empty = c"size=4k,nr_inodes=1,mode=000".as_ptr().cast();
@@ -2811,16 +3516,16 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
             if libc::stat(h.as_ptr(), &raw mut st) == 0
                 && libc::mount(tmpfs, h.as_ptr(), tmpfs, shut, empty) != 0
             {
-                fail(out, c"hiding another domain");
+                fail(out, Setting::OtherDomain);
             }
         }
         if libc::mount(tmpfs, c"/sys".as_ptr(), tmpfs, shut, empty) != 0 {
-            fail(out, c"hiding /sys");
+            fail(out, Setting::Sys);
         }
         // Its PID namespace's /proc.
         let quiet = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
         if libc::mount(c"proc".as_ptr(), c"/proc".as_ptr(), c"proc".as_ptr(), quiet, nil) != 0 {
-            fail(out, c"mounting its /proc");
+            fail(out, Setting::Proc);
         }
         // Its /dev.
         let dev = c"mode=755,size=64k".as_ptr().cast();
@@ -2832,26 +3537,26 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
             dev,
         ) != 0
         {
-            fail(out, c"mounting its /dev");
+            fail(out, Setting::Dev);
         }
         for (path, major, minor) in DEV {
             if libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o666, libc::makedev(major, minor)) != 0
                 || libc::chmod(path.as_ptr(), 0o666) != 0
             {
-                fail(out, c"making its /dev");
+                fail(out, Setting::DevNodes);
             }
         }
         for (target, path) in LINKS {
             if libc::symlink(target.as_ptr(), path.as_ptr()) != 0 {
-                fail(out, c"linking its /dev");
+                fail(out, Setting::DevLinks);
             }
         }
         if libc::mkdir(c"/dev/shm".as_ptr(), 0o755) != 0 || libc::mkdir(c"/dev/mqueue".as_ptr(), 0o755) != 0 {
-            fail(out, c"making its /dev/shm and /dev/mqueue");
+            fail(out, Setting::ShmMqueue);
         }
         let ro_dev = libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NOEXEC;
         if libc::mount(null, c"/dev".as_ptr(), null, ro_dev, nil) != 0 {
-            fail(out, c"making its /dev read-only");
+            fail(out, Setting::DevReadOnly);
         }
         // Its own scratch: /tmp, init's mount of it, which its server instance holds too
         // (D139); and /dev/shm.
@@ -2865,7 +3570,7 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
                 mount_api::MOVE_MOUNT_F_EMPTY_PATH,
             ) != 0
         {
-            fail(out, c"making its scratch");
+            fail(out, Setting::Scratch);
         }
         for (path, data) in [(c"/dev/shm", p.shm.as_ptr())] {
             let mut st: libc::stat = std::mem::zeroed();
@@ -2881,7 +3586,7 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
             ) != 0
                 || libc::chown(path.as_ptr(), d.id, d.id) != 0
             {
-                fail(out, c"making its scratch");
+                fail(out, Setting::Scratch);
             }
         }
         // Its POSIX message queues, of its own IPC namespace, as a Docker container's
@@ -2895,7 +3600,7 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
             nil,
         ) != 0
         {
-            fail(out, c"mounting its /dev/mqueue");
+            fail(out, Setting::Mqueue);
         }
         // Its names: its peers', over the system's /etc/hosts, and where it reaches past
         // the microVM its resolver, over /etc/resolv.conf; each read-only, made in its
@@ -2911,15 +3616,15 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
                 &p.hosts,
                 c"/etc/hosts",
                 c"/tmp/.hosts",
-                c"writing its /etc/hosts",
-                c"mounting its /etc/hosts",
+                Setting::WritingHosts,
+                Setting::MountingHosts,
             ),
             (
                 &p.resolv,
                 c"/etc/resolv.conf",
                 c"/tmp/.resolv",
-                c"writing its /etc/resolv.conf",
-                c"mounting its /etc/resolv.conf",
+                Setting::WritingResolv,
+                Setting::MountingResolv,
             ),
         ] {
             let mut st: libc::stat = std::mem::zeroed();
@@ -2955,14 +3660,14 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
                 0o444,
             );
             if fd < 0 || libc::write(fd, content.as_ptr().cast(), content.len()) != content.len() as isize {
-                fail(out, c"writing its trust bundle");
+                fail(out, Setting::WritingTrust);
             }
             libc::close(fd);
             if libc::mount(made.as_ptr(), target.as_ptr(), null, libc::MS_BIND, nil) != 0
                 || libc::mount(null, target.as_ptr(), null, ro, nil) != 0
                 || libc::unlink(made.as_ptr()) != 0
             {
-                fail(out, c"mounting its trust bundle");
+                fail(out, Setting::MountingTrust);
             }
         }
         // Its Unix sockets' directories, each its own mount, read-only where it only
@@ -2977,7 +3682,7 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
                 mount_api::MOVE_MOUNT_F_EMPTY_PATH,
             ) != 0
             {
-                fail(out, c"mounting its Unix sockets");
+                fail(out, Setting::Sockets);
             }
         }
         // Its volumes, at their mount points.
@@ -2991,21 +3696,21 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
                 mount_api::MOVE_MOUNT_F_EMPTY_PATH,
             ) != 0
             {
-                fail(out, c"mounting its volumes");
+                fail(out, Setting::Volumes);
             }
         }
         // Its own name, and loopback.
         if libc::sethostname(p.hostname.as_ptr(), p.hostname.as_bytes().len()) != 0 {
-            fail(out, c"naming its host");
+            fail(out, Setting::HostName);
         }
         if !crate::run::loopback_up_raw() {
-            fail(out, c"bringing its loopback up");
+            fail(out, Setting::Loopback);
         }
         // Its link, which init makes once it exists.
         if let Some(go) = p.go {
             let mut byte = 0u8;
             if libc::read(go, (&raw mut byte).cast(), 1) != 1 {
-                fail(out, c"waiting for its link");
+                fail(out, Setting::Link);
             }
         }
         // The chooser's filter (D122), whose listener goes to init on its channel, which
@@ -3019,21 +3724,42 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
                 notify,
             );
             let Ok(listener) = RawFd::try_from(listener) else {
-                fail(out, c"loading the chooser's filter");
+                fail(out, Setting::ChooserFilter);
             };
             if listener < 0 {
-                fail(out, c"loading the chooser's filter");
+                fail(out, Setting::ChooserFilter);
             }
             let sent = crate::hostbind::send_fd(channel, b"L", listener, 0);
             libc::close(listener);
             if !sent {
-                fail(out, c"giving init the chooser's listener");
+                fail(out, Setting::ChooserListener);
             }
         }
+        handover(p, c, stdout, out, setup)
+    }
+}
+
+/// A member's generation after its own mounts, in place (D270): its first's made by [`child`],
+/// a later one's ([`rechild`]) in the mount namespace its generations keep. Its terminal its
+/// session's, its stdio, its launch status, its Landlock ruleset and its starter's channel at
+/// their places and no other descriptor of init's, then confined and its program run
+/// ([`exec_child`]).
+fn handover(p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, setup: RawFd) -> ! {
+    let fail = |out, s: Setting| -> ! {
+        crate::domains::fail(
+            out,
+            setup,
+            crate::managed::Step::Setup,
+            Some(crate::managed::Doing::Setting(s)),
+        )
+    };
+    // SAFETY: each call below is a system call on descriptors and buffers made before the
+    // clone, in a process of one thread.
+    unsafe {
         // A terminal of its own (D244) is its session's controlling terminal, as an exec's
         // is made (run.rs `child`, TIOCSCTTY after setsid(2)), and its stdin.
         if p.terminal && (libc::setsid() < 0 || libc::ioctl(stdout, libc::TIOCSCTTY, 0) != 0) {
-            fail(out, c"making its terminal its session's");
+            fail(out, Setting::Terminal);
         }
         // Its stdio, and no other descriptor of init's.
         let input = match (p.terminal, p.stdin) {
@@ -3053,42 +3779,109 @@ fn child(d: &Domain, p: &Prepared, c: &Confinement, stdout: RawFd, out: RawFd, s
             || libc::dup2(stdout, 1) < 0
             || libc::dup2(out, 2) < 0
         {
-            fail(out, c"giving it its stdio");
+            fail(out, Setting::Stdio);
         }
         if libc::dup3(status, libc::STDERR_FILENO + 1, libc::O_CLOEXEC) < 0 {
-            fail(2, c"retaining its launch status");
+            fail(2, Setting::Status);
         }
         if libc::dup3(ruleset, RULESET_FD, libc::O_CLOEXEC) < 0 {
-            fail(2, c"retaining its Landlock ruleset");
+            fail(2, Setting::Ruleset);
         }
         if libc::dup3(starter, crate::starter::STARTER_FD, libc::O_CLOEXEC) < 0 {
-            fail(2, c"retaining its starter's channel");
+            fail(2, Setting::Starter);
         }
         if libc::syscall(libc::SYS_close_range, above as u32, u32::MAX, 0u32) != 0 {
             crate::domains::fail(
                 2,
                 libc::STDERR_FILENO + 1,
                 crate::managed::Step::Setup,
-                c"closing init's descriptors",
+                Some(crate::managed::Doing::Setting(Setting::Descriptors)),
             );
         }
         exec_child(p, c)
     }
 }
 
+/// A member's later generation's first process (D270), in the mount namespace its
+/// generations keep, which its launch entered ([`crate::managed::Launch::child_into`]): its
+/// mounts are its first generation's, and what was plugged into it since, but for its PID
+/// namespace's `/proc`, made anew, the old one's namespace gone, and its components: each of
+/// the last generation's let go, each of this one's put at its path, read-only. Then as its
+/// first ([`handover`]).
+fn rechild(p: &Prepared, c: &Confinement, swaps: &Swaps, stdout: RawFd, out: RawFd, setup: RawFd) -> ! {
+    let fail = |out, s: Setting| -> ! {
+        crate::domains::fail(
+            out,
+            setup,
+            crate::managed::Step::Setup,
+            Some(crate::managed::Doing::Setting(s)),
+        )
+    };
+    let nil = std::ptr::null::<libc::c_void>();
+    // SAFETY: each call below is a system call on NUL-terminated strings and descriptors made
+    // before the clone, in a process of one thread.
+    unsafe {
+        let quiet = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+        if libc::umount2(c"/proc".as_ptr(), libc::MNT_DETACH) != 0
+            || libc::mount(c"proc".as_ptr(), c"/proc".as_ptr(), c"proc".as_ptr(), quiet, nil) != 0
+        {
+            fail(out, Setting::ProcAnew);
+        }
+        for at in &swaps.detach {
+            if libc::umount2(at.as_ptr(), libc::MNT_DETACH) != 0 {
+                fail(out, Setting::ComponentGone);
+            }
+        }
+        for (copy, at) in &swaps.attach {
+            if libc::syscall(
+                libc::SYS_move_mount,
+                *copy,
+                c"".as_ptr(),
+                libc::AT_FDCWD,
+                at.as_ptr(),
+                mount_api::MOVE_MOUNT_F_EMPTY_PATH,
+            ) != 0
+            {
+                fail(out, Setting::ComponentAt);
+            }
+        }
+    }
+    handover(p, c, stdout, out, setup)
+}
+
+/// What a later generation's view changes at its paths (D270): each path its last generation
+/// had a component at, let go of; and each of its own components, a mount not yet attached,
+/// and its path.
+struct Swaps {
+    detach: Vec<CString>,
+    attach: Vec<(RawFd, CString)>,
+}
+
 fn exec_child(p: &Prepared, c: &Confinement) -> ! {
     let setup = libc::STDERR_FILENO + 1;
     let out = libc::STDERR_FILENO;
-    let fail = |out, what| -> ! { fail(out, setup, crate::managed::Step::Setup, what) };
+    let fail = |out, s: Setting| -> ! {
+        fail(
+            out,
+            setup,
+            crate::managed::Step::Setup,
+            Some(crate::managed::Doing::Setting(s)),
+        )
+    };
     // SAFETY: the actor's remaining confinement uses prepared buffers and system calls.
     unsafe {
         if let Err(step) = rules(c, RULESET_FD).and_then(|()| confine(c, RULESET_FD)) {
-            fail(out, step.what());
+            crate::domains::fail(
+                out,
+                setup,
+                crate::managed::Step::Setup,
+                Some(crate::managed::Doing::Confining(step)),
+            );
         }
         // As the member (confine-02): it starts in no directory it could not enter itself,
         // as a command run in it does (crate::enter).
         if libc::chdir(c.workdir.as_ptr()) != 0 {
-            fail(out, c"entering its working directory");
+            fail(out, Setting::WorkingDirectory);
         }
         // Its starter, everything it is now (confine-10): what is run in it is born in its
         // own Landlock domain, as a process of its own would be.
@@ -3100,7 +3893,7 @@ fn exec_child(p: &Prepared, c: &Confinement) -> ! {
             p.argv.as_ptr(),
             p.envp.as_ptr(),
         );
-        crate::domains::fail(out, setup, crate::managed::Step::Exec, c"running its command")
+        crate::domains::fail(out, setup, crate::managed::Step::Exec, None)
     }
 }
 
@@ -3165,6 +3958,27 @@ pub enum Confining {
 }
 
 impl Confining {
+    /// Every step, each once.
+    pub const ALL: [Confining; 12] = [
+        Confining::BoundingSet,
+        Confining::Ids,
+        Confining::Capabilities,
+        Confining::NoNewPrivs,
+        Confining::BaseRule,
+        Confining::VolumeOpen,
+        Confining::VolumeRule,
+        Confining::PlugRootRule,
+        Confining::SocketRule,
+        Confining::Landlock,
+        Confining::Signals,
+        Confining::Seccomp,
+    ];
+
+    /// The step `code` names, as a launch reads it back.
+    pub fn of(code: u8) -> Option<Confining> {
+        Confining::ALL.into_iter().find(|c| *c as u8 == code)
+    }
+
     pub fn what(self) -> &'static CStr {
         match self {
             Confining::BoundingSet => c"dropping its capabilities",
@@ -3180,6 +3994,141 @@ impl Confining {
             Confining::Signals => c"restoring its signals",
             Confining::Seccomp => c"loading its seccomp filter",
         }
+    }
+}
+
+/// The step of a member's setup ([`child`], [`exec_child`]) that failed, told its launch beside
+/// its errno ([`crate::managed::Doing`]), so that the launch's error names it as the member's
+/// output does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Setting {
+    MountsPrivate = 1,
+    ImageRoot,
+    SystemReadOnly,
+    OtherDomain,
+    Sys,
+    Proc,
+    Dev,
+    DevNodes,
+    DevLinks,
+    ShmMqueue,
+    DevReadOnly,
+    Scratch,
+    Mqueue,
+    WritingHosts,
+    MountingHosts,
+    WritingResolv,
+    MountingResolv,
+    WritingTrust,
+    MountingTrust,
+    Sockets,
+    Volumes,
+    HostName,
+    Loopback,
+    Link,
+    ChooserFilter,
+    ChooserListener,
+    Terminal,
+    Stdio,
+    Status,
+    Ruleset,
+    Starter,
+    Descriptors,
+    WorkingDirectory,
+    /// A later generation's `/proc`, made anew for its PID namespace (D270).
+    ProcAnew,
+    /// A path its last generation had a component at, let go of (D270).
+    ComponentGone,
+    /// One of its generation's components put at its path (D270).
+    ComponentAt,
+}
+
+impl Setting {
+    /// Every setting, each once.
+    pub const ALL: [Setting; 36] = [
+        Setting::MountsPrivate,
+        Setting::ImageRoot,
+        Setting::SystemReadOnly,
+        Setting::OtherDomain,
+        Setting::Sys,
+        Setting::Proc,
+        Setting::Dev,
+        Setting::DevNodes,
+        Setting::DevLinks,
+        Setting::ShmMqueue,
+        Setting::DevReadOnly,
+        Setting::Scratch,
+        Setting::Mqueue,
+        Setting::WritingHosts,
+        Setting::MountingHosts,
+        Setting::WritingResolv,
+        Setting::MountingResolv,
+        Setting::WritingTrust,
+        Setting::MountingTrust,
+        Setting::Sockets,
+        Setting::Volumes,
+        Setting::HostName,
+        Setting::Loopback,
+        Setting::Link,
+        Setting::ChooserFilter,
+        Setting::ChooserListener,
+        Setting::Terminal,
+        Setting::Stdio,
+        Setting::Status,
+        Setting::Ruleset,
+        Setting::Starter,
+        Setting::Descriptors,
+        Setting::WorkingDirectory,
+        Setting::ProcAnew,
+        Setting::ComponentGone,
+        Setting::ComponentAt,
+    ];
+
+    pub fn what(self) -> &'static CStr {
+        match self {
+            Setting::MountsPrivate => c"making its mounts private",
+            Setting::ImageRoot => c"entering the image as built",
+            Setting::SystemReadOnly => c"making the system read-only",
+            Setting::OtherDomain => c"hiding another domain",
+            Setting::Sys => c"hiding /sys",
+            Setting::Proc => c"mounting its /proc",
+            Setting::Dev => c"mounting its /dev",
+            Setting::DevNodes => c"making its /dev",
+            Setting::DevLinks => c"linking its /dev",
+            Setting::ShmMqueue => c"making its /dev/shm and /dev/mqueue",
+            Setting::DevReadOnly => c"making its /dev read-only",
+            Setting::Scratch => c"making its scratch",
+            Setting::Mqueue => c"mounting its /dev/mqueue",
+            Setting::WritingHosts => c"writing its /etc/hosts",
+            Setting::MountingHosts => c"mounting its /etc/hosts",
+            Setting::WritingResolv => c"writing its /etc/resolv.conf",
+            Setting::MountingResolv => c"mounting its /etc/resolv.conf",
+            Setting::WritingTrust => c"writing its trust bundle",
+            Setting::MountingTrust => c"mounting its trust bundle",
+            Setting::Sockets => c"mounting its Unix sockets",
+            Setting::Volumes => c"mounting its volumes",
+            Setting::HostName => c"naming its host",
+            Setting::Loopback => c"bringing its loopback up",
+            Setting::Link => c"waiting for its link",
+            Setting::ChooserFilter => c"loading the chooser's filter",
+            Setting::ChooserListener => c"giving init the chooser's listener",
+            Setting::Terminal => c"making its terminal its session's",
+            Setting::Stdio => c"giving it its stdio",
+            Setting::Status => c"retaining its launch status",
+            Setting::Ruleset => c"retaining its Landlock ruleset",
+            Setting::Starter => c"retaining its starter's channel",
+            Setting::Descriptors => c"closing init's descriptors",
+            Setting::WorkingDirectory => c"entering its working directory",
+            Setting::ProcAnew => c"mounting its /proc anew",
+            Setting::ComponentGone => c"letting its last generation's component go",
+            Setting::ComponentAt => c"putting its component at its path",
+        }
+    }
+
+    /// The setting `code` names, as its launch reads it back.
+    pub fn of(code: u8) -> Option<Setting> {
+        Setting::ALL.into_iter().find(|s| *s as u8 == code)
     }
 }
 
@@ -3354,6 +4303,51 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
     use super::*;
+
+    /// D277: a member's launch that failed entering its working directory is told its host
+    /// typed, its index, errno and directory; one that failed any other way, its words alone.
+    #[test]
+    fn a_launch_that_could_not_enter_its_workdir_is_told_typed() {
+        use crate::managed::{Doing, Failure, Step};
+        let failed = |step, doing| Failure {
+            step,
+            errno: libc::ENOENT,
+            doing,
+        };
+        let entering = failed(Step::Setup, Some(Doing::Setting(Setting::WorkingDirectory)));
+        assert_eq!(
+            unentered_of(1, &entering, c"/Users/ada/proj"),
+            Some(shards_abi::run::members::Unentered {
+                member: 1,
+                errno: libc::ENOENT,
+                workdir: b"/Users/ada/proj".to_vec(),
+            })
+        );
+        for other in [
+            failed(Step::Setup, Some(Doing::Setting(Setting::Volumes))),
+            failed(Step::Setup, None),
+            failed(Step::Exec, None),
+            failed(Step::Helper, None),
+        ] {
+            assert_eq!(unentered_of(1, &other, c"/w"), None, "{other}");
+        }
+    }
+
+    /// A member's leaves (D270) are directories made beneath its cgroup's and opened, each once:
+    /// a second of one name is refused, as mkdir(2) refuses it, so that no leaf is taken over.
+    #[test]
+    fn a_members_leaves_are_made_once_beneath_its_cgroup() {
+        let dir = shards_testdir::TempDir::new("leaves").unwrap();
+        let group = std::fs::File::open(dir.path()).unwrap();
+        let population = leaf(&group, c"gen").unwrap();
+        leaf(&group, c"server").unwrap();
+        assert!(population.metadata().unwrap().is_dir());
+        assert!(dir.path().join(GEN_LEAF).is_dir() && dir.path().join(SERVER_LEAF).is_dir());
+        assert_eq!(
+            leaf(&group, c"gen").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
 
     /// Init's own check of the nesting grant against the image as built (D234): granted
     /// only where the normalized Agentfile declares `NESTING` (`"nesting": true`) and no
@@ -3655,6 +4649,8 @@ mod tests {
                     copy: true,
                     main: true,
                     own: true,
+                    noexec: false,
+                    members: None,
                 },
                 Share {
                     tag: "shards1".into(),
@@ -3663,9 +4659,66 @@ mod tests {
                     copy: false,
                     main: false,
                     own: false,
+                    noexec: false,
+                    members: None,
                 },
             ]
         );
+    }
+
+    /// A share whose files may not be run (D279): `noexec` among its flags, which each domain's
+    /// mount of it takes.
+    #[test]
+    fn a_share_refusing_execution_is_read_so() {
+        let noexec = |flags: &str| {
+            shares_of(&[[b"volume=shards0\0/proj\0".as_slice(), flags.as_bytes(), b"\0"].concat()])
+                .first()
+                .map(|s| s.noexec)
+        };
+        assert_eq!(noexec("domains,noexec"), Some(true));
+        assert_eq!(noexec("domains,ro"), Some(false));
+    }
+
+    /// A share its orchestrator gave members as they start (D277): theirs alone, by declared
+    /// index, and where a `VOLUME` lies there only as it says too; one given none, as its
+    /// `VOLUME` says.
+    #[test]
+    fn a_share_given_members_is_theirs_alone() {
+        let entry = |flags: &str| [b"volume=shards0\0/proj\0".as_slice(), flags.as_bytes(), b"\0"].concat();
+        let given_to = |flags: &str| {
+            shares_of(&[entry(flags)])
+                .into_iter()
+                .next()
+                .and_then(|s| s.members)
+        };
+        assert_eq!(given_to("domains,member=1,member=3"), Some(vec![1, 3]));
+        assert_eq!(given_to("domains"), None);
+        let member = |m: u32, volumes: Vec<VolumeRule>| Domain {
+            id: FIRST_ID + m,
+            volumes,
+            ..domain_at("/agents/a", &[])
+        };
+        let share = |members: Option<Vec<u32>>| Share {
+            tag: "shards0".into(),
+            dest: "/proj".into(),
+            ro: false,
+            copy: false,
+            main: true,
+            own: false,
+            noexec: false,
+            members,
+        };
+        let denied = vec![VolumeRule {
+            path: "/proj".into(),
+            granted: false,
+            chown: String::new(),
+            chmod: String::new(),
+        }];
+        assert!(given_share(&member(1, Vec::new()), &share(Some(vec![1]))));
+        assert!(!given_share(&member(2, Vec::new()), &share(Some(vec![1]))));
+        assert!(!given_share(&member(1, denied.clone()), &share(Some(vec![1]))));
+        assert!(!given_share(&member(1, denied), &share(None)));
+        assert!(given_share(&member(2, Vec::new()), &share(None)));
     }
 
     /// A volume no `VOLUME` scopes is every domain's; one `FOR` scopes, those it names.
