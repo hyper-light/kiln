@@ -959,6 +959,10 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                 query: String,
                 #[serde(rename = "type", default)]
                 kind: Option<String>,
+                /// What a formula monitor's query reads (its variables, dynamic thresholds), and
+                /// what its window and thresholds take besides (`super::monitors::query_of`).
+                #[serde(default)]
+                options: super::monitors::Options,
             }
             let v: V = read_json(req.into_body(), QUERY_BODY).await?;
             if v.kind.as_deref() == Some(super::monitors::COMPOSITE) {
@@ -987,11 +991,13 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             }
             // What it watches besides, to draw: the metric query, or the log or span search, and its
             // window.
-            Ok(match kiln_obs::monitor::parse(&v.query) {
+            Ok(match super::monitors::query_of(&v.query, &v.options) {
                 Ok(q) => {
                     let (kind, watched, window_ms) = match &q.kind {
                         kiln_obs::monitor::Kind::Metric { query, window_ms, .. } => ("metric", json!({ "query": query }), window_ms),
                         kiln_obs::monitor::Kind::Change { query, window_ms, .. } => ("change", json!({ "query": query }), window_ms),
+                        // A formula of logs, spans or events: its queries, each measured over the whole window.
+                        kiln_obs::monitor::Kind::RecordsFormula { query, window_ms } => ("records-formula", json!({ "query": query }), window_ms),
                         kiln_obs::monitor::Kind::Logs { search, window_ms, .. } => ("logs", json!({ "search": search }), window_ms),
                         kiln_obs::monitor::Kind::Spans { search, window_ms, .. } => ("spans", json!({ "search": search }), window_ms),
                         // A forecast's window is ahead: `window_ms` its horizon.
@@ -1002,7 +1008,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                             ("error-tracking", json!({ "search": search, "query": kiln_obs::errors::monitor_query(search) }), window_ms)
                         }
                     };
-                    srv::json(StatusCode::OK, &json!({ "ok": true, "op": q.op.as_str(), "threshold": q.threshold, "kind": kind, "watched": watched, "window_ms": window_ms }))
+                    srv::json(StatusCode::OK, &json!({ "ok": true, "op": q.op.as_str(), "threshold": q.threshold, "dynamic": q.dynamic.is_some(), "kind": kind, "watched": watched, "window_ms": window_ms }))
                 }
                 Err(e) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": e.to_string() })),
             })

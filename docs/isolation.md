@@ -78,10 +78,18 @@ the machine's network) is replaced by an Agentfile image's members.
   placeholders its CLI's file in its person's volume holds (`.credentials.json`, `auth.json`), so they
   stand for the sign-in again. Every runner leases from that one broker: the server's own in its
   process, every other over its link (`secrets::lessor::Remote`), for its own isolated agents'
-  people's sign-ins alone, of a server that names `secrets.leases` (docs/wire.md). Where a runner's
-  microVMs lease no credentials, or its server answers none yet, the harness signs in itself, as
-  before, said in the runner's log. Other harnesses sign in themselves: Shards has no profile of
-  their CLIs' sign-ins.
+  people's sign-ins alone, of a server that names `secrets.leases` (docs/wire.md). What crosses the
+  link is wiped once used, as Shards' injector wipes what it holds: each ask's and answer's JSON,
+  made the size it comes to, and every copy kiln holds of it on its way (its frame in the net
+  thread's outbox, the words a frame is read into and their tree); the transport's own buffers are
+  hyper-transport's. A launch before its runner's server has said whether it answers (a session
+  restored as its runner started) waits for that word, then is granted its sign-in as any launch is
+  (`secrets::lessor::answering`). Where a runner's microVMs lease no credentials, or its server
+  answers none, the harness signs in itself, as before, said in the runner's log. A harness switched
+  into its running microVM (P6c.5) is granted its sign-in as a launch is, or the switch is refused,
+  never left to sign in itself there: Hex's microVMs, which grant a sign-in only as a box is made,
+  refuse it until their swap call carries one (`sandbox::Microvms::swap`). Other harnesses sign in
+  themselves: Shards has no profile of their CLIs' sign-ins.
 - **Its stdio are the member's streams.** The seam's run is the `Duplex` its session drives
   (`crate::proc::duplex_of_run`, `sandbox::held`): what the adapter writes reaches the member's stdin in
   order, the end of its stdin is the member's, what the member writes fills its stdout and stderr, and
@@ -201,6 +209,14 @@ its own through Hex (`sandbox::hexvm`).
   (`Spec::engine_version`). The runner refuses one decided under another (`engine::stale`), naming its engine
   now, so a session placed just before a switch never starts on the engine the runner had. The push is ordered
   against starts on the runner's link (a barrier).
+- **Its real-VM test** (`vm_harnesses` `engine::p2_3_…`) has the microVM session answer a turn in its microVM
+  before the switch and another after it, as it drains, each waited for on its harness's liveness (step 35's
+  waits), so a harness that never ran there fails at once in kiln's word on it. It can't pass on the Hex kiln
+  vendors (1969a423e, on Shards 9975d1f55): its image class gives a start share to the run's root alone, so a
+  harness never starts in its project (Shards D277: `Setup (entering its working directory): errno 2`), its run
+  ends failed, and kiln says exit -1. The switch ends nothing; the session ended before it. It passes once Hex
+  vendors Shards with D277 and gives a share its members (`hex_api::Mount`), and kiln maps `Share::members` in
+  `sandbox::hexvm` (P1.4).
 
 ## Live overrides
 
@@ -261,11 +277,14 @@ its digest and its size (vCPUs and MiB, as the session's isolation gives them), 
 - **Refused, held.** A microVM runtime that keeps no pools refuses one in its own words: Hex's microVMs do until its
   image class takes Shards' `ImagePools` (`sandbox::hexvm::NO_POOLS`, P3.1). The refusal is said once a pool, and
   asked again only as a new pool of it begins; a pool never kept is never let go.
-- **Shown on the runners page.** `GET /api/runners/:name/pools` (docs/api.md) shows each pool the same rule names over
-  the starts the server keeps: its agent (the definition its sessions started from, else their harness), its
-  deployment experiment's variant (P7.1: a variant booting another image or size is a pool of its own on the node,
-  sized by its own starts), its microVM, its starts and hits, and when it's let go. Its node's warm hosts aren't
-  reported to the server yet (`warm_hosts` null).
+- **Shown on the runners page.** A runner's details on the Runners page list its warm pools under "Warm pools", from
+  `GET /api/runners/:name/pools` (docs/api.md): each pool the same rule names over the starts the server keeps, with
+  its agent, its deployment experiment's variant (P7.1: a variant booting another image or size is a pool of its own
+  on the node, sized by its own starts), its size, its starts and hits, and when it's let go; one whose window has
+  passed leaves the list then. Its agent is named as the person looking may know it, as agent definitions are: the
+  definition its sessions started from where they reach it (their own, everyone's for the server's owner and whoever
+  has `agentdefs.manage`, and kiln's own), the harness of sessions started from none, and nothing of another person's
+  agent, whose pool still shows. Its node's warm hosts aren't reported to the server yet (`warm_hosts` null).
 
 ## Facts
 

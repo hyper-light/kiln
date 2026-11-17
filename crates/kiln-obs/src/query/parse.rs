@@ -118,8 +118,10 @@ pub enum Func {
     MovingAvg,
     Ewma,
     Clamp,
-    /// `anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below')`: the series
-    /// and its band (`crate::anomaly`).
+    /// `anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below')`, and Datadog's
+    /// anomaly monitors' named arguments (`direction=`, `alert_window=`, `interval=`,
+    /// `count_default_zero=`, `seasonality=`, `timezone=`): the series and its band
+    /// (`crate::anomaly`).
     Anomalies,
     /// `forecast(query, 'linear'|'seasonal', deviations, model=, seasonality=, history=,
     /// interval=)`: the series, and past its last point what it will do and its bounds
@@ -174,10 +176,26 @@ pub enum Func {
     CalendarShift,
     /// `top5`, `bottom10_max`, ... (`[top|bottom][5|10|15|20][_measure]`): `top` and `bottom` in one.
     Ranked { n: u8, bottom: bool, by: Rank },
-    /// `max(a, b, ...)`, `min(...)`: at each point the largest (least) value of its arguments,
-    /// queries or numbers.
+    /// `max(a, b, ...)`, `min(...)` (`maximum`, `minimum`: Datadog's querying page's names): at
+    /// each point the largest (least) value of its arguments, queries or numbers. With a group of
+    /// tags (`max(q, {env})`), a nested query's space aggregation, as [`Func::Avg`]'s.
     Max,
     Min,
+    // Datadog's nested queries (docs.datadoghq.com/metrics/nested_queries, its JSON tab's formulas).
+    /// `rollup(q, 'avg'|'sum'|'min'|'max'|'count'|'pXX'|'stddev'[, seconds])`: another layer of time
+    /// aggregation, `q` read at its own step and each bucket of `seconds` aggregated.
+    Rollup,
+    /// `avg(q, {tags})`, `sum`, `stddev`, and `max`, `min` with a group: another layer of space
+    /// aggregation, `q`'s series combined by the tags named; `percentile(q, 'pXX', {tags})`.
+    Avg,
+    Sum,
+    Stddev,
+    Percentile,
+    /// `is_greater(q, x)`, `is_less(q, x)`, `is_between(q, lo, hi)` (exclusive): 1 at each point
+    /// where the condition holds, 0 where it does not.
+    IsGreater,
+    IsLess,
+    IsBetween,
 }
 
 /// How `top` and `bottom` rank series: by their mean (Datadog's unless said), least, most, last,
@@ -256,8 +274,16 @@ impl Func {
             "week_before" => Self::WeekBefore,
             "month_before" => Self::MonthBefore,
             "calendar_shift" => Self::CalendarShift,
-            "max" => Self::Max,
-            "min" => Self::Min,
+            "max" | "maximum" => Self::Max,
+            "min" | "minimum" => Self::Min,
+            "rollup" => Self::Rollup,
+            "avg" => Self::Avg,
+            "sum" => Self::Sum,
+            "stddev" => Self::Stddev,
+            "percentile" => Self::Percentile,
+            "is_greater" => Self::IsGreater,
+            "is_less" => Self::IsLess,
+            "is_between" => Self::IsBetween,
             other => return Self::spanned(other),
         })
     }
@@ -293,17 +319,22 @@ impl Func {
             Self::Top | Self::Bottom => (1, 4),
             Self::Timeshift => (2, 2),
             // `moving_rollup(query, seconds[, aggregator])`; `ewma(query[, span])`, 20 unless said.
-            Self::MovingAvg => (2, 3),
+            // `moving_rollup(query, seconds[, aggregator][, 'lookback'])`.
+            Self::MovingAvg => (2, 4),
             Self::Ewma => (1, 2),
             Self::Round => (1, 2),
             Self::Pow | Self::ClampMin | Self::ClampMax | Self::CutoffMin | Self::CutoffMax => (2, 2),
             Self::CalendarShift => (2, 3),
             Self::Clamp => (3, 3),
-            Self::Anomalies => (1, 4),
+            // The query, its algorithm, bounds and direction; then Datadog's six named arguments.
+            Self::Anomalies => (1, 10),
             // The query and its algorithm; deviations; then named arguments.
             Self::Forecast => (2, 8),
             Self::Outliers => (1, 4),
             Self::Max | Self::Min => (2, 64),
+            Self::Rollup => (2, 3),
+            Self::Avg | Self::Sum | Self::Stddev | Self::IsGreater | Self::IsLess => (2, 2),
+            Self::Percentile | Self::IsBetween => (3, 3),
             _ => (1, 1),
         }
     }
@@ -344,6 +375,8 @@ pub enum Node {
     /// A named argument, `model='reactive'`, its value as written (a string's, a number's or a
     /// name's): a function's argument, nothing else.
     Named(String, String),
+    /// A nested query's group of tags, `{env, team}`: a space aggregation's argument, nothing else.
+    Group(Vec<String>),
 }
 
 /// A parsed query: its nodes, children before their parents, and the root; and where each metric
@@ -509,6 +542,26 @@ pub fn parse(q: &str) -> Result<Ast, ParseError> {
                     b.push(Node::Metric(mq));
                     expect_operand = false;
                     i = next;
+                }
+                // A nested query's group of tags, `{env, team}`: a space aggregation's argument.
+                Tok::LBrace if matches!(ops.last(), Some(Op::Call(..))) => {
+                    let mut tags = Vec::new();
+                    let mut j = i + 1;
+                    loop {
+                        match toks.get(j) {
+                            Some((_, Tok::Name(t))) => {
+                                tags.push((*t).to_owned());
+                                j += 1;
+                            }
+                            Some((_, Tok::Comma)) => j += 1,
+                            Some((_, Tok::RBrace)) if !tags.is_empty() => break,
+                            Some((a, t)) => return Err(syntax(*a, format!("a tag expected in a group's {{}}, found {t:?}"))),
+                            None => return Err(syntax(at, "an unclosed {")),
+                        }
+                    }
+                    b.push(Node::Group(tags));
+                    expect_operand = false;
+                    i = j + 1;
                 }
                 // An empty argument list: `f()`.
                 Tok::RParen if matches!(ops.last(), Some(Op::Call(..))) => {
@@ -1218,6 +1271,51 @@ mod tests {
         assert_eq!(metric(&ast, ast.root).space, SpaceAgg::Avg);
     }
 
+    /// Datadog's anomaly monitors' named arguments, as its page's example writes them, after
+    /// `anomalies()`' own; its querying page's `maximum()` and `minimum()`, and a metric of that
+    /// name still a metric.
+    #[test]
+    fn anomalies_take_named_arguments_and_maximum_is_max() {
+        let ast = parse("anomalies(avg:system.cpu.system{name:cassandra}, 'basic', 3, direction='above', alert_window='last_5m', interval=20, count_default_zero='true', seasonality='weekly', timezone='UTC')").unwrap();
+        let Node::Call(Func::Anomalies, args) = &ast.nodes[ast.root] else { panic!("{:?}", ast.nodes[ast.root]) };
+        let named: Vec<(&str, &str)> = args
+            .iter()
+            .filter_map(|&a| match &ast.nodes[a] {
+                Node::Named(k, v) => Some((k.as_str(), v.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, [("direction", "above"), ("alert_window", "last_5m"), ("interval", "20"), ("count_default_zero", "true"), ("seasonality", "weekly"), ("timezone", "UTC")]);
+        let ast = parse("maximum(a{*}, b{*}) - minimum(a{*}, 1)").unwrap();
+        assert!(ast.nodes.iter().any(|n| matches!(n, Node::Call(Func::Max, a) if a.len() == 2)));
+        assert!(ast.nodes.iter().any(|n| matches!(n, Node::Call(Func::Min, a) if a.len() == 2)));
+        assert!(matches!(parse("maximum{*}").unwrap().nodes[0], Node::Metric(_)));
+    }
+
+    /// Datadog's nested queries as its page's JSON tab writes them, a query in place of its
+    /// `query1`: a layer of time aggregation, of space aggregation (a group of tags its last
+    /// argument), `moving_rollup` in lookback mode, and the boolean remaps.
+    #[test]
+    fn nested_queries_parse_as_datadog_s_json_tab_writes_them() {
+        for q in [
+            "rollup(avg:aws.ec2.cpuutilization{*} by {env,team}.rollup(avg, 300), 'p95', 1800)",
+            "max(avg:aws.ec2.cpuutilization{*} by {env,host}.rollup(avg, 300), { env })",
+            "percentile(avg:aws.ec2.cpuutilization{*} by {env,team}.rollup(avg, 300), 'p95', {env})",
+            "rollup(sum:api.requests{*} by {env}.rollup(avg, 14400), 'stddev', 43200)",
+            "moving_rollup(moving_rollup(avg:aws.ec2.cpuutilization{*} by {env}.rollup(avg, 300), 600, 'max', 'lookback'), 7200, 'stddev', 'lookback')",
+            "is_greater(avg:cpu{*}, 30)",
+            "is_less(avg:cpu{*}, 30)",
+            "is_between(avg:cpu{*}, 10, 30)",
+        ] {
+            assert!(parse(q).is_ok(), "{q}: {:?}", parse(q));
+        }
+        let ast = parse("max(avg:cpu{*} by {env,host}, { env, team })").unwrap();
+        assert!(ast.nodes.iter().any(|n| *n == Node::Group(vec!["env".into(), "team".into()])), "{:?}", ast.nodes);
+        for bad in ["max(avg:cpu{*}, {})", "{env}", "max(avg:cpu{*}, {env)", "avg(avg:cpu{*})", "percentile(avg:cpu{*}, {env})", "is_between(avg:cpu{*}, 1)", "rollup(avg:cpu{*})"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn mistakes_are_errors_that_say_where() {
         for bad in [
@@ -1294,7 +1392,8 @@ mod tests {
         assert!(parse("avg:cpu{env:$env.value}").is_ok());
         for bad in [
             r#"logs("x").last("5m")"#,
-            r#"logs("x").rollup("median", "@d")"#,
+            r#"logs("x").rollup("pc80", "@d")"#,
+            r#"logs("x").rollup("median")"#,
             r#"logs("x").rollup("sum")"#,
             r#"logs("(x")"#,
             r#"logs("x").by(service)"#,

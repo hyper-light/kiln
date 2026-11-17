@@ -1080,7 +1080,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             boxed(|| crate::harness::limit::put(&hub, &name, req)).await.map_err(|(c, m)| err(c, m))
         }
         // The warm pools kiln names on a runner (`crate::sandbox::pools`; kiln plan 01a1dd2e…, P3.2).
-        (&Method::GET, ["api", "runners", name, "pools"]) => boxed(|| crate::sandbox::pools::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "runners", name, "pools"]) => boxed(|| crate::sandbox::pools::get(&hub, &caller, name)).await.map_err(|(c, m)| err(c, m)),
         // How a runner runs new agent sessions, its engine (`crate::harness::engine`; kiln plan 01a1dd2e…, P2.3).
         (&Method::GET, ["api", "runners", name, "engine"]) => boxed(|| crate::harness::engine::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
         (&Method::PUT, ["api", "runners", name, "engine"]) => {
@@ -1450,6 +1450,25 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, name, body)).await
         }
+        // A person's experiments on their agent definitions (`crate::agentdefs::experiments`, kiln plan
+        // 01a1cd8e862e7169a074db3d5fa33f3d P7.1): every one of theirs by definition, as the UI reads them; each change
+        // under its definition, its path naming what its operation takes.
+        (&Method::GET, ["api", "agentdef-experiments"]) => boxed(|| own_op(&hub, &caller, "agentdefs.experiments.list", query_value(&q))).await,
+        (_, ["api", "agentdefs", id, "experiments", rest @ ..]) => {
+            let Some((name, named)) = crate::agentdefs::experiments::ops::op_of(&method, rest) else {
+                return Err(err(StatusCode::NOT_FOUND, format!("no route {method} {}", s.join("/"))));
+            };
+            let named: Vec<(&str, String)> = named.into_iter().map(|(k, v)| (k, v.to_owned())).collect();
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+                for (k, v) in named {
+                    o.insert(k.into(), json!(v));
+                }
+            }
+            boxed(|| own_op(&hub, &caller, name, body)).await
+        }
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
@@ -1559,6 +1578,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
             Err(e) => Err(err(StatusCode::CONFLICT, e)),
         },
+        // A session paused, let go on, or started again now (kiln plan 01a1dd2e…, P5.5c): `sessions.pause`, `sessions.resume`
+        // (its pause taken away), `sessions.restart`.
+        (m @ (&Method::POST | &Method::DELETE), ["api", "harness", "sessions", id, "pause"]) => {
+            let name = if *m == Method::POST { "sessions.pause" } else { "sessions.resume" };
+            boxed(|| own_op(&hub, &caller, name, json!({"agent": id}))).await
+        }
+        (&Method::POST, ["api", "harness", "sessions", id, "restart"]) => boxed(|| own_op(&hub, &caller, "sessions.restart", json!({"agent": id}))).await,
         // An agent moved to another machine: `agents.move` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S3),
         // 202 as its move goes on after the answer.
         (&Method::POST, ["api", "harness", "agents", id, "move"]) => {
@@ -5595,8 +5621,8 @@ impl AgentsSeen {
         if m.kind == "attention" {
             return crate::harness::attention::person(&self.caller).is_some_and(|who| m.person.as_deref() == Some(who.as_str()));
         }
-        // An Agentfile's change, to its owner and whoever reaches everyone's (`crate::agentfiles`).
-        if m.kind == "agentfile" {
+        // An Agentfile's change, or its builds', to its owner and whoever reaches everyone's (`crate::agentfiles`).
+        if m.kind == "agentfile" || m.kind == "agentfile_builds" {
             return m.person.as_deref().is_some_and(|owner| crate::agentfiles::hears(&self.caller, owner));
         }
         if self.all {
@@ -5628,7 +5654,7 @@ impl Narrow {
             "resync" => return true,
             // AgentsSeen has already checked the attention event's person (attention plan 01a199e1b177752e84dad5dc990e6a15),
             // and an Agentfile's owner.
-            "attention" | "agentfile" => return true,
+            "attention" | "agentfile" | "agentfile_builds" => return true,
             "inbox" => return m.person.as_deref() == Some(self.person.as_str()),
             _ => {}
         }
@@ -6879,51 +6905,10 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let attention_kind = if body.spec.prompt.is_some() { "message" } else { "command" };
-    // A deployment experiment's split (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1): each new session of its
-    // target is one of its variants, drawn as it opens, one at a time. One opened with ids of its own, or taking a
-    // conversation up again, opens as asked.
-    let split = match person.as_deref().filter(|_| body.ids.is_empty() && body.spec.resume.is_none() && body.spec.helper.is_none()) {
-        Some(person) => {
-            let agentfile = crate::harness::lineage::agentfile_of(&body.spec.kind, body.spec.isolation.as_ref().and_then(|i| i.image.as_deref()), body.spec.isolation.is_some());
-            let starting = crate::ci::experiments::Starting { agentdef: None, harness: &body.spec.kind, agentfile: agentfile.as_deref(), person };
-            crate::ci::experiments::assign(hub, &starting).await.map(|d| (d, person.to_owned(), agentfile))
-        }
-        None => None,
-    };
-    let infos = match split {
-        Some((first, person, agentfile)) => {
-            let mut infos = Vec::new();
-            let mut refused = None;
-            let mut draw = Some(first);
-            for k in 0..count.clamp(1, 16) {
-                let d = match draw.take() {
-                    Some(d) => Some(d),
-                    None => crate::ci::experiments::assign(hub, &crate::ci::experiments::Starting { agentdef: None, harness: &body.spec.kind, agentfile: agentfile.as_deref(), person: &person }).await,
-                };
-                let drawn = d.is_some();
-                let opened = match d {
-                    Some(d) => open_drawn(hub, caller.as_ref(), &body.target, body.spec.clone(), &d, &person).await,
-                    None => hub.harness.open(hub, &body.target, body.spec.clone(), count.clamp(1, 16) - k).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}"))),
-                };
-                // A variant that can't start there is its failure, kept as its draw's: the rest are drawn still.
-                match opened {
-                    Ok(i) => infos.extend(i),
-                    Err(e) => refused = Some(e),
-                }
-                if !drawn {
-                    break;
-                }
-            }
-            match refused {
-                Some(e) if infos.is_empty() => return Err(e),
-                _ => infos,
-            }
-        }
-        None => hub.harness.open_as(hub, &body.target, body.spec, count, &body.ids).await.map_err(|e| {
-            let status = if e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
-            err(status, format!("{e:#}"))
-        })?,
-    };
+    let infos = hub.harness.open_as(hub, &body.target, body.spec, count, &body.ids).await.map_err(|e| {
+        let status = if e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
+        err(status, format!("{e:#}"))
+    })?;
     // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`), and
     // whose it is.
     if let Some(c) = &caller {
@@ -6933,42 +6918,6 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         }
     }
     Ok(srv::json(StatusCode::OK, &infos))
-}
-
-/// Whose Agentfiles a console start reads: its caller's, or the owner's on a kiln nobody else signs in to.
-fn who_of(caller: Option<&crate::authz::Caller>) -> Result<crate::agentfiles::Who, ApiError> {
-    let owner = crate::authz::Caller::owner();
-    crate::agentfiles::Who::of(caller.unwrap_or(&owner)).map_err(|e| err(StatusCode::FORBIDDEN, e.to_string()))
-}
-
-/// One session of a console start opened as split draw `d`'s variant (P7.1) on `target`: its spec made the
-/// variant's, its Agentfile read, its machine checked to start microVMs where it's one's; then what came of it kept
-/// as the draw's, a refusal its variant's failure.
-async fn open_drawn(hub: &Hub, caller: Option<&crate::authz::Caller>, target: &str, mut spec: crate::harness::session::Spec, d: &crate::ci::experiments::Draw, person: &str) -> Result<Vec<crate::harness::session::Info>, ApiError> {
-    crate::harness::lineage::spec_as_variant(&mut spec, &d.arm, d.assigned.clone(), person);
-    let opened = async {
-        // Each on its own engine (kiln plan 01a1dd2e…, P2.4): a microVM's on a runner that starts them, a host
-        // variant's on a runner whose engine is host, never made a microVM by its runner's engine.
-        if spec.isolation.is_some() {
-            crate::harness::lineage::isolation_on(hub, target).map_err(|why| err(StatusCode::CONFLICT, format!("an agent can't run isolated there: {why}")))?;
-        } else if crate::harness::lineage::engine_at(hub, target).map_err(|why| err(StatusCode::CONFLICT, why))? != crate::harness::engine::Engine::Host {
-            return Err(err(StatusCode::CONFLICT, format!("variant `{}` runs on the host engine, and {target} runs its sessions in microVMs (its engine is microvm)", d.arm.name)));
-        }
-        let kind = crate::harness::kinds::Kind::get(&spec.kind).ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unknown harness {:?}", spec.kind)))?;
-        if let Some(image) = spec.isolation.as_mut().and_then(|i| i.image.as_mut()) {
-            let who = who_of(caller)?;
-            *image = crate::harness::lineage::image_for(hub, &who, kind, image).await.map_err(|(status, why)| err(status, why))?;
-        }
-        crate::harness::lineage::kept_agentfile(hub, spec.isolation.as_ref(), Some(person)).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?.into_spec(&mut spec);
-        hub.harness.open(hub, target, spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))
-    }
-    .await;
-    let came = match &opened {
-        Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| "no session opened".to_owned()),
-        Err(e) => Err(e.1.clone()),
-    };
-    crate::ci::experiments::started(hub, d, came).await;
-    opened
 }
 
 /// The agents the request's caller acts on (docs/agents.md, "Whose agents"), what a broadcast's preview picks among.

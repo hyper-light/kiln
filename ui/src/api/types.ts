@@ -429,6 +429,49 @@ export interface AgentLimitView {
   max: number;
 }
 
+/* ---------------------------- warm pools (Runners → a runner) ---------------------------- */
+
+/**
+ * Whose a warm pool is, as you may know it (as agent definitions are): `definition`, the agent definition its
+ * sessions started from, which you reach (yours, everyone's for the server's owner and those with
+ * `agentdefs.manage`, and kiln's own); `harness`, the harness of sessions started from none; `another`, another
+ * person's agent, of which nothing is said.
+ */
+export type WarmPoolAgentFrom = "definition" | "harness" | "another";
+
+/** A warm pool kiln names on a runner's microVMs (kiln plan 01a1dd2e…, P3.2; docs/isolation.md, "Warm pools"). */
+export interface WarmPool {
+  /** Its agent definition's id, or its harness's; null for another person's. */
+  agent: string | null;
+  agent_from: WarmPoolAgentFrom;
+  /** Its agent definition's name, or its harness's; null for another person's. */
+  agent_name: string | null;
+  /** The deployment experiment and variant its sessions ran as (P7.1). */
+  variant: { experiment: string; arm: string } | null;
+  /** Its microVM's image, pinned by its digest. */
+  image: string;
+  /** Its microVM's vCPUs and MiB, 0 where its session's isolation gives none; both null where it gives neither. */
+  vcpus: number | null;
+  memory_mib: number | null;
+  starts: number;
+  /** Its starts whose microVM started on a warm host of it. */
+  hits: number;
+  began_ms: number;
+  last_ms: number;
+  /** When it's let go, unless another start of it comes first (Unix ms). */
+  until_ms: number;
+  /** Its node's warm hosts for it; null while no runner reports them. */
+  warm_hosts: number | null;
+}
+
+/** The warm pools kiln names on a runner now (`GET /api/runners/:name/pools`). */
+export interface WarmPoolsView {
+  runner: string;
+  /** How long a pool is kept past its latest start: its node's own keep-alive. */
+  keep_ms: number;
+  pools: WarmPool[];
+}
+
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
 export type DnsMode = "resolver" | "authoritative";

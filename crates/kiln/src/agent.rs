@@ -3840,6 +3840,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ev::Net(Some(NetEvent::Connected { binding, secured, .. })) => {
                 #[cfg(unix)]
                 { feature_negotiation = FeatureNegotiation::default(); }
+                // A connection of its own: what an earlier one's caps said goes with it (`secrets::lessor::Heard`).
+                crate::secrets::lessor::heard(crate::secrets::lessor::Word::Gone);
                 crate::harness::handing::mail_supported(false);
                 tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
                 chaos_drop = chaos.and_then(|c| c.drop_every).map(|d| Instant::now() + d);
@@ -4024,6 +4026,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 crate::harness::handing::mail_supported(false);
                 #[cfg(unix)]
                 { feature_negotiation = FeatureNegotiation::default(); }
+                crate::secrets::lessor::heard(crate::secrets::lessor::Word::Gone);
                 leases.away();
                 // The channel's items in flight go again once the server says what it has, and
                 // the server's from what this side says it has: the session loops' too (runner-fan).
@@ -4141,6 +4144,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         (None, None) => tracing::debug!(?what, "a frame about something handed over, with nowhere to go"),
                     }
                     continue;
+                }
+                // A question's answer may carry a run's leased value (`crate::secrets::lessor`): its frame wiped once read.
+                let mut data = data;
+                if matches!(msg, ServerMsg::ReachAnswer { .. }) {
+                    hex_api::lease::wipe(&mut data);
                 }
                 // What it carries is read here, once (`crate::wire::payload_of`, docs/wire.md "What
                 // can't be read"). What can't be read is refused: a command on the channel is NACKed
@@ -4453,18 +4461,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         continue;
                     }
-                    // One replay of a recorded session's tool calls in a microVM of a split's variant (kiln plan
-                    // 01a1dd2e… P7.1b): run on a task of its own, its scratch beneath this runner's state, answered as
-                    // it ends.
-                    Carried::Read(FromServer::Replay { req, ask }) => {
-                        let (up, under) = (uplink.0.clone(), o.state_dir.join("replays"));
-                        drop(crate::rt::spawn(async move {
-                            let answer = crate::sandbox::replay::answer(*ask, &under).await;
-                            let json = serde_json::to_string(&answer).ok();
-                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
-                        }));
-                        continue;
-                    }
                     Carried::Read(FromServer::FrontDoor(push)) => {
                         // Settings (and certificates) are never logged: an upload carries a key.
                         if let Some(fd) = &front_door {
@@ -4698,6 +4694,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Caps { caps } => {
                         #[cfg(unix)]
                         feature_negotiation.caps(caps);
+                        // Whether its named features, which say whether it answers this runner's runs' leases, follow.
+                        crate::secrets::lessor::heard(crate::secrets::lessor::Word::Caps { names: caps & proto::CAP_FEATURES != 0 });
                         // An identity of this process's own, for a key it made and keeps, certified
                         // on each connection (docs/ci.md W27-R01); an ephemeral runner's too (a `k8s`
                         // pool's pod, a v1 job's), enrolled by kiln, so its leg signs as the leg.
@@ -4824,6 +4822,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     ServerMsg::Welcome { server_version, sample_seconds: _ } => {
                         tracing::info!(%server_version, "server welcomed agent");
+                        // With no caps before it, a server from before them, which answers no run's lease.
+                        crate::secrets::lessor::heard(crate::secrets::lessor::Word::Welcome);
                         // What waited for the connection, in order: what was held while it was
                         // down, the jobs' events again, then their results not yet received.
                         welcomed = true;
@@ -5093,7 +5093,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         sent_changes.state_pages = pages;
                         tracing::debug!(?names, "the server speaks these features");
                         crate::reach::told::server_features(&names);
-                        crate::secrets::lessor::server_features(&names);
+                        crate::secrets::lessor::heard(crate::secrets::lessor::Word::Features { leases: proto::feature::speaks(&names, proto::feature::LEASES) });
                         // Its admission's hints go to a server that takes them (AUDIT O1).
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Offers(proto::feature::speaks(&names, proto::feature::OFFERS))).await;
@@ -5764,6 +5764,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Stream(m) => (LANE_STREAM, Kind::Term, proto::encode(m)),
                     Up::Port(m) => (LANE_PORTS, Kind::Term, proto::encode(m)),
                 };
+                // A reach question may carry a run's sign-in's tokens (`crate::secrets::lessor`): its words wiped once its
+                // frame is made, and its frame as the net thread lets go of it, or here where it goes nowhere.
+                let wiped = if let Up::Reach(AgentMsg::ReachAsk { json, .. }) = &mut up {
+                    crate::secrets::lessor::wipe_text(json);
+                    true
+                } else {
+                    false
+                };
                 // An answer to one of the server's commands: when it was made, and what it answered (runner-fan).
                 let answer = if matches!(&up, Up::Term(AgentMsg::Wire(crate::wire::channel::Frame::Ack(_)))) { answers_at.pop_front() } else { None };
                 let Ok(data) = data else { continue };
@@ -5778,6 +5786,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     let (lane, kind, data) = wire_form(lane, kind, data, &grants, server_leases);
                     match &delay_line {
                         Some(d) => d.send(lane, kind, data, again),
+                        None if wiped => {
+                            net.send_wiped(SERVER_PEER, lane, kind, data).await;
+                        }
                         None => {
                             net.send(SERVER_PEER, lane, kind, data).await;
                         }
@@ -5787,6 +5798,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 } else if again {
                     // Sent from `unreceived` and `journal` once connected again.
+                } else if wiped {
+                    let mut data = data;
+                    hex_api::lease::wipe(&mut data);
                 } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_OBSERVE && lane != LANE_CONVO && lane != LANE_FILES {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));

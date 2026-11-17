@@ -21,6 +21,8 @@
 //! - `narrowed` (`vm_e2e/narrowed.rs`): a Goose session of kiln's own Agentfile in a microVM, the
 //!   stand-in in Goose's place, reaching past it only its person's provider's hosts, and saying so; one
 //!   whose home can't be read keeps every destination, saying why (kiln plan step 17 part 6).
+//! - `ended` (`vm_e2e/ended.rs`): a session's microVM whose run ended on its own has its box deleted and its use
+//!   charged (Unix: it finds and kills a VM process with `ps` and `kill`).
 //!
 //! No real harness and no model runs here unless ROOT points these at one (`VM_E2E_*`).
 //!
@@ -32,6 +34,9 @@ mod vm_e2e;
 mod step35;
 #[path = "vm_e2e/narrowed.rs"]
 mod narrowed;
+#[cfg(unix)]
+#[path = "vm_e2e/ended.rs"]
+mod ended;
 
 // =================================================================================================
 // The checks, against samples. Each guard has its red beside its green; the comment names the
@@ -572,14 +577,14 @@ mod waits {
         assert!(refused.to_string().starts_with("pi's first turn: it is idle") && refused.to_string().ends_with(&text));
     }
 
-    /// Before its harness's first answer a wait has no clock: alive and silent, it waits on however
-    /// long (the cold start, the person's ruling of 2026-11-13). A picked bound (the 600 s this
-    /// replaces) refuses at the third look.
+    /// Before its harness's first answer, in a run that has none of its kind, a wait has no clock:
+    /// alive and silent, it waits on however long (the cold start, the person's ruling of 2026-11-13).
+    /// A picked bound (the 600 s this replaces) refuses at the third look.
     #[test]
     fn s35_before_its_first_answer_a_wait_follows_its_harness_alone() {
         let pace = Pace::default();
-        assert_eq!(pace.window(Asked::Opening), None);
-        let mut w = Watch::new(Asked::Opening, pace.window(Asked::Opening));
+        assert_eq!(pace.window(Asked::Opening, &Learned::default()), None);
+        let mut w = Watch::new(Asked::Opening, pace.window(Asked::Opening, &Learned::default()));
         for secs in [0, 1, 600, 86_400] {
             assert_eq!(w.look(&word("running"), &[], None, false, s(secs)), Verdict::Wait, "at {secs} s");
         }
@@ -596,7 +601,7 @@ mod waits {
             pace.answered(s(took));
         }
         assert_eq!(pace.slowest(), Some(s(11)));
-        let window = pace.window(Asked::Message("m"));
+        let window = pace.window(Asked::Message("m"), &Learned::default());
         assert_eq!(window, Some(s(11)));
         let mut w = Watch::new(Asked::Message("m"), window);
         let asked = vec![user(1, "m", "go")];
@@ -611,17 +616,60 @@ mod waits {
         assert_eq!(w.look(&queued, &line, None, false, s(42)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
     }
 
-    /// A turn the drive asked to be long waits as a first does, whatever it learned: no earlier answer
-    /// bounds a turn asked to take longer. Bounding it by the slowest answer refuses it at 2 s.
+    /// A turn the drive asked to be long waits as a first does, whatever its drive learned: no shorter
+    /// kind of answer bounds a turn asked to take longer. Bounding it by the slowest answer refuses it at
+    /// 2 s.
     #[test]
     fn s35_a_turn_asked_to_be_long_follows_its_harness_alone() {
         let mut pace = Pace::default();
         pace.answered(s(1));
-        assert_eq!(pace.window(Asked::Steered("steer")), None);
-        let mut w = Watch::new(Asked::Steered("steer"), pace.window(Asked::Steered("steer")));
+        let run = Learned { opening: Some(s(40)), steered: None };
+        assert_eq!(pace.window(Asked::Steered("steer"), &run), None);
+        let mut w = Watch::new(Asked::Steered("steer"), pace.window(Asked::Steered("steer"), &run));
         for secs in [0, 2, 3_600] {
             assert_eq!(w.look(&word("running"), &[user(1, "steer", "STEER x")], None, false, s(secs)), Verdict::Wait);
         }
+    }
+
+    /// A run's later drives are judged where its first had nothing to go by (r637: the tenth drive on
+    /// one HVF runner, pi's, waited an hour, until its carrier ended the server and runner). A run keeps,
+    /// per kind, its runner's slowest start (an image built, a microVM booted, a first turn) and its
+    /// slowest turn asked to be long, each a whole wait from ask to answer; a later drive's cold start is
+    /// bounded by the first, a later steered turn by the second, and a drive's own answers still bound
+    /// its own later waits. The other kinds teach the run nothing, being shorter than a start. Taking
+    /// out the run's record leaves the cold start unbounded; keeping the other kinds in it bounds a start
+    /// by a message's answer.
+    #[test]
+    fn s35_a_runs_earlier_answers_bound_its_later_drives_cold_starts() {
+        let mut run = Learned::default();
+        for (asked, took) in [(Asked::Opening, 40), (Asked::Message("m"), 90), (Asked::Steered("steer"), 25), (Asked::Opening, 30), (Asked::Stop { said: None }, 95), (Asked::Kiln, 99)] {
+            run.answered(asked, s(took));
+        }
+        assert_eq!(run, Learned { opening: Some(s(40)), steered: Some(s(25)) });
+        let later = Pace::default();
+        assert_eq!(later.window(Asked::Opening, &run), Some(s(40)));
+        assert_eq!(later.window(Asked::Steered("steer"), &run), Some(s(25)));
+        assert_eq!(later.window(Asked::Message("m"), &run), None, "a message's wait is its own drive's to bound");
+        // Its cold start, kiln's word on it still for a whole window of the run's slowest start: refused.
+        let mut w = Watch::new(Asked::Opening, later.window(Asked::Opening, &run));
+        assert_eq!(w.look(&word("starting"), &[], None, false, s(0)), Verdict::Wait);
+        assert_eq!(w.look(&word("starting"), &[], None, false, s(40)), Verdict::Wait);
+        assert_eq!(w.look(&word("starting"), &[], None, false, s(41)), Verdict::Refuse(Stall::Quiet { quiet: s(41), slowest: s(40) }));
+        // A drive's own answers bound its own later start (its resumed session's); a steered turn, the run's such turns alone.
+        let mut drove = Pace::default();
+        drove.answered(s(11));
+        assert_eq!(drove.window(Asked::Opening, &run), Some(s(11)));
+        assert_eq!(drove.window(Asked::Steered("steer"), &run), Some(s(25)));
+        // A run's first of a kind is its cold start.
+        assert_eq!(later.window(Asked::Opening, &Learned::default()), None);
+        assert_eq!(drove.window(Asked::Steered("steer"), &Learned::default()), None);
+    }
+
+    /// A wait refused because a process of its fixture's own ended says which and how.
+    #[test]
+    fn s35_a_wait_whose_party_ended_says_which() {
+        let gone = Stall::Party(SetupStuck::Exited { party: Party::Runner, how: "signal: 9 (SIGKILL)".into() });
+        assert_eq!(gone.to_string(), "the Runner process ended (signal: 9 (SIGKILL)): nothing of it answers again");
     }
 
     /// Where kiln's word says its harness is gone for good, a wait refuses at once: no runner holds it;
@@ -1334,6 +1382,33 @@ mod host {
         anyhow::ensure!(refused.is_some_and(|r| r.evidence.contains(r#""status":"idle""#) && r.evidence.contains("completed") && r.evidence.contains("STUB_DONE")), "{waited:?}");
         pace.stop(&f, &id)
     }
+
+    /// A wait whose fixture's own runner ended refuses, typed, naming it and how: a first wait with no
+    /// window, on a turn held until stopped, which kiln's word alone (its session disconnected) leaves
+    /// waiting on. Taking out the parties' look in `Pace::until` waits on for good. It ends its own
+    /// runner, so never ROOT's (`VM_E2E_SERVER`).
+    #[test]
+    fn s35_a_wait_whose_runner_ended_refuses_at_once() -> anyhow::Result<()> {
+        use crate::vm_e2e::{Asked, Party, Pace, Refused, SetupStuck, Stall};
+        if std::process::Command::new("python3").arg("--version").output().is_err() {
+            eprintln!("SKIP: the stand-in harness needs python3");
+            return Ok(());
+        }
+        if std::env::var_os("VM_E2E_SERVER").is_some() {
+            eprintln!("SKIP: it ends its fixture's runner, and VM_E2E_SERVER names ROOT's");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let f = crate::vm_e2e::host_fixture(dir.path())?;
+        let project = crate::vm_e2e::project(dir.path())?;
+        let id = crate::vm_e2e::open(&f, &serde_json::json!({"kind": "pi", "cwd": project, "prompt": crate::vm_e2e::stub_stopped_turn()}))?;
+        let pid = f.runner_pid.ok_or_else(|| anyhow::anyhow!("its runner has no pid"))?;
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(i32::try_from(pid)?), nix::sys::signal::Signal::SIGKILL)?;
+        let waited = Pace::default().until(&f, &id, Asked::Opening, "pi's first turn", |_, _| false);
+        let refused = waited.as_ref().err().and_then(|e| e.downcast_ref::<Refused>());
+        anyhow::ensure!(refused.is_some_and(|r| matches!(&r.stall, Stall::Party(SetupStuck::Exited { party: Party::Runner, .. }))), "{waited:?}");
+        Ok(())
+    }
 }
 
 // =================================================================================================
@@ -1362,10 +1437,34 @@ mod engine {
         }
     }
 
+    /// MicroVM session `id`'s turn answered in its microVM: its opening prompt's (`client` none), else the message
+    /// sent now as `client`. Its harness said it ran in a guest's kernel, and kiln says it runs in its microVM. Waited
+    /// for as step 35's waits are, on its harness's liveness and progress: one that ended, or never started in its
+    /// microVM, refuses the wait at once in kiln's word on it (`Stuck::Ended`), where a look at `runs.in` alone can
+    /// miss a run that started and ended between two looks.
+    fn answered_in_its_microvm(f: &vm_e2e::Fixture, pace: &mut vm_e2e::Pace, id: &str, client: Option<&str>, what: &str) -> anyhow::Result<()> {
+        let (info, events) = match client {
+            None => pace.until(f, id, vm_e2e::Asked::Opening, what, |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?,
+            Some(client) => {
+                vm_e2e::command(f, id, &json!({"type": "send", "id": client, "text": "do the task", "mode": "queue"}))?;
+                pace.until(f, id, vm_e2e::Asked::Message(client), what, |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, client), vm_e2e::STUB_DONE))?
+            }
+        };
+        let lines = match client {
+            None => vm_e2e::said(&events),
+            Some(client) => vm_e2e::said_after(&events, client),
+        };
+        vm_e2e::check_in_guest(vm_e2e::where_said(&lines).as_ref(), std::env::consts::OS, vm_e2e::host_boot_id().as_deref()).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+        anyhow::ensure!(info.pointer("/runs/in") == Some(&json!("microvm")), "{what}: kiln says it runs {}", info.get("runs").unwrap_or(&Value::Null));
+        Ok(())
+    }
+
     /// P2.3's first and second tests, and AC3: a runner that holds microVMs reports `microvm`, by
     /// default; its owner switches it to `host`: the session in a microVM there goes on (`draining`
-    /// 1), the next that asks nothing starts on its host with no microVM, and one that needs a microVM
-    /// is refused, the engine named. Set back, it's `microvm` again.
+    /// 1), answering its next turn in its microVM, the next that asks nothing starts on its host with no
+    /// microVM, and one that needs a microVM is refused, the engine named. Set back, it's `microvm` again.
+    /// The microVM session answers a turn there before the switch too, so a harness that never ran in its
+    /// microVM fails here, in kiln's words on it, before anything is switched.
     #[test]
     fn p2_3_a_runner_with_microvms_defaults_to_microvm_and_a_switch_to_host_starts_the_next_on_its_host() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1379,17 +1478,18 @@ mod engine {
         let project = vm_e2e::project(dir.path())?;
         let kept = vm_e2e::keep_stub(&f, "claude")?;
         let image = format!("agentfile:{}", kept.id);
-        let vm = vm_e2e::open(&f, &json!({"kind": "claude", "cwd": project, "isolation": {"kind": "microvm", "image": image}}))?;
-        anyhow::ensure!(runs_in(&f, &vm)? == "microvm", "{}", vm_e2e::info(&f, &vm)?);
+        let vm = vm_e2e::open(&f, &json!({"kind": "claude", "cwd": project, "prompt": "do the task", "isolation": {"kind": "microvm", "image": image}}))?;
+        let mut pace = vm_e2e::Pace::default();
+        answered_in_its_microvm(&f, &mut pace, &vm, None, "the microVM one's first turn")?;
 
         let v = vm_e2e::set_engine(&f, &f.machine, "host")?;
         anyhow::ensure!(v.get("engine") == Some(&json!("host")) && v.get("from") == Some(&json!("server")) && v.get("draining") == Some(&json!(1)), "switched, the microVM one draining: {v}");
         let next = vm_e2e::open(&f, &json!({"kind": "claude", "cwd": project}))?;
-        anyhow::ensure!(runs_in(&f, &next)? == "host" && vm_e2e::info(&f, &next)?.get("isolation") == Some(&Value::Null), "the next on its host: {}", vm_e2e::info(&f, &next)?);
+        anyhow::ensure!(runs_in(&f, &next)? == "host" && vm_e2e::info(&f, &next)?.get("isolation").is_none_or(Value::is_null), "the next on its host: {}", vm_e2e::info(&f, &next)?);
         let body = json!({"target": format!("agent:{}", f.machine), "spec": {"kind": "claude", "cwd": project, "isolation": {"kind": "microvm", "image": image}}});
         let (code, said) = crate::common::http_within(f.port, "POST", "/api/harness/sessions", &f.admin, Some(&body), std::time::Duration::from_secs(75))?;
         anyhow::ensure!(code >= 400 && said.contains("its engine is host"), "a microVM refused on it: {code} {said}");
-        anyhow::ensure!(vm_e2e::status(&vm_e2e::info(&f, &vm)?) != "exited", "the microVM one goes on: {}", vm_e2e::info(&f, &vm)?);
+        answered_in_its_microvm(&f, &mut pace, &vm, Some("after-the-switch"), "the microVM one goes on, draining")?;
         for id in [&next, &vm] {
             let _ = crate::common::http(f.port, "DELETE", &format!("/api/harness/agents/{id}"), &f.admin, None);
         }

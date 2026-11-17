@@ -222,6 +222,10 @@ pub enum Out {
     /// A test build's copy (`crate::runner::chaos`, `copy=`): every frame sent from now on is
     /// appended to this file as it's handed below the channel, before any fault (W27-R02).
     Copy(std::path::PathBuf),
+    /// A frame that may carry a credential's value or a sign-in's tokens (a run's ask of its server's run-lease broker,
+    /// or its answer: `crate::secrets::lessor`), sent as [`Out::Frame`] is, its bytes wiped as the net thread lets go
+    /// of them: once the endpoint has taken its copy, shed, or forgotten with its peer ([`Queued`]).
+    Wiped { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8> },
 }
 
 /// About one frame in `every` of `lane` (of those whose first byte, a message's variant, is
@@ -406,6 +410,12 @@ impl NetHandle {
     /// Queue without waiting; returns false when full (callers drop or retry).
     pub fn try_send(&self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> bool {
         self.tx.try_send(Out::Frame { peer, lane, kind, data }).is_ok()
+    }
+
+    /// [`NetHandle::send`] of a frame that may carry a credential's value or a sign-in's tokens ([`Out::Wiped`]): its
+    /// bytes wiped as the net thread lets go of them.
+    pub async fn send_wiped(&self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> bool {
+        self.tx.send(Out::Wiped { peer, lane, kind, data }).await.is_ok()
     }
 
     pub async fn command(&self, out: Out) -> bool {
@@ -734,7 +744,7 @@ impl crate::memory::queue::Weigh for Out {
     /// Its place and what it carries: a frame's bytes, the names and keys it says.
     fn weight(&self) -> usize {
         std::mem::size_of::<Out>().saturating_add(match self {
-            Out::Frame { data, .. } => data.len(),
+            Out::Frame { data, .. } | Out::Wiped { data, .. } => data.len(),
             Out::Revoke { name } | Out::Unrevoke { name } => name.len(),
             Out::RevokeKeys { keys, why } => keys.iter().map(String::len).sum::<usize>().saturating_add(why.len()),
             Out::Copy(path) => path.as_os_str().len(),
@@ -945,14 +955,57 @@ macro_rules! clock {
 
 #[derive(Default)]
 struct Outbox {
-    queues: HashMap<(PeerId, u32), VecDeque<(Kind, Vec<u8>)>>,
+    queues: HashMap<(PeerId, u32), VecDeque<(Kind, Queued)>>,
     /// A test build's faults, each with its draw's state, and the seed they draw from.
     faults: Vec<(Shed, u64)>,
     seed: u64,
     /// A frame each lane holds back to send late (`Act::Late`), and since when.
-    late: HashMap<(PeerId, u32), (Kind, Vec<u8>, Instant)>,
+    late: HashMap<(PeerId, u32), (Kind, Queued, Instant)>,
     /// A test build's copy of every frame handed to it (`Out::Copy`).
     copy: Option<std::fs::File>,
+}
+
+/// A frame the outbox holds: its bytes, wiped as it lets go of them (sent, shed, forgotten, or ended with it) where it
+/// was handed over as one that may carry a credential's value ([`Out::Wiped`]; hex_api's `wipe`, zeroize's writes).
+#[derive(Clone)]
+struct Queued {
+    data: Vec<u8>,
+    wiped: bool,
+}
+
+impl Queued {
+    fn new(data: Vec<u8>, wiped: bool) -> Queued {
+        Queued { data, wiped }
+    }
+}
+
+/// An [`Out::Frame`]'s bytes, let go of as they always were.
+impl From<Vec<u8>> for Queued {
+    fn from(data: Vec<u8>) -> Queued {
+        Queued::new(data, false)
+    }
+}
+
+impl std::ops::Deref for Queued {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for Queued {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.data
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        if self.wiped {
+            hex_api::lease::wipe(&mut self.data);
+        }
+    }
 }
 
 /// What became of a frame handed to the outbox.
@@ -965,7 +1018,12 @@ enum Push {
 }
 
 impl Outbox {
-    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, mut data: Vec<u8>) -> Push {
+    fn push(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+        self.push_queued(peer, lane, kind, Queued::from(data))
+    }
+
+    /// [`Outbox::push`] of a frame as the net thread holds it, one to wipe among them ([`Queued`]).
+    fn push_queued(&mut self, peer: PeerId, lane: u32, kind: Kind, mut data: Queued) -> Push {
         if let Some(f) = &mut self.copy {
             use std::io::Write as _;
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
@@ -1009,7 +1067,7 @@ impl Outbox {
         if unreadable {
             let mut marked = MARK.to_vec();
             marked.append(&mut data);
-            data = marked;
+            data = Queued::new(marked, data.wiped);
             tracing::warn!(lane = crate::proto::lane_name(lane), copies = if twice { 2 } else { 1 }, "chaos: frames made unreadable");
         }
         // One held back goes after this one; this one waits for the next, when it's to be late.
@@ -1040,7 +1098,7 @@ impl Outbox {
         }
     }
 
-    fn queue(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Vec<u8>) -> Push {
+    fn queue(&mut self, peer: PeerId, lane: u32, kind: Kind, data: Queued) -> Push {
         let q = self.queues.entry((peer, lane)).or_default();
         if q.len() >= OUTBOX_FRAMES {
             if kind == Kind::Control {
@@ -1259,8 +1317,14 @@ async fn run_loop(
                 }
                 for cmd in cmds {
                     match cmd {
-                        Out::Frame { peer, lane, kind, data } => {
-                            if outbox.push(peer, lane, kind, data) == Push::Stuck {
+                        // A frame to wipe is held so as it waits, and let go of so ([`Queued`]).
+                        frame @ (Out::Frame { .. } | Out::Wiped { .. }) => {
+                            let (peer, lane, pushed) = match frame {
+                                Out::Frame { peer, lane, kind, data } => (peer, lane, outbox.push(peer, lane, kind, data)),
+                                Out::Wiped { peer, lane, kind, data } => (peer, lane, outbox.push_queued(peer, lane, kind, Queued::new(data, true))),
+                                _ => continue,
+                            };
+                            if pushed == Push::Stuck {
                                 // Its control lane's queue is full: rather than lose control
                                 // frames, the connection closes, and the channel's resume repairs
                                 // what it carried.
@@ -1717,7 +1781,7 @@ mod tests {
         o.faults = vec![(Shed { lane, variant: Some(46), every: 1, act: Act::Unknown(past) }, 0x9e37_79b9_7f4a_7c15)];
         let frame = vec![46u8, 1, 2, 3];
         assert_eq!(o.push(peer, lane, Kind::Term, frame.clone()), Push::Queued);
-        let sent = o.queues.get(&(peer, lane)).and_then(|q| q.front()).map(|(_, d)| d.clone()).unwrap_or_default();
+        let sent = o.queues.get(&(peer, lane)).and_then(|q| q.front()).map(|(_, d)| d.to_vec()).unwrap_or_default();
         assert!(sent.starts_with(&MARK), "{sent:?}");
         assert_eq!(unmarked(&sent), [past, 1, 2, 3], "its index one past, the mark off");
         assert_eq!(unmarked(&frame), frame, "one not made unreadable is read as it went");
@@ -1801,7 +1865,7 @@ mod tests {
     #[test]
     fn a_fault_sends_frames_twice_or_late() {
         let (peer, bulk): (PeerId, u32) = (0xdead_0009, 13);
-        let queued = |o: &Outbox| -> Vec<Vec<u8>> { o.queues.get(&(peer, bulk)).into_iter().flatten().map(|(_, d)| d.clone()).collect() };
+        let queued = |o: &Outbox| -> Vec<Vec<u8>> { o.queues.get(&(peer, bulk)).into_iter().flatten().map(|(_, d)| d.to_vec()).collect() };
         // Let go of uncounted: the lane is "other" to the metric, which the test after this one
         // counts on alone.
         let done = |mut o: Outbox| o.queues.clear();

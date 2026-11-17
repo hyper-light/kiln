@@ -357,7 +357,7 @@ impl Issues {
                 let mut group: Vec<(String, String)> =
                     kiln_obs::monitor::ERROR_FACETS.into_iter().zip(key).filter(|(f, _)| by.iter().any(|b| b == f)).map(|(f, v)| (f.to_owned(), v.to_owned())).collect();
                 group.sort();
-                kiln_obs::monitor::Value { group, value }
+                kiln_obs::monitor::Value::of(group, value)
             })
             .collect())
     }

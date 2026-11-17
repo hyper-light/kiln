@@ -19,8 +19,6 @@
 //!   loop and its adapter treat a microVM's member as they treat a process of the machine's.
 //! - [`pools`]: the warm pools kiln names on the machine's microVMs from its agents' starts, and lets
 //!   go of after their keep window (kiln plan 01a1dd2e…, P3.2), and each runner's as the server shows them.
-//! - [`replay`]: a recorded session's tool calls run in a microVM of a split's variant, and what it measured
-//!   (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b).
 
 #[cfg(test)]
 pub mod fake;
@@ -31,7 +29,6 @@ pub mod image;
 pub mod isolated;
 pub mod narrow;
 pub mod pools;
-pub mod replay;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,6 +113,28 @@ impl Microvms {
             (None, _) if !sign_ins.is_empty() => Err(Refusal::Unsupported("a harness's sign-in captured outside its microVM".into())),
             (None, _) => self.sandbox.launch(launch).await,
         }
+    }
+
+    /// `held`'s member swapped for `launch`'s in the microVM it runs in (`Run::swap`; kiln plan 01a1dd2e…, P6c.5: a
+    /// harness switched in place), its harness granted `sign_ins` as [`Microvms::launch`] grants a new microVM's (plan
+    /// step 33), never left to sign in itself there, its tokens in its microVM. Hex grants a sign-in only as a box is
+    /// made (its C8), and has no call yet that swaps a member in place and grants it one (`hexvm::NO_SWAP_SIGN_IN`); a
+    /// stand-in grants none: a swap whose harness has a sign-in is refused, typed, by either, and its run goes on.
+    pub async fn swap(&self, held: &held::Held, launch: kiln_seams::sandbox::Launch, sign_ins: &[crate::secrets::signin::SignIn]) -> Result<Box<dyn Run>, Refusal> {
+        match swap_refused(self.hex.is_some(), sign_ins) {
+            Some(refused) => Err(refused),
+            None => held.swap(launch).await,
+        }
+    }
+}
+
+/// Why a swap whose harness has `sign_ins` is refused by microVMs that are Hex's (`hex`) or a stand-in's
+/// ([`Microvms::swap`]); none for one with none, which its boundary swaps as before.
+fn swap_refused(hex: bool, sign_ins: &[crate::secrets::signin::SignIn]) -> Option<Refusal> {
+    match (hex, sign_ins.is_empty()) {
+        (_, true) => None,
+        (true, false) => Some(Refusal::Unsupported(hexvm::NO_SWAP_SIGN_IN.into())),
+        (false, false) => Some(Refusal::Unsupported("a harness's sign-in captured outside its microVM".into())),
     }
 }
 
@@ -413,6 +432,23 @@ async fn read(rx: &crate::memory::queue::Receiver<Vec<u8>>, open: bool) -> Optio
 
 #[cfg(test)]
 mod tests {
+    /// Plan step 33 (D242): a harness switched in place into the microVM its session runs in (P6c.5) is granted its
+    /// sign-in as a launch is, or its swap is refused, typed, never left to sign in itself there with its tokens in its
+    /// microVM: Hex's microVMs, which grant one only as a box is made (its C8), refuse it until their swap call carries
+    /// one; a stand-in's, which grant none, refuse it as their launch does; a swap whose harness has none goes to its
+    /// boundary as before. Written, not run (the person's rule of 2026-11-16).
+    #[test]
+    fn s33_a_harness_swapped_in_is_granted_its_sign_in_or_refused() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::Refusal;
+        let egress = vec!["api.anthropic.com:443".to_owned(), "platform.claude.com:443".to_owned()];
+        let sign_in = crate::secrets::signin::Provider::ClaudeCode.grant("owner", &egress, None).ok_or_else(|| anyhow::anyhow!("no sign-in granted toward its hosts"))?;
+        let one = [sign_in];
+        anyhow::ensure!(matches!(super::swap_refused(true, &one), Some(Refusal::Unsupported(why)) if why == super::hexvm::NO_SWAP_SIGN_IN), "Hex's microVMs");
+        anyhow::ensure!(matches!(super::swap_refused(false, &one), Some(Refusal::Unsupported(why)) if why.contains("sign-in")), "a stand-in's");
+        anyhow::ensure!(super::swap_refused(true, &[]).is_none() && super::swap_refused(false, &[]).is_none(), "one with no sign-in goes to its boundary");
+        Ok(())
+    }
+
     /// Step 17: a machine whose kiln carries no microVM runtime says so in its facts, and why (one
     /// answer, which `virt.microvm` says too); its hypervisor is the one the runner found.
     #[test]

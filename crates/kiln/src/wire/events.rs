@@ -186,6 +186,9 @@ pub enum ServerEvent {
     /// sockets, and those of whoever reaches everyone's. After every tagged frame before it; a page from
     /// before it doesn't apply it.
     Agentfile(AgentfileChange),
+    /// One of a person's Agentfiles' builds ahead of its sessions changed (`crate::agentfiles::prebuild`), heard
+    /// as [`ServerEvent::Agentfile`] is. After every tagged frame before it; a page from before it doesn't apply it.
+    AgentfileBuilds(AgentfileBuilds),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -257,11 +260,16 @@ pub struct AgentfileChange {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(test, ts(as = "Option<bool>", optional))]
     pub deleted: bool,
-    /// Its builds ahead of its sessions changed, and nothing else of it (kiln plan 01a1dd2e… P4.5): a page that shows
-    /// them loads them again (`GET /api/agentfiles/:id/builds`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
-    pub builds: bool,
+}
+
+/// An Agentfile whose builds ahead of its sessions changed, and nothing else of it (kiln plan 01a1dd2e… P4.5): whose
+/// and which. A page that shows them loads them again (`GET /api/agentfiles/:id/builds`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct AgentfileBuilds {
+    /// `owner`, or `user:<id>`: who hears it.
+    pub owner: String,
+    pub id: String,
 }
 
 /// The two frames tagged `queue`.
@@ -528,7 +536,7 @@ impl IncidentBrief {
 }
 
 /// An experiment as its frame says it: its state, and what changed with it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct ExperimentBrief {
     pub id: String,
@@ -978,7 +986,10 @@ mod tests {
             json!({ "type": "deploy_registration", "removed": { "app": "web", "environment": "prod" } }),
         )?;
         same(
-            ServerEvent::Experiment { repo: "acme/app".into(), experiment: Box::new(ExperimentBrief { id: "E1".into(), repo: "acme/app".into(), state: "measuring".into(), measured: Some(2), runs: Some(6), decision: None }) },
+            ServerEvent::Experiment {
+                repo: "acme/app".into(),
+                experiment: Box::new(ExperimentBrief { id: "E1".into(), repo: "acme/app".into(), state: "measuring".into(), measured: Some(2), runs: Some(6), ..ExperimentBrief::default() }),
+            },
             json!({ "type": "experiment", "repo": "acme/app", "experiment": { "id": "E1", "repo": "acme/app", "state": "measuring", "measured": 2, "runs": 6 } }),
         )?;
         let run = NoticeRun { repo: "acme/app".into(), id: "r1".into(), number: 7, workflow: "ci.yml".into(), name: "CI".into(), branch: "main".into(), sha: "abc".into(), message: "m".into(), actor: "ada".into(), conclusion: "failure".into(), url: "u".into() };

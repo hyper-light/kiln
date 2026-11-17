@@ -605,6 +605,7 @@ fn export_records(r: &kiln_obs::query::parse::RecordQuery, name: &str) -> Value 
         Measure::Avg(m) => ("avg", Some(format!("@{m}"))),
         Measure::Min(m) => ("min", Some(format!("@{m}"))),
         Measure::Max(m) => ("max", Some(format!("@{m}"))),
+        Measure::Pct(m, p) => (Measure::pct_name(*p), Some(format!("@{m}"))),
     };
     let mut compute = json!({ "aggregation": aggregation });
     if let (Some(m), Some(o)) = (metric, compute.as_object_mut()) {

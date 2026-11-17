@@ -537,7 +537,7 @@ pub struct Ask {
     /// The ids to start them under, one each, made by the caller (`crate::util::is_id`), so that
     /// its page can open an agent's own page before it has started (W21-R15): asked again under
     /// the same ids, a start is refused (409, `IdTaken`) rather than started twice. A start with
-    /// ids of its own opens as asked, no experiment's split drawn for it (P7.1).
+    /// ids of its own opens as asked, no experiment's variant drawn for it (P7.1).
     pub ids: Option<Vec<String>>,
     /// The speed to start at (`Spec::speed`: "" standard); none, its harness's own.
     pub speed: Option<String>,
@@ -546,11 +546,8 @@ pub struct Ask {
     pub reach: Option<String>,
     /// The terminal session it belongs to (`Spec::shell`): a person's start from a terminal.
     pub shell: Option<String>,
-    /// The task it was given apart from its definition's words (`agentdefs.run`): what a split's variant that's
-    /// another agent is told after that agent's words (P7.1). The definition a split matches is kiln's to say
-    /// ([`Ask::definition`]), never what's asked.
-    pub task: Option<String>,
-    /// Its microVM's vCPUs and MiB, as a split's variant sizes it (P7.1): never from what's asked.
+    /// Its microVM's vCPUs and MiB, as a definition's experiment's variant sizes it (P7.1): never from what's
+    /// asked.
     #[serde(skip)]
     pub size: Option<(u32, u64)>,
     /// A card's helper (`super::about`), when kiln starts one for a person (`agents.about`): never
@@ -1391,38 +1388,36 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
 /// Start agents for `by`: checked against its parent when it's an agent, on the machine picked,
 /// each recorded with whom it acts for and who started it.
 pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refused> {
-    // A deployment experiment's split (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1): each new session of its
-    // target that its opener starts is one of its variants, drawn as it starts. A card's helper, and a conversation
-    // taken up again, start as they were.
+    // A definition's live experiment (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1,
+    // `crate::agentdefs::experiments`): each new session of one of its person's own definitions that has one is one
+    // of its variants, drawn as it starts. A card's helper, and a conversation taken up again, start as they were.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
     let fresh = ask.helper.is_none() && ask.resume.as_deref().is_none_or(|r| r.trim().is_empty()) && ask.ids().is_empty();
-    let Some(person) = person.filter(|_| fresh) else {
+    let (Some(person), Some(definition)) = (person.filter(|_| fresh), ask.definition.clone()) else {
         return start_as(hub, by, ask, |_| {}).await;
     };
     let count = ask.count.unwrap_or(1).clamp(1, 16);
-    let agentfile = agentfile_of(&ask.kind, ask.image.as_deref(), ask.isolation.as_deref().map(str::trim) == Some(Isolation::MICROVM));
     let mut infos = Vec::new();
     let mut refused = None;
     for k in 0..count {
-        let starting = crate::ci::experiments::Starting { agentdef: ask.definition.as_ref().map(|d| d.id.as_str()), harness: ask.kind.trim(), agentfile: agentfile.as_deref(), person: &person };
-        let Some(draw) = crate::ci::experiments::assign(hub, &starting).await else {
+        let Some(draw) = crate::agentdefs::experiments::assign(hub, &definition.id, &person).await else {
             let rest = Ask { count: Some(count - k), ..ask.clone() };
             infos.extend(start_as(hub, by, rest, |_| {}).await?);
             return Ok(infos);
         };
-        let one = as_variant(Ask { count: Some(1), ..ask.clone() }, &draw.arm);
-        let assigned = draw.assigned.clone();
+        let one = as_deployment(Ask { count: Some(1), ..ask.clone() }, &draw);
+        let assigned = draw.assigned();
         let got = start_as(hub, by, one, move |spec| spec.experiment = Some(assigned)).await;
         let came = match &got {
             Ok(i) => i.first().map(|x| x.id.clone()).ok_or_else(|| "no session started".to_owned()),
             Err((_, why)) => Err(why.clone()),
         };
-        crate::ci::experiments::started(hub, &draw, came).await;
+        crate::agentdefs::experiments::started(hub, &draw, came).await;
         // A variant that can't start is its failure, kept as its draw's: the rest are drawn still.
         match got {
             Ok(i) => infos.extend(i),
             Err(e) => {
-                tracing::warn!(error = %e.1, "a split's variant didn't start");
+                tracing::warn!(error = %e.1, "an experiment's variant didn't start");
                 refused = Some(e);
             }
         }
@@ -1433,62 +1428,17 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     }
 }
 
-/// A start's target, as a split matches it (P7.1), from its harness, the Agentfile it names and whether it's
-/// isolated: the Agentfile it's made from (kiln's own for its harness where it's isolated and names none).
-pub fn agentfile_of(kind: &str, named: Option<&str>, isolated: bool) -> Option<String> {
-    let named = named.map(str::trim).filter(|i| !i.is_empty()).map(str::to_owned);
-    let isolated = isolated || named.is_some();
-    named.or_else(|| crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == kind.trim()).map(|b| b.name.to_owned()).filter(|_| isolated))
-}
-
-/// `spec` as a split's variant `arm` opens it (P7.1; the console's start, `api::harness_open`), for `person`: its
-/// harness (a model, effort and mode of another harness left out), its model, its engine, in a microVM its Agentfile
-/// and size, an agent's words before its task, and its assignment.
-pub fn spec_as_variant(spec: &mut Spec, arm: &crate::ci::experiments::Arm, assigned: crate::harness::session::Assigned, person: &str) {
-    if spec.kind != arm.harness {
-        (spec.model, spec.effort, spec.mode) = (None, None, None);
-    }
-    spec.kind.clone_from(&arm.harness);
-    if let Some(m) = &arm.model {
-        spec.model = Some(m.clone());
-    }
-    spec.isolation = (arm.engine != "host").then(|| Isolation {
-        image: arm.agentfile.clone(),
-        person: Some(person.to_owned()),
-        cpus: arm.size.map(|s| kiln_ci::sched::state::Cpus::whole(u64::from(s.cpus))).filter(|c| !c.is_zero()),
-        memory: arm.size.and_then(|s| s.memory_mib.checked_mul(1 << 20)).filter(|b| *b > 0),
-        ..Isolation::microvm()
-    });
-    if let Some(settings) = &arm.settings {
-        spec.prompt = crate::agentdefs::first_message(settings, spec.prompt.as_deref());
-    }
-    // Its Agentfile's text and its build's secrets are read again for the variant's Agentfile (`kept_agentfile`).
-    spec.agentfile = None;
-    spec.build_secrets = Vec::new();
-    spec.experiment = Some(assigned);
-}
-
-/// `ask` as a split's variant `arm` starts it (P7.1): its harness (a model, effort and mode asked of another harness
-/// left out), its model, its engine, in a microVM its Agentfile and size, and, an agent's, what its definition tells
-/// it of the task.
-fn as_variant(mut ask: Ask, arm: &crate::ci::experiments::Arm) -> Ask {
-    if ask.kind.trim() != arm.harness {
-        (ask.model, ask.effort, ask.mode) = (None, None, None);
-    }
-    ask.kind.clone_from(&arm.harness);
-    if let Some(m) = &arm.model {
-        ask.model = Some(m.clone());
-    }
-    if arm.engine == "host" {
+/// `ask` as a definition's experiment's variant `d` starts it (P7.1): on the host engine a process of its machine's,
+/// else in a microVM of its Agentfile and size; its own model where it has one. It's still its definition's session,
+/// at the version it's at.
+fn as_deployment(mut ask: Ask, d: &crate::agentdefs::experiments::Draw) -> Ask {
+    if d.engine == Engine::Host {
         (ask.isolation, ask.image, ask.size) = (Some("none".into()), None, None);
     } else {
-        (ask.isolation, ask.image, ask.size) = (Some(Isolation::MICROVM.into()), arm.agentfile.clone(), arm.size.map(|s| (s.cpus, s.memory_mib)));
+        (ask.isolation, ask.image, ask.size) = (Some(Isolation::MICROVM.into()), d.agentfile.clone(), d.size());
     }
-    if let Some(settings) = &arm.settings {
-        let task = ask.task.clone().or_else(|| ask.prompt.clone());
-        ask.prompt = crate::agentdefs::first_message(settings, task.as_deref());
-        // It runs that agent's words: its sessions are that definition's, at its version as the split started.
-        ask.definition = arm.agent.clone().map(|id| crate::agentdefs::sessions::Definition { id, version: arm.agent_version.unwrap_or(0) });
+    if let Some(m) = &d.model {
+        ask.model = Some(m.clone());
     }
     ask
 }

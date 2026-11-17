@@ -6902,90 +6902,9 @@ mode in QuickJS, a tool per operation, skills) from deployments to all of CI, an
   options now include `firecracker` and `shards` (built from an Agentfile that declares the agent
   and its grants).
 
-  **Splits** (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1; the person's decision 7): an
-  experiment may split a person's own sessions across deployments instead of measuring options
-  (`experiments.start` with `target` and `arms`).
-  - The target is one of their agent definitions, or a harness and, where given, its Agentfile.
-  - Each of its 2 or more variants (`arms`) is a deployment with a weight in percent (together
-    100): an Agentfile, an agent or a harness, an engine (`microvm` or `host`) and a VM size.
-  - While it runs, each new session of the target that its opener starts, through `agents.start`
-    or the console, is one variant:
-    - drawn by weight as it starts (a seeded draw, so its shares are its weights');
-    - recorded on the session (`experiment` on its info) and kept for its life;
-    - started as that variant's deployment, the variant's size sizing its microVM.
-  - A conversation taken up again and a card's helper start as asked.
-  - A variant whose start is refused counts that start as a failure. The rest of the start's
-    sessions are still drawn.
-  - `experiments.pause` stops the draws and `experiments.resume` starts them again.
-  - `experiments.decide` promotes one variant, on a person's press: every later session of the
-    target is that variant (`promoted`), and the split is over. `experiments.cancel` ends the
-    split and its promotion.
-  - A split's results come from its sessions as they run and end (`experiments.get`). Each
-    variant gets:
-    - how many sessions it was assigned;
-    - its failures (a start refused, a session that never ran, or one that ended in error);
-    - its start time within each start kind (cold, from a template, warm), never pooled, since
-      warm pools sized by demand give a variant of low weight more cold starts;
-    - its start-kind mix, as a measure of its own;
-    - its footprint, peak and steady, and its host CPU, from each start's record
-      (`Start::measured`, Hex's meter of its microVM);
-    - its sessions' outcomes.
-  - Each measure has an anytime-valid confidence sequence, so a reading after every session is
-    valid at that moment:
-    - for rates, the hedged betting sequence of Waudby-Smith and Ramdas, "Estimating means of
-      bounded random variables by betting" (JRSS B, 2024), with its predictable plug-in bets;
-    - for medians, the quantile construction of Howard and Ramdas, "Sequential estimation of
-      quantiles with applications to A/B-testing and best-arm identification" (Bernoulli, 2022),
-      after Howard et al., "Time-uniform, nonparametric, nonasymptotic confidence sequences"
-      (Annals of Statistics, 2021).
-  - A winner on a measure is a variant whose sequence lies wholly below every other's. Each
-    variant's sequences are held at 5 % / k for its k variants, so a winner holds at 95 % whenever
-    it's read.
-
-  **Replays** (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b, an addition to a split; the person:
-  "Replay is fine as an addition"): `experiments.replay` (`POST /api/experiments/:id/replay`
-  `{session, rounds?, on?}`) replays one of the opener's recorded sessions against a split's variants.
-  - **What runs** (`kiln_ci::replay::plan`): the session's tool calls, read from kiln's conversation
-    store in their order. Its shell commands run (a command line by the shell, a command's words as
-    they are), and the files it wrote whole are written. A call is not run, and is counted by why,
-    where a model, a person or a server made or answered it (a subagent, a skill, a question, a plan,
-    an MCP tool), where it reached the web, where its harness did it in its own process (a read, a
-    search, its to-do list), where it edited a file in place, where it ran in the background, where it
-    never ended, or where the record keeps only part of its input (kiln keeps 16 KiB of each string of
-    a call's input, `clip_json`).
-  - **Where**: in a microVM of each variant that runs in one (a host variant isn't replayed: its
-    session's commands would run on the machine itself). Its image and size are the variant's, as
-    an isolated start of it has them. The replay's script is the microVM's own command, as `shards run
-    IMAGE COMMAND` runs one. No member of its image is driven, no grant is made, so nothing passes its
-    VM and no model is reached, and no credential is given. It sees two folders of its own and none of
-    the machine's: an empty one at the session's folder's path, where its steps start, and
-    `/kiln-replay`, its script and each step's end.
-  - **How often**: `rounds` times (3, an experiment's repetitions by default; at most 20, as they
-    are). Each round runs every variant once, in an order shuffled by the replay's id and round, one
-    run at a time on one runner (runs side by side would measure each other): `on`, or the session's
-    own machine.
-  - **The same measures** as a split's sessions, read the same way (`kiln_ci::split::analyze`):
-    - a run's start, from its boot asked to its microVM running, within its kind;
-    - its footprint, peak and steady, and its host CPU, from Hex's meter of its microVM;
-    - its failures: a run that couldn't be carried out (its microVM refused, its run ended before
-      its steps did, its limit passed);
-    - its outcomes: `ended`, `diverged` (it ran to its end and a step ended otherwise than its
-      record), or `failed`. How many steps diverged is a measure of its own (`diverged_steps`).
-  - **Its use is read** where the recording says the step running then would end. Each read that
-    finds no step ended doubles the wait (binary exponential backoff, so a replay slower than its
-    recording is read O(log) times a step). A wait is never shorter than a read took, nor a
-    millisecond, the recording's unit. Once every step has ended, its box is deleted with Hex's final
-    use, so its CPU and steady footprint cover its whole run. The script holds its run until then:
-    Hex reads no use of a run that ended on its own (`delete_with_host_use` answers `NotRunning`).
-  - **Its bounds** are kiln's own. A run may take an experiment's run's three hours (`ONE_RUN`), and
-    its answer is waited for that and the five minutes a machine measuring may go unheard
-    (`UNHEARD`). Its ask must fit one frame of the interactive lane it's sent on (1 MiB), or the
-    replay is refused before it runs.
-  - **Not yet**: a replay's folder starts empty, since no record says what the session's folder
-    held as it started; calls that read the project diverge alike in every variant. Hex runs no
-    program in a running Shards image VM (its `exec` awaits `Upstream::MemberExec`), so a replay is
-    its microVM's own command. Hex surfaces neither that command's output nor its end, so steps' ends
-    come back through its scratch folder.
+  A person's own sessions split across deployments (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1)
+  are an agent definition's experiments (`agentdefs.experiments.*`, docs/api.md "Experiments"),
+  not these: experiments here measure options of code.
 
 **Acceptance criteria**
 

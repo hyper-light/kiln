@@ -544,6 +544,8 @@ fn schemas() -> Map<String, Value> {
             ("warning_recovery", nullable(number())),
             ("ok", describe(nullable(number()), "a service check monitor's: OK runs in a row to recover (its critical and warning: runs in a row too)")),
             ("unknown", describe(nullable(number()), "a service check monitor's: UNKNOWN runs in a row to NO DATA")),
+            ("critical_query", describe(nullable(string()), "a formula monitor's dynamic threshold (its query `> threshold`): a formula of its variables, formula(\"query1 / query2\").rollup(\"p99\").last(\"1w\").multiplier(1.5)")),
+            ("critical_recovery_query", describe(nullable(string()), "beside critical_query: its recovery threshold, a formula as it is")),
         ],
         &[],
     );
@@ -555,6 +557,50 @@ fn schemas() -> Map<String, Value> {
             ("renotify_interval", describe(nullable(integer()), "minutes")),
             ("evaluation_delay", describe(nullable(integer()), "seconds")),
             ("every", describe(nullable(integer()), "seconds between evaluations")),
+            (
+                "scheduling_options",
+                describe(
+                    nullable(object(
+                        &[(
+                            "evaluation_window",
+                            nullable(object(&[("hour_starts", nullable(integer())), ("day_starts", nullable(string())), ("month_starts", nullable(integer())), ("timezone", nullable(string()))], &[])),
+                        )],
+                        &[],
+                    )),
+                    "where a cumulative window (current_1h, current_1d, current_1mo) begins: hour_starts alone (a minute), or day_starts (04:00), month_starts (1) and timezone",
+                ),
+            ),
+            (
+                "variables",
+                describe(
+                    array(object(
+                        &[
+                            ("name", string()),
+                            ("data_source", one_of(&["metrics", "logs", "spans", "events"])),
+                            ("query", describe(string(), "data_source metrics: a metric query")),
+                            ("search", describe(object(&[("query", string())], &["query"]), "logs, spans, events: Datadog's log search syntax")),
+                            (
+                                "compute",
+                                describe(
+                                    object(&[("aggregation", one_of(&["count", "cardinality", "median", "pc75", "pc90", "pc95", "pc98", "pc99", "sum", "min", "max", "avg"])), ("metric", string()), ("interval", integer())], &["aggregation"]),
+                                    "logs, spans, events: the measure of a facet (metric, `@duration`), over the monitor's whole window",
+                                ),
+                            ),
+                            ("group_by", describe(array(object(&[("facet", string()), ("limit", integer()), ("sort", any())], &["facet"])), "logs, spans, events: its groups' facets (every group evaluated)")),
+                            ("indexes", array(string())),
+                        ],
+                        &["name", "data_source"],
+                    )),
+                    "a formula monitor's queries by their names, its query formula(\"query1 / query2\").rollup(\"avg\").last(\"5m\"): metric queries (data_source metrics), or Datadog's event platform queries of logs, spans and events (each measured over the whole window, then the formula)",
+                ),
+            ),
+            (
+                "threshold_windows",
+                describe(
+                    nullable(object(&[("trigger_window", nullable(string())), ("recovery_window", nullable(string()))], &[])),
+                    "an anomaly monitor's, both: trigger_window its query's alert_window, recovery_window the window its recovery thresholds are of (last_15m)",
+                ),
+            ),
         ],
         &[],
     );

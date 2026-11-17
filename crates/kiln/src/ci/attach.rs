@@ -1251,7 +1251,7 @@ const AGENTS_SECONDS: &str = "SELECT COALESCE(SUM(j.finished_at - j.started_at),
 async fn over_budget(hub: &Arc<Hub>, a: &Attachment, all: &[Incident]) -> Option<String> {
     let since = today();
     let agents: Vec<String> = all.iter().filter(|x| x.attachment == a.id && x.at >= since).filter_map(|x| x.agent.clone()).collect();
-    let tokens: u64 = agents.iter().filter_map(|id| hub.harness.state(id)).map(|s| s.usage.input_tokens + s.usage.output_tokens).sum();
+    let tokens: u64 = agents.iter().filter_map(|id| hub.harness.state(id)).map(|s| s.usage.tokens()).sum();
     if tokens >= a.limits.tokens_per_day {
         return Some(format!("{}'s agents have spent {tokens} tokens today, past its limit of {}: a person takes this one, or raises the limit", a.name, a.limits.tokens_per_day));
     }

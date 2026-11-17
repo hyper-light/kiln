@@ -62,6 +62,12 @@ pub struct ThresholdsIn {
     pub ok: Option<f64>,
     /// A service check monitor's: UNKNOWN runs in a row to NO DATA (none: never).
     pub unknown: Option<f64>,
+    /// Datadog's dynamic thresholds, a formula monitor's (`> threshold`): formulas of its variables
+    /// (`formula("query1 / query2").rollup("p99").last("1w").multiplier(1.5)`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critical_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critical_recovery_query: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -77,6 +83,152 @@ pub struct Options {
     pub evaluation_delay: Option<u32>,
     /// Seconds between evaluations.
     pub every: Option<u32>,
+    /// Datadog's: where a cumulative window (`current_1h`, `current_1d`, `current_1mo`) begins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling_options: Option<SchedulingOptions>,
+    /// Datadog's, an anomaly monitor's: the window its trigger reads (its query's `alert_window`)
+    /// and the one its recovery reads (`kiln_obs::monitor::Query::windows`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold_windows: Option<ThresholdWindows>,
+    /// Datadog's, a formula monitor's queries by their names ([`Variable`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<Variable>,
+}
+
+/// Datadog's `threshold_windows` of an anomaly monitor, timeframes (`last_15m`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThresholdWindows {
+    pub trigger_window: Option<String>,
+    pub recovery_window: Option<String>,
+}
+
+/// A monitor's query read with what its options give it (Datadog's): a formula monitor's variables
+/// and dynamic thresholds (`options.variables`, `thresholds.critical_query`), a cumulative window's
+/// start (`scheduling_options.evaluation_window`), an anomaly monitor's `threshold_windows`.
+pub fn query_of(query: &str, o: &Options) -> Result<monitor::Query, String> {
+    let q = if query.trim_start().starts_with("formula(") {
+        let named = o.variables.iter().map(Variable::named).collect::<Result<Vec<(&str, String)>, String>>()?;
+        let vars: Vec<(&str, &str)> = named.iter().map(|(n, q)| (*n, q.as_str())).collect();
+        monitor::parse_formula(query, &vars, o.thresholds.critical_query.as_deref(), o.thresholds.critical_recovery_query.as_deref()).map_err(|e| e.to_string())?
+    } else {
+        if !o.variables.is_empty() || o.thresholds.critical_query.is_some() || o.thresholds.critical_recovery_query.is_some() {
+            return Err("options.variables and thresholds.critical_query: a formula monitor's (formula(\"query1 / query2\").last(\"5m\") > threshold)".into());
+        }
+        monitor::parse(query).map_err(|e| e.to_string())?
+    };
+    let q = match o.scheduling_options.as_ref().and_then(|s| s.evaluation_window.as_ref()) {
+        Some(w) => q.starting(w.hour_starts, w.day_starts.as_deref(), w.month_starts, w.timezone.as_deref()).map_err(|e| e.to_string())?,
+        None => q,
+    };
+    match &o.threshold_windows {
+        // Datadog's rule: both windows, or none.
+        Some(ThresholdWindows { trigger_window: Some(trigger), recovery_window: Some(recovery) }) => q.windows(trigger, recovery).map_err(|e| e.to_string()),
+        Some(_) => Err("threshold_windows: both trigger_window and recovery_window (Datadog's \"must include both\")".into()),
+        None => Ok(q),
+    }
+}
+
+/// A formula monitor's query by its name (Datadog's `options.variables`): a metric query
+/// (`data_source: metrics`, its `query`), or a query of Datadog's event platform of logs, spans or
+/// events (`data_source` `logs`, `spans`, `events`: its `search.query`, `compute` and `group_by`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Variable {
+    pub name: String,
+    pub data_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<EventSearch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute: Option<Compute>,
+    /// Its groups' facets. Each one's `limit` and `sort` (Datadog's top values a facet) are kept as
+    /// said, but kiln evaluates every group, as its log monitors do: none is left out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<GroupBy>,
+    /// Datadog's log indexes it reads, taken as a log monitor's `.index()` is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub indexes: Vec<String>,
+}
+
+/// An event platform query's search (Datadog's `search.query`, its log search syntax).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EventSearch {
+    pub query: String,
+}
+
+/// What an event platform query measures: Datadog's `compute.aggregation` (`count`,
+/// `cardinality`, `median`, `pc75` to `pc99`, `sum`, `min`, `max`, `avg`) of its `metric` (a facet,
+/// `@duration`). Its `interval` (a graph's step, ms) is kept as said: a monitor measures its whole
+/// window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Compute {
+    pub aggregation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval: Option<i64>,
+}
+
+/// One of an event platform query's groups: its facet (`service`, `@http.status_code`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupBy {
+    pub facet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<serde_json::Value>,
+}
+
+impl Variable {
+    /// Its name and its query in kiln's language: a metric query as it is; one of logs, spans or
+    /// events as `kiln_obs::monitor::records_query` writes it.
+    fn named(&self) -> Result<(&str, String), String> {
+        use kiln_obs::query::parse::RecordSource;
+        if self.name.is_empty() {
+            return Err("a formula's variable: its name".into());
+        }
+        let of = match self.data_source.as_str() {
+            "metrics" => return self.query.clone().map(|q| (self.name.as_str(), q)).ok_or_else(|| format!("{}: its query (data_source metrics)", self.name)),
+            "logs" => RecordSource::Logs,
+            "spans" => RecordSource::Spans,
+            "events" => RecordSource::Events,
+            other => return Err(format!("{}: data_source {other} (metrics, logs, spans or events: {other} is data kiln does not keep)", self.name)),
+        };
+        let compute = self.compute.as_ref().ok_or_else(|| format!("{}: its compute (an aggregation: count, cardinality, median, pc75, pc90, pc95, pc98, pc99, sum, min, max, avg)", self.name))?;
+        if let Some(i) = compute.interval.filter(|&i| i <= 0) {
+            return Err(format!("{}: compute.interval {i} (milliseconds, above 0)", self.name));
+        }
+        if let Some(g) = self.group_by.iter().find(|g| g.facet.trim().is_empty() || g.limit.is_some_and(|l| l < 1)) {
+            return Err(format!("{}: group_by {:?} (a facet; a limit of 1 or more)", self.name, g.facet));
+        }
+        let by: Vec<&str> = self.group_by.iter().map(|g| g.facet.trim()).collect();
+        let search = self.search.as_ref().map_or("", |s| s.query.as_str());
+        Ok((self.name.as_str(), kiln_obs::monitor::records_query(of, search, compute.aggregation.trim(), compute.metric.as_deref(), &by)))
+    }
+}
+
+/// Datadog's `scheduling_options` of a monitor: its `evaluation_window`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchedulingOptions {
+    pub evaluation_window: Option<EvaluationWindow>,
+}
+
+/// Where a metric monitor's cumulative window begins, as Datadog's API has it
+/// (`kiln_obs::monitor::Query::starting` holds it to Datadog's rules): `hour_starts`, the minute of
+/// the hour; `day_starts` (`04:00`) and `month_starts` (1), in `timezone`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvaluationWindow {
+    pub hour_starts: Option<u32>,
+    pub day_starts: Option<String>,
+    pub month_starts: Option<u32>,
+    pub timezone: Option<String>,
 }
 
 /// Datadog's type for a composite monitor.
@@ -84,7 +236,7 @@ pub const COMPOSITE: &str = "composite";
 /// Datadog's type for a service check monitor.
 pub const SERVICE_CHECK: &str = "service check";
 /// Datadog's types of the monitors whose kind their query says, as its API names them.
-pub const TYPES: [&str; 7] = ["metric alert", "query alert", "log alert", "trace-analytics alert", "slo alert", "error-tracking alert", SERVICE_CHECK];
+pub const TYPES: [&str; 8] = ["metric alert", "query alert", "log alert", "trace-analytics alert", "slo alert", "error-tracking alert", "event-v2 alert", SERVICE_CHECK];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Monitor {
@@ -129,7 +281,7 @@ fn slo_values(store: &Shared, id: &str, burn: Option<(i64, i64)>, now: i64) -> R
         },
         None => kiln_obs::slo::status(store, &slo, now).map_err(eval)?.budget_left,
     };
-    Ok(value.map(|v| vec![monitor::Value { group: Vec::new(), value: v }]).unwrap_or_default())
+    Ok(value.map(|v| vec![monitor::Value::of(Vec::new(), v)]).unwrap_or_default())
 }
 
 /// An Error Tracking monitor's values (`monitor::Kind::ErrorTracking`): its issues' errors over
@@ -212,17 +364,20 @@ impl Monitor {
         if checks::is_check(&self.query) || self.kind.as_deref() == Some(SERVICE_CHECK) {
             return self.compiled_check().map(|(q, t)| Compiled::Check(q, t));
         }
-        let q = monitor::parse(&self.query).map_err(|e| e.to_string())?;
+        let q = query_of(&self.query, &self.options)?;
         if matches!(q.kind, monitor::Kind::ErrorTracking { .. }) && self.options.notify_no_data {
             return Err("an Error Tracking monitor has no NO DATA: an issue without errors in its window counts none".into());
         }
         let t = &self.options.thresholds;
+        if q.dynamic.is_some() && (t.critical.is_some() || t.critical_recovery.is_some()) {
+            return Err("a dynamic threshold (`> threshold`): no critical or critical_recovery number beside it (Datadog's \"cannot be combined with static thresholds\")".into());
+        }
         if let Some(c) = t.critical
             && c != q.threshold
         {
             return Err(format!("the critical threshold {c} is not the query's {}", q.threshold));
         }
-        let t = Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery };
+        let t = Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery, dynamic: q.dynamic.is_some() };
         Ok(Compiled::Query(q, t))
     }
 
@@ -266,6 +421,7 @@ impl Monitor {
         match &q.kind {
             monitor::Kind::Metric { window_ms, .. }
             | monitor::Kind::Change { window_ms, .. }
+            | monitor::Kind::RecordsFormula { window_ms, .. }
             | monitor::Kind::Logs { window_ms, .. }
             | monitor::Kind::Spans { window_ms, .. }
             | monitor::Kind::ErrorTracking { window_ms, .. } => *window_ms,
@@ -584,6 +740,8 @@ impl Monitors {
             }
         };
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * Monitor::window_ms(&q), |mins| i64::from(mins) * 60_000);
+        // What each group's state moves by besides its value (`kiln_obs::monitor::Own`).
+        let owns: HashMap<Group, monitor::Own> = values.iter().map(|v| (v.group.clone(), v.own)).collect();
         let mut found: Vec<(Group, Option<f64>, Option<State>)> = values.into_iter().map(|v| (v.group, Some(v.value), None)).collect();
         // An Error Tracking monitor's group in trouble that it no longer finds (its issue resolved,
         // ignored, no longer new, or without errors in the window) counts none, and recovers: a
@@ -595,7 +753,7 @@ impl Monitors {
             found.extend(gone.into_iter().map(|g| (g, Some(0.0), None)));
         }
         let said = Said { threshold: q.threshold, warning: t.warning };
-        self.apply(store, m, now, no_data_ms, found, |prev, value, _| monitor::next(prev, value, q.op, &t, m.options.notify_no_data), said)
+        self.apply(store, m, now, no_data_ms, found, |group, prev, value, _| monitor::next(prev, value, owns.get(group).copied().unwrap_or_default(), q.op, &t, m.options.notify_no_data), said)
     }
 
     /// A service check monitor's evaluation: each group moved by its last runs
@@ -609,7 +767,7 @@ impl Monitors {
         let groups = checks::evaluate(&held(store), q, t, now - delay, lookback);
         let found = groups.into_iter().map(|g| (g.group, Some(f64::from(g.status)), g.state)).collect();
         let said = Said { threshold: f64::from(t.critical), warning: t.warning.map(f64::from) };
-        self.apply(store, m, now, 0, found, |prev, _, made| made.unwrap_or(prev), said)
+        self.apply(store, m, now, 0, found, |_, prev, _, made| made.unwrap_or(prev), said)
     }
 
     /// A composite's evaluation: its groups' states from the states of the monitors it reads, as
@@ -625,7 +783,7 @@ impl Monitors {
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * every_ms, |mins| i64::from(mins) * 60_000);
         let notify = m.options.notify_no_data;
         let found: Vec<(Group, Option<f64>, Option<State>)> = results.into_iter().map(|(g, s)| (g, None, Some(s))).collect();
-        self.apply(store, m, now, no_data_ms, found, |prev, _, s| s.filter(|&s| s != State::NoData || notify).unwrap_or(prev), Said { threshold: f64::NAN, warning: None })
+        self.apply(store, m, now, no_data_ms, found, |_, prev, _, s| s.filter(|&s| s != State::NoData || notify).unwrap_or(prev), Said { threshold: f64::NAN, warning: None })
     }
 
     /// What an evaluation found, applied: each group found moves from its last state to what
@@ -640,7 +798,7 @@ impl Monitors {
         now: i64,
         no_data_ms: i64,
         found: Vec<(Group, Option<f64>, Option<State>)>,
-        next: impl Fn(State, Option<f64>, Option<State>) -> State,
+        next: impl Fn(&Group, State, Option<f64>, Option<State>) -> State,
         said: Said,
     ) -> bool {
         let renotify_ms = m.options.renotify_interval.map(|mins| i64::from(mins) * 60_000).filter(|&r| r > 0);
@@ -659,7 +817,7 @@ impl Monitors {
                 seen.insert(key.clone());
                 let g = groups.entry(key).or_insert_with(|| GroupState { group, state: State::Ok.as_str().into(), value: None, since: now, last_data: now, notified: 0, quiet_recovery: false });
                 let prev = State::parse(&g.state).unwrap_or(State::Ok);
-                let to = next(prev, value, made);
+                let to = next(&g.group, prev, value, made);
                 g.value = value;
                 g.last_data = now;
                 if to != prev {
@@ -1003,6 +1161,42 @@ mod tests {
             created: 0,
             modified: 0,
         }
+    }
+
+    /// Datadog's formula monitor of its event platform (its API client's RUM and CI examples' shape:
+    /// `search`, `indexes`, `compute`, `group_by` with its `limit` and `sort`) of logs: compiled to
+    /// a formula of kiln's records queries, measured over the whole window, its variables kept as
+    /// said; a data source kiln does not keep, a variable without its compute or with a group of no
+    /// facet, refused.
+    #[test]
+    fn a_formula_monitor_of_logs_reads_records_and_other_products_are_refused() -> anyhow::Result<()> {
+        let v = |name: &str, data_source: &str, search: &str| -> anyhow::Result<Variable> {
+            Ok(serde_json::from_value(serde_json::json!({
+                "data_source": data_source, "name": name, "search": { "query": search }, "indexes": ["*"],
+                "compute": { "aggregation": "count" }, "group_by": [{ "facet": "service", "limit": 10, "sort": { "aggregation": "count", "order": "desc" } }],
+            }))?)
+        };
+        let m = |variables: Vec<Variable>| Monitor { query: r#"formula("query1 / query2 * 100").last("15m") >= 5"#.into(), options: Options { variables, ..Options::default() }, ..metric_monitor() };
+        let logs = m(vec![v("query1", "logs", "status:error")?, v("query2", "logs", "")?]);
+        match logs.compiled() {
+            Ok(Compiled::Query(q, _)) => anyhow::ensure!(
+                matches!(&q.kind, monitor::Kind::RecordsFormula { query, window_ms: 900_000 } if query == r#"(logs("status:error").rollup("count").by("service")) / (logs("").rollup("count").by("service")) * 100"#),
+                "{q:?}"
+            ),
+            other => anyhow::bail!("{other:?}"),
+        }
+        let kept = serde_json::to_value(&logs.options.variables)?;
+        anyhow::ensure!(kept.pointer("/0/group_by/0/sort/order") == Some(&serde_json::json!("desc")) && kept.pointer("/0/indexes/0") == Some(&serde_json::json!("*")), "{kept}");
+        let mut no_compute = v("query2", "logs", "")?;
+        no_compute.compute = None;
+        let mut no_facet = v("query2", "spans", "")?;
+        if let Some(g) = no_facet.group_by.first_mut() {
+            g.facet = " ".into();
+        }
+        for bad in [vec![v("query1", "rum", "")?, v("query2", "rum", "")?], vec![v("query1", "logs", "")?, no_compute], vec![v("query1", "spans", "")?, no_facet]] {
+            anyhow::ensure!(m(bad.clone()).compiled().is_err(), "{bad:?} taken");
+        }
+        Ok(())
     }
 
     /// Goal 9, plan 01a1a87b2cec step 5: the next evaluation is due when the first monitor's is (one not evaluated yet:

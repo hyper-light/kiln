@@ -15,7 +15,9 @@
 //!   tool, and in code mode (`code_run`'s `kiln.agents.start`).
 //!
 //! `rest::` and `mcp::` skip, saying why, until the runner a test starts says it starts microVMs
-//! (`facts.virt.microvm`); `VM_E2E=1` makes that a failure. A vendor's own CLI, from kiln's Agentfile
+//! (`facts.virt.microvm`); `VM_E2E=1` makes that a failure. A REST drive checks its links last, and
+//! where kiln's word on its session says Hex reported no agent-control link they fail by that gap's
+//! name (`vm_e2e::LinkGap`, gaps.json's `link_report`). A vendor's own CLI, from kiln's Agentfile
 //! or a person's own made from it, takes ROOT's task alone (`vm_e2e::TASK_WORDS`): never the
 //! stand-in's words. ROOT runs them: `tests/vm_e2e/README.md`.
 
@@ -79,10 +81,17 @@ fn untasked(kind: &str, image: &str) -> Option<String> {
 /// What a drive held back comes to: said and skipped, or with `VM_E2E=1` a failure.
 fn held_back(why: String, failed: &mut Vec<String>) {
     if vm_e2e::isolation_required() {
-        failed.push(format!("{why} (VM_E2E=1 requires a real task)"));
+        failed_now(failed, format!("{why} (VM_E2E=1 requires a real task)"));
     } else {
         eprintln!("{why}");
     }
+}
+
+/// A drive's failure, said as it comes, so a run ended from outside (its bound, a kill) keeps what each drive
+/// before it came to, and kept for the test's end.
+fn failed_now(failed: &mut Vec<String>, why: String) {
+    eprintln!("FAILED: {why}");
+    failed.push(why);
 }
 
 // =================================================================================================
@@ -92,7 +101,7 @@ fn held_back(why: String, failed: &mut Vec<String>) {
 mod checks {
     use serde_json::Value;
 
-    const FLAGS: [&str; 5] = ["linux_build", "mcp", "mcp_in_microvm", "resume", "ui_pick_up"];
+    const FLAGS: [&str; 6] = ["linux_build", "mcp", "mcp_in_microvm", "resume", "ui_pick_up", "link_report"];
 
     /// The repository's root, where gaps.json's paths start.
     fn root() -> std::path::PathBuf {
@@ -159,10 +168,11 @@ mod checks {
     }
 
     /// Every harness has its row; each flag is a boolean (null where a fact isn't recorded yet, but
-    /// never `linux_build`, `mcp` or `ui_pick_up`, which kiln's own code says); each flag false or null
-    /// has a gap naming it, with why and sources that hold; each caveat says what and cites what holds
-    /// it; the row's reason rests on sources, its pin first. Taking out the per-flag rule passes a row
-    /// with a false flag and no gap; taking out `cited` passes a source that isn't there.
+    /// never `linux_build`, `mcp`, `ui_pick_up` or `link_report`, which kiln's own code says); each
+    /// flag false or null has a gap naming it, with why and sources that hold; each caveat says what
+    /// and cites what holds it; the row's reason rests on sources, its pin first. Taking out the
+    /// per-flag rule passes a row with a false flag and no gap; taking out `cited` passes a source
+    /// that isn't there.
     #[test]
     fn s35_every_harness_has_its_row_and_each_gap_its_cited_reason() -> anyhow::Result<()> {
         let gaps = super::gaps()?;
@@ -171,7 +181,7 @@ mod checks {
             let listed: Vec<(&str, &Value)> = row.get("gaps").and_then(Value::as_array).into_iter().flatten().map(|g| (g.get("what").and_then(Value::as_str).unwrap_or(""), g)).collect();
             for flag in FLAGS {
                 let v = row.get(flag).ok_or_else(|| anyhow::anyhow!("{kind} says nothing of {flag}"))?;
-                let known = ["linux_build", "mcp", "ui_pick_up"].contains(&flag);
+                let known = ["linux_build", "mcp", "ui_pick_up", "link_report"].contains(&flag);
                 anyhow::ensure!(v.is_boolean() || (v.is_null() && !known), "{kind}'s {flag} is {v}");
                 let gap = listed.iter().find(|(w, _)| *w == flag);
                 anyhow::ensure!(v.as_bool() == Some(true) || gap.is_some(), "{kind}'s {flag} is {v} with no gap saying why");
@@ -238,6 +248,44 @@ mod checks {
         assert!(super::untasked_by("codex", "harness-codex", false, but_marker).is_some_and(|w| w.ends_with("VM_E2E_DONE_MARKER isn't given")));
         assert_eq!(super::untasked_by("codex", "agentfile:0123", true, none), None, "the stand-in takes its own words");
     }
+
+    /// A REST drive's links, where kiln's word on its session says it runs in a microVM with no agent-control link
+    /// reported, fail by that gap's name ahead of what the checks said; elsewhere in the checks' own words; and each
+    /// row whose `link_report` is false names the gap in the words a run's red says. Taking out `link_gap`'s microVM
+    /// rule names the gap for a session on the host; taking out its absence rule names it for one whose link kiln
+    /// reports.
+    #[test]
+    fn s35_a_drive_whose_link_hex_reports_none_fails_by_that_name() -> anyhow::Result<()> {
+        use crate::vm_e2e::{LinkGap, LinkSuites, REQUIRED_LINKS, REQUIRED_SUITE, check_links, link_gap};
+        let runs = |control: Value| serde_json::json!({"runs": {"in": "microvm", "vm": "kiln-z1", "image": "harness-claude@sha256:00", "host_pid": null, "control": control}});
+        let unlinked = serde_json::json!({"runs": {"in": "microvm", "vm": "kiln-z1", "image": "harness-claude@sha256:00", "host_pid": null}});
+        let linked = runs(serde_json::json!({"controller": {"suite": REQUIRED_SUITE}, "endpoint": {"suite": REQUIRED_SUITE}, "lanes": ["control", "mcp:0"]}));
+        assert_eq!(link_gap(&unlinked), Some(LinkGap::HexReportsNoLink));
+        assert_eq!(link_gap(&runs(Value::Null)), Some(LinkGap::HexReportsNoLink));
+        assert_eq!(link_gap(&linked), None);
+        assert_eq!(link_gap(&serde_json::json!({"runs": {"in": "host", "pid": 7}})), None, "a process of the machine's rides no link");
+        // As the gap leaves them: the server-runner link read at both ends, the agent-control link's ends and lanes not.
+        let read = |name: &str, suite: Option<&str>, lanes: Option<Vec<String>>| LinkSuites { name: name.into(), client: suite.map(str::to_owned), server: suite.map(str::to_owned), lanes };
+        let gapped: Vec<LinkSuites> = REQUIRED_LINKS.into_iter().map(|n| read(n, (n == "server-runner").then_some(REQUIRED_SUITE), None)).collect();
+        let named = check_links(&gapped, true, &unlinked).err().ok_or_else(|| anyhow::anyhow!("links the gap left unread passed"))?;
+        anyhow::ensure!(named.gap == Some(LinkGap::HexReportsNoLink) && named.to_string().starts_with(&LinkGap::HexReportsNoLink.to_string()), "{named}");
+        anyhow::ensure!(check_links(&gapped, false, &unlinked).is_err_and(|e| e.gap == Some(LinkGap::HexReportsNoLink)), "a harness kiln gives no MCP: its links' suites fail by the gap's name too");
+        let bare = check_links(&gapped, true, &linked).err().ok_or_else(|| anyhow::anyhow!("links left unread passed"))?;
+        anyhow::ensure!(bare.gap.is_none() && bare.to_string() == bare.said, "kiln reports the link, so no gap is named: {bare}");
+        let whole: Vec<LinkSuites> = REQUIRED_LINKS.into_iter().map(|n| read(n, Some(REQUIRED_SUITE), (n == "agent-control").then(|| vec!["control".to_owned(), "mcp:0".to_owned()]))).collect();
+        anyhow::ensure!(check_links(&whole, true, &linked).is_ok() && check_links(&whole, true, &unlinked).is_ok(), "links that pass pass, whatever kiln says of the session");
+        // The record names the gap as a run's red does.
+        let gaps = super::gaps()?;
+        for kind in crate::vm_e2e::KINDS {
+            if gaps.pointer(&format!("/{kind}/link_report")) != Some(&Value::Bool(false)) {
+                continue;
+            }
+            let gap = gaps.pointer(&format!("/{kind}/gaps")).and_then(Value::as_array).into_iter().flatten().find(|g| g.get("what").and_then(Value::as_str) == Some("link_report"));
+            let why = gap.and_then(|g| g.get("why")).and_then(Value::as_str).unwrap_or_default();
+            anyhow::ensure!(why.starts_with(&LinkGap::HexReportsNoLink.to_string()), "{kind}'s link_report gap doesn't begin as a run's red says it ({}): {why:?}", LinkGap::HexReportsNoLink);
+        }
+        Ok(())
+    }
 }
 
 // =================================================================================================
@@ -293,7 +341,8 @@ mod rest {
 
     /// Each harness in a microVM from kiln's Agentfile and from a person's own, each starting an agent
     /// from inside where kiln gives it its MCP server; every harness is driven and every failure said
-    /// at the end, so one run shows where each stands.
+    /// as it comes and again at the end, so one run shows where each stands. Its drives share one
+    /// runner, whose answers to the first bound the later ones' cold starts (`vm_e2e::Learned`).
     #[test]
     fn s35_every_harness_in_a_microvm_from_kilns_agentfile_and_a_persons_own() -> anyhow::Result<()> {
         let gaps = super::gaps()?;
@@ -316,7 +365,7 @@ mod rest {
             // kiln's own image: `in_microvm` holds it to ROOT's task itself.
             let kilns = vm_e2e::builtin_image(kind);
             if let Err(e) = vm_e2e::in_microvm(&f, kind, &kilns, &project, mcp, mcp) {
-                failed.push(format!("{kind} from {kilns}: {e:#}"));
+                super::failed_now(&mut failed, format!("{kind} from {kilns}: {e:#}"));
             }
             // A person's own: held to ROOT's task here, as an `agentfile:<id>` is a stand-in's to it.
             if let Some(why) = super::untasked(kind, "a person's own Agentfile") {
@@ -326,11 +375,11 @@ mod rest {
             match users_own(&f, kind) {
                 Ok(Some(own)) => {
                     if let Err(e) = vm_e2e::in_microvm(&f, kind, &own, &project, mcp, mcp) {
-                        failed.push(format!("{kind} from a person's own ({own}): {e:#}"));
+                        super::failed_now(&mut failed, format!("{kind} from a person's own ({own}): {e:#}"));
                     }
                 }
                 Ok(None) => eprintln!("SKIP: {kind} from a person's own Agentfile: the stand-in's image is asked for (VM_E2E_IMAGE_{}) and no text of a person's is named (VM_E2E_OWN_{})", kind.to_ascii_uppercase(), kind.to_ascii_uppercase()),
-                Err(e) => failed.push(format!("{kind}: keeping a person's own Agentfile: {e:#}")),
+                Err(e) => super::failed_now(&mut failed, format!("{kind}: keeping a person's own Agentfile: {e:#}")),
             }
         }
         anyhow::ensure!(failed.is_empty(), "{} of the drives failed:\n{}", failed.len(), failed.join("\n\n"));
@@ -379,7 +428,7 @@ mod rest {
             let prompt = vm_e2e::task("VM_E2E_PROMPT", KIND, &probe, vm_e2e::stub_prompt(KIND, true, false, &probe));
             match vm_e2e::open(&f, &json!({"kind": KIND, "cwd": project, "prompt": prompt, "isolation": {"kind": "microvm", "image": image}})) {
                 Ok(id) => agents.push((id, probe, vm_e2e::Pace::default())),
-                Err(e) => failed.push(format!("{KIND}: starting one from {image}: {e:#}")),
+                Err(e) => super::failed_now(&mut failed, format!("{KIND}: starting one from {image}: {e:#}")),
             }
         }
         let mut vms = Vec::new();
@@ -389,7 +438,7 @@ mod rest {
             let (info, events) = match first {
                 Ok(seen) => seen,
                 Err(e) => {
-                    failed.push(format!("{e:#}"));
+                    super::failed_now(&mut failed, format!("{e:#}"));
                     continue;
                 }
             };
@@ -406,13 +455,15 @@ mod rest {
                     Err(e) => checks.push(Err(format!("{e:#}"))),
                 }
             }
-            failed.extend(checks.into_iter().filter_map(Result::err).map(|e| format!("{what}: {e}")));
+            for e in checks.into_iter().filter_map(Result::err) {
+                super::failed_now(&mut failed, format!("{what}: {e}"));
+            }
             vms.push(info.pointer("/runs/vm").cloned());
         }
         // Each the one member of a microVM of its own, which is how its lane tells it from the other.
         match vms.as_slice() {
             [Some(a), Some(b)] if a != b => {}
-            [a, b] => failed.push(format!("{KIND}: the two agents' microVMs as kiln names them (runs.vm) aren't two of their own: {a:?}, {b:?}")),
+            [a, b] => super::failed_now(&mut failed, format!("{KIND}: the two agents' microVMs as kiln names them (runs.vm) aren't two of their own: {a:?}, {b:?}")),
             // Fewer than two first turns ended, each said above.
             _ => {}
         }
@@ -420,7 +471,7 @@ mod rest {
         for (id, _, pace) in &mut agents {
             let ended = super::mcp::call(&f, super::mcp::Via::Tools, "agents.stop", json!({"agent": id, "children": true})).and_then(|_| pace.unlisted(&f, id, &format!("{KIND}: {id} still listed after agents.stop")));
             if let Err(e) = ended {
-                failed.push(format!("{KIND}: ending {id}: {e:#}"));
+                super::failed_now(&mut failed, format!("{KIND}: ending {id}: {e:#}"));
             }
         }
         anyhow::ensure!(failed.is_empty(), "{} of the checks failed:\n{}", failed.len(), failed.join("\n\n"));

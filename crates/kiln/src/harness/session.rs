@@ -200,17 +200,14 @@ pub struct Start {
     pub measured: Option<Measured>,
 }
 
-/// The variant of a deployment experiment a session runs as (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1): drawn
-/// by its variants' weights as it started, or its experiment's promoted variant once one was decided.
+/// The variant of its definition's experiment a session runs as (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1):
+/// drawn by its variants' weights as it started.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentExperiment"))]
 pub struct Assigned {
     pub experiment: String,
     pub arm: String,
-    /// Its experiment's decision promoted it: the split had ended, so no draw.
-    #[serde(default)]
-    pub promoted: bool,
 }
 
 /// What a start of a session's harness in a microVM measured (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1, a
@@ -401,8 +398,8 @@ pub struct Spec {
     /// The plan run it does a step of (`plans::agents`): set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_run: Option<String>,
-    /// The deployment experiment's variant it was assigned as it started (P7.1, `ci::experiments::assign`): kept
-    /// for its life. Set by kiln, never from what was asked.
+    /// Its definition's experiment's variant it was drawn as it started (P7.1, `agentdefs::experiments::assign`):
+    /// kept for its life. Set by kiln, never from what was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experiment: Option<Assigned>,
     /// What it helps with when it's a card's helper (`harness::about`: `about`, answering what a
@@ -4137,17 +4134,29 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     Some(Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local })
 }
 
-/// A person pauses it, or resumes it (`Command::Pause` without a task): its processes held stopped by
-/// its machine's pacer (`crate::headroom::pause`), now or as soon as it has any, or why they can't
-/// be, said in its conversation.
-fn pause_session(s: &Session, on: bool) {
+/// A person pauses it, or resumes it (`Command::Pause` without a task), or why it can't be, said in its conversation.
+/// On its machine's host its processes are held stopped by its machine's pacer (`crate::headroom::pause`), now or as
+/// soon as it has any. In a microVM, whose guest runs no process of this machine's for the pacer to hold, its boundary
+/// pauses its run (`Held::pause`, kiln plan 01a1dd2e…, P5.5c, through Hex's P5.5b) while one runs (`run`); with none,
+/// there's nothing to pause, and a resume lets go of its pause. Refused, it goes on as it was, never said paused.
+async fn pause_session(s: &Session, on: bool, run: Option<Arc<crate::sandbox::held::Held>>) {
+    let microvm = s.spec.lock().isolation.is_some();
+    let held = match run {
+        Some(run) if microvm => run.pause(on).await.map_err(|why| format!("its microVM didn't take it ({why})")),
+        None if microvm && on => Err("nothing of it runs in its microVM now".to_owned()),
+        None if microvm => Ok(()),
+        _ => crate::headroom::pause(&s.id, on),
+    };
     let mut core = s.core.lock();
-    match crate::headroom::pause(&s.id, on) {
+    match held {
         Ok(()) => {
             core.state.frozen = on.then(Core::now);
             core.touch_state();
         }
-        Err(why) => core.upsert(&format!("pause-refused-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("Not paused: {why}.") }),
+        Err(why) => {
+            let what = if on { "paused" } else { "resumed" };
+            core.upsert(&format!("pause-refused-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("Not {what}: {why}.") });
+        }
     }
 }
 
@@ -5428,9 +5437,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 drop(core);
                                 on_change();
                             }
-                            // A person's pause of the whole of it: its processes, held where they are.
+                            // A person's pause of the whole of it: its processes, or its microVM, held where they are.
                             Command::Pause { on, task: None } => {
-                                pause_session(&s, on);
+                                pause_session(&s, on, p.boundary()).await;
                                 on_change();
                             }
                             // A person's branch: a new session beside it, or of its own.
@@ -6095,9 +6104,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         drop(core);
                         on_change();
                     }
-                    // Paused while it isn't running: its processes are held as soon as it has any.
+                    // Paused while it isn't running: its processes are held as soon as it has any (none of a microVM's).
                     Command::Pause { on, task: None } => {
-                        pause_session(&s, on);
+                        pause_session(&s, on, None).await;
                         on_change();
                     }
                     // Branched while it isn't running: from its conversation as it was.
@@ -6839,6 +6848,36 @@ mod tests {
         }
         let again = s.resume_spec();
         assert_eq!((again.isolation, again.agentfile.as_deref(), again.resume.as_deref()), (Some(isolation), Some("FROM scratch\n"), Some("thread-1")));
+    }
+
+    /// Kiln plan 01a1dd2e…, P5.5c: a person's pause of a session in a microVM is its boundary's (`Held::pause`), never
+    /// its machine's pacer's, which holds no process of a guest: with no microVM of it running, a pause is refused, said
+    /// in its conversation and never said held, and a resume lets go of a pause it held. Mutation: the pacer's pause for
+    /// every engine (`headroom::pause` whatever `isolation`) says the pacer's words, or says it paused where one paces.
+    #[test]
+    fn p5_5c_a_microvm_sessions_pause_is_its_boundarys_never_its_pacers() -> anyhow::Result<()> {
+        let (s, _rx) = idle("isolated-paused");
+        *s.spec.lock() = Spec { kind: "claude".into(), isolation: Some(Isolation::microvm()), ..Spec::default() };
+        let s = Arc::new(s);
+        let paused = Arc::clone(&s);
+        crate::rt::block_on(async move {
+            pause_session(&paused, true, None).await;
+            anyhow::Ok(())
+        })?;
+        {
+            let core = s.core.lock();
+            anyhow::ensure!(core.state.frozen.is_none(), "never said paused");
+            let said = core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text == "Not paused: nothing of it runs in its microVM now."));
+            anyhow::ensure!(said, "its refusal said in its conversation");
+        }
+        s.core.lock().state.frozen = Some(1);
+        let resumed = Arc::clone(&s);
+        crate::rt::block_on(async move {
+            pause_session(&resumed, false, None).await;
+            anyhow::Ok(())
+        })?;
+        anyhow::ensure!(s.core.lock().state.frozen.is_none(), "a resume lets go of its pause");
+        Ok(())
     }
 
     #[cfg(unix)]

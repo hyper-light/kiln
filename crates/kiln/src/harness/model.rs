@@ -1005,6 +1005,14 @@ pub struct Usage {
     pub context_window: Option<u64>,
 }
 
+impl Usage {
+    /// Its tokens, in and out: what an attachment's tokens a day count (`crate::ci::attach`) and an agent definition's
+    /// token limit holds (`crate::agentdefs::limits`).
+    pub fn tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 /// One window of the plan limits of the account a session runs on (what the harness's own
 /// /usage shows): how much of it is used and when it starts over.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -2631,38 +2639,9 @@ pub fn clip_json(v: &serde_json::Value, max: usize) -> serde_json::Value {
     }
 }
 
-/// Whether `s` is a string [`clip_middle`] shortened: its marker, the count of the bytes it left out, between its head
-/// and its tail.
-pub fn was_clipped(s: &str) -> bool {
-    s.split("\n… ").skip(1).any(|rest| rest.split_once(" bytes omitted …\n").is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
-}
-
-/// Whether a string of `v` is one [`clip_json`] shortened (a recorded call a replay can't run whole, P7.1b).
-pub fn json_clipped(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::String(s) => was_clipped(s),
-        serde_json::Value::Array(a) => a.iter().any(json_clipped),
-        serde_json::Value::Object(o) => o.values().any(json_clipped),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// P7.1b: a string `clip_json` shortened is known shortened, one it left whole isn't, nor one that only reads like
-    /// its marker, so a replay never runs a shortened call as if it were whole.
-    #[test]
-    fn p7_1b_what_clipping_shortened_is_known_shortened() {
-        let long = "x".repeat(100);
-        let v = serde_json::json!({"command": long, "args": ["a", long], "description": "short"});
-        assert!(json_clipped(&clip_json(&v, 10)));
-        assert!(!json_clipped(&v));
-        assert!(was_clipped(&clip_middle(&long, 10).0));
-        assert!(!was_clipped("… 5 bytes omitted … in a sentence"));
-        assert!(!was_clipped("a\n…  bytes omitted …\nb"));
-    }
 
     /// Goal 9, plan 01a1a87b2cec step 5: an event reads as serde's derive (its body flattened, tagged by `kind`) read it,
     /// the derive kept here for it: every kind of body, as written (its tag after the event's own fields), with its own

@@ -2041,6 +2041,10 @@ pub struct Registry {
     opening: Rcu<std::collections::HashSet<String>>,
     /// What a viewer's attach waits for while the server starts ([`Registry::returned`]).
     pub returning: super::returning::Returning,
+    /// The sessions that may be past one of their agent definitions' limits now, for the task that holds them to those
+    /// (`crate::agentdefs::limits`): told as a session's spending changes ([`Registry::apply`]) and as one starts from a
+    /// definition (`crate::agentdefs::sessions::record`).
+    pub limits: crate::agentdefs::limits::Told,
     /// Tests: what every session started here runs instead of its harness (a program that isn't
     /// there, so no harness ever starts, whatever this machine has installed).
     #[cfg(test)]
@@ -2230,6 +2234,7 @@ impl Registry {
             answers: super::answers::Answers::new(WAITING_MAX),
             opening: Rcu::default(),
             returning: super::returning::Returning::default(),
+            limits: crate::agentdefs::limits::Told::default(),
             #[cfg(test)]
             test_program: Mutex::new(None),
         }
@@ -3287,6 +3292,8 @@ impl Registry {
         let attention_before = s.get(id).map(|m| super::attention::signature(&m.info));
         // The same meta again (a harness says it at each turn): nothing to keep, encode or send.
         let mut meta_same = false;
+        // What it has spent (its tokens, its cost) changed: its agent definition's limits are looked at again (below).
+        let mut spent = false;
         let mut gone = false;
         // The copy's events went another way than its viewers have them: they start over from it.
         let mut resync = false;
@@ -3481,6 +3488,8 @@ impl Registry {
             Update::Closed => {
                 gone = true;
                 goals_ended(hub, id);
+                // What it came to, where a definition's experiment drew it, kept before it's gone (P7.1).
+                crate::agentdefs::experiments::measures::closed(hub, &m.info);
                 // Its identities with it (docs/ci.md W27-R01).
                 let (store, id) = (hub.store.clone(), id.to_owned());
                 drop(crate::rt::spawn(async move {
@@ -3494,6 +3503,10 @@ impl Registry {
                 m.started_over();
             }
             Update::State { state } => {
+                // What it has spent, against the state the copy's was made of, else (one written out off the shard lets go of
+                // that) the copy's own: the same again tells no one.
+                let was = m.state_of.as_ref().map(|(was, _)| (was.usage.tokens(), was.usage.cost_usd)).or_else(|| m.state.get::<super::model::Usage>("usage").map(|u| (u.tokens(), u.cost_usd)));
+                spent = was != Some((state.usage.tokens(), state.usage.cost_usd));
                 // The same state as the copy's was made of, the copy's still that one: not made again; another is
                 // written once and kept by its fields, its keys the last one's (goal 9, plan 01a1a87b2cec step 5: a
                 // whole state made into a value tree was 0.45% of the process in rt7's calm profile, its patch's field
@@ -3745,6 +3758,11 @@ impl Registry {
         // timestamps after releasing the mirrors; refreshes can't create activity.
         if let Some(info) = observed {
             super::attention::observe(hub, &info);
+        }
+        // kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.4: a session that spent more may be past its agent definition's
+        // token or cost limit now, at a turn's end or, where its harness says it sooner, during the turn.
+        if spent {
+            self.limits.tell(id);
         }
         // The whole changeset a patch made, kept in the store as it is when that write goes.
         if let (Some(files), Some(store)) = (stored_changes, self.convo.as_ref()) {

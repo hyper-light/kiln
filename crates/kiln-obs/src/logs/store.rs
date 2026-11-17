@@ -489,11 +489,17 @@ pub enum Measure {
     Avg(String),
     Min(String),
     Max(String),
+    /// A percentile of them: Datadog's `median` (50), `pc75`, `pc90`, `pc95`, `pc98`, `pc99`.
+    Pct(String, u8),
 }
+
+/// The percentiles Datadog's log and trace analytics monitors take of a measure, by their names.
+const PCTS: [(&str, u8); 6] = [("median", 50), ("pc75", 75), ("pc90", 90), ("pc95", 95), ("pc98", 98), ("pc99", 99)];
 
 impl Measure {
     /// Datadog's rollup of records, as a log monitor's `.rollup()` names it: `count` (or none), or
-    /// `cardinality`, `sum`, `avg`, `min`, `max` of a facet (`@duration`), a span's with `spans`.
+    /// `cardinality`, `sum`, `avg`, `min`, `max`, `median`, `pc75`, `pc90`, `pc95`, `pc98`, `pc99`
+    /// of a facet (`@duration`), a span's with `spans`.
     pub fn parse(name: Option<&str>, facet: Option<&str>, spans: bool) -> Option<Self> {
         let facet = facet.map(|f| f.trim().trim_start_matches('@'));
         Some(match (name.map(str::trim), facet) {
@@ -503,8 +509,14 @@ impl Measure {
             (Some("avg"), Some(f)) => Self::Avg(f.to_owned()),
             (Some("min"), Some(f)) => Self::Min(f.to_owned()),
             (Some("max"), Some(f)) => Self::Max(f.to_owned()),
+            (Some(p), Some(f)) => Self::Pct(f.to_owned(), PCTS.iter().find(|(n, _)| *n == p)?.1),
             _ => return None,
         })
+    }
+
+    /// A percentile's name, as Datadog's rollups name it (`median`, `pc95`).
+    pub fn pct_name(p: u8) -> &'static str {
+        PCTS.iter().find(|(_, q)| *q == p).map_or("median", |(n, _)| *n)
     }
 
     /// Whether it counts (records, or values), so a bucket nothing fell in is 0 rather than none.
@@ -603,7 +615,10 @@ pub enum AggregateError {
     Step,
 }
 
-/// One cell's running value.
+/// One cell's running value. A percentile's values are kept as a distribution's are, counts of
+/// exponential buckets (`crate::dist`: DDSketch's, within 1.09% of any value, its least and most
+/// exact), so a cell holds a few hundred counts at the most whatever its records, merged in any
+/// order alike.
 #[derive(Debug)]
 struct Acc {
     n: u64,
@@ -611,11 +626,12 @@ struct Acc {
     min: f64,
     max: f64,
     distinct: Option<std::collections::HashSet<String>>,
+    sketch: Option<crate::dist::Merged>,
 }
 
 impl Acc {
     fn new() -> Self {
-        Self { n: 0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY, distinct: None }
+        Self { n: 0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY, distinct: None, sketch: None }
     }
 
     /// Another's, of the same group and bucket, taken in.
@@ -630,6 +646,12 @@ impl Acc {
                 None => self.distinct = Some(d),
             }
         }
+        if let Some(theirs) = o.sketch {
+            let mine = self.sketch.get_or_insert_with(|| crate::dist::Merged::new(theirs.scale));
+            for (b, n) in theirs.counts.into_values() {
+                mine.add(b, theirs.scale, n);
+            }
+        }
     }
 
     fn value(&self, measure: &Measure) -> f64 {
@@ -640,6 +662,7 @@ impl Acc {
             Measure::Avg(_) => self.sum / self.n.max(1) as f64,
             Measure::Min(_) => self.min,
             Measure::Max(_) => self.max,
+            Measure::Pct(_, p) => self.sketch.as_ref().and_then(|s| s.quantile(f64::from(*p) / 100.0, Some((self.min, self.max)))).unwrap_or(f64::NAN),
         }
     }
 }
@@ -702,7 +725,7 @@ impl Grouping {
     /// Counts a record that matched into its cell.
     fn take(&mut self, r: &RecordRef<'_>, by: &[Facet], measure: &Measure, bucket: u32, cells_max: usize) -> Result<(), AggregateError> {
         let value = match measure {
-            Measure::Sum(k) | Measure::Avg(k) | Measure::Min(k) | Measure::Max(k) => match r.attr(k).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()) {
+            Measure::Sum(k) | Measure::Avg(k) | Measure::Min(k) | Measure::Max(k) | Measure::Pct(k, _) => match r.attr(k).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()) {
                 Some(v) => Some(v),
                 None => return Ok(()),
             },
@@ -718,6 +741,11 @@ impl Grouping {
             acc.sum += v;
             acc.min = acc.min.min(v);
             acc.max = acc.max.max(v);
+            if let Measure::Pct(..) = measure
+                && let Some(b) = crate::dist::bucket_of(v, crate::dist::SCALE)
+            {
+                acc.sketch.get_or_insert_with(|| crate::dist::Merged::new(crate::dist::SCALE)).add(b, crate::dist::SCALE, 1.0);
+            }
         }
         if let Measure::Cardinality(f) = measure
             && let Some(v) = f.of(r)
@@ -749,7 +777,7 @@ impl Grouping {
 /// Whether a measure's value is the same whatever order its records come in (and so a scan of it
 /// may be split among threads): a sum's bits are not.
 fn order_free(measure: &Measure) -> bool {
-    matches!(measure, Measure::Count | Measure::Cardinality(_) | Measure::Min(_) | Measure::Max(_))
+    matches!(measure, Measure::Count | Measure::Cardinality(_) | Measure::Min(_) | Measure::Max(_) | Measure::Pct(..))
 }
 
 impl LogSnapshot {

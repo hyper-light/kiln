@@ -41,7 +41,7 @@ pub struct Builtin {
 }
 
 fn settings(harness: &str, instructions: String, skills: Vec<String>, agentfile: Option<String>) -> Settings {
-    Settings { harness: harness.to_owned(), model: None, instructions, tools: Vec::new(), mcp: Vec::new(), skills, limits: Limits::default(), agentfile, volumes: Vec::new() }
+    Settings { harness: harness.to_owned(), model: None, instructions, tools: Vec::new(), mcp: Vec::new(), skills, limits: Limits::default(), agentfile, volumes: Vec::new(), engine: None, cpus: None, memory: None }
 }
 
 fn one(name: &str, about: String, settings: Settings) -> Builtin {

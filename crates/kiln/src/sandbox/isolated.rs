@@ -155,7 +155,8 @@ pub const SWAPPED: &str = "swapped";
 /// `session` ([`bridge`], its asks `host`'s), where its microVMs carry the lane. A build of its image is
 /// given `secrets` (`Spec::build_secrets`, P4.7). With `swap_from`, the harness a session switches from in a microVM of
 /// its own (kiln plan 01a1dd2e…, P6c.5), its member is swapped for this one there (`Run::swap`): the same microVM, none
-/// started; refused, why, and that harness's run is let go of.
+/// started, its sign-in granted as a launch's is or the swap refused (`Microvms::swap`); refused, why, and that
+/// harness's run is let go of.
 #[allow(clippy::too_many_arguments, reason = "a launch's own, and the run a switch swaps it into")]
 pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret], swap_from: Option<crate::proc::Duplex>) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
@@ -250,11 +251,11 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     let size = super::pools::size_of(spec.isolation.as_ref());
     let asked = std::time::Instant::now();
     let (run, swapped) = match swap_from {
-        // A switch: its member swapped for this one in the microVM it runs in. Hex grants a sign-in as a box is made
-        // (its C8), so a swapped-in harness signs in itself; Hex's microVMs swap none yet ([`NO_SWITCH`]).
+        // A switch: its member swapped for this one in the microVM it runs in, granted its sign-in as a launch is, never
+        // left to sign in itself there (`Microvms::swap`).
         Some(from) => {
             let held = from.boundary().ok_or_else(|| anyhow::anyhow!("{} has no microVM to be swapped into", kind.name))?;
-            let swapped = held.swap(launch).await.map_err(|r| anyhow::anyhow!("{} couldn't be swapped into its microVM ({image}): {r}", kind.name));
+            let swapped = vms.swap(&held, launch, &sign_ins).await.map_err(|r| anyhow::anyhow!("{} couldn't be swapped into its microVM ({image}): {r}", kind.name));
             drop(from);
             (swapped?, true)
         }
@@ -554,11 +555,14 @@ async fn home_of(root: &Path, person: &str, kind: &Kind, source: Source<'_>, ima
 /// its CLI's own, taken outside its microVM, its access token filled in toward `egress`'s hosts of its provider's
 /// alone ([`signin::Provider::grant`]), with the placeholders an earlier capture gave its CLI, as its file in
 /// `layout`'s volumes on this machine holds them. None, said, where `vms` hold no credentials (they aren't Hex's, or no
-/// broker leases theirs: `hexvm::NO_BROKER`), no broker answers this runner's runs yet (`secrets::lessor::answered`: a
+/// broker leases theirs: `hexvm::NO_BROKER`), no broker answers this runner's runs (`secrets::lessor::answering`: a
 /// server from before), it acts for no person, or `egress` names no destination or doesn't reach its hosts: its
-/// harness then signs in itself, its tokens in its microVM, as before plan step 33.
+/// harness then signs in itself, its tokens in its microVM, as before plan step 33. Where one could be granted, a
+/// launch before this runner's server has said whether it answers (a session restored as the runner started) waits
+/// for its word, as Hex grants a sign-in only as a box is made (its C8): granted then, or not, as any launch's is.
 async fn sign_in_of(provider: signin::Provider, person: Option<&str>, layout: Option<&home::Layout>, egress: &Egress, vms: &Microvms) -> anyhow::Result<Vec<signin::SignIn>> {
-    let leased = crate::secrets::lessor::answered() && vms.hex.as_ref().is_some_and(|h| kiln_seams::Sandbox::holds(&**h).credentials);
+    let leases = vms.hex.as_ref().is_some_and(|h| kiln_seams::Sandbox::holds(&**h).credentials);
+    let leased = leases && person.is_some() && matches!(egress, Egress::Only(_)) && crate::secrets::lessor::answering().await;
     let (Some(person), Egress::Only(hosts), true) = (person, egress, leased) else {
         tracing::warn!(?provider, leased, person = person.is_some(), "its harness signs in itself, its tokens in its microVM: kiln takes a sign-in outside only for a person's run in microVMs that lease credentials");
         return Ok(Vec::new());
