@@ -61,6 +61,10 @@
 //!   bound from. The home's volumes are listed and cleared through Hex (`Runtime::volumes`, `Runtime::clear_volume`),
 //!   each on the blocking pool (each starts the node's `shards`, and a listing walks every volume's files); a refusal
 //!   of a volume's is typed by its cause (`Refusal::Volume`).
+//! - **Its link** (kiln plan step 35's `/runs/control`) is the agent-control link Hex's controller drives its run over
+//!   (`Runtime::link`, Shards' `Linked::report`): each end's TLS as each says it, and every lane Hex was granted on it,
+//!   `mcp:<member>` among them where its harness member's bridge is asked. Its stdio ride none of it: they are its run
+//!   host's member streams.
 
 use std::io::{BufRead as _, Write as _};
 use std::collections::HashMap;
@@ -631,6 +635,17 @@ fn disk_of(volumes: &[kiln_seams::sandbox::Volume]) -> Result<u64, Refusal> {
     volumes.iter().try_fold(0u64, |all, v| all.checked_add(v.bound.get())).ok_or_else(|| Refusal::Invalid { what: "its volumes", why: "their bounds together pass 2^64 bytes".into() })
 }
 
+/// Hex's word on a run's agent-control link (`Runtime::link`) as the seam's: each end's TLS by the names rustls gives
+/// its suite and its group, or by its IANA code where rustls names none (`kiln_ci::facts::Negotiated`), and its lanes
+/// by Shards' names, as Hex gives them.
+fn link_of(link: hex_api::ControlLink) -> Link {
+    let said = |end: hex_api::Negotiated| {
+        let named = |name: Option<&str>, code: u16| name.map_or_else(|| format!("{code:#06x}"), str::to_owned);
+        kiln_ci::facts::Negotiated { suite: named(end.suite_name, end.suite), group: named(end.group_name, end.group) }
+    };
+    Link { controller: said(link.controller), endpoint: said(link.endpoint), lanes: link.lanes }
+}
+
 /// What a run's threads say to its `next`: its output, then its member's end.
 enum Said {
     Out(Output),
@@ -841,9 +856,28 @@ impl Run for HexRun {
         Some(self.vm.name.clone())
     }
 
-    // Its stdio ride the member's streams from its run host, no link of Shards' agent control.
+    // The agent-control link Hex's controller drives its run over (Hex's `Runtime::link`, which waits for its endpoint's
+    // report; module docs). None where its run ended before that link was made, and none, warned, where Hex refuses it
+    // otherwise.
     fn link(&self) -> BoxFuture<'_, Option<Link>> {
-        Box::pin(async { None })
+        Box::pin(async move {
+            let (runtime, id) = (Arc::clone(&self.vm.runtime), self.vm.id.try_clone().ok()?);
+            match crate::rt::blocking(move || runtime.link(&id)).await {
+                Ok(Ok(link)) => Some(link_of(link)),
+                Ok(Err(why @ (hex_api::Refusal::NoSuchBox(_) | hex_api::Refusal::NotRunning(..)))) => {
+                    tracing::debug!(vm = %self.vm.name, why = %why, "its run ended before its agent-control link was made");
+                    None
+                }
+                Ok(Err(why)) => {
+                    tracing::warn!(vm = %self.vm.name, error = %why, "its microVM's agent-control link wasn't read");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(vm = %self.vm.name, error = %format!("{e:#}"), "its microVM's agent-control link wasn't read");
+                    None
+                }
+            }
+        })
     }
 
     // None live yet (`HOLDS.live`): Hex's wire calls for a running box's network and folders (kiln plan 01a1dd2e…,
@@ -899,7 +933,7 @@ pub(crate) mod tests {
     use kiln_ci::place::holder::BoxName;
     use kiln_seams::Records as _;
     use kiln_seams::records::{Consistency, SimRecords};
-    use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Output, Refusal, Run, Sandbox as _, Signal};
+    use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Link, Output, Refusal, Run, Sandbox as _, Signal};
 
     use super::{Charge, Charged, HexVms, USE, Used, host_cpu_ns};
 
@@ -1375,6 +1409,9 @@ pub(crate) mod tests {
         harnesses: parking_lot::Mutex<std::collections::VecDeque<String>>,
         /// The harness's end of each connection handed out: what it was sent.
         answered: parking_lot::Mutex<Vec<std::io::PipeReader>>,
+        /// What `link` answers for a box it holds, as Hex's image class reports a run's link; none, refused as a run
+        /// whose connection ended before its endpoint reported is.
+        links: parking_lot::Mutex<Option<hex_api::ControlLink>>,
     }
 
     /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
@@ -1467,6 +1504,11 @@ pub(crate) mod tests {
             let (bridge, sent) = Bridge::new(&says)?;
             self.answered.lock().push(sent);
             Ok(Box::new(bridge))
+        }
+        /// As Hex's image class answers it: `NoSuchBox` once its box is gone; else [`Metered::links`]'s.
+        fn link(&self, id: &BoxId) -> Result<hex_api::ControlLink, H> {
+            self.sim.inspect(id)?;
+            self.links.lock().clone().ok_or_else(|| H::NotRunning(id.clone(), "link: its run ended"))
         }
         fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, H> {
             self.deletes.fetch_add(1, Ordering::AcqRel);
@@ -1786,6 +1828,33 @@ pub(crate) mod tests {
             run.kill();
             let (_, ends) = drain(run.as_ref()).await;
             assert_eq!(ends, [Exit::Killed]);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln plan step 35's `/runs/control`: a run's link is Hex's agent-control link to its microVM (`Runtime::link`),
+    /// each end's TLS said by the names rustls gives it, or by its IANA code where rustls names none, and its lanes as
+    /// Hex gives them, `mcp:0` among them; the same each time it's asked. A link Hex refuses is none.
+    #[test]
+    fn s35_a_runs_link_is_hexs_agent_control_link_its_ends_by_rustls_names_or_iana_codes() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, _records, vms) = metered();
+            let end = |suite_name, group_name| hex_api::Negotiated { suite: 0x1302, suite_name, group: 0x11ec, group_name };
+            let lanes: Vec<String> = ["control", "exec", "log:run", "mcp:0"].map(String::from).into();
+            *rt.links.lock() = Some(hex_api::ControlLink { controller: end(Some("TLS13_AES_256_GCM_SHA384"), Some("X25519MLKEM768")), endpoint: end(None, None), lanes: lanes.clone() });
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            let said = |suite: &str, group: &str| kiln_ci::facts::Negotiated { suite: suite.into(), group: group.into() };
+            let want = Link { controller: said("TLS13_AES_256_GCM_SHA384", "X25519MLKEM768"), endpoint: said("0x1302", "0x11ec"), lanes };
+            assert_eq!(run.link().await, Some(want.clone()));
+            assert_eq!(run.link().await, Some(want), "the same each time it's asked");
+            *rt.links.lock() = None;
+            let unlinked = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            assert_eq!(unlinked.link().await, None, "a link Hex refuses is none");
+            for run in [run, unlinked] {
+                run.kill();
+                let (_, ends) = drain(run.as_ref()).await;
+                assert_eq!(ends, [Exit::Killed]);
+            }
             anyhow::Ok(())
         })
     }
