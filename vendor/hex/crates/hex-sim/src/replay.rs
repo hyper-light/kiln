@@ -544,7 +544,7 @@ leg,0,1,1,11,0,plain,0,0,-,-,shards
             }
         }
         // One class name more than there are classes (`Class::COUNT`), whatever their count.
-        let named = format!("node,1,1,0,0,{}\n", vec!["oci"; Class::COUNT + 1].join("+"));
+        let named = format!("node,1,1,0,0,{}\n", ["oci"; Class::COUNT + 1].join("+"));
         assert!(
             matches!(
                 parse(&named, &Limits::default()),

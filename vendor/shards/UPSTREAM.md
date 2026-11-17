@@ -4,7 +4,7 @@ The microVMs kiln's harnesses run in (`docs/shards.md`; kiln plan 01a1cd8e862e71
 the one Shards revision kiln and Hex build on.
 
 - **Upstream:** https://github.com/hyper-light/shards, commit `8d6029e4d69392d93640135c8fa781239e92a769`
-  (2026-11-17), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too (Hex `fbc70cb06`, which
+  (2026-11-17), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too (Hex `992c5a33a`, which
   makes no change to Shards): its guests' console is `shards_api::CONSOLE` (hvc0) since it deleted the 16550
   (`35e2de91e`), and `host_check` says whether a host runs its microVMs. Since `1389dc0b6` it has a member's run-time arguments (D256), and Hex's image
   class drives its agent-control link's client (`shards-remote`, whose QUIC is kiln's hyper-raft's). Beside
