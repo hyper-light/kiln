@@ -1894,6 +1894,11 @@ impl StartKind {
             StartKind::Warm => StartedFrom::Warm,
         }
     }
+
+    /// The kind `name` names, as its sample lines say it (`SHARDS_IMAGE_COST_KINDS`).
+    fn named(name: &str) -> Option<StartKind> {
+        StartKind::ALL.into_iter().find(|k| format!("{k:?}") == name)
+    }
 }
 
 /// The homes and specs [`image_start_costs`] starts each kind with: one home whose guest is
@@ -1967,7 +1972,10 @@ impl CostRig {
                 timed_start(&ImageShards::new(), &self.saved_home, &self.saved)
             }
             StartKind::Restored => timed_start(&ImageShards::new(), &self.home, &self.restored),
-            StartKind::Warm => timed_start(&self.pools, &self.home, &self.restored),
+            StartKind::Warm => {
+                self.warm_ready();
+                timed_start(&self.pools, &self.home, &self.restored)
+            }
         };
         assert_eq!(
             started.from,
@@ -1975,13 +1983,27 @@ impl CostRig {
             "a start asked as {kind:?} started {:?}{}; its run host said: {}",
             started.from,
             if kind == StartKind::Warm {
-                " (its pool had no warm host ready)"
+                " (its pool had said a host of it was warm)"
             } else {
                 ""
             },
             std::fs::read_to_string(&started.diagnostics).unwrap_or_default()
         );
         started
+    }
+
+    /// Waits until its pool says a host of it is warm, judged as this test's own processes
+    /// are: a warm start is asked only then, as a caller's next start comes once its pool has
+    /// refilled the host its last one took, so that none races that refill (P3.1's warm
+    /// starts, docs/research/measurements/p3-warm-start).
+    #[track_caller]
+    fn warm_ready(&self) {
+        let mut patience = Patience::started();
+        while !self.pools.held().iter().any(|p| p.warm > 0) {
+            assert!(patience.holds(), "its pool never said a host of it was warm");
+            std::thread::sleep(patience.next_look());
+        }
+        patience.done();
     }
 
     /// What comes before the measured starts: the image's files read once by a start of
@@ -2118,18 +2140,20 @@ shards api-run: not timed
 
 /// Where a shards-api image start's time goes, for each way it starts (D253): from the boot's
 /// call to its answer (Hex's `hex.image.boot`: `boot_stoppable` and the diagnostics' keep), to
-/// its harness's first output, and its stop, `SHARDS_IMAGE_COST_N` starts of each, the kinds
-/// taken round-robin, each round starting one kind later, so that the host's drift and a
-/// pool's refill after its warm start fall on every kind alike (PM M29). Each start's kind is
-/// held to the one asked. Then two passes of one start of each kind, every timed line on the
-/// caller's clock, from the boot's call, in order: `timed`, its run host's and shards-api's
-/// steps alone (`SHARDS_TIMING`): its run host's spawn, preparation and launches, its grants
-/// answered, the way from `READY` through `TAKEN` and `STARTED`, shards-api's own steps to its
-/// answer, and its first output; then `debug`, its VM's log at debug too (`SHARDS_LOG`), which
-/// slows it: its VM's spawn, exec and App Sandbox entry to its `main`, its own steps and its
-/// guest's markers. Its VM's lines share one pipe with its run host's, so where its reader
-/// lags a write waits on it, and the line after shows the wait: `timed`'s gaps are its run
-/// host's own.
+/// its harness's first output, and its stop, `SHARDS_IMAGE_COST_N` starts of each kind
+/// `SHARDS_IMAGE_COST_KINDS` names (comma-separated, as [`StartKind`] names them; all four
+/// where it is unset), the kinds taken round-robin, each round starting one kind later, so
+/// that the host's drift and a pool's refill after its warm start fall on every kind alike
+/// (PM M29), each warm start asked once its pool says a host of it is warm
+/// ([`CostRig::warm_ready`]). Each start's kind is held to the one asked. Then two passes of
+/// one start of each kind, every timed line on the caller's clock, from the boot's call, in
+/// order: `timed`, its run host's and shards-api's steps alone (`SHARDS_TIMING`): its run
+/// host's spawn, preparation and launches, its grants answered, the way from `READY` through
+/// `TAKEN` and `STARTED`, shards-api's own steps to its answer, and its first output; then
+/// `debug`, its VM's log at debug too (`SHARDS_LOG`), which slows it: its VM's spawn, exec and
+/// App Sandbox entry to its `main`, its own steps and its guest's markers. Its VM's lines share
+/// one pipe with its run host's, so where its reader lags a write waits on it, and the line
+/// after shows the wait: `timed`'s gaps are its run host's own.
 #[test]
 #[ignore = "a measurement: SHARDS_IMAGE_COST_N starts of each kind; ROOT runs it"]
 fn image_start_costs() {
@@ -2140,15 +2164,30 @@ fn image_start_costs() {
         .expect("SHARDS_IMAGE_COST_N names the starts of each kind")
         .parse()
         .expect("SHARDS_IMAGE_COST_N is a count");
-    let kinds: &[StartKind] = if shards_vmm::vm::restores_here() {
-        &StartKind::ALL
+    let asked: Vec<StartKind> = match std::env::var("SHARDS_IMAGE_COST_KINDS") {
+        Ok(names) => names
+            .split(',')
+            .map(|name| {
+                StartKind::named(name).unwrap_or_else(|| {
+                    panic!("SHARDS_IMAGE_COST_KINDS: {name} is none of {:?}", StartKind::ALL)
+                })
+            })
+            .collect(),
+        Err(_) => StartKind::ALL.to_vec(),
+    };
+    let kinds: Vec<StartKind> = if shards_vmm::vm::restores_here() {
+        asked
     } else {
         let _ = writeln!(
             std::io::stderr(),
             "SKIP: Saved, Restored and Warm: this host's hypervisor restores no snapshot (PM M345)"
         );
-        &StartKind::ALL[..1]
+        asked.into_iter().filter(|&k| k == StartKind::Booted).collect()
     };
+    if kinds.is_empty() {
+        return;
+    }
+    let kinds = kinds.as_slice();
     let host = format!(
         "backend {}, {}",
         shards_vmm::hv::BACKEND.unwrap_or("none"),
@@ -2887,38 +2926,19 @@ fn canary(label: &str) -> String {
         .collect()
 }
 
-/// Plan step 33's leak scan (docs/research/measurements/s33-leak-scan), on what it scans:
-/// what `ImageGuest::save` writes, which is its owner's alone (D259).
-/// Python 3 runs it: `python3`, on Windows `python`.
-fn leak_scan(secrets: &std::path::Path, paths: &[&std::path::Path]) -> (Option<i32>, String) {
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/research/measurements/s33-leak-scan/scan.py");
-    let python = if cfg!(windows) { "python" } else { "python3" };
-    let out = std::process::Command::new(python)
-        .arg("-I")
-        .arg(script)
-        .arg("--secrets")
-        .arg(secrets)
-        .args(paths)
-        .output()
-        .unwrap();
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.code(), said)
-}
-
 /// D259, and plan step 33's leak scan checked on a real microVM: a run's memory saved by its
 /// owner holds what the run's harness was given, and the scan finds it there, while a value
 /// never given is found nowhere. Do: give the harness (the test guest echoing its stdin, so that
 /// it runs on) a value in its environment and one in a staged file; ask a save outside the run's
 /// home, then one in it; echo a line after; scan the save, and the harness's environment as
-/// given, first for the values given, then for one never given. Expect: the first save refused
-/// `Destination` and nothing made; the second a snapshot directory, its generation's memory
-/// written; the harness still echoing; both values found in the save's memory, each by its name,
-/// and the environment's in its file (exit 3); the value never given found nowhere.
+/// given, first for the values given, then for one never given (`common::leak_scan_judged`).
+/// Expect: the first save refused `Destination` and nothing made; the second a snapshot
+/// directory, its generation's memory written; the harness still echoing; both values found in
+/// the save's memory, each by its name, and the environment's in its file (exit 3); the value
+/// never given found nowhere. Under L1 (KVM arm64), whose guest has no Python, the save and what
+/// the scan is given are left on the outer host's share (SHARDS_L1_OUT), and that host scans
+/// and judges them as here once the guest is gone (boot.rs'
+/// `snapshot_tests_pass_on_a_kvm_host_of_this_architecture`).
 #[test]
 fn a_saved_runs_memory_holds_what_its_harness_was_given_and_the_scan_finds_it() {
     if cannot_run_vms() {
@@ -2969,14 +2989,12 @@ fn a_saved_runs_memory_holds_what_its_harness_was_given_and_the_scan_finds_it() 
     assert!(std::fs::metadata(&memory).unwrap().len() > 0);
     echo(b"after\n");
     let keys = TempDir::new("api-save-keys");
-    let given = keys.join("given.json");
     std::fs::write(
-        &given,
+        keys.join("given.json"),
         format!(r#"{{"env_token":"{in_env}","file_token":"{in_file}"}}"#),
     )
     .unwrap();
-    let not_given = keys.join("never.json");
-    std::fs::write(&not_given, format!(r#"{{"never_token":"{never}"}}"#)).unwrap();
+    std::fs::write(keys.join("never.json"), format!(r#"{{"never_token":"{never}"}}"#)).unwrap();
     let env = keys.join("env");
     std::fs::create_dir(&env).unwrap();
     std::fs::write(
@@ -2984,25 +3002,10 @@ fn a_saved_runs_memory_holds_what_its_harness_was_given_and_the_scan_finds_it() 
         format!("SHARDS_LEAK_CANARY={in_env}\0"),
     )
     .unwrap();
-    let (code, said) = leak_scan(&given, &[&saved, &env]);
-    assert_eq!(code, Some(3), "{said}");
-    let memory = memory.display().to_string();
-    for name in ["given.json:env_token", "given.json:file_token"] {
-        assert!(
-            said.lines()
-                .any(|l| l.starts_with(&format!("FOUND {memory} offset ")) && l.ends_with(name)),
-            "{name} in the save's memory: {said}"
-        );
+    match std::env::var_os("SHARDS_L1_OUT") {
+        Some(out) => common::leave_leak_scan(std::path::Path::new(&out), &saved, &keys),
+        None => common::leak_scan_judged(&saved, &keys),
     }
-    assert!(
-        said.contains("harness-codex offset 19 length 64: a run of given.json:env_token"),
-        "{said}"
-    );
-    // Never given, never found: what else credential-shaped its memory holds is listed (exit 4)
-    // and is no secret's.
-    let (code, said) = leak_scan(&not_given, &[&saved, &env]);
-    assert!(matches!(code, Some(0 | 4)), "{said}");
-    assert!(said.contains(" 0 secret runs found"), "{said}");
     guest.stop().unwrap();
 }
 

@@ -4325,6 +4325,7 @@ dependencies = [
  "sha2 0.11.1",
  "shards-abi",
  "shards-afunix",
+ "shards-apple",
  "shards-dns",
  "shards-ipc",
  "shards-remote",
@@ -4332,6 +4333,13 @@ dependencies = [
  "unsize",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "shards-apple"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

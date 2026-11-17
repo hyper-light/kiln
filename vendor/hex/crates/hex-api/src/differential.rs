@@ -701,10 +701,12 @@ fn kind(r: &Refusal) -> &'static str {
             crate::Upstream::MemberDestinations => "Awaits(MemberDestinations)",
             crate::Upstream::NestedChannel => "Awaits(NestedChannel)",
             crate::Upstream::RatePeriod => "Awaits(RatePeriod)",
+            crate::Upstream::ExecSignalAfterOutput => "Awaits(ExecSignalAfterOutput)",
         },
         Refusal::Failed { .. } => "Failed",
         Refusal::Unconfigured { .. } => "Unconfigured",
         Refusal::Guest { .. } => "Guest",
+        Refusal::Volume { .. } => "Volume",
     }
 }
 

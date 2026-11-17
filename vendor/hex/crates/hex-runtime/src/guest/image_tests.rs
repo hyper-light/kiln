@@ -367,9 +367,29 @@ struct ModelRun {
     /// Whether its stops' threads end with no answer, as the test sets it: a stop asked unwinds before its run's end, as
     /// a stop whose thread failed would (D231's stop is never refused, so only its thread's end leaves it unanswered).
     abandon_stops: AtomicBool,
+    /// Each plug its run host took, in order (kiln plan 01a1dd2e…, P6.2: a run's volumes as it starts).
+    plugs: Mutex<Vec<shards_api::image::Plug>>,
+    /// What its run host refuses the next plug with, as the test sets it: none, each plug taken.
+    refuse_plug: Mutex<Option<ImageRefusal>>,
+    /// What its VM tells it used in all as its run ends on its own (D260's final use), as the test sets it: none, and
+    /// its end tells none ([`ended`]).
+    final_use: Mutex<Option<Microvm>>,
 }
 
 impl ModelRun {
+    /// `end` as the model's run host says it, with the final use the test gave it where its run ended on its own
+    /// (an exit), as a VM tells it once its machine is down; else as [`ended`] says it.
+    fn ended(&self, end: RunEnd) -> RunEnded {
+        match (&end, self.final_use.lock().unwrap().clone()) {
+            (RunEnd::Exited(_), Some(microvm)) => RunEnded {
+                end,
+                final_use: shards_api::image::FinalUse::Read(microvm),
+                paused: Duration::ZERO,
+            },
+            _ => ended(end),
+        }
+    }
+
     /// Holds each stop from now on (`true`), or lets every one held go (`false`).
     fn hold_stops(&self, held: bool) {
         *self.stop_held.lock().unwrap() = held;
@@ -484,13 +504,16 @@ impl ImageGuest for ModelGuest {
     fn started_from(&self) -> StartedFrom {
         self.started_from
     }
+    // The model runs each member's first generation alone (Shards' D270: 0), all the class asks: another's streams
+    // are none it holds, and its end never comes, as Shards answers a generation not started.
     fn take_output(
         &self,
         member: &MemberName,
+        generation: u32,
         channel: Channel,
     ) -> Result<std::io::PipeReader, ImageRefusal> {
         let mut outside = self.outside.lock().unwrap();
-        let ends = outside.get_mut(&member.name);
+        let ends = outside.get_mut(&member.name).filter(|_| generation == 0);
         let taken = match channel {
             Channel::Stdout => ends.and_then(|e| e.1.take()),
             Channel::Stderr => ends.and_then(|e| e.2.take()),
@@ -500,10 +523,15 @@ impl ImageGuest for ModelGuest {
             why: format!("{}'s output was taken, or it doesn't run", member.name),
         })
     }
-    fn take_input(&self, member: &MemberName) -> Result<std::io::PipeWriter, ImageRefusal> {
+    fn take_input(
+        &self,
+        member: &MemberName,
+        generation: u32,
+    ) -> Result<std::io::PipeWriter, ImageRefusal> {
         let mut outside = self.outside.lock().unwrap();
         outside
             .get_mut(&member.name)
+            .filter(|_| generation == 0)
             .and_then(|e| e.0.take())
             .ok_or_else(|| ImageRefusal::Spec {
                 what: "member",
@@ -513,6 +541,7 @@ impl ImageGuest for ModelGuest {
     fn wait_member(
         &self,
         member: &MemberName,
+        generation: u32,
         _: Duration,
     ) -> Result<Option<MemberEnd>, ImageRefusal> {
         Ok(self
@@ -521,7 +550,42 @@ impl ImageGuest for ModelGuest {
             .lock()
             .unwrap()
             .get(&member.name)
-            .copied())
+            .copied()
+            .filter(|_| generation == 0))
+    }
+    fn restart(&self, _: &MemberName, _: &[Vec<u8>], _: Duration) -> Result<u32, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's restarts",
+            why: "it restarts no member: the class asks none".to_owned(),
+        })
+    }
+    fn swap(
+        &self,
+        _: &str,
+        _: &str,
+        _: shards_api::image::SwapWhen,
+        _: Option<&[Vec<u8>]>,
+        _: Duration,
+    ) -> Result<shards_api::image::Swapped, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's swaps",
+            why: "it swaps no component: the class asks none".to_owned(),
+        })
+    }
+    fn restore(
+        &self,
+        _: &str,
+        _: shards_api::image::SwapWhen,
+        _: Option<&[Vec<u8>]>,
+        _: Duration,
+    ) -> Result<shards_api::image::Swapped, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's swaps",
+            why: "it swaps no component: the class asks none".to_owned(),
+        })
+    }
+    fn components(&self) -> Vec<shards_api::image::ComponentAt> {
+        Vec::new()
     }
     fn stats(&self, _: StatsScope, patience: Duration) -> Result<Stats, ImageRefusal> {
         self.run.stats_asked.lock().unwrap().push(patience);
@@ -557,7 +621,8 @@ impl ImageGuest for ModelGuest {
         })
     }
     // Ready on time where its run gave its command the nesting grant; refused as Shards refuses a run that asks none
-    // (D234), and the plugs of a model with none (D235).
+    // (D234). Its plugs taken and kept, or refused as the test asks (D271: a run's volumes as it starts); its unplugs
+    // refused, the class asking none.
     fn wait_ready(
         &self,
         _: Option<shards_api::image::Ready>,
@@ -571,16 +636,17 @@ impl ImageGuest for ModelGuest {
             why: "the run asked no nesting grant".to_owned(),
         })
     }
-    fn plug(&self, _: &shards_api::image::Plug, _: Duration) -> Result<(), ImageRefusal> {
-        Err(ImageRefusal::Unsupported {
-            what: "the model's plugs",
-            why: "it has none".to_owned(),
-        })
+    fn plug(&self, plug: &shards_api::image::Plug, _: Duration) -> Result<(), ImageRefusal> {
+        if let Some(why) = self.run.refuse_plug.lock().unwrap().take() {
+            return Err(why);
+        }
+        self.run.plugs.lock().unwrap().push(plug.clone());
+        Ok(())
     }
     fn unplug(&self, _: &str, _: Duration) -> Result<(), ImageRefusal> {
         Err(ImageRefusal::Unsupported {
-            what: "the model's plugs",
-            why: "it has none".to_owned(),
+            what: "the model's unplugs",
+            why: "the class asks none".to_owned(),
         })
     }
     fn egress(&self) -> shards_api::image::Narrowing {
@@ -599,6 +665,17 @@ impl ImageGuest for ModelGuest {
     fn revoke_egress(
         &self,
         _: &shards_api::image::EgressGrant,
+        _: Duration,
+    ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
+        Err(ImageRefusal::Unsupported {
+            what: "the model's grants past its microVM",
+            why: "it changes none as its run runs".to_owned(),
+        })
+    }
+    fn member_egress(
+        &self,
+        _: &MemberName,
+        _: Option<&shards_api::image::Reach>,
         _: Duration,
     ) -> Result<shards_api::image::Narrowing, ImageRefusal> {
         Err(ImageRefusal::Unsupported {
@@ -651,7 +728,7 @@ impl ImageGuest for ModelGuest {
     }
     fn wait_for(&self, _: Duration) -> Result<Option<RunEnded>, ImageRefusal> {
         let end = self.run.end.lock().unwrap().clone();
-        Ok(end.map(ended).or_else(|| {
+        Ok(end.map(|end| self.run.ended(end)).or_else(|| {
             self.run.gone.lock().unwrap().as_ref().map(|said| {
                 RunEnded::unused(
                     RunEnd::Failed(format!("the run host exited without its run's end: {said}")),
@@ -665,6 +742,7 @@ impl ImageGuest for ModelGuest {
     fn wait_channel(
         &self,
         member: &MemberName,
+        _: u32,
         _: Channel,
         _: Duration,
     ) -> Result<Option<ChannelEnd>, ImageRefusal> {
@@ -697,7 +775,7 @@ impl ImageGuest for ModelGuest {
 }
 
 /// `end` as the model's run host says it (image channel v28): its microVM's final use unread, killed where its run was
-/// stopped, else untold. No call of the class reads a final use.
+/// stopped, else untold. A run the test gave a final use tells it at its own end ([`ModelRun::ended`]).
 fn ended(end: RunEnd) -> RunEnded {
     let why = match end {
         RunEnd::Stopped => Unused::Killed,
@@ -760,6 +838,13 @@ struct ModelImages {
     /// members whose bridge takes no connection, each other's connection its harness echoing what it is sent
     /// ([`serve_mcp`]); none, and it serves none.
     bridged: Mutex<Option<Vec<u32>>>,
+    /// Where the model's run host serves programs run in its members (D243) on Shards' real agent-control endpoint: the
+    /// members that refuse them, and where each exec's member and spec is told ([`serve_execs`]); none, and it serves
+    /// none.
+    executed: Mutex<Option<(Vec<u32>, Execed)>>,
+    /// Where the model's run host names these members' MCP bridges (D254) in its real agent-control endpoint's report
+    /// and serves no lane past it ([`serve_reports`]); none, and its endpoint is another's.
+    reports: Mutex<Option<Vec<u32>>>,
 }
 
 impl ModelImages {
@@ -783,6 +868,8 @@ impl ModelImages {
             serve: Mutex::new(None),
             steered: Mutex::new(None),
             bridged: Mutex::new(None),
+            executed: Mutex::new(None),
+            reports: Mutex::new(None),
         })
     }
 
@@ -994,14 +1081,23 @@ impl Images for ModelImages {
                 self.serve.lock().unwrap().clone(),
                 self.steered.lock().unwrap().clone(),
                 self.bridged.lock().unwrap().clone(),
+                self.executed.lock().unwrap().clone(),
             ) {
                 (None, ..) => None,
-                (Some(ask), _, _, Some(refused)) => Some(serve_mcp(ask, refused)),
-                (Some(ask), _, Some((ended, taken)), None) => {
+                (Some(ask), _, _, _, Some((refused, execed))) => {
+                    Some(serve_execs(ask, refused, execed))
+                }
+                (Some(ask), _, _, Some(refused), None) => Some(serve_mcp(ask, refused)),
+                (Some(ask), _, Some((ended, taken)), None, None) => {
                     Some(serve_members(ask, ended, taken))
                 }
-                (Some(ask), Some(dir), None, None) => Some(serve_lanes(ask, dir)),
-                (Some(_), None, None, None) => Some(model_control()),
+                (Some(ask), Some(dir), None, None, None) => Some(serve_lanes(ask, dir)),
+                (Some(ask), None, None, None, None) => {
+                    Some(match self.reports.lock().unwrap().clone() {
+                        Some(bridges) => serve_reports(ask, &bridges),
+                        None => model_control(),
+                    })
+                }
             },
             nesting: spec.nesting,
             egress: spec.egress.clone(),
@@ -1128,8 +1224,9 @@ fn kept(owner: &Owner, id: &BoxId) -> Party {
     }
 }
 
-/// Joint plan step 12: do create, then start, an image VM of two vCPUs and 256 MiB with no command.
-/// Expect: create records it Creating and shows it Created, booting nothing; start writes Ready first
+/// AC-T7.4.1 (joint plan step 12): do create, then start, an image VM of two vCPUs and 256 MiB with no command.
+/// Expect: create records it Creating and shows it Created, of its own class, `shards-image` (its backend still
+/// Shards'; docs/design/shards-image-class.md §11, P2.2), booting nothing; start writes Ready first
 /// and boots once, asking Shards for exactly its pinned image, its admitted size, no command, none of its
 /// image's grants (default deny until goal 15 programs them; no destination kept, D236) and no nesting grant
 /// (D234: no harness is a nested runtime); then it shows Running.
@@ -1141,7 +1238,7 @@ fn a_created_vm_boots_at_start_its_admitted_size_and_no_grant() {
     let id = made.id.clone();
     assert_eq!(
         (made.class, made.state, made.exit),
-        (hex_api::Class::Shards, BoxState::Created, None)
+        (hex_api::Class::ShardsImage, BoxState::Created, None)
     );
     assert_eq!(record(&owner, &id).unwrap().phase, Phase::Creating);
     assert!(images.asked.lock().unwrap().is_empty());
@@ -1417,10 +1514,12 @@ fn w12_a_members_mcp_bridge_rides_its_boot_member() {
 }
 
 /// Joint plan step 12 for kiln's step 18 (D231's shares): an image VM's guest sees the host directories its caller
-/// names, and only those. Do boot a VM sharing a home volume read-write and a project read-only; one granted egress and
-/// sharing none; then one whose share Shards refuses. Expect the first boot to ask Shards for exactly those two shares,
-/// each its host directory, where the guest sees it and whether read-only, in order; the second for none, its grants
-/// widening no share; the third's start refused as Invalid, in Shards' own words.
+/// names, and only those. Do boot a VM sharing a home volume read-write and a project read-only, the project given to its
+/// harness as it starts (its member scope, Shards' D277; P1.4); one granted egress and sharing none; then one whose
+/// share Shards refuses. Expect the first boot to ask Shards for exactly those two shares, each its host directory,
+/// where the guest sees it and whether read-only, in order, its files run from (D279's `exec`), the home the run's own
+/// root's alone and the project its harness's too; the second for none, its grants widening no share; the third's
+/// start refused as Invalid, in Shards' own words.
 #[test]
 fn w12_an_image_vm_shares_exactly_the_host_directories_its_caller_names() {
     use hex_api::{Destination, Grant, Member, MemberKind, Mount, Ports, Proto};
@@ -1429,11 +1528,16 @@ fn w12_an_image_vm_shares_exactly_the_host_directories_its_caller_names() {
             source: std::path::PathBuf::from("/var/lib/kiln/homes/ada/.claude"),
             destination: "/home/agent/.claude".to_owned(),
             read_only: false,
+            members: Vec::new(),
         },
         Mount {
             source: std::path::PathBuf::from("/srv/projects/hex"),
             destination: "/work/hex".to_owned(),
             read_only: true,
+            members: vec![Member {
+                kind: MemberKind::Harness,
+                name: "codex".to_owned(),
+            }],
         },
     ];
     let boot_of = |shares: Vec<Mount>, grants: Vec<Grant>| {
@@ -1468,6 +1572,20 @@ fn w12_an_image_vm_shares_exactly_the_host_directories_its_caller_names() {
         .map(|m| (m.source.clone(), m.destination.clone(), m.read_only))
         .collect();
     assert_eq!(asked, named);
+    assert_eq!(
+        shared
+            .shares
+            .iter()
+            .map(|s| (s.exec, s.members.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (true, None),
+            (
+                true,
+                Some(PlugFor::Members(vec![MemberName::harness("codex")]))
+            ),
+        ]
+    );
     let granted = boot_of(
         Vec::new(),
         vec![Grant::Egress {
@@ -1607,6 +1725,287 @@ fn b9_a_box_admitted_with_less_disk_than_shards_keeps_holds_that_tail() {
     assert_eq!(images.run.diagnostics.lock().unwrap().len(), 1);
 }
 
+/// An image VM's spec given `volumes` (kiln plan 01a1dd2e…, P6.2), its box admitted with the sim's VM and `disk` bytes
+/// of disk, which its volumes' bounds are drawn from.
+fn volumed(name: &str, disk: u64, volumes: Vec<ImageVolume>) -> BoxSpec {
+    let mut cost = allocation().cost;
+    cost.ceiling.disk_bytes = disk;
+    let mut workload = allocation().resources;
+    workload.disk_bytes = disk;
+    BoxSpec {
+        class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+            volumes,
+            ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
+        })),
+        allocation: Some(cost.allocate(workload).unwrap()),
+        ..spec(name, None)
+    }
+}
+
+/// A GiB, a volume's bound in these tests.
+const GIB: u64 = 1 << 30;
+
+/// A harness's 1 GiB volume, read-write at `/volumes/cache` (kiln's own place for an agent's volumes).
+fn cache() -> ImageVolume {
+    ImageVolume {
+        name: "kiln-agent-cache".to_owned(),
+        bound: NonZeroU64::new(GIB).unwrap(),
+        at: "/volumes/cache".to_owned(),
+        members: vec![Member {
+            kind: MemberKind::Harness,
+            name: "claude".to_owned(),
+        }],
+        read_only: false,
+    }
+}
+
+/// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1; Shards' D271, D281): an image VM's volumes are plugged into its members as its
+/// run starts, beneath the plug root its run is granted, each held to its bound, and its diagnostics held within what
+/// its admitted disk leaves. Do start a VM admitted with 3 GiB of disk, given a 1 GiB volume read-write into its
+/// harness and a 1 GiB one read-only into its harness and an agent, both beneath `/volumes`. Expect its boot granted
+/// `/volumes` alone as a plug root, each volume plugged once and in its order, by its name and bound, into its members,
+/// at its place, read-only as asked and its files runnable, before its start answers; and its diagnostics held within
+/// the 1 GiB its volumes leave.
+#[test]
+fn p6_2_an_image_vms_volumes_are_plugged_beneath_their_root_as_it_starts() {
+    let images = ModelImages::new();
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let harness = cache().members;
+    let both = vec![
+        harness[0].clone(),
+        Member {
+            kind: MemberKind::Agent,
+            name: "helper".to_owned(),
+        },
+    ];
+    let notes = ImageVolume {
+        name: "kiln-agent-notes".to_owned(),
+        at: "/volumes/notes".to_owned(),
+        members: both.clone(),
+        read_only: true,
+        ..cache()
+    };
+    let id = runtime
+        .create(volumed("image-volumes", 3 * GIB, vec![cache(), notes]))
+        .unwrap()
+        .id;
+    runtime.start(&id).unwrap();
+    assert_eq!(
+        images.asked.lock().unwrap().last().unwrap().plug_roots,
+        ["/volumes"]
+    );
+    let bound = Some(NonZeroU64::new(GIB).unwrap());
+    let plug = |name: &str, members: &[Member], at: &str, read_only: bool| Plug {
+        source: PlugSource::Volume {
+            name: name.to_owned(),
+            bound,
+        },
+        to: PlugFor::Members(members.iter().map(member_name).collect()),
+        at: at.to_owned(),
+        read_only,
+        exec: true,
+    };
+    assert_eq!(
+        *images.run.plugs.lock().unwrap(),
+        [
+            plug("kiln-agent-cache", &harness, "/volumes/cache", false),
+            plug("kiln-agent-notes", &both, "/volumes/notes", true),
+        ]
+    );
+    assert_eq!(*images.run.diagnostics_bounds.lock().unwrap(), [GIB]);
+}
+
+/// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1; Shards' D281, R04): a volume its run host refuses as the run starts refuses
+/// the start, typed by what holds the volume, the run stopped and the box ended in Shards' words. Do start a VM given a
+/// volume its run host refuses `Bound` (the runs holding it serve it with another bound), then one given a volume
+/// refused `Clearing` (a clearing holds it). Expect each start refused `Volume` with that cause in Shards' words,
+/// nothing plugged, its run stopped once, and the box shown Empty, its exit unknown and its `ended` quoting them.
+#[test]
+fn p6_2_a_volume_its_run_host_refuses_refuses_the_start_typed() {
+    for (cause, typed) in [
+        (PlugRefusal::Bound, VolumeCause::Bound),
+        (PlugRefusal::Clearing, VolumeCause::Clearing),
+    ] {
+        let images = ModelImages::new();
+        let (runtime, _owner) = model_runtime(&images, waits());
+        let words = format!("volume kiln-agent-cache: {cause:?}, as the test asked");
+        *images.run.refuse_plug.lock().unwrap() = Some(ImageRefusal::Plug(cause, words.clone()));
+        let id = runtime
+            .create(volumed("image-volume-refused", GIB, vec![cache()]))
+            .unwrap()
+            .id;
+        assert_eq!(
+            runtime.start(&id),
+            Err(Refusal::Volume {
+                cause: typed,
+                why: words.clone()
+            })
+        );
+        assert!(images.run.plugs.lock().unwrap().is_empty());
+        assert_eq!(images.run.stops.load(Ordering::SeqCst), 1);
+        let info = runtime.inspect(&id).unwrap();
+        assert_eq!(
+            (info.state, info.exit),
+            (BoxState::Empty, Some(Exit::Unknown))
+        );
+        assert!(
+            info.ended
+                .as_deref()
+                .is_some_and(|ended| ended.contains(&words)),
+            "{info:?}"
+        );
+    }
+}
+
+/// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1): a VM's volumes are refused before anything is made where they could never be
+/// given: their bounds together past the disk its box was admitted with (no box writes past its admission), or one
+/// beneath a directory its guest keeps its own (Shards' `plug::root_name`). Do create a VM admitted with 1 GiB of disk
+/// given two 1 GiB volumes, and one given a volume beneath `/proc`. Expect each refused Invalid saying why, with no
+/// record made. Do create one admitted with 2 GiB given the same two. Expect it made.
+#[test]
+fn p6_2_volumes_past_the_admitted_disk_or_beneath_inits_own_are_refused_at_create() {
+    let images = ModelImages::new();
+    let (runtime, owner) = model_runtime(&images, waits());
+    let notes = ImageVolume {
+        name: "kiln-agent-notes".to_owned(),
+        at: "/volumes/notes".to_owned(),
+        ..cache()
+    };
+    match runtime.create(volumed(
+        "image-volumes-past",
+        GIB,
+        vec![cache(), notes.clone()],
+    )) {
+        Err(Refusal::Invalid { why, .. }) => assert!(why.contains("admitted"), "{why}"),
+        other => panic!("volumes past the admitted disk: {other:?}"),
+    }
+    let proc = ImageVolume {
+        at: "/proc/cache".to_owned(),
+        ..cache()
+    };
+    match runtime.create(volumed("image-volume-proc", GIB, vec![proc])) {
+        Err(Refusal::Invalid { why, .. }) => assert!(why.contains("\"/proc\""), "{why}"),
+        other => panic!("a volume beneath /proc: {other:?}"),
+    }
+    for refused in ["image-volumes-past", "image-volume-proc"] {
+        assert!(record(&owner, &BoxId::new(refused).unwrap()).is_none());
+    }
+    runtime
+        .create(volumed("image-volumes-fit", 2 * GIB, vec![cache(), notes]))
+        .unwrap();
+}
+
+/// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1, R04): each of Shards' plug refusals typed by what refused it, a run's volumes
+/// as it starts being the class's only plugs. Expect what holds the volume, `Bound` and `Clearing`, as `Volume` by its
+/// retry; the spec's (`Request`, `Member`, `Outside`, `Taken`, `Volume`) as Invalid; its host's and its microVM's
+/// (`Host`, `Device`) as Os; an unplug's (`Unknown`, `Busy`) as the class's own fault, Broken; each in Shards' words.
+#[test]
+fn p6_2_each_plug_refusal_is_typed_by_what_refused_it() {
+    let id = BoxId::new("image-plug-refused").unwrap();
+    let words = "Shards' words".to_owned();
+    let typed = |cause| {
+        refused(
+            &id,
+            "booting a Shards image VM",
+            ImageRefusal::Plug(cause, words.clone()),
+        )
+    };
+    assert_eq!(
+        typed(PlugRefusal::Bound),
+        Refusal::Volume {
+            cause: VolumeCause::Bound,
+            why: words.clone()
+        }
+    );
+    assert_eq!(
+        typed(PlugRefusal::Clearing),
+        Refusal::Volume {
+            cause: VolumeCause::Clearing,
+            why: words.clone()
+        }
+    );
+    for cause in [
+        PlugRefusal::Request,
+        PlugRefusal::Member,
+        PlugRefusal::Outside,
+        PlugRefusal::Taken,
+        PlugRefusal::Volume,
+    ] {
+        assert!(
+            matches!(typed(cause), Refusal::Invalid { what: "shards image's volume", ref why } if why.contains(&words)),
+            "{cause:?}"
+        );
+    }
+    for cause in [PlugRefusal::Host, PlugRefusal::Device] {
+        assert!(
+            matches!(typed(cause), Refusal::Os { op: "booting a Shards image VM", ref why } if why.contains(&words)),
+            "{cause:?}"
+        );
+    }
+    for cause in [PlugRefusal::Unknown, PlugRefusal::Busy] {
+        assert!(
+            matches!(typed(cause), Refusal::Broken(ref why) if why.contains(&words)),
+            "{cause:?}"
+        );
+    }
+}
+
+/// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1, R04): Shards' refusals of its home's volumes' listing or a clearing typed as
+/// the call it answers. Expect a volume a run holds `Volume { InUse }` and one the home has none of `Volume { Unknown
+/// }`, each in Shards' words; a name the store takes no volume by Invalid; and files not all removed, a `shards` that
+/// didn't start, one that ended unanswered and one of another version, Os.
+#[test]
+fn p6_2_a_clearings_refusals_are_typed_by_what_refused_it() {
+    let op = "clearing a Shards home's volume";
+    assert_eq!(
+        volume_refused(
+            op,
+            VolumeRefusal::Clear(ClearCause::InUse, "held".to_owned())
+        ),
+        Refusal::Volume {
+            cause: VolumeCause::InUse,
+            why: "held".to_owned()
+        }
+    );
+    assert_eq!(
+        volume_refused(
+            op,
+            VolumeRefusal::Clear(ClearCause::Unknown, "none".to_owned())
+        ),
+        Refusal::Volume {
+            cause: VolumeCause::Unknown,
+            why: "none".to_owned()
+        }
+    );
+    assert_eq!(
+        volume_refused(op, VolumeRefusal::Clear(ClearCause::Name, "bad".to_owned())),
+        Refusal::Invalid {
+            what: "volume",
+            why: "bad".to_owned()
+        }
+    );
+    for why in [
+        VolumeRefusal::Clear(ClearCause::Store, "left".to_owned()),
+        VolumeRefusal::Start("no shards there".to_owned()),
+        VolumeRefusal::Ended {
+            status: Some(1),
+            said: "said".to_owned(),
+        },
+        VolumeRefusal::Version(9),
+    ] {
+        assert!(
+            matches!(
+                volume_refused(op, why.clone()),
+                Refusal::Os {
+                    op: "clearing a Shards home's volume",
+                    ..
+                }
+            ),
+            "{why:?}"
+        );
+    }
+}
+
 /// Joint plan step 12 (D258's `keep_diagnostics`; ROOT, 2026-11-13): a box's run host's diagnostics are kept whole in one
 /// file under the node's state, named in its record as its start's intent is written, and a failed run's `ended` quotes
 /// their last bytes after its own words; the file goes with the box's delete. Do start an image VM, write its run host's
@@ -1725,10 +2124,11 @@ fn three_members() -> Vec<MemberInfo> {
 /// Goal 2's item 2 (D238, D252; ROOT, 2026-11-14: a signal reaches every process in the box, a VM's its members'):
 /// a signal but KILL to a running VM rides each live member's own lane on its run's agent-control endpoint, which the
 /// run asks of this class's key alone, its controller dialed as the signal goes; a member that has ended is skipped,
-/// and one that runs no program is none a signal reaches. A member's exec still awaits the endpoint's exec. Do: a run
-/// whose endpoint is Shards' own on loopback, its members a harness, an agent that has ended and files; exec in it,
-/// then send it TERM. Expect: Awaits(MemberExec); TERM taken, the harness's lane alone steered with 15, the box
-/// Running, no stop; the run's spec asking the endpoint of one key and no socket lane.
+/// and one that runs no program is none a signal reaches. A program runs in a member it names (`exec_member`), so an
+/// exec naming none is refused. Do: a run whose endpoint is Shards' own on loopback, its members a harness, an agent
+/// that has ended and files; exec in it naming no member, then send it TERM. Expect: Invalid naming exec; TERM taken,
+/// the harness's lane alone steered with 15, the box Running, no stop; the run's spec asking the endpoint of one key
+/// and no socket lane.
 #[test]
 fn item2_term_reaches_every_live_member_and_the_vm_runs_on() {
     let images = ModelImages::new();
@@ -1746,9 +2146,7 @@ fn item2_term_reaches_every_live_member_and_the_vm_runs_on() {
     );
     assert!(matches!(
         runtime.exec(&id, hex_api::Program::of(&["true"]), hex_api::Stdio::null()),
-        Err(Refusal::Awaits {
-            needs: Upstream::MemberExec
-        })
+        Err(Refusal::Invalid { what: "exec", .. })
     ));
     assert_eq!(runtime.signal(&id, Signal::TERM), Ok(()));
     assert_eq!(*taken.lock().unwrap(), vec![(0, 15)]);
@@ -2044,10 +2442,44 @@ fn a_member_that_ends_with_its_run_ends_as_the_run_did() {
     );
 }
 
+/// kiln P2.3 (AC-T7.4.1): a member its caller drives whose run failed (in its run host's or its VM's words, Shards'
+/// D249) ends in those words, never an unknown exit that drops them. Do: take a driven member of a running VM; have its
+/// run fail, the member ending with it. Expect its wait refused `Failed`, naming its box and the run's words.
+#[test]
+fn p23_a_member_whose_run_failed_ends_in_its_runs_words() {
+    let images = ModelImages::new();
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let codex = Member {
+        kind: MemberKind::Harness,
+        name: "codex".to_owned(),
+    };
+    let mut boxed = spec("image-member-failed", None);
+    if let ClassSpec::ShardsImage(image) = &mut boxed.class {
+        image.members.push(ImageMember::new(codex.clone()));
+    }
+    let id = runtime.create(boxed).unwrap().id;
+    runtime.start(&id).unwrap();
+    let mut proc = runtime.member(&id, &codex).unwrap();
+    images
+        .run
+        .member_ends
+        .lock()
+        .unwrap()
+        .insert("codex".to_owned(), MemberEnd::WithRun);
+    let words = "Setup (entering its working directory): errno 2";
+    *images.run.end.lock().unwrap() = Some(RunEnd::Failed(words.to_owned()));
+    let ended = proc.wait_for(Duration::ZERO);
+    assert!(
+        matches!(&ended, Err(Refusal::Failed { id: failed, why }) if *failed == id && why == words),
+        "{ended:?}"
+    );
+}
+
 /// Shards' #72 (image channel v27, `MemberEnd::Signaled`): a member's end is typed, a signal that killed it its own end
 /// beside its exit, never folded into the status `docker run` reports (128 plus its number), which an exit can be too.
-/// Do: take three members of a running VM; have one killed by TERM, one by KILL, and one exit 143. Expect
-/// `Exit::Signal(15)`, `Exit::Signal(9)` and `Exit::Code(143)`, each its own.
+/// Do: take four members of a running VM; have one killed by TERM, one by KILL, one exit 143, and one ended at once by
+/// a restart (Shards' D270, image channel v38: `MemberEnd::Killed`, every process of it killed). Expect
+/// `Exit::Signal(15)`, `Exit::Signal(9)`, `Exit::Code(143)` and `Exit::Signal(9)`, each its own.
 #[test]
 fn r12_a_members_end_tells_a_signal_from_its_exit() {
     let images = ModelImages::new();
@@ -2060,6 +2492,7 @@ fn r12_a_members_end_tells_a_signal_from_its_exit() {
         ("termed", MemberEnd::Signaled(15), Exit::Signal(15)),
         ("killed", MemberEnd::Signaled(9), Exit::Signal(9)),
         ("exited", MemberEnd::Exited(143), Exit::Code(143)),
+        ("restarted", MemberEnd::Killed, Exit::Signal(9)),
     ];
     let mut boxed = spec("image-member-ends", None);
     if let ClassSpec::ShardsImage(image) = &mut boxed.class {
@@ -2079,6 +2512,57 @@ fn r12_a_members_end_tells_a_signal_from_its_exit() {
             .insert(name.to_owned(), end);
         assert_eq!(proc.wait_for(Duration::ZERO).unwrap(), Some(exit), "{name}");
     }
+}
+
+/// Shards' image channel 51 (AC-T7.4.1; CLAUDE.md §3): each refusal Shards added past 9975d1f55 is typed by what it
+/// refused. Do: map a run host's budget with no room for the run's lanes (D252), a member's working directory its guest
+/// couldn't enter (D277), a member's restart and a component's swap (D270, which this class asks of no run), and a
+/// shared network's grant refused (D285). Expect the budget's as the host's (`Os`), the working directory's and the
+/// network's as the spec's (`Invalid`), each in Shards' words, and the restart's and the swap's as the class's own
+/// fault (`Broken`).
+#[test]
+fn v51_shards_new_refusals_are_typed_by_what_they_refused() {
+    let id = BoxId::new("v51-refused").unwrap();
+    let full = refused(
+        &id,
+        "booting a Shards image VM",
+        ImageRefusal::Capacity("no room for its link".to_owned()),
+    );
+    assert!(
+        matches!(&full, Refusal::Os { why, .. } if why.contains("no room for its link")),
+        "{full:?}"
+    );
+    let unentered = refused(
+        &id,
+        "waiting for a member's end",
+        ImageRefusal::Workdir("Harness codex: /w: errno 2".to_owned()),
+    );
+    assert!(
+        matches!(&unentered, Refusal::Invalid { what: "shards image", why } if why.contains("errno 2")),
+        "{unentered:?}"
+    );
+    for asked_of_none in [
+        ImageRefusal::Restart(
+            shards_api::image::RestartRefusal::Capacity,
+            "no room".to_owned(),
+        ),
+        ImageRefusal::Swap(
+            shards_api::image::SwapRefusal::Workdir,
+            "errno 2".to_owned(),
+        ),
+    ] {
+        let mapped = refused(&id, "a call", asked_of_none);
+        assert!(matches!(&mapped, Refusal::Broken(_)), "{mapped:?}");
+    }
+    let taken = refused(
+        &id,
+        "a call",
+        ImageRefusal::Net(shards_api::image::NetRefusal::NameTaken, "codex".to_owned()),
+    );
+    assert!(
+        matches!(&taken, Refusal::Invalid { what: "shards image's network", why } if why.contains("NameTaken")),
+        "{taken:?}"
+    );
 }
 
 /// Goal 2's r13 (decision 9; Shards' pending lane handles, 155b5ee2e; AC-T7.4.1): a member lane's ask goes once, and
@@ -3287,7 +3771,12 @@ fn image_vms_are_served_only_with_shards_kernel_and_init_both_or_neither() {
         })),
         super::super::tests::config(),
     )
-    .with_images(host_images(), waits(), owner.diagnostics());
+    // A host Shards' check says runs microVMs: this test's fact is the guest pair alone.
+    .with_images(
+        checked_images(|| Ok(shards_api::HostCheck::Usable(shards_api::Backend::Kvm))),
+        waits(),
+        owner.diagnostics(),
+    );
     let books: Arc<dyn Books> = owner.clone();
     runtime.bind_books(Arc::downgrade(&books)).unwrap();
     let made = runtime
@@ -3344,6 +3833,311 @@ fn the_guest_pair_is_read_as_the_run_host_reads_it() {
             why.contains("SHARDS_KERNEL") && why.contains("SHARDS_INIT"),
             "{k:?} {i:?}: {why}"
         );
+    }
+}
+
+/// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2): Shards' check of the host (`shards_api::host_check`, D262) decides whether a
+/// node boots image VMs, each of its answers mapped. Do: map a usable host, hosts Shards says run no microVM, and each way
+/// the check fails to be made or read. Expect: the usable host served; each unusable one refused Platform in Shards' own
+/// words; a check that didn't start, that the OS failed or that ended without its answer refused Os, its words kept; an
+/// answer of another Shards' refused Platform, naming it.
+#[test]
+fn p2_2_each_host_check_answer_maps_to_the_class_or_its_refusal() {
+    use shards_api::{Backend, CheckRefusal, HostCheck, Unusable};
+    assert_eq!(
+        runs_microvms(Ok(HostCheck::Usable(Backend::HypervisorFramework))),
+        Ok(())
+    );
+    for why in [
+        Unusable::KvmMissing,
+        Unusable::KvmDenied,
+        Unusable::HvSupportOff,
+        Unusable::WhpOff,
+        Unusable::NoNested,
+        Unusable::Unsupported {
+            os: "macos".into(),
+            arch: "x86_64".into(),
+        },
+    ] {
+        assert_eq!(
+            runs_microvms(Ok(HostCheck::Unusable {
+                backend: Some(Backend::Kvm),
+                why: why.clone(),
+            })),
+            Err(Refusal::Platform {
+                what: "Shards image VMs",
+                platform: std::env::consts::OS,
+                why: why.to_string(),
+            })
+        );
+    }
+    assert!(matches!(
+        runs_microvms(Err(CheckRefusal::Start("no such file".into()))),
+        Err(Refusal::Os { op: "starting shards api-check", why }) if why == "no such file"
+    ));
+    assert!(matches!(
+        runs_microvms(Err(CheckRefusal::Os {
+            what: "making the check's pipe",
+            kind: std::io::ErrorKind::OutOfMemory,
+        })),
+        Err(Refusal::Os {
+            op: "making the check's pipe",
+            ..
+        })
+    ));
+    assert!(matches!(
+        runs_microvms(Err(CheckRefusal::Ended {
+            status: Some(3),
+            said: "shards: no such command: api-check".into(),
+        })),
+        Err(Refusal::Os { why, .. }) if why.contains("no such command: api-check")
+    ));
+    assert!(matches!(
+        runs_microvms(Err(CheckRefusal::Version(2))),
+        Err(Refusal::Platform { what: "Shards image VMs", why, .. }) if why.contains("version 2")
+    ));
+}
+
+/// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2): a node's guest runtime lists the Shards image class where it boots image VMs,
+/// the class's capacity its host's plane; one whose host Shards' check says runs no microVM lists none, and refuses an
+/// image VM's create and the class's capacity alike, in Shards' words. Do: a guest runtime over the model's image boot,
+/// and one given the refusal `host_images` makes of a host whose user may not open `/dev/kvm`. Expect: the first's
+/// classes hold shards-image, its capacity of the class the owner's plane; the second's hold none of it, its create and
+/// its capacity of the class each refused Platform naming `/dev/kvm`, and no boot asked of either.
+#[test]
+fn p2_2_a_guest_runtime_lists_the_image_class_only_where_it_boots_image_vms() {
+    let images = ModelImages::new();
+    let (serving, _owner) = model_runtime(&images, waits());
+    assert!(
+        serving.classes().contains(&hex_api::Class::ShardsImage),
+        "{:?}",
+        serving.classes()
+    );
+    // Its host's pool, with the class's one route at its per-box cost on that pool (§11).
+    assert_eq!(
+        serving.capacity(hex_api::Class::ShardsImage),
+        Ok(Some(Capacity {
+            routes: vec![hex_api::RouteOffer {
+                key: route_key().unwrap(),
+                cost: Some(cost(host_pool().total).unwrap()),
+                backing: None,
+            }],
+            ..host_pool()
+        }))
+    );
+    let refused = runs_microvms(Ok(shards_api::HostCheck::Unusable {
+        backend: Some(shards_api::Backend::Kvm),
+        why: shards_api::Unusable::KvmDenied,
+    }))
+    .unwrap_err();
+    assert!(
+        matches!(&refused, Refusal::Platform { what: "Shards image VMs", why, .. } if why.contains("/dev/kvm")),
+        "{refused:?}"
+    );
+    let owner = Arc::new(Owner::new());
+    let unserved = GuestRuntime::new(
+        Arc::new(shards_api::sim::SimGuests::new(|_| {
+            shards_api::End::PowerOff
+        })),
+        super::super::tests::config(),
+    )
+    .with_images(Err(refused.clone()), waits(), owner.diagnostics());
+    let books: Arc<dyn Books> = owner.clone();
+    unserved.bind_books(Arc::downgrade(&books)).unwrap();
+    assert!(!unserved.classes().contains(&hex_api::Class::ShardsImage));
+    assert_eq!(
+        unserved.create(spec("unserved", None)),
+        Err(refused.clone())
+    );
+    assert_eq!(unserved.capacity(hex_api::Class::ShardsImage), Err(refused));
+    assert!(record(&owner, &BoxId::new("unserved").unwrap()).is_none());
+    assert!(images.asked.lock().unwrap().is_empty());
+}
+
+/// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2; docs/design/shards-image-class.md §11): the class's per-box cost is Shards'
+/// envelope on its node's plane. Do derive it for a plane twice and for another plane; allocate under it VMs asked at
+/// nothing, at a unit of each, and past Shards' least by less than a unit; and derive it for planes short of Shards'
+/// least VM. Expect its floor Shards' least VM, its ceiling the plane, no allowance of its own, one identity for one
+/// plane and another for another; each allocation one Shards boots as asked, covering what was asked; a VM past the
+/// plane refused; and the short planes refused.
+#[test]
+fn p2_2_the_image_class_cost_is_shards_envelope_on_its_nodes_plane() {
+    let total = host_pool().total;
+    let profile = cost(total).unwrap();
+    let (vcpus, least) = shards_api::envelope(std::env::consts::ARCH, 0, 0).unwrap();
+    assert_eq!(
+        profile.floor,
+        CapacityResources {
+            cpu_milli: u64::from(vcpus) * 1_000,
+            mem_bytes: least << 20,
+            disk_bytes: 0,
+        }
+    );
+    assert_eq!(profile.ceiling, total);
+    assert_eq!(profile.guest_overhead, CapacityResources::default());
+    assert_eq!(profile.overhead, CapacityResources::default());
+    assert_eq!(cost(total), Ok(profile));
+    let larger = CapacityResources {
+        mem_bytes: total.mem_bytes * 2,
+        ..total
+    };
+    assert_ne!(cost(larger).unwrap().id, profile.id);
+    for asked in [
+        CapacityResources::default(),
+        CapacityResources {
+            cpu_milli: 1,
+            mem_bytes: 1,
+            disk_bytes: 1,
+        },
+        CapacityResources {
+            cpu_milli: 1_500,
+            mem_bytes: (least << 20) + 1,
+            disk_bytes: 4_097,
+        },
+        CapacityResources {
+            cpu_milli: 3_000,
+            mem_bytes: 300 << 20,
+            disk_bytes: 0,
+        },
+    ] {
+        let allocation = profile.allocate(asked).unwrap();
+        assert!(admitted_size(&allocation).is_ok(), "{asked:?}");
+        assert_eq!(allocation.covers(asked), Ok(()), "{asked:?}");
+    }
+    assert!(
+        profile
+            .allocate(CapacityResources {
+                cpu_milli: total.cpu_milli + 1,
+                ..CapacityResources::default()
+            })
+            .is_err()
+    );
+    for short in [
+        CapacityResources {
+            cpu_milli: 500,
+            ..total
+        },
+        CapacityResources {
+            mem_bytes: 1 << 20,
+            ..total
+        },
+    ] {
+        assert!(cost(short).is_err(), "{short:?}");
+    }
+}
+
+/// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2; docs/design/shards-image-class.md §11): a node's preflight holds an image
+/// VM's record to the image class's own checks, never a dedicated guest's. Do preflight the record of a VM its scheduler
+/// routed and sized under the class's cost; of one made with no route, sized by its caller; of one whose route names a
+/// backing; and of one sized at memory Shards boots otherwise. Expect the first two to pass; the third refused
+/// Uncertain, naming its route; the fourth refused Invalid, naming its allocation.
+#[test]
+fn p2_2_a_node_preflights_an_image_record_as_its_class_admitted_it() {
+    let images = ModelImages::new();
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let ready = |spec: BoxSpec| BoxRecord::new(spec, Phase::Ready, Vec::new());
+    let mut admitted = spec("image-admitted", None);
+    admitted.bounds = Bounds {
+        cpu_max_milli: Some(2_000),
+        memory_max: Some(256 << 20),
+        ..Bounds::default()
+    };
+    admitted.allocation = Some(
+        cost(host_pool().total)
+            .unwrap()
+            .allocate(CapacityResources {
+                cpu_milli: 2_000,
+                mem_bytes: 256 << 20,
+                disk_bytes: 0,
+            })
+            .unwrap(),
+    );
+    admitted.route = Some(hex_api::RouteReceipt {
+        key: route_key().unwrap(),
+        backing: None,
+    });
+    assert_eq!(runtime.preflight_box(&ready(admitted.clone())), Ok(()));
+    assert_eq!(
+        runtime.preflight_box(&ready(spec("image-own-size", None))),
+        Ok(())
+    );
+    let mut backed = admitted;
+    backed.route = Some(hex_api::RouteReceipt {
+        key: route_key().unwrap(),
+        backing: Some(hex_api::BackingKey {
+            pool: [1; 32],
+            generation: [2; 16],
+        }),
+    });
+    let refused = runtime.preflight_box(&ready(backed)).unwrap_err();
+    assert!(
+        matches!(&refused, Refusal::Lifecycle { cause: LifecycleCause::Uncertain, why: Some(why), .. } if why.contains("route")),
+        "{refused:?}"
+    );
+    let mut odd = spec("image-odd", None);
+    odd.allocation = Some(
+        hex_api::RuntimeCost {
+            id: [5; 32],
+            floor: CapacityResources::default(),
+            ceiling: CapacityResources {
+                cpu_milli: 1_000,
+                mem_bytes: 1 << 30,
+                disk_bytes: 0,
+            },
+            quantum: CapacityResources {
+                cpu_milli: 1_000,
+                mem_bytes: 1 << 20,
+                disk_bytes: 1,
+            },
+            guest_overhead: CapacityResources::default(),
+            overhead: CapacityResources::default(),
+        }
+        .allocate(CapacityResources {
+            cpu_milli: 1_000,
+            mem_bytes: 129 << 20,
+            disk_bytes: 0,
+        })
+        .unwrap(),
+    );
+    let refused = runtime.preflight_box(&ready(odd)).unwrap_err();
+    assert!(
+        matches!(&refused, Refusal::Invalid { what: "shards image", why } if why.contains("allocation")),
+        "{refused:?}"
+    );
+}
+
+/// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2): a node counts its image class's route among the routes it offers where it
+/// boots image VMs, so its offers stay within their eligibility word. Do project the routes of a node's guest runtime
+/// that boots image VMs and of one that boots none. Expect the first's projection to hold the image route beside the
+/// dedicated guest's, two, and the second's the dedicated guest's alone, one.
+#[test]
+fn p2_2_a_node_counts_its_image_route_where_it_boots_image_vms() {
+    let images = ModelImages::new();
+    let config = super::super::tests::config();
+    let owner = Arc::new(Owner::new());
+    let unusable = runs_microvms(Ok(shards_api::HostCheck::Unusable {
+        backend: Some(shards_api::Backend::Kvm),
+        why: shards_api::Unusable::KvmDenied,
+    }))
+    .unwrap_err();
+    for (boot, count) in [
+        (Ok(Arc::clone(&images) as Arc<dyn Images>), 2),
+        (Err(unusable), 1),
+    ] {
+        let runtime = GuestRuntime::new(
+            Arc::new(shards_api::sim::SimGuests::new(|_| {
+                shards_api::End::PowerOff
+            })),
+            config.clone(),
+        )
+        .with_images(boot, waits(), owner.diagnostics())
+        .with_runtime_cost(fixed_cost(&config))
+        .unwrap();
+        let books: Arc<dyn Books> = owner.clone();
+        runtime.bind_books(Arc::downgrade(&books)).unwrap();
+        let mut projection = crate::devices::RouteProjection::new();
+        runtime.project_routes(&[], None, &mut projection).unwrap();
+        assert_eq!(projection.count().unwrap(), count);
     }
 }
 
@@ -4262,6 +5056,8 @@ fn node_vm() -> NodeVm {
             host: std::path::PathBuf::from("/srv/node-state"),
             at: "/run/hex/shares/0".to_owned(),
             read_only: false,
+            exec: true,
+            members: None,
         }],
         controller: [9; 32],
         lanes: 6,
@@ -4311,8 +5107,10 @@ fn w39_a_node_vm_boots_under_shards_init_through_the_image_class_and_is_never_a_
                 lanes: vm.lanes,
                 window: u32::try_from(hex_core::stream::MAX_FRAME).unwrap(),
             }),
+            stdio: false,
         })
     );
+    assert!(spec.egress_ceiling.is_empty());
     assert_eq!(
         (booted.run, booted.control, booted.ready),
         (vm.run, model_control(), shards_api::image::Ready::OnTime)
@@ -4519,6 +5317,7 @@ fn serve_members(
             inputs: &[],
             execs: Some(shards_api::control::exec_admissions()),
             sockets: None,
+            bridges: &[],
         },
     )
     .unwrap();
@@ -4572,6 +5371,7 @@ fn serve_mcp(
             inputs: &[],
             execs: Some(shards_api::control::exec_admissions()),
             sockets: None,
+            bridges: &[],
         },
     )
     .unwrap();
@@ -4642,6 +5442,148 @@ fn echo_harness(start: shards_api::control::exec::Start) {
     drop((stdout, input));
 }
 
+/// Each program the model's member host was asked to run (D243), with its member's index and its spec, in order.
+type Execed = Arc<Mutex<Vec<(u32, shards_abi::run::Spec)>>>;
+
+/// A run's real agent-control endpoint (D238, D252) on loopback, Shards' own, its microVM's key the model's, taking
+/// `ask`'s controller alone and admitting its execs; its host serves each exec as a run host serves a program run in a
+/// member (D243), each ask told to `execed` with its member's index: one in a member in `refused`, as one that has
+/// ended, `Unstarted(Refused)`; any other started ([`model_program`]). A model run's endpoint and host live while the
+/// test does.
+fn serve_execs(
+    ask: &shards_api::image::ControlAsk,
+    refused: Vec<u32>,
+    execed: Execed,
+) -> shards_api::image::ControlAt {
+    use shards_api::control::exec;
+    let vm = shards_api::control::Identity::generate().unwrap();
+    let (endpoint, served) = shards_remote::control::Endpoint::bind(
+        &vm,
+        ask.controller,
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        shards_remote::control::Streams {
+            outputs: &[],
+            inputs: &[],
+            execs: Some(shards_api::control::exec_admissions()),
+            sockets: None,
+            bridges: &[],
+        },
+    )
+    .unwrap();
+    let (address, waker, wake) = (endpoint.address, endpoint.waker, endpoint.wake);
+    std::thread::spawn(move || endpoint.run());
+    let starts = served.execs.unwrap();
+    let revoke = served.revoke;
+    std::thread::spawn(move || {
+        // Held for the endpoint's life: let go, it would end every lane.
+        let _revoke = revoke;
+        for start in starts {
+            let exec::Kind::Exec(spec) = &start.ask.kind else {
+                panic!("an ask of no program: {:?}", start.ask.kind);
+            };
+            execed
+                .lock()
+                .unwrap()
+                .push((start.ask.member, spec.as_ref().clone()));
+            if refused.contains(&start.ask.member) {
+                start
+                    .replies
+                    .tell(exec::Reply::Unstarted(exec::Unstarted::Refused));
+                continue;
+            }
+            std::thread::spawn(move || model_program(start));
+        }
+    });
+    shards_api::image::ControlAt {
+        address,
+        vm: vm.fingerprint(),
+        waker,
+        wake,
+    }
+}
+
+/// `bytes` as one record of the output `to` produces, once it has room.
+fn produce(to: &shards_remote::managed::Producer, bytes: &[u8]) {
+    to.wait_capacity().unwrap();
+    let mut record = to.take_buffer().unwrap().unwrap();
+    record.extend_from_slice(bytes);
+    to.submit(record).unwrap();
+}
+
+/// A program run in a member as the model's host runs one (D243): it says it started, writes its arguments, joined by
+/// spaces, as a line to its stdout and `said` to its stderr; then `cat` echoes what it is sent to its stdout until that
+/// ends, `sleep` runs until a signal ends it, and `exit N` exits N, any other 0. It finishes both outputs before it says
+/// how it ended, as Shards' exec host does, keeping its streams' controls until its steering closes.
+fn model_program(start: shards_api::control::exec::Start) {
+    use shards_api::control::exec::{Kind, Reply, Steer};
+    use shards_remote::managed::input::Next;
+    let shards_api::control::exec::Start {
+        ask,
+        stdout,
+        stderr,
+        stdin,
+        steer,
+        replies,
+        ..
+    } = start;
+    let Kind::Exec(spec) = ask.kind else {
+        panic!("an ask of no program");
+    };
+    let argv: Vec<String> = spec
+        .argv
+        .iter()
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    replies.tell(Reply::Started);
+    produce(&stdout.0, format!("{}\n", argv.join(" ")).as_bytes());
+    if let Some((producer, _)) = &stderr {
+        produce(producer, b"said\n");
+    }
+    let mut end = Reply::Exited(0);
+    match argv.first().map(String::as_str) {
+        Some("cat") => {
+            let (relay, input) = stdin.as_ref().unwrap();
+            let mut written = 0u64;
+            loop {
+                match relay.next() {
+                    Next::Record { bytes, .. } => {
+                        written += bytes.len() as u64;
+                        produce(&stdout.0, &bytes);
+                        relay.delivered(bytes);
+                    }
+                    Next::End => {
+                        input.ended(written, shards_abi::run::managed::InputEnd::Closed);
+                        break;
+                    }
+                    Next::Abort(errno) => {
+                        input.ended(written, shards_abi::run::managed::InputEnd::Aborted(errno));
+                        break;
+                    }
+                    Next::Gone => break,
+                }
+            }
+        }
+        Some("sleep") => {
+            while let Ok(steered) = steer.recv() {
+                replies.took();
+                if let Steer::Signal(signal) = steered {
+                    end = Reply::Signaled(signal);
+                    break;
+                }
+            }
+        }
+        Some("exit") => end = Reply::Exited(argv[1].parse().unwrap()),
+        _ => {}
+    }
+    stdout.1.finish().unwrap();
+    if let Some((_, control)) = &stderr {
+        control.finish().unwrap();
+    }
+    replies.tell(end);
+    while steer.recv().is_ok() {}
+    drop((stdout, stderr, stdin));
+}
+
 /// A run's real agent-control endpoint (D252) on loopback, its microVM's key the model's own, taking `ask`'s controller
 /// alone and admitting the lanes it grants; its host connects each lane to the socket it names in `dir`, as
 /// shards-init's relay host does (D251), and answers with its run host's end of it ([`lane_to`]). A model run's
@@ -4664,6 +5606,7 @@ fn serve_lanes(
                 lanes: grant.lanes,
                 window: grant.window,
             }),
+            bridges: &[],
         },
     )
     .unwrap();
@@ -5558,10 +6501,10 @@ fn b3_started_over_a_run_that_failed_as_it_booted_answers_its_failure() {
 
 /// The review's B-5 (docs/design/shards-image-class.md §3; goal 54's change 3): a delete answering its VM's final use
 /// answers none only where its run never started, so kiln charges nothing. A VM whose command ran and ended before its
-/// delete has no use left to read (Shards' stats answer only a running run), so its delete is refused, typed, the box
-/// kept as it was, never answered none. Do: start a VM, read its use as it runs, have its command exit; ask its delete
-/// with its host use; then delete it. Expect: `NotRunning`, naming its final use, its record kept; then the plain delete
-/// removing it.
+/// delete, its VM telling no final use with that end (D260's `Unused::Untold`), has no use left to read (Shards' stats
+/// answer only a running run), so its delete is refused, typed, the box kept as it was, never answered none. Do: start a
+/// VM, read its use as it runs, have its command exit; ask its delete with its host use; then delete it. Expect:
+/// `NotRunning`, naming its final use, its record kept; then the plain delete removing it.
 #[test]
 fn b5_a_delete_with_host_use_of_a_vm_whose_command_ended_first_is_refused_and_keeps_the_box() {
     let vcpus = allocation().vm_size().unwrap().vcpus;
@@ -5581,7 +6524,7 @@ fn b5_a_delete_with_host_use_of_a_vm_whose_command_ended_first_is_refused_and_ke
     *images.run.end.lock().unwrap() = Some(RunEnd::Exited(0));
     let refused = runtime.delete_with_host_use(&id);
     assert!(
-        matches!(&refused, Err(Refusal::NotRunning(named, _)) if *named == id),
+        matches!(&refused, Err(Refusal::NotRunning(named, why)) if *named == id && why.contains("ended on its own")),
         "{refused:?}"
     );
     assert!(
@@ -5589,6 +6532,81 @@ fn b5_a_delete_with_host_use_of_a_vm_whose_command_ended_first_is_refused_and_ke
         "the refused delete removed the box"
     );
     runtime.delete(&id).unwrap();
+    assert!(record(&owner, &id).is_none());
+}
+
+/// Kiln's P7.1b ask (lane replay, kiln 107a4da17; Shards' D260; AC-T7.4.1): a run that ends on its own keeps the final
+/// use its VM tells with that end, so its owner needn't hold it running to be charged what it used. Do: a VM whose
+/// command ends on its own, its VM telling its final use; see it ended; read its record; delete it with its host use.
+/// Expect: its record keeping its exit and that use (its VM's counters, each vCPU's guest time by index, its window no
+/// longer than the run took to be seen ended); the delete answering that use and removing the box.
+#[test]
+fn p7_a_run_that_ends_on_its_own_keeps_its_final_use_for_its_delete() {
+    let vcpus = allocation().vm_size().unwrap().vcpus;
+    let images = ModelImages::new();
+    *images.run.final_use.lock().unwrap() = microvm(Ok(guest_times(vcpus)));
+    let (runtime, owner) = model_runtime(&images, waits());
+    let command = vec!["/bin/sh".into(), "/kiln-replay/replay.sh".into()];
+    let id = runtime
+        .create(spec("p7-final-use", Some(command)))
+        .unwrap()
+        .id;
+    let before = Instant::now();
+    runtime.start(&id).unwrap();
+    *images.run.end.lock().unwrap() = Some(RunEnd::Exited(0));
+    shown(&runtime, &id, BoxState::Empty, &REAPED_SHOWN);
+    let seen = before.elapsed();
+    let kept = record(&owner, &id).unwrap();
+    assert_eq!(kept.exit, Some(Exit::Code(0)));
+    let used = kept.final_use.unwrap();
+    assert_eq!(
+        (used.cpu_ns, used.footprint_bytes, used.resident_bytes),
+        (9_000_000, 1 << 20, 1 << 20)
+    );
+    assert_eq!(
+        used.guest_ns,
+        (1..=u64::from(vcpus))
+            .map(|n| 1_000 * n)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(used.charged, hex_api::Charged::ToThread);
+    assert!(
+        used.window <= seen,
+        "{used:?} past the {seen:?} its run took to be seen ended"
+    );
+    assert_eq!(runtime.delete_with_host_use(&id), Ok(Some(used)));
+    assert!(record(&owner, &id).is_none());
+}
+
+/// Kiln's P7.1b (Shards' D260; the review's B-5 as it stands with a final use told; AC-T7.4.1): a delete with its host
+/// use that is the first call to see its run's own end answers the use its VM told with it, where before it was
+/// refused, nothing left to read. Do: start a VM whose VM tells its final use, read its use as it runs, have its
+/// command exit; ask its delete with its host use. Expect: that final use, its window no shorter than the read's, and
+/// the box gone.
+#[test]
+fn p7_a_delete_that_first_sees_its_runs_own_end_answers_its_final_use() {
+    let vcpus = allocation().vm_size().unwrap().vcpus;
+    let images = ModelImages::new();
+    *images.run.stats.lock().unwrap() = Stats {
+        microvm: microvm(Ok(guest_times(vcpus))),
+        ..Stats::default()
+    };
+    *images.run.final_use.lock().unwrap() = microvm(Ok(guest_times(vcpus)));
+    let (runtime, owner) = model_runtime(&images, waits());
+    let command = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+    let id = runtime
+        .create(spec("p7-final-use-first-seen", Some(command)))
+        .unwrap()
+        .id;
+    runtime.start(&id).unwrap();
+    let read = runtime.host_use(&id).unwrap();
+    *images.run.end.lock().unwrap() = Some(RunEnd::Exited(0));
+    let used = runtime.delete_with_host_use(&id).unwrap().unwrap();
+    assert_eq!(
+        (used.cpu_ns, used.guest_ns.len()),
+        (9_000_000, usize::try_from(vcpus).unwrap())
+    );
+    assert!(used.window >= read.window, "{read:?} then {used:?}");
     assert!(record(&owner, &id).is_none());
 }
 
@@ -6147,6 +7165,247 @@ fn w2_mcp_a_connections_kill_resets_it_and_its_end_reads_killed() {
     assert_eq!(runtime.inspect(&id).unwrap().state, BoxState::Running);
 }
 
+/// A program's end in a member once its outputs have finished: no recorded operation makes it, so measuring, for its
+/// fact alone (hex_testkit::waits).
+static PROGRAM_END: Patience = Patience::measuring("test.hex_runtime.image_program_end");
+
+/// `proc`'s end as a program's in a member comes, as [`PROGRAM_END`] waits, by the test's own run, which lives while it
+/// does.
+fn program_end(proc: &mut Box<dyn Proc>) -> Exit {
+    follow::within(
+        &PROGRAM_END,
+        "a member's program's end",
+        || Party::Live,
+        |by| {
+            let wait = by.map_or(Duration::MAX, |at| {
+                at.saturating_duration_since(Instant::now())
+            });
+            proc.wait_for(wait).unwrap()
+        },
+    )
+    .unwrap()
+}
+
+fn harness(name: &str) -> Member {
+    Member {
+        kind: MemberKind::Harness,
+        name: name.to_owned(),
+    }
+}
+
+/// Kiln's P7.1b ask (lane replay, kiln 107a4da17; Shards' D243 on D238's exec lane; AC-T7.4.1): a program runs in a
+/// running image VM's member through its run's agent-control endpoint, as its caller's program, no member of it driven.
+/// Do: a run whose endpoint is Shards' own on loopback, its members a harness, an agent and files; run `cat -` in the
+/// harness, a variable, a working directory and its three streams asked for; write a line to its stdin and end it, then
+/// read its stdout and stderr to their ends. Expect: a program of no host process, its streams given once; its stdout
+/// its arguments' line then what it was sent, its stderr its own; its end `Exit::Code(0)`; one lane asked, of the
+/// harness's index, carrying its arguments, its variable as `NAME=VALUE`, its working directory and its stdin, no
+/// terminal and no user; the box Running, its VM never stopped.
+#[test]
+fn p7_a_program_runs_in_a_member_as_its_callers_program() {
+    use std::io::{Read, Write};
+    let images = ModelImages::new();
+    *images.members.lock().unwrap() = three_members();
+    let execed = Execed::default();
+    *images.executed.lock().unwrap() = Some((Vec::new(), Arc::clone(&execed)));
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let id = runtime.create(spec("image-exec", None)).unwrap().id;
+    runtime.start(&id).unwrap();
+    let program = Program {
+        args: vec!["cat".to_owned(), "-".to_owned()],
+        env: vec![("KILN_REPLAY".to_owned(), "1".to_owned())],
+        cwd: Some("/work/app".to_owned()),
+        user: None,
+    };
+    let all = hex_api::Ask {
+        stdin: true,
+        stdout: true,
+        stderr: true,
+    };
+    let mut proc = runtime
+        .exec_member(
+            &id,
+            &harness("claude"),
+            program,
+            Stdio {
+                ask: all,
+                ..Stdio::null()
+            },
+        )
+        .unwrap();
+    assert!(!proc.on_this_host(), "a program in a member is its guest's");
+    let given = proc.streams().unwrap();
+    assert!(
+        proc.streams().unwrap().stdout.is_none(),
+        "its streams are given once"
+    );
+    let mut to = hex_api::OwnedStream::from(given.stdin.unwrap());
+    let mut from = hex_api::OwnedStream::from(given.stdout.unwrap());
+    let mut errors = hex_api::OwnedStream::from(given.stderr.unwrap());
+    to.write_all(b"step 1\n").unwrap();
+    drop(to);
+    let mut heard = String::new();
+    from.read_to_string(&mut heard).unwrap();
+    assert_eq!(heard, "cat -\nstep 1\n");
+    let mut said = String::new();
+    errors.read_to_string(&mut said).unwrap();
+    assert_eq!(said, "said\n");
+    assert_eq!(program_end(&mut proc), Exit::Code(0));
+    let asked = execed.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "one lane asked");
+    let (member, ran) = &asked[0];
+    assert_eq!(*member, 0, "the harness's index");
+    assert_eq!(ran.argv, vec![b"cat".to_vec(), b"-".to_vec()]);
+    assert_eq!(ran.env, vec![b"KILN_REPLAY=1".to_vec()]);
+    assert_eq!(ran.cwd, b"/work/app".to_vec());
+    assert!(
+        ran.stdin && ran.tty.is_none() && ran.user.is_empty(),
+        "{ran:?}"
+    );
+    assert_eq!(images.run.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.inspect(&id).unwrap().state, BoxState::Running);
+}
+
+/// Kiln's P7.1b (Shards' D243; AC-T7.4.1): a program that can't run in a member is refused, typed, its program checked
+/// before its run. Do: a box whose run's members are a harness, an agent its host refuses programs in (as one that has
+/// ended) and files; run a program in the harness before its start; after it, one naming a user, then programs in the
+/// agent `ghost` its run declares not, in the files, in the agent, and one naming no member through `exec`; then stop
+/// the VM and run one in the harness. Expect: `NotRunning(id, "exec in a member")` before its start; `Invalid` naming
+/// the program for the user, and the member for `ghost`; `NotRunning(id, "exec in a member: it runs no program")` for
+/// the files; `NotRunning(id, "exec in a member: its member refused it, ended or confined")` for the agent; `Invalid`
+/// naming exec; and `NotRunning(id, "exec in a member")` once the VM has stopped. Only the agent's lane was asked.
+#[test]
+fn p7_a_program_that_cant_run_in_a_member_is_refused_typed() {
+    let images = ModelImages::new();
+    *images.members.lock().unwrap() = three_members();
+    let execed = Execed::default();
+    *images.executed.lock().unwrap() = Some((vec![1], Arc::clone(&execed)));
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let id = runtime.create(spec("image-exec-refused", None)).unwrap().id;
+    let ran = |member: &Member, program: Program| {
+        runtime
+            .exec_member(&id, member, program, Stdio::null())
+            .map(drop)
+    };
+    let claude = harness("claude");
+    assert_eq!(
+        ran(&claude, Program::of(&["true"])),
+        Err(Refusal::NotRunning(id.clone(), "exec in a member"))
+    );
+    runtime.start(&id).unwrap();
+    let as_root = Program {
+        user: Some(hex_api::User::default()),
+        ..Program::of(&["true"])
+    };
+    assert!(matches!(
+        ran(&claude, as_root),
+        Err(Refusal::Invalid {
+            what: "program",
+            ..
+        })
+    ));
+    assert_eq!(
+        ran(&agent("ghost"), Program::of(&["true"])),
+        Err(Refusal::Invalid {
+            what: "member",
+            why: format!("box {id}'s run declares no agent ghost"),
+        })
+    );
+    assert_eq!(
+        ran(&agent("notes"), Program::of(&["true"])),
+        Err(Refusal::NotRunning(
+            id.clone(),
+            "exec in a member: it runs no program"
+        ))
+    );
+    assert_eq!(
+        ran(&agent("helper"), Program::of(&["true"])),
+        Err(Refusal::NotRunning(
+            id.clone(),
+            "exec in a member: its member refused it, ended or confined"
+        ))
+    );
+    assert!(matches!(
+        runtime.exec(&id, Program::of(&["true"]), Stdio::null()),
+        Err(Refusal::Invalid { what: "exec", .. })
+    ));
+    runtime.signal(&id, Signal::KILL).unwrap();
+    assert_eq!(
+        ran(&claude, Program::of(&["true"])),
+        Err(Refusal::NotRunning(id.clone(), "exec in a member"))
+    );
+    let asked: Vec<u32> = execed
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(member, _)| *member)
+        .collect();
+    assert_eq!(asked, vec![1], "only the agent's lane was asked");
+}
+
+/// Kiln's P7.1b (Shards' D243's `EXEC_SIGNAL`; AC-T7.4.1): a program's kill rides its own lane while its outputs are
+/// open. Do: run `sleep` in the harness, read its first line, then kill it and read its stdout to its end. Expect: the
+/// line; the kill done; its stdout's end; its end `Exit::Signal(9)`, its host having taken signal 9; its kill again,
+/// once it has ended, done at once; the box Running, its VM never stopped.
+#[test]
+fn p7_a_programs_kill_rides_its_lane_and_its_end_reads_killed() {
+    use std::io::{BufRead, Read};
+    let images = ModelImages::new();
+    *images.members.lock().unwrap() = three_members();
+    *images.executed.lock().unwrap() = Some((Vec::new(), Execed::default()));
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let id = runtime.create(spec("image-exec-kill", None)).unwrap().id;
+    runtime.start(&id).unwrap();
+    let out = hex_api::Ask {
+        stdout: true,
+        ..hex_api::Ask::default()
+    };
+    let mut proc = runtime
+        .exec_member(
+            &id,
+            &harness("claude"),
+            Program::of(&["sleep"]),
+            Stdio {
+                ask: out,
+                ..Stdio::null()
+            },
+        )
+        .unwrap();
+    let given = proc.streams().unwrap();
+    let mut from = std::io::BufReader::new(hex_api::OwnedStream::from(given.stdout.unwrap()));
+    let mut line = String::new();
+    from.read_line(&mut line).unwrap();
+    assert_eq!(line, "sleep\n");
+    assert_eq!(proc.kill(), Ok(()));
+    let mut rest = Vec::new();
+    from.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "{rest:?}");
+    assert_eq!(program_end(&mut proc), Exit::Signal(9));
+    assert_eq!(proc.kill(), Ok(()));
+    assert_eq!(images.run.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.inspect(&id).unwrap().state, BoxState::Running);
+}
+
+/// Kiln's P7.1b (Shards' `ExecControl` at 9975d1f55; AC-T7.4.1): once a program's outputs have finished its control
+/// waits for its exit, and steers nothing beside that wait, so its kill can't ride its lane then. Do: kill a program
+/// whose control its end's thread has taken, its end not yet told; then tell its end and kill it again. Expect:
+/// `Awaits(ExecSignalAfterOutput)`, nothing marked killed; then done at once.
+#[test]
+fn p7_a_kill_once_a_programs_outputs_have_finished_awaits_shards() {
+    let control = Mutex::new(None);
+    let killed = AtomicBool::new(false);
+    let end: ExecEnd = Arc::new(Slot::new());
+    assert_eq!(
+        kill_exec(&control, &killed, &end),
+        Err(Refusal::Awaits {
+            needs: Upstream::ExecSignalAfterOutput
+        })
+    );
+    assert!(!killed.load(Ordering::SeqCst));
+    end.put(Ok(Exit::Code(0)));
+    assert_eq!(kill_exec(&control, &killed, &end), Ok(()));
+}
+
 /// Set in the child [`c10_a_cold_ready_wait_is_told_as_it_starts`] starts of itself: there it boots a node VM cold.
 const C10_CHILD: &str = "HEX_TEST_C10_COLD_READY_CHILD";
 
@@ -6310,4 +7569,266 @@ fn b12_an_image_vm_whose_record_cant_be_read_is_refused_in_its_words() {
         Err(Refusal::Broken(why)) => assert!(why.contains("its bytes end mid-field"), "{why}"),
         other => panic!("an unreadable record inspected: {other:?}"),
     }
+}
+
+/// A warm room counting its claims, each refused, and its gives (kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1): a
+/// pool's host claims its room before it starts, so a room refusing every claim starts none.
+#[derive(Default)]
+struct CountedRoom {
+    claims: AtomicUsize,
+    gives: AtomicUsize,
+}
+
+impl WarmRoom for CountedRoom {
+    fn claim(&self, _: &WarmHost) -> bool {
+        self.claims.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+
+    fn give(&self, _: &WarmHost, _: Gave) {
+        self.gives.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The image class alone over the model's boot, given warm room `room` where there is one, its owner kept by the caller.
+fn pooling_class(room: Option<Arc<dyn WarmRoom>>) -> (ImageClass, Owner) {
+    let owner = Owner::new();
+    let class = ImageClass::new(super::super::tests::config().binary).with_boot(
+        Ok(ModelImages::new() as Arc<dyn Images>),
+        waits(),
+        owner.diagnostics(),
+    );
+    if let Some(room) = room {
+        class.bind_room(room).unwrap();
+    }
+    (class, owner)
+}
+
+/// HEX-IMG-9, the warm pools' conformance case.
+fn pools_case() -> &'static hex_api::conformance::Case {
+    hex_api::conformance::IMAGE_CASES
+        .iter()
+        .find(|case| case.id == "HEX-IMG-9")
+        .unwrap()
+}
+
+/// The pool of the model's boxes: their image and admitted size.
+fn sim_pool() -> WarmPool {
+    WarmPool {
+        image: hex_api::sim::SIM_IMAGE.to_owned(),
+        size: allocation().vm_size().unwrap(),
+    }
+}
+
+/// Kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1 (CP-T7.2; HEX-IMG-9): do hold the class given a warm room to the
+/// pools' case. Expect: it passes, each pool kept once however often asked, listed with no host warm or starting, until
+/// it's let go; and no keep claimed its room, as no box of a pool started.
+#[test]
+fn p3_1_the_class_given_a_room_keeps_lists_and_lets_go_of_warm_pools() {
+    let room = Arc::new(CountedRoom::default());
+    let (class, _owner) = pooling_class(Some(Arc::clone(&room) as Arc<dyn WarmRoom>));
+    pools_case()
+        .check(&class, &hex_api::sim::SimFixture::ShardsImage)
+        .unwrap();
+    assert_eq!(room.claims.load(Ordering::SeqCst), 0, "a keep claimed room");
+    assert_eq!(room.gives.load(Ordering::SeqCst), 0, "a let-go gave room");
+}
+
+/// P3.1 (HEX-IMG-9's other branch): do ask a class given no warm room to keep, and to let go of, a pool. Expect: each
+/// refused `Unconfigured` naming the warm room, which kiln maps to its typed NO_POOLS, and none listed.
+#[test]
+fn p3_1_a_class_given_no_room_keeps_no_pool() {
+    let (class, _owner) = pooling_class(None);
+    let pool = sim_pool();
+    assert_eq!(
+        Runtime::keep_pool(&class, &pool),
+        Err(Refusal::no_warm_room())
+    );
+    assert_eq!(
+        Runtime::let_go_pool(&class, &pool),
+        Err(Refusal::no_warm_room())
+    );
+    assert_eq!(Runtime::pools(&class), Ok(Vec::new()));
+    pools_case()
+        .check(&class, &hex_api::sim::SimFixture::ShardsImage)
+        .unwrap();
+}
+
+/// P3.1: do ask for a pool of a size Shards boots otherwise (one MiB of memory, short of its least). Expect: refused
+/// `Invalid` naming the warm pool, as a box of that size is refused at its create, and kept by none.
+#[test]
+fn p3_1_a_pool_of_a_size_shards_boots_otherwise_is_refused() {
+    let (class, _owner) = pooling_class(Some(Arc::new(CountedRoom::default())));
+    let pool = WarmPool {
+        size: VmSize {
+            vcpus: 1,
+            memory_mib: 1,
+        },
+        ..sim_pool()
+    };
+    assert!(
+        matches!(
+            Runtime::keep_pool(&class, &pool),
+            Err(Refusal::Invalid {
+                what: "warm pool",
+                ..
+            })
+        ),
+        "a pool Shards would boot at another size"
+    );
+    assert_eq!(Runtime::pools(&class), Ok(Vec::new()));
+}
+
+/// P3.1: do bind a class's warm room, then the same room again, then another. Expect: the same taken, another refused
+/// `Broken`, as its record authority is bound once.
+#[test]
+fn p3_1_a_classs_warm_room_is_bound_once() {
+    let room: Arc<dyn WarmRoom> = Arc::new(CountedRoom::default());
+    let (class, _owner) = pooling_class(Some(Arc::clone(&room)));
+    assert_eq!(class.bind_room(room), Ok(()));
+    assert!(matches!(
+        class.bind_room(Arc::new(CountedRoom::default())),
+        Err(Refusal::Broken(_))
+    ));
+}
+
+/// P3.1: do keep a pool of another image at a box's size, start the box; then keep the box's own pool and start a box of
+/// it. Expect: the first boots on the class's own boot, no kept pool being its; the second never reaches that boot, its
+/// pool's taking it (Shards' own run hosts, which this test has none of, so its start is refused; its room refuses every
+/// host its pool would start warm).
+#[test]
+fn p3_1_a_box_boots_through_the_pool_kept_for_its_image_and_size_alone() {
+    let images = ModelImages::new();
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let room = Arc::new(CountedRoom::default());
+    runtime
+        .images
+        .bind_room(Arc::clone(&room) as Arc<dyn WarmRoom>)
+        .unwrap();
+    let other = WarmPool {
+        image: format!("hex-other@sha256:{}", "0".repeat(64)),
+        ..sim_pool()
+    };
+    Runtime::keep_pool(&runtime.images, &other).unwrap();
+    let unpooled = runtime.create(spec("image-unpooled", None)).unwrap().id;
+    runtime.start(&unpooled).unwrap();
+    assert_eq!(images.asked.lock().unwrap().len(), 1);
+    Runtime::keep_pool(&runtime.images, &sim_pool()).unwrap();
+    let pooled = runtime.create(spec("image-pooled", None)).unwrap().id;
+    assert!(runtime.start(&pooled).is_err(), "no Shards run host here");
+    assert_eq!(
+        images.asked.lock().unwrap().len(),
+        1,
+        "a box of a kept pool booted on the class's own boot"
+    );
+}
+
+/// A run's real agent-control endpoint (D238, D252) on loopback, Shards' own, its microVM's key the model's, taking
+/// `ask`'s controller alone and admitting its execs, its report naming `bridges` as the members whose MCP bridge its run
+/// serves (D254); its host starts nothing a controller asks, each ask refused as one its run asked none of, so what a
+/// controller reads of it is its report. A model run's endpoint and host live while the test does.
+fn serve_reports(
+    ask: &shards_api::image::ControlAsk,
+    bridges: &[u32],
+) -> shards_api::image::ControlAt {
+    use shards_api::control::exec;
+    let vm = shards_api::control::Identity::generate().unwrap();
+    let (endpoint, served) = shards_remote::control::Endpoint::bind(
+        &vm,
+        ask.controller,
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        shards_remote::control::Streams {
+            outputs: &[],
+            inputs: &[],
+            execs: Some(shards_api::control::exec_admissions()),
+            sockets: None,
+            bridges,
+        },
+    )
+    .unwrap();
+    let (address, waker, wake) = (endpoint.address, endpoint.waker, endpoint.wake);
+    std::thread::spawn(move || endpoint.run());
+    let starts = served.execs.unwrap();
+    let revoke = served.revoke;
+    std::thread::spawn(move || {
+        // Held for the endpoint's life: let go, it would end every lane.
+        let _revoke = revoke;
+        for start in starts {
+            start
+                .replies
+                .tell(exec::Reply::Unstarted(exec::Unstarted::Refused));
+        }
+    });
+    shards_api::image::ControlAt {
+        address,
+        vm: vm.fingerprint(),
+        waker,
+        wake,
+    }
+}
+
+/// Kiln plan step 35's `/runs/control` (D238, D239, D254; AC-T7.4.1): a running image VM's agent-control link, as both
+/// its ends say it. Do: a box whose spec asks the agent `helper` (its run's member 1) a bridge, its run's endpoint
+/// Shards' own on loopback, its report naming member 1's bridge; ask its link before its start, then twice once it
+/// runs, then once its VM is killed. Expect: `NotRunning(id, "link")` before the start; then both ends' word on one TLS
+/// 1.3 handshake, TLS13_AES_256_GCM_SHA384 (0x1302, D239) and one key exchange group, each named, and the lanes its
+/// controller was granted, by Shards' names: its control lane, its execs and the run's log they read, then member 1's
+/// bridge (`mcp:1`); the second answer the first's; the box Running, its VM never stopped; and `NotRunning(id, "link")`
+/// once its VM is killed.
+#[test]
+fn s35_a_running_image_vms_link_says_both_ends_tls_and_its_lanes() {
+    let images = ModelImages::new();
+    *images.members.lock().unwrap() = three_members();
+    *images.reports.lock().unwrap() = Some(vec![1]);
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let helper = agent("helper");
+    let id = runtime
+        .create(bridged_spec("image-link", &[&helper]))
+        .unwrap()
+        .id;
+    assert_eq!(
+        runtime.link(&id),
+        Err(Refusal::NotRunning(id.clone(), "link"))
+    );
+    runtime.start(&id).unwrap();
+    let link = runtime.link(&id).unwrap();
+    assert_eq!(
+        link.controller, link.endpoint,
+        "both ends' word on one handshake"
+    );
+    assert_eq!(
+        (link.controller.suite, link.controller.suite_name),
+        (0x1302, Some("TLS13_AES_256_GCM_SHA384"))
+    );
+    assert!(
+        link.controller.group_name.is_some(),
+        "{:?}",
+        link.controller
+    );
+    assert_eq!(link.lanes, ["control", "exec", "log:run", "mcp:1"]);
+    assert_eq!(runtime.link(&id).unwrap(), link, "asked again, the same");
+    assert_eq!(images.run.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.inspect(&id).unwrap().state, BoxState::Running);
+    runtime.signal(&id, Signal::KILL).unwrap();
+    assert_eq!(
+        runtime.link(&id),
+        Err(Refusal::NotRunning(id.clone(), "link"))
+    );
+}
+
+/// Kiln plan step 35 (AC-T7.4.1): a link whose endpoint never reported is refused as `Runtime::link` says. Do: refuse a
+/// box's link for its connection's end, this side's own close among them, then for the endpoint's reset of its control
+/// lane. Expect: `NotRunning(id, "link: its run ended")` for the end; `Os` for the reset, in Shards' words, naming the box.
+#[test]
+fn s35_a_link_with_no_report_is_refused_typed() {
+    let id = BoxId::new("image-link-refused").unwrap();
+    assert_eq!(
+        link_refused(&id, Fault::Lost(shards_api::control::Ended::Local)),
+        Refusal::NotRunning(id.clone(), "link: its run ended")
+    );
+    let reset = link_refused(&id, Fault::Revoked);
+    assert!(
+        matches!(&reset, Refusal::Os { why, .. } if why.starts_with("box image-link-refused: ")),
+        "{reset:?}"
+    );
 }

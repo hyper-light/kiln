@@ -89,7 +89,7 @@ impl From<Stop> for Error {
     }
 }
 
-/// The operator supplies backend truth. A registry has at most the scheduler's three classes;
+/// The operator supplies backend truth. A registry has at most the scheduler's four classes;
 /// runtimes without a device-attachment seam cannot silently accept scheduler device assignments.
 #[derive(Clone, Default)]
 pub struct Runtimes {
@@ -116,6 +116,7 @@ fn backend_class(class: Class) -> hex_api::Class {
         Class::Oci => hex_api::Class::Oci,
         Class::Firecracker => hex_api::Class::Firecracker,
         Class::Shards => hex_api::Class::Shards,
+        Class::ShardsImage => hex_api::Class::ShardsImage,
     }
 }
 
@@ -133,6 +134,8 @@ impl Runtimes {
                 }
                 Class::Firecracker => supported.contains(&hex_api::Class::Firecracker),
                 Class::Shards => supported.contains(&hex_api::Class::Shards),
+                // Listed only where its node's image boot runs and Shards' host check says it runs microVMs (P2.2).
+                Class::ShardsImage => supported.contains(&hex_api::Class::ShardsImage),
             };
             if !initialized {
                 return Err(invalid(
@@ -222,6 +225,7 @@ impl Runtimes {
                 Class::Oci => hex_api::Class::Process,
                 Class::Firecracker => hex_api::Class::Firecracker,
                 Class::Shards => hex_api::Class::Shards,
+                Class::ShardsImage => hex_api::Class::ShardsImage,
             };
             if !initialized.contains(&form) {
                 return Err(invalid_static(
@@ -1876,7 +1880,8 @@ impl Driver {
 }
 
 fn validate(demand: &Demand, payload: &Payload) -> Result<(), Error> {
-    payload.spec.check()?;
+    // A payload names neither the route nor the allocation its admission derives, which an image VM's size is from.
+    payload.spec.check_payload()?;
     if payload.spec.route.is_some() {
         return Err(invalid_static("the scheduler derives the initialized execution route").into());
     }
@@ -1927,6 +1932,7 @@ fn validate(demand: &Demand, payload: &Payload) -> Result<(), Error> {
         (Class::Oci, hex_api::Class::Process | hex_api::Class::Oci)
             | (Class::Firecracker, hex_api::Class::Firecracker)
             | (Class::Shards, hex_api::Class::Shards)
+            | (Class::ShardsImage, hex_api::Class::ShardsImage)
     ) {
         return Err(invalid("placement backend and payload class disagree").into());
     }

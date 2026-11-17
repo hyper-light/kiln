@@ -1,5 +1,6 @@
 use std::io::{PipeReader, PipeWriter};
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,12 @@ pub enum Class {
     Firecracker,
     /// A microVM run by an initialized Shards backend.
     Shards,
+    /// A Shards image VM ([`ClassSpec::ShardsImage`]): an Agentfile image Shards' run host boots under shards-init
+    /// (Shards' D231), a microVM of its own, counted apart from Hex's own Shards guests. Listed only where the node's
+    /// image boot is configured and Shards' check of its host (`shards_api::host_check`, D262) says it runs microVMs
+    /// (kiln plan 01a1dd2e…, P2.2; docs/design/shards-image-class.md §11). Appended (the wire is append-only).
+    #[serde(rename = "shards-image")]
+    ShardsImage,
 }
 
 impl Class {
@@ -29,6 +36,7 @@ impl Class {
             Self::Oci => "oci",
             Self::Firecracker => "firecracker",
             Self::Shards => "shards",
+            Self::ShardsImage => "shards-image",
         }
     }
 }
@@ -70,12 +78,18 @@ impl BoxSpec {
         self.route.map(|receipt| receipt.key.execution)
     }
 
-    /// Resolve only the original form or its validated immutable execution receipt.
+    /// Resolve only the original form or its validated immutable execution receipt: the class of the backend that runs
+    /// it. A Shards image VM's is the Shards backend, whose image class boots it (D231).
     pub fn backend_class(&self) -> Result<Class, Refusal> {
         self.check()?;
         Ok(match self.route_execution() {
             None | Some(crate::runtime::Execution::Native | crate::runtime::Execution::NodeVm) => {
-                self.class.class()
+                match self.class.class() {
+                    Class::ShardsImage => Class::Shards,
+                    class @ (Class::Process | Class::Oci | Class::Firecracker | Class::Shards) => {
+                        class
+                    }
+                }
             }
             Some(
                 crate::runtime::Execution::ShardsShared
@@ -86,8 +100,24 @@ impl BoxSpec {
     }
 
     /// Whether every value it names is well formed, before anything is made: its bounds, its owner and
-    /// a structured container's spec, each refused by its field's name (CLAUDE.md §3).
+    /// a structured container's spec, each refused by its field's name (CLAUDE.md §3), and a Shards image
+    /// VM's size from its admitted allocation.
     pub fn check(&self) -> Result<(), Refusal> {
+        self.check_payload()?;
+        match &self.class {
+            ClassSpec::ShardsImage(_) => self.check_image_size(),
+            ClassSpec::Process
+            | ClassSpec::Oci(_)
+            | ClassSpec::Bundle(_)
+            | ClassSpec::Firecracker(_)
+            | ClassSpec::Shards(_) => Ok(()),
+        }
+    }
+
+    /// Whether it is well formed as a scheduler's payload, before its admission (hex-node's `placement::validate`):
+    /// every check of [`BoxSpec::check`] but a Shards image VM's size, which its admitted allocation gives, the
+    /// scheduler deriving that from the original demand as it admits the box (docs/design/shards-image-class.md §11).
+    pub fn check_payload(&self) -> Result<(), Refusal> {
         self.bounds.check()?;
         self.check_devices()?;
         if let Some(route) = self.route {
@@ -130,11 +160,20 @@ impl BoxSpec {
         Ok(())
     }
 
-    /// A Shards image VM: its image and command ([`ShardsImage::check`]), its size from an admitted
-    /// allocation of whole vCPUs and MiB ([`crate::Allocation::vm_size`]), and no physical device,
-    /// which D231's image boot takes none of.
+    /// A Shards image VM: its image and command ([`ShardsImage::check`]), and no physical device, which
+    /// D231's image boot takes none of.
     fn check_image(&self, image: &ShardsImage) -> Result<(), Refusal> {
         image.check()?;
+        if !self.devices.is_empty() {
+            return Err(invalid_image(
+                "devices are named: D231's image boot attaches no physical device".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A Shards image VM's size: an admitted allocation of whole vCPUs and MiB ([`crate::Allocation::vm_size`]).
+    fn check_image_size(&self) -> Result<(), Refusal> {
         self.allocation
             .ok_or_else(|| {
                 invalid_image(
@@ -143,11 +182,6 @@ impl BoxSpec {
                 )
             })?
             .vm_size()?;
-        if !self.devices.is_empty() {
-            return Err(invalid_image(
-                "devices are named: D231's image boot attaches no physical device".to_owned(),
-            ));
-        }
         Ok(())
     }
 
@@ -280,7 +314,8 @@ impl ClassSpec {
             Self::Process => Class::Process,
             Self::Oci(_) | Self::Bundle(_) => Class::Oci,
             Self::Firecracker(_) => Class::Firecracker,
-            Self::Shards(_) | Self::ShardsImage(_) => Class::Shards,
+            Self::Shards(_) => Class::Shards,
+            Self::ShardsImage(_) => Class::ShardsImage,
         }
     }
 }
@@ -313,8 +348,9 @@ pub struct ShardsImage {
     /// step 18: a person's home volumes, and a project at its host path, D235): each a `Mount`, its `source` the host
     /// directory, absolute on the host its node runs on, its `destination` where the guest sees it, absolute, and
     /// `read_only` whether the guest may write it. A member gets one where its image's `VOLUME` at that path is for it
-    /// (Shards' D109), the run's own command where no `VOLUME` declares it. None by default: the guest sees only the
-    /// shares named here, the image's own grants widening none. After the members (append-only).
+    /// (Shards' D109), or where its member scope names it (`Mount::members`, Shards' D277), and the run's own command
+    /// gets every one. None by default: the guest sees only the shares named here, the image's own grants widening none.
+    /// After the members (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<Mount>,
     /// Its members' credentials, granted by reference (Shards' D242; joint plan step 33; docs/design/credential-grants.md):
@@ -329,6 +365,73 @@ pub struct ShardsImage {
     /// its CLI given placeholders in their places. None by default. After the credentials (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sign_ins: Vec<crate::SignInGrant>,
+    /// The volumes of the node's Shards home its members are given as its run starts (kiln plan 01a1dd2e…, P6.2;
+    /// Shards' D271 and D281), each kept there past the run, so the next run given it finds what this one left. None
+    /// by default. After the sign-ins (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<ImageVolume>,
+}
+
+/// A volume of the node's Shards home a Shards image's members are given as its run starts
+/// ([`ShardsImage::volumes`]): plugged into its members in its running microVM as Shards plugs one (D271), beneath a
+/// plug root its run is granted at its start, made there, empty, where it isn't, and held to its bound as its files are
+/// written (D281). Its run holds it until it ends, so no clearing removes it meanwhile
+/// ([`crate::Runtime::clear_volume`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageVolume {
+    /// Its name in the store, whose grammar Shards holds it to as it plugs it.
+    pub name: String,
+    /// The most its files may take, by Shards' measure (D281: a unit of its host's file system for each name, and each
+    /// file's length and attributes in whole units), a write past it refused ENOSPC in its members: drawn from its
+    /// box's admitted disk, its box's volumes' bounds together within it. A volume runs hold is served with the bound
+    /// they were given, so one asked with another is refused while any run holds it ([`crate::VolumeCause::Bound`]).
+    pub bound: NonZeroU64,
+    /// Where its members see it: absolute and plain, strictly beneath a top-level directory, which its run is granted
+    /// as a plug root at its start (D271); no other volume's or share's place.
+    pub at: String,
+    /// The members it is plugged into, each once: at least one.
+    pub members: Vec<crate::Member>,
+    pub read_only: bool,
+}
+
+impl ImageVolume {
+    /// Whether Shards can be asked to plug it, told by its place: a name the store and the node's wire can hold (not
+    /// empty, no NUL; the rest of its grammar is Shards'), its place absolute and plain ([`plain`]) and beneath a
+    /// top-level directory, and its members each named as a grant's member is and once, at least one.
+    fn check(&self, at: usize) -> Result<(), Refusal> {
+        if self.name.is_empty() || self.name.contains('\0') {
+            return Err(invalid_image(format!(
+                "volumes[{at}].name {:?} names no volume",
+                self.name
+            )));
+        }
+        if !plain(&self.at) || steps(&self.at).nth(1).is_none() {
+            return Err(invalid_image(format!(
+                "volumes[{at}].at {:?} isn't absolute, plain and beneath a top-level directory, its plug root",
+                self.at
+            )));
+        }
+        if self.members.is_empty() {
+            return Err(invalid_image(format!(
+                "volumes[{at}].members names none: a volume is plugged into the members named"
+            )));
+        }
+        named_once(&format!("volumes[{at}].members"), &self.members)
+    }
+}
+
+/// Each of `members` named as a grant's member is, and once, a share's or a volume's (Shards' D277, D271), refused by its
+/// place in `field`.
+fn named_once(field: &str, members: &[crate::Member]) -> Result<(), Refusal> {
+    for (i, member) in members.iter().enumerate() {
+        member
+            .check_named(&format!("{field}[{i}]"))
+            .map_err(invalid_image)?;
+        if members.get(..i).unwrap_or_default().contains(member) {
+            return Err(invalid_image(format!("{field}[{i}] names {member} again")));
+        }
+    }
+    Ok(())
 }
 
 /// A member of a Shards image its caller drives ([`ShardsImage::members`]): which one, by the kind and name
@@ -388,20 +491,12 @@ impl ImageMember {
                 "members[{at}].env's variable {k:?} can't be set"
             )));
         }
-        if let Some(dir) = &self.workdir {
-            let plain = dir.starts_with('/')
-                && !dir.contains('\0')
-                && (dir == "/"
-                    || dir
-                        .get(1..)
-                        .unwrap_or_default()
-                        .split('/')
-                        .all(|c| !c.is_empty() && c != "." && c != ".."));
-            if !plain {
-                return Err(invalid_image(format!(
-                    "members[{at}].workdir {dir:?} isn't absolute and plain"
-                )));
-            }
+        if let Some(dir) = &self.workdir
+            && !plain(dir)
+        {
+            return Err(invalid_image(format!(
+                "members[{at}].workdir {dir:?} isn't absolute and plain"
+            )));
         }
         if let Some(i) = self.args.iter().position(|a| a.contains('\0')) {
             return Err(invalid_image(format!(
@@ -423,6 +518,7 @@ impl ShardsImage {
             shares: Vec::new(),
             credentials: Vec::new(),
             sign_ins: Vec::new(),
+            volumes: Vec::new(),
         }
     }
 
@@ -432,8 +528,10 @@ impl ShardsImage {
     /// grants [`crate::check_grants`] takes, and members its caller drives each named once and checked as
     /// [`ImageMember`] checks one. Refused by its field's name (CLAUDE.md §3); the rest of
     /// the name's grammar is Shards' to refuse as it resolves the image, and a grant Shards can't hold
-    /// exactly is the runtime's to refuse as it programs the boot. Its credentials, last, as
-    /// [`crate::check_credentials`] takes them over its grants (refused naming `credentials`).
+    /// exactly is the runtime's to refuse as it programs the boot. Its volumes each checked as [`ImageVolume`]
+    /// checks one, at no share's or other volume's place; their bounds against its box's admitted disk are the
+    /// runtime's to hold as it creates the box. Its credentials, last, as [`crate::check_credentials`] takes them over
+    /// its grants (refused naming `credentials`).
     pub fn check(&self) -> Result<(), Refusal> {
         check_pinned("shards image", &self.image)?;
         if let Some(command) = &self.command {
@@ -494,6 +592,32 @@ impl ShardsImage {
                 return Err(invalid_image(format!(
                     "{field} {:?} is another share's too",
                     share.destination
+                )));
+            }
+            // Its member scope (Shards' D277): each member named as a grant's member is, once, as Shards refuses a
+            // share given to one twice.
+            named_once(&format!("shares[{at}].members"), &share.members)?;
+        }
+        // Its volumes (kiln plan 01a1dd2e…, P6.2), each checked and each at a place of its own, no share's or other
+        // volume's however its path is spelled, so no plug hides another's files.
+        for (at, volume) in self.volumes.iter().enumerate() {
+            volume.check(at)?;
+            let taken = self
+                .shares
+                .iter()
+                .map(|s| s.destination.as_str())
+                .chain(
+                    self.volumes
+                        .get(..at)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|v| v.at.as_str()),
+                )
+                .any(|place| same_place(place, &volume.at));
+            if taken {
+                return Err(invalid_image(format!(
+                    "volumes[{at}].at {:?} is a share's or another volume's place too",
+                    volume.at
                 )));
             }
         }
@@ -605,6 +729,12 @@ impl OciSpec {
                     "{field} is the root: a mount over it would hide the rootfs"
                 )));
             }
+            if !m.members.is_empty() {
+                return Err(invalid_spec(format!(
+                    "mounts[{i}].members names members a container doesn't have: a member scope is a Shards image \
+                     VM's share's"
+                )));
+            }
         }
         if let Some(name) = &self.hostname {
             host_name("hostname", name, Self::MAX_HOSTNAME)?;
@@ -665,6 +795,19 @@ fn same_place(a: &str, b: &str) -> bool {
 /// The components of an absolute path that each name a step ([`path_parts`] past the empty ones and `.`).
 fn steps(path: &str) -> impl Iterator<Item = &str> {
     path_parts(path).filter(|part| !part.is_empty() && *part != ".")
+}
+
+/// Whether `path` is absolute and plain, as Shards takes a member's working directory (D231) and a plug's place (D271)
+/// in its Linux guest: from `/`, with no NUL, each component past it a step (none empty, `.` or `..`).
+fn plain(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains('\0')
+        && (path == "/"
+            || path
+                .get(1..)
+                .unwrap_or_default()
+                .split('/')
+                .all(|c| !c.is_empty() && c != "." && c != ".."))
 }
 
 /// A host path a spec names: absolute on the host that runs the container (POSIX-absolute on Linux and
@@ -733,13 +876,21 @@ pub enum Rootfs {
     Layers(Vec<PathBuf>),
 }
 
-/// A host path bound into a container.
+/// A host path bound into a container, or a host directory a Shards image VM's guest sees ([`ShardsImage::shares`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mount {
     pub source: PathBuf,
     /// Where it appears in the container: an absolute path.
     pub destination: String,
     pub read_only: bool,
+    /// Its member scope, a Shards image VM's share's alone (Shards' D277, `ImageShare::members`): the members given it
+    /// as they start, at `destination` in each one's own root before its command runs, so one may work in it from its
+    /// first instruction (a project its harness's working directory is in), each named once by the kind and name its
+    /// image's Agentfile gives it, and one its image declares that runs (Shards refuses another at boot). None: the
+    /// run's own root alone, a member seeing it only where its image's `VOLUME` there is for it (D109). A container has
+    /// no members: an `oci` mount naming one is refused. After `read_only` (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<crate::Member>,
 }
 
 /// What a container sees of the network.
@@ -1166,6 +1317,7 @@ mod tests {
                 source: "/srv/data".into(),
                 destination: "/data".to_owned(),
                 read_only: true,
+                members: Vec::new(),
             }],
             hostname: Some("box-1.example".to_owned()),
             network: Network::Private,
@@ -1493,6 +1645,7 @@ mod tests {
             source: PathBuf::from(source),
             destination: destination.to_owned(),
             read_only,
+            members: Vec::new(),
         };
         let home = share(
             "/var/lib/kiln/homes/ada/.claude",
@@ -1544,6 +1697,173 @@ mod tests {
         }
     }
 
+    /// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1; Shards' D271, D281): the volumes of the node's Shards home an image VM's
+    /// members are given as its run starts. Do check a VM given a volume read-write into its harness and one read-only
+    /// into its harness and an agent, beside a project share, and one given none. Expect both to pass and read back
+    /// whole from JSON, none left out of it when there are none. Do give a volume no name, a name with a NUL, a place
+    /// that is relative, a top-level directory alone, through `..` or with an empty component, the share's place or
+    /// another volume's, no member, a member twice and a member's name Shards' parser refuses. Expect each refused as
+    /// Invalid naming the volume's field, by its place.
+    #[test]
+    fn p6_2_an_image_vms_volumes_are_checked_by_field() {
+        let harness = crate::Member {
+            kind: crate::MemberKind::Harness,
+            name: "claude".to_owned(),
+        };
+        let agent = crate::Member {
+            kind: crate::MemberKind::Agent,
+            name: "helper".to_owned(),
+        };
+        let volume = |name: &str, at: &str, members: Vec<crate::Member>| ImageVolume {
+            name: name.to_owned(),
+            bound: NonZeroU64::new(1 << 30).unwrap(),
+            at: at.to_owned(),
+            members,
+            read_only: false,
+        };
+        let cache = volume("kiln-agent-cache", "/volumes/cache", vec![harness.clone()]);
+        let notes = ImageVolume {
+            read_only: true,
+            ..volume(
+                "kiln-agent-notes",
+                "/volumes/notes",
+                vec![harness.clone(), agent.clone()],
+            )
+        };
+        let with = |volumes: Vec<ImageVolume>| ShardsImage {
+            shares: vec![Mount {
+                source: PathBuf::from("/srv/projects/hex"),
+                destination: "/work/hex".to_owned(),
+                read_only: false,
+                members: Vec::new(),
+            }],
+            volumes,
+            ..ShardsImage::new(crate::sim::SIM_IMAGE)
+        };
+        let given = with(vec![cache.clone(), notes]);
+        given.check().unwrap();
+        let json = serde_json::to_value(&given).unwrap();
+        assert_eq!(serde_json::from_value::<ShardsImage>(json).unwrap(), given);
+        let none = with(Vec::new());
+        none.check().unwrap();
+        assert!(
+            serde_json::to_value(&none)
+                .unwrap()
+                .get("volumes")
+                .is_none()
+        );
+        let shouty = crate::Member {
+            kind: crate::MemberKind::Harness,
+            name: "Claude".to_owned(),
+        };
+        for (bad, field) in [
+            (
+                volume("", "/volumes/x", vec![harness.clone()]),
+                "volumes[1].name",
+            ),
+            (
+                volume("a\0b", "/volumes/x", vec![harness.clone()]),
+                "volumes[1].name",
+            ),
+            (
+                volume("x", "volumes/x", vec![harness.clone()]),
+                "volumes[1].at",
+            ),
+            (
+                volume("x", "/volumes", vec![harness.clone()]),
+                "volumes[1].at",
+            ),
+            (
+                volume("x", "/volumes/../etc", vec![harness.clone()]),
+                "volumes[1].at",
+            ),
+            (
+                volume("x", "/volumes//x", vec![harness.clone()]),
+                "volumes[1].at",
+            ),
+            (
+                volume("x", "/work/hex", vec![harness.clone()]),
+                "volumes[1].at",
+            ),
+            (
+                volume("x", "/volumes/cache", vec![harness.clone()]),
+                "volumes[1].at",
+            ),
+            (volume("x", "/volumes/x", Vec::new()), "volumes[1].members"),
+            (
+                volume("x", "/volumes/x", vec![harness.clone(), harness.clone()]),
+                "volumes[1].members[1]",
+            ),
+            (
+                volume("x", "/volumes/x", vec![shouty]),
+                "volumes[1].members[0]",
+            ),
+        ] {
+            match with(vec![cache.clone(), bad.clone()]).check() {
+                Err(Refusal::Invalid { what, why }) => assert_eq!(
+                    (what, why.contains(field)),
+                    ("shards image", true),
+                    "{bad:?}: {why}"
+                ),
+                other => panic!("{bad:?}: not refused as Invalid: {other:?}"),
+            }
+        }
+    }
+
+    /// P1.4 (kiln's share member scope; Shards' D277, AC-T7.4.1): a share names the members given it as they start. Do
+    /// check a VM sharing a project with its harness; one whose share names its harness twice, or a member by no
+    /// member's name; and a container mounting a directory for a member. Expect the first to pass and read back whole
+    /// from JSON, a share with no scope written without one; the two shares refused as Invalid naming their member's
+    /// field; and the container's mount refused as Invalid naming its members.
+    #[test]
+    fn p14_a_shares_member_scope_is_checked_and_a_containers_mount_names_none() {
+        let codex = crate::Member {
+            kind: crate::MemberKind::Harness,
+            name: "codex".to_owned(),
+        };
+        let share = |members: Vec<crate::Member>| Mount {
+            source: PathBuf::from("/srv/projects/hex"),
+            destination: "/work/hex".to_owned(),
+            read_only: false,
+            members,
+        };
+        let with = |shares: Vec<Mount>| ShardsImage {
+            shares,
+            ..ShardsImage::new(crate::sim::SIM_IMAGE)
+        };
+        let scoped = with(vec![share(vec![codex.clone()])]);
+        scoped.check().unwrap();
+        let json = serde_json::to_value(&scoped).unwrap();
+        assert_eq!(serde_json::from_value::<ShardsImage>(json).unwrap(), scoped);
+        let unscoped = serde_json::to_value(share(Vec::new())).unwrap();
+        assert!(unscoped.get("members").is_none(), "{unscoped}");
+        let unnamed = crate::Member {
+            kind: crate::MemberKind::Agent,
+            name: "Not A Name".to_owned(),
+        };
+        for (members, field) in [
+            (vec![codex.clone(), codex.clone()], "shares[0].members[1]"),
+            (vec![unnamed], "shares[0].members[0]"),
+        ] {
+            match with(vec![share(members)]).check() {
+                Err(Refusal::Invalid {
+                    what: "shards image",
+                    why,
+                }) => assert!(why.contains(field), "{why}"),
+                other => panic!("not refused as Invalid: {other:?}"),
+            }
+        }
+        let mut container = spec();
+        container.mounts = vec![share(vec![codex])];
+        match container.check() {
+            Err(Refusal::Invalid {
+                what: "oci spec",
+                why,
+            }) => assert!(why.contains("mounts[0].members"), "{why}"),
+            other => panic!("not refused as Invalid: {other:?}"),
+        }
+    }
+
     /// The review's B-10 (AC-T7.4.1, joint plan step 12): two shares the guest sees at one place are one share too
     /// many, however their paths are spelled, or the read-only one's intent is lost to the order they are mounted in.
     /// Do check a VM sharing a project read-only at `/work/hex` beside another directory, read-write, at the same place
@@ -1557,6 +1877,7 @@ mod tests {
             source: PathBuf::from(source),
             destination: destination.to_owned(),
             read_only,
+            members: Vec::new(),
         };
         let with = |first: &str, second: &str| ShardsImage {
             shares: vec![
@@ -1595,7 +1916,7 @@ mod tests {
         }
     }
 
-    /// AC-T7.4.1 (joint plan step 12): a Shards image VM of class Shards, its image pinned by a digest
+    /// AC-T7.4.1 (joint plan step 12): a Shards image VM of its own class (P2.2), its image pinned by a digest
     /// and its size its allocation's. Do: check a pinned image running its members alone, and one with a
     /// command, and read each back from JSON. Expect: both pass, read back whole, and a run of either is
     /// refused (a VM has an init). Do: break the image's pin, its digest's algorithm or digits, the name
@@ -1610,7 +1931,7 @@ mod tests {
         };
         for image in [pinned.clone(), commanded] {
             let boxed = image_box(image);
-            assert_eq!(boxed.class.class(), Class::Shards);
+            assert_eq!(boxed.class.class(), Class::ShardsImage);
             assert_eq!(boxed.check(), Ok(()));
             assert!(matches!(
                 boxed.check_run(),
@@ -1690,6 +2011,57 @@ mod tests {
                     why,
                 }) => assert!(why.contains(says), "{says}: refused as {why:?}"),
                 other => panic!("{says}: {other:?}"),
+            }
+        }
+    }
+
+    /// AC-T7.4.1 (kiln plan 01a1dd2e…, P2.2; shards-image-class.md §11): a scheduler's payload of an image VM names no
+    /// allocation, its scheduler deriving it as it admits the box. Do: check an image VM with no allocation as a
+    /// payload and as a box to make; then break its pin, and name a device. Expect: the payload passes and the box is
+    /// refused naming its allocation; each break refused by both checks alike, naming its field.
+    #[test]
+    fn p2_2_an_image_payload_is_checked_without_the_allocation_its_scheduler_derives() {
+        let mut payload = image_box(ShardsImage::new(crate::sim::SIM_IMAGE));
+        payload.allocation = None;
+        assert_eq!(payload.check_payload(), Ok(()));
+        match payload.check() {
+            Err(Refusal::Invalid {
+                what: "shards image",
+                why,
+            }) => assert!(why.contains("allocation"), "refused as {why:?}"),
+            other => panic!("{other:?}"),
+        }
+        type Break = Box<dyn Fn(&mut BoxSpec)>;
+        let cases: Vec<(&str, Break)> = vec![
+            (
+                "pinned",
+                Box::new(|spec: &mut BoxSpec| {
+                    if let ClassSpec::ShardsImage(image) = &mut spec.class {
+                        image.image = "harness:1".to_owned();
+                    }
+                }),
+            ),
+            (
+                "devices",
+                Box::new(|spec: &mut BoxSpec| {
+                    spec.devices = vec![DeviceId {
+                        kind: crate::DeviceKind::Gpu,
+                        key: 1,
+                    }]
+                }),
+            ),
+        ];
+        for (says, break_it) in cases {
+            let mut broken = payload.clone();
+            break_it(&mut broken);
+            for checked in [broken.check_payload(), broken.check()] {
+                match checked {
+                    Err(Refusal::Invalid {
+                        what: "shards image",
+                        why,
+                    }) => assert!(why.contains(says), "{says}: refused as {why:?}"),
+                    other => panic!("{says}: {other:?}"),
+                }
             }
         }
     }

@@ -27,8 +27,9 @@ use crate::calls::{
 use crate::copy::{Cut, Cuts, DuplexIo, copy, copy_in};
 
 /// The OS handle under a guest connection, which an event loop waits on: a file descriptor on Unix, a
-/// Winsock socket on Windows.
-pub use shards_api::Handle;
+/// Winsock socket on Windows, as the client's own waits take one. A Shards guest's stream on Windows is two named pipes
+/// (Shards' D272), on which no socket wait waits, so it is bridged to a local socket there ([`shards`]).
+pub use crate::calls::Handle;
 
 /// One fallibly allocated, uniquely owned duplex facade. Native stream cloning remains explicit.
 pub type DuplexOwner = triomphe::UniqueArc<dyn Duplex>;
@@ -211,7 +212,9 @@ pub struct Piped {
 /// A connection a link hands to an exec's caller whole ([`Link::dial_handoff_before`]; the review's D-5): its own socket,
 /// moved to the caller once it is named, never a duplicate.
 pub enum Handoff {
-    /// A Shards connection ([`shards::ShardsStream::into_end`]).
+    /// A Shards connection ([`shards::ShardsStream::into_end`]): on Unix, its own socket. On Windows a Shards connection
+    /// is two pipes (Shards' D272), handed over bridged ([`shards::handoff`]).
+    #[cfg(unix)]
     Shards(shards::ShardsStream),
     /// The owner's end of a bridged connection ([`bridge::Bridged::into_socket`]), its cut told to its program's end.
     Bridged(bridge::Bridged),
@@ -221,6 +224,7 @@ impl Handoff {
     /// The connection, named and half-closed through it before it is handed over.
     fn conn(&mut self) -> &mut dyn Duplex {
         match self {
+            #[cfg(unix)]
             Self::Shards(stream) => stream,
             Self::Bridged(bridged) => bridged,
         }
@@ -229,6 +233,7 @@ impl Handoff {
     /// Its socket, its caller's from here, left waiting as a caller's file does (HEX-RT-17).
     fn into_end(self) -> Result<hex_api::End, Refusal> {
         match self {
+            #[cfg(unix)]
             Self::Shards(stream) => stream.into_end(),
             Self::Bridged(bridged) => {
                 let local = bridged
@@ -308,6 +313,7 @@ static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
     ),
     class_waits!("client.guest.answer", "firecracker", measuring),
     class_waits!("client.guest.answer", "shards", measuring),
+    class_waits!("client.guest.answer", "shards-image", measuring),
 ];
 #[cfg(not(target_os = "macos"))]
 static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
@@ -315,6 +321,7 @@ static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
     class_waits!("client.guest.answer", "oci", measuring),
     class_waits!("client.guest.answer", "firecracker", measuring),
     class_waits!("client.guest.answer", "shards", measuring),
+    class_waits!("client.guest.answer", "shards-image", measuring),
 ];
 
 /// The relay's token on a guest's control connection whose caller gave no deadline (the review's D-2), learned as
@@ -387,6 +394,7 @@ static QUIC_CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
     class_waits!("client.quic.answer", "oci", measuring),
     class_waits!("client.quic.answer", "firecracker", measuring),
     class_waits!("client.quic.answer", "shards", measuring),
+    class_waits!("client.quic.answer", "shards-image", measuring),
 ];
 
 static QUIC_RELAY_TOKEN: Patience = Patience::measuring("client.quic.relay.token");
@@ -743,11 +751,18 @@ fn caller_end(conn: &dyn Duplex) -> Result<hex_api::End, Refusal> {
     waiting_end(end)
 }
 
+/// What a caller's end is made of: a file descriptor on Unix (Shards' own stream socket there, `shards_api::OwnedSocket`),
+/// a Winsock socket on Windows, a bridged connection's (a Shards stream's two pipes, D272, are bridged there).
+#[cfg(unix)]
+type OwnedEnd = std::os::fd::OwnedFd;
+#[cfg(windows)]
+type OwnedEnd = std::os::windows::io::OwnedSocket;
+
 /// A stdio connection's socket as its caller's end (HEX-RT-17): Shards waits around a non-blocking socket in its Stream
 /// wrapper, and only the raw socket outlives the handoff, so it is left waiting, as its caller's OwnedStream needs; the
 /// control connection stays evented.
 #[cfg(any(unix, windows))]
-fn waiting_end(socket: shards_api::OwnedSocket) -> Result<hex_api::End, Refusal> {
+fn waiting_end(socket: OwnedEnd) -> Result<hex_api::End, Refusal> {
     #[cfg(unix)]
     {
         let flags = rustix::fs::fcntl_getfl(&socket)
@@ -804,23 +819,27 @@ pub(crate) fn open_offered(
                 )
                 .map_err(|why| shards::refusal(OP, &why))?;
                 deadline.remaining(OP)?;
-                let mut conn = shards::ShardsStream::new(conn)?;
-                name_before(&mut conn, named, deadline)?;
                 conn
             }
-            None => {
-                let mut conn = shards::ShardsStream::new(connect_following(
-                    &identity,
-                    offer.setup,
-                    &OFFERED,
-                )?)?;
-                conn.write_all(&stream::name(named))
-                    .map_err(os("naming a stdio connection"))?;
-                conn
-            }
+            None => connect_following(&identity, offer.setup, &OFFERED)?,
         };
-        // Its own socket, moved to the caller, never a duplicate (the review's D-5).
-        conn.into_end().map(Some)
+        let conn = shards::ShardsStream::new(conn)?;
+        // On Windows a Shards connection is two pipes (Shards' D272): named, then carried on a pipe of the caller's own.
+        #[cfg(windows)]
+        return shards::piped(conn, named, deadline).map(|piped| Some(piped.end));
+        // Its own socket, named, then moved to the caller, never a duplicate (the review's D-5).
+        #[cfg(unix)]
+        {
+            let mut conn = shards::handoff(conn)?;
+            match deadline {
+                Some(deadline) => name_before(conn.conn(), named, deadline)?,
+                None => conn
+                    .conn()
+                    .write_all(&stream::name(named))
+                    .map_err(os("naming a stdio connection"))?,
+            }
+            conn.into_end().map(Some)
+        }
     };
     Ok(hex_api::Given {
         stdin: open(offer.streams.stdin, stream::Stdio::In)?,

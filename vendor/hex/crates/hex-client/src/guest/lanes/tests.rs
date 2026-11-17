@@ -50,6 +50,7 @@ impl Run {
                 inputs: &[],
                 execs: None,
                 sockets: Some(admitted),
+                bridges: &[],
             },
         )
         .unwrap();

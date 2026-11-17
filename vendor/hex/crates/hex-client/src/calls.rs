@@ -97,16 +97,17 @@ pub enum BoxKind {
 pub const BOX_KINDS: usize = BoxKind::Mcp as usize + 1;
 
 /// The classes a box is of ([`Class`]), a table of box kinds' waits for each, in [`by_class`]'s order.
-pub const CLASSES: usize = 4;
+pub const CLASSES: usize = 5;
 
-/// `tables`' entry for `class`: process, oci, firecracker, shards, in that order.
+/// `tables`' entry for `class`: process, oci, firecracker, shards, shards-image, in that order.
 pub(crate) fn by_class<W>(tables: &[W; CLASSES], class: Class) -> &W {
-    let [process, oci, firecracker, shards] = tables;
+    let [process, oci, firecracker, shards, shards_image] = tables;
     match class {
         Class::Process => process,
         Class::Oci => oci,
         Class::Firecracker => firecracker,
         Class::Shards => shards,
+        Class::ShardsImage => shards_image,
     }
 }
 
@@ -164,6 +165,7 @@ static UNRECORDED: [[Patience; BOX_KINDS]; CLASSES] = [
     class_waits!("client.unrecorded", "oci", measuring),
     class_waits!("client.unrecorded", "firecracker", measuring),
     class_waits!("client.unrecorded", "shards", measuring),
+    class_waits!("client.unrecorded", "shards-image", measuring),
 ];
 
 /// The wait of `request`'s plain kind in `waits`, a client's table of its plain kinds' learned waits (decision 9: a
@@ -3277,6 +3279,26 @@ impl<T: Transport> Runtime for Core<T> {
         )
     }
 
+    /// Refused, typed, before anything is sent: the node's wire carries no member exec yet (kiln's P7.1b runs its programs
+    /// in members through a runtime made in its own process, hex-node's `ImageRuntime`), and the trait's refusal would
+    /// read as a box with no members.
+    fn exec_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        program: Program,
+        stdio: Stdio,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        let _ = (member, program, stdio);
+        Err(Refusal::Invalid {
+            what: "exec_member",
+            why: format!(
+                "box {id}: the node's wire carries no member exec yet; a program in a member runs through a runtime in \
+                 the node's own process"
+            ),
+        })
+    }
+
     // Joint plan step 14: a box's room, rate and host use are told and read in the node's own process, by its charge
     // learner and by a runtime made in its caller's process; the node's wire carries none of them yet.
     fn room(&self, id: &BoxId, room: Option<i64>) -> Result<Option<u64>, Refusal> {
@@ -3309,6 +3331,18 @@ impl<T: Transport> Runtime for Core<T> {
             why: format!(
                 "box {id}: the node's wire carries no host-use call yet; a box's host use is read in the node's own \
                  process"
+            ),
+        })
+    }
+
+    // Kiln plan step 35: a box's agent-control link is read in the process holding its run's controller, the node's own
+    // or a runtime made in its caller's process, as kiln's is; the node's wire carries no link call yet.
+    fn link(&self, id: &BoxId) -> Result<hex_api::ControlLink, Refusal> {
+        Err(Refusal::Invalid {
+            what: "link",
+            why: format!(
+                "box {id}: the node's wire carries no link call yet; a box's agent-control link is read in the node's \
+                 own process"
             ),
         })
     }

@@ -63,7 +63,7 @@ fn checked_name(name: &str) -> Result<(), Refusal> {
 fn checked_shape(spec: &NodeSpec) -> Result<(), Refusal> {
     spec.check_runtime_pools()
         .map_err(|e| invalid(e.to_string()))?;
-    for class in [Class::Firecracker, Class::Shards] {
+    for class in [Class::Firecracker, Class::Shards, Class::ShardsImage] {
         if spec.routes.is_none()
             && spec.classes.has(class)
             && spec.costs.get(class.index()).is_none_or(Option::is_none)
@@ -77,7 +77,7 @@ fn checked_shape(spec: &NodeSpec) -> Result<(), Refusal> {
         return Err(invalid("device list and GPU capacity disagree"));
     }
     let mut classes = Classes::NONE;
-    for class in [Class::Oci, Class::Firecracker, Class::Shards] {
+    for class in Class::ALL {
         if spec.classes.has(class) {
             classes = classes.with(class);
         }

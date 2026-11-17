@@ -491,7 +491,7 @@ impl Layout {
                 node.id =
                     NodeId(u32::try_from(at).map_err(|_| SimError::Config("too many nodes"))?);
             }
-            let classes = [Class::Oci, Class::Firecracker, Class::Shards]
+            let classes = Class::ALL
                 .into_iter()
                 .filter(|&c| local.iter().any(|n| n.classes.has(c)))
                 .fold(Classes::NONE, Classes::with);

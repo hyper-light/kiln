@@ -16,6 +16,7 @@ fn relay_payload_class(spec: OciSpec) -> ClassSpec {
         hex_sim::model::Class::Oci => ClassSpec::Oci(spec),
         hex_sim::model::Class::Firecracker => ClassSpec::Firecracker(spec),
         hex_sim::model::Class::Shards => ClassSpec::Shards(spec),
+        hex_sim::model::Class::ShardsImage => panic!("the relay's class is never the image class"),
     }
 }
 

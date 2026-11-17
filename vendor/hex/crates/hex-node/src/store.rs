@@ -589,6 +589,15 @@ impl Store {
             true,
             &record.spec.id,
         )?;
+        // What its VM used in all where its run ended on its own (D260's final use), written with its end: a fact as its
+        // exit is, kept for its delete with its host use.
+        let final_use = lifecycle_fact(
+            "final_use",
+            current.final_use.take(),
+            record.final_use.clone(),
+            true,
+            &record.spec.id,
+        )?;
         // The file its run host's diagnostics are kept in (D258), named with its start's intent alone.
         let diagnostics = lifecycle_fact(
             "diagnostics",
@@ -613,6 +622,7 @@ impl Store {
         current.exit = exit;
         current.ended = ended;
         current.started_from = started_from;
+        current.final_use = final_use;
         current.diagnostics = diagnostics;
         current.native_scope = native_scope;
         // Both writers count monotonically: publishing a backend completion cannot discard a
@@ -1450,7 +1460,7 @@ fn must_outlive_host(record: &BoxRecord) -> bool {
 fn managed_scope_required(record: &BoxRecord) -> bool {
     matches!(
         record.spec.class.class(),
-        hex_api::Class::Shards | hex_api::Class::Firecracker
+        hex_api::Class::Shards | hex_api::Class::ShardsImage | hex_api::Class::Firecracker
     ) || (record.spec.class.class() == hex_api::Class::Oci && record.spec.allocation.is_some())
 }
 
@@ -1694,6 +1704,68 @@ mod tests {
         };
         assert!(store.put_lifecycle(&other_start).is_err());
         assert_eq!(read(), kept);
+    }
+
+    /// Kiln's P7.1b (Shards' D260; AC-T7.4.1): a Shards image VM whose run ended on its own has what its VM used in all
+    /// written with its end through the lifecycle writes, kept for its delete with its host use across the node's
+    /// restarts, a fact as its exit is. Do write a Ready record, then it with its exit and its final use, then as a
+    /// writer that read it before; then another use; then reopen the store's directory and read it. Expect the use kept
+    /// as written, the stale writer's absence keeping it, another refused Uncertain naming it, and the reopened store
+    /// reading it alike.
+    #[test]
+    fn p7_lifecycle_writes_keep_a_runs_final_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let mut stale = record("image-final-use");
+        stale.phase = Phase::Creating;
+        store.put_lifecycle(&stale).unwrap();
+        stale.phase = Phase::Ready;
+        store.put_lifecycle(&stale).unwrap();
+        let used = hex_api::HostUse {
+            cpu_ns: 9_000_000,
+            footprint_bytes: 1 << 20,
+            resident_bytes: 1 << 20,
+            guest_ns: vec![1_000, 2_000],
+            window: std::time::Duration::from_millis(250),
+            charged: hex_api::Charged::ToThread,
+        };
+        let ended = BoxRecord {
+            exit: Some(hex_api::Exit::Code(0)),
+            final_use: Some(used.clone()),
+            ..stale.clone()
+        };
+        store.put_lifecycle(&ended).unwrap();
+        let read = || store.read_lifecycle(&stale.spec.id).unwrap().unwrap();
+        assert_eq!(read().final_use.as_ref(), Some(&used));
+        store.put_lifecycle(&stale).unwrap();
+        assert_eq!(
+            read().final_use.as_ref(),
+            Some(&used),
+            "a stale writer's absence keeps it"
+        );
+        let other = BoxRecord {
+            final_use: Some(hex_api::HostUse {
+                cpu_ns: 1,
+                ..used.clone()
+            }),
+            ..ended.clone()
+        };
+        let refused = store.put_lifecycle(&other);
+        assert!(
+            matches!(&refused, Err(Refusal::Lifecycle { why: Some(why), .. }) if why.contains("final_use")),
+            "{refused:?}"
+        );
+        assert_eq!(read().final_use.as_ref(), Some(&used));
+        drop(store);
+        let reopened = store_in(dir.path());
+        assert_eq!(
+            reopened
+                .read_lifecycle(&stale.spec.id)
+                .unwrap()
+                .unwrap()
+                .final_use,
+            Some(used)
+        );
     }
 
     /// Joint plan step 12 (ROOT, 2026-11-13: every Lifecycle Uncertain gets its reason; a bare one cost two diagnoses):

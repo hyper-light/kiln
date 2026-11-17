@@ -55,6 +55,7 @@ static CLASS_ANSWERS: [[Patience; BOX_KINDS]; CLASSES] = [
     class_waits!("client.answer", "oci", measuring),
     class_waits!("client.answer", "firecracker", measuring),
     class_waits!("client.answer", "shards", measuring),
+    class_waits!("client.answer", "shards-image", measuring),
 ];
 
 pub type Client = Core<Socket>;

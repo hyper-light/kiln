@@ -236,10 +236,12 @@ fn ended_by_node_vm(record: &BoxRecord) -> Option<hex_api::NodeRun> {
     }
 }
 
-/// The class a VM of `class` is learned in: a Shards or Firecracker microVM's; none for a native box's.
+/// The class a VM of `class` is learned in: a Shards, Shards image or Firecracker microVM's, an image VM's its own (P2.2);
+/// none for a native box's.
 fn vm_class(class: hex_api::Class) -> Option<Class> {
     match class {
         hex_api::Class::Shards => Some(Class::Shards),
+        hex_api::Class::ShardsImage => Some(Class::ShardsImage),
         hex_api::Class::Firecracker => Some(Class::Firecracker),
         hex_api::Class::Process | hex_api::Class::Oci => None,
     }
@@ -562,7 +564,9 @@ pub(crate) fn sort<'a, R: std::borrow::Borrow<BoxRecord>>(
                 && match record.spec.class.class() {
                     hex_api::Class::Process => true,
                     hex_api::Class::Oci => !hosted,
-                    hex_api::Class::Shards | hex_api::Class::Firecracker => false,
+                    hex_api::Class::Shards
+                    | hex_api::Class::ShardsImage
+                    | hex_api::Class::Firecracker => false,
                 } =>
             {
                 CapacityResources {
@@ -887,8 +891,8 @@ pub(crate) fn ran(
 /// to await.
 fn move_awaits(class: Class) -> Option<Upstream> {
     match class {
-        Class::Shards => Some(Upstream::LiveMove),
-        _ => None,
+        Class::Shards | Class::ShardsImage => Some(Upstream::LiveMove),
+        Class::Oci | Class::Firecracker => None,
     }
 }
 
@@ -2002,6 +2006,7 @@ impl Learner {
             }
             let class = match record.class() {
                 hex_api::Class::Shards => Class::Shards,
+                hex_api::Class::ShardsImage => Class::ShardsImage,
                 hex_api::Class::Firecracker => Class::Firecracker,
                 hex_api::Class::Process | hex_api::Class::Oci => continue,
             };
@@ -2144,7 +2149,7 @@ impl Learner {
             let Some(vm) = self.vms.get(&scope) else {
                 continue;
             };
-            if vm.class != Class::Shards
+            if !matches!(vm.class, Class::Shards | Class::ShardsImage)
                 || vm.awaits.is_some()
                 || (vm.room == Some(budget.room) && vm.untold.is_none())
             {

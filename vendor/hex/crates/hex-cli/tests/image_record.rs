@@ -176,6 +176,8 @@ fn spec(
         gpu_report: None,
         // No plug root (Shards' D271, image channel v35): nothing is plugged into its run as it runs.
         plug_roots: Vec::new(),
+        // No member's reach past its image's grants (Shards' D278, image channel v39).
+        egress_ceiling: Vec::new(),
     }
 }
 

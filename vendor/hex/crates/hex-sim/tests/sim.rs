@@ -875,6 +875,7 @@ fn the_hard_filters_keep_every_placement_in_bounds() {
                 Class::Oci => 0,
                 Class::Firecracker => 1,
                 Class::Shards => 2,
+                Class::ShardsImage => panic!("the generator draws no Shards image VM"),
             };
             match w.kind {
                 Kind::Benchmark => benchmarks[at] += 1,

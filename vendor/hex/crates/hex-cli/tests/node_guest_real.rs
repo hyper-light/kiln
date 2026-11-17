@@ -868,6 +868,9 @@ mod kvm {
                 host: share.dir.clone(),
                 at: share.at.clone(),
                 read_only: share.read_only,
+                // As the node's guest runtime gives them (guest/mod.rs): run from, and the run's own root alone.
+                exec: true,
+                members: None,
             })
             .collect();
         let identity = shards_api::control::Identity::generate().unwrap();

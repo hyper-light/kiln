@@ -39,13 +39,17 @@ use sha2::{Digest, Sha256};
 /// instead of hanging it.
 const PATIENCE: Duration = Duration::from_secs(60);
 
-/// The controller: argv as the SDK prepares it, plus the helper's `--host-lifeline FD`. It records itself
-/// in the lab's `records` folder (`RECORDS`, written in when the lab writes the script), and its descendant
-/// records itself there once it ignores SIGHUP, so it outlives the controller: a controller's end orphans
-/// its group, which the kernel hangs up where a member is stopped (XNU's `orphanpg`), and one hung up
-/// before its trap would end with the controller by chance. The descendant never reads the lifeline. The
-/// controller then reads its lifeline until the helper's end closes it.
+/// The guest's `shards`. A node asks it `api-check`, Shards' check of the host (D262), as the node starts
+/// (docs/design/shards-image-class.md §11): it answers nothing and records nothing, so the node lists no
+/// image class and the lab's records hold controllers alone. Otherwise it is the controller: argv as the
+/// SDK prepares it, plus the helper's `--host-lifeline FD`. It records itself in the lab's `records` folder
+/// (`RECORDS`, written in when the lab writes the script), and its descendant records itself there once it
+/// ignores SIGHUP, so it outlives the controller: a controller's end orphans its group, which the kernel
+/// hangs up where a member is stopped (XNU's `orphanpg`), and one hung up before its trap would end with
+/// the controller by chance. The descendant never reads the lifeline. The controller then reads its
+/// lifeline until the helper's end closes it.
 const CONTROLLER: &str = r#"#!/bin/sh
+if [ "$1" = "api-check" ]; then exit 0; fi
 echo $$ > "RECORDS/controller.$$"
 lifeline=""
 while [ $# -gt 0 ]; do

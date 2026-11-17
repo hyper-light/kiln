@@ -144,7 +144,9 @@ pub fn parse(text: &str, limits: &Limits) -> Result<Cluster, TraceError> {
                     classes,
                     platform: Default::default(),
                     virt: Virt {
-                        kvm: classes.has(Class::Firecracker) || classes.has(Class::Shards),
+                        kvm: classes.has(Class::Firecracker)
+                            || classes.has(Class::Shards)
+                            || classes.has(Class::ShardsImage),
                         ..Virt::default()
                     },
                     devices: crate::model::unnamed_gpus(gpus),
@@ -338,7 +340,11 @@ fn class(text: &str, line: usize) -> Result<Class, TraceError> {
         "oci" => Ok(Class::Oci),
         "firecracker" => Ok(Class::Firecracker),
         "shards" => Ok(Class::Shards),
-        _ => Err(bad(line, "a class not oci, firecracker or shards")),
+        "shards-image" => Ok(Class::ShardsImage),
+        _ => Err(bad(
+            line,
+            "a class not oci, firecracker, shards or shards-image",
+        )),
     }
 }
 
@@ -347,7 +353,7 @@ fn class(text: &str, line: usize) -> Result<Class, TraceError> {
 fn node_classes(text: &str, line: usize) -> Result<Classes, TraceError> {
     let mut classes = Classes::NONE;
     for (n, name) in text.split('+').enumerate() {
-        if n >= 3 {
+        if n >= Class::COUNT {
             return Err(bad(line, "more classes than there are"));
         }
         classes = classes.with(class(name, line)?);

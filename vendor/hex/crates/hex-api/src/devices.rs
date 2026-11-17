@@ -213,7 +213,8 @@ mod unavailable_cause {
 }
 
 impl BackendUnavailable {
-    /// There are exactly two VM observer classes in the existing public Class enum.
+    /// There are exactly two VM observer classes in the public Class enum: a Shards image VM attaches no physical
+    /// device (D231), so its class observes none.
     pub const MAX_COUNT: usize = [crate::Class::Firecracker, crate::Class::Shards].len();
 
     pub fn from_refusal(backend: crate::Class, cause: Refusal) -> Result<Self, Refusal> {

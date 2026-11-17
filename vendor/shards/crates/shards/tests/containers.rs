@@ -179,11 +179,29 @@ fn exit(child: &mut Child, home: &Path) -> Option<i32> {
             return status.code();
         }
         if !patience.holds() {
+            let stood = standing(home);
             let _ = child.kill();
-            panic!("shards run did not exit, it, its daemon and microVMs no longer progressing");
+            panic!(
+                "shards (process {}) did not exit, it, its daemon and microVMs no longer progressing\n{stood}",
+                child.id()
+            );
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Where `home` stands, read with no client of its own, which, of another build than its
+/// daemon (a gated test's daemon, [`Gated`]), would replace that daemon
+/// (`shards_ipc::Identity::of_build`): its daemon's last words, last first, and the processes
+/// under it. Linux CI's hang watcher takes their stacks.
+fn standing(home: &Path) -> String {
+    let log = std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default();
+    let tail: Vec<&str> = log.lines().rev().take(40).collect();
+    format!(
+        "daemon.log, last first:\n{}\nprocesses:\n{}",
+        tail.join("\n"),
+        common::processes_under(&log)
+    )
 }
 
 /// Waits for process `pid` to end while it goes on (`common::Wait` on it and what descends
@@ -348,13 +366,20 @@ fn many_published_ports_all_reach_the_guest() {
 
 /// `--network container:NAME` (D119): the joiner runs in the provider's microVM, in its
 /// network namespace, as Docker's joiner runs in the provider's: it reaches the provider's
-/// listener on the loopback, and has its hostname.
+/// listener on the loopback, and has its hostname. The provider serves the joiner's one ask and
+/// ends as the joiner does, and their microVM ends with them, its daemon going on: its guest,
+/// counting the joiner unfinished as the provider's command ended, takes only `SAVE` for the
+/// provider's layer, which its VM once asked as `KEEP`, the joiner having left its own count
+/// by then, each then waiting on the other past the runs and past the daemon (CI 43968984258,
+/// x86_64 musl: this test's microVM 20 minutes past its daemon's end; `warm::joined`).
 #[test]
 fn a_container_joins_another_containers_network() {
     let Some((home, image)) = home("containers-join") else {
         return;
     };
     let mut provider = start(&home, &image, &["--name", "prov"], &["serve", "7000", "1"]);
+    let vm = shards_in(&home, &["inspect", "vm", "-f", "{{.State.Pid}}", "prov"]);
+    let vm: u32 = vm.stdout.trim().parse().unwrap_or_else(|_| panic!("{vm}"));
     let joined = run_in(
         &home,
         &image,
@@ -367,6 +392,12 @@ fn a_container_joins_another_containers_network() {
         "{joined}"
     );
     assert_eq!(exit(&mut provider, &home), Some(0));
+    if let Err(refused) = process_ended(vm, "a provider's VM past its run and its joiner's") {
+        panic!(
+            "{refused}\n{}",
+            common::stacks_of(&[("its VM process", vm)], Some(&*home))
+        );
+    }
 }
 
 /// A joiner is a container of its own (D119): detached, its log kept; an exec in it runs
@@ -8146,7 +8177,12 @@ fn usage_mistakes_are_answered_without_a_daemon() {
 /// This build's `shards`, whose runs' VMs wait before they are ready for as long as the
 /// test keeps a gate shut, so that a run stays pending, its microVM created (audit A06).
 /// On Unix it is in a directory of its own, with a VM process binary (`SHARDS_VM_BINARY`)
-/// that waits for the gate to open before it becomes this build's. Windows has no exec,
+/// that waits at the gate, a FIFO, before it becomes this build's: in its open of it,
+/// running nothing, until a writer opens it (fifo(7)), so that a client the test waits on
+/// is judged on its own progress and its daemon's, never on a gate's poll (one stuck past a
+/// polled gate ran to CI's step limit, undumped: CI 43968984258, x86_64 gnu,
+/// `rm_cancels_a_run_whose_vm_is_not_ready`). Let through, it goes on where the test opened
+/// the gate, and ends where the test ended first. Windows has no exec,
 /// and a VM process opens nothing but what its daemon opens for it (D30): there the gate
 /// is a copy of the init its runs boot, held open sharing nothing under an oplock
 /// ([`common::Oplocked`]), so that the daemon's open of it for a VM waits until the gate opens.
@@ -8157,6 +8193,11 @@ struct Gated {
     #[cfg(windows)]
     held: std::cell::RefCell<Option<common::Oplocked>>,
     dir: TempDir,
+    // After the directory: the gate's FIFO is held open for writing until its name has gone,
+    // so that a VM process that comes to it as the directory goes finds no FIFO, never one
+    // with no writer to wait for.
+    #[cfg(unix)]
+    writer: std::cell::RefCell<Option<std::fs::File>>,
 }
 
 impl Gated {
@@ -8169,17 +8210,24 @@ impl Gated {
                 shards_testdir::program_copy(from, &dir.join(to)).unwrap();
             }
         }
+        let gate = dir.join("gate");
+        let fifo = std::ffi::CString::new(gate.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo(3) of a NUL-terminated path.
+        let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "{}: {}", gate.display(), std::io::Error::last_os_error());
         let vm = dir.join("shards-vm");
-        // It gives up once the test's directory has gone.
         let script = format!(
-            "#!/bin/sh\nwhile [ ! -e '{open}' ]; do [ -d '{dir}' ] || exit 1; sleep 0.01; done\nexec '{vm}' \"$@\"\n",
+            "#!/bin/sh\n: <'{gate}'\n[ -e '{open}' ] || exit 1\nexec '{vm}' \"$@\"\n",
+            gate = gate.display(),
             open = dir.join("open").display(),
-            dir = dir.display(),
             vm = shards_vm().display()
         );
         // Exec'd by the daemon's spawner.
         shards_testdir::program(&vm, &script).unwrap();
-        Gated { dir }
+        Gated {
+            dir,
+            writer: std::cell::RefCell::new(None),
+        }
     }
 
     #[cfg(windows)]
@@ -8196,6 +8244,18 @@ impl Gated {
     #[cfg(unix)]
     fn open(&self) {
         std::fs::write(self.dir.join("open"), b"").unwrap();
+        *self.writer.borrow_mut() = Some(self.open_writer().unwrap());
+    }
+
+    /// The gate's FIFO opened for writing, which lets every VM process at it through, and
+    /// every one after while it is held: read and write, so that its open waits for no reader
+    /// (fifo(7): Linux; XNU's `fifo_open` alike).
+    #[cfg(unix)]
+    fn open_writer(&self) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.dir.join("gate"))
     }
 
     #[cfg(windows)]
@@ -8261,6 +8321,18 @@ impl Gated {
     }
 }
 
+/// A gate the test left shut lets its VM processes through as the test ends, to find it shut
+/// for good and end.
+#[cfg(unix)]
+impl Drop for Gated {
+    fn drop(&mut self) {
+        if self.writer.get_mut().is_none() {
+            let writer = self.open_writer().ok();
+            *self.writer.get_mut() = writer;
+        }
+    }
+}
+
 /// A command left going, its output collected as it comes.
 struct Going {
     child: Child,
@@ -8302,10 +8374,6 @@ fn created(gated: &Gated, home: &Path, run: &mut Going) -> String {
         }
         *last.borrow_mut() = listed.to_string();
         if !patience.holds() {
-            // Where the run stands: what the daemon said, and its processes.
-            let log = std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default();
-            let tail: Vec<&str> = log.lines().rev().take(40).collect();
-            let procs = common::processes_under(&log);
             // The run's client, if it has ended: what it said.
             let client = match run.child.try_wait() {
                 Ok(Some(status)) => {
@@ -8319,9 +8387,9 @@ fn created(gated: &Gated, home: &Path, run: &mut Going) -> String {
                 Err(e) => format!("unknown: {e}"),
             };
             panic!(
-                "the run's container never showed while its daemon progressed; the last ps: {}\nthe run's client: {client}\ndaemon.log, last first:\n{}\nprocesses:\n{procs}",
+                "the run's container never showed while its daemon progressed; the last ps: {}\nthe run's client: {client}\n{}",
                 last.borrow(),
-                tail.join("\n")
+                standing(home)
             );
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -17600,13 +17668,15 @@ fn a_runs_log_is_compressed_and_queued_as_its_options_say() {
     }
 }
 
-/// `listener`'s first connection, from `home`'s daemon, waited for while that daemon and its
-/// microVMs go on ([`Patience`], its kind its caller's call site): none where its wait is
-/// refused, which a test then fails on, not waits for ever.
+/// `listener`'s first connection, from `home`'s daemon as it delivers a run's log to `to`
+/// (the run's `--log-opt` that addresses it), waited for while that daemon and its microVMs
+/// go on ([`Patience`], its kind its caller's call site), and while that run's shipper
+/// sleeps before its next try there (D209 Part 10): none where its wait is refused, which a
+/// test then fails on, not waits for ever.
 #[track_caller]
-fn accept_within(listener: &std::net::TcpListener, home: &Path) -> Option<std::net::TcpStream> {
+fn accept_within(listener: &std::net::TcpListener, home: &Path, to: &str) -> Option<std::net::TcpStream> {
     listener.set_nonblocking(true).unwrap();
-    let mut patience = Patience::of(home);
+    let mut patience = Patience::of(home).delivery_to(to);
     loop {
         match listener.accept() {
             Ok((conn, _)) => {
@@ -17682,16 +17752,18 @@ fn syslog_parts(parts: &[usize]) {
     assert!((8000..8192).contains(&whole[0]), "{parts:?}");
 }
 
-/// What a syslog server reads on `listener`'s first connection: its lines until `lines`
-/// have come, or all it gets until the connection ends; none where none comes.
+/// What a syslog server reads on `listener`'s first connection, a run's log delivered to
+/// `to` ([`accept_within`]): its lines until `lines` have come, or all it gets until the
+/// connection ends; none where none comes.
 fn syslog_lines(
     listener: std::net::TcpListener,
     lines: usize,
     home: &Path,
+    to: &str,
 ) -> std::thread::JoinHandle<Vec<String>> {
-    let home = home.to_path_buf();
+    let (home, to) = (home.to_path_buf(), to.to_string());
     std::thread::spawn(move || {
-        let Some(conn) = accept_within(&listener, &home) else {
+        let Some(conn) = accept_within(&listener, &home, &to) else {
             return Vec::new();
         };
         let mut read = BufReader::new(common::Following::of_home(&conn, &home));
@@ -17786,7 +17858,7 @@ fn a_runs_log_is_sent_to_syslog_as_its_options_say() {
     // its time its output's.
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = format!("syslog-address=tcp://{}", tcp.local_addr().unwrap());
-    let reading = syslog_lines(tcp, 2, &home);
+    let reading = syslog_lines(tcp, 2, &home, &address);
     syslog(
         "tcp",
         &[&address, "syslog-format=rfc5424micro", "syslog-facility=local0"],
@@ -17873,9 +17945,10 @@ fn a_runs_log_is_sent_to_syslog_as_its_options_say() {
     );
     let tls = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = crate::common::minted_port(tls.local_addr().unwrap().port());
-    let at = home.to_path_buf();
+    let address = format!("syslog-address=tcp+tls://localhost:{port}");
+    let (at, to) = (home.to_path_buf(), address.clone());
     let reading = std::thread::spawn(move || {
-        let Some(conn) = accept_within(&tls, &at) else {
+        let Some(conn) = accept_within(&tls, &at, &to) else {
             return (String::new(), Err(std::io::ErrorKind::NotConnected));
         };
         let mut session = rustls::ServerConnection::new(server).unwrap();
@@ -17892,7 +17965,7 @@ fn a_runs_log_is_sent_to_syslog_as_its_options_say() {
     syslog(
         "tls",
         &[
-            &format!("syslog-address=tcp+tls://localhost:{port}"),
+            &address,
             &format!("syslog-tls-ca-cert={}", ca_file.display()),
             "syslog-format=rfc5424",
             "tag=tls",
@@ -18021,15 +18094,13 @@ fn a_runs_log_is_sent_to_syslog_as_its_options_say() {
 
     // A server that comes up only after the run: its log waits in the store, and goes.
     let port = free_port();
-    syslog(
-        "later",
-        &[&format!("syslog-address=tcp://127.0.0.1:{port}"), "tag=later"],
-        &["streams", "out", "err"],
-    );
+    let address = format!("syslog-address=tcp://127.0.0.1:{port}");
+    syslog("later", &[&address, "tag=later"], &["streams", "out", "err"]);
     let reading = syslog_lines(
         std::net::TcpListener::bind(("127.0.0.1", port)).unwrap(),
         2,
         &home,
+        &address,
     );
     let got = reading.join().unwrap();
     assert!(
@@ -18039,9 +18110,10 @@ fn a_runs_log_is_sent_to_syslog_as_its_options_say() {
 
     // One whose daemon stops before its server comes up: the next daemon sends it.
     let port = free_port();
+    let address = format!("syslog-address=tcp://127.0.0.1:{port}");
     syslog(
         "restarted",
-        &[&format!("syslog-address=tcp://127.0.0.1:{port}"), "tag=restarted"],
+        &[&address, "tag=restarted"],
         &["streams", "out", "err"],
     );
     let stopped = without_vms(&home, &["daemon", "stop"]);
@@ -18052,7 +18124,7 @@ fn a_runs_log_is_sent_to_syslog_as_its_options_say() {
     // `ps` had started one (CI run 43876891053).
     let server = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
     assert_eq!(shards(&["ps", "-a", "-q"]).status, Some(0));
-    let reading = syslog_lines(server, 2, &home);
+    let reading = syslog_lines(server, 2, &home, &address);
     let got = reading.join().unwrap();
     assert!(
         got.len() == 2 && got[0].ends_with(": err\n") && got[1].ends_with(": out\n"),
@@ -18280,9 +18352,9 @@ fn a_runs_log_is_sent_to_gelf_as_its_options_say() {
     // TCP: each message followed by a NUL.
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = format!("gelf-address=tcp://{}", tcp.local_addr().unwrap());
-    let at = home.to_path_buf();
+    let (at, to) = (home.to_path_buf(), address.clone());
     let reading = std::thread::spawn(move || {
-        let conn = accept_within(&tcp, &at).unwrap();
+        let conn = accept_within(&tcp, &at, &to).unwrap();
         let mut read = BufReader::new(common::Following::of_home(&conn, &at));
         let mut got = Vec::new();
         while got.len() < 2 {
@@ -18445,9 +18517,9 @@ fn a_runs_log_is_sent_to_fluentd_as_its_options_say() {
     // TCP, to the nanosecond, an ack asked for each.
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = format!("fluentd-address={}", tcp.local_addr().unwrap());
-    let at = home.to_path_buf();
+    let (at, to) = (home.to_path_buf(), address.clone());
     let reading = std::thread::spawn(move || {
-        let conn = accept_within(&tcp, &at).unwrap();
+        let conn = accept_within(&tcp, &at, &to).unwrap();
         fluentd_events(&mut Answering::of_home(&conn, &at), 2)
     });
     fluentd(

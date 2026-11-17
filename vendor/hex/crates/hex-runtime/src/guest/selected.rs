@@ -129,8 +129,11 @@ impl Record {
             .mem_bytes
             .checked_div(1 << 20)
             .ok_or_else(|| invalid("memory unit conversion failed"))?;
-        if (!matches!(spec.class.class(), Class::Oci | Class::Shards))
-            || (spec.devices.is_empty() && spec.class.class() != Class::Shards)
+        if (!matches!(
+            spec.class.class(),
+            Class::Oci | Class::Shards | Class::ShardsImage
+        )) || (spec.devices.is_empty()
+            && !matches!(spec.class.class(), Class::Shards | Class::ShardsImage))
             || spec.devices.iter().any(|id| id.kind != DeviceKind::Gpu)
         {
             return Err(invalid("a dedicated guest requires exact GPU claims"));

@@ -11,10 +11,15 @@
 //!
 //! A Shards image VM ([`ClassSpec::ShardsImage`]) is a box whose init is its run's command, as the
 //! image class's own cases ([`crate::conformance::IMAGE_CASES`]) hold it: created without a VM, booted
-//! by start, ended by KILL, its members unreached (their exec and signals refused as awaiting Shards'
-//! agent-control endpoint), and its guest time per vCPU read while it runs. The simulated VM runs every
+//! by start, ended by KILL, its members the ones its spec names (taken, signalled, and running the
+//! simulator's programs as a member's exec, `Runtime::exec_member`; an exec naming no member refused as
+//! the class refuses it), and its guest time per vCPU read while it runs. The simulated VM runs every
 //! vCPU the whole time it runs: the most guest time a real one can report, so a consumer's bound holds
-//! against it.
+//! against it. The warm pools it's asked to keep ([`Runtime::keep_pool`]) are names alone, at most one for each box it
+//! may hold: it boots no host ahead of a box, so none is ever warm or starting. Its volumes ([`ShardsImage::volumes`],
+//! kiln plan 01a1dd2e…, P6.2) are the simulator's home's, as the image class holds them: their bounds within the box's
+//! admitted disk, made as its start plugs them, held while its VM runs, and listed and cleared as Shards' store answers
+//! ([`Runtime::volumes`], [`Runtime::clear_volume`]); their files take no bytes, its members writing none.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -25,8 +30,9 @@ use crate::conformance::{Act, Fixture};
 use crate::{
     Allocation, Bounds, BoxId, BoxInfo, BoxSpec, BoxState, CapacityResources, Class, ClassSpec,
     Exit, GuestTime, Member, Network, OciSpec, Proc, Program, Refusal, Rootfs, Runtime,
-    RuntimeCost, ShardsImage, Signal, Stdio, Upstream, Usage,
+    RuntimeCost, ShardsImage, Signal, Stdio, Usage, WarmHeld, WarmPool,
 };
+use crate::{HomeVolume, VolumeCause};
 
 /// The echo program: what comes in on `stdin` goes out on `stdout`, at most [`SIM_ECHO_BYTES`] of it, and it ends
 /// 0 at its input's end (1 past the most it copies), on a thread of its own.
@@ -85,6 +91,17 @@ pub struct SimRuntime {
     term_ends_init: bool,
     /// A specific initialized endpoint, when exercising routing between distinct backends.
     backend: Option<Class>,
+    /// The warm pools it keeps, by name alone, at most [`SIM_BOXES`].
+    pools: Mutex<std::collections::BTreeSet<WarmPool>>,
+    /// Its home's volumes, by name: each its bound and when it was made. Locked after `boxes` where a call takes both.
+    volumes: Mutex<BTreeMap<String, SimVolume>>,
+}
+
+/// A volume of the simulator's home (kiln plan 01a1dd2e…, P6.2): the bound its last first holder set, and when it was
+/// made, in nanoseconds since the Unix epoch.
+struct SimVolume {
+    bound: u64,
+    created_ns: u64,
 }
 
 struct SimBox {
@@ -256,6 +273,114 @@ impl SimRuntime {
 }
 
 impl SimRuntime {
+    /// `image`'s volumes as its run starts, as the class plugs them (kiln plan 01a1dd2e…, P6.2): refused
+    /// `Volume { Bound }` where the running boxes, `held`, serve one with another bound; else each made where it isn't,
+    /// its bound the one asked.
+    fn plug_volumes(
+        &self,
+        held: &BTreeMap<String, u64>,
+        image: &ShardsImage,
+    ) -> Result<(), Refusal> {
+        if let Some(v) = image.volumes.iter().find(|v| {
+            held.get(&v.name)
+                .is_some_and(|bound| *bound != v.bound.get())
+        }) {
+            return Err(Refusal::Volume {
+                cause: VolumeCause::Bound,
+                why: format!(
+                    "volume {} is served with another bound than the {} bytes asked: its bound changes only while no \
+                     run holds it",
+                    v.name, v.bound
+                ),
+            });
+        }
+        let made_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+            });
+        let mut volumes = self.volumes.lock().map_err(poisoned)?;
+        for v in &image.volumes {
+            volumes
+                .entry(v.name.clone())
+                .or_insert(SimVolume {
+                    bound: v.bound.get(),
+                    created_ns: made_ns,
+                })
+                .bound = v.bound.get();
+        }
+        Ok(())
+    }
+
+    /// `program` started in box `b` with `stdio`, the caller's asked ends `given` handed with it: the simulator's
+    /// programs, each run as an exec's is, at most [`SIM_PROCS`] in a box.
+    fn started(
+        b: &mut SimBox,
+        program: &Program,
+        mut stdio: Stdio,
+        given: crate::Given,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        if b.procs.len() >= SIM_PROCS {
+            return Err(Refusal::Full(SIM_PROCS));
+        }
+        let proc = Arc::new(SimProc::default());
+        let name = program.args.first().map(String::as_str).unwrap_or_default();
+        let bounds = &b.spec.bounds;
+        match name {
+            "say" => {
+                let words = program.args.get(1..).unwrap_or_default().join(" ");
+                write(stdio.stdout.as_mut(), format!("{words}\n").as_bytes());
+                proc.end(Exit::Code(0))?;
+            }
+            "fail" => {
+                let code: i32 = arg(program, 1)?;
+                write(stdio.stderr.as_mut(), b"failing\n");
+                proc.end(Exit::Code(code))?;
+            }
+            "wait" => {}
+            "hog" => {
+                let bytes: u64 = arg(program, 1)?;
+                if bounds.memory_max.is_some_and(|m| bytes > m) {
+                    b.usage.oom_kills = b.usage.oom_kills.saturating_add(1);
+                    proc.end(Exit::Signal(Signal::KILL.number()))?;
+                } else {
+                    b.usage.memory_peak_bytes = b.usage.memory_peak_bytes.max(bytes);
+                    proc.end(Exit::Code(0))?;
+                }
+            }
+            "spawn" => {
+                let n: u64 = arg(program, 1)?;
+                // The program is a process itself, so n more need n + 1 within the bound.
+                if bounds.pids_max.is_some_and(|m| n >= u64::from(m)) {
+                    b.usage.pids_refused = b.usage.pids_refused.saturating_add(1);
+                    write(stdio.stderr.as_mut(), b"spawn: can't fork\n");
+                    proc.end(Exit::Code(2))?;
+                } else {
+                    proc.end(Exit::Code(0))?;
+                }
+            }
+            "pwd" => {
+                let cwd = program.cwd.clone().unwrap_or_else(|| "/".to_owned());
+                write(stdio.stdout.as_mut(), format!("{cwd}\n").as_bytes());
+                proc.end(Exit::Code(0))?;
+            }
+            "echo" => echo(Arc::clone(&proc), stdio.stdin.take(), stdio.stdout.take())?,
+            other => {
+                return Err(Refusal::Invalid {
+                    what: "program",
+                    why: format!(
+                        "{other:?}: the simulator runs say, fail, wait, hog, spawn, pwd and echo"
+                    ),
+                });
+            }
+        }
+        if let Some(run) = &b.run {
+            run.left.lock().map_err(poisoned)?.push(Arc::clone(&proc));
+        }
+        b.procs.push(Arc::clone(&proc));
+        Ok(Box::new(SimHandle(proc, Some(given))))
+    }
+
     /// A signal to an image VM: KILL stops it, ending its run as Shards' stop does; any other is its run's
     /// members', which its image runs and take it as their lanes give it (goal 2's item 2), the VM running on;
     /// once it has ended, none reaches it.
@@ -370,6 +495,7 @@ impl Runtime for SimRuntime {
                 Class::Oci,
                 Class::Firecracker,
                 Class::Shards,
+                Class::ShardsImage,
             ],
         }
     }
@@ -402,6 +528,20 @@ impl Runtime for SimRuntime {
                 // the rest awaiting Shards (N4), refused before anything is made.
                 if let Some(needs) = crate::unheld(&image.grants) {
                     return Err(Refusal::Awaits { needs });
+                }
+                // Its volumes' bounds within the disk it was admitted with, as the class holds them (P6.2).
+                let admitted = spec.allocation.map_or(u64::MAX, |a| a.resources.disk_bytes);
+                let bounds = image
+                    .volumes
+                    .iter()
+                    .try_fold(0u64, |all, v| all.checked_add(v.bound.get()));
+                if bounds.is_none_or(|bounds| bounds > admitted) {
+                    return Err(Refusal::Invalid {
+                        what: "shards image",
+                        why: format!(
+                            "its volumes' bounds pass the disk it was admitted with, {admitted} bytes"
+                        ),
+                    });
                 }
             }
             ClassSpec::Process | ClassSpec::Bundle(_) => {}
@@ -446,6 +586,8 @@ impl Runtime for SimRuntime {
 
     fn start(&self, id: &BoxId) -> Result<(), Refusal> {
         let mut boxes = self.boxes()?;
+        // What the running boxes hold before this one starts, which holds nothing until it does.
+        let held = held_bounds(&boxes)?;
         let b = boxes
             .get_mut(id)
             .ok_or_else(|| Refusal::NoSuchBox(id.clone()))?;
@@ -463,6 +605,14 @@ impl Runtime for SimRuntime {
         }
         if init.exit()?.is_some() {
             return Err(Refusal::NotRunning(id.clone(), "start"));
+        }
+        if let ClassSpec::ShardsImage(image) = &b.spec.class
+            && let Err(why) = self.plug_volumes(&held, image)
+        {
+            // Its run stopped, as the class stops one a volume is refused to: the box ends, its exit unread.
+            init.end(Exit::Unknown)?;
+            b.started = true;
+            return Err(why);
         }
         if let Some(vm) = &mut b.vm {
             vm.booted = Some(Instant::now());
@@ -487,70 +637,79 @@ impl Runtime for SimRuntime {
         let b = boxes
             .get_mut(id)
             .ok_or_else(|| Refusal::NoSuchBox(id.clone()))?;
+        // A program in an image VM runs in a member it names, as the class refuses one that names none.
         if b.vm.is_some() {
-            return Err(Refusal::Awaits {
-                needs: Upstream::MemberExec,
+            return Err(Refusal::Invalid {
+                what: "exec",
+                why: format!(
+                    "box {id} is a Shards image VM: a program runs in one of its members, which exec_member names"
+                ),
             });
         }
-        if b.procs.len() >= SIM_PROCS {
-            return Err(Refusal::Full(SIM_PROCS));
+        Self::started(b, &program, stdio, given)
+    }
+
+    /// A program in a member of a running image VM its spec names (`Runtime::exec_member`), run as an exec's program is:
+    /// its run's members the spec's here, as `signal_member` has them. Refused as the class refuses it: a program naming
+    /// a user, Invalid; a member the spec names not, Invalid; a VM not running, or a member its caller took that has
+    /// ended, NotRunning.
+    fn exec_member(
+        &self,
+        id: &BoxId,
+        member: &Member,
+        program: Program,
+        mut stdio: Stdio,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        program.check()?;
+        program.fits(&SIM_EXEC_LIMIT)?;
+        if program.user.is_some() {
+            return Err(Refusal::Invalid {
+                what: "program",
+                why: "a program in a Shards image VM's member runs as its member does: it names no user"
+                    .to_owned(),
+            });
         }
-        let proc = Arc::new(SimProc::default());
-        let name = program.args.first().map(String::as_str).unwrap_or_default();
-        let bounds = &b.spec.bounds;
-        match name {
-            "say" => {
-                let words = program.args.get(1..).unwrap_or_default().join(" ");
-                write(stdio.stdout.as_mut(), format!("{words}\n").as_bytes());
-                proc.end(Exit::Code(0))?;
-            }
-            "fail" => {
-                let code: i32 = arg(&program, 1)?;
-                write(stdio.stderr.as_mut(), b"failing\n");
-                proc.end(Exit::Code(code))?;
-            }
-            "wait" => {}
-            "hog" => {
-                let bytes: u64 = arg(&program, 1)?;
-                if bounds.memory_max.is_some_and(|m| bytes > m) {
-                    b.usage.oom_kills = b.usage.oom_kills.saturating_add(1);
-                    proc.end(Exit::Signal(Signal::KILL.number()))?;
-                } else {
-                    b.usage.memory_peak_bytes = b.usage.memory_peak_bytes.max(bytes);
-                    proc.end(Exit::Code(0))?;
-                }
-            }
-            "spawn" => {
-                let n: u64 = arg(&program, 1)?;
-                // The program is a process itself, so n more need n + 1 within the bound.
-                if bounds.pids_max.is_some_and(|m| n >= u64::from(m)) {
-                    b.usage.pids_refused = b.usage.pids_refused.saturating_add(1);
-                    write(stdio.stderr.as_mut(), b"spawn: can't fork\n");
-                    proc.end(Exit::Code(2))?;
-                } else {
-                    proc.end(Exit::Code(0))?;
-                }
-            }
-            "pwd" => {
-                let cwd = program.cwd.clone().unwrap_or_else(|| "/".to_owned());
-                write(stdio.stdout.as_mut(), format!("{cwd}\n").as_bytes());
-                proc.end(Exit::Code(0))?;
-            }
-            "echo" => echo(Arc::clone(&proc), stdio.stdin.take(), stdio.stdout.take())?,
-            other => {
-                return Err(Refusal::Invalid {
-                    what: "program",
-                    why: format!(
-                        "{other:?}: the simulator runs say, fail, wait, hog, spawn, pwd and echo"
-                    ),
-                });
-            }
+        let given = stdio.make_asked()?;
+        let mut boxes = self.boxes()?;
+        let b = boxes
+            .get_mut(id)
+            .ok_or_else(|| Refusal::NoSuchBox(id.clone()))?;
+        let ClassSpec::ShardsImage(image) = &b.spec.class else {
+            return Err(Refusal::Invalid {
+                what: "member",
+                why: format!(
+                    "box {id} isn't a Shards image box: only one has members a program runs in"
+                ),
+            });
+        };
+        if !image.members.iter().any(|m| &m.member == member) {
+            return Err(Refusal::Invalid {
+                what: "member",
+                why: format!("box {id}'s run declares no {member}"),
+            });
         }
-        if let Some(run) = &b.run {
-            run.left.lock().map_err(poisoned)?.push(Arc::clone(&proc));
+        let running = match &b.init {
+            Some(init) => b.started && init.exit()?.is_none(),
+            None => false,
+        };
+        if !running {
+            return Err(Refusal::NotRunning(id.clone(), "exec in a member"));
         }
-        b.procs.push(Arc::clone(&proc));
-        Ok(Box::new(SimHandle(proc, Some(given))))
+        let taken = b.vm.as_ref().and_then(|vm| {
+            vm.taken
+                .iter()
+                .find(|(taken, _)| taken == member)
+                .map(|(_, proc)| Arc::clone(proc))
+        });
+        if let Some(proc) = taken
+            && proc.exit()?.is_some()
+        {
+            return Err(Refusal::NotRunning(
+                id.clone(),
+                "exec in a member: its member refused it, ended or confined",
+            ));
+        }
+        Self::started(b, &program, stdio, given)
     }
 
     /// A member of a running image VM its spec names takes a signal alone (goal 2's item 2), its run's members the
@@ -753,6 +912,95 @@ impl Runtime for SimRuntime {
         }
         Ok(())
     }
+
+    /// Kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1: at most one pool for each box it may hold, as a node keeps at
+    /// most one for each of its boxes, refused `Full` past them.
+    fn keep_pool(&self, pool: &WarmPool) -> Result<(), Refusal> {
+        pool.check()?;
+        let mut pools = self.pools.lock().map_err(poisoned)?;
+        if !pools.contains(pool) && pools.len() >= SIM_BOXES {
+            return Err(Refusal::Full(SIM_BOXES));
+        }
+        pools.insert(pool.clone());
+        Ok(())
+    }
+
+    fn let_go_pool(&self, pool: &WarmPool) -> Result<(), Refusal> {
+        self.pools.lock().map_err(poisoned)?.remove(pool);
+        Ok(())
+    }
+
+    fn pools(&self) -> Result<Vec<WarmHeld>, Refusal> {
+        Ok(self
+            .pools
+            .lock()
+            .map_err(poisoned)?
+            .iter()
+            .map(|pool| WarmHeld {
+                pool: pool.clone(),
+                warm: 0,
+                starting: 0,
+            })
+            .collect())
+    }
+
+    /// Its home's volumes, each with its bound, its files taking no bytes.
+    fn volumes(&self) -> Result<Vec<HomeVolume>, Refusal> {
+        Ok(self
+            .volumes
+            .lock()
+            .map_err(poisoned)?
+            .iter()
+            .map(|(name, v)| HomeVolume {
+                name: name.clone(),
+                bytes: Some(0),
+                bound: Some(v.bound),
+                charge: Some(0),
+                created_ns: v.created_ns,
+                anonymous: false,
+            })
+            .collect())
+    }
+
+    /// Volume `name` removed, refused `InUse` while a running box holds it and `Unknown` where there is none.
+    fn clear_volume(&self, name: &str) -> Result<(), Refusal> {
+        let boxes = self.boxes()?;
+        if held_bounds(&boxes)?.contains_key(name) {
+            return Err(Refusal::Volume {
+                cause: VolumeCause::InUse,
+                why: format!("volume {name} is held by a running box"),
+            });
+        }
+        let mut volumes = self.volumes.lock().map_err(poisoned)?;
+        match volumes.remove(name) {
+            Some(_) => Ok(()),
+            None => Err(Refusal::Volume {
+                cause: VolumeCause::Unknown,
+                why: format!("no volume {name} is in the simulator's home"),
+            }),
+        }
+    }
+}
+
+/// The bound each volume a running image box holds is served with, by its name (kiln plan 01a1dd2e…, P6.2): a box holds
+/// its volumes from its start until its VM ends, as a run holds them from its start's plug to its end.
+fn held_bounds(boxes: &BTreeMap<BoxId, SimBox>) -> Result<BTreeMap<String, u64>, Refusal> {
+    let mut held = BTreeMap::new();
+    for b in boxes.values() {
+        let ClassSpec::ShardsImage(image) = &b.spec.class else {
+            continue;
+        };
+        let running = match &b.init {
+            Some(init) => b.started && init.exit()?.is_none(),
+            None => false,
+        };
+        if running {
+            for v in &image.volumes {
+                held.insert(v.name.clone(), v.bound.get());
+            }
+        }
+    }
+    Ok(held)
 }
 
 /// A simulated program, and the caller's ends of the streams its exec asked for until they are taken.
@@ -1009,6 +1257,100 @@ mod tests {
         ));
     }
 
+    /// Kiln's P7.1b (Shards' D243, `Runtime::exec_member`; AC-T7.4.1): do run `say` in a running sim image box's
+    /// member its spec names, its stdout asked for; expect its words on its stdout and its end 0. Expect a program
+    /// naming a user refused Invalid naming the program, a member its spec names not Invalid naming the member, an exec
+    /// naming no member Invalid naming exec, one before the box's start and one in a process box refused as the class
+    /// refuses them.
+    #[test]
+    fn a_sim_image_boxs_member_runs_a_program_named_for_it() {
+        use std::io::Read as _;
+        let runtime = SimRuntime::new();
+        let claude = Member {
+            kind: crate::MemberKind::Harness,
+            name: "claude".to_owned(),
+        };
+        let id = BoxId::new("sim-exec").unwrap();
+        runtime
+            .create(BoxSpec {
+                id: id.clone(),
+                bounds: Bounds::default(),
+                class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+                    members: vec![crate::ImageMember::new(claude.clone())],
+                    ..ShardsImage::new(SIM_IMAGE)
+                })),
+                owner: None,
+                devices: Vec::new(),
+                allocation: Some(sim_vm_allocation().unwrap()),
+                route: None,
+                band: 0,
+            })
+            .unwrap();
+        let out = || Stdio {
+            ask: crate::Ask {
+                stdout: true,
+                ..crate::Ask::default()
+            },
+            ..Stdio::null()
+        };
+        assert!(matches!(
+            runtime.exec_member(&id, &claude, Program::of(&["say", "hi"]), out()),
+            Err(Refusal::NotRunning(_, "exec in a member"))
+        ));
+        runtime.start(&id).unwrap();
+        let mut proc = runtime
+            .exec_member(&id, &claude, Program::of(&["say", "hi"]), out())
+            .unwrap();
+        let mut from = crate::OwnedStream::from(proc.streams().unwrap().stdout.unwrap());
+        let mut said = String::new();
+        from.read_to_string(&mut said).unwrap();
+        assert_eq!(said, "hi\n");
+        assert_eq!(
+            proc.wait_for(Duration::from_secs(60)).unwrap(),
+            Some(Exit::Code(0))
+        );
+        let as_root = Program {
+            user: Some(crate::User::default()),
+            ..Program::of(&["say", "hi"])
+        };
+        assert!(matches!(
+            runtime.exec_member(&id, &claude, as_root, Stdio::null()),
+            Err(Refusal::Invalid {
+                what: "program",
+                ..
+            })
+        ));
+        let helper = Member {
+            kind: crate::MemberKind::Agent,
+            name: "helper".to_owned(),
+        };
+        assert!(matches!(
+            runtime.exec_member(&id, &helper, Program::of(&["say", "hi"]), Stdio::null()),
+            Err(Refusal::Invalid { what: "member", .. })
+        ));
+        assert!(matches!(
+            runtime.exec(&id, Program::of(&["say", "hi"]), Stdio::null()),
+            Err(Refusal::Invalid { what: "exec", .. })
+        ));
+        let plain = BoxId::new("sim-exec-process").unwrap();
+        runtime
+            .create(BoxSpec {
+                id: plain.clone(),
+                bounds: Bounds::default(),
+                class: ClassSpec::Process,
+                owner: None,
+                devices: Vec::new(),
+                allocation: None,
+                route: None,
+                band: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime.exec_member(&plain, &claude, Program::of(&["say", "hi"]), Stdio::null()),
+            Err(Refusal::Invalid { what: "member", .. })
+        ));
+    }
+
     #[test]
     fn the_simulator_passes_the_conformance_suite() {
         for fixture in [
@@ -1108,6 +1450,30 @@ mod tests {
         );
     }
 
+    /// Kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1 (CLAUDE.md §2): do keep as many pools as the simulator may hold
+    /// boxes, then one more. Expect: the one more refused `Full`, one kept already kept again, and a pool let go making
+    /// room for the one more.
+    #[test]
+    fn p3_1_the_simulator_refuses_a_pool_past_its_box_bound() {
+        let rt = SimRuntime::new();
+        let size = sim_vm_allocation().unwrap().vm_size().unwrap();
+        let pool = |n: usize| WarmPool {
+            image: format!("hex-sim-pool-{n}@sha256:{}", "0".repeat(64)),
+            size,
+        };
+        for n in 0..SIM_BOXES {
+            rt.keep_pool(&pool(n)).unwrap();
+        }
+        assert_eq!(
+            rt.keep_pool(&pool(SIM_BOXES)),
+            Err(Refusal::Full(SIM_BOXES))
+        );
+        assert_eq!(rt.keep_pool(&pool(0)), Ok(()), "one kept already");
+        assert_eq!(rt.pools().unwrap().len(), SIM_BOXES);
+        rt.let_go_pool(&pool(0)).unwrap();
+        assert_eq!(rt.keep_pool(&pool(SIM_BOXES)), Ok(()));
+    }
+
     #[test]
     fn the_simulator_refuses_past_its_box_bound() {
         let rt = SimRuntime::new();
@@ -1121,5 +1487,86 @@ mod tests {
             rt.create(SimFixture::Process.spec(id, Bounds::default())),
             Err(Refusal::Full(SIM_BOXES))
         );
+    }
+
+    /// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1): the simulator holds an image VM's volumes as the image class does. Do
+    /// create a VM whose volume's bound passes its admitted disk; start one given a 1 GiB volume and list the home's
+    /// volumes; clear it while that VM runs; start a second VM asking it with another bound; end the first and clear
+    /// the volume; clear it again. Expect the first refused Invalid with no box made; the volume listed with its bound
+    /// once its VM starts; its clearing refused `Volume { InUse }` while the VM runs; the second's start refused
+    /// `Volume { Bound }`, that box ended; the volume cleared once the first VM has ended, none listed then, and the
+    /// next clearing refused `Volume { Unknown }`.
+    #[test]
+    fn p6_2_the_simulator_holds_an_image_vms_volumes_as_the_class_does() {
+        let rt = SimRuntime::new();
+        let given = |name: &str, disk: u64, bound: u64| {
+            let mut spec =
+                SimFixture::ShardsImage.spec(BoxId::new(name).unwrap(), Bounds::default());
+            let ClassSpec::ShardsImage(image) = &mut spec.class else {
+                panic!("the image fixture's spec is no image VM's");
+            };
+            image.volumes = vec![crate::ImageVolume {
+                name: "kiln-agent-cache".to_owned(),
+                bound: std::num::NonZeroU64::new(bound).unwrap(),
+                at: "/volumes/cache".to_owned(),
+                members: vec![Member {
+                    kind: crate::MemberKind::Harness,
+                    name: "claude".to_owned(),
+                }],
+                read_only: false,
+            }];
+            let mut cost = sim_vm_allocation().unwrap().cost;
+            cost.ceiling.disk_bytes = disk;
+            let mut workload = sim_vm_allocation().unwrap().resources;
+            workload.disk_bytes = disk;
+            spec.allocation = Some(cost.allocate(workload).unwrap());
+            spec
+        };
+        assert!(matches!(
+            rt.create(given("past", 1 << 20, 1 << 30)),
+            Err(Refusal::Invalid {
+                what: "shards image",
+                ..
+            })
+        ));
+        assert!(rt.list().unwrap().is_empty());
+        let first = rt.create(given("first", 1 << 30, 1 << 30)).unwrap().id;
+        rt.start(&first).unwrap();
+        let listed: Vec<_> = rt
+            .volumes()
+            .unwrap()
+            .into_iter()
+            .map(|v| (v.name, v.bound, v.anonymous))
+            .collect();
+        assert_eq!(
+            listed,
+            [("kiln-agent-cache".to_owned(), Some(1 << 30), false)]
+        );
+        assert!(matches!(
+            rt.clear_volume("kiln-agent-cache"),
+            Err(Refusal::Volume {
+                cause: VolumeCause::InUse,
+                ..
+            })
+        ));
+        let second = rt.create(given("second", 1 << 30, 1 << 29)).unwrap().id;
+        assert!(matches!(
+            rt.start(&second),
+            Err(Refusal::Volume {
+                cause: VolumeCause::Bound,
+                ..
+            })
+        ));
+        assert_eq!(rt.inspect(&second).unwrap().exit, Some(Exit::Unknown));
+        rt.signal(&first, Signal::KILL).unwrap();
+        assert_eq!(rt.clear_volume("kiln-agent-cache"), Ok(()));
+        assert!(rt.volumes().unwrap().is_empty());
+        assert!(matches!(
+            rt.clear_volume("kiln-agent-cache"),
+            Err(Refusal::Volume {
+                cause: VolumeCause::Unknown,
+                ..
+            })
+        ));
     }
 }

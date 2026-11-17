@@ -112,6 +112,7 @@ fn label(class: Class) -> &'static str {
         Class::Oci => "oci",
         Class::Firecracker => "firecracker",
         Class::Shards => "shards",
+        Class::ShardsImage => "shards-image",
     }
 }
 

@@ -179,7 +179,17 @@ pub(super) struct Answers {
     /// `STATS`, a member's ports, a network's switch, a layer's size, an update), by its
     /// byte.
     pub builtins: Box<[Record; 256]>,
+    /// A network's switch (`NETWORK`) asked each of [`NETWORK_VERBS`], each its own kind: a
+    /// `make` records a network in init's memory, a `connect` gives a running member its
+    /// address in three namespaces and its grants again (init links.rs). One record of them
+    /// all took makes' answers for a connect's slowest (CI 43968984258: a connect ended 5.7 ms
+    /// into a stillness, past makes' 3.0 ms).
+    pub networks: [Record; NETWORK_VERBS.len()],
 }
+
+/// What a network's switch is asked (init members.rs `network`), each judged by its own
+/// record ([`Answers::networks`]).
+pub(super) const NETWORK_VERBS: [&str; 5] = ["default", "make", "remove", "connect", "disconnect"];
 
 impl Default for Answers {
     fn default() -> Answers {
@@ -199,6 +209,7 @@ impl Default for Answers {
             #[cfg(target_os = "macos")]
             grants: Record::new(),
             builtins: Box::new([const { Record::new() }; 256]),
+            networks: [const { Record::new() }; NETWORK_VERBS.len()],
         }
     }
 }
@@ -318,7 +329,7 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
         self.due_after(id, interval(&cfg, Duration::ZERO, Status::Starting));
         let c = &self.checks;
         if !c.started.swap(true, Ordering::SeqCst)
-            && let Err(e) = std::thread::Builder::new()
+            && let Err(e) = crate::daemon::DaemonThread::new()
                 .name("health".into())
                 .spawn_scoped(threads, move || self.check_all(threads))
         {
@@ -394,7 +405,7 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
                 continue;
             }
             let watched = id.clone();
-            if let Err(e) = std::thread::Builder::new()
+            if let Err(e) = crate::daemon::DaemonThread::new()
                 .name("probe".into())
                 .spawn_scoped(threads, move || self.probe_once(&watched, &cfg, &argv))
             {
@@ -527,16 +538,28 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
             Some(RunState::Tracked(t)) => Some(t.vm.id()),
             _ => None,
         };
-        self.exec_waiting(id, spec, None, limit, self.answered_wait(vm, spec.builtin))
+        self.exec_waiting(id, spec, None, limit, self.answered_wait(vm, spec))
     }
 
-    /// How init's answer of `builtin` is waited for in a microVM whose process is `vm`: while
-    /// it runs, judged by that builtin's record (D215's judge, [`Wait::WhileRuns`]): before
-    /// its first answer, its liveness alone; then past the slowest seen, ended where a whole
-    /// one shows it ran no CPU, its host not the reason (R03, ROOT's (3), 2026-11-13). With no
-    /// process to follow, its end alone.
-    pub(super) fn answered_wait(&self, vm: Option<u32>, builtin: u8) -> Wait<'_> {
-        match (vm, self.answers.builtins.get(usize::from(builtin))) {
+    /// How init's answer of `spec`'s builtin is waited for in a microVM whose process is
+    /// `vm`: while it runs, judged by its kind's record (D215's judge, [`Wait::WhileRuns`]),
+    /// the builtin's, or a network verb's own ([`Answers::networks`]): before its first
+    /// answer, its liveness alone; then past the slowest seen, ended where a whole one shows it
+    /// ran no CPU, its host not the reason (R03, ROOT's (3), 2026-11-13). With no process to
+    /// follow, its end alone.
+    pub(super) fn answered_wait(&self, vm: Option<u32>, spec: &shards_abi::run::Spec) -> Wait<'_> {
+        let verb = match (
+            spec.builtin == shards_abi::run::builtin::NETWORK,
+            spec.argv.first(),
+        ) {
+            (true, Some(verb)) => NETWORK_VERBS.iter().position(|v| v.as_bytes() == verb.as_slice()),
+            _ => None,
+        };
+        let record = match verb {
+            Some(at) => self.answers.networks.get(at),
+            None => self.answers.builtins.get(usize::from(spec.builtin)),
+        };
+        match (vm, record) {
             (Some(vm), Some(record)) => Wait::WhileRuns(vm, record),
             _ => Wait::Ending,
         }
@@ -592,25 +615,36 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
     ) -> std::io::Result<Ended> {
         let (mut out, into) = std::io::pipe()?;
         let null = std::fs::File::open(crate::os::NULL)?;
+        let begun = Begun::now(wait);
         let ours = self.send_exec(id, spec, argv, false, [null.as_fd(), into.as_fd(), into.as_fd()])?;
         // The VM holds the rest: its end sees the output end.
         drop((into, null));
-        Ok(std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             let control = &ours;
-            let reader = scope.spawn(move || {
-                let mut buf = [0u8; 16 << 10];
-                while let Ok(n @ 1..) = out.read(&mut buf) {
-                    if !sink(buf.get(..n).unwrap_or_default()) {
-                        // Nobody wants the rest: the exec goes, and its output with it.
-                        kill(control);
-                        break;
+            let reader = crate::daemon::DaemonThread::new()
+                .name("exec output".into())
+                .spawn_scoped(scope, move || {
+                    let mut buf = [0u8; 16 << 10];
+                    while let Ok(n @ 1..) = out.read(&mut buf) {
+                        if !sink(buf.get(..n).unwrap_or_default()) {
+                            // Nobody wants the rest: the exec goes, and its output with it.
+                            kill(control);
+                            break;
+                        }
                     }
+                });
+            let reader = match reader {
+                Ok(reader) => reader,
+                // No thread to read it: the exec goes, as one whose output nobody wants.
+                Err(e) => {
+                    kill(control);
+                    return Err(e);
                 }
-            });
-            let ended = await_exit(&ours, wait);
+            };
+            let ended = await_exit(&ours, begun);
             let _ = reader.join();
-            ended
-        }))
+            Ok(ended)
+        })
     }
 
     /// An exec of `spec` in microVM `id` on the asker's own descriptors: what it
@@ -624,8 +658,9 @@ impl<D: crate::containers::Disk> super::Daemon<D> {
         stdio: [shards_ipc::fd::BorrowedFd<'_>; 3],
         wait: Wait<'_>,
     ) -> std::io::Result<Ended> {
+        let begun = Begun::now(wait);
         let ours = self.send_exec(id, spec, None, input, stdio)?;
-        Ok(await_exit(&ours, wait))
+        Ok(await_exit(&ours, begun))
     }
 
     /// Starts the NOTICE built-in of the guest of the run whose inbox is `inbox`, which the
@@ -755,8 +790,8 @@ pub(super) enum Wait<'a> {
     /// since the look before ([`Cut::Stalled`]), or where it could not be read
     /// ([`Cut::Unread`]). A microVM its host holds at a `memory.high` is slowed there for as
     /// long as it is over it, and the answer of one asked to give back what would bring it
-    /// under comes as its host lets it run (D188; PM M467). An answer there as the wait
-    /// begins teaches nothing: it was waited for not at all (D222).
+    /// under comes as its host lets it run (D188; PM M467). It begins before its exec is
+    /// asked ([`Begun`]), so its answer, however soon, teaches from the ask.
     WhileRuns(u32, &'a Record),
     /// A group member's word, judged as WhileRuns, with its refusal told immediately:
     /// the group must not invent an elapsed-time verdict while this wait still progresses,
@@ -765,22 +800,39 @@ pub(super) enum Wait<'a> {
     GroupWord(u32, &'a Record, &'a (dyn Fn(&Cut) + Sync)),
 }
 
-/// Waits on `ours` for an exec's end, ending it (SIGKILL) as `wait` says, and waiting on for
-/// its end then, so that none outlives its asker.
-fn await_exit(ours: &shards_ipc::Stream, wait: Wait<'_>) -> Ended {
-    let (mut follow, mut cut) = match wait {
-        // Its answer there as its wait begins was waited for not at all: read as it is, it
-        // teaches its kind nothing (D222's wait of nothing), as a slot's rest is learned only
-        // where it was waited for (D185's `Asked::waited`).
-        Wait::WhileRuns(..) | Wait::GroupWord(..) if super::readable_within(ours, Some(Duration::ZERO)) => {
-            (None, None)
-        }
-        Wait::WhileRuns(vm, record) | Wait::GroupWord(vm, record, _) => match following(vm, record) {
-            Ok(follow) => (follow, None),
-            Err(cut) => (None, Some(cut)),
-        },
-        Wait::Ending | Wait::For(_) => (None, None),
-    };
+/// A wait for an exec's end, begun before its exec is asked (D188, amended by ci-fixes): its
+/// microVM's process followed from then, or why it could not be, so that no answer can come
+/// before the wait and each one teaches its kind its whole time from the ask. Begun after its
+/// ask, an answer there first taught nothing, and on Windows arm64 its output reader's spawn
+/// outlasted a stand-in's answer every time (CI 43968984258: no give-back learned in ~24k
+/// passes).
+struct Begun<'a> {
+    wait: Wait<'a>,
+    follow: Option<Follow<'a>>,
+    cut: Option<Cut>,
+}
+
+impl<'a> Begun<'a> {
+    fn now(wait: Wait<'a>) -> Begun<'a> {
+        let (follow, cut) = match wait {
+            Wait::WhileRuns(vm, record) | Wait::GroupWord(vm, record, _) => match following(vm, record) {
+                Ok(follow) => (follow, None),
+                Err(cut) => (None, Some(cut)),
+            },
+            Wait::Ending | Wait::For(_) => (None, None),
+        };
+        Begun { wait, follow, cut }
+    }
+}
+
+/// Waits on `ours` for an exec's end, ending it (SIGKILL) as its wait, `begun`, says, and
+/// waiting on for its end then, so that none outlives its asker.
+fn await_exit(ours: &shards_ipc::Stream, begun: Begun<'_>) -> Ended {
+    let Begun {
+        wait,
+        mut follow,
+        mut cut,
+    } = begun;
     if let Some(cut) = &cut {
         if let Wait::GroupWord(_, _, refused) = wait {
             refused(cut);
@@ -944,23 +996,23 @@ mod tests {
     }
 
     /// Waits for `wait` in an exec whose VM side `theirs` is answered by `answer`, on a
-    /// thread of its own that begins only as the wait is about to: an answer timed from its
-    /// thread's start, begun first, came early of the wait on a busy host.
+    /// thread of its own that is asked, as the daemon asks its exec, once the wait has begun.
     fn waited(wait: Wait<'_>, answer: impl FnOnce(shards_ipc::Stream) + Send) -> Ended {
         let (ours, theirs) = shards_ipc::Stream::pair().unwrap();
         let (go, gone) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
-            s.spawn(move || {
+            crate::daemon::party::spawn_in(s, move || {
                 if gone.recv().is_ok() {
                     answer(theirs);
                 }
             });
+            let begun = Begun::now(wait);
             go.send(()).unwrap();
-            await_exit(&ours, wait)
+            await_exit(&ours, begun)
         })
     }
 
-    /// The exec's answer, `status`, said `after` its wait was about to begin.
+    /// The exec's answer, `status`, said `after` it was asked.
     fn answers(status: u8, after: Duration) -> impl FnOnce(shards_ipc::Stream) + Send {
         move |theirs| {
             std::thread::sleep(after);
@@ -1023,22 +1075,34 @@ mod tests {
         let shards_api::Seen::Learned { slowest, .. } = record.seen() else {
             panic!("its answer taught nothing");
         };
-        // The answer thread starts before await_exit begins its measured wait.
-        assert!(!slowest.is_zero(), "its genuine wait taught no interval");
+        assert!(slowest >= after, "{slowest:?}, its wait begun before its ask");
     }
 
-    /// An exec's answer there as its wait begins was waited for not at all: it is taken, and
-    /// teaches its kind nothing (D222's wait of nothing), whose W* of next to nothing would
-    /// have its kind's next asks looked at each microsecond. Its microVM's process is this
-    /// one, which lives throughout.
+    /// An answer there before its waiter reads came within its wait, which begins before its
+    /// exec is asked (D188, amended by ci-fixes): it teaches its kind its time from the wait's
+    /// start. Before, a wait begun after its ask learned nothing from such an answer, and a
+    /// microVM that answered faster than its waiter's reader was spawned never taught its kind
+    /// (CI 43968984258, Windows arm64). Its microVM's process is this one, which lives
+    /// throughout.
     #[test]
-    fn an_exit_said_before_its_wait_teaches_nothing() {
+    fn an_answer_there_before_its_waiter_reads_teaches_from_its_ask() {
         let record = Record::new();
         let (ours, theirs) = shards_ipc::Stream::pair().unwrap();
+        let begun = Begun::now(Wait::WhileRuns(std::process::id(), &record));
+        let began = Instant::now();
+        // The ask's way to its microVM, which answers as it reads it.
+        std::thread::sleep(Duration::from_millis(1));
         shards_ipc::send(&theirs, shards_ipc::kind::EXIT, &[7], &[]).unwrap();
-        let ended = await_exit(&ours, Wait::WhileRuns(std::process::id(), &record));
+        let answered = began.elapsed();
+        let ended = await_exit(&ours, begun);
         assert_eq!((ended.status, ended.cut), (Some(7), None));
-        assert_eq!(record.seen(), shards_api::Seen::Cold);
+        let shards_api::Seen::Learned { slowest, .. } = record.seen() else {
+            panic!("an answer within its wait taught nothing");
+        };
+        assert!(
+            slowest >= answered,
+            "{slowest:?} from its wait's start, its answer {answered:?} past it"
+        );
     }
 
     /// Set in the child of `a_microvm_that_runs_at_any_rate_is_waited_for`: it runs a CPU a
@@ -1087,12 +1151,10 @@ mod tests {
         let shards_api::Seen::Learned { slowest: now, .. } = record.seen() else {
             panic!("its record was lost");
         };
-        // What the wait learned is its own answer's time, from its begin, which follows its
-        // first reads of the trickler (`following`): past the slowest before, within the
-        // wait's whole; never the answer's 3.5 s exactly, which a busy host's delay between
-        // the go and that begin takes from.
+        // What the wait learned is its own answer's time from its begin, before the answer
+        // was asked: the answer's own 3.5 s at least, within the wait's whole.
         assert!(
-            now > slowest && now <= wall,
+            now >= slowest * 7 / 2 && now <= wall,
             "its answer, slower, raised W*: {now:?} of {wall:?}"
         );
     }
@@ -1108,7 +1170,7 @@ mod tests {
         let record = learned(slowest);
         let busy = std::sync::atomic::AtomicBool::new(true);
         std::thread::scope(|s| {
-            s.spawn(|| {
+            crate::daemon::party::spawn_in(s, || {
                 while busy.load(Ordering::Relaxed) {
                     std::hint::spin_loop();
                 }

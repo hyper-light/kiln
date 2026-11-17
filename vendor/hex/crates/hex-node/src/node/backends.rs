@@ -421,7 +421,9 @@ impl Node {
                     "this node has no Shards backend for a box its record says is one",
                 )),
             },
-            Class::Process | Class::Oci => return Forward::Back(Box::new((call, stdio))),
+            Class::Process | Class::Oci | Class::ShardsImage => {
+                return Forward::Back(Box::new((call, stdio)));
+            }
         };
         match client {
             Ok(client) => crate::recorded::forward_evented(client, call, stdio, reply, ended),
@@ -659,7 +661,7 @@ impl Node {
                         |record, source| backend.handoff_unsubmitted(record, source),
                     )?;
                 }
-                Class::Shards => {
+                Class::Shards | Class::ShardsImage => {
                     let backend = shards.ok_or_else(|| {
                         uncertain(
                             id,
@@ -878,7 +880,8 @@ impl Node {
                 .and_then(|backends| backends.firecracker.as_deref())
                 .map(|backend| Some(backend as &dyn Runtime))
                 .ok_or_else(|| missing(class)),
-            Class::Shards => self
+            // An image VM's backend is the Shards guest runtime, whose image class boots it (D231).
+            Class::Shards | Class::ShardsImage => self
                 .backends
                 .get()
                 .and_then(|backends| backends.shards.as_deref())
@@ -906,8 +909,12 @@ impl Node {
             if backends.firecracker.is_some() {
                 classes.push(Class::Firecracker);
             }
-            if backends.shards.is_some() {
+            if let Some(shards) = &backends.shards {
                 classes.push(Class::Shards);
+                // P2.2: its image class, where its guest runtime boots image VMs.
+                if shards.classes().contains(&Class::ShardsImage) {
+                    classes.push(Class::ShardsImage);
+                }
             }
         }
         classes
@@ -990,7 +997,7 @@ impl Node {
                             .and_then(|backends| backends.firecracker.as_ref())
                             .ok_or_else(|| uncertain(id, "this node has no Firecracker backend for a box its record says is one"))?
                             .validate_binding(&record.spec),
-                        Class::Shards => self
+                        Class::Shards | Class::ShardsImage => self
                             .backends
                             .get()
                             .and_then(|backends| backends.shards.as_ref())
@@ -1309,7 +1316,7 @@ fn guest_node_class(spec: &BoxSpec) -> Result<Option<Class>, Refusal> {
     }
     Ok(match spec.backend_class()? {
         class @ (Class::Firecracker | Class::Shards) => Some(class),
-        Class::Process | Class::Oci => None,
+        Class::Process | Class::Oci | Class::ShardsImage => None,
     })
 }
 

@@ -116,6 +116,9 @@ fn guest_node(root: &Path) -> (Arc<Recorded<WithGuest<SimRuntime>>>, Arc<AtomicU
             disk_bytes: 0,
         },
     };
+    // The image class as `hex node` configures its guest (hex-cli's configured_guest): Shards' check asked of its
+    // `shards`, a model's path here, so it serves no image VM.
+    let images = hex_runtime::guest::host_images(&config.binary);
     let boots = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&boots);
     let guest = GuestRuntime::new(
@@ -129,9 +132,8 @@ fn guest_node(root: &Path) -> (Arc<Recorded<WithGuest<SimRuntime>>>, Arc<AtomicU
     .with_runtime_paths(
         shards_api::RuntimePaths::new(root.join("cache"), root.join("home")).unwrap(),
     )
-    // The image class as `hex node` configures its guest (hex-cli's configured_guest).
     .with_images(
-        hex_runtime::guest::host_images(),
+        images,
         Ok(hex_runtime::guest::ImageWaits::new()),
         root.join("image-diagnostics"),
     )

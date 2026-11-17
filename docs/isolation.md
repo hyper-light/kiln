@@ -211,12 +211,12 @@ its own through Hex (`sandbox::hexvm`).
   against starts on the runner's link (a barrier).
 - **Its real-VM test** (`vm_harnesses` `engine::p2_3_…`) has the microVM session answer a turn in its microVM
   before the switch and another after it, as it drains, each waited for on its harness's liveness (step 35's
-  waits), so a harness that never ran there fails at once in kiln's word on it. It can't pass on the Hex kiln
-  vendors (1969a423e, on Shards 9975d1f55): its image class gives a start share to the run's root alone, so a
-  harness never starts in its project (Shards D277: `Setup (entering its working directory): errno 2`), its run
-  ends failed, and kiln says exit -1. The switch ends nothing; the session ended before it. It passes once Hex
-  vendors Shards with D277 and gives a share its members (`hex_api::Mount`), and kiln maps `Share::members` in
-  `sandbox::hexvm` (P1.4).
+  waits), so a harness that never ran there fails at once in kiln's word on it. It couldn't pass on the Hex
+  kiln vendored before (1969a423e, on Shards 9975d1f55): its image class gave a start share to the run's root alone,
+  so a harness never started in its project (Shards D277: `Setup (entering its working directory): errno 2`), its
+  run ended failed, and kiln said exit -1; the switch ended nothing, the session having ended before it. The Hex
+  kiln vendors now (225fd3d97, on Shards 8d6029e4d) gives a share its members (`hex_api::Mount`), and kiln maps
+  `Share::members` in `sandbox::hexvm` (P1.4); its run on that Hex is owed.
 
 ## Live overrides
 

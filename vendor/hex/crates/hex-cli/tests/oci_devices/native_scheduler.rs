@@ -159,11 +159,13 @@ impl Fixture<'_> {
                     source: PathBuf::from("/usr"),
                     destination: "/usr".into(),
                     read_only: true,
+                    members: Vec::new(),
                 },
                 Mount {
                     source: PathBuf::from(&self.lab.exe),
                     destination: "/hex".into(),
                     read_only: true,
+                    members: Vec::new(),
                 },
             ];
             // Visibility alone grants no cgroup authority. Both real nodes are present in every
@@ -176,6 +178,7 @@ impl Fixture<'_> {
                         source: gpu.node.clone(),
                         destination: destination.into(),
                         read_only: true,
+                        members: Vec::new(),
                     }),
             );
             ClassSpec::Oci(Box::new(OciSpec {

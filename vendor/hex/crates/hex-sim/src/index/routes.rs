@@ -376,6 +376,7 @@ impl Routes {
                     ),
                     Class::Firecracker => offer.key.class == hex_api::Class::Firecracker,
                     Class::Shards => offer.key.class == hex_api::Class::Shards,
+                    Class::ShardsImage => offer.key.class == hex_api::Class::ShardsImage,
                 },
                 |class| offer.key.class == class,
             );

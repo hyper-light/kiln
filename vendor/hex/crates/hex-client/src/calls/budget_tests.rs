@@ -172,12 +172,14 @@ impl<const SEAM: bool> Transport for Apart<SEAM> {
             class_waits!("test.client_measured", "oci", measuring),
             class_waits!("test.client_measured", "firecracker", measuring),
             class_waits!("test.client_measured", "shards", measuring),
+            class_waits!("test.client_measured", "shards-image", measuring),
         ];
         static SEAM_WAITS: [[Patience; BOX_KINDS]; CLASSES] = [
             class_waits!("test.client_seam", "process", measuring),
             class_waits!("test.client_seam", "oci", measuring),
             class_waits!("test.client_seam", "firecracker", measuring),
             class_waits!("test.client_seam", "shards", measuring),
+            class_waits!("test.client_seam", "shards-image", measuring),
         ];
         by_class(if SEAM { &SEAM_WAITS } else { &MEASURED }, class)
     }

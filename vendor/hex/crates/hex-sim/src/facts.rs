@@ -126,8 +126,11 @@ pub fn within_cgroup(memory: Mem, limit: Option<u64>, current: Option<u64>) -> M
 
 /// Necessary platform conditions for an initialized runtime. A Windows class already carries its
 /// caller's verified availability; optional features alone never establish that it was initialized.
+/// Shards image VMs need the hypervisor Shards boots them on, and their runtime is initialized only where
+/// Shards' own check of the host (`shards_api::host_check`, D262) says it runs microVMs (kiln plan
+/// 01a1dd2e…, P2.2), which on Windows is the one fact of it.
 pub fn classes(os: Os, arch: Arch, virt: Virt, initialized: Classes) -> Classes {
-    [Class::Oci, Class::Firecracker, Class::Shards]
+    Class::ALL
         .into_iter()
         .filter(|&class| {
             initialized.has(class)
@@ -136,19 +139,21 @@ pub fn classes(os: Os, arch: Arch, virt: Virt, initialized: Classes) -> Classes 
                     (
                         Os::Linux,
                         Arch::X86_64 | Arch::Aarch64,
-                        Class::Firecracker | Class::Shards,
+                        Class::Firecracker | Class::Shards | Class::ShardsImage,
                     ) => virt.kvm,
                     (Os::Windows, Arch::X86_64 | Arch::Aarch64, Class::Oci) => true,
                     (Os::Windows, Arch::X86_64, Class::Shards) => true,
-                    (Os::Macos, Arch::Aarch64, Class::Shards) => virt.hvf,
+                    (Os::Windows, Arch::X86_64 | Arch::Aarch64, Class::ShardsImage) => true,
+                    (Os::Macos, Arch::Aarch64, Class::Shards | Class::ShardsImage) => virt.hvf,
                     _ => false,
                 }
         })
         .fold(Classes::NONE, Classes::with)
 }
 
-/// Windows optional features are necessary for native containers and Shards' WHP backend. The node
-/// intersects this filter with initialized runtime classes before advertising either.
+/// Windows optional features are necessary for native containers and Shards' WHP backend, which boots
+/// Shards image VMs too. The node intersects this filter with initialized runtime classes before
+/// advertising any.
 pub fn windows_classes(containers: bool, hypervisor_platform: bool) -> Classes {
     let classes = if containers {
         Classes::NONE.with(Class::Oci)
@@ -156,7 +161,7 @@ pub fn windows_classes(containers: bool, hypervisor_platform: bool) -> Classes {
         Classes::NONE
     };
     if hypervisor_platform {
-        classes.with(Class::Shards)
+        classes.with(Class::Shards).with(Class::ShardsImage)
     } else {
         classes
     }
@@ -645,7 +650,10 @@ mod tests {
         );
         assert_eq!(windows_classes(true, false), oci);
         assert_eq!(windows_classes(false, false), Classes::NONE);
-        assert_eq!(windows_classes(false, true), shards);
+        assert_eq!(
+            windows_classes(false, true),
+            shards.with(Class::ShardsImage)
+        );
         assert_eq!(
             classes(
                 Os::Windows,
@@ -659,7 +667,10 @@ mod tests {
             classes(Os::Windows, Arch::Aarch64, Virt::default(), shards),
             Classes::NONE
         );
-        assert_eq!(classes(Os::Macos, Arch::Aarch64, hvf, Classes::ALL), shards);
+        assert_eq!(
+            classes(Os::Macos, Arch::Aarch64, hvf, Classes::ALL),
+            shards.with(Class::ShardsImage)
+        );
         assert_eq!(
             classes(Os::Macos, Arch::X86_64, hvf, Classes::ALL),
             Classes::NONE
@@ -668,6 +679,24 @@ mod tests {
             classes(Os::Freebsd, Arch::X86_64, kvm, Classes::ALL),
             Classes::NONE
         );
+        // P2.2: the image class only where its runtime was initialized, which Shards' host check gates, and on the
+        // hypervisor Shards boots it on: Windows' WHP, arm64 too, has no fact of Hex's own.
+        let image = Classes::NONE.with(Class::ShardsImage);
+        assert_eq!(classes(Os::Linux, Arch::X86_64, kvm, image), image);
+        assert_eq!(
+            classes(Os::Linux, Arch::X86_64, Virt::default(), image),
+            Classes::NONE
+        );
+        assert_eq!(classes(Os::Linux, Arch::Aarch64, kvm, shards), shards);
+        assert_eq!(
+            classes(Os::Windows, Arch::Aarch64, Virt::default(), image),
+            image
+        );
+        assert_eq!(
+            classes(Os::Macos, Arch::Aarch64, Virt::default(), image),
+            Classes::NONE
+        );
+        assert_eq!(classes(Os::Macos, Arch::X86_64, hvf, image), Classes::NONE);
     }
 
     #[test]

@@ -920,6 +920,7 @@ impl Service {
             let class = match backend.class.as_str() {
                 "oci" => hex_sim::model::Class::Oci,
                 "shards" => hex_sim::model::Class::Shards,
+                "shards-image" => hex_sim::model::Class::ShardsImage,
                 "firecracker" => hex_sim::model::Class::Firecracker,
                 other => {
                     return Err(Refusal::Invalid {
@@ -1161,6 +1162,7 @@ impl Service {
                     hex_sim::model::Class::Oci => "oci",
                     hex_sim::model::Class::Firecracker => "firecracker",
                     hex_sim::model::Class::Shards => "shards",
+                    hex_sim::model::Class::ShardsImage => "shards-image",
                 }
                 .into(),
                 sum_ns: row.sum_ns.to_string(),
@@ -1190,6 +1192,7 @@ impl Service {
                     "oci" => hex_sim::model::Class::Oci,
                     "firecracker" => hex_sim::model::Class::Firecracker,
                     "shards" => hex_sim::model::Class::Shards,
+                    "shards-image" => hex_sim::model::Class::ShardsImage,
                     _ => {
                         return Err(Refusal::Invalid {
                             what: "peer launch class",

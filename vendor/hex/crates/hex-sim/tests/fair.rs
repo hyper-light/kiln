@@ -196,6 +196,7 @@ fn as_trace(cluster: &Cluster) -> String {
             Class::Oci => "oci",
             Class::Firecracker => "firecracker",
             Class::Shards => "shards",
+            Class::ShardsImage => "shards-image",
         };
         let opt = |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
         out += &format!(

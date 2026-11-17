@@ -1091,6 +1091,11 @@ impl GuestRuntime {
                     host: share.dir.clone(),
                     at: share.at.clone(),
                     read_only: share.read_only,
+                    // Its containers' programs may run from a share, as before Shards' D279 (image channel v41).
+                    exec: true,
+                    // Its run's own root alone (Shards' D277, image channel v37): Hex's init, the run's own command,
+                    // mounts it, and the node image runs no member.
+                    members: None,
                 })
                 .collect(),
             controller: identity.fingerprint(),
@@ -1335,6 +1340,9 @@ impl Runtime for GuestRuntime {
         }
     }
     fn capacity(&self, class: Class) -> Result<Option<hex_api::Capacity>, Refusal> {
+        if class == Class::ShardsImage {
+            return self.image_capacity().map(Some);
+        }
         if !matches!(class, Class::Oci | Class::Shards) {
             return Err(Refusal::Invalid {
                 what: "capacity class",
@@ -1383,11 +1391,15 @@ impl Runtime for GuestRuntime {
     }
 
     fn classes(&self) -> Vec<Class> {
+        let mut classes = vec![Class::Oci];
         if self.uses_books() && self.runtime_cost.is_some() {
-            vec![Class::Oci, Class::Shards]
-        } else {
-            vec![Class::Oci]
+            classes.push(Class::Shards);
         }
+        // P2.2: its image class, where its node boots image VMs (`ImageClass::serves`), which a create says otherwise.
+        if self.uses_books() && self.images.serves().is_ok() {
+            classes.push(Class::ShardsImage);
+        }
+        classes
     }
 
     fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
@@ -1432,12 +1444,8 @@ impl Runtime for GuestRuntime {
     fn exec(&self, id: &BoxId, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, Refusal> {
         let snapshot = match self.routed(id)? {
             books::Routed::Retired(record) => return Err(record.retired_refusal()?),
-            // A member's program is the agent-control endpoint's (joint plan step 11).
-            books::Routed::Image(_) => {
-                return Err(Refusal::Awaits {
-                    needs: hex_api::Upstream::MemberExec,
-                });
-            }
+            // A program in an image VM runs in a member it names (`exec_member`).
+            books::Routed::Image(_) => return Err(image::unnamed_member(id)),
             books::Routed::Other(snapshot) => snapshot,
         };
         let snapshot = snapshot.as_ref();
@@ -1473,6 +1481,29 @@ impl Runtime for GuestRuntime {
         }
     }
 
+    /// A program in an image VM's member (Shards' D243, on its run's exec lane); any other box's refused as the trait
+    /// refuses it.
+    fn exec_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        program: Program,
+        stdio: Stdio,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        match self.routed(id)? {
+            books::Routed::Retired(record) => Err(record.retired_refusal()?),
+            books::Routed::Image(record) => self
+                .images
+                .exec_member_image(record, member, program, stdio),
+            books::Routed::Other(_) => Err(Refusal::Invalid {
+                what: "member",
+                why: format!(
+                    "box {id} isn't a Shards image box: only one has members a program runs in"
+                ),
+            }),
+        }
+    }
+
     /// Goal 2's item 3: an image VM's member's next MCP connection (D254); any other box's refused as the trait refuses
     /// it.
     fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
@@ -1483,6 +1514,22 @@ impl Runtime for GuestRuntime {
                 what: "mcp",
                 why: format!(
                     "box {id} isn't a Shards image box: only one has members with an MCP bridge"
+                ),
+            }),
+        }
+    }
+
+    /// Kiln plan step 35's `/runs/control`: an image VM's agent-control link (D238, D254), as both its ends say it; any
+    /// other box's refused as the trait refuses it.
+    fn link(&self, id: &BoxId) -> Result<hex_api::ControlLink, Refusal> {
+        match self.routed(id)? {
+            books::Routed::Retired(record) => Err(record.retired_refusal()?),
+            books::Routed::Image(record) => self.images.link_image(record),
+            books::Routed::Other(None) => Err(Refusal::NoSuchBox(id.try_clone()?)),
+            books::Routed::Other(Some(_)) => Err(Refusal::Invalid {
+                what: "link",
+                why: format!(
+                    "box {id} isn't a Shards image box: only its run has an agent-control link"
                 ),
             }),
         }
@@ -2243,17 +2290,20 @@ impl<P: Runtime> Runtime for WithGuest<P> {
                 }
                 self.oci.capacity(class)
             }
-            Class::Shards => self.oci.capacity(class),
+            Class::Shards | Class::ShardsImage => self.oci.capacity(class),
             Class::Firecracker => self.process.capacity(class),
         }
     }
 
     fn classes(&self) -> Vec<Class> {
-        if self.oci.classes().contains(&Class::Shards) {
-            vec![Class::Process, Class::Oci, Class::Shards]
-        } else {
-            vec![Class::Process, Class::Oci]
+        let mut classes = vec![Class::Process, Class::Oci];
+        let guest = self.oci.classes();
+        for class in [Class::Shards, Class::ShardsImage] {
+            if guest.contains(&class) {
+                classes.push(class);
+            }
         }
+        classes
     }
 
     fn create(&self, spec: BoxSpec) -> Result<BoxInfo, Refusal> {
@@ -2286,6 +2336,20 @@ impl<P: Runtime> Runtime for WithGuest<P> {
 
     fn mcp(&self, id: &BoxId, member: &hex_api::Member) -> Result<Box<dyn Proc>, Refusal> {
         self.holder(id)?.mcp(id, member)
+    }
+
+    fn exec_member(
+        &self,
+        id: &BoxId,
+        member: &hex_api::Member,
+        program: Program,
+        stdio: Stdio,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        self.holder(id)?.exec_member(id, member, program, stdio)
+    }
+
+    fn link(&self, id: &BoxId) -> Result<hex_api::ControlLink, Refusal> {
+        self.holder(id)?.link(id)
     }
 
     fn signal_member(

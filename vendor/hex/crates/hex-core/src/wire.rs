@@ -52,14 +52,15 @@ use hex_api::{
     ConnectFailure, ConnectPhase, ConnectReply, ControlWake, CredentialGrant, Destination,
     DeviceHolder, DeviceId, DeviceInfo, DeviceKind, DeviceUnavailable, Execution, Exit,
     GpuEligibility, Grant, GuestEnd, GuestFailure, GuestTime, ImageArch, ImageMember, ImageOs,
-    ImagePlatform, IoKind, IoRates, Learned, LearnedAwait, LearnedCeiling, LearnedEnd,
+    ImagePlatform, ImageVolume, IoKind, IoRates, Learned, LearnedAwait, LearnedCeiling, LearnedEnd,
     LearnedHolder, LearnedHolding, LearnedOverhead, LearnedPrior, LearnedRank, LearnedRate,
     LearnedReservations, LearnedUnacted, LearnedUnread, LearnedUnrecorded, LearnedUse,
     LearnedWindow, LifecycleCause, MAX_DEVICES, MAX_LEARNED_HOLDINGS, MAX_LEARNED_PRIORS,
     MAX_RUNTIME_ROUTES, Member, MemberKind, Mount, Network, NodeVmPhase, NodeVmReceipt, OciSpec,
     PhysicalDevice, PhysicalReport, Ports, Program, Proto, Published, RateHeld, Receiver, Refusal,
     Rootfs, RouteKey, RouteOffer, RouteReceipt, RuntimeCost, ShardsImage, Signal, StartedFrom,
-    Upstream, Usage, User, check_credentials, check_grants, check_published, check_sign_ins,
+    Upstream, Usage, User, VolumeCause, check_credentials, check_grants, check_published,
+    check_sign_ins,
 };
 
 use hex_api::lease::{Lease, LeaseRefused, SignInRefused, SignInTokens, Value};
@@ -3532,12 +3533,7 @@ fn put_oci(w: &mut Writer, spec: &OciSpec) -> Result<(), Fault> {
         }
     }
     put_program(w, &spec.init)?;
-    w.list(&spec.mounts, |w, m| {
-        w.path(&m.source)?;
-        w.string(&m.destination)?;
-        w.bool(m.read_only);
-        Ok(())
-    })?;
+    w.list(&spec.mounts, put_mount)?;
     w.option_with(spec.hostname.as_deref(), Writer::string)?;
     w.u8(match spec.network {
         Network::Host => 0,
@@ -3556,13 +3552,7 @@ fn oci(r: &mut Reader<'_>) -> Result<OciSpec, Fault> {
         t => return Err(Fault::value("rootfs", format!("variant {t}"))),
     };
     let init = program(r)?;
-    let mounts = r.list(|r| {
-        Ok(Mount {
-            source: r.path()?,
-            destination: r.string("mount destination")?,
-            read_only: r.bool("read_only")?,
-        })
-    })?;
+    let mounts = r.list(|r| mount(r, "mount destination"))?;
     let hostname = r.option(|r| r.string("hostname"))?;
     let network = match r.u8()? {
         0 => Network::Host,
@@ -3584,8 +3574,10 @@ fn oci(r: &mut Reader<'_>) -> Result<OciSpec, Fault> {
 /// step 12), then its network grants (joint plan step 15), then the members its caller drives, each its member,
 /// its variables, an option of its working directory (joint plan step 17), its run-time arguments (D256, after
 /// the working directory) and whether it asks an MCP bridge (Shards' D254, after its arguments), then its shares (kiln's step 18), each its host directory, where its guest sees it and
-/// whether read-only, as a mount's, then its credential grants (joint plan step 33, [`put_credentials`]). Fields a later
-/// step adds go after the credentials (append-only).
+/// whether read-only, and the members it is given to (Shards' D277), as a mount's ([`put_mount`]), then its credential
+/// grants (joint plan step 33, [`put_credentials`]), then its sign-ins ([`put_sign_ins`]), then its volumes (kiln plan
+/// 01a1dd2e…, P6.2), each its name, its bound, where its members see it, its members, each as a grant's member, and
+/// whether read-only. Fields a later step adds go after the volumes (append-only).
 fn put_shards_image(w: &mut Writer, image: &ShardsImage) -> Result<(), Fault> {
     w.string(&image.image)?;
     w.option_with(image.command.as_deref(), |w, command| {
@@ -3603,14 +3595,17 @@ fn put_shards_image(w: &mut Writer, image: &ShardsImage) -> Result<(), Fault> {
         w.bool(m.mcp);
         Ok(())
     })?;
-    w.list(&image.shares, |w, m| {
-        w.path(&m.source)?;
-        w.string(&m.destination)?;
-        w.bool(m.read_only);
-        Ok(())
-    })?;
+    w.list(&image.shares, put_mount)?;
     put_credentials(w, &image.credentials, &image.grants)?;
-    put_sign_ins(w, &image.sign_ins, &image.credentials, &image.grants)
+    put_sign_ins(w, &image.sign_ins, &image.credentials, &image.grants)?;
+    w.list(&image.volumes, |w, v| {
+        w.string(&v.name)?;
+        w.u64(v.bound.get());
+        w.string(&v.at)?;
+        w.list(&v.members, put_member)?;
+        w.bool(v.read_only);
+        Ok(())
+    })
 }
 
 fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
@@ -3627,18 +3622,24 @@ fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
                 mcp: r.bool("member mcp")?,
             })
         })?,
-        shares: r.list(|r| {
-            Ok(Mount {
-                source: r.path()?,
-                destination: r.string("share destination")?,
-                read_only: r.bool("read_only")?,
-            })
-        })?,
+        shares: r.list(|r| mount(r, "share destination"))?,
         credentials: Vec::new(),
         sign_ins: Vec::new(),
+        volumes: Vec::new(),
     };
     image.credentials = credentials(r, &image.grants)?;
     image.sign_ins = sign_ins(r, &image.credentials, &image.grants)?;
+    image.volumes = r.list(|r| {
+        Ok(ImageVolume {
+            name: r.string("volume name")?,
+            bound: std::num::NonZeroU64::new(r.u64()?).ok_or_else(|| {
+                Fault::value("volume bound", "0: a volume's bound is at least a byte")
+            })?,
+            at: r.string("volume place")?,
+            members: r.list(member)?,
+            read_only: r.bool("volume read_only")?,
+        })
+    })?;
     Ok(image)
 }
 
@@ -3839,6 +3840,26 @@ fn put_grant(w: &mut Writer, grant: &Grant) -> Result<(), Fault> {
     Ok(())
 }
 
+/// A mount, a container's or a Shards image VM's share: its host path, where it is seen, whether read-only, and its
+/// member scope (Shards' D277, after `read_only`): the members it is given to, none for a container's, which its spec's
+/// check refuses, so a scope a caller names is never dropped on its way.
+fn put_mount(w: &mut Writer, m: &Mount) -> Result<(), Fault> {
+    w.path(&m.source)?;
+    w.string(&m.destination)?;
+    w.bool(m.read_only);
+    w.list(&m.members, put_member)
+}
+
+/// [`put_mount`]'s, `destination` naming where it is seen in a refusal.
+fn mount(r: &mut Reader<'_>, destination: &'static str) -> Result<Mount, Fault> {
+    Ok(Mount {
+        source: r.path()?,
+        destination: r.string(destination)?,
+        read_only: r.bool("read_only")?,
+        members: r.list(member)?,
+    })
+}
+
 fn put_member(w: &mut Writer, member: &Member) -> Result<(), Fault> {
     w.u8(match member.kind {
         MemberKind::Agent => 0,
@@ -3988,6 +4009,8 @@ fn class_tag(c: Class) -> u8 {
         Class::Oci => 1,
         Class::Firecracker => 2,
         Class::Shards => 3,
+        // P2.2: a Shards image VM's own class, after every older one.
+        Class::ShardsImage => 4,
     }
 }
 
@@ -3997,6 +4020,7 @@ fn class(r: &mut Reader<'_>) -> Result<Class, Fault> {
         1 => Ok(Class::Oci),
         2 => Ok(Class::Firecracker),
         3 => Ok(Class::Shards),
+        4 => Ok(Class::ShardsImage),
         t => Err(Fault::value("class", format!("variant {t}"))),
     }
 }
@@ -4309,6 +4333,17 @@ fn put_plain_refusal(w: &mut Writer, refusal: &Refusal) -> Result<(), Fault> {
             w.string(op)?;
             put_guest_failure(w, failure)
         }
+        // Kiln plan 01a1dd2e…, P6.2: a Shards home's volume refused by what held it (D281), after every older refusal.
+        Refusal::Volume { cause, why } => {
+            w.u8(17);
+            w.u8(match cause {
+                VolumeCause::Bound => 0,
+                VolumeCause::Clearing => 1,
+                VolumeCause::InUse => 2,
+                VolumeCause::Unknown => 3,
+            });
+            w.string(why)
+        }
     }
 }
 
@@ -4513,6 +4548,16 @@ fn plain_refusal(r: &mut Reader<'_>, tag: u8) -> Result<Refusal, Fault> {
         16 => Refusal::Guest {
             op: name(&r.string("refusal name")?)?,
             failure: guest_failure(r)?,
+        },
+        17 => Refusal::Volume {
+            cause: match r.u8()? {
+                0 => VolumeCause::Bound,
+                1 => VolumeCause::Clearing,
+                2 => VolumeCause::InUse,
+                3 => VolumeCause::Unknown,
+                t => return Err(Fault::value("volume cause", format!("variant {t}"))),
+            },
+            why: r.string("refusal reason")?,
         },
         t => return Err(Fault::value("refusal", format!("variant {t}"))),
     })

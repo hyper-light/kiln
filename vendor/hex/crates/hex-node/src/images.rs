@@ -1,8 +1,10 @@
-//! A runtime of the Shards class on Agentfile images alone (joint plan step 12's item B; kiln's step 17, part 7: launch
+//! A runtime of the Shards image class (`shards-image`) alone (joint plan step 12's item B; kiln's step 17, part 7: launch
 //! through Hex): no guest of Hex's, no PID 1 and no guest configuration, which stay for every other host. Its boxes, each
 //! a Shards image VM booted under shards-init (D231), are the image class's ([`ImageClass`]); their run hosts the
 //! `shards` binary given, with the Shards home and cache given; their records a node Store of its own under the
-//! directory given, changed one at a time; and each run host's diagnostics a file beside them.
+//! directory given, changed one at a time; and each run host's diagnostics a file beside them. It lists the class only
+//! where Shards' check of its host says it runs microVMs (kiln plan 01a1dd2e…, P2.2), and says why where it doesn't
+//! ([`ImageClass::serves`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,13 +12,13 @@ use std::time::Duration;
 
 use hex_api::lease::Lessors;
 use hex_api::{
-    BoxId, BoxInfo, BoxSpec, Class, HostUse, Member, Proc, Program, Refusal, Runtime, Signal,
-    Stdio, Usage,
+    BoxId, BoxInfo, BoxSpec, Class, ControlLink, HomeVolume, HostUse, Member, Proc, Program,
+    Refusal, Runtime, Signal, Stdio, Usage, WarmHeld, WarmPool,
 };
 use hex_core::record::{BoxRecord, PoolRecord};
 use hex_runtime::devices::{Books, PoolPreparationCheck, PoolRecords, Records, Transaction};
 use hex_runtime::guest::{ImageClass, ImageWaits, host_images};
-use shards_api::image::Images;
+use shards_api::image::{Images, WarmRoom};
 
 use crate::store::{Store, TURNS};
 use crate::turns::Turns;
@@ -34,14 +36,16 @@ impl ImageRuntime {
     /// The class whose run hosts are the `shards` binary `shards` (built at Hex's vendored Shards revision, so it speaks
     /// the image channel Hex's `shards_api` does), their Shards home and cache `paths`, whose store holds the images,
     /// its boxes' records under `records` (`records/state` and `records/run`, made where missing), and each run host's
-    /// diagnostics in `records/image-diagnostics`. Shards' image boot as every host runs it ([`host_images`]), its waits
-    /// learned from their own answers (decision 9).
+    /// diagnostics in `records/image-diagnostics`. Shards' image boot as every host runs it, where Shards' check of this
+    /// host says it runs microVMs ([`host_images`]: else it lists no class, and a create says why), its waits learned
+    /// from their own answers (decision 9).
     pub fn new(
         shards: PathBuf,
         paths: shards_api::RuntimePaths,
         records: &Path,
     ) -> Result<Arc<Self>, Refusal> {
-        Self::with_images(shards, paths, records, host_images(), Ok(ImageWaits::new()))
+        let images = host_images(&shards);
+        Self::with_images(shards, paths, records, images, Ok(ImageWaits::new()))
     }
 
     /// [`ImageRuntime::new`] over the image boot `images` and the waits `waits` given.
@@ -64,11 +68,12 @@ impl ImageRuntime {
         records: &Path,
         lessors: Arc<dyn Lessors>,
     ) -> Result<Arc<Self>, Refusal> {
+        let images = host_images(&shards);
         Self::built(
             shards,
             paths,
             records,
-            host_images(),
+            images,
             Ok(ImageWaits::new()),
             Some(lessors),
         )
@@ -118,6 +123,13 @@ impl ImageRuntime {
     /// to boot, read and stop its node VM, its records this runtime's own Store.
     pub fn class(&self) -> &ImageClass {
         &self.class
+    }
+
+    /// The room its warm pools' hosts are charged to, `room`, its owner's, the room its owner admits its boxes from,
+    /// bound once ([`ImageClass::bind_room`]; kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1): from then on it keeps
+    /// the warm pools it is asked to keep. A runtime given none refuses a pool, `Unconfigured` ([`hex_api::WARM_ROOM`]).
+    pub fn bind_room(&self, room: Arc<dyn WarmRoom>) -> Result<(), Refusal> {
+        self.class.bind_room(room)
     }
 
     /// Whether box `id`'s turn is free now, held by no transaction: what the tests of the runtime's turns read.
@@ -287,7 +299,8 @@ impl Transaction for Kept<'_> {
     }
 }
 
-/// Every call the image class's own: it serves the Shards class alone.
+/// Every call the image class's own: it serves the Shards image class alone, listed where its host boots image VMs
+/// ([`ImageClass::serves`]).
 impl Runtime for ImageRuntime {
     fn classes(&self) -> Vec<Class> {
         self.class.classes()
@@ -325,6 +338,18 @@ impl Runtime for ImageRuntime {
     fn mcp(&self, id: &BoxId, member: &Member) -> Result<Box<dyn Proc>, Refusal> {
         self.class.mcp(id, member)
     }
+    fn exec_member(
+        &self,
+        id: &BoxId,
+        member: &Member,
+        program: Program,
+        stdio: Stdio,
+    ) -> Result<Box<dyn Proc>, Refusal> {
+        self.class.exec_member(id, member, program, stdio)
+    }
+    fn link(&self, id: &BoxId) -> Result<ControlLink, Refusal> {
+        self.class.link(id)
+    }
     fn signal_member(&self, id: &BoxId, member: &Member, signal: Signal) -> Result<(), Refusal> {
         self.class.signal_member(id, member, signal)
     }
@@ -346,6 +371,21 @@ impl Runtime for ImageRuntime {
     }
     fn started(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {
         self.class.started(id)
+    }
+    fn keep_pool(&self, pool: &WarmPool) -> Result<(), Refusal> {
+        self.class.keep_pool(pool)
+    }
+    fn let_go_pool(&self, pool: &WarmPool) -> Result<(), Refusal> {
+        self.class.let_go_pool(pool)
+    }
+    fn pools(&self) -> Result<Vec<WarmHeld>, Refusal> {
+        self.class.pools()
+    }
+    fn volumes(&self) -> Result<Vec<HomeVolume>, Refusal> {
+        self.class.volumes()
+    }
+    fn clear_volume(&self, name: &str) -> Result<(), Refusal> {
+        self.class.clear_volume(name)
     }
 }
 

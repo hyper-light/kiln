@@ -213,7 +213,7 @@ impl Prober {
                 available
             }
         };
-        let classes = [Class::Oci, Class::Firecracker, Class::Shards]
+        let classes = Class::ALL
             .into_iter()
             .filter(|&c| self.classes.has(c) && available.has(c))
             .fold(Classes::NONE, Classes::with);

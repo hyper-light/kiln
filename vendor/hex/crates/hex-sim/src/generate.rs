@@ -756,10 +756,13 @@ fn gpu_room(host: &NodeSpec, class: Class) -> Result<u32, SimError> {
         .map_err(|_| SimError::Config("generated GPU capability count"))
 }
 
-/// One of the classes `classes` holds, each alike (OCI when it holds none).
+/// One of the census's three kinds `classes` holds, each alike (OCI when it holds none): no recorded trace carries a
+/// Shards image VM, so none is drawn, and a node's image class leaves the draw as it was.
 fn one_of(rng: &mut Rng, classes: Classes) -> Class {
-    let pick = rng.range(0, u64::from(classes.count().saturating_sub(1)));
-    [Class::Oci, Class::Firecracker, Class::Shards]
+    const KINDS: [Class; 3] = [Class::Oci, Class::Firecracker, Class::Shards];
+    let held = KINDS.into_iter().filter(|&c| classes.has(c)).count();
+    let pick = rng.range(0, u64::try_from(held.saturating_sub(1)).unwrap_or(0));
+    KINDS
         .into_iter()
         .filter(|&c| classes.has(c))
         .nth(usize::try_from(pick).unwrap_or(0))

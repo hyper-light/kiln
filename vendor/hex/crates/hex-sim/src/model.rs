@@ -79,12 +79,16 @@ impl Os {
     /// and Firecracker and Shards microVMs where KVM is usable (both VMMs run on it); Windows OCI
     /// containers and Shards microVMs (on the Windows Hypervisor Platform, which kiln's facts don't
     /// probe); macOS Shards microVMs where Hypervisor.framework is supported; FreeBSD none Hex places.
+    /// Shards image VMs run wherever Shards microVMs do: one backend boots both.
     pub fn classes(self, virt: Virt) -> Classes {
         match self {
             Os::Linux if virt.kvm => Classes::ALL,
             Os::Linux => Classes::NONE.with(Class::Oci),
-            Os::Windows => Classes::NONE.with(Class::Oci).with(Class::Shards),
-            Os::Macos if virt.hvf => Classes::NONE.with(Class::Shards),
+            Os::Windows => Classes::NONE
+                .with(Class::Oci)
+                .with(Class::Shards)
+                .with(Class::ShardsImage),
+            Os::Macos if virt.hvf => Classes::NONE.with(Class::Shards).with(Class::ShardsImage),
             Os::Macos | Os::Freebsd => Classes::NONE,
         }
     }
@@ -554,6 +558,9 @@ impl RuntimeRoutes {
                     Os::Freebsd => false,
                 },
                 hex_api::Class::Process | hex_api::Class::Oci => native_os == node.platform.os,
+                // An image VM's route executes on Shards, its backend class Shards' above (`RouteKey::check`, P2.2):
+                // no route's backend is the image class itself.
+                hex_api::Class::ShardsImage => false,
             };
             if arch != node.platform.arch || !supported {
                 return Err(crate::SimError::Config(
@@ -833,8 +840,10 @@ pub fn unnamed_gpus(n: u32) -> Vec<Device> {
     (0..n).map(|_| Device::gpu(ModelId::UNNAMED, 0)).collect()
 }
 
-/// What runs a workload. Hex places three: OCI containers, Firecracker microVMs and Shards
-/// microVMs (Ada, 2026-11-06), each only on a node that can run it.
+/// What runs a workload. Hex places four: OCI containers, Firecracker microVMs and Shards
+/// microVMs (Ada, 2026-11-06), and Shards image VMs, an Agentfile image Shards boots under shards-init (kiln plan
+/// 01a1dd2e…, P2.2: their own class, so a node lists them only where its image boot runs and each is counted apart
+/// from Hex's own Shards guests), each only on a node that can run it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(usize)]
 pub enum Class {
@@ -842,11 +851,17 @@ pub enum Class {
     Oci,
     Firecracker,
     Shards,
+    ShardsImage,
 }
 
 impl Class {
-    pub const COUNT: usize = Self::Shards as usize + 1;
-    pub const ALL: [Self; Self::COUNT] = [Self::Oci, Self::Firecracker, Self::Shards];
+    pub const COUNT: usize = Self::ShardsImage as usize + 1;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Oci,
+        Self::Firecracker,
+        Self::Shards,
+        Self::ShardsImage,
+    ];
     /// Whether it can be given a device of `kind` on a node of `os`
     /// (docs/research/scheduler/agentic-workloads.md §6 and finding 8: device access is a property of
     /// the node and the class). An OCI container on Linux can be given each kind: its runtime passes
@@ -864,6 +879,8 @@ impl Class {
             (Class::Firecracker, Os::Linux) => matches!(kind, DeviceKind::Gpu | DeviceKind::Vfio),
             (Class::Shards, Os::Linux) => matches!(kind, DeviceKind::Gpu | DeviceKind::Vfio),
             (Class::Shards, Os::Macos | Os::Windows) => kind == DeviceKind::Gpu,
+            // D231's image boot attaches no physical device.
+            (Class::ShardsImage, _) => false,
             _ => false,
         }
     }
@@ -875,13 +892,14 @@ impl Class {
         matches!((self, os), (Class::Oci, Os::Linux))
     }
 
-    /// Its place among the three, as reports and per-class arrays give them: OCI containers,
-    /// Firecracker microVMs, Shards microVMs.
+    /// Its place among the four, as reports and per-class arrays give them: OCI containers,
+    /// Firecracker microVMs, Shards microVMs, Shards image VMs.
     pub fn index(self) -> usize {
         match self {
             Class::Oci => 0,
             Class::Firecracker => 1,
             Class::Shards => 2,
+            Class::ShardsImage => 3,
         }
     }
 }
@@ -891,7 +909,7 @@ impl Class {
 pub struct Classes(u8);
 
 impl Classes {
-    pub const ALL: Self = Self(0b111);
+    pub const ALL: Self = Self(0b1111);
     pub const NONE: Self = Self(0);
 
     pub fn with(self, class: Class) -> Self {
@@ -917,6 +935,7 @@ impl Classes {
             Class::Oci => 1,
             Class::Firecracker => 2,
             Class::Shards => 4,
+            Class::ShardsImage => 8,
         }
     }
 }
@@ -925,7 +944,7 @@ impl Classes {
 /// (a container's shim, a microVM's VMM and the kernel's share of it). A workload's need includes its
 /// class's.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Overheads([Overhead; 3]);
+pub struct Overheads([Overhead; Class::COUNT]);
 
 /// One class's overhead.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1032,16 +1032,18 @@ fn configured_guest(
             &why,
         ))
     })?;
-    // The Shards class on Agentfile images (joint plan step 12): Shards' image boot, which every host runs, or
-    // the refusal naming this node's SHARDS_KERNEL and SHARDS_INIT where its run hosts couldn't take them as a
-    // pair, read here once, which a create of the class then says; its waits learned from their own answers
-    // (decision 9: no record is read).
+    // The Shards image class (joint plan step 12; P2.2): Shards' image boot, which every host runs, or the refusal
+    // naming this node's SHARDS_KERNEL and SHARDS_INIT where its run hosts couldn't take them as a pair, or Shards'
+    // own words where its check of this host, asked of the guest's `shards`, says it runs no microVM, read here once,
+    // which the node's classes then leave the class out for and a create of it says; its waits learned from their own
+    // answers (decision 9: no record is read).
+    let images = hex_runtime::guest::host_images(&config.binary);
     let mut guest = GuestRuntime::new(Arc::new(provider), config)
         .recorded_at(backend_path(state, "@guest").map_err(failed)?)
         .with_runtime_paths(paths)
         .with_gpu_catalog(catalog)
         .with_images(
-            hex_runtime::guest::host_images(),
+            images,
             Ok(hex_runtime::guest::ImageWaits::new()),
             backend_path(state, "image-diagnostics").map_err(failed)?,
         )

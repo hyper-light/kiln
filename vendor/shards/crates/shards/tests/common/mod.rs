@@ -294,6 +294,102 @@ pub fn snapshot_file(dir: &Path, name: &str) -> PathBuf {
     generation.join(newest)
 }
 
+/// Plan step 33's leak scan (docs/research/measurements/s33-leak-scan), on what it scans:
+/// what `ImageGuest::save` writes, which is its owner's alone (D259).
+/// Python 3 runs it: `python3`, on Windows `python`.
+fn leak_scan(secrets: &Path, paths: &[&Path]) -> (Option<i32>, String) {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/research/measurements/s33-leak-scan/scan.py");
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let out = Command::new(python)
+        .arg("-I")
+        .arg(script)
+        .arg("--secrets")
+        .arg(secrets)
+        .args(paths)
+        .output()
+        .unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.code(), said)
+}
+
+/// api_image's leak-scan test judged (D259): `saved`, a run's save, scanned with its harness's
+/// environment as given (`keys/env`), first for the values the harness was given
+/// (`keys/given.json`), then for one never given (`keys/never.json`). Both values given are
+/// found in the save's memory, each by its name, and the environment's in its file (exit 3);
+/// the one never given nowhere. Where the test runs, or on L1's outer host
+/// ([`leave_leak_scan`]).
+pub fn leak_scan_judged(saved: &Path, keys: &Path) {
+    let memory = snapshot_file(saved, "memory").display().to_string();
+    let env = keys.join("env");
+    let (code, said) = leak_scan(&keys.join("given.json"), &[saved, &env]);
+    assert_eq!(code, Some(3), "{said}");
+    for name in ["given.json:env_token", "given.json:file_token"] {
+        assert!(
+            said.lines()
+                .any(|l| l.starts_with(&format!("FOUND {memory} offset ")) && l.ends_with(name)),
+            "{name} in the save's memory: {said}"
+        );
+    }
+    assert!(
+        said.contains("harness-codex offset 19 length 64: a run of given.json:env_token"),
+        "{said}"
+    );
+    // Never given, never found: what else credential-shaped its memory holds is listed (exit 4)
+    // and is no secret's.
+    let (code, said) = leak_scan(&keys.join("never.json"), &[saved, &env]);
+    assert!(matches!(code, Some(0 | 4)), "{said}");
+    assert!(said.contains(" 0 secret runs found"), "{said}");
+}
+
+/// Where in the outer host's share a test under L1 leaves a run's save to scan.
+const LEAK_SCAN_LEFT: &str = "leak-scan";
+
+/// `saved`, a run's save, and `keys`, what its scan is given ([`leak_scan_judged`]), left in
+/// `out`, the outer host's share under L1 (SHARDS_L1_OUT, boot.rs), for that host to scan
+/// once the guest is gone ([`judge_left_leak_scan`]): an L1 guest has no Python.
+pub fn leave_leak_scan(out: &Path, saved: &Path, keys: &Path) {
+    let left = out.join(LEAK_SCAN_LEFT);
+    copy_used_tree(saved, &left.join("saved"));
+    copy_used_tree(keys, &left.join("keys"));
+}
+
+/// The save a test under L1 left in `out`, this host's side of its share
+/// ([`leave_leak_scan`]), judged as the test judges one in place; nothing where none was left.
+pub fn judge_left_leak_scan(out: &Path) {
+    let left = out.join(LEAK_SCAN_LEFT);
+    if left.exists() {
+        leak_scan_judged(&left.join("saved"), &left.join("keys"));
+    }
+}
+
+/// Directory `from` copied to `to`: its directories, and its regular files, each with only
+/// what its file system says holds data and is not all zeros (`platform::copy_used`), so that a
+/// save's sparse files take no more of `to`'s disk than they did of `from`'s, and synced, as `to`
+/// may be a share whose host reads it once this guest is gone. No link is copied: the scan
+/// follows none.
+fn copy_used_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let (path, copy) = (entry.path(), to.join(entry.file_name()));
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            copy_used_tree(&path, &copy);
+        } else if kind.is_file() {
+            let source = std::fs::File::open(&path).unwrap();
+            let len = source.metadata().unwrap().len();
+            let made = std::fs::File::create(&copy).unwrap();
+            shards_vmm::platform::copy_used(&source, &made, len).unwrap();
+            made.sync_all().unwrap();
+        }
+    }
+}
+
 /// shards' guest kernel for the host architecture: Linux 6.18.48 with Firecracker's
 /// microVM config and ours (resources/kernel), built reproducibly by CI.
 pub fn kernel_artifact() -> Artifact {
@@ -2430,6 +2526,19 @@ impl Patience {
         Patience::with(Some(home), site)
     }
 
+    /// [`at`](Self::at) waiting for `awaited`, a kind kept apart from the site's other waits
+    /// ([`WaitKind::awaiting`]; [`STATE`] is `at`'s own): an answer's body, which comes when
+    /// what it answers comes (a container's end, an event stream's end), read after its
+    /// head, which comes at once and would teach the body's wait a W* of one read (CI
+    /// 43968984258's x86_64 musl job: engine.rs' waits for a container's end and for an
+    /// events stream's last chunk refused 4 to 16 ms into a stillness past their heads').
+    pub fn awaiting(home: &Path, site: &'static std::panic::Location<'static>, awaited: &str) -> Patience {
+        Patience {
+            wait: Wait::on(WaitKind::awaiting(site, awaited), Party::own(Some(home)), awaited),
+            state: Patient::Holds,
+        }
+    }
+
     /// Patience with client `client`, what descends from it, and the daemon of `home`: a
     /// wait on what a command brings about, which starts its home's daemon, or waits out one
     /// of another build stepping aside, before any daemon is there to follow.
@@ -2480,6 +2589,13 @@ impl Patience {
             wait: Wait::on(WaitKind::awaiting(site, STATE), party, STATE),
             state: Patient::Holds,
         }
+    }
+
+    /// It as a wait on the delivery of a run's log to `to` ([`Wait::delivery_to`]): a log
+    /// server's wait for a run's lines.
+    pub fn delivery_to(mut self, to: &str) -> Patience {
+        self.wait.party.delivery = Some(to.to_string());
+        self
     }
 
     /// Whether to look again: while its judge holds it and its party lives; once either
@@ -2540,6 +2656,15 @@ impl Patience {
     }
 }
 
+/// The least a guest gives back at once: one block of its free lists, which free page
+/// reporting hands the host whole (`page_reporting_order`, its pageblock: 2 MiB with 4 KiB
+/// pages, the least a page is, and more with larger pages; mm/page_reporting.c,
+/// virtio/balloon.rs, D151). A dip of less is no give-back's, and taken for its first fall it
+/// ends a cold settle before the guest has reported: CI 43968984258's x86_64 musl job took a
+/// microVM "idle" at 871706624 bytes after a 1 GiB free, and its 512 MiB read then grew it
+/// 29 MiB, a baseline taken before its give-back had settled.
+pub const REPORTED: u64 = 2 << 20;
+
 /// A give-back followed (ROOT's ruling, D209 Part 4): a VM process's own resident memory
 /// (`Usage::footprint`) while it falls. A give-back is progress while that falls, as the
 /// daemon's judge of an end counts it (daemon/ends.rs `goes_on`), so this is a judged
@@ -2553,10 +2678,13 @@ impl Patience {
 /// fall, which it waits on for as long as the process lives. Begun before what it gives
 /// back is freed, its first fall spans the free and its guest's whole wait before it
 /// reports (mm/page_reporting.c `PAGE_REPORTING_DELAY`, D151), which each later report
-/// only waits again.
+/// only waits again. A fall is one report's at least, [`REPORTED`] below the level its last
+/// fall left or its memory rose to since: less is its process's own memory moving.
 pub struct Falling {
     pid: u32,
     wait: Wait,
+    /// The level a fall is counted from: its memory at its last fall, or the most it has
+    /// held since.
     held: u64,
     /// Its last fall, and the last time a look found its host holding it since.
     fell: Option<Instant>,
@@ -2596,8 +2724,10 @@ impl Falling {
     pub fn settled(mut self) -> u64 {
         loop {
             let now = Falling::footprint(self.pid);
-            let fell = now < self.held;
-            self.held = now;
+            let fell = now.saturating_add(REPORTED) <= self.held;
+            if fell || now > self.held {
+                self.held = now;
+            }
             if fell {
                 (self.fell, self.quiet) = (Some(Instant::now()), Some(Instant::now()));
             }
@@ -2629,6 +2759,15 @@ impl Falling {
                     }
                     self.wait.kind.keep();
                 }
+                let _ = writeln!(
+                    io::stderr(),
+                    "VM process {}'s give-back settled at {now} bytes, {:?} in, its last fall {:?} in\n{}",
+                    self.pid,
+                    self.wait.began.elapsed(),
+                    self.fell
+                        .map(|fell| fell.saturating_duration_since(self.wait.began)),
+                    self.wait.account()
+                );
                 return now;
             }
             std::thread::sleep(self.wait.next_look());
@@ -3522,6 +3661,9 @@ pub struct Party {
     /// for its account: which of them a refusal's last progress was (b24: a run's VM
     /// process, its daemon's spawner's child, told from the client's by its name alone).
     kin: std::collections::BTreeMap<u32, (u32, String)>,
+    /// The destination of the delivery of a run's log its wait reads, as the run's options
+    /// name it ([`Wait::delivery_to`]); none for a wait on anything else.
+    delivery: Option<String>,
 }
 
 /// Process `pid`'s status as its OS gives it: Linux its `/proc/<pid>/stat` state (field 3,
@@ -3530,6 +3672,40 @@ pub struct Party {
 /// (status 2), 0 of 12 threads runnable" of an idle daemon), each said with its letter or
 /// number; none where it cannot be read (Windows,
 /// whose process has no such state).
+/// Where the threads of process `pid` wait, each by its kernel's name for the place it
+/// sleeps (`/proc/<pid>/task/<tid>/wchan`, proc(5)), with how many: for a refusal's account,
+/// which said a party's threads all slept but not on what (CI 43968984258, x86_64 musl:
+/// engine.rs' refused create and `/system/df`, each daemon's 17 threads `S`, its looks on
+/// time). None where none is read, and off Linux.
+fn waits_in(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()?.flatten() {
+            let Ok(wchan) = std::fs::read_to_string(task.path().join("wchan")) else {
+                continue;
+            };
+            let wchan = wchan.trim();
+            // "0": a thread on a CPU, or a name its reader may not see.
+            if !wchan.is_empty() && wchan != "0" {
+                *counts.entry(wchan.to_string()).or_default() += 1;
+            }
+        }
+        (!counts.is_empty()).then(|| {
+            counts
+                .iter()
+                .map(|(wchan, n)| format!("{wchan} x{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn process_status(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -3642,7 +3818,9 @@ pub struct Looked {
     pub daemon_ran: Option<String>,
     /// Whether it saw its party's own processes run or rest unheld: none of them held from
     /// running, stopped, starved of a CPU (`shards_api::Watch::starved`), ending or found
-    /// anew, no run of its home in its stop grace, its daemon saying nothing (words are
+    /// anew, its daemon within no deadline of its own that holds it ([`Party::graced`]: a
+    /// run's stop grace, a log's next try to the destination it reads), its daemon saying
+    /// nothing (words are
     /// progress its CPU does not show), and no progress of this process's servers', which it
     /// may be waiting on. Only such looks' windows are its judge's rate's
     /// (`shards_api::Span::work`, D215).
@@ -3694,6 +3872,7 @@ impl Party {
             beside: None,
             served: None,
             kin: std::collections::BTreeMap::new(),
+            delivery: None,
         }
     }
 
@@ -3775,8 +3954,10 @@ impl Party {
     /// stalled on its memory, and so running nothing), or stopped or suspended one, which
     /// D215's look finds `Still` on Linux and a test's wait counts as its host's hold: a kiln
     /// runner's headroom guard suspends a run's processes as it paces them (ROOT,
-    /// 2026-11-13); or, a process of it live, held where a run of its home is in its stop
-    /// grace ([`graced`](Self::graced)), the daemon's own deadline; else still; and gone where no process of it runs and its daemon said
+    /// 2026-11-13); or, a process of it live, held where its daemon is within a deadline of
+    /// its own that holds it, a run of its home in its stop grace or, for a wait on the
+    /// delivery of a run's log, that run's shipper paused until its next try there
+    /// ([`graced`](Self::graced)); else still; and gone where no process of it runs and its daemon said
     /// nothing, its liveness ended. A process found anew is judged from the look after. A
     /// machine of this process's is never gone: its liveness is its caller's. Its daemon's own
     /// run is said apart ([`Looked::daemon_ran`]), its waiter's to weigh. A look that found
@@ -3950,11 +4131,11 @@ impl Party {
             looked.found = Found::Held;
             looked.what = format!("its VM process {pid} in its launch, the host's to admit (PM M166)");
         }
-        if live && let Some((run, left)) = self.graced() {
+        if live && let Some((run, what, left)) = self.graced() {
             looked.vouched = false;
             if looked.found == Found::Still {
                 looked.found = Found::Held;
-                looked.what = format!("its daemon in run {run}'s stop grace, {left:?} more");
+                looked.what = format!("its daemon in run {run}'s {what}, {left:?} more");
             }
         }
         if !live && looked.found == Found::Still && !matches!(self.members, Members::Machine) {
@@ -3967,27 +4148,44 @@ impl Party {
         looked
     }
 
-    /// The run of its home whose stop grace has longest to go, and how long (`shards_ipc::
-    /// GRACE`): the daemon's own deadline, its SIGKILL, before which it and that run may run
-    /// nothing at all, as a command that ignores its stop signal keeps them, and are not
-    /// stalled (D209). None past every grace, nor where none is kept.
-    fn graced(&self) -> Option<(String, Duration)> {
+    /// The deadline of its home's daemon that holds it and has longest to go: the run it is
+    /// of, what it is, and how long. The daemon keeps each in its run's directory while it
+    /// holds, and before it nothing need run, so none is a stall (D209): a run's stop grace
+    /// (`shards_ipc::GRACE`), its SIGKILL, before which the daemon and that run may run
+    /// nothing at all, as a command that ignores its stop signal keeps them, which holds
+    /// every wait on the daemon; and a run's log's shipper's next try (`shards_ipc::RETRY`),
+    /// before which the shipper sleeps, its receiver having failed it, as a server not yet
+    /// up does, which holds up the delivery to the destination it names alone, and so holds
+    /// only a wait on that delivery ([`delivery`](Self::delivery), Part 10). None past every
+    /// one, nor where none is kept.
+    fn graced(&self) -> Option<(String, String, Duration)> {
         let now = std::time::SystemTime::now();
         std::fs::read_dir(self.home.as_ref()?.join("containers"))
             .ok()?
-            .filter_map(|run| {
-                let run = run.ok()?;
-                let left = shards_ipc::grace_until(&run.path())?.duration_since(now).ok()?;
-                Some((run.file_name().to_string_lossy().into_owned(), left))
+            .filter_map(Result::ok)
+            .flat_map(|run| {
+                let dir = run.path();
+                let grace = shards_ipc::deadline_in(&dir, shards_ipc::GRACE)
+                    .map(|(due, _)| (due, "stop grace".to_string()));
+                let retry = shards_ipc::deadline_in(&dir, shards_ipc::RETRY).and_then(|(due, to)| {
+                    let to = to.filter(|to| self.delivery.as_ref() == Some(to))?;
+                    Some((due, format!("log's pause before its next try to {to}")))
+                });
+                let name = run.file_name().to_string_lossy().into_owned();
+                [grace, retry]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |(due, what)| Some((name.clone(), what, due.duration_since(now).ok()?)))
             })
-            .max_by_key(|(_, left)| *left)
+            .max_by_key(|(_, _, left)| *left)
     }
 
     /// What each process it follows is doing now, as its OS gives it, for a wait's account of
     /// itself, so that a refusal names its own premise (ROOT, 2026-11-14: api_image.rs:1379's
     /// refusal named no member's state, whether one was ending among them): its status
     /// ([`process_status`]), how many of its threads are runnable (`shards_api::
-    /// runnable_threads`), and its end under way or its stop, as its look found them.
+    /// runnable_threads`), where its threads wait ([`waits_in`]), and its end under way or its
+    /// stop, as its look found them.
     fn states(&self) -> String {
         if self.watched.is_empty() {
             return "none followed".into();
@@ -4006,6 +4204,9 @@ impl Party {
                 );
                 if let Some((runnable, threads)) = shards_api::runnable_threads(pid) {
                     said.push_str(&format!(", {runnable} of {threads} threads runnable"));
+                }
+                if let Some(waits) = waits_in(pid) {
+                    said.push_str(&format!(", its threads waiting in {waits}"));
                 }
                 if watch.ended() {
                     said.push_str(", its end under way");
@@ -4697,6 +4898,15 @@ impl Wait {
         let mut wait = Wait::on(kind, Party::client(client, home), asked);
         wait.command = true;
         wait
+    }
+
+    /// It as a wait on the delivery of a run's log to `to`, the destination as the run's
+    /// options name it (`logging::destination`: `syslog-address=tcp://127.0.0.1:514`): a
+    /// pause of that run's shipper before its next try there holds it, and holds no other
+    /// wait (`shards_ipc::RETRY`, D209 Part 10).
+    pub fn delivery_to(mut self, to: &str) -> Wait {
+        self.party.delivery = Some(to.to_string());
+        self
     }
 
     /// A wait beginning now on `party`, `asked` naming what it waits for.
@@ -6305,6 +6515,17 @@ pub fn judged_there<T: Send>(
     judging(wait, Stage::Begun, asked, stop, call)
 }
 
+/// Where a judged call's own thread is ([`judging`]).
+enum Calling {
+    /// Spawned, not yet at its first line: its OS has it runnable, and it has run none of
+    /// its call.
+    Spawned,
+    /// Running its call, followed by its own clock.
+    Calls(ServerThread),
+    /// Past its call, its clock let go of; its answer on its way.
+    Called,
+}
+
 /// [`judged`]'s wait, its looks saying its answer missing where `stage` is
 /// [`Stage::Awaited`], and never where it is [`Stage::Begun`]. `call` runs on a thread of
 /// this process, shards-api's client, whose work (a spec's checks, an image's reads, a
@@ -6314,7 +6535,7 @@ pub fn judged_there<T: Send>(
 /// 206 µs on HVF and one in 28.6 ms on KVM at 0 ns of the started processes' CPU, taught
 /// their call sites a W* that refused the next call as it worked). The thread names itself
 /// as it starts and is let go of before it returns, under one lock, so its clock is read
-/// only while it lives.
+/// only while it lives ([`Calling`]).
 fn judging<T: Send>(
     mut wait: Wait,
     stage: Stage,
@@ -6322,14 +6543,14 @@ fn judging<T: Send>(
     stop: impl FnOnce(),
     call: impl FnOnce() -> T + Send,
 ) -> Result<T, String> {
-    let calling: std::sync::Mutex<Option<ServerThread>> = std::sync::Mutex::new(None);
+    let calling = std::sync::Mutex::new(Calling::Spawned);
     let thread = || calling.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::thread::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = scope.spawn(move || {
-            *thread() = Some(ServerThread::this());
+            *thread() = Calling::Calls(ServerThread::this());
             let answer = call();
-            *thread() = None;
+            *thread() = Calling::Called;
             let _ = tx.send(answer);
         });
         let refused = loop {
@@ -6345,9 +6566,18 @@ fn judging<T: Send>(
                 },
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            if let Some(thread) = thread().as_mut() {
-                let before = thread.last;
-                wait.call_looked(thread.ran() > before, thread.runnable());
+            match &mut *thread() {
+                // Runnable and none of its call run: its host's hold, as a thread of its
+                // that is runnable and not running is (CI 43968984258, aarch64 musl: a call
+                // spinning for 200 ms, its thread not yet named 2.06 ms into its wait beside
+                // the busy stand-ins of the tests around it, refused as idle, "its last
+                // progress its start").
+                Calling::Spawned => wait.call_looked(false, true),
+                Calling::Calls(thread) => {
+                    let before = thread.last;
+                    wait.call_looked(thread.ran() > before, thread.runnable());
+                }
+                Calling::Called => {}
             }
             let looked = if stage == Stage::Awaited {
                 wait.look(false)
@@ -6623,7 +6853,8 @@ enum Guest {
     /// More: progress until its first line, its liveness after.
     Streaming,
     /// A machine of this process's: this process's threads beside its waiter's, progress
-    /// throughout ([`Party::machine`]).
+    /// throughout ([`Party::machine`]); or, of more vCPUs than its host has CPUs, its
+    /// liveness alone, its lines its progress ([`guest_says`]).
     Machine,
 }
 
@@ -6706,6 +6937,21 @@ impl<'a> Heard<'a> {
         )
     }
 
+    /// A wait of `kind` for a line of a guest's ([`guest_says`]), `asked` naming which: by its
+    /// lines, its caller beginning another wait as each comes, and by the CPU of this
+    /// process's threads beside the one that waits read as `cpu` says ([`Party::machine`]).
+    fn lines(kind: &'static WaitKind, asked: &str, cpu: Cpu) -> Heard<'static> {
+        let mut party = Party::machine();
+        party.read_cpu(cpu);
+        Heard {
+            wait: Wait::on(kind, party, asked),
+            guest: Guest::Machine,
+            streamed: None,
+            bytes: 0,
+            new: false,
+        }
+    }
+
     /// Something it said, `new` where it had not said it before.
     pub fn said(&mut self, new: bool) {
         self.new |= new;
@@ -6783,10 +7029,268 @@ pub fn machine_ended(
     }
 }
 
+/// What [`guest_says`] awaits first, and keys that wait's kind by: its guest's first line,
+/// from its wait's start.
+pub const FIRST_LINE: &str = "its guest's first line";
+/// What each of [`guest_says`]' waits after its first awaits, and keys their kind by: its
+/// guest's next line, from the line before.
+pub const NEXT_LINE: &str = "its guest's next line";
+
+/// What a guest said as [`guest_says`] read it: each line as a read first found it, and the
+/// time from the wait's start at which that read began.
+pub struct Lines {
+    began: Instant,
+    seen: Vec<(Duration, String)>,
+    known: std::collections::BTreeSet<String>,
+}
+
+impl Lines {
+    fn new() -> Lines {
+        Lines {
+            began: Instant::now(),
+            seen: Vec::new(),
+            known: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Takes in a read of its guest, `said` its whole lines: each line it had not said before
+    /// is kept, and said on stderr after `tag` and its time where a tag is given, which CI's
+    /// log keeps whatever ends the test, a step's limit among them. Returns how many lines it
+    /// had before: those past them are new.
+    fn heard(&mut self, said: &[u8], tag: Option<&str>) -> usize {
+        let (before, at) = (self.seen.len(), self.began.elapsed());
+        for line in String::from_utf8_lossy(said).lines() {
+            if self.known.insert(line.to_string()) {
+                if let Some(tag) = tag {
+                    let _ = writeln!(io::stderr(), "{tag} {at:?}: {line}");
+                }
+                self.seen.push((at, line.to_string()));
+            }
+        }
+        before
+    }
+
+    /// Each line, after the time from the wait's start at which the read that first found
+    /// it began.
+    pub fn seen(&self) -> &[(Duration, String)] {
+        &self.seen
+    }
+
+    /// Every line, as its guest said them.
+    pub fn text(&self) -> String {
+        self.seen
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every line, after the time a read first found it: what a failure says.
+    pub fn timed(&self) -> String {
+        self.seen
+            .iter()
+            .map(|(at, line)| format!("{at:.3?} {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// How [`guest_says`]' wait ended.
+#[derive(Debug)]
+pub enum Saying<E> {
+    /// Its guest said a line with its text: the first such, and its machine's end where that
+    /// came before the read that found it.
+    Said { line: String, ended: Option<E> },
+    /// Its machine ended and its guest had not said it: its end, none where the channel that
+    /// tells it closed without one.
+    Ended(Option<E>),
+    /// Its wait was refused: what its wait said of itself.
+    Refused(String),
+}
+
+/// Whether a guest of `vcpus` vCPUs has more than this host has CPUs, and so runs them for
+/// ever, its workload stopped or not ([`Cpu::Liveness`]).
+fn wider_than_host(vcpus: u32) -> bool {
+    let cpus = std::thread::available_parallelism().map_or(0, std::num::NonZero::get);
+    usize::try_from(vcpus).is_ok_and(|vcpus| vcpus > cpus)
+}
+
+/// Waits for a guest to say a line containing `text`, each read of its whole lines `read`'s,
+/// until `ended`, its machine's end, comes; judged by its guest's own progress, its lines
+/// (D261): each line it had not said before.
+/// - Each wait is judged as D215's judge judges ([`Heard`]), its party this process's threads
+///   beside the one that waits ([`Party::machine`]), whose CPU is the liveness alone of a
+///   guest of more vCPUs than its host has CPUs (`vcpus`), and its progress otherwise.
+/// - Its first line's wait is a kind of its own ([`FIRST_LINE`]), beside its call site and
+///   `size`. Each line that comes begins a wait for the next, of another ([`NEXT_LINE`]), whose
+///   W* is the slowest gap between two lines seen on this host, so that a guest silent for
+///   longer than that is refused there, however long its boot.
+/// - Only a pass teaches them: once it has found its text, what its waits took (the time to its
+///   first line, where it was found missing first; the slowest gap after it) is taught to their
+///   kinds and kept on this host. A guest that stalls, or a wait refused, teaches nothing.
+/// - Its guest is read as its read's own cost weighs against the wait so far (`shards_api::
+///   pause`, D215's pace), and before each look its judge makes, which sees what it found.
+/// - Its machine's end ends it, what its guest said by then read first.
+#[track_caller]
+pub fn guest_says<E>(
+    mut read: impl FnMut() -> Vec<u8>,
+    ended: &std::sync::mpsc::Receiver<E>,
+    text: &str,
+    size: &str,
+    vcpus: u32,
+    tag: Option<&str>,
+) -> (Saying<E>, Lines) {
+    let site = std::panic::Location::caller();
+    let (first, next) = (
+        WaitKind::of(site, FIRST_LINE, size),
+        WaitKind::of(site, NEXT_LINE, size),
+    );
+    let cpu = if wider_than_host(vcpus) {
+        Cpu::Liveness
+    } else {
+        Cpu::Progress
+    };
+    let mut lines = Lines::new();
+    let mut heard = Heard::lines(first, FIRST_LINE, cpu);
+    // When its last lines were read, from its start; what its first line's wait took, and
+    // the slowest wait for a next line since, each where its wait found it missing first.
+    let (mut last, mut first_came, mut slowest) = (Duration::ZERO, None, None::<Duration>);
+    let mut read_at = Instant::now();
+    loop {
+        if Instant::now() >= read_at {
+            let began = Instant::now();
+            let from = lines.heard(&read(), tag);
+            let cost = began.elapsed();
+            if let Some(&(at, _)) = lines.seen.get(from) {
+                if heard.wait.awaited() {
+                    let waited = at.saturating_sub(last);
+                    if from == 0 {
+                        first_came = Some(waited);
+                    } else {
+                        slowest = Some(slowest.map_or(waited, |s| s.max(waited)));
+                    }
+                }
+                last = at;
+                if let Some(line) = lines.seen[from..].iter().find(|(_, l)| l.contains(text)) {
+                    let line = line.1.clone();
+                    for (kind, waited) in [(first, first_came), (next, slowest)] {
+                        if let Some(waited) = waited {
+                            kind.record().teach_unrated(waited);
+                            kind.keep();
+                        }
+                    }
+                    return (Saying::Said { line, ended: None }, lines);
+                }
+                heard = Heard::lines(next, NEXT_LINE, cpu);
+            }
+            let left = heard
+                .wait
+                .judge
+                .due()
+                .map_or(Duration::MAX, |due| due.saturating_duration_since(Instant::now()));
+            read_at = Instant::now() + shards_api::pause(cost, heard.wait.began.elapsed(), left);
+        }
+        if let Err(refused) = heard.look(true) {
+            return (Saying::Refused(refused), lines);
+        }
+        let pause = read_at
+            .saturating_duration_since(Instant::now())
+            .min(heard.next_look());
+        let end = match ended.recv_timeout(pause) {
+            Ok(end) => Some(end),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        };
+        let from = lines.heard(&read(), tag);
+        let saying = match lines.seen[from..].iter().find(|(_, l)| l.contains(text)) {
+            Some((_, line)) => Saying::Said {
+                line: line.clone(),
+                ended: end,
+            },
+            None => Saying::Ended(end),
+        };
+        return (saying, lines);
+    }
+}
+
+/// [`guest_says`] of a machine this process runs, `handle`, whose end `ended` says (a
+/// thread's `running.wait()`): its lines those of its console, or, while its console has
+/// carried nothing, of its kernel's printk ring, read from its memory
+/// ([`Handle::console_said`](shards_vmm::vm::Handle::console_said), D261: hvc0 registers only
+/// at device_initcall, and its ring is found from subsys_initcall on, as VMCOREINFO is
+/// published). Once it has said it, or its wait is refused, its machine is stopped and its
+/// end waited for ([`machine_ended`]), so that none of it runs once this returns. The line
+/// and what it said; or what failed, and what it said, each line after when a read first
+/// found it.
+#[track_caller]
+pub fn machine_says(
+    handle: &shards_vmm::vm::Handle,
+    ended: &std::sync::mpsc::Receiver<shards_vmm::vm::ExitReason>,
+    text: &str,
+    size: &str,
+    vcpus: u32,
+    tag: Option<&str>,
+) -> Result<(String, Lines), String> {
+    use shards_vmm::vm::ExitReason;
+    let (saying, lines) = guest_says(|| handle.console_said().lines, ended, text, size, vcpus, tag);
+    let stop = match saying {
+        Saying::Said { ended: None, .. } | Saying::Refused(_) => {
+            handle.stop();
+            machine_ended(handle, ended).err()
+        }
+        Saying::Said { ended: Some(_), .. } | Saying::Ended(_) => None,
+    };
+    let failed = match saying {
+        Saying::Said { line, .. } if stop.is_none() => return Ok((line, lines)),
+        Saying::Said { .. } => format!("its guest said {text:?}"),
+        // Its end's own line, a vCPU's "VM entry failed" among them (D261's A/B), on a line
+        // of its own.
+        Saying::Ended(Some(ExitReason::Error(e))) => {
+            format!("no {text:?} from its guest: its machine ended:\n{e}")
+        }
+        Saying::Ended(end) => format!("no {text:?} from its guest: its machine ended: {end:?}"),
+        Saying::Refused(refused) => format!("no {text:?} from its guest: {refused}"),
+    };
+    let stop = stop.map_or_else(String::new, |refused| {
+        format!("\nstopped, its machine did not end: {refused}")
+    });
+    Err(format!(
+        "{failed}{stop}\nwhat it said, each line after when a read first found it:\n{}",
+        lines.timed()
+    ))
+}
+
 impl Drop for Vm {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A process this test started, killed and reaped as it drops, as [`Vm`] is: as its test ends,
+/// and as a failing test's panic unwinds past it, which leaves a bare `std::process::Child`
+/// running (CI 43968984258, x86_64 gnu: boot.rs' rate test failed past its boot, and its guest,
+/// told to spin for ten minutes, ran 6.5 minutes past the test binary's end). On Unix `run
+/// --kernel` becomes the VM process; on Windows its VM process is in a job that ends with it.
+pub struct Reaped(pub std::process::Child);
+
+impl std::ops::Deref for Reaped {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 

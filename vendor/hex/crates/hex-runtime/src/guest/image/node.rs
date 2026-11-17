@@ -117,11 +117,13 @@ impl ImageClass {
         // Its diagnostics held within the disk its allocation was admitted with, or the tail Shards keeps to quote a run's
         // end where that is less, as an image box's are (the review's B-9).
         let kept_within = vm.allocation.resources.disk_bytes;
+        // A node VM is given no volume: its boot plugs none.
         if let Err(why) = boot_on_its_thread(
             images,
             spec,
             kept,
             kept_within,
+            Vec::new(),
             Party(Arc::clone(&slot)),
             stop,
         ) {
@@ -217,7 +219,7 @@ impl ImageClass {
         let waits = image.waits()?;
         let books = self.authority()?;
         let slot = match image.runs.settle(run, Some(waits))? {
-            Settled::Started(guest) | Settled::Running(guest) => {
+            Settled::Started(guest, _) | Settled::Running(guest, _) => {
                 let slot = image.stop(guest, None)?;
                 image.runs.stop_asked(run, &slot)?;
                 slot
@@ -281,7 +283,7 @@ impl ImageClass {
     pub fn node_runs(&self, run: NodeRun) -> Result<bool, Refusal> {
         let image = self.image()?;
         let guest = match image.runs.settle(run, image.waits.as_ref().ok())? {
-            Settled::Started(guest) | Settled::Running(guest) => guest,
+            Settled::Started(guest, _) | Settled::Running(guest, _) => guest,
             Settled::Ends(end) => {
                 self.ended_node(self.authority()?.as_ref(), run, &end)?;
                 return Ok(false);
@@ -305,7 +307,7 @@ impl ImageClass {
         let image = self.image()?;
         let waits = image.waits()?;
         let guest = match image.runs.settle(run, Some(waits))? {
-            Settled::Started(guest) | Settled::Running(guest) => guest,
+            Settled::Started(guest, _) | Settled::Running(guest, _) => guest,
             _ => return Err(not_running(&run)),
         };
         let vcpus = self
@@ -363,7 +365,7 @@ impl ImageClass {
     fn node_guest(&self, run: NodeRun) -> Result<Arc<dyn ImageGuest>, Refusal> {
         let image = self.image()?;
         match image.runs.settle(run, Some(image.waits()?))? {
-            Settled::Started(guest) | Settled::Running(guest) => Ok(guest),
+            Settled::Started(guest, _) | Settled::Running(guest, _) => Ok(guest),
             _ => Err(not_running(&run)),
         }
     }
@@ -425,6 +427,8 @@ impl ImageClass {
                     lanes: vm.lanes,
                     window,
                 }),
+                // No member's stdio on its lanes (Shards' D252, image channel v44): it runs no member.
+                stdio: false,
             }),
             gpu_devices: Vec::new(),
             // No sign-in grant (Shards' D242 step 8): a node VM signs in to nothing.
@@ -435,6 +439,8 @@ impl ImageClass {
             gpu_report: None,
             // No plug root (Shards' D271, image channel v35): a node VM's shares are its start's.
             plug_roots: Vec::new(),
+            // No member's reach (Shards' D278, image channel v39): it runs no member, and nothing passes its VM.
+            egress_ceiling: Vec::new(),
         })
     }
 }
@@ -673,7 +679,39 @@ pub(in crate::guest) fn refused(op: &'static str, why: ImageRefusal) -> Refusal 
                 ended.end
             ),
         },
-        other => Refusal::Os {
+        // Its run host's budget had no room for its agent-control endpoint, charged as it binds (Shards' D252, image
+        // channel v51): it may boot once that host has room.
+        ImageRefusal::Capacity(why) => Refusal::Os {
+            op,
+            why: format!("its run host's budget had no room for its agent-control endpoint: {why}"),
+        },
+        // A member of the node image that could not enter its working directory (Shards' D277): the image's.
+        ImageRefusal::Workdir(why) => Refusal::Invalid {
+            what: "the node image (HEX_GUEST_IMAGE)",
+            why: format!("a member's working directory: {why}"),
+        },
+        // Only a member's restart or a component's swap (Shards' D270) is refused so, and a node VM's run asks neither.
+        ImageRefusal::Restart(cause, why) => Refusal::Broken(format!(
+            "Shards refused {op} as a member's restart ({cause:?}): {why}"
+        )),
+        ImageRefusal::Swap(cause, why) => Refusal::Broken(format!(
+            "Shards refused {op} as a component's swap ({cause:?}): {why}"
+        )),
+        // Its run host's, its VM's, or a call's its run makes, in Shards' words.
+        other @ (ImageRefusal::Boot(_)
+        | ImageRefusal::Host(_)
+        | ImageRefusal::Os { .. }
+        | ImageRefusal::Plug(..)
+        | ImageRefusal::Room(_)
+        | ImageRefusal::Rate(_)
+        | ImageRefusal::Terminal(_)
+        | ImageRefusal::Save(..)
+        | ImageRefusal::GpuProbe(_)
+        | ImageRefusal::DiagnosticsBound { .. }
+        | ImageRefusal::OtherPool { .. }
+        | ImageRefusal::Paused { .. }
+        | ImageRefusal::Pause(_)
+        | ImageRefusal::Net(..)) => Refusal::Os {
             op,
             why: other.to_string(),
         },

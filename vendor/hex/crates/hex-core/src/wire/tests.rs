@@ -632,6 +632,7 @@ fn oci_spec() -> BoxSpec {
                 source: PathBuf::from("/data"),
                 destination: "/mnt".to_owned(),
                 read_only: true,
+                members: Vec::new(),
             }],
             hostname: Some("box".to_owned()),
             network: Network::Private,
@@ -2502,6 +2503,7 @@ fn any_spec() -> impl Strategy<Value = BoxSpec> {
                         source,
                         destination,
                         read_only,
+                        members: Vec::new(),
                     })
                     .collect(),
                 hostname,
@@ -2547,7 +2549,7 @@ fn any_exit() -> impl Strategy<Value = Exit> {
 fn any_info() -> impl Strategy<Value = BoxInfo> {
     (
         any_id(),
-        0u8..4,
+        0u8..5,
         0u8..3,
         any_bounds(),
         any::<bool>(),
@@ -2566,7 +2568,8 @@ fn any_info() -> impl Strategy<Value = BoxInfo> {
                     0 => Class::Process,
                     1 => Class::Oci,
                     2 => Class::Firecracker,
-                    _ => Class::Shards,
+                    3 => Class::Shards,
+                    _ => Class::ShardsImage,
                 },
                 state: match state {
                     0 => BoxState::Empty,
@@ -2647,6 +2650,16 @@ fn any_cause() -> impl Strategy<Value = Refusal> {
             any_guest_failure()
         )
             .prop_map(|(op, failure)| Refusal::Guest { op, failure }),
+        (
+            proptest::sample::select(vec![
+                VolumeCause::Bound,
+                VolumeCause::Clearing,
+                VolumeCause::InUse,
+                VolumeCause::Unknown
+            ]),
+            any_text()
+        )
+            .prop_map(|(cause, why)| Refusal::Volume { cause, why }),
     ]
 }
 
@@ -4755,6 +4768,59 @@ fn a_shards_image_spec_is_class_tag_5_then_its_image_and_command() {
     }
 }
 
+/// P2.2 (kiln plan 01a1dd2e…): a Shards image VM's own class is tag 4, after every class before it, wherever the wire
+/// carries a class. Do: a node's hello listing it, a capacity call for it and a box's info of it. Expect: each read back
+/// identical, the call's class byte 4. Do: that byte 5. Expect: refused as a class's variant.
+#[test]
+fn the_shards_image_class_is_tag_4_and_reads_back_identical() {
+    let hello = Answer::Hello(Hello {
+        build: build(),
+        classes: vec![
+            Class::Process,
+            Class::Oci,
+            Class::Shards,
+            Class::ShardsImage,
+        ],
+        limits: Limits {
+            connections: 64,
+            message_bytes: MAX_MESSAGE,
+            in_flight: 1,
+            programs: 1,
+        },
+        budgets: Budgets {
+            in_flight: 64,
+            programs: 1024,
+        },
+    });
+    let bytes = answer(1, &hello, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        hello
+    );
+    let capacity = Request::Call(Call::Capacity(Class::ShardsImage));
+    let bytes = request(2, &capacity, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        capacity
+    );
+    assert_eq!(bytes.last(), Some(&4));
+    let mut hostile = bytes.clone();
+    *hostile.last_mut().unwrap() = 5;
+    assert!(matches!(
+        read_request(&received(&hostile, 0), MAX_MESSAGE).map_err(|bad| bad.fault),
+        Err(Fault::Value { what: "class", .. })
+    ));
+    let shown = Answer::Info(BoxInfo {
+        class: Class::ShardsImage,
+        ..info()
+    });
+    let bytes = answer(3, &shown, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        shown
+    );
+}
+
 /// AC-T7.4.1 (joint plan steps 12 and 14): a usage answer's guest time follows its eight counters as
 /// an option: tag 0 and a count of nanoseconds by vCPU, or tag 1 and what its backend awaits. Do: answer
 /// each. Expect: read back as written, its option, tag and count where said. Do: a guest-time tag 2, and
@@ -5809,11 +5875,13 @@ fn w12_a_shards_image_vms_shares_cross_the_wire_after_its_members() {
                     source: PathBuf::from("/var/lib/kiln/homes/ada/.claude"),
                     destination: "/home/agent/.claude".to_owned(),
                     read_only: false,
+                    members: Vec::new(),
                 },
                 Mount {
                     source: PathBuf::from("/srv/projects/hex"),
                     destination: "/work/hex".to_owned(),
                     read_only: true,
+                    members: Vec::new(),
                 },
             ],
             ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
@@ -5829,6 +5897,75 @@ fn w12_a_shards_image_vms_shares_cross_the_wire_after_its_members() {
         read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
         create
     );
+}
+
+/// Kiln plan 01a1dd2e…, P6.2 (AC-T7.4.1; Shards' D271, D281): do create a Shards image VM given two volumes of its
+/// node's Shards home beside a share, one read-write into its harness and one read-only into its harness and an agent.
+/// Expect it read back whole, its volumes after its sign-ins. Do read it as a peer would send it with a volume's bound
+/// of 0. Expect it refused as the volume's bound, which is at least a byte.
+#[test]
+fn p6_2_a_shards_image_vms_volumes_cross_the_wire_after_its_sign_ins() {
+    let harness = Member {
+        kind: MemberKind::Harness,
+        name: "claude".to_owned(),
+    };
+    let agent = Member {
+        kind: MemberKind::Agent,
+        name: "helper".to_owned(),
+    };
+    // A bound no other eight bytes of the message spell, so its place is found by its bytes.
+    let marked = std::num::NonZeroU64::new(0x0123_4567_89ab_cdef).unwrap();
+    let create = Request::Call(Call::Create(Box::new(BoxSpec {
+        id: id("image-volumes"),
+        bounds: Bounds::default(),
+        class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+            members: vec![hex_api::ImageMember::new(harness.clone())],
+            shares: vec![Mount {
+                source: PathBuf::from("/srv/projects/hex"),
+                destination: "/work/hex".to_owned(),
+                read_only: true,
+                members: Vec::new(),
+            }],
+            volumes: vec![
+                hex_api::ImageVolume {
+                    name: "kiln-agent-cache".to_owned(),
+                    bound: marked,
+                    at: "/volumes/cache".to_owned(),
+                    members: vec![harness.clone()],
+                    read_only: false,
+                },
+                hex_api::ImageVolume {
+                    name: "kiln-agent-notes".to_owned(),
+                    bound: std::num::NonZeroU64::new(1 << 20).unwrap(),
+                    at: "/volumes/notes".to_owned(),
+                    members: vec![harness, agent],
+                    read_only: true,
+                },
+            ],
+            ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
+        })),
+        owner: None,
+        devices: Vec::new(),
+        allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+        route: None,
+        band: 0,
+    })));
+    let bytes = request(95, &create, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        create
+    );
+    let mark = marked.get().to_le_bytes();
+    let at = bytes.windows(mark.len()).position(|w| w == mark).unwrap();
+    let mut zero = bytes.clone();
+    zero[at..at + mark.len()].fill(0);
+    assert!(matches!(
+        read_request(&received(&zero, 0), MAX_MESSAGE).map_err(|bad| bad.fault),
+        Err(Fault::Value {
+            what: "volume bound",
+            ..
+        })
+    ));
 }
 
 /// Joint plan step 15 (every grant visible in Hex's record of the VM): do create a Shards image VM granted a provider
@@ -6084,9 +6221,10 @@ fn unchecked_credentials(list: &[CredentialGrant]) -> Vec<u8> {
 }
 
 /// Joint plan step 33 (every credential grant in Hex's record of the VM; Shards' D242): do create a Shards image VM
-/// granting its harness a credential toward its provider, beside a share. Expect it read back whole, its credentials
-/// written right after the share, last of the image. Do write one whose credential its harness's egress doesn't reach,
-/// and read it as a peer that skipped the check would send it. Expect both refused as invalid credentials.
+/// granting its harness a credential toward its provider, beside a share given to that harness as it starts (its member
+/// scope, Shards' D277). Expect it read back whole, the share's member scope right after its read-only flag, and its
+/// credentials right after the share, last of the image. Do write one whose credential its harness's egress doesn't
+/// reach, and read it as a peer that skipped the check would send it. Expect both refused as invalid credentials.
 #[test]
 fn w33_a_shards_image_vms_credential_grants_cross_the_wire_after_its_shares() {
     let spec = |credentials: Vec<CredentialGrant>| BoxSpec {
@@ -6098,6 +6236,7 @@ fn w33_a_shards_image_vms_credential_grants_cross_the_wire_after_its_shares() {
                 source: PathBuf::from("/srv/projects/hex"),
                 destination: "/work/hex".to_owned(),
                 read_only: true,
+                members: vec![harness()],
             }],
             credentials,
             ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
@@ -6119,9 +6258,14 @@ fn w33_a_shards_image_vms_credential_grants_cross_the_wire_after_its_shares() {
     put_credentials(&mut listed, &granted, &each_way()).unwrap();
     let listed = listed.done().unwrap();
     let share = b"/work/hex";
-    // After the share's guest path, its read-only flag, then the credentials.
-    let at = bytes.windows(share.len()).position(|w| w == share).unwrap() + share.len() + 1;
-    assert_eq!(bytes[at - 1], 1);
+    let mut scope = Writer::new(MAX_MESSAGE);
+    scope.list(&[harness()], put_member).unwrap();
+    let scope = scope.done().unwrap();
+    // After the share's guest path, its read-only flag, then its member scope, then the credentials.
+    let flag = bytes.windows(share.len()).position(|w| w == share).unwrap() + share.len();
+    assert_eq!(bytes[flag], 1);
+    assert_eq!(&bytes[flag + 1..flag + 1 + scope.len()], scope.as_slice());
+    let at = flag + 1 + scope.len();
     assert_eq!(&bytes[at..at + listed.len()], listed.as_slice());
     let unreached = openai_credential("evil.example");
     let refused = Request::Call(Call::Create(Box::new(spec(unreached.clone()))));

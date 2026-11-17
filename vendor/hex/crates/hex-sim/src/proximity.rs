@@ -467,6 +467,9 @@ fn class_at(class: Class) -> usize {
         Class::Oci => 0,
         Class::Firecracker => 1,
         Class::Shards => 2,
+        // The census records no Shards image VM: past the study's kinds, which a report refuses
+        // (`SimError::Config`).
+        Class::ShardsImage => CLASSES.len(),
     }
 }
 

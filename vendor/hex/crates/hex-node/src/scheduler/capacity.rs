@@ -77,7 +77,11 @@ pub(super) fn profiles(
         if let Some(cost) = cost {
             cost.check()?;
         }
-        if matches!(class, Class::Firecracker | Class::Shards) && cost.is_none() {
+        if matches!(
+            class,
+            Class::Firecracker | Class::Shards | Class::ShardsImage
+        ) && cost.is_none()
+        {
             return Err(invalid("initialized VM class has no verified per-box cost"));
         }
         let slot = costs

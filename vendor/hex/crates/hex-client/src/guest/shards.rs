@@ -1,8 +1,11 @@
 //! The guest's ports through Shards (docs/design/shards-guest.md §2, Appendix A "Hex's side"): a
 //! [`Link`] whose first dial is `shards_api::Guest::connect_before` and every later one
 //! `connect_once_before`, a dial past its W* `connect_while_runs`, Firecracker's `CONNECT <port>` on the
-//! guest's vsock, and a [`Duplex`] over the stream it returns. Hex never names Shards' stream type: on
-//! Windows it is Shards' overlapped AF_UNIX socket, whose timeouts poll first, behind the same trait.
+//! guest's vsock, and a [`Duplex`](super::Duplex) over the stream it returns. Hex never names Shards' stream
+//! type. On Windows it is two named pipes (Shards' D272: a way down, read, and a way up, written), on which neither
+//! this client's readiness waits (`WSAPoll`) nor its node's completion port (Winsock's events) wait: there a
+//! connection the client waits on is bridged to a local socket pair, and an exec's stream is carried on a pipe whose
+//! end is its caller's, as a node VM's lanes are ([`super::lanes`]).
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -15,7 +18,17 @@ use hex_api::{
 };
 use hex_core::patience::{Patience, Piece};
 
-use super::{Duplex, DuplexOwner, Handoff, Link, own_duplex};
+#[cfg(windows)]
+use super::Piped;
+#[cfg(windows)]
+use super::bridge::{Bridged, Local, end, pair};
+#[cfg(unix)]
+use super::{Duplex, Handoff};
+use super::{DuplexOwner, Link, own_duplex};
+#[cfg(windows)]
+use crate::Cut;
+#[cfg(windows)]
+use crate::calls::ReplyDeadline;
 
 /// This host's class, as the records name it (bench/native/guest/records.tsv, evidence alone: no wait reads it, the
 /// review's C-9): the hypervisor Shards boots its guests with here.
@@ -45,6 +58,7 @@ impl ShardsStream {
 
     /// Its socket, its caller's from here (HEX-RT-17): moved, never duplicated, so no copy of it is open to pass to a
     /// process (the review's D-5), and left waiting, as a caller's file does. Refused while another handle shares it.
+    #[cfg(unix)]
     pub(crate) fn into_end(self) -> Result<hex_api::End, Refusal> {
         let stream = triomphe::Arc::try_unwrap(self.0).map_err(|_| {
             Refusal::Broken(
@@ -73,6 +87,7 @@ impl Write for ShardsStream {
     }
 }
 
+#[cfg(unix)]
 impl Duplex for ShardsStream {
     /// Another handle on the same stream, shared, never a duplicate (the review's D-5).
     fn try_clone(&self) -> io::Result<DuplexOwner> {
@@ -309,16 +324,268 @@ impl Link for ShardsLink {
     }
 
     fn dial_before(&self, port: u32, deadline: Option<Instant>) -> Result<DuplexOwner, Refusal> {
-        own_duplex(self.stream_before(port, deadline)?)
+        duplex(self.stream_before(port, deadline)?)
     }
 
-    /// A Shards stream is handed to its caller as its own socket (the review's D-5).
+    /// A Shards stream is handed to its caller as its own socket (the review's D-5). On Windows, where it is two pipes, an
+    /// exec's stream is carried on a pipe of the caller's instead ([`Link::dial_piped`]).
+    #[cfg(unix)]
     fn dial_handoff_before(
         &self,
         port: u32,
         deadline: Option<Instant>,
     ) -> Option<Result<Handoff, Refusal>> {
-        Some(self.stream_before(port, deadline).map(Handoff::Shards))
+        Some(self.stream_before(port, deadline).and_then(handoff))
+    }
+
+    /// An exec's stream on a Shards connection of its own, carried on a pipe whose end is the caller's ([`piped`]).
+    #[cfg(windows)]
+    fn dial_piped(
+        &self,
+        named: hex_core::stream::Named,
+        deadline: Option<Instant>,
+    ) -> Option<Result<Piped, Refusal>> {
+        Some(self.piped(named, deadline))
+    }
+}
+
+#[cfg(windows)]
+impl ShardsLink {
+    /// [`Link::dial_piped`]: a stdio connection within `deadline` where the caller gives one, named and carried.
+    fn piped(
+        &self,
+        named: hex_core::stream::Named,
+        deadline: Option<Instant>,
+    ) -> Result<Piped, Refusal> {
+        let cap = deadline.map(ReplyDeadline::caller_before).transpose()?;
+        let stream = self.stream_before(hex_core::stream::STDIO_PORT, deadline)?;
+        piped(stream, named, cap)
+    }
+}
+
+/// `stream` as a connection the client waits on: itself on Unix, where it is a stream socket.
+#[cfg(unix)]
+fn duplex(stream: ShardsStream) -> Result<DuplexOwner, Refusal> {
+    own_duplex(stream)
+}
+
+/// `stream` as a connection the client waits on, on Windows: its two pipes bridged to a local socket ([`bridge`]).
+#[cfg(windows)]
+fn duplex(stream: ShardsStream) -> Result<DuplexOwner, Refusal> {
+    own_duplex(bridge(stream)?)
+}
+
+/// `stream` as a connection handed to its caller whole: its own socket.
+#[cfg(unix)]
+pub(crate) fn handoff(stream: ShardsStream) -> Result<Handoff, Refusal> {
+    Ok(Handoff::Shards(stream))
+}
+
+/// An exec's stream on its own Shards connection `stream`, carried on a pipe whose end is the caller's (Windows; HEX-RT-17:
+/// a caller there is handed handles alone, and a Shards connection is two pipes, Shards' D272, which no one handle
+/// carries both ways), its name written first, within `deadline` where the call gives one. An output stream's connection
+/// ends its own half once named, and a thread copies the connection into the pipe ([`piped_out`]); stdin's copies the
+/// pipe into the connection ([`piped_in`]): one thread a stream, as a node VM's lane carried so ([`super::lanes`]). A
+/// pipe carries no reset: an output's cut is told by its [`Piped::cut`], where the node watches it.
+#[cfg(windows)]
+pub(crate) fn piped(
+    stream: ShardsStream,
+    named: hex_core::stream::Named,
+    deadline: Option<ReplyDeadline>,
+) -> Result<Piped, Refusal> {
+    const NAMING: &str = "naming a stdio connection";
+    let conn: &dyn shards_api::Stream = &**stream.0;
+    if let Some(deadline) = deadline {
+        conn.set_write_timeout(Some(deadline.remaining(NAMING)?))
+            .map_err(|e| Refusal::os(NAMING, e))?;
+    }
+    let mut to = conn;
+    to.write_all(&hex_core::stream::name(named))
+        .map_err(|e| Refusal::os(NAMING, e))?;
+    if deadline.is_some() {
+        conn.set_write_timeout(None)
+            .map_err(|e| Refusal::os(NAMING, e))?;
+    }
+    let (from, to) =
+        std::io::pipe().map_err(|e| Refusal::os("making an exec's stream's pipe", e))?;
+    match named.stream {
+        hex_core::stream::Stdio::In => {
+            std::thread::Builder::new()
+                .name("hex-shards-stdin".to_owned())
+                .spawn(move || piped_in(from, stream))
+                .map_err(|e| Refusal::os("starting a stdin connection's copier", e))?;
+            Ok(Piped {
+                end: to.into(),
+                cut: None,
+            })
+        }
+        hex_core::stream::Stdio::Out | hex_core::stream::Stdio::Err => {
+            // It carries nothing this way once named: its peer's End then closes the stream whole.
+            conn.shutdown(Shutdown::Write)
+                .map_err(|e| Refusal::os("ending an output stream's own half", e))?;
+            let cut = Cut::default();
+            let recorded = cut.clone();
+            std::thread::Builder::new()
+                .name("hex-shards-output".to_owned())
+                .spawn(move || piped_out(stream, to, &recorded))
+                .map_err(|e| Refusal::os("starting an output connection's copier", e))?;
+            Ok(Piped {
+                end: from.into(),
+                cut: Some(cut),
+            })
+        }
+    }
+}
+
+/// Stdin's connection: what the caller writes to its pipe, into the connection, its pipe's end the connection's own end
+/// of writing. A write the connection refuses (the program let its stdin go, HEX-GUEST-41) lets the pipe go, so the
+/// caller's next write fails, as a closed stdin's does. The connection's reading, which carries nothing this way, is held
+/// to its end, so the guest's relay is never cut off before it has read what came.
+#[cfg(windows)]
+fn piped_in(mut from: std::io::PipeReader, stream: ShardsStream) {
+    let conn: &dyn shards_api::Stream = &**stream.0;
+    let (mut to, mut rest) = (conn, conn);
+    let mut buf = vec![0u8; hex_core::lanes::DATA_BOUND];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => {
+                if conn.shutdown(Shutdown::Write).is_err() {
+                    return;
+                }
+                break;
+            }
+            Ok(n) => {
+                if to.write_all(buf.get(..n).unwrap_or_default()).is_err() {
+                    return;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                let _ = conn.shutdown(Shutdown::Both);
+                return;
+            }
+        }
+    }
+    drop(from);
+    while matches!(rest.read(&mut buf), Ok(n) if n > 0) {}
+}
+
+/// An output stream's connection: its bytes into the caller's pipe, its end the pipe's, and its error the cut, recorded
+/// before the pipe ends. A caller gone from its pipe lets the connection go, so the guest's next write on it fails, as a
+/// program's write fails once its stdout's pipe has no reader.
+#[cfg(windows)]
+fn piped_out(stream: ShardsStream, mut to: std::io::PipeWriter, cut: &Cut) {
+    let mut from: &dyn shards_api::Stream = &**stream.0;
+    let mut buf = vec![0u8; hex_core::lanes::DATA_BOUND];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                if to.write_all(buf.get(..n).unwrap_or_default()).is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                cut.record(&e);
+                return;
+            }
+        }
+    }
+}
+
+/// `stream` as the owner's end of a local socket pair, its bytes the stream's (Windows; Shards' D272): two threads copy
+/// between the pair's other end and the stream, one a way, each through the stream's shared reads or writes (`&dyn
+/// Stream`'s, the handle the client holds, so no duplicate of its pipes is made: the review's D-5), sharing the pair's
+/// end, one reading it and one writing it. Each ends on a fact: the owner's end of writing or its close, the stream's
+/// end, or its error, which the owner reads as the cut after the bytes before it. Its cost is a node VM lane's (two
+/// threads and one copy a way, [`super::lanes`]'s bridge) until the node's completion port waits on a pipe itself.
+#[cfg(windows)]
+fn bridge(stream: ShardsStream) -> Result<Bridged, Refusal> {
+    let bridged = || -> io::Result<Bridged> {
+        let (owner, ours) = pair()?;
+        let cut = Cut::default();
+        let ours = Arc::new(ours);
+        let (up, writes) = (Arc::clone(&ours), triomphe::Arc::clone(&stream.0));
+        std::thread::Builder::new()
+            .name("hex-shards-up".to_owned())
+            .spawn(move || upward(&**writes, &up))?;
+        let (reads, recorded) = (stream.0, cut.clone());
+        std::thread::Builder::new()
+            .name("hex-shards-down".to_owned())
+            .spawn(move || downward(&**reads, &ours, &recorded))?;
+        Ok(Bridged::new(owner, cut))
+    };
+    bridged().map_err(|e| Refusal::os("bridging a Shards guest stream to a local socket", e))
+}
+
+/// What the owner writes, to the stream; the owner's end of writing, or its close, is the stream's own end of writing.
+/// A write the stream refuses (its end, or its guest's) ends this way, the owner's writes then failing at [`Bridged`]'s
+/// write once the cut is recorded, and what the owner sends meanwhile read here and let go ([`writes_refused`]). An error
+/// reading the pair ends the stream both ways.
+#[cfg(windows)]
+fn upward(stream: &dyn shards_api::Stream, mut from: &Local) {
+    let mut to = stream;
+    let mut buf = vec![0u8; hex_core::lanes::DATA_BOUND];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => {
+                let _ = stream.shutdown(Shutdown::Write);
+                return;
+            }
+            Ok(n) => {
+                if to.write_all(buf.get(..n).unwrap_or_default()).is_err() {
+                    writes_refused(from, &mut buf);
+                    return;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+        }
+    }
+}
+
+/// The owner's writes once the stream refuses them: read and let go to the owner's end of writing, its close or its
+/// reset, so the pair's other end never closes with bytes unread, which would reset the owner's socket and drop what it
+/// hasn't read (Winsock, the review's D-4), as a lane's bridge does.
+#[cfg(windows)]
+fn writes_refused(mut from: &Local, buf: &mut [u8]) {
+    loop {
+        match from.read(buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// What the guest sends, to the owner; the stream's end is the owner's end of input, and its error the cut, recorded
+/// before the owner's socket ends. An owner gone ends the copy, its handle on the stream let go with it.
+#[cfg(windows)]
+fn downward(stream: &dyn shards_api::Stream, mut to: &Local, cut: &Cut) {
+    let mut from = stream;
+    let mut buf = vec![0u8; hex_core::lanes::DATA_BOUND];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => {
+                let _ = to.shutdown(Shutdown::Write);
+                return;
+            }
+            Ok(n) => {
+                if to.write_all(buf.get(..n).unwrap_or_default()).is_err() {
+                    end(to);
+                    return;
+                }
+            }
+            Err(e) => {
+                cut.record(&e);
+                end(to);
+                return;
+            }
+        }
     }
 }
 
