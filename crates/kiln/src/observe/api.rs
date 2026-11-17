@@ -2090,7 +2090,8 @@ impl serde::Serialize for RecordOut<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap as _;
         let r = self.0;
-        let mut m = s.serialize_map(Some(10))?;
+        let event = r.source == kiln_obs::monitor::EVENTS;
+        let mut m = s.serialize_map(Some(if event { 11 } else { 10 }))?;
         m.serialize_entry("ts_ns", &r.ts)?;
         m.serialize_entry("status", kiln_obs::logs::record::level(r.severity))?;
         m.serialize_entry("severity", &r.severity)?;
@@ -2101,8 +2102,40 @@ impl serde::Serialize for RecordOut<'_> {
         m.serialize_entry("attributes", &AttrsOut(&r.attrs))?;
         m.serialize_entry("trace_id", &r.trace_id.map(HexOut))?;
         m.serialize_entry("span_id", &r.span_id.map(HexOut))?;
+        if event {
+            m.serialize_entry("id", &event_id(r).to_string())?;
+        }
         m.end()
     }
+}
+
+/// An event's id (its `id` in an answer, a monitor's `{{event.id}}`): a SHA-256 (FIPS 180-4) of what
+/// it holds (its time, severity, service, host, source, message, its attributes sorted, its trace
+/// and span), each part after its length, its first 63 bits a positive 64-bit integer, as Datadog's
+/// v1 events' `id` (its API's `int64`). A record never changes once kept, so its id is the same
+/// whenever and wherever it is read; two events with all of that the same are one id. Written as
+/// text, past what a JavaScript number holds exactly.
+pub(super) fn event_id(r: &Record) -> u64 {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    let mut put = |b: &[u8]| {
+        h.update(u64::try_from(b.len()).unwrap_or(u64::MAX).to_be_bytes());
+        h.update(b);
+    };
+    put(&r.ts.to_be_bytes());
+    put(&[r.severity]);
+    for text in [&r.service, &r.host, &r.source, &r.message] {
+        put(text.as_bytes());
+    }
+    let mut attrs: Vec<&(String, String)> = r.attrs.iter().collect();
+    attrs.sort_unstable();
+    for (k, v) in attrs {
+        put(k.as_bytes());
+        put(v.as_bytes());
+    }
+    put(r.trace_id.as_ref().map(<[u8; 16]>::as_slice).unwrap_or_default());
+    put(r.span_id.as_ref().map(<[u8; 8]>::as_slice).unwrap_or_default());
+    h.finalize().iter().take(8).fold(0u64, |acc, b| (acc << 8) | u64::from(*b)) >> 1
 }
 
 /// Attributes as an object: each key where it first comes, with the last value it is given. A record
@@ -2555,6 +2588,31 @@ mod tests {
             "took_ms": 1.5,
         });
         assert_eq!(serde_json::to_string(&out)?, serde_json::to_string(&before)?);
+        Ok(())
+    }
+
+    /// An event's id is a digest of what it holds: the same however its attributes come, another for
+    /// another event, a positive 64-bit integer, and this one's the value its encoding gives
+    /// (`hashlib.sha256` over the same parts, each after its length, outside kiln), so it never
+    /// changes; an event's record carries it, a log's none.
+    #[test]
+    fn an_event_s_id_is_a_digest_of_what_it_holds() -> Result<(), serde_json::Error> {
+        let event = Record {
+            ts: 1_700_000_000_000_000_000,
+            severity: 9,
+            source: kiln_obs::monitor::EVENTS.into(),
+            message: "Deploy\n\nweb 1.2".into(),
+            attrs: vec![("title".into(), "Deploy".into()), ("env".into(), "prod".into())],
+            ..Record::default()
+        };
+        assert_eq!(event_id(&event), 1_090_159_783_163_431_310);
+        let reordered = Record { attrs: vec![("env".into(), "prod".into()), ("title".into(), "Deploy".into())], ..event.clone() };
+        assert_eq!(event_id(&reordered), event_id(&event), "its attributes in any order");
+        assert_ne!(event_id(&Record { message: "Deploy\n\nweb 1.3".into(), ..event.clone() }), event_id(&event));
+        let written = serde_json::to_value(RecordOut(&event))?;
+        assert_eq!(written.get("id").and_then(Value::as_str), Some("1090159783163431310"));
+        let log = Record { source: "nginx".into(), ..event };
+        assert!(serde_json::to_value(RecordOut(&log))?.get("id").is_none(), "a log has none");
         Ok(())
     }
 }

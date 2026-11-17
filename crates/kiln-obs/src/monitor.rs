@@ -43,6 +43,9 @@
 pub mod checks;
 pub mod composite;
 pub mod downtime;
+pub mod template;
+
+pub use template::{Rendered, Vars, render, render_message};
 
 use std::collections::HashMap;
 
@@ -1236,6 +1239,141 @@ pub fn evaluate_records(at: &LogsAt, q: &Query, now: i64, delay_ms: i64) -> Resu
     Ok(out)
 }
 
+/// What a log, span or event monitor's group's records are, for its message's variables (Datadog's
+/// matching attribute variables, `{{log.message}}`; a formula's "resolve based on events extracted
+/// from the first query") and its notification's samples.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupRecords {
+    pub of: RecordSource,
+    /// A search of the group's own records (`crate::logs::search`'s; spans' by `parse_spans`): its
+    /// query's, its facets' values said.
+    pub search: String,
+    pub window_ms: i64,
+}
+
+/// [`GroupRecords`] of a monitor's group, searched by the facets it has a value of (a notification
+/// group of `notify_by` has some of them); none for a monitor of other data.
+pub fn group_records(q: &Query, group: &[(String, String)]) -> Option<GroupRecords> {
+    let (of, base, by, window_ms) = match &q.kind {
+        Kind::Logs { search, by, window_ms, .. } => {
+            let of = if search.starts_with(&format!("source:{EVENTS}")) { RecordSource::Events } else { RecordSource::Logs };
+            (of, logs_only(search), by.clone(), *window_ms)
+        }
+        Kind::Spans { search, by, window_ms, .. } => (RecordSource::Spans, search.clone(), by.clone(), *window_ms),
+        Kind::RecordsFormula { query, window_ms } => {
+            let ast = crate::query::parse::parse(query).ok()?;
+            let r = ast.nodes.into_iter().find_map(|n| if let Node::Records(r) = n { Some(r) } else { None })?;
+            let base = match r.of {
+                RecordSource::Logs => logs_only(&r.text),
+                RecordSource::Events => events_only(&r.text),
+                RecordSource::Spans => r.text.clone(),
+            };
+            (r.of, base, r.by, *window_ms)
+        }
+        _ => return None,
+    };
+    let mut terms: Vec<String> = Vec::with_capacity(by.len());
+    for f in &by {
+        let key = f.name();
+        let bare = key.trim_start_matches('@');
+        let Some((_, value)) = group.iter().find(|(k, _)| k == &key || k == bare) else { continue };
+        terms.push(format!("{key}:\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")));
+    }
+    let base = base.trim();
+    let search = match (base.is_empty() || base == "*", terms.is_empty()) {
+        (true, true) => "*".to_owned(),
+        (true, false) => terms.join(" "),
+        (false, true) => base.to_owned(),
+        (false, false) => format!("({base}) {}", terms.join(" ")),
+    };
+    Some(GroupRecords { of, search, window_ms })
+}
+
+/// Whether a monitor counts (records, distinct values, an issue's errors; a formula of records
+/// each of whose queries does), so a group without data counts 0: Datadog's `on_missing_data`
+/// default ("monitors using a count query treat an empty evaluation as `0`").
+pub fn counts(q: &Query) -> bool {
+    match &q.kind {
+        Kind::Logs { measure, .. } | Kind::Spans { measure, .. } => measure.counts(),
+        Kind::ErrorTracking { .. } => true,
+        Kind::RecordsFormula { query, .. } => crate::query::parse::parse(query).is_ok_and(|ast| ast.nodes.iter().all(|n| !matches!(n, Node::Records(r) if !r.measure.counts()))),
+        _ => false,
+    }
+}
+
+/// The tags a monitor's groups are by, as its groups name them (a metric query's `by {…}`, a
+/// records query's facets, an Error Tracking monitor's): what Datadog's `notify_by` may name.
+pub fn group_keys(q: &Query) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    match &q.kind {
+        Kind::Logs { by, .. } | Kind::Spans { by, .. } => keys.extend(by.iter().map(Facet::name)),
+        Kind::ErrorTracking { by, .. } => keys.extend(by.iter().cloned()),
+        Kind::Metric { query, .. } | Kind::Change { query, .. } | Kind::Forecast { query, .. } | Kind::RecordsFormula { query, .. } => {
+            if let Ok(ast) = crate::query::parse::parse(query) {
+                for n in &ast.nodes {
+                    match n {
+                        Node::Metric(m) => keys.extend(m.by.iter().cloned()),
+                        Node::Records(r) => keys.extend(r.by.iter().map(|f| f.name().trim_start_matches('@').to_owned())),
+                        Node::Group(tags) => keys.extend(tags.iter().cloned()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Kind::Slo { .. } => {}
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The bucket Datadog judges a full window by (its metric monitor page, "Data window"): a window
+/// "in minutes" by the minute, "in hours" by ten minutes, "in days" by the hour, "in month" by four
+/// hours (kiln's windows are of ms: under an hour, a day, and 730 hours, Datadog's month).
+fn full_bucket_ms(window_ms: i64) -> i64 {
+    if window_ms < 3_600_000 {
+        60_000
+    } else if window_ms < 86_400_000 {
+        600_000
+    } else if window_ms < MAX_METRIC_WINDOW_MS {
+        3_600_000
+    } else {
+        14_400_000
+    }
+}
+
+/// The groups of a metric monitor (a rolling window's, a change monitor's now) whose window as of
+/// `now` is full, as Datadog's "Require a full window of data" judges one: data in the first of
+/// [`full_bucket_ms`]'s buckets, and no more than three of them without ("Otherwise, the
+/// evaluation is canceled and the monitor state is unchanged"). None for a monitor it does not
+/// apply to ("This setting only applies to metric monitors").
+pub fn full_windows(src: Source<'_>, q: &Query, now: i64, delay_ms: i64) -> Result<Option<Vec<Vec<(String, String)>>>, MonitorError> {
+    let (query, window_ms) = match &q.kind {
+        Kind::Metric { query, window_ms, cumulative: None, .. } | Kind::Change { query, window_ms, .. } => (query.as_str(), *window_ms),
+        _ => return Ok(None),
+    };
+    let (from, to, _) = aligned(window_ms, now - delay_ms.max(0));
+    let mut req = Request::new(query, from, to);
+    req.step = Some(full_bucket_ms(window_ms));
+    req.anchored = true;
+    let a = src.ask(&req).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let full = |values: &[f64]| values.first().is_some_and(|v| v.is_finite()) && values.iter().filter(|v| !v.is_finite()).count() <= 3;
+    let mut out: Vec<Vec<(String, String)>> = a
+        .series
+        .into_iter()
+        .filter(|s| full(&s.values))
+        .map(|s| {
+            let mut g = s.tags;
+            g.sort();
+            g
+        })
+        .collect();
+    if a.scalar.is_some_and(f64::is_finite) {
+        out.push(Vec::new());
+    }
+    Ok(Some(out))
+}
+
 /// A forecast monitor's values: over the next `ahead_ms` (in [`FORECAST_POINTS`] buckets, or its
 /// `interval`'s), each group's forecast's highest upper bound or lowest lower one. A group whose
 /// forecast could not be made (too little history) has none.
@@ -1348,84 +1486,10 @@ impl Transition {
             "is_warning_recovery" => self.to == State::Ok && self.from == State::Warn,
             "is_alert_to_warning" => self.from == State::Alert && self.to == State::Warn,
             "is_warning_to_alert" => self.from == State::Warn && self.to == State::Alert,
+            "is_no_data_recovery" => self.from == State::NoData && self.to == State::Ok,
             _ => return None,
         })
     }
-}
-
-/// What a message's variables stand for.
-#[derive(Debug, Clone, Default)]
-pub struct Vars<'a> {
-    pub monitor: &'a str,
-    pub value: Option<f64>,
-    pub threshold: f64,
-    pub warn_threshold: Option<f64>,
-    pub group: &'a [(String, String)],
-    pub link: &'a str,
-    /// Variables besides, by their whole name: an Error Tracking monitor's issue's
-    /// (`issue.attributes.error.type`, ...).
-    pub extra: &'a [(String, String)],
-}
-
-fn num(v: f64) -> String {
-    if v == v.trunc() && v.abs() < 1e15 { format!("{v:.0}") } else { format!("{v:.4}").trim_end_matches('0').to_owned() }
-}
-
-/// A message rendered from Datadog's template syntax: `{{value}}`, `{{threshold}}`,
-/// `{{warn_threshold}}`, `{{monitor.name}}`, `{{group}}`, `{{<tag>.name}}` (the group's tag),
-/// `{{link}}`, the variables [`Vars::extra`] names, and sections `{{#is_alert}}…{{/is_alert}}` (`^` for not) over the transition's
-/// kind. Sections nest; the walk keeps a stack of its own. What it does not know it leaves as it
-/// was written.
-pub fn render(template: &str, t: Transition, v: &Vars<'_>) -> String {
-    let mut out = String::with_capacity(template.len());
-    // Whether each open section shows its body.
-    let mut shown: Vec<bool> = Vec::new();
-    let mut rest = template;
-    while let Some(open) = rest.find("{{") {
-        let visible = shown.iter().all(|&s| s);
-        if visible {
-            out.push_str(rest.get(..open).unwrap_or(""));
-        }
-        let after = rest.get(open + 2..).unwrap_or("");
-        let Some(close) = after.find("}}") else {
-            if visible {
-                out.push_str(rest.get(open..).unwrap_or(""));
-            }
-            return out;
-        };
-        let tag = after.get(..close).unwrap_or("").trim();
-        rest = after.get(close + 2..).unwrap_or("");
-        if let Some(section) = tag.strip_prefix('#').or_else(|| tag.strip_prefix('^')) {
-            let on = t.is(section.trim()).unwrap_or(false);
-            shown.push(if tag.starts_with('^') { !on } else { on });
-            continue;
-        }
-        if tag.starts_with('/') {
-            shown.pop();
-            continue;
-        }
-        if !visible {
-            continue;
-        }
-        let group_tag = tag.strip_suffix(".name").and_then(|k| v.group.iter().find(|(gk, _)| gk == k)).map(|(_, gv)| gv.clone());
-        let text = match tag {
-            "value" => v.value.map_or_else(|| "no data".to_owned(), num),
-            "threshold" => num(v.threshold),
-            "warn_threshold" => v.warn_threshold.map(num).unwrap_or_default(),
-            "monitor.name" | "name" => v.monitor.to_owned(),
-            "group" => v.group.iter().map(|(k, gv)| format!("{k}:{gv}")).collect::<Vec<_>>().join(","),
-            "link" => v.link.to_owned(),
-            _ => match group_tag.or_else(|| v.extra.iter().find(|(k, _)| k == tag).map(|(_, x)| x.clone())) {
-                Some(g) => g,
-                None => format!("{{{{{tag}}}}}"),
-            },
-        };
-        out.push_str(&text);
-    }
-    if shown.iter().all(|&s| s) {
-        out.push_str(rest);
-    }
-    out
 }
 
 /// The `@` mentions in a message: where it goes (`@slack-ops`, `@pagerduty-oncall`,
@@ -1537,7 +1601,7 @@ mod tests {
     #[test]
     fn messages_render_datadog_s_template_syntax() {
         let group = vec![("host".to_owned(), "web-1".to_owned()), ("env".to_owned(), "prod".to_owned())];
-        let v = Vars { monitor: "CPU high", value: Some(93.25), threshold: 90.0, warn_threshold: Some(80.0), group: &group, link: "https://kiln/monitors/1", extra: &[] };
+        let v = Vars { monitor: "CPU high", value: Some(93.25), threshold: 90.0, warn_threshold: Some(80.0), group: &group, link: "https://kiln/monitors/1", extra: &[], ..Vars::default() };
         let template = "{{#is_alert}}CPU on {{host.name}} is {{value}}% (> {{threshold}}) @slack-ops @pagerduty-oncall{{/is_alert}}{{#is_recovery}}{{host.name}} recovered @slack-ops{{/is_recovery}}{{^is_recovery}} [{{group}}]{{/is_recovery}} {{link}} {{unknown.var}}";
         let alert = render(template, Transition { from: State::Ok, to: State::Alert }, &v);
         assert_eq!(alert, "CPU on web-1 is 93.25% (> 90) @slack-ops @pagerduty-oncall [host:web-1,env:prod] https://kiln/monitors/1 {{unknown.var}}");
@@ -1553,6 +1617,87 @@ mod tests {
         let v = Vars { extra: &extra, ..v };
         let said = render("{{issue.attributes.error.type}} on {{host.name}}: {{issue.attributes.error.stack}}", Transition { from: State::Ok, to: State::Alert }, &v);
         assert_eq!(said, "ValueError on web-1: {{issue.attributes.error.stack}}");
+    }
+
+    /// The rest of Datadog's template syntax (its "Variables" page and its "Template Variable
+    /// Evaluation" guide, their own examples where they give one): conditions on a variable,
+    /// `{{else}}`, renotifications, priorities, the triggered times, recovery thresholds and the
+    /// comparator, `{{eval}}` and its functions, `local_time`, `urlencode`, keys with dots and
+    /// facets, comments, raw blocks and `{{{…}}}`; what does not read left as written, and nothing
+    /// deep or unclosed panics.
+    #[test]
+    fn messages_take_the_rest_of_datadog_s_template_syntax() {
+        let group = vec![("@machine_id".to_owned(), "m-7".to_owned()), ("dot.key.test".to_owned(), "five".to_owned()), ("host".to_owned(), "db-cassandra-1".to_owned()), ("service".to_owned(), "ad server".to_owned())];
+        // 2021-05-31: first triggered 14:19 UTC, last 14:27, now 14:49 (the page's table's A, B, ...).
+        let at = |h: i64, m: i64| crate::query::calendar::days_from_civil(2021, 5, 31) * 86_400_000 + h * 3_600_000 + m * 60_000;
+        let v = Vars {
+            monitor: "Disk",
+            value: Some(5.0),
+            threshold: 90.0,
+            warn_threshold: Some(80.0),
+            critical_recovery: Some(85.0),
+            comparator: Some(Op::Gt),
+            group: &group,
+            link: "https://kiln/m/1",
+            first_triggered: Some(at(14, 19)),
+            last_triggered: Some(at(14, 27)),
+            now: at(14, 49),
+            priority: Some(2),
+            ..Vars::default()
+        };
+        let alert = Transition { from: State::Ok, to: State::Alert };
+        let r = |t: &str| render(t, alert, &v);
+        assert_eq!(r(r#"{{#is_match "host.name" "db"}}db team{{else}}others{{/is_match}}"#), "db team");
+        assert_eq!(r(r#"{{#is_match "host.name" "web" "database"}}x{{else}}y{{/is_match}}{{^is_match "host.name" "db"}}z{{/is_match}}"#), "y");
+        assert_eq!(r(r#"{{#is_exact_match "value" "5.0"}}five{{/is_exact_match}}{{#is_exact_match "host.datacenter" ""}} none{{/is_exact_match}}"#), "five none");
+        assert_eq!(r(r#"{{#is_exact_match "[dot.key.test].name" "five"}}dotted{{/is_exact_match}} {{[dot.key.test].name}} {{@machine_id.name}}"#), "dotted five m-7");
+        assert_eq!(r("{{#is_priority 'P2'}}p2{{/is_priority}}{{#is_priority 'P1'}}p1{{/is_priority}}"), "p2");
+        assert_eq!(r("{{#is_warning}}{{#is_alert}}a{{else}}b{{/is_alert}}{{/is_warning}}"), "");
+        let renotified = Vars { renotify: true, ..v.clone() };
+        let again = "{{^is_renotify}}first{{/is_renotify}}{{#is_renotify}}again{{/is_renotify}}";
+        assert_eq!((render(again, alert, &v), render(again, alert, &renotified)), ("first".to_owned(), "again".to_owned()));
+        assert_eq!(render("{{#is_no_data_recovery}}back{{/is_no_data_recovery}}", Transition { from: State::NoData, to: State::Ok }, &v), "back");
+        assert_eq!(render("{{#is_unknown}}u{{/is_unknown}}", Transition { from: State::Ok, to: State::NoData }, &Vars { unknown: true, ..v.clone() }), "u");
+        assert_eq!(r("{{first_triggered_at}} {{last_triggered_at_epoch}} {{triggered_duration_sec}}"), format!("2021-05-31 14:19:00+00:00 {} 1800", at(14, 27)));
+        assert_eq!(r("{{local_time 'last_triggered_at' 'Asia/Tokyo'}}"), "2021-05-31 23:27:00+09:00");
+        // The comparator a variable, so its `>` HTML-encoded as what any variable says is (Datadog's
+        // "Character escape"); `{{{…}}}` says it raw, and the message's own text stays as written.
+        assert_eq!(r("{{comparator}} {{threshold}} {{warn_threshold}} {{alert_recovery_threshold}} {{warn_recovery_threshold}} {{ok_threshold}}"), "&gt; 90 80 85 80 ");
+        assert_eq!(r("value > {{{comparator}}} {{threshold}}"), "value > > 90");
+        assert_eq!(r(r#"{{eval "last_triggered_at_epoch-15*60*1000"}}"#), (at(14, 27) - 900_000).to_string());
+        assert_eq!(r(r#"{{#is_exact_match (eval "int(last_triggered_at_epoch / 3600000 % 24)") "8" "14"}}day shift{{/is_exact_match}}"#), "day shift");
+        assert_eq!(
+            r(r#"{{eval "round(12.376, 2)"}} {{eval "dec(12.25)"}} {{eval "-2^2"}} {{eval "-1 % 24"}} {{eval "humanize_bytes(1500000)"}} {{eval "upper(host.name)"}} {{eval "substring('host:D', 5)"}} {{eval "strip('abchost:Eabc', 'abc')"}}"#),
+            "12.38 0.25 -4 23 1.5 MB DB-CASSANDRA-1 D host:E"
+        );
+        assert_eq!(r(r#"https://kiln/services/{{urlencode "service.name"}}"#), "https://kiln/services/ad%20server");
+        let said = render_message("{{#is_alert}}{{override_priority 'P1'}}page{{/is_alert}}{{#is_warning}}{{override_priority 'P4'}}{{/is_warning}}", alert, &v);
+        assert_eq!(said, Rendered { text: "page".into(), priority: Some(1) });
+        assert_eq!(r("a{{!-- a comment --}}b{{! another }}c{{!-- unclosed dashes }}d {{{{raw}}}}{{ x }} {{value}}{{{{/raw}}}} {{{value}}}"), "abcd {{ x }} {{value}} 5");
+        assert_eq!(r(r#"{{{{is_match "host.name" "db"}}}}{{ .matched }} the host{{{{/is_match}}}}"#), "{{ .matched }} the host");
+        let unread = r#"{{eval "1 +"}} {{ nope }} {{local_time 'last_triggered_at' 'Mars/Base'}} {{eval "f(1,)"}}"#;
+        assert_eq!(r(unread), unread);
+        // Its "Character escape" example: a value HTML-encoded, `{{{…}}}` raw, kiln's own links as
+        // they are; a tag of several values sorted, by commas; a variable of a record the message
+        // reads that the record lacks, empty; a number's point dropped with its zeros.
+        let url = "https://status.example.com/check?service=web&region=us-east";
+        let tagged = vec![("check".to_owned(), url.to_owned()), ("role".to_owned(), "db_postgres".to_owned()), ("role".to_owned(), "db_cassandra".to_owned())];
+        let extra = vec![("log.link".to_owned(), "https://kiln/observe/logs?q=a&range=1h".to_owned()), ("log.message".to_owned(), "a < b".to_owned())];
+        let blank = vec!["log".to_owned()];
+        let w = Vars { group: &tagged, extra: &extra, blank: &blank, ..v.clone() };
+        assert_eq!(
+            render(r#"{{check.name}} {{{check.name}}} {{log.link}} {{role.name}} [{{log.attributes.gone}}] {{log.message}} {{eval "1.00001"}} {{span.message}}"#, alert, &w),
+            format!("https://status.example.com/check?service=web&amp;region=us-east {url} https://kiln/observe/logs?q=a&range=1h db_cassandra,db_postgres [] a &lt; b 1 {{{{span.message}}}}")
+        );
+        // An item by its name, as its page's `{{service.links[Runbook]}}`, a name with a space too;
+        // a service's variable its definition lacks, empty.
+        let items = vec![("service.links[Runbook]".to_owned(), "https://wiki/r".to_owned()), ("service.links[On-call Runbook]".to_owned(), "https://wiki/o".to_owned())];
+        let read = vec!["service".to_owned()];
+        let s = Vars { extra: &items, blank: &read, ..v.clone() };
+        assert_eq!(render("{{service.links[Runbook]}} {{service.links[On-call Runbook]}} [{{service.team}}] {{service.name}}", alert, &s), "https://wiki/r https://wiki/o [] ad server");
+        // No recursion: deep brackets read; unclosed sections and blocks never panic.
+        assert_eq!(r(&format!("{{{{eval \"{}1{}\"}}}}", "(".repeat(100_000), ")".repeat(100_000))), "1");
+        let _ = r(&("{{#is_match \"host.name\" \"db\"}}".repeat(10_000) + "{{{{raw}}}}x{{!--"));
     }
 
     /// Ten days of a daily cycle every five minutes, a spike in the last few minutes: the anomaly

@@ -247,7 +247,7 @@ fn end_of(i: &Info, now: i64) -> End {
         at,
         failed,
         peak: measured().filter_map(|m| m.footprint_peak_bytes).max(),
-        steady: measured().filter_map(|m| m.footprint_steady_bytes).last(),
+        steady: measured().filter_map(|m| m.footprint_steady_bytes).next_back(),
         cpu_ns: cpu,
         outcome: if failed { Outcome::Failed } else { Outcome::Ended },
     }

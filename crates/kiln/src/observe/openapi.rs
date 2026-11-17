@@ -601,6 +601,31 @@ fn schemas() -> Map<String, Value> {
                     "an anomaly monitor's, both: trigger_window its query's alert_window, recovery_window the window its recovery thresholds are of (last_15m)",
                 ),
             ),
+            ("renotify_statuses", describe(nullable(array(one_of(&["alert", "warn", "no data"]))), "the states told again each renotify_interval (alert and no data unless said)")),
+            ("renotify_occurrences", describe(nullable(integer()), "how many times a state is told again at the most (1 or more; none: no end)")),
+            ("escalation_message", describe(nullable(string()), "a template said after the message when a state is told again")),
+            ("timeout_h", describe(nullable(integer()), "hours without data after which a group in ALERT or WARN resolves, 0 to 24")),
+            ("require_full_window", describe(boolean(), "a metric monitor's: a group evaluated only once its window is full (Datadog's buckets: none of the first missing, three at the most)")),
+            ("new_group_delay", describe(nullable(integer()), "seconds a new group (one not seen for a day) is not evaluated")),
+            ("include_tags", describe(nullable(boolean()), "whether a notification's title names its group (true unless said)")),
+            (
+                "on_missing_data",
+                describe(
+                    nullable(one_of(&["default", "show_no_data", "show_and_notify_no_data", "resolve"])),
+                    "a monitor of logs, spans, events or Error Tracking's: a group the evaluation finds no data of: default (a count's 0, else its last state), NO DATA shown, NO DATA told, or OK; not beside notify_no_data",
+                ),
+            ),
+            ("notify_audit", describe(boolean(), "the handles its message mentions (chat, email, webhooks) told it was created, modified or deleted")),
+            ("notify_by", describe(nullable(array(string())), "some of the query's group tags, its notifications by them (each the worst of its groups), or [\"*\"]: one for all")),
+            ("group_retention_duration", describe(nullable(string()), "a monitor of logs, spans, events or Error Tracking's: how long a group without data is kept, 60m to 72h (1h, 2d)")),
+            (
+                "notification_preset_name",
+                describe(
+                    nullable(one_of(&["show_all", "hide_query", "hide_handles", "hide_all", "hide_query_and_handles", "show_only_snapshot", "hide_handles_and_footer"])),
+                    "what a notification shows besides its message: hide_all, hide_handles_and_footer and show_only_snapshot drop its link back to kiln (it shows no query, handles or snapshot)",
+                ),
+            ),
+            ("enable_logs_sample", describe(boolean(), "a log monitor's: its notifications of trouble list its group's latest logs, 10 at the most")),
         ],
         &[],
     );
