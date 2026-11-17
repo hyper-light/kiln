@@ -1980,11 +1980,11 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     // Each wait follows the harness, bounded by its slowest answer in this drive once it gave one, before
     // that by its run's ([`Pace::window`]).
     let mut pace = Pace::default();
-    let mut ends = Ends { f, ids: Vec::new() };
+    let mut ends = Ends::new(f);
 
     // Start: its first turn runs to its end.
     let id = open(f, &ask.spec(&ask.prompt, None))?;
-    ends.ids.push(id.clone());
+    ends.started(&id);
     let (first_info, events) = pace.until(f, &id, Asked::Opening, &format!("{kind}'s first turn"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
     let first = said(&events);
@@ -2040,7 +2040,7 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
         let found = child_of().ok_or_else(|| anyhow::anyhow!("{kind} started no agent from where it runs; it said {first:?}"))?;
         audit = f.get(&format!("/api/audit?q={}&limit=1000", id.get(..8).unwrap_or(&id)))?.as_array().cloned().unwrap_or_default();
         if let Some(c) = found.get("id").and_then(Value::as_str) {
-            ends.ids.push(c.to_owned());
+            ends.started(c);
             pace.stop(f, c)?;
             ends.ended(c);
         }
@@ -2056,7 +2056,7 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     // Resume: a new session takes its conversation up again, its harness's own session.
     let hs = hs.ok_or_else(|| anyhow::anyhow!("{kind}: kiln knows no harness session of {id} to take up again"))?;
     let resumed = open(f, &ask.spec(&ask.resumed, Some(&hs)))?;
-    ends.ids.push(resumed.clone());
+    ends.started(&resumed);
     let (resumed_info, _) = pace.until(f, &resumed, Asked::Opening, &format!("{kind} taking its conversation up again"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
     let took_up = resumed_info.get("harness_session").unwrap_or(&Value::Null);
@@ -2068,14 +2068,23 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
 
 /// The sessions a drive started and hasn't ended, each ended (the API's DELETE, as [`Pace::stop`] asks it) as
 /// it drops: a drive refused part way leaves none of its sessions, nor the microVM each holds, running into the
-/// next drive on its runner.
-struct Ends<'f> {
+/// next drive on its runner. The REST drive's ([`drive`]) and the MCP drive's (`step35::mcp::drive`).
+pub struct Ends<'f> {
     f: &'f Fixture,
     ids: Vec<String>,
 }
 
-impl Ends<'_> {
-    fn ended(&mut self, id: &str) {
+impl<'f> Ends<'f> {
+    pub fn new(f: &'f Fixture) -> Self {
+        Self { f, ids: Vec::new() }
+    }
+
+    /// Session `id`, started: ended as this drops unless [`Ends::ended`] says it was.
+    pub fn started(&mut self, id: &str) {
+        self.ids.push(id.to_owned());
+    }
+
+    pub fn ended(&mut self, id: &str) {
         self.ids.retain(|i| i != id);
     }
 }
