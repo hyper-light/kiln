@@ -241,8 +241,8 @@ a server and a runner of its own (never ROOT's: it writes the person's home in t
   reads it). `/runs/reach` must be `{"as": "narrowed", "uses": ["anthropic"], "hosts": […]}`, the
   hosts kiln's table keeps for it (`BY_USE`). Inside, the stand-in's `CONNECT=api.anthropic.com:443`
   connects, and `CONNECT=api.groq.com:443` is refused by the microVM's network: its resolver answers
-  REFUSED, RCODE 5 (Shards' D236), said `CONNECT_REFUSED api.groq.com:443 dns rcode 5`. No notice
-  says it isn't narrowed.
+  NXDOMAIN, RCODE 3, at once (Shards' D46 and D278, amended 2026-11-16, where it answered REFUSED,
+  RCODE 5), said `CONNECT_REFUSED api.groq.com:443 dns rcode 3`. No notice says it isn't narrowed.
 - **Whole, and said.** With the person's config unreadable (a folder at its path), `/runs/reach` is
   `{"as": "whole", "why": {"unread": {"file": "<its path in the microVM>", …}}}`, a warning notice
   says the network isn't narrowed and why, and both hosts connect: every destination the image names.

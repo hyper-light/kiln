@@ -1231,8 +1231,8 @@ mod stub {
     }
 
     /// A resolver as a microVM's network answers names (Shards' D236): `granted.test` at 127.0.0.1, and
-    /// every other name REFUSED (RFC 1035 4.1.1, RCODE 5), as its network process answers a name no
-    /// grant names.
+    /// every other name NXDOMAIN (RFC 1035 4.1.1, RCODE 3, no SOA), as its network answers a name no grant
+    /// names (Shards' D46 and D278, amended 2026-11-16, where it answered REFUSED, RCODE 5).
     fn network_answer(q: &[u8]) -> Option<Vec<u8>> {
         let mut at = 12;
         let mut labels = Vec::new();
@@ -1251,15 +1251,15 @@ mod stub {
             out.extend_from_slice(question);
             out.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
         } else {
-            out.extend_from_slice(&[0x81, 0x85, 0, 1, 0, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(&[0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0]);
             out.extend_from_slice(question);
         }
         Some(out)
     }
 
     /// Kiln plan step 17 part 6's probe: the stand-in's `CONNECT=` says what its network answers for a
-    /// destination, typed: a granted name's address, connected to; a name its resolver REFUSES, by the
-    /// answer's code, as a microVM's network refuses a name no grant names.
+    /// destination, typed: a granted name's address, connected to; a name its resolver has no address for,
+    /// by the answer's code, as a microVM's network answers a name no grant names (NXDOMAIN).
     #[test]
     fn s17_the_stand_in_says_what_its_network_answers_for_a_destination() -> anyhow::Result<()> {
         let dns = std::net::UdpSocket::bind("127.0.0.1:0")?;
@@ -1284,7 +1284,7 @@ mod stub {
         let turn = s.until(|v| v.get("id") == Some(&json!(3)))?;
         let text = said(&turn, "/params/update/content/text").join("\n");
         assert!(text.contains(&format!("CONNECT_OK granted.test:{port} 127.0.0.1")), "{text}");
-        assert!(text.contains(&format!("CONNECT_REFUSED refused.test:{port} dns rcode 5")), "{text}");
+        assert!(text.contains(&format!("CONNECT_REFUSED refused.test:{port} dns rcode 3")), "{text}");
         Ok(())
     }
 

@@ -16,7 +16,7 @@
 //! What it reads:
 //! - `/runs/reach`.
 //! - The stand-in's `CONNECT=` lines: its resolver's answer for the name, then a TCP connection. A
-//!   name no grant names is REFUSED by the microVM's network, RCODE 5 (Shards' D236).
+//!   name no grant names has no address on the microVM's network: NXDOMAIN, RCODE 3 ([`UNGRANTED`]).
 //! - The session's notices.
 //!
 //! It skips until its runner starts microVMs; with `VM_E2E=1` it fails instead, as step 34's runs do.
@@ -40,6 +40,13 @@ const PERSON: &str = "owner";
 /// Goose Agentfile (`agentfiles::builtin::destinations::BY_USE`).
 const KEPT: (&str, &str) = ("anthropic", "api.anthropic.com:443");
 const DROPPED: &str = "api.groq.com:443";
+
+/// What the stand-in says of a name no grant names (`CONNECT_REFUSED <host>:<port> dns rcode <n>`): its
+/// microVM's network answers NXDOMAIN, RCODE 3 (RFC 1035 §4.1.1), at once (`shards_dns::denied`, and
+/// shards-init's agents' resolver). Shards does since D46's and D278's amendments of 2026-11-16, in the
+/// Shards kiln vendors from f1e8a097b on; before them it answered REFUSED, RCODE 5, which musl's stub
+/// resolver drops, waiting out its timeout.
+const UNGRANTED: &str = "dns rcode 3";
 
 fn goose() -> anyhow::Result<&'static kiln::agentfiles::builtin::Builtin> {
     kiln::agentfiles::builtin::ALL.iter().find(|b| b.harness == "goose").ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for goose"))
@@ -211,7 +218,7 @@ fn s17_a_goose_session_reaches_its_persons_providers_hosts_alone_and_says_so_whe
     let (events, lines) = probed(&f, &mut pace, &id, "narrowed-1", &[KEPT.1, DROPPED])?;
     in_guest(&lines).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
     anyhow::ensure!(matches!(connect_said(&lines, KEPT.1), Some(("CONNECT_OK", _))), "{what}: {} wasn't reached from its microVM: {lines:?}", KEPT.1);
-    anyhow::ensure!(connect_said(&lines, DROPPED) == Some(("CONNECT_REFUSED", "dns rcode 5")), "{what}: {DROPPED} wasn't refused by its network (REFUSED, RCODE 5): {lines:?}");
+    anyhow::ensure!(connect_said(&lines, DROPPED) == Some(("CONNECT_REFUSED", UNGRANTED)), "{what}: {DROPPED} wasn't refused by its network (NXDOMAIN, RCODE 3): {lines:?}");
     anyhow::ensure!(notices(&events, "warn").iter().all(|n| !n.contains("isn't narrowed")), "{what}: it says it isn't narrowed: {:?}", notices(&events, "warn"));
     pace.stop(&f, &id)?;
 
@@ -257,9 +264,9 @@ mod checks {
 
     #[test]
     fn s17_what_the_stand_in_said_of_a_destination_is_read_by_its_word() {
-        let lines: Vec<String> = ["CWD /p", "CONNECT_OK api.anthropic.com:443 160.79.104.10", "CONNECT_REFUSED api.groq.com:443 dns rcode 5", "STUB_DONE"].map(String::from).to_vec();
+        let lines: Vec<String> = ["CWD /p", "CONNECT_OK api.anthropic.com:443 160.79.104.10", "CONNECT_REFUSED api.groq.com:443 dns rcode 3", "STUB_DONE"].map(String::from).to_vec();
         assert_eq!(connect_said(&lines, "api.anthropic.com:443"), Some(("CONNECT_OK", "160.79.104.10")));
-        assert_eq!(connect_said(&lines, "api.groq.com:443"), Some(("CONNECT_REFUSED", "dns rcode 5")));
+        assert_eq!(connect_said(&lines, "api.groq.com:443"), Some(("CONNECT_REFUSED", UNGRANTED)));
         assert_eq!(connect_said(&lines, "api.openai.com:443"), None);
         assert_eq!(connect_said(&["CONNECT_OK api.anthropic.com:4430 1.2.3.4".to_owned()], "api.anthropic.com:443"), None, "a destination is read whole");
     }
