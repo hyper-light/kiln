@@ -23,9 +23,13 @@
 //! - **Its use** (#73 part 7 slice 3; plan step 32's charge) is read while it runs through Hex's `host_use`. Hex
 //!   answers that on no event, so kiln reads it on its own charge cadence: placement's measures read a run's
 //!   [`Meter`] as its group (`reach::place::Group::Hex`). As the run ends, what it cost is kept in kiln's records
-//!   ([`USE`], [`HexVms::with_ledger`]) before anything acts on that end. The charge is Hex's final use (its
-//!   window the whole run, read with its end), or the use last read where the delete answers none or
-//!   `NoSuchBox`. A run never read and given no final use (it never started) is charged nothing.
+//!   ([`USE`], [`HexVms::with_ledger`]) before anything acts on that end. The charge is Hex's final use, which the
+//!   delete answers: read just before the delete's stop where the run still runs, its window the whole run; or, where
+//!   the run ended on its own first (a box's own command ended), the use its VM told as it went down (Shards' D260),
+//!   which Hex keeps with that end until the delete, its window ending where Hex first saw the end. The use last
+//!   read is charged where the delete answers none, `NoSuchBox`, or `NotRunning`: a run that ended with no final use
+//!   kept (its VM told none, as one whose process was killed tells none, or it was stopped before the delete), whose
+//!   box then goes by a plain delete. A run never read and given no final use (it never started) is charged nothing.
 //! - **Its credentials** (plan step 33, Shards' D242) are granted by reference: each of its launch's grants one of
 //!   `ShardsImage::credentials`, to its harness member, toward the hosts it names, the reference the secret's name in
 //!   kiln's store and never its value. Hex leases each value as the VM's egress first needs it, through the lessors
@@ -100,8 +104,9 @@ pub struct HexVms {
 /// [`Charged`] in JSON.
 pub const USE: &str = "hex.use";
 
-/// Which use a run was charged: Hex's final one, read with its end, its window the whole run; or the last one read
-/// while it ran, where its delete answered none or found it gone.
+/// Which use a run was charged: Hex's final one, which its delete answered (read just before its stop, or told by its
+/// VM with an end that came first and kept until then); or the last one read while it ran, where its delete answered
+/// none, found it gone, or found it ended with none kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Charge {
@@ -234,9 +239,11 @@ impl Vm {
 }
 
 /// Deletes `vm`'s box and keeps what it cost before anything acts on its end (module docs).
-/// - Where its delete answers a final use, that use is charged.
-/// - Where it answers none (its end unread) or `NoSuchBox` (an earlier delete ended it and its answer was lost), the
-///   use last read is charged. Where none was ever read (a run that never started), nothing is.
+/// - Where its delete answers a final use, that use is charged: its run's, whether it still ran at the delete or had
+///   ended on its own before it.
+/// - Where it answers none (its end unread), `NoSuchBox` (an earlier delete ended it and its answer was lost) or
+///   `NotRunning` (its run ended with no final use kept, its box left as it was and then deleted plainly), the use last
+///   read is charged. Where none was ever read (a run that never started), nothing is.
 ///
 /// An error where its box may still be there or its charge wasn't kept, so a later delete asks again.
 async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
@@ -248,9 +255,9 @@ async fn finish(vm: &Arc<Vm>) -> Result<(), String> {
             *vm.last.lock() = Some((used, Charge::Final));
         }
         Ok(None) | Err(hex_api::Refusal::NoSuchBox(_)) => {}
-        // Its run ended on its own before this delete (its own command ended, or its VM failed): Hex reads no use of a
-        // run that has ended and leaves its box as it was (`NotRunning`), so it goes by a plain delete, charged the use
-        // last read.
+        // The fallback where Hex kept no final use: its run ended before this delete and its VM told none (as one
+        // whose process was killed tells none), or it was stopped first. Hex leaves its box as it was (`NotRunning`),
+        // so it goes by a plain delete, charged the use last read.
         Err(hex_api::Refusal::NotRunning(..)) => {
             let (runtime, id) = (Arc::clone(&vm.runtime), vm.id.try_clone().map_err(|e| e.to_string())?);
             match crate::rt::blocking(move || runtime.delete(&id)).await.map_err(|e| format!("its delete didn't run: {e:#}"))? {
@@ -304,8 +311,9 @@ impl Commanded {
         crate::rt::blocking(move || runtime.usage(&id)).await.ok()?.ok()?.started_from
     }
 
-    /// Deletes its box and keeps its charge ([`finish`]): what its VM lived on, as that charge has it (Hex's final use
-    /// where its run was still running, else the use last read); or why its box may still be there.
+    /// Deletes its box and keeps its charge ([`finish`]): what its VM lived on, as that charge has it (Hex's final use,
+    /// whether its command still ran at the delete or had ended on its own before it; else the use last read); or why
+    /// its box may still be there.
     pub async fn end(self) -> Result<Option<Lived>, String> {
         self.ended.store(true, Ordering::Release);
         finish(&self.vm).await?;
@@ -894,7 +902,7 @@ pub(crate) mod tests {
     use kiln_seams::records::{Consistency, SimRecords};
     use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Output, Refusal, Run, Sandbox as _, Signal};
 
-    use super::{Charge, Charged, HexVms, USE, Used, host_cpu_ns};
+    use super::{Charge, Charged, HexVms, Lived, USE, Used, host_cpu_ns};
 
     /// The sandbox over Hex's simulator, its boxes numbered as a runner process of epoch 7 numbers those of its runs
     /// that reserve nothing.
@@ -1343,10 +1351,14 @@ pub(crate) mod tests {
     /// Hex's simulator with a VM's host use as Hex's image runtime answers it (`host_use`, and the final use
     /// `delete_with_host_use` answers, its window the whole run, `None` for a box never started), which the
     /// simulator doesn't model. Read `n` is `use_at(n)`. Its first delete may lose its answer (the box deleted,
-    /// an error said), and its start may be refused. Its credentials as Hex's image class leases them (plan step 33),
-    /// which the simulator doesn't model either: a box granting one refused `Unconfigured` as it is created where it
-    /// was given no lessors (`ImageClass::can_lease`), else its run's lessor asked of them as it starts
-    /// (`ImageClass::run_lessor`) and kept by box; and each spec it was asked to create kept as its wire writes it.
+    /// an error said), and its start may be refused. Its started runs may be taken to have ended on their own with
+    /// no final use told (Shards' D260: a VM whose process was killed tells none), each delete with its use then
+    /// refused `NotRunning` and its box left as it was, as Hex's image class refuses it; otherwise a run that ended
+    /// on its own is answered its final use, as one still running is. Its credentials as Hex's image class leases
+    /// them (plan step 33), which the simulator doesn't model either: a box granting one refused `Unconfigured` as
+    /// it is created where it was given no lessors (`ImageClass::can_lease`), else its run's lessor asked of them as
+    /// it starts (`ImageClass::run_lessor`) and kept by box; and each spec it was asked to create kept as its wire
+    /// writes it.
     #[derive(Default)]
     pub(crate) struct Metered {
         sim: SimRuntime,
@@ -1355,6 +1367,7 @@ pub(crate) mod tests {
         deletes: AtomicU64,
         lose_first_answer: AtomicBool,
         refuse_start: AtomicBool,
+        ended_untold: AtomicBool,
         lessors: parking_lot::Mutex<Option<Arc<dyn hex_api::lease::Lessors>>>,
         lessees: parking_lot::Mutex<Vec<(String, Arc<dyn hex_api::lease::Lessor>)>>,
         specs: parking_lot::Mutex<Vec<String>>,
@@ -1458,6 +1471,10 @@ pub(crate) mod tests {
         }
         fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, H> {
             self.deletes.fetch_add(1, Ordering::AcqRel);
+            if self.ended_untold.load(Ordering::Acquire) && self.started.lock().contains(id.as_str()) {
+                self.sim.inspect(id)?;
+                return Err(H::NotRunning(id.clone(), "delete with its host use: its run ended on its own, its VM telling none of its use"));
+            }
             self.sim.delete(id)?;
             let started = self.started.lock().remove(id.as_str());
             if self.lose_first_answer.swap(false, Ordering::AcqRel) {
@@ -1555,6 +1572,53 @@ pub(crate) mod tests {
             assert_eq!(rt.sim.list()?, []);
             assert_eq!(charged(&records, "kiln-z7-0").await?, None, "charged nothing");
             assert!(vms.meter("kiln-z7-0").is_none());
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln goal af2998eb, Phase 7 (Hex's answer to P7.1b's ask, over Shards' D260): a box whose own command ended
+    /// on its own before its delete is charged the final use that delete answers, the use its VM told as it went
+    /// down, which Hex kept with that end, over the use read before it. What it lived on is that use, its peak the
+    /// most any read said; its box is gone, asked for once.
+    #[test]
+    fn p7_a_command_that_ended_on_its_own_is_charged_the_final_use_its_delete_answers() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, records, vms) = metered();
+            let ran = vms.boot_command(SIM_IMAGE, vec!["/bin/sh".into(), "-c".into(), "exit 0".into()], &[], None).await?;
+            ran.meter().read()?;
+            let lived = ran.end().await.map_err(anyhow::Error::msg)?;
+            let told = Charged::of(&final_use(), Charge::Final);
+            assert_eq!(charged(&records, "kiln-z7-0").await?, Some(told.clone()), "its final use, not the one read before");
+            assert_eq!(lived, Some(Lived { cpu_ns: told.cpu_ns, window_ns: told.window_ns, footprint_steady_bytes: told.footprint_bytes, footprint_peak_bytes: told.footprint_bytes }));
+            assert_eq!(rt.deletes.load(Ordering::Acquire), 1, "deleted with its use, once");
+            assert_eq!(rt.sim.list()?, []);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln goal af2998eb, Phase 7: a run that ended before its delete with no final use told (as a VM whose process
+    /// was killed tells none) is refused `NotRunning` by Hex's delete with its use, which leaves its box as it was;
+    /// kiln then deletes it plainly and charges the use last read, a box running its own command and a session's
+    /// alike, each kept before its end is said.
+    #[test]
+    fn p7_a_run_ended_with_no_final_use_told_goes_by_a_plain_delete_charged_its_last_read() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, records, vms) = metered();
+            rt.ended_untold.store(true, Ordering::Release);
+            let ran = vms.boot_command(SIM_IMAGE, vec!["/bin/sh".into(), "-c".into(), "exit 0".into()], &[], None).await?;
+            ran.meter().read()?;
+            let lived = ran.end().await.map_err(anyhow::Error::msg)?;
+            let read = Charged::of(&use_at(1), Charge::LastRead);
+            assert_eq!(charged(&records, "kiln-z7-0").await?, Some(read.clone()), "charged the use last read");
+            assert_eq!(lived.map(|l| (l.cpu_ns, l.window_ns, l.footprint_steady_bytes)), Some((read.cpu_ns, read.window_ns, read.footprint_bytes)));
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            vms.meter("kiln-z7-1").ok_or_else(|| anyhow::anyhow!("a live run has its meter"))?.read()?;
+            run.kill();
+            let (end, kept) = charged_as_it_ends(run.as_ref(), &records, "kiln-z7-1").await?;
+            assert_eq!(end, Exit::Killed);
+            assert_eq!(kept, Some(Charged::of(&use_at(2), Charge::LastRead)), "a session's box alike");
+            assert_eq!(rt.deletes.load(Ordering::Acquire), 2, "each asked for its use once, then deleted plainly");
+            assert_eq!(rt.sim.list()?, [], "both boxes gone");
             anyhow::Ok(())
         })
     }

@@ -1,13 +1,14 @@
-//! `HexVms::finish` on real microVMs (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b, a9fbded98): a box whose run
-//! ended on its own before its delete is deleted, charged the use last read. Hex alone, asked to delete such a box with
-//! its final use, answers `NotRunning` and leaves the box as it was (its image class's `ended_first`), where kiln's
-//! delete stopped before a9fbded98.
+//! `HexVms::finish` on real microVMs (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1b, a9fbded98; goal af2998eb's
+//! Phase 7): a box whose run ended on its own before its delete is deleted and charged what it cost.
 //!
-//! - **A replay's box** (`HexVms::boot_command`): its microVM's own command ended.
+//! - **A replay's box** (`HexVms::boot_command`): its microVM's own command ended. Its VM told its final use as it went
+//!   down (Shards' D260), which Hex keeps with that end until the box's delete answers it (`delete_with_host_use`), so
+//!   it's charged `Charge::Final` though nothing read it while it ran.
 //! - **A session's box** (`HexVms::launch_as`, as an isolated session launches): its harness member's microVM failed
-//!   under it, its VM process killed here as a VM that dies is. Its end is said once its box is gone. A session whose
-//!   harness ends on its own leaves its run up (Shards' `ATTEND` holds it until it's stopped), so its delete reads its
-//!   final use as before.
+//!   under it, its VM process killed here as a VM that dies is. A VM killed tells no final use, so Hex refuses its
+//!   delete with its use (`NotRunning`) and leaves the box as it was; kiln deletes it plainly and charges the use last
+//!   read (`Charge::LastRead`). Its end is said once its box is gone. A session whose harness ends on its own leaves
+//!   its run up (Shards' `ATTEND` holds it until it's stopped), so its delete reads its final use as before.
 //!
 //! Each is held to its box gone from Hex's list, no VM process of it left, and its charge in kiln's records. The
 //! stand-in harness (`tests/fixtures/vm-stub/harness`) is built from this checkout's build context into the test's own
@@ -160,17 +161,19 @@ async fn check(image: String, runtime: Arc<ImageRuntime>, vm: std::path::PathBuf
     let hex_vms =
         HexVms::new(Arc::clone(&runtime) as Arc<dyn hex_api::Runtime>, move || Some(named(n.fetch_add(1, Ordering::Relaxed)))).with_ledger(Arc::clone(&records) as Arc<dyn kiln_seams::Records>);
 
-    // A replay's box: its own command ends at once.
+    // A replay's box: its own command ends at once, and its VM tells its final use as it goes down.
     let replay = hex_vms.boot_command(&image, vec!["/bin/sh".into(), "-c".into(), "exit 0".into()], &[], None).await.map_err(|e| anyhow::anyhow!("a replay's microVM didn't start: {e}"))?;
     let info = ended(&runtime, named(0)).await?;
     eprintln!("replay's box ended on its own: {:?}, {:?}", info.exit, info.ended);
-    let r = Arc::clone(&runtime);
-    let alone = kiln::rt::blocking(move || r.delete_with_host_use(&named(0).id()?)).await?;
-    assert!(matches!(alone, Err(H::NotRunning(..))), "Hex reads no final use of a run that ended: {alone:?}");
-    assert!(listed(&runtime, named(0)).await?, "and leaves its box as it was");
+    assert!(listed(&runtime, named(0)).await?, "Hex keeps its box, with its end, until its delete");
     let lived = replay.end().await.map_err(|e| anyhow::anyhow!("its end: {e}"))?;
     assert!(!listed(&runtime, named(0)).await?, "kiln's finish deleted the box whose run ended on its own");
-    assert_eq!((lived, charged(&records, named(0)).await?), (None, None), "never read, charged nothing");
+    let kept = charged(&records, named(0)).await?;
+    eprintln!("replay's box, deleted: it lived on {lived:?}, charged {kept:?}");
+    let kept = kept.ok_or_else(|| anyhow::anyhow!("no charge kept: Hex's delete answered no final use of a run that ended on its own"))?;
+    assert_eq!(kept.of, Charge::Final, "the final use Hex's delete answered, its run never read while it ran: {kept:?}");
+    assert!(kept.window_ns > 0, "its window runs from its run's start to its end: {kept:?}");
+    assert_eq!(lived.map(|l| (l.cpu_ns, l.window_ns, l.footprint_steady_bytes)), Some((kept.cpu_ns, kept.window_ns, kept.footprint_bytes)), "what it lived on is its charge");
     assert_eq!(vm_processes(&vm)?, Vec::<u32>::new(), "no VM process of it left");
 
     // A session's box: its harness member's microVM dies under it.
@@ -192,7 +195,7 @@ async fn check(image: String, runtime: Arc<ImageRuntime>, vm: std::path::PathBuf
     eprintln!("session's box, its VM killed: its member's end {end:?}, read before {read:?}");
     assert!(!listed(&runtime, named(1)).await?, "its box is gone by the time its end is said");
     let kept = charged(&records, named(1)).await?;
-    assert!(kept.as_ref().is_some_and(|c| c.of == Charge::LastRead && c.footprint_bytes == read.footprint_bytes), "charged the use last read, its run ended before its delete: {kept:?}");
+    assert!(kept.as_ref().is_some_and(|c| c.of == Charge::LastRead && c.footprint_bytes == read.footprint_bytes), "charged the use last read, its VM killed telling no final use: {kept:?}");
     drop(run);
     assert_eq!(vm_processes(&vm)?, Vec::<u32>::new(), "no VM process left");
     Ok(())
