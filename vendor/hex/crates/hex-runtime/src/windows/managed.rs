@@ -22,10 +22,6 @@ use super::{Held, WinRuntime, copy_path, copy_text, pending, std_handles};
 pub(super) struct Receipt {
     identity: Identity,
     process: Mutex<BoxProc>,
-    /// The runtime folders its launch gave the VM process, whose cache holds the records of the AppContainer profiles
-    /// it makes ([`release_app_containers`]); none for a controller taken back after its node's end, whose launch
-    /// this runtime never saw.
-    paths: Option<shards_api::RuntimePaths>,
 }
 
 pub(super) fn host_bounds(record: NativeRecord<'_>) -> Result<Bounds, Refusal> {
@@ -293,12 +289,6 @@ pub(super) fn launch(
     let paths = plan
         .runtime_paths()
         .ok_or_else(|| record.uncertain("its Windows launch plan has no runtime paths"))?;
-    // Kept for its receipt, which releases the VM's AppContainer profiles with its scope ([`release_app_containers`]).
-    let released_paths =
-        shards_api::RuntimePaths::new(copy_path(paths.cache())?, copy_path(paths.home())?)
-            .map_err(|why| {
-                record.uncertain(&format!("its Windows launch's runtime paths: {why}"))
-            })?;
     // None: a launch that follows its guest, with no deadline of its caller's (the review's C-9).
     let deadline = patience
         .map(|patience| {
@@ -413,7 +403,6 @@ pub(super) fn launch(
         let receipt = Receipt {
             identity,
             process: Mutex::new(BoxProc::new(process, pid, boxed.shared())),
-            paths: Some(released_paths),
         };
         boxed
             .managed
@@ -582,7 +571,6 @@ fn controller(
             vsock,
         },
         process: Mutex::new(BoxProc::new(process, expected.pid, boxed.shared())),
-        paths: None,
     })
 }
 
@@ -729,19 +717,17 @@ pub(super) fn finalize(
 
 /// Deletes the AppContainer profiles, and their records, that the VM process of `receipt` made (Shards' D141), once its
 /// scope has ended `end`, released: a VM ended by its job's end, as Hex ends every managed VM, leaves them, for Shards'
-/// next VM start to sweep (shards_api::release_app_containers). A controller taken back after its node's end has no
-/// runtime folders of this runtime's to name them by: its profiles are left to that sweep. Each refusal is typed, the
-/// finalize refused with it, so its caller tries again: a scope short of released Uncertain; a record a live process
-/// holds (a sweep under way, or a process given the VM's pid since) Busy; a deletion's failure an OS refusal.
+/// next VM start to sweep (shards_api::release_app_containers). Shards keeps their records per user, beside the
+/// profiles, so a controller taken back after its node's end releases them as one that launched its VM does. Each
+/// refusal is typed, the finalize refused with it, so its caller tries again: a scope short of released Uncertain; a
+/// record a live process holds (a sweep under way, or a process given the VM's pid since) Busy; a deletion's failure an
+/// OS refusal.
 fn release_app_containers(
     record: NativeRecord<'_>,
     receipt: &Receipt,
     end: ManagedEnd,
 ) -> Result<usize, Refusal> {
-    let Some(paths) = &receipt.paths else {
-        return Ok(0);
-    };
-    shards_api::release_app_containers(paths, &receipt.identity, end).map_err(|why| match why {
+    shards_api::release_app_containers(&receipt.identity, end).map_err(|why| match why {
         shards_api::Refusal::Release(shards_api::ReleaseRefusal::ScopeLive) => record
             .uncertain("its Windows scope wasn't released as its VM's AppContainer profiles were"),
         shards_api::Refusal::Release(shards_api::ReleaseRefusal::Held) => {
