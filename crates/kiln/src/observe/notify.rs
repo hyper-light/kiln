@@ -359,6 +359,13 @@ pub struct Notice {
     /// incident's severity and state).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facts: Option<Vec<(String, String)>>,
+    /// Whether its title names its group (Datadog's `include_tags`, true unless its monitor says).
+    #[serde(skip)]
+    pub include_tags: bool,
+    /// Whether it carries its links back to kiln (Datadog's `notification_preset_name`: `hide_all`,
+    /// `hide_handles_and_footer` and `show_only_snapshot` drop them).
+    #[serde(skip)]
+    pub footer: bool,
 }
 
 impl Notice {
@@ -371,7 +378,7 @@ impl Notice {
         if let Some(h) = &self.headline {
             return h.clone();
         }
-        let group = if self.group.is_empty() { String::new() } else { format!(" on {}", self.group.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(",")) };
+        let group = if self.group.is_empty() || !self.include_tags { String::new() } else { format!(" on {}", self.group.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(",")) };
         let word = match self.state {
             "ALERT" => "Triggered",
             "WARN" => "Warning",
@@ -424,7 +431,7 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
                 "attachments": [{
                     "color": hex,
                     "blocks": [
-                        { "type": "section", "text": { "type": "mrkdwn", "text": format!("*<{}|{}>*\n{}", n.link, clip(&n.title(), 200), clip(&n.body(), 2900)) } },
+                        { "type": "section", "text": { "type": "mrkdwn", "text": if n.footer { format!("*<{}|{}>*\n{}", n.link, clip(&n.title(), 200), clip(&n.body(), 2900)) } else { format!("*{}*\n{}", clip(&n.title(), 200), clip(&n.body(), 2900)) } } },
                         { "type": "context", "elements": [{ "type": "mrkdwn", "text": match &n.facts {
                             Some(f) => f.iter().map(|(k, v)| format!("{k} *{v}*")).collect::<Vec<_>>().join(" · "),
                             None => format!("value *{}* · threshold {} · {}", n.value_text(), n.threshold, if group.is_empty() { "all".to_owned() } else { group.clone() }),
@@ -439,17 +446,20 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
             for (k, v) in n.group.iter().take(23) {
                 fields.push(json!({ "name": clip(k, 256), "value": clip(v, 1024), "inline": true }));
             }
-            let body = json!({
-                "embeds": [{
-                    "title": clip(&n.title(), 256),
-                    "description": clip(&n.body(), 4096),
-                    "url": n.link,
-                    "color": int,
-                    "fields": fields,
-                    "timestamp": rfc3339(n.at),
-                    "footer": { "text": "kiln" },
-                }],
+            let mut embed = json!({
+                "title": clip(&n.title(), 256),
+                "description": clip(&n.body(), 4096),
+                "color": int,
+                "fields": fields,
+                "timestamp": rfc3339(n.at),
             });
+            if n.footer
+                && let Some(e) = embed.as_object_mut()
+            {
+                e.insert("url".into(), json!(n.link));
+                e.insert("footer".into(), json!({ "text": "kiln" }));
+            }
+            let body = json!({ "embeds": [embed] });
             (url.clone(), serde_json::to_vec(&body).unwrap_or_default(), json_headers)
         }
         Integration::Teams { url } => {
@@ -470,7 +480,7 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
                             { "type": "TextBlock", "text": n.body(), "wrap": true },
                             { "type": "FactSet", "facts": facts },
                         ],
-                        "actions": [{ "type": "Action.OpenUrl", "title": "Open in kiln", "url": n.link }],
+                        "actions": if n.footer { json!([{ "type": "Action.OpenUrl", "title": "Open in kiln", "url": n.link }]) } else { json!([]) },
                     },
                 }],
             });
@@ -490,7 +500,7 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
                 _ => "info",
             };
             let source = n.group.iter().find(|(k, _)| k == "host").map_or("kiln", |(_, v)| v.as_str());
-            let body = json!({
+            let mut body = json!({
                 "routing_key": routing_key,
                 "event_action": if resolve { "resolve" } else { "trigger" },
                 "dedup_key": dedup_key(n),
@@ -506,10 +516,14 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
                         None => json!({ "message": n.body(), "value": n.value, "threshold": n.threshold, "monitor_id": n.monitor_id, "state": n.state, "tags": n.tags }),
                     },
                 },
-                "links": [{ "href": n.link, "text": "Open in kiln" }],
                 "client": "kiln",
-                "client_url": n.link,
             });
+            if n.footer
+                && let Some(b) = body.as_object_mut()
+            {
+                b.insert("links".into(), json!([{ "href": n.link, "text": "Open in kiln" }]));
+                b.insert("client_url".into(), json!(n.link));
+            }
             (url.clone().unwrap_or_else(|| PAGERDUTY_EVENTS.to_owned()), serde_json::to_vec(&body).unwrap_or_default(), json_headers)
         }
         Integration::Opsgenie { api_key, url } => {
@@ -529,14 +543,18 @@ pub fn request(i: &Integration, n: &Notice) -> (String, Vec<u8>, Vec<(String, St
             for (k, v) in n.facts() {
                 details.insert(clip(&k.to_lowercase(), 100), json!(clip(&v, 500)));
             }
-            details.insert("link".into(), json!(n.link));
+            if n.footer {
+                details.insert("link".into(), json!(n.link));
+            }
             for (k, v) in &n.group {
                 details.insert(clip(k, 100), json!(clip(v, 500)));
             }
+            let facts = n.facts().iter().map(|(k, v)| format!("{} {v}", k.to_lowercase())).collect::<Vec<_>>().join(" · ");
+            let description = if n.footer { format!("{}\n\n{facts}\n{}", n.body(), n.link) } else { format!("{}\n\n{facts}", n.body()) };
             let body = json!({
                 "message": clip(&n.title(), 130),
                 "alias": alias,
-                "description": clip(&format!("{}\n\n{}\n{}", n.body(), n.facts().iter().map(|(k, v)| format!("{} {v}", k.to_lowercase())).collect::<Vec<_>>().join(" · "), n.link), 15_000),
+                "description": clip(&description, 15_000),
                 "tags": n.tags.iter().take(20).map(|t| clip(t, 50)).collect::<Vec<_>>(),
                 "details": details,
                 "entity": clip(if group.is_empty() { &n.monitor } else { &group }, 512),
@@ -582,7 +600,9 @@ pub fn email(n: &Notice, to: &[String], from: &str) -> super::smtp::Mail {
     let (_, color, _) = n.color();
     let mut facts = n.facts();
     facts.extend(n.group.iter().cloned());
-    let text = format!("{}\n\n{}\n\n{}\n\nOpen in kiln: {}\n", n.title(), n.body(), facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"), n.link);
+    let open = if n.footer { format!("\n\nOpen in kiln: {}", n.link) } else { String::new() };
+    let text = format!("{}\n\n{}\n\n{}{open}\n", n.title(), n.body(), facts.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n"));
+    let open_html = if n.footer { format!("<div style=\"margin-top:20px\"><a href=\"{}\" style=\"color:#1c1d21;font-weight:600\">Open in kiln</a></div>", html_escape(&n.link)) } else { String::new() };
     let rows: String = facts
         .iter()
         .map(|(k, v)| format!("<tr><td style=\"padding:2px 16px 2px 0;color:#6b6f76\">{}</td><td style=\"padding:2px 0\">{}</td></tr>", html_escape(k), html_escape(v)))
@@ -594,11 +614,10 @@ pub fn email(n: &Notice, to: &[String], from: &str) -> super::smtp::Mail {
 <div style=\"font-size:18px;font-weight:600\">{title}</div>\
 <div style=\"margin-top:12px;white-space:pre-wrap\">{body}</div>\
 <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:16px;font-size:13px\">{rows}</table>\
-<div style=\"margin-top:20px\"><a href=\"{link}\" style=\"color:#1c1d21;font-weight:600\">Open in kiln</a></div>\
+{open_html}\
 </td></tr></table></body></html>",
         title = html_escape(&n.title()),
         body = html_escape(&n.body()),
-        link = html_escape(&n.link),
     );
     let domain = from.rsplit_once('@').map_or("kiln", |(_, d)| d);
     let headers = vec![("References".to_owned(), format!("<{}@{domain}>", dedup_key(n))), ("X-Kiln-Monitor".to_owned(), n.monitor_id.chars().filter(|c| !c.is_control()).collect()), ("X-Kiln-State".to_owned(), n.state.to_owned())];
@@ -831,8 +850,10 @@ fn plain(n: &Notice) -> String {
             s.push_str(part);
         }
     }
-    s.push_str("\n\nOpen in kiln: ");
-    s.push_str(&n.link);
+    if n.footer {
+        s.push_str("\n\nOpen in kiln: ");
+        s.push_str(&n.link);
+    }
     s
 }
 
@@ -847,6 +868,9 @@ pub fn jira_text(cloud: bool, n: &Notice) -> Value {
             text.push_str(&format!("\n{k}: {v}"));
         }
         let text = text.trim().replace("{noformat}", "{ noformat}");
+        if !n.footer {
+            return Value::String(format!("{{noformat}}\n{text}\n{{noformat}}"));
+        }
         return Value::String(format!("{{noformat}}\n{text}\n{{noformat}}\n[Open in kiln|{}]", n.link.replace(['|', ']'], "")));
     }
     // A text node holds some text: none is empty.
@@ -873,10 +897,12 @@ pub fn jira_text(cloud: bool, n: &Notice) -> Value {
     if !items.is_empty() {
         content.push(json!({ "type": "bulletList", "content": items }));
     }
-    if n.link.contains("://") {
-        content.push(json!({ "type": "paragraph", "content": [{ "type": "text", "text": "Open in kiln", "marks": [{ "type": "link", "attrs": { "href": n.link } }] }] }));
-    } else if !n.link.is_empty() {
-        content.push(json!({ "type": "paragraph", "content": [text(&n.link)] }));
+    if n.footer {
+        if n.link.contains("://") {
+            content.push(json!({ "type": "paragraph", "content": [{ "type": "text", "text": "Open in kiln", "marks": [{ "type": "link", "attrs": { "href": n.link } }] }] }));
+        } else if !n.link.is_empty() {
+            content.push(json!({ "type": "paragraph", "content": [text(&n.link)] }));
+        }
     }
     json!({ "type": "doc", "version": 1, "content": content })
 }
@@ -1093,7 +1119,36 @@ mod tests {
             event: "monitor.transition",
             headline: None,
             facts: None,
+            include_tags: true,
+            footer: true,
         }
+    }
+
+    /// Datadog's `include_tags: false` (its guide's "`[Triggered] Monitor Title`") and its presets
+    /// that drop a notification's footer (`hide_all`, `hide_handles_and_footer`): the group out of
+    /// the title, and no link back to kiln in any service's format.
+    #[test]
+    fn a_notice_without_its_tags_or_its_footer_says_neither() -> anyhow::Result<()> {
+        let bare = Notice { include_tags: false, footer: false, ..notice("ALERT") };
+        anyhow::ensure!(bare.title() == "[Triggered] CPU high", "{}", bare.title());
+        anyhow::ensure!(notice("ALERT").title() == "[Triggered] CPU high on host:web-1");
+        let services = [
+            Integration::Slack { url: "https://hooks.slack.test/x".into() },
+            Integration::Discord { url: "https://discord.test/x".into() },
+            Integration::Teams { url: "https://teams.test/x".into() },
+            Integration::Pagerduty { routing_key: "k".into(), url: None },
+            Integration::Opsgenie { api_key: "k".into(), url: None },
+        ];
+        for i in &services {
+            let (_, body, _) = request(i, &bare);
+            anyhow::ensure!(!String::from_utf8_lossy(&body).contains("kiln.example"), "{i:?}: {}", String::from_utf8_lossy(&body));
+            let (_, body, _) = request(i, &notice("ALERT"));
+            anyhow::ensure!(String::from_utf8_lossy(&body).contains("kiln.example"), "{i:?} lost its link");
+        }
+        let mail = email(&bare, &["ops@example.com".to_owned()], "kiln@example.com");
+        anyhow::ensure!(!mail.text.contains("Open in kiln") && !mail.html.contains("Open in kiln") && mail.subject == "[Triggered] CPU high", "{}", mail.text);
+        anyhow::ensure!(!plain(&bare).contains("kiln.example") && !jira_text(false, &bare).to_string().contains("kiln.example") && !jira_text(true, &bare).to_string().contains("kiln.example"));
+        Ok(())
     }
 
     #[test]
