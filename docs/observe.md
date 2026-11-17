@@ -275,7 +275,11 @@ Events are records too, of source `kiln.event`: one store, one search. But they 
 monitor's own alerts are events at error's severity, and a monitor of `status:error` that counted
 them would count its own alerting. A log monitor, and the logs explorer, read logs only
 (`kiln_obs::monitor::logs_only`: the search and `-source:kiln.event`) unless the search names
-`kiln.event`; the event stream reads events only.
+`kiln.event`; the event stream reads events only. An event's **id** (its `id` in a search's answer,
+a monitor's `{{event.id}}`) is a digest of what it holds (SHA-256 of its time, severity, service,
+host, source, message, attributes sorted, trace and span, each after its length), its first 63 bits
+a positive 64-bit integer, as Datadog's v1 events' `id` is, written as text: a record never changes
+once kept, so its id is the same wherever and whenever it is read, and costs no room.
 
 A replica publishes the log records it applies to a **feed** (`kiln_obs::logs::tail`) while anyone
 follows them (live tail, §6): each batch's rows copied once into a ring bounded at 32 MiB, kept until
@@ -2005,7 +2009,8 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   escalation reads one (Datadog's matching attribute variables: `{{log.message}}`, `service`,
   `status`, `source`, `host`, `trace_id`, `span_id`, `timestamp`, `{{log.attributes.<key>}}`,
   `{{log.tags.<key>}}`; a span's `{{span.resource_name}}`, `operation_name`, `env`, `type`,
-  `status`, …; an event's `{{event.title}}`, `text`, `host.name`, `tags`, `attributes`), and
+  `status`, …; an event's `{{event.id}}` (§4.6), `title`, `text`, `host.name`, `tags`,
+  `attributes`), and
   `{{log.link}}` (`{{span.link}}`, `{{event.link}}`), its explorer scoped to the group's search over
   a range that covers its window; a formula's are its first query's; what the record lacks is empty
   (Datadog's "the variable renders empty"), as is all of it when no record is found. A composite's
@@ -2013,19 +2018,35 @@ options, so a monitor written for Datadog reads here. Its type, when it says one
   `{{a.log.message}}` of a monitor of logs), `a`, `b`, … as its query first names them (Datadog's
   form letters them as they are chosen and its API writes their ids), each its group the
   composite's group holds. A check's has `{{check_message}}`, an issue's `{{issue.attributes.error.*}}`
-  and `{{issue.link}}`. Any other variable kiln does not know is left as it was written. Its
+  and `{{issue.link}}`. A group by `host` reads its host (Datadog's "Query group by host"):
+  `{{host.ip}}`, `{{host.metadata_agent_version}}`, `metadata_machine`, `metadata_platform` and
+  `metadata_processor` (the Agent's host metadata, Datadog's own `meta` fields, else what kiln knows
+  of the host's platform, §10.9) and each of its tags of every source, `{{host.role.name}}` (several
+  values sorted, by commas), as the hosts' last inventory has them: a monitor's evaluation reads it
+  as it is, and the monitors ask for one, where a message reads a host's own variables, before they
+  evaluate (made again once 15 s old, in the background). A group by `service` reads its Service
+  Catalog definition (§10.8; "Query group by service"): `{{service.team}}`, `{{service.links}}` and
+  `{{service.docs}}` (each link `name: url`, by commas; docs the links of type `doc`, the schema's
+  since v2.1) and one by its name, `{{service.links[Runbook]}}`, its URL. What the host or the
+  service lacks is empty. Any other variable kiln does not know is left as it was written. Its
   `@slack-<name>`, `@discord-<name>`, `@teams-<name>`, `@pagerduty-<name>`, `@webhook-<name>`
   mentions name integrations (§10), read from the rendered message, so a mention may be built of
   variables (`@slack-{{service.name}}`, Datadog's dynamic handles).
-- **Messages kiln does not fill**, and why: a monitor grouped by host's host metadata
-  (`{{host.ip}}`, `{{host.metadata_agent_version}}`, `metadata_machine`, `metadata_platform`,
-  `metadata_processor`, and the host's other tags, `{{host.role.name}}`) and a service's Service
-  Catalog variables (`{{service.team}}`, `docs`, `links`, `links[Runbook]`): kiln keeps both (§10.8,
-  §10.9), but its host inventory is made asynchronously and on demand, which a monitor's
-  evaluation, on the blocking pool, does not wait on; they are left as written. Kubernetes'
-  (`{{kube_namespace.*}}`, `{{pod_name.*}}`), network devices' (`{{network_device.*}}`), RUM's,
-  CI's, audit's, Database Monitoring's and Synthetic tests' variables are of data kiln does not
-  keep. An event's `{{event.id}}` is empty: kiln's events have no id of their own.
+- **Unsupported: variables of data kiln does not keep.** Of Datadog's Variables page
+  (<https://docs.datadoghq.com/monitors/notify/variables.md>), kiln fills none of these, left as
+  written: a group by `kube_namespace` and `kube_cluster_name` (`{{kube_namespace.status}}`,
+  `labels`, `annotations`, …) or by `pod_name` (`{{pod_name.phase}}`, `conditions`, …), Kubernetes'
+  objects as its API keeps them, which kiln does not read (its containers are cgroups' and the
+  engine's, §10.10); a group by `device_ip` and `device_namespace` (`{{network_device.*}}`), Network
+  Device Monitoring's; and the matching attribute variables of RUM (`{{rum.attributes.<key>}}`,
+  `{{rum.tags.<key>}}`, `{{rum.link}}`), CI Pipeline and CI Test (`{{cipipeline.*}}`,
+  `{{citest.*}}`), Audit Trail (`{{audit.attributes.<key>}}`, `{{audit.message}}`) and Database
+  Monitoring (`{{databasemonitoring.attributes.<key>}}`), products whose data kiln does not keep.
+  Synthetic Monitoring's (`{{synthetics.attributes.*}}`, its Template Variables page,
+  <https://docs.datadoghq.com/synthetics/notifications/template_variables.md>) are not filled
+  either: kiln's synthetic tests (§10.4) write their runs as Datadog's series and records, but a
+  monitor of them reads those series, not a test's result, step or location as Datadog's synthetics
+  variables do.
 - The server, the leader, evaluates each on the blocking pool; each group's change is an event
   (`source:kiln.event @event.type:monitor.alert`, …) and, unless muted, its notifications; states
   are saved as they change. Each evaluation holds the store on its own (a write waits on no more

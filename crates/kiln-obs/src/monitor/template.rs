@@ -6,7 +6,8 @@
 //!   `{{warn_recovery_threshold}}`, `{{ok_threshold}}`, `{{comparator}}`, `{{first_triggered_at}}`,
 //!   `{{last_triggered_at}}` (and their `_epoch`s), `{{triggered_duration_sec}}`, `{{monitor.name}}`,
 //!   `{{group}}`, `{{link}}`, a group's tag (`{{host.name}}`, `{{[dot.key].name}}`, a facet's
-//!   `{{@machine_id.name}}`), and what [`Vars::extra`] names.
+//!   `{{@machine_id.name}}`), and what [`Vars::extra`] names, an item of one by its name as written
+//!   (`{{service.links[Runbook]}}`).
 //! - Sections, nested: `{{#is_alert}}…{{else}}…{{/is_alert}}` (`^` for not) of the transition's kind,
 //!   `is_renotify`, `is_unknown`, `is_priority 'P1'`, and `is_match` / `is_exact_match` of a variable
 //!   (or of an `(eval "…")`) against strings.
@@ -342,6 +343,10 @@ fn priority_of(s: &str) -> Option<u8> {
 
 /// A tag that opens no section: a helper's text, or a variable's; none for what it does not know.
 fn helper(tag: &str, v: &Vars<'_>, priority: &mut Option<u8>) -> Option<String> {
+    // A variable named as written whole, spaces and all (`{{service.links[On-call Runbook]}}`).
+    if let Some((_, x)) = v.extra.iter().find(|(k, _)| k == tag) {
+        return Some(x.clone());
+    }
     let (name, args) = split(tag)?;
     match (name, args.as_slice()) {
         (_, []) => lookup(name, v),
@@ -369,8 +374,13 @@ fn epoch_of(name: &str, v: &Vars<'_>) -> Option<i64> {
 /// What a variable stands for, by its name: Datadog's own, one [`Vars::extra`] names, or a group's
 /// tag (`host.name`; a bare `env` too, as Datadog's `is_match` example reads one).
 fn lookup(name: &str, v: &Vars<'_>) -> Option<String> {
+    let raw = name.trim();
+    // An item by its name, as written (`service.links[Runbook]`).
+    if let Some((_, x)) = v.extra.iter().find(|(k, _)| k == raw) {
+        return Some(x.clone());
+    }
     // A key with dots, bracketed: `[dot.key.test].name`, `log.attributes.[error.message]`.
-    let name = name.trim().replace(".[", ".").replace(['[', ']'], "");
+    let name = raw.replace(".[", ".").replace(['[', ']'], "");
     let n = name.as_str();
     let time = |ms: Option<i64>| ms.and_then(|ms| local_time(ms, Zone::UTC)).unwrap_or_default();
     let epoch = |ms: Option<i64>| ms.map(|ms| ms.to_string()).unwrap_or_default();
