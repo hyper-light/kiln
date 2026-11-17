@@ -27,7 +27,6 @@ import {
   limitWords,
   measureOf,
   METRIC,
-  passes,
   queryOf,
   startMs,
   variantIn,
@@ -37,6 +36,7 @@ import {
   type Criterion,
   type CriterionAsk,
   type Experiment,
+  type Interval,
   type Measure,
   type Op,
   type Variant,
@@ -50,7 +50,7 @@ import { ApiError } from "@/api/client";
 import { Loadable } from "@/components/ui/loading";
 import { sendingProps, useHold, type Failed, type Hold } from "@/lib/action";
 import { invalidate, resourceData, watch } from "@/lib/resource";
-import { rebalance, rescale, variantName, variantTone, type Deployment } from "./variants";
+import { measureAxis, onAxis, rebalance, rescale, variantName, variantTone, winsMeasure, type Deployment } from "./variants";
 import { sandboxesRes, type SandboxBrief } from "@/api/microvms";
 import type { AgentInfo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
@@ -469,12 +469,13 @@ function DefinitionGroup({ d, open, onOpen, onSetup, inRow, session }: { d: Agen
 /** An experiment's state as Mission's tree's stands (its counts' dots), and in its own words. */
 const EXP_STAND: Record<Experiment["state"], string> = { live: "working", paused: "paused", promoted: "done", stopped: "stopped" };
 const EXP_WORD: Record<string, string> = { working: "Live", paused: "Paused", done: "Promoted", stopped: "Stopped" };
-/** What each measure is, how it reads, and its unit. */
-const MEASURE: Record<Measure, { word: string; f: (x: number) => string; unit: string }> = {
-  warm_ms: { word: "Warm start", f: (x) => `${Math.round(x)}ms`, unit: "ms" },
-  peak_gib: { word: "Peak memory", f: (x) => `${x.toFixed(2)}G`, unit: "GiB" },
-  failed_pct: { word: "Failed sessions", f: (x) => `${Math.round(x)}%`, unit: "%" },
+/** What each measure is, its word on a variant's line, what its middle is, how it reads, and its unit. */
+const MEASURE: Record<Measure, { word: string; label: string; mid: "median" | "rate"; f: (x: number) => string; unit: string }> = {
+  warm_ms: { word: "Warm start", label: "warm", mid: "median", f: (x) => `${Math.round(x)}ms`, unit: "ms" },
+  peak_gib: { word: "Peak memory", label: "peak", mid: "median", f: (x) => `${x.toFixed(2)}G`, unit: "GiB" },
+  failed_pct: { word: "Failed sessions", label: "failed", mid: "rate", f: (x) => `${Math.round(x)}%`, unit: "%" },
 };
+const MEASURES = Object.keys(MEASURE) as Measure[];
 
 /**
  * What a control of an experiment asks the server (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1), one change
@@ -887,8 +888,8 @@ function ExperimentNodes({ d, e, names, hold, ask, onPromoted }: { d: AgentDef; 
 }
 
 /**
- * A variant: its swatch and name (renamed in place), its measures where its sessions have any, its weight and
- * sessions, Promote, its removal.
+ * A variant: its swatch and name (renamed in place), its measures where its sessions have any (each its 95% interval on
+ * the axis its experiment's variants share), its weight and sessions, Promote, its removal.
  */
 function VariantLine({
   all,
@@ -927,8 +928,6 @@ function VariantLine({
   const tone = variantTone(i, all.length);
   const name = variantName(all, i, names);
   const m = v.measures;
-  // Its 95% interval clears every other variant's: only where every one has measures.
-  const win = (k: Measure) => m !== undefined && all.every((o) => o === v || (o.measures !== undefined && m[k][2] < o.measures[k][0]));
   return (
     <li className="df-vline">
       <span className="df-vline-top">
@@ -959,9 +958,9 @@ function VariantLine({
       </span>
       {m && (
         <span className="df-vline-measures">
-          <Measure label="warm" iv={m.warm_ms} f={MEASURE.warm_ms.f} win={win("warm_ms")} />
-          <Measure label="peak" iv={m.peak_gib} f={MEASURE.peak_gib.f} win={win("peak_gib")} />
-          <Measure label="failed" iv={m.failed_pct} f={MEASURE.failed_pct.f} win={win("failed_pct")} />
+          {MEASURES.map((k) => (
+            <Measure key={k} k={k} iv={m[k]} axis={measureAxis(all, k) ?? [m[k][0], m[k][2]]} tone={tone} win={winsMeasure(all, i, k)} />
+          ))}
         </span>
       )}
       <span className="df-vline-weight">
@@ -1017,17 +1016,16 @@ const OP_WORD: Record<Op, string> = { ">": "greater than", ">=": "greater than o
 
 /**
  * A criterion: its name, its rule (its query's value against its bound, as a monitor decides it) and
- * its query; each variant's value, passing or missing, the best marked where the rule has a direction;
- * and each variant's day by day, its bound drawn across. Its values show where the query reads one of
- * kiln's session metrics and its variants' sessions measured it (kiln's monitors evaluate the rest): none
- * is shown for a variant with no measures.
+ * its query; each variant's value of its query as kiln's monitors evaluate it now, whatever it reads (the
+ * server's `values`), passing or missing, the best marked where the rule has a direction; and, where it
+ * reads one of kiln's session metrics, each variant's day by day, its bound drawn across.
  */
 function CriterionBlock({ c, vs, names, held, onDrop }: { c: Criterion; vs: Variant[]; names: ReadonlyMap<string, string>; held: boolean; onDrop?: () => void }) {
   const k = measureOf(c.query);
   const f = k ? MEASURE[k].f : (x: number) => String(Number(x.toPrecision(4)));
-  const vals = vs.map((v) => (k ? v.measures?.[k][1] : undefined));
-  const mids = vals.filter((x): x is number => x !== undefined);
-  const best = mids.length === 0 ? null : c.op === "<" || c.op === "<=" ? Math.min(...mids) : c.op === ">" || c.op === ">=" ? Math.max(...mids) : null;
+  const vals = vs.map((v) => c.values?.[v.id]);
+  const xs = vals.flatMap((x) => (x ? [x.value] : []));
+  const best = xs.length === 0 ? null : c.op === "<" || c.op === "<=" ? Math.min(...xs) : c.op === ">" || c.op === ">=" ? Math.max(...xs) : null;
   return (
     <div className="df-crit">
       <span className="df-crit-top">
@@ -1044,29 +1042,26 @@ function CriterionBlock({ c, vs, names, held, onDrop }: { c: Criterion; vs: Vari
       <code className="df-crit-query">
         {c.query} {c.op} {c.bound}
       </code>
-      {k ? (
-        <>
-          {mids.length > 0 && (
-            <span className="df-crit-vals">
-              {vs.map((v, i) => {
-                const x = vals[i];
-                if (x === undefined) return null;
-                const ok = passes(c.op, x, c.bound);
-                return (
-                  <span key={v.id} className="df-crit-val" data-best={x === best || undefined} data-missed={!ok || undefined}>
-                    <Swatch tone={variantTone(i, vs.length)} />
-                    {f(x)}
-                    {ok ? " passes" : " misses"}
-                    {x === best ? " · best" : ""}
-                  </span>
-                );
-              })}
-            </span>
-          )}
-          <TrendChart lines={vs.map((v, i) => ({ label: variantName(vs, i, names), tone: variantTone(i, vs.length), values: v.trend?.[k] ?? [] }))} bound={c.bound} label={`${c.name}, day by day`} />
-        </>
+      {xs.length > 0 ? (
+        <span className="df-crit-vals">
+          {vs.map((v, i) => {
+            const x = vals[i];
+            if (!x) return null;
+            return (
+              <span key={v.id} className="df-crit-val" data-best={x.value === best || undefined} data-missed={!x.passes || undefined}>
+                <Swatch tone={variantTone(i, vs.length)} />
+                {f(x.value)}
+                {x.passes ? " passes" : " misses"}
+                {x.value === best ? " · best" : ""}
+              </span>
+            );
+          })}
+        </span>
       ) : (
-        <span className="df-note">Values from kiln&apos;s monitors.</span>
+        <span className="df-note">No values yet.</span>
+      )}
+      {k && (
+        <TrendChart lines={vs.map((v, i) => ({ label: variantName(vs, i, names), tone: variantTone(i, vs.length), values: v.trend?.[k] ?? [] }))} bound={c.bound} label={`${c.name}, day by day`} />
       )}
     </div>
   );
@@ -1342,12 +1337,25 @@ function SetupNodes({
   );
 }
 
-/** A measure as its median, with a check where its 95% interval clears every other variant's. */
-function Measure({ label, iv, f, win }: { label: string; iv: [number, number, number]; f: (x: number) => string; win: boolean }) {
+/**
+ * A measure of a variant (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.2): its 95% interval a bar along `axis`, the
+ * one its experiment's variants share, its middle a tick, in its swatch's tone; its middle beside, and a check where
+ * its interval clears every other variant's.
+ */
+function Measure({ k, iv, axis, tone, win }: { k: Measure; iv: Interval; axis: [number, number]; tone: string; win: boolean }) {
+  const { word, label, mid, f } = MEASURE[k];
+  const [low, high] = [onAxis(iv[0], axis), onAxis(iv[2], axis)];
   return (
-    <span className="ms-measure" data-win={win || undefined} title={`${label}: median ${f(iv[1])}, 95% ${f(iv[0])}–${f(iv[2])}`}>
-      {label} {f(iv[1])}
-      {win ? " ✓" : ""}
+    <span className="df-measure" data-win={win || undefined} title={`${word}: ${mid} ${f(iv[1])}, 95% ${f(iv[0])}–${f(iv[2])}${win ? ", clear of every other variant's" : ""}`}>
+      <span className="df-measure-k">{label}</span>
+      <span className="df-whisk" aria-hidden="true">
+        <b style={{ left: `${low}%`, width: `${high - low}%`, background: tone }} />
+        <s style={{ left: `${onAxis(iv[1], axis)}%`, background: tone }} />
+      </span>
+      <span className="df-measure-v">
+        {f(iv[1])}
+        {win ? " ✓" : ""}
+      </span>
     </span>
   );
 }

@@ -19,14 +19,19 @@ Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P7.1, P7.2. Rules: [principles.md](p
 
 The EXPERIMENT group of an agent's dropdown ([agents.md](agents.md)): one line (the split's swatches, weights,
 sessions, its state, pause) until opened; then a row per variant: swatch and name, measures (warm ms, peak GiB,
-failed %, each its median with a ✓ where its 95% interval beats every other's), its weight slider, Promote (asked in
-place, Undo in its toast). Dragging a weight moves the others in proportion (always 100) and stages a new split,
+failed %: each its 95% interval as a bar in the variant's tone along the axis every variant of the experiment shares,
+its middle a tick and beside it, with a ✓ where its interval clears every other's), its weight slider and its
+sessions, Promote (asked in place, Undo in its toast). Each criterion shows every variant's value of its query as
+kiln's monitors evaluate it, passing or missing, the best marked, and, for kiln's own session metrics, each variant's
+day by day. Counts and measures stay live: the list is read again as a session the experiment drew starts, has its
+first start measured, or ends. Dragging a weight moves the others in proportion (always 100) and stages a new split,
 hatched until Apply; Discard drops it. New experiment (⋯) sets one up in place: variants added without a cap, each a
 deployment and a weight, then Start. A session's variant shows as its swatch and name on its row, in the Agents tab
 and beside its version.
 
 ## Open
 
-- Replay (re-running past sessions' inputs on another deployment): designed in the standalone mockups, not built.
-- The server's own experiment routes; the mock's experiments live in `ui/mock/agentdefs.ts` and the UI changes them
-  locally.
+- A variant's measures come all three or none (the server's `measures`): a host variant, with no warm start or peak,
+  shows none, and no winner shows beside it.
+- A start kiln refuses, and a change made elsewhere (another tab, an agent through kiln's tools), send no event: the
+  list shows them when it's next read.

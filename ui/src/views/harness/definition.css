@@ -609,11 +609,57 @@ button.df-crumb:hover {
 .df-vline-top > .ms-edit-in {
   width: 180px;
 }
+/* Its measures (definitions.tsx Measure), each a cell as wide on every variant's line, so a measure's whiskers line up
+   down the list: its word; its 95% interval a bar along the axis its experiment's variants share, its middle a tick,
+   in its variant's tone; then its middle, checked where its interval clears every other variant's. */
 .df-vline-measures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
   color: #c8cad0;
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 18px;
+}
+.df-measure {
+  display: inline-grid;
+  grid-template-columns: 6ch 64px 8ch;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.df-measure-k {
+  color: #97999f;
+}
+.df-measure[data-win] > .df-measure-v {
+  color: #bfdccf;
+}
+.df-whisk {
+  position: relative;
+  height: 14px;
+}
+.df-whisk::before {
+  content: "";
+  position: absolute;
+  inset: 6.5px 0 auto;
+  height: 1px;
+  background: #1b1d22;
+}
+.df-whisk > b {
+  position: absolute;
+  top: 5px;
+  min-width: 2px;
+  height: 4px;
+  border-radius: 2px;
+  opacity: 0.6;
+}
+.df-whisk > s {
+  position: absolute;
+  top: 1px;
+  width: 2px;
+  height: 12px;
+  border-radius: 1px;
+  transform: translateX(-50%);
 }
 .df-vline-weight {
   display: inline-flex;

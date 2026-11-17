@@ -5,11 +5,13 @@
  * person's own, and kiln's (`kiln:<name>`), its UI agents replaceable by one of yours (`uses`).
  *
  * Its experiments are the server's (`agentdefs.experiments.*`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
- * P7.1): each splits its new sessions between deployments. What the server doesn't keep yet is read from
- * proposals (p/uicontract is building them): the sessions started from each and how fast it starts where,
- * and what an experiment's variants measure. The rows the UI draws are made of both (`AgentDef`).
+ * P7.1, P7.2): each splits its new sessions between deployments, and says what each variant's sessions
+ * measure and each criterion's query of them. What the server doesn't keep yet is read from proposals
+ * (p/uicontract is building them): the sessions started from each and how fast it starts where. The rows
+ * the UI draws are made of both (`AgentDef`).
  */
 import type { Res } from "@/lib/data";
+import type { ServerEvent } from "./types";
 import { request } from "./client";
 
 const enc = encodeURIComponent;
@@ -91,7 +93,7 @@ export interface RunAnswer {
 
 /* ------------------------------------------------ experiments (agentdefs.experiments.*, P7.1) */
 
-/** A measure of one variant: a 95% interval of its median and the median, [low, mid, high]. */
+/** A measure of one variant: its middle (a median, or failures' rate) within its 95% interval, [low, mid, high]. */
 export type Interval = [number, number, number];
 /** What a variant's sessions are measured by. */
 export type Measure = "warm_ms" | "peak_gib" | "failed_pct";
@@ -118,17 +120,16 @@ export interface Variant {
   sessions: number;
   /** What new sessions start on now: the experiment's first variant, until one is promoted, then that one. */
   current: boolean;
-  /** What its sessions measure: none yet (the server's next part of P7.1), and nothing is shown for it until then. */
+  /**
+   * What its sessions measure: the median of its warm starts (ms) and of its microVMs' peak memory (GiB), and the
+   * percent of its sessions that failed; none until its sessions bound all three, and nothing is shown for it until then.
+   */
   measures?: Record<Measure, Interval>;
-  /** Each measure's median, day by day since its experiment started, oldest first; none yet, as `measures`. */
+  /** Each measure's middle at the end of each day (UTC), oldest first, today's last, every variant's over the same days; a measure none of its sessions has yet left out. */
   trend?: Partial<Record<Measure, number[]>>;
 }
 /** How a criterion compares its query's value with its bound: kiln's monitors' comparators (kiln-obs monitor.rs `Op`). */
 export type Op = ">" | ">=" | "==" | "!=" | "<" | "<=";
-/** Whether `v` passes `bound` by `op`, as kiln's monitors decide it. */
-export function passes(op: Op, v: number, bound: number): boolean {
-  return op === ">" ? v > bound : op === ">=" ? v >= bound : op === "<" ? v < bound : op === "<=" ? v <= bound : op === "==" ? v === bound : v !== bound;
-}
 export interface Criterion {
   id: string;
   /** What its person calls it. */
@@ -141,6 +142,11 @@ export interface Criterion {
   query: string;
   op: Op;
   bound: number;
+  /**
+   * Each variant's value of its query, by the variant's id, as kiln's monitors evaluate it now, and whether it passes
+   * its bound; none where the query gives no variant a value.
+   */
+  values?: Record<string, { value: number; passes: boolean }>;
 }
 /** Each measure kiln keeps of a session, as its monitoring metric. */
 export const METRIC: Record<Measure, string> = { warm_ms: "kiln.session.warm_ms", peak_gib: "kiln.session.peak_memory_gib", failed_pct: "kiln.session.failed_pct" };
@@ -371,13 +377,43 @@ export const agentdefsApi = {
   sessions: (signal?: AbortSignal) => request<Record<string, DefSessions>>("GET", "/api/agentdef-sessions", undefined, { signal }),
 };
 
-/** The rows, from the server's list and the proposals together. */
+/**
+ * What a session an experiment drew last said of the facts its variant's measures are made of (the server's `Reading`,
+ * crates/kiln/src/agentdefs/experiments/measures.rs): its first start measured, and it over.
+ */
+export interface DrawnFacts {
+  measured: boolean;
+  over: boolean;
+}
+/** Each drawn session's, by its id, as its harness's events said them; let go as it closes. */
+const drawn = new Map<string, DrawnFacts>();
+
+/**
+ * Whether `ev` changes what an experiment shows (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.2, its live counts and
+ * measures), `seen` holding what the events before it said: a session an experiment drew, new (its variant's count), its
+ * first start measured, or over; or one closing that never said it was over, which the server reads as over as it goes.
+ */
+export function drawChanged(ev: ServerEvent, seen: Map<string, DrawnFacts> = drawn): boolean {
+  if (ev.type === "harness_closed") {
+    const was = seen.get(ev.id);
+    seen.delete(ev.id);
+    return was !== undefined && !was.over;
+  }
+  if (ev.type !== "harness" || !ev.info.experiment) return false;
+  const now: DrawnFacts = { measured: ev.info.starts?.some((s) => Boolean(s.measured)) ?? false, over: ev.info.status === "exited" };
+  const was = seen.get(ev.info.id);
+  seen.set(ev.info.id, now);
+  return !was || was.measured !== now.measured || was.over !== now.over;
+}
+
+/** The rows, from the server's list and the proposals together: read again as an experiment's sessions change what it shows. */
 export const agentdefsRes: Res<AgentDef[]> = {
   key: "agentdefs/list",
   fetch: async (s) => {
     const [list, sessions, experiments] = await Promise.all([agentdefsApi.list(s), agentdefsApi.sessions(s), agentdefsApi.experiments.list(s)]);
     return compose(list, sessions, experiments);
   },
+  opts: { on: ["harness", "harness_closed"], relevant: (ev) => drawChanged(ev) },
 };
 /** Its versions, newest first. */
 export const agentdefVersionsRes = (id: string): Res<AgentDefVersion[]> => ({ key: `agentdefs/versions/${id}`, fetch: (s) => agentdefsApi.versions(id, s) });

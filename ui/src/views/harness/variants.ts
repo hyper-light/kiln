@@ -2,9 +2,9 @@
  * Variants of an experiment (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P7.1), as people tell them
  * apart: never by a letter (kiln's research grades are lettered), by their swatch, a colour along
  * kiln's prism, and by their name, by default what sets each apart from the others. And their
- * weights, which always add up to 100.
+ * weights, which always add up to 100, and their measures on axes they share (P7.2).
  */
-import type { Variant } from "@/api/agentdefs";
+import type { Measure, Variant } from "@/api/agentdefs";
 
 /** A variant's colour: its place along kiln's prism (index.css --prism), so any number of variants reads apart, in kiln's own colours. */
 const PRISM: [number, number, number][] = [
@@ -81,4 +81,30 @@ export function rebalance(ws: readonly number[], i: number, w: number): number[]
   const last = out.length - 1 === i ? out.length - 2 : out.length - 1;
   out[last] = (out[last] ?? 0) + drift;
   return out;
+}
+
+/**
+ * Measure `k`'s axis across an experiment's variants (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.2): from the lowest
+ * of their 95% intervals' lows to the highest of their highs, so every variant's interval is drawn to the same scale;
+ * none where no variant has measures.
+ */
+export function measureAxis(vs: readonly Pick<Variant, "measures">[], k: Measure): [number, number] | null {
+  const ivs = vs.flatMap((v) => (v.measures ? [v.measures[k]] : []));
+  if (ivs.length === 0) return null;
+  return [Math.min(...ivs.map((iv) => iv[0])), Math.max(...ivs.map((iv) => iv[2]))];
+}
+
+/** Where `x` falls along `axis`, as a percent of its length: its middle where the axis is one value. */
+export function onAxis(x: number, [lo, hi]: readonly [number, number]): number {
+  return hi > lo ? ((x - lo) / (hi - lo)) * 100 : 50;
+}
+
+/**
+ * Whether variant `i` clearly wins measure `k`: its whole 95% interval below every other variant's, so none overlaps
+ * it (each measure is better lower: a faster warm start, less memory, fewer failures); only where every variant has
+ * measures.
+ */
+export function winsMeasure(vs: readonly Pick<Variant, "measures">[], i: number, k: Measure): boolean {
+  const m = vs[i]?.measures;
+  return m !== undefined && vs.every((o, j) => j === i || (o.measures !== undefined && m[k][2] < o.measures[k][0]));
 }

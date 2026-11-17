@@ -2035,13 +2035,6 @@ button.mc-pick[aria-expanded="true"] .mc-chev {
 }
 
 /* Agents you manage (definitions.tsx), in the dropdown under a row: the experiment's split and its variants. */
-.ms-measure + .ms-measure::before {
-  content: " · ";
-  color: #5c6470;
-}
-.ms-measure[data-win] {
-  color: #bfdccf;
-}
 .ms-weight-in {
   width: 96px;
   height: 14px;

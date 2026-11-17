@@ -29,8 +29,10 @@
  *   POST   …/:e/promote                                {variant}: its deployment the definition's next version, the split's weights kept → {experiment, agentdef}
  *   DELETE …/:e                                        {deleted: true}
  *   POST   /api/mock/agentdef-experiments              the seeded experiments again (the browser tests start from them)
- * Each change answers {experiment}. Its seeded variants' `measures` and `trend` are a PROPOSAL (the server's next
- * part of P7.1): one made here has none, as the server's have.
+ * Each change answers {experiment}. Its seeded variants' `measures` and `trend` stand in for what their sessions
+ * measured (crates/kiln/src/agentdefs/experiments/measures.rs): one made here has none, as the server's has none until
+ * its sessions bound all three. Each criterion's `values` stand in for kiln's monitors' evaluation of its query, a
+ * variant's measure's middle where the query reads one of kiln's session metrics, and none for another.
  *
  * Errors are `{error}`, with the server's codes and words. Times are Unix seconds, an experiment's Unix ms.
  *
@@ -270,7 +272,7 @@ interface Variant {
   weight: number;
   /** How many of its draws' sessions started. */
   sessions: number;
-  /** PROPOSAL (the server's next part of P7.1): what its sessions measured, the seeded variants' alone. */
+  /** What its sessions measured, the seeded variants' alone. */
   measures?: { warm_ms: Interval; peak_gib: Interval; failed_pct: Interval };
   trend?: { warm_ms: number[]; peak_gib: number[]; failed_pct: number[] };
 }
@@ -503,6 +505,21 @@ export function sessionDef(session: string): { agent: string; agentfile: string;
 
 /* ---------------------------------------- experiments' operations, as the server's (crates/kiln/src/agentdefs/experiments) */
 
+/** Whether `v` passes `bound` by `op`, as kiln's monitors decide it (kiln-obs monitor.rs `Op::passes`). */
+const passes = (op: Op, v: number, bound: number) => (op === ">" ? v > bound : op === ">=" ? v >= bound : op === "<" ? v < bound : op === "<=" ? v <= bound : op === "==" ? v === bound : v !== bound);
+/** The one of kiln's session metrics a query reads first, as its measure; none where it reads another. */
+const measureOf = (query: string) => (Object.keys(METRIC) as (keyof typeof METRIC)[]).find((m) => METRIC[m] === /([a-z_][\w.]*)\{/i.exec(query)?.[1]);
+/** Each variant's value of `c`'s query, by its id, and whether it passes `c`'s bound: none where no variant has one. */
+function valuesOf(c: Criterion, vs: Variant[]) {
+  const k = measureOf(c.query);
+  const out: Record<string, { value: number; passes: boolean }> = {};
+  for (const v of vs) {
+    const value = k ? v.measures?.[k][1] : undefined;
+    if (value !== undefined) out[v.id] = { value, passes: passes(c.op, value, c.bound) };
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 /** An experiment as its operations answer it: each variant whether it's what its definition runs now, the sessions it drew. */
 function experimentOf(e: Experiment) {
   const current = e.promoted ?? e.variants[0]?.id;
@@ -517,7 +534,10 @@ function experimentOf(e: Experiment) {
     started_at: e.started_at,
     ...(e.promoted ? { promoted: e.promoted } : {}),
     by: e.by,
-    criteria: e.criteria.map((c) => ({ ...c })),
+    criteria: e.criteria.map((c) => {
+      const values = valuesOf(c, e.variants);
+      return { ...c, ...(values ? { values } : {}) };
+    }),
     variants: e.variants.map((v) => ({
       id: v.id,
       name: v.name,

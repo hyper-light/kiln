@@ -2,8 +2,9 @@
 // 01a1cd8e862e7169a074db3d5fa33f3d P7.1), against the mock, which answers them as crates/kiln/src/agentdefs/experiments
 // does (mock/agentdefs.ts), in the Engine tab's agents' cards: each change shown as the server answered it, and the list
 // read again says the same; a second live one refused in the server's words, and resuming beside one; a host variant
-// set up with no Agentfile or size; a promotion that keeps its split's weights and makes the definition its next
-// version; a delete asked first, gone for good, with no Undo.
+// set up with no Agentfile or size; each variant's measures as 95% intervals on axes the variants share, a clear winner
+// checked, and each criterion's values as the server evaluated them (P7.2); a promotion that keeps its split's weights
+// and makes the definition its next version; a delete asked first, gone for good, with no Undo.
 import { expect as expectNow, test, type Locator, type Page } from "@playwright/test";
 
 const expect = expectNow.configure({ timeout: 15_000 });
@@ -18,7 +19,7 @@ type Listed = {
   state: string;
   version: number;
   promoted?: string;
-  criteria: { id: string; name: string }[];
+  criteria: { id: string; name: string; values?: Record<string, { value: number; passes: boolean }> }[];
   variants: { id: string; engine: string; agentfile: string | null; cpus?: number; memory?: number; weight: number; current: boolean; measures?: unknown }[];
 };
 
@@ -129,7 +130,64 @@ test("p7_1 a host variant's setup has no Agentfile or size, and it starts as the
     ["host", null, undefined, undefined, 20, false],
   ]);
   await expect(under(made).locator(".df-vname")).toHaveText(["microVM", "host"]);
-  await expect(under(made).locator(".ms-measure")).toHaveCount(0);
+  await expect(under(made).locator(".df-measure")).toHaveCount(0);
+  expect(said, said.join("\n")).toEqual([]);
+});
+
+test("p7_2 each variant's measures are 95% intervals on axes its variants share, a clear winner checked, and each criterion's values are the server's", async ({ page }) => {
+  const said = errors(page);
+  const reviewer = await defId(page, "reviewer");
+  // A criterion over a metric that isn't one of kiln's session metrics: no variant has a value of it.
+  const added = await page.request.post(`/api/agentdefs/${reviewer}/experiments/reviewer-size/criteria`, {
+    data: { name: "Queue", query: "avg(last_1d):avg:kiln.queue.depth{*} by {variant}", op: "<", bound: 5 },
+  });
+  expect(added.ok()).toBe(true);
+  const body = await engineTab(page);
+  const held = under(line(card(body, "reviewer"), "Right-size its microVM"));
+  const small = held.locator("li.df-vline", { hasText: "Small" });
+  const large = held.locator("li.df-vline", { hasText: "Large" });
+  // Each variant's sessions as drawn, and each measure's middle beside its interval: Small's peak memory clear of
+  // Large's, checked; their warm starts and failures overlap, and neither is.
+  await expect(small.locator(".df-vline-weight .df-head-v")).toHaveText("50% · 49 sessions");
+  await expect(large.locator(".df-vline-weight .df-head-v")).toHaveText("50% · 47 sessions");
+  await expect(small.locator(".df-measure-v")).toHaveText(["215ms", "2.29G ✓", "12%"]);
+  await expect(large.locator(".df-measure-v")).toHaveText(["221ms", "3.00G", "2%"]);
+  await expect(held.locator(".df-measure[data-win]")).toHaveCount(1);
+  // Each interval a bar along the axis both share, from the lowest low (Small's warm start) to the highest high (Large's).
+  const edges = async (l: Locator) => {
+    const b = await l.boundingBox();
+    if (!b) throw new Error("not drawn");
+    return { left: b.x, right: b.x + b.width };
+  };
+  const cell = (v: Locator, k: number) => v.locator(".df-measure").nth(k);
+  const [warmAxis, smallWarm, largeWarm] = [
+    await edges(cell(small, 0).locator(".df-whisk")),
+    await edges(cell(small, 0).locator(".df-whisk > b")),
+    await edges(cell(large, 0).locator(".df-whisk > b")),
+  ];
+  expect(Math.abs(smallWarm.left - warmAxis.left)).toBeLessThan(1);
+  expect(Math.abs(largeWarm.right - warmAxis.right)).toBeLessThan(1);
+  expect(smallWarm.right).toBeGreaterThan(largeWarm.left);
+  const [smallPeak, largePeak] = [await edges(cell(small, 1).locator(".df-whisk > b")), await edges(cell(large, 1).locator(".df-whisk > b"))];
+  expect(smallPeak.right).toBeLessThan(largePeak.left);
+  // Each criterion's values as kiln's monitors evaluate its query, passing or missing, the best marked; none of a
+  // metric no variant has, and no day-by-day chart of it.
+  const crit = (name: string) => held.locator(".df-crit", { has: page.locator(".df-crit-name", { hasText: new RegExp(`^${name}$`) }) });
+  await expect(crit("Warm start").locator(".df-crit-val")).toHaveText(["215ms passes · best", "221ms passes"]);
+  await expect(crit("Failed sessions").locator(".df-crit-val")).toHaveText(["12% misses", "2% passes · best"]);
+  await expect(crit("Failed sessions").locator(".df-crit-val[data-missed]")).toHaveText(["12% misses"]);
+  await expect(crit("Peak memory").locator(".df-crit-val")).toHaveText(["2.29G passes · best", "3.00G passes"]);
+  await expect(crit("Queue").locator(".df-note")).toHaveText("No values yet.");
+  await expect(crit("Queue").locator(".df-trend")).toHaveCount(0);
+  await expect(crit("Warm start").locator(".df-trend")).toHaveCount(1);
+  // As the server answered them.
+  const kept = (await listed(page, reviewer)).find((e) => e.id === "reviewer-size");
+  expect(kept?.criteria.map((c) => c.values)).toEqual([
+    { "5e1c": { value: 215, passes: true }, a37d: { value: 221, passes: true } },
+    { "5e1c": { value: 12, passes: false }, a37d: { value: 2, passes: true } },
+    { "5e1c": { value: 2.29, passes: true }, a37d: { value: 3, passes: true } },
+    undefined,
+  ]);
   expect(said, said.join("\n")).toEqual([]);
 });
 

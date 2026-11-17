@@ -1,7 +1,8 @@
 /** Variants are told apart by a swatch and a name, never a letter; their weights stay at 100 (views/harness/variants.ts). */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { rebalance, rescale, variantName, variantTone, type Deployment } from "../src/views/harness/variants";
+import type { Interval } from "../src/api/agentdefs";
+import { measureAxis, onAxis, rebalance, rescale, variantName, variantTone, winsMeasure, type Deployment } from "../src/views/harness/variants";
 
 const G = 2 ** 30;
 const v = (agentfile: string, cpus: number, memory: number, name: string | null = null): Deployment => ({ agentfile, engine: "microvm", cpus, memory: memory * G, name });
@@ -67,4 +68,31 @@ test("moving one weight moves the others in proportion, always to 100", () => {
     100,
   );
   assert.equal(six[2], 40);
+});
+
+/** A variant's measures, each [low, mid, high] (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.2); `{}` has none. */
+const measured = (warm: Interval, peak: Interval, failed: Interval) => ({ measures: { warm_ms: warm, peak_gib: peak, failed_pct: failed } });
+const small = measured([208, 215, 223], [2.24, 2.29, 2.35], [6, 12, 20]);
+const large = measured([212, 221, 229], [2.94, 3.0, 3.07], [0, 2, 8]);
+
+test("p7_2 a measure's axis runs from the lowest low to the highest high of its variants' intervals, each drawn along it", () => {
+  assert.deepEqual(measureAxis([small, large, {}], "warm_ms"), [208, 229]);
+  assert.deepEqual(measureAxis([small, large], "failed_pct"), [0, 20]);
+  assert.equal(measureAxis([{}, {}], "warm_ms"), null);
+  assert.deepEqual([onAxis(208, [208, 229]), onAxis(229, [208, 229]), onAxis(5, [0, 20])], [0, 100, 25]);
+  // An axis of one value: its middle.
+  assert.equal(onAxis(3, [3, 3]), 50);
+});
+
+test("p7_2 a variant wins a measure only where its whole interval is below every other's, and none does beside one without measures", () => {
+  // Peak memory: Small's high under Large's low. Warm starts and failures overlap: neither wins.
+  assert.deepEqual([winsMeasure([small, large], 0, "peak_gib"), winsMeasure([small, large], 1, "peak_gib")], [true, false]);
+  assert.deepEqual([winsMeasure([small, large], 0, "warm_ms"), winsMeasure([small, large], 1, "warm_ms")], [false, false]);
+  assert.deepEqual([winsMeasure([small, large], 0, "failed_pct"), winsMeasure([small, large], 1, "failed_pct")], [false, false]);
+  // Intervals that touch overlap.
+  const touching = [measured([1, 2, 3], [1, 1, 1], [0, 0, 0]), measured([3, 4, 5], [2, 2, 2], [1, 1, 1])];
+  assert.equal(winsMeasure(touching, 0, "warm_ms"), false);
+  // A variant with no measures (a host's, or one too new to bound them) leaves each measure without a winner.
+  assert.equal(winsMeasure([small, large, {}], 0, "peak_gib"), false);
+  assert.equal(winsMeasure([small, {}], 1, "peak_gib"), false);
 });
