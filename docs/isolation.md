@@ -97,8 +97,11 @@ the machine's network) is replaced by an Agentfile image's members.
   do (`proc::STDOUT_CHUNKS`, `STDERR_CHUNKS`, one bound for both): no number of its own, and the same
   backpressure on the member as on a process. The adapters are the ones host sessions use, unchanged
   but for the folder they name: Codex's requests and ACP's `session/new` and `session/load` name the
-  project as its microVM sees it (`sandbox::isolated::Seen`, 2806f93b6: a Windows machine's `C:\src\app`
-  at `/work/app`), which is the machine's own path for a Unix project and for every session on its host.
+  project as its microVM sees it (`sandbox::isolated::Seen`: a Windows machine's `C:\src\app` at
+  `/mnt/c/src/app`, its path as WSL names it, Shards' D235), which is the machine's own path for a Unix
+  project and for every session on its host. What a harness says of the folder it works in (Claude Code's
+  `init` and worktrees, Codex's thread) is the machine's folder again (`Seen::host_of`), the session's own,
+  where kiln reads its files; what it says of its files is read against its folder as it sees it.
 - **It's no process of the machine's**: its session has no pid (`Duplex::host_pid` is none), nothing
   of it is in the session's group of processes, and it is never handed across an in-place upgrade
   (it stops, and starts again in the next image, its conversation going on).
@@ -359,9 +362,11 @@ Built, each where it is:
 - **A member's run-time arguments** (Shards' D256, `MemberSpec::args`; Hex's `ImageMember::args`): its
   command line is its image's command, then the session's flags (`--resume`, `--model`).
 - **The project at its host path as the harness starts**: its folder shared at its own path as its box is
-  made (Hex's `ShardsImage::shares`), and its working directory there. Each start share is given to its harness
-  member as it starts (Shards' D277, Hex's `Mount::members`, `hexvm::mount_of`), so its harness works in its
-  project from its first instruction; one given to a member a launch doesn't drive is refused, typed.
+  made (Hex's `ShardsImage::shares`), and its working directory there; a Windows host's at its path as WSL
+  names it, `C:\X` at `/mnt/c/X` (`sandbox::isolated::guest_path`, D235's root of a Windows host's drives).
+  Each start share is given to its harness member as it starts (Shards' D277, Hex's `Mount::members`,
+  `hexvm::mount_of`), so its harness works in its project from its first instruction; one given to a
+  member a launch doesn't drive is refused, typed.
 - **A member's signals** (Shards' D238, Hex's `Runtime::signal_member`): interrupt and stop reach the member
   alone on its own lane of its run's agent-control endpoint; its kill is its box's delete.
 - **kiln's MCP from inside** (Shards' D254, Hex's `ImageMember::mcp` and `Runtime::mcp`): above.

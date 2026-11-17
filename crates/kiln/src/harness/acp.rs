@@ -2293,12 +2293,12 @@ mod tests {
 
     /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: an isolated ACP agent's session is
     /// opened, new or loaded, in its project as its microVM has it (`sandbox::isolated::guest_path`): a
-    /// Windows machine's folder at `/work/<name>`, a Unix one at its own path; an agent on its machine
-    /// opens it in the machine's.
+    /// Windows machine's folder at its path as WSL names it (`/mnt/c/…`, Shards' D235), a Unix one at its
+    /// own path; an agent on its machine opens it in the machine's.
     #[test]
     fn s17_an_isolated_acp_session_opens_in_its_guest_folder() {
         use super::super::session::{Isolation, Spec};
-        for (host, told, isolation) in [(r"C:\src\app", "/work/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
+        for (host, told, isolation) in [(r"C:\src\app", "/mnt/c/src/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
             for (resume, method) in [(None, "session/new"), (Some("s0".to_owned()), "session/load")] {
                 let spec = Spec { kind: "gemini".into(), cwd: Some(host.into()), isolation: isolation.clone(), resume, ..Spec::default() };
                 let mut core = TestCore::new();
