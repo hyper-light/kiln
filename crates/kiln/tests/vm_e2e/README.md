@@ -75,10 +75,15 @@ every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words 
 
 No wait has a time of its own (`vm_e2e::Pace`; docs/research/s35-every-harness/waits/README.md). Until a
 harness gives its first answer in a drive, and while it works on a turn the drive asked to be long, a wait
-follows its liveness and progress alone. After that, the slowest answer the harness has given in the drive
-bounds how long it may go without progress. A wait ends at once, typed and saying why, where kiln's own
-word says no answer can come. Each refusal prints the session's state, each of its messages' delivery,
-and its timeline.
+is bounded by what the run's earlier drives on the same runner answered of that kind (`vm_e2e::Learned`:
+its slowest start, its slowest steered turn); before the run's first of that kind it follows its liveness
+and progress alone. After that, the slowest answer the harness has given in the drive bounds how long it
+may go without progress. A wait ends at once, typed and saying why, where kiln's own word says no answer
+can come, or where the fixture's own server or runner ended. Each refusal prints the session's state,
+each of its messages' delivery, and its timeline. A drive refused part way ends the sessions it started.
+As it runs it says where it stands, so a run ended from outside shows it: `DRIVE:` (a harness and its
+image), `WAIT:` (each wait as it begins: the harness's step, its session, its window or none), `FAILED:`
+(`step35::rest::`, each failure as it comes) and `ENDED:` (a session a refused drive left).
 
 On a busy host kiln holds a queued message in its own queue until the machine has room (docs/headroom.md),
 and the drive's turns then wait there. The test's own runner has its headroom off; turn ROOT's runner's off

@@ -735,9 +735,20 @@ pub struct Fixture {
     _server: Option<Mutex<common::Server>>,
     _runner: Option<Mutex<Runner>>,
     pub log: Option<PathBuf>,
+    /// What its runner answered so far in this run, of the kinds a drive's own answers don't bound ([`Learned`]).
+    learned: Mutex<Learned>,
 }
 
 impl Fixture {
+    /// What its runner answered so far in this run ([`Learned`]).
+    pub fn learned(&self) -> Learned {
+        *self.learned.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn learn(&self, asked: Asked<'_>, took: Duration) {
+        self.learned.lock().unwrap_or_else(PoisonError::into_inner).answered(asked, took);
+    }
+
     pub fn get(&self, path: &str) -> anyhow::Result<Value> {
         let (code, body) = common::http(self.port, "GET", path, &self.admin, None)?;
         anyhow::ensure!(code == 200, "GET {path}: {code} {body}");
@@ -853,8 +864,10 @@ pub fn setup<T>(ended: impl Fn() -> Option<SetupStuck>, mut look: impl FnMut() -
     }
 }
 
-/// [`setup`] on fixture `f`'s parties, woken by kiln's events socket, refused with its runner's log.
+/// [`setup`] on fixture `f`'s parties, woken by kiln's events socket, refused with its runner's log. Said as it
+/// begins ([`waiting`]).
 fn setup_on<T>(f: &Fixture, what: &str, look: impl FnMut() -> anyhow::Result<Setup<T>>) -> anyhow::Result<T> {
+    waiting(what, None, None);
     let mut wake = Wake::events(f);
     setup(|| f.ended(), look, |stuck| anyhow::Error::new(SetupRefused { what: what.to_owned(), stuck, evidence: f.runner_log() }), |took| {
         wake.next(None, took);
@@ -1019,7 +1032,7 @@ pub fn up(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixtur
         let admin = std::env::var("VM_E2E_TOKEN").map_err(|_| anyhow::anyhow!("VM_E2E_SERVER needs VM_E2E_TOKEN, its admin token"))?;
         let machine = std::env::var("VM_E2E_MACHINE").map_err(|_| anyhow::anyhow!("VM_E2E_SERVER needs VM_E2E_MACHINE, its runner's machine id"))?;
         let runner_pid = std::env::var("VM_E2E_RUNNER_PID").ok().and_then(|p| p.trim().parse().ok());
-        return Ok(Fixture { port, admin, machine, dir: dir.to_path_buf(), runner_pid, _server: None, _runner: None, log: None });
+        return Ok(Fixture { port, admin, machine, dir: dir.to_path_buf(), runner_pid, _server: None, _runner: None, log: None, learned: Mutex::default() });
     }
     up_own(dir, name, env)
 }
@@ -1029,7 +1042,7 @@ pub fn up(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixtur
 pub fn up_own(dir: &Path, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Fixture> {
     let server = common::start(dir, &common::Options::default())?;
     let (runner, log) = runner(dir, server.port, name, env)?;
-    let f = Fixture { port: server.port, admin: server.admin.clone(), machine: common::machine(name), dir: dir.to_path_buf(), runner_pid: Some(runner.0.id()), _server: Some(Mutex::new(server)), _runner: Some(Mutex::new(runner)), log: Some(log) };
+    let f = Fixture { port: server.port, admin: server.admin.clone(), machine: common::machine(name), dir: dir.to_path_buf(), runner_pid: Some(runner.0.id()), _server: Some(Mutex::new(server)), _runner: Some(Mutex::new(runner)), log: Some(log), learned: Mutex::default() };
     setup_on(&f, &format!("runner {name} connecting"), || {
         let (code, body) = common::http(f.port, "GET", "/api/agents", &f.admin, None)?;
         if code != 200 {
@@ -1285,22 +1298,25 @@ impl std::fmt::Display for Stuck {
 pub enum Stall {
     /// The session can't answer it.
     Stuck(Stuck),
-    /// No progress for a whole window as long as the slowest answer its harness gave in this drive.
+    /// No progress for a whole window as long as the slowest answer that bounds it ([`Pace::window`]).
     Quiet { quiet: Duration, slowest: Duration },
     /// Its message waits in kiln's queue (its delivery `queued`, or in the queue) on an idle session for
     /// a whole window, and no cause kiln states applies to it ([`holds`]): kiln never hands it over.
     DeliveryStuck { message: String, quiet: Duration, slowest: Duration },
+    /// A process of the fixture's own ended ([`Fixture::ended`]): nothing of the session answers again.
+    Party(SetupStuck),
 }
 
 impl std::fmt::Display for Stall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stuck(s) => std::fmt::Display::fmt(s, f),
-            Self::Quiet { quiet, slowest } => write!(f, "no progress for {quiet:?}, a whole window as long as its slowest answer in this drive ({slowest:?})"),
+            Self::Quiet { quiet, slowest } => write!(f, "no progress for {quiet:?}, a whole window as long as the slowest answer that bounds it ({slowest:?}: this drive's, else this run's of its kind)"),
             Self::DeliveryStuck { message, quiet, slowest } => write!(
                 f,
-                "delivery stuck: {message} waits in kiln's queue on an idle session, and no cause kiln states applies to it (admission's own wait on it, a room wait, a pause, a freeze), for {quiet:?}, a whole window as long as its slowest answer in this drive ({slowest:?})"
+                "delivery stuck: {message} waits in kiln's queue on an idle session, and no cause kiln states applies to it (admission's own wait on it, a room wait, a pause, a freeze), for {quiet:?}, a whole window as long as the slowest answer that bounds it ({slowest:?})"
             ),
+            Self::Party(s) => std::fmt::Display::fmt(s, f),
         }
     }
 }
@@ -1323,14 +1339,50 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 /// What a drive has learned of its harness's answers: the slowest so far, each one whole wait from the
-/// drive's ask to its answer; none before its first, the drive's cold start. The one value its waits
-/// are bounded by: nothing is picked, seeded or carried over from another run.
+/// drive's ask to its answer; none before its first, the drive's cold start. Its waits are bounded by
+/// it, and where it bounds none (its cold start, a turn asked to be long) by its run's [`Learned`]:
+/// nothing is picked, seeded or carried over from another run.
 #[derive(Debug, Default)]
 pub struct Pace {
     slowest: Option<Duration>,
     /// Each session's feed ([`Wake::session`]), held from its first wait until it's ended: what kiln
     /// says of a message the drive sends between waits (admission's word on it) is heard by the next.
     feeds: std::collections::BTreeMap<String, Wake>,
+}
+
+/// What a run's drives have learned on one fixture's runner of the answers no drive's own bound: the
+/// slowest start of a session to its first turn's end ([`Asked::Opening`]) and the slowest turn asked to
+/// be long ([`Asked::Steered`]), each one whole wait from the ask to its answer. Kept per kind, as Shards
+/// keeps a VM process's boots apart from its connects (D215): a start builds an image and boots a microVM,
+/// far longer than a running harness's answer. Kept per run, from its own answers alone, so its later
+/// drives are judged where its first had nothing to go by; none of a kind before its first answer, whose
+/// wait is the run's cold start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Learned {
+    pub opening: Option<Duration>,
+    pub steered: Option<Duration>,
+}
+
+impl Learned {
+    /// An answer to `asked` that took `took`, kept where it is the slowest of its kind.
+    pub fn answered(&mut self, asked: Asked<'_>, took: Duration) {
+        let kept = match asked {
+            Asked::Opening => &mut self.opening,
+            Asked::Steered(_) => &mut self.steered,
+            Asked::Message(_) | Asked::Stop { .. } | Asked::Kiln => return,
+        };
+        *kept = Some(kept.map_or(took, |s| s.max(took)));
+    }
+}
+
+/// Said as a wait begins: what it waits on (its harness and step), its session, and what bounds it, so a
+/// run ended from outside (its bound, a kill) shows where each drive stood.
+fn waiting(what: &str, id: Option<&str>, window: Option<Duration>) {
+    let on = id.map(|id| format!(" (session {id})")).unwrap_or_default();
+    match window {
+        Some(w) => eprintln!("WAIT: {what}{on}: refused after {w:?} without progress"),
+        None => eprintln!("WAIT: {what}{on}: no window, its parties' liveness and kiln's word alone"),
+    }
 }
 
 /// What a look at a session tells its wait.
@@ -1679,17 +1731,28 @@ fn refused(f: &Fixture, id: &str, what: &str, stall: Stall, info: &Value, events
     anyhow::Error::new(Refused { what: what.to_owned(), stall, evidence })
 }
 
+/// A wait refused because a process of the fixture's own ended (`stuck`): which, how, and its runner's log.
+fn party_ended(f: &Fixture, what: &str, stuck: SetupStuck) -> anyhow::Error {
+    anyhow::Error::new(Refused { what: what.to_owned(), stall: Stall::Party(stuck), evidence: format!("its runner's log, its last lines:\n{}", f.runner_log()) })
+}
+
 impl Pace {
     /// The slowest answer so far.
     pub fn slowest(&self) -> Option<Duration> {
         self.slowest
     }
 
-    /// The longest a wait on `asked` may go without progress: none before the drive's first answer,
-    /// nor for a turn the drive asked to be long ([`Asked::Steered`]), which follow the harness's
-    /// liveness and progress alone.
-    pub fn window(&self, asked: Asked<'_>) -> Option<Duration> {
-        if matches!(asked, Asked::Steered(_)) { None } else { self.slowest }
+    /// The longest a wait on `asked` may go without progress: the drive's slowest answer. Where that bounds
+    /// none, its run's slowest of the kind (`run`): the drive's cold start by the run's slowest start, and a
+    /// turn asked to be long ([`Asked::Steered`]), which no shorter kind of answer bounds, by the run's slowest
+    /// such turn. None before the run's first answer of that kind: that wait follows its harness's liveness
+    /// and kiln's word alone.
+    pub fn window(&self, asked: Asked<'_>, run: &Learned) -> Option<Duration> {
+        match asked {
+            Asked::Steered(_) => run.steered,
+            Asked::Opening => self.slowest.or(run.opening),
+            Asked::Message(_) | Asked::Stop { .. } | Asked::Kiln => self.slowest,
+        }
     }
 
     /// An answer that took `took`.
@@ -1698,16 +1761,23 @@ impl Pace {
     }
 
     /// Waits on session `id` until `done` holds of kiln's word on it and its timeline, following its
-    /// harness ([`Watch`]): the time its answer took is learned; refused, typed ([`Refused`]), where
-    /// kiln's word says no answer can come, or once a whole window passes without progress where the
-    /// drive has learned one ([`Pace::window`]). It wakes on the session's feed, whose frames it hears
-    /// ([`Watch::heard`]), kept for the session's next wait.
+    /// harness ([`Watch`]): the time its answer took is learned, by the drive and by its run
+    /// ([`Learned`]); refused, typed ([`Refused`]), where a process of the fixture's own ended, where
+    /// kiln's word says no answer can come, or once a whole window passes without progress where one
+    /// was learned ([`Pace::window`]). It wakes on the session's feed, whose frames it hears
+    /// ([`Watch::heard`]), kept for the session's next wait; kiln's word on a session moves when its
+    /// runner goes (`Disconnected`), so a wait with no window still looks again then.
     pub fn until(&mut self, f: &Fixture, id: &str, asked: Asked<'_>, what: &str, done: impl Fn(&Value, &[Value]) -> bool) -> anyhow::Result<(Value, Vec<Value>)> {
         let began = Instant::now();
-        let mut watch = Watch::new(asked, self.window(asked));
+        let window = self.window(asked, &f.learned());
+        waiting(what, Some(id), window);
+        let mut watch = Watch::new(asked, window);
         let mut wake = self.feeds.remove(id).unwrap_or_else(|| Wake::session(f, id));
         let mut said_held = String::new();
         loop {
+            if let Some(stuck) = f.ended() {
+                return Err(party_ended(f, what, stuck));
+            }
             let looked = Instant::now();
             let (i, e) = (info(f, id)?, events(f, id)?);
             let held = done(&i, &e);
@@ -1725,7 +1795,9 @@ impl Pace {
             }
             match verdict {
                 Verdict::Done => {
-                    self.answered(began.elapsed());
+                    let took = began.elapsed();
+                    self.answered(took);
+                    f.learn(asked, took);
                     self.feeds.insert(id.to_owned(), wake);
                     return Ok((i, e));
                 }
@@ -1746,9 +1818,14 @@ impl Pace {
     /// word on it moving while it's listed, woken by kiln's events socket, which says each session's end.
     pub fn unlisted(&mut self, f: &Fixture, id: &str, what: &str) -> anyhow::Result<()> {
         let began = Instant::now();
-        let mut watch = Watch::new(Asked::Kiln, self.window(Asked::Kiln));
+        let window = self.window(Asked::Kiln, &f.learned());
+        waiting(what, Some(id), window);
+        let mut watch = Watch::new(Asked::Kiln, window);
         let mut wake = Wake::events(f);
         loop {
+            if let Some(stuck) = f.ended() {
+                return Err(party_ended(f, what, stuck));
+            }
             let looked = Instant::now();
             let (code, body) = common::http(f.port, "GET", &format!("/api/harness/sessions/{id}"), &f.admin, None)?;
             if code == 404 {
@@ -1900,11 +1977,14 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let nonce = nonce();
     let mut inventory = Inventory::new(programs);
     let look = |inv: &mut Inventory| if roots.is_empty() { Ok(()) } else { inv.look(roots) };
-    // Each wait follows the harness, bounded by its slowest answer in this drive once it gave one.
+    // Each wait follows the harness, bounded by its slowest answer in this drive once it gave one, before
+    // that by its run's ([`Pace::window`]).
     let mut pace = Pace::default();
+    let mut ends = Ends { f, ids: Vec::new() };
 
     // Start: its first turn runs to its end.
     let id = open(f, &ask.spec(&ask.prompt, None))?;
+    ends.ids.push(id.clone());
     let (first_info, events) = pace.until(f, &id, Asked::Opening, &format!("{kind}'s first turn"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
     let first = said(&events);
@@ -1960,7 +2040,9 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
         let found = child_of().ok_or_else(|| anyhow::anyhow!("{kind} started no agent from where it runs; it said {first:?}"))?;
         audit = f.get(&format!("/api/audit?q={}&limit=1000", id.get(..8).unwrap_or(&id)))?.as_array().cloned().unwrap_or_default();
         if let Some(c) = found.get("id").and_then(Value::as_str) {
+            ends.ids.push(c.to_owned());
             pace.stop(f, c)?;
+            ends.ended(c);
         }
         child = Some(found);
     }
@@ -1969,16 +2051,46 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let last = info(f, &id)?;
     let hs = last.get("harness_session").and_then(Value::as_str).map(str::to_owned);
     pace.stop(f, &id)?;
+    ends.ended(&id);
 
     // Resume: a new session takes its conversation up again, its harness's own session.
     let hs = hs.ok_or_else(|| anyhow::anyhow!("{kind}: kiln knows no harness session of {id} to take up again"))?;
     let resumed = open(f, &ask.spec(&ask.resumed, Some(&hs)))?;
+    ends.ids.push(resumed.clone());
     let (resumed_info, _) = pace.until(f, &resumed, Asked::Opening, &format!("{kind} taking its conversation up again"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
     let took_up = resumed_info.get("harness_session").unwrap_or(&Value::Null);
     anyhow::ensure!(took_up.as_str() == Some(hs.as_str()), "{kind}: the resumed session's harness session is {took_up}, not {hs}");
     pace.stop(f, &resumed)?;
+    ends.ended(&resumed);
     Ok(Drove { id, info: first_info, first, events, links, child, audit, last, resumed, resumed_info, inventory })
+}
+
+/// The sessions a drive started and hasn't ended, each ended (the API's DELETE, as [`Pace::stop`] asks it) as
+/// it drops: a drive refused part way leaves none of its sessions, nor the microVM each holds, running into the
+/// next drive on its runner.
+struct Ends<'f> {
+    f: &'f Fixture,
+    ids: Vec<String>,
+}
+
+impl Ends<'_> {
+    fn ended(&mut self, id: &str) {
+        self.ids.retain(|i| i != id);
+    }
+}
+
+impl Drop for Ends<'_> {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            // Longer than the server waits for its runner's answer (`hub::COMMAND_WITHIN`).
+            match common::http_within(self.f.port, "DELETE", &format!("/api/harness/agents/{id}"), &self.f.admin, None, Duration::from_secs(75)) {
+                Ok((200, _)) => eprintln!("ENDED: {id}, which its drive left running as it was refused"),
+                Ok((code, body)) => eprintln!("ENDED: {id} not: {code} {body}"),
+                Err(e) => eprintln!("ENDED: {id} not: {e:#}"),
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2185,6 +2297,7 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
     }
     let (_kept, image) = boots(f, kind, image)?;
     let image = image.as_str();
+    eprintln!("DRIVE: {kind} from {image} in a microVM on {}", f.machine);
     let to_kiln = grants_to_kiln(&agentfile_of(f, image)?, &kiln_ports(f)).map_err(|e| anyhow::anyhow!("{image}: {e}"))?;
     anyhow::ensure!(to_kiln.is_empty(), "{kind} from {image}: its image grants a way to kiln past the agent-control link's {}<member> lane (Shards D254): {to_kiln:?}", MCP_LANE.1);
     let marker = std::env::var("VM_E2E_DONE_MARKER").unwrap_or_else(|_| STUB_DONE.to_owned());
