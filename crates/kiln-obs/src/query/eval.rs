@@ -389,10 +389,30 @@ impl<'a> From<&'a crate::lock::RwLock<Store>> for Source<'a> {
     }
 }
 
+/// How a monitor's window reads its query (`crate::monitor`), as Datadog's evaluation paths do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Path {
+    /// Bucket by bucket on the request's grid: a graph's reading, and a monitor's classic path.
+    Buckets,
+    /// Each metric or records query's buckets summed, then the formula on the sums, one bucket of
+    /// all of the grid: Datadog's `.as_count()` path ("Aggregation function applied before
+    /// division", its guide "as_count() in Monitor Evaluations").
+    Summed,
+    /// The range one bucket, from its start to its end exactly: a distribution's percentile of
+    /// every value in it (Datadog's `percentile(pXX)` time aggregation, "only available for the
+    /// distribution metric type").
+    Whole,
+}
+
 impl Source<'_> {
     /// `req`'s answer ([`eval`]'s, or [`eval_shared`]'s).
     pub fn ask(self, req: &Request<'_>) -> Result<Answer, QueryError> {
         self.with(|lease| eval_with(lease, req))
+    }
+
+    /// `req`'s answer read on `path` (a monitor's window).
+    pub(crate) fn ask_path(self, req: &Request<'_>, path: Path) -> Result<Answer, QueryError> {
+        self.with(|lease| eval_path(lease, req, path))
     }
 
     /// `f` with a lease of the store: held throughout, or shared, `f` asked again as a query is
@@ -429,11 +449,20 @@ pub(crate) fn shared<T>(store: &crate::lock::RwLock<Store>, f: impl Fn(&Lease<'_
 }
 
 fn eval_with(lease: &Lease<'_>, req: &Request<'_>) -> Result<Answer, QueryError> {
+    eval_path(lease, req, Path::Buckets)
+}
+
+fn eval_path(lease: &Lease<'_>, req: &Request<'_>, path: Path) -> Result<Answer, QueryError> {
     let ast = parse(req.query)?;
     if req.to <= req.from {
         return Err(QueryError::EmptyRange);
     }
-    let grid = grid_for(&ast, req)?;
+    let grid = match path {
+        Path::Whole => Grid::uniform(req.from, req.to - req.from, 1),
+        Path::Buckets | Path::Summed => grid_for(&ast, req)?,
+    };
+    // A sum's formula reads one bucket of all of the grid.
+    let whole = Grid::uniform(grid.from, grid.time(grid.n).saturating_sub(grid.from).max(1), 1);
     let shifts = shifts(&ast)?;
     let ext = extensions(&ast, grid, req.now);
     // A node's grid: the answer's, begun `ext` buckets earlier beneath `anomalies()`.
@@ -448,17 +477,26 @@ fn eval_with(lease: &Lease<'_>, req: &Request<'_>) -> Result<Answer, QueryError>
             Node::Str(s) => Value::Str(s.clone()),
             Node::Named(k, v) => Value::Named(k.clone(), v.clone()),
             Node::Metric(q) => {
+                if path == Path::Whole && distribution_of(&*lease.hold()?, q).is_none() {
+                    let (NameMatch::Exact(name) | NameMatch::Glob(name)) = &q.metric;
+                    return Err(QueryError::Invalid(format!("percentile(…) reads a distribution's values over the window: {name} is none")));
+                }
                 let g = at(ext.get(id).copied().unwrap_or(0));
                 let edges = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
-                Value::Set(metric(lease, q, g, Spans::new(g, edges.0, edges.1.as_deref()), req.max_series, &mut scratch, &mut scanned)?)
+                let set = metric(lease, q, g, Spans::new(g, edges.0, edges.1.as_deref()), req.max_series, &mut scratch, &mut scanned)?;
+                Value::Set(if path == Path::Summed { summed(set) } else { set })
             }
             Node::Records(r) => {
+                if path == Path::Whole {
+                    return Err(QueryError::Invalid("percentile(…) reads a distribution's values over the window: a log, span or event query has none".into()));
+                }
                 let g = at(ext.get(id).copied().unwrap_or(0));
                 let (off, edges) = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
                 if edges.is_some() {
                     return Err(QueryError::Invalid("a log, span or event query is read in even buckets: no calendar rollup or calendar shift of one".into()));
                 }
-                Value::Set(records(lease, r, g, off, req.max_series, &mut scanned)?)
+                let set = records(lease, r, g, off, req.max_series, &mut scanned)?;
+                Value::Set(if path == Path::Summed { summed(set) } else { set })
             }
             Node::Neg(x) => match take(&mut values, *x)? {
                 Value::Scalar(a) => Value::Scalar(-a),
@@ -482,9 +520,14 @@ fn eval_with(lease: &Lease<'_>, req: &Request<'_>) -> Result<Answer, QueryError>
                     taken.push(take(&mut values, a)?);
                 }
                 let own = ext.get(id).copied().unwrap_or(0);
+                if path != Path::Buckets && matches!(f, Func::Anomalies | Func::Forecast | Func::Outliers) {
+                    return Err(QueryError::Invalid("anomalies(), forecast() and outliers() read their query bucket by bucket: not under a monitor's sum of .as_count() queries, nor its percentile".into()));
+                }
                 if *f == Func::Anomalies {
                     let inner = args.first().and_then(|&a| ext.get(a)).copied().unwrap_or(own);
-                    anomalies(taken, inner.saturating_sub(own), at(own))?
+                    // Datadog's `count_default_zero` speaks of counts: a query read `.as_count()`.
+                    let counts = args.first().and_then(|&a| ast.nodes.get(a)).is_some_and(|n| matches!(n, Node::Metric(m) if m.mode == Some(CountMode::Count)));
+                    anomalies(taken, inner.saturating_sub(own), at(own), counts)?
                 } else if *f == Func::Forecast {
                     forecast(taken, at(own))?
                 } else if *f == Func::Pow {
@@ -495,9 +538,9 @@ fn eval_with(lease: &Lease<'_>, req: &Request<'_>) -> Result<Answer, QueryError>
                     extreme(*f == Func::Max, taken)?
                 } else {
                     if taken.iter().any(|v| matches!(v, Value::Named(..))) {
-                        return Err(QueryError::Invalid(format!("{f:?} takes no named arguments (forecast() does)")));
+                        return Err(QueryError::Invalid(format!("{f:?} takes no named arguments (forecast() and anomalies() do)")));
                     }
-                    call(*f, taken, at(own))?
+                    call(*f, taken, if path == Path::Summed { whole } else { at(own) })?
                 }
             }
         };
@@ -514,7 +557,19 @@ fn eval_with(lease: &Lease<'_>, req: &Request<'_>) -> Result<Answer, QueryError>
     if series.len() > req.max_series {
         return Err(QueryError::TooManySeries(series.len(), req.max_series));
     }
-    Ok(Answer { grid, series, scalar, scanned_series: scanned.0, scanned_samples: scanned.1 })
+    Ok(Answer { grid: if path == Path::Summed { whole } else { grid }, series, scalar, scanned_series: scanned.0, scanned_samples: scanned.1 })
+}
+
+/// Each series' buckets summed into one: a query's time aggregation before its formula, on
+/// Datadog's `.as_count()` path; none where it has no value.
+fn summed(set: Vec<Series>) -> Vec<Series> {
+    set.into_iter()
+        .map(|mut s| {
+            let total = s.values.iter().copied().filter(|v| v.is_finite()).fold(None, |a: Option<f64>, v| Some(a.unwrap_or(0.0) + v));
+            s.values = vec![total.unwrap_or(f64::NAN)];
+            s
+        })
+        .collect()
 }
 
 /// The grid: the step asked, or the smallest nice step that fits the range in the points asked,
@@ -724,9 +779,17 @@ fn extensions(ast: &Ast, grid: Grid, now: Option<i64>) -> Vec<usize> {
 /// `anomalies(query, algorithm, bounds, direction)`: each series' last `grid.n` buckets, and its band
 /// of `bounds` deviations (2 unless said) about what the algorithm (`basic` unless said) expected of
 /// each before it saw it, learned from the `history` buckets before them; anomalous past the band on
-/// the side asked (`both` unless said).
-fn anomalies(mut args: Vec<Value>, history: usize, grid: Grid) -> Result<Value, QueryError> {
-    let usage = || QueryError::Invalid("anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below')".into());
+/// the side asked (`both` unless said). Datadog's anomaly monitors' named arguments after them:
+/// `direction=`; `count_default_zero='true'`, a bucket without a value a zero where the query reads
+/// counts (`counts`: `.as_count()`); `alert_window=` and `interval=`, which the monitor reads
+/// (`crate::monitor`; `interval` the grid's step, `grid_for`); `seasonality=` of `agile` and
+/// `robust` (kiln learns the season itself, `crate::anomaly`) and `timezone='UTC'`, checked.
+fn anomalies(mut args: Vec<Value>, history: usize, grid: Grid, counts: bool) -> Result<Value, QueryError> {
+    let usage = || {
+        QueryError::Invalid(
+            "anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below', direction='above', alert_window='last_5m', interval=seconds, count_default_zero='true'|'false', seasonality='hourly'|'daily'|'weekly', timezone='UTC')".into(),
+        )
+    };
     if args.is_empty() {
         return Err(usage());
     }
@@ -734,23 +797,60 @@ fn anomalies(mut args: Vec<Value>, history: usize, grid: Grid) -> Result<Value, 
         Value::Set(s) => s,
         _ => return Err(usage()),
     };
-    let algorithm = match args.first() {
+    let at = args.iter().position(|v| matches!(v, Value::Named(..))).unwrap_or(args.len());
+    let (positional, named) = args.split_at(at);
+    let algorithm = match positional.first() {
         Some(Value::Str(s)) => Algorithm::parse(s).ok_or_else(usage)?,
         None => Algorithm::Basic,
         _ => return Err(usage()),
     };
-    let k = match args.get(1) {
+    let k = match positional.get(1) {
         Some(Value::Scalar(x)) if *x > 0.0 && x.is_finite() => *x,
         None => 2.0,
         _ => return Err(usage()),
     };
-    let direction = match args.get(2) {
+    let mut direction = match positional.get(2) {
         Some(Value::Str(s)) => Direction::parse(s).ok_or_else(usage)?,
         None => Direction::Both,
         _ => return Err(usage()),
     };
+    if positional.len() > 3 {
+        return Err(usage());
+    }
+    let mut zero = false;
+    for v in named {
+        let Value::Named(key, val) = v else { return Err(usage()) };
+        match key.as_str() {
+            "direction" => direction = Direction::parse(val).ok_or_else(usage)?,
+            "alert_window" => {
+                if duration_ms(val.trim().trim_start_matches("last_")).is_none() {
+                    return Err(usage());
+                }
+            }
+            "interval" => {
+                if !val.parse::<f64>().is_ok_and(|s| s.is_finite() && s >= 1.0) {
+                    return Err(usage());
+                }
+            }
+            "count_default_zero" => {
+                zero = match val.to_ascii_lowercase().as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(usage()),
+                }
+            }
+            // Datadog's: "Exclude this parameter when using the basic algorithm."
+            "seasonality" if algorithm != Algorithm::Basic && matches!(val.to_ascii_lowercase().as_str(), "hourly" | "daily" | "weekly") => {}
+            // kiln's seasons are UTC's.
+            "timezone" if val.eq_ignore_ascii_case("utc") => {}
+            _ => return Err(usage()),
+        }
+    }
     let mut out = Vec::with_capacity(set.len());
-    for s in set {
+    for mut s in set {
+        if zero && counts {
+            s.values.iter_mut().filter(|v| v.is_nan()).for_each(|v| *v = 0.0);
+        }
         let split = history.min(s.values.len());
         let (past, now) = s.values.split_at(split);
         // Learned from the finite points of the history, gaps left out; their spacing their mean gap
@@ -4998,6 +5098,75 @@ mod tests {
             text.clear();
             write(&f, 0, &mut rng, &mut text);
             assert_eq!(selected(&text), held(&|t| holds(&f, t)), "{text}");
+        }
+    }
+
+    /// A monitor's window paths (`Path`): `Summed` sums each query's buckets before its formula,
+    /// one bucket of the whole grid (a function then reads that bucket); `Whole` reads the range
+    /// as one bucket, of a distribution alone; neither takes a function that reads its query bucket
+    /// by bucket. And Datadog's querying page's `maximum()` and `minimum()`.
+    #[test]
+    fn monitor_paths_sum_before_the_formula_and_read_the_window_whole() {
+        let s = store();
+        let ask = |q: &str, path: Path| {
+            let mut r = Request::new(q, 0, 600_000);
+            r.step = Some(60_000);
+            eval_path(&Lease::Held(&s), &r, path)
+        };
+        // Errors: one each 10 s a host, 60 a host over the ten minutes.
+        let a = ask("sum:errors{host:a}.as_count() / sum:errors{*}.as_count()", Path::Summed).unwrap();
+        assert_eq!(a.grid, Grid::uniform(0, 600_000, 1));
+        assert!((a.series[0].values[0] - 1.0 / 3.0).abs() < 1e-12, "{a:?}");
+        assert_eq!(ask("sum:errors{host:a}.as_count()", Path::Summed).unwrap().series[0].values, vec![60.0]);
+        assert_eq!(ask("per_second(sum:errors{host:a}.as_count())", Path::Summed).unwrap().series[0].values, vec![0.1]);
+        assert_eq!(ask("sum:errors{host:a}.as_count()", Path::Buckets).unwrap().series[0].values.len(), 10);
+        assert!(ask("p50:cpu{*}", Path::Whole).is_err());
+        assert!(ask("anomalies(sum:errors{*}.as_count(), 'basic', 2)", Path::Summed).is_err());
+        assert!(ask("outliers(avg:cpu{*} by {host}, 'dbscan', 1)", Path::Summed).is_err());
+        assert_eq!(q(&s, "maximum(avg:cpu{host:a}, avg:cpu{host:b})").series[0].values[0], 20.0);
+        assert_eq!(q(&s, "minimum(100, 3 * avg:cpu{host:c})").scalar, None);
+        assert_eq!(q(&s, "minimum(100, 3 * avg:cpu{host:c})").series[0].values[0], 100.0);
+    }
+
+    /// `anomalies()` takes Datadog's anomaly monitors' named arguments after its own: a count read
+    /// `.as_count()` with `count_default_zero='true'` has a zero where a bucket has no value (a
+    /// gauge, or `'false'`, none); a seasonality of `agile` or `robust` alone; the rest checked.
+    #[test]
+    fn anomalies_take_datadog_s_named_arguments() {
+        let mut s = Store::new(Keyed::with_keys(3, 4));
+        let mut b = Builder::new();
+        // A point every other minute: the odd minutes without one.
+        for (name, kind) in [("c", Kind::Count), ("g", Kind::Gauge)] {
+            let k = SeriesKey::new(name, [("host", "a")], kind).unwrap();
+            b.define(&k);
+            b.run(k.fp, (0..5).map(|i| (i * 120_000, 1.0)));
+        }
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str| {
+            let mut r = Request::new(q, 0, 600_000);
+            r.step = Some(60_000);
+            eval(&s, &r)
+        };
+        let values = |q: &str| ask(q).unwrap_or_else(|e| panic!("{q}: {e}")).series[0].values.clone();
+        assert_eq!(values("anomalies(sum:c{*}.as_count(), 'basic', 2, direction='above', count_default_zero='true')"), vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+        assert!(values("anomalies(sum:c{*}.as_count(), 'basic', 2, count_default_zero='false')").iter().skip(1).step_by(2).all(|v| v.is_nan()));
+        assert!(values("anomalies(avg:g{*}, 'basic', 2, count_default_zero='true')").iter().skip(1).step_by(2).all(|v| v.is_nan()));
+        let a = ask("anomalies(avg:g{*}, 'agile', 3, direction='below', alert_window='last_5m', interval=60, seasonality='weekly', timezone='UTC')").unwrap();
+        let bounds = a.series[0].bounds.as_ref().unwrap();
+        assert_eq!((bounds.direction, bounds.k, bounds.algorithm), (Direction::Below, 3.0, "agile"));
+        for bad in [
+            "anomalies(avg:g{*}, 'basic', 2, seasonality='weekly')",
+            "anomalies(avg:g{*}, 'agile', 2, seasonality='monthly')",
+            "anomalies(avg:g{*}, 'basic', 2, alert_window='soon')",
+            "anomalies(avg:g{*}, 'basic', 2, interval=0)",
+            "anomalies(avg:g{*}, 'basic', 2, timezone='America/New_York')",
+            "anomalies(avg:g{*}, 'basic', 2, direction='sideways')",
+            "anomalies(avg:g{*}, 'basic', 2, count_default_zero='maybe')",
+            "anomalies(avg:g{*}, 'basic', 2, nope='x')",
+            "anomalies(avg:g{*}, direction='above', 'basic')",
+            "abs(avg:g{*}, direction='above')",
+        ] {
+            assert!(ask(bad).is_err(), "{bad}");
         }
     }
 }
