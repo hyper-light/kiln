@@ -335,11 +335,12 @@ for (const anchored of [true, false]) {
       const typical = middle((await boxes(page)).map((r) => r.height));
       expect(tall, "the tree is no taller than two rows").toBeGreaterThan(2 * typical);
       // A window half as tall as the tree: taken for a row, then measured as tall as it is, the tree moves what's under it by more than the window shows.
-      // And half as tall as the page under the tree at most, for a window's worth of it past the tree to scroll to (a tree of whole sandboxes is taller
-      // than all the rows under it); in the page's own pixels (a phone may draw the page smaller than its screen, to fit its width).
+      // And a third as tall as the page under the tree at most: scrolling the tree's bottom more than a window over the viewport takes more than two
+      // windows of page under it, and a third leaves room for that past the pixel (a tree of whole sandboxes is taller than all the rows under it); in
+      // the page's own pixels (a phone may draw the page smaller than its screen, to fit its width).
       const under = await tree.evaluate((t) => document.documentElement.scrollHeight - (t.getBoundingClientRect().bottom + scrollY) - 1);
       const scale = (await page.evaluate(() => innerHeight)) / full.height;
-      const size = { width: full.width, height: Math.floor(Math.min(tall, under / scale) / 2) };
+      const size = { width: full.width, height: Math.floor(Math.min(tall / 2, under / scale / 3)) };
       await page.setViewportSize(size);
       await toLead();
       await expect(tree).toHaveCount(1);
