@@ -152,10 +152,10 @@ pub struct Variant {
     /// It's its definition as it runs now: its experiment's first variant, until one is promoted, then that one.
     pub current: bool,
     /// What its sessions measure, each `[low, mid, high]`: the median of its warm starts (ms) and of its microVMs'
-    /// peak memory (GiB), and the percent of its sessions that failed, each within its 95% interval; none until its
-    /// sessions bound all three.
+    /// peak memory (GiB), and the percent of its sessions that failed, each within its 95% interval once its
+    /// sessions bound it; none until they bound one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional, type = "{ warm_ms: [number, number, number], peak_gib: [number, number, number], failed_pct: [number, number, number] }"))]
+    #[cfg_attr(test, ts(optional, type = "{ warm_ms?: [number, number, number], peak_gib?: [number, number, number], failed_pct?: [number, number, number] }"))]
     pub measures: Option<measures::Measures>,
     /// Each measure as it stood at the end of each day (UTC), oldest first, today's last; a measure none of its
     /// sessions has yet is left out.
