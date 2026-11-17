@@ -443,6 +443,13 @@ impl Infra {
         }
     }
 
+    /// The inventory last made, as it was made, for what reads hosts synchronously (a monitor's
+    /// message: `super::monitors`); none before one is made, or after a mute changed it
+    /// ([`Infra::forget`]) until one is made again. It makes none.
+    pub fn last(&self) -> Option<Arc<Inventory>> {
+        lock(&self.made).clone()
+    }
+
     /// An inventory made now, and kept (unless what was made was forgotten meanwhile): on the
     /// blocking pool, the shards' tasks never waiting on it.
     async fn make(self: &Arc<Self>, now: i64) -> Result<Arc<Inventory>, super::api::Fail> {

@@ -832,9 +832,10 @@ fn latest_records(store: &Shared, m: &Monitor, q: &monitor::Query, group: &[(Str
 /// `{{log.tags.<key>}}`: kiln keeps a record's tags as attributes), and the reserved attributes its
 /// page lists for the kind: a log's `message`, `service`, `status`, `source`, `host`, `span_id`,
 /// `trace_id`, `timestamp`; a span's `env`, `operation_name`, `resource_name` (its name), `service`,
-/// `status` (`ok`, `error`), `type`, ids and `timestamp`; an event's `title`, `text`, `host.name`,
-/// `attributes` (an object, as the API writes one), `tags` (`key:value`, by commas) and `timestamp`;
-/// each with its `link`. Ids are hex, as kiln's API writes them; times as `{{last_triggered_at}}` is.
+/// `status` (`ok`, `error`), `type`, ids and `timestamp`; an event's `id` (`super::api::event_id`),
+/// `title`, `text`, `host.name`, `attributes` (an object, as the API writes one), `tags`
+/// (`key:value`, by commas) and `timestamp`; each with its `link`. A log's and a span's ids are hex,
+/// as kiln's API writes them; times as `{{last_triggered_at}}` is.
 fn record_vars(prefix: &str, r: &kiln_obs::logs::record::Record, link: &str) -> Vec<(String, String)> {
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let attr = |k: &str| r.attrs.iter().rev().find(|(a, _)| a == k).map(|(_, v)| v.clone());
@@ -863,6 +864,7 @@ fn record_vars(prefix: &str, r: &kiln_obs::logs::record::Record, link: &str) -> 
         "event" => {
             let title = attr("title").unwrap_or_else(|| r.message.lines().next().unwrap_or_default().to_owned());
             let text = r.message.strip_prefix(title.as_str()).map_or(r.message.as_str(), |t| t.trim_start_matches('\n'));
+            put("id", super::api::event_id(r).to_string());
             put("text", text.to_owned());
             put("title", title);
             put("host.name", r.host.clone());
@@ -877,6 +879,98 @@ fn record_vars(prefix: &str, r: &kiln_obs::logs::record::Record, link: &str) -> 
             put("host", r.host.clone());
         }
     }
+    out
+}
+
+/// Whether a message reads a host's own variables (`{{host.ip}}`, `{{host.metadata_…}}`, its tags'
+/// `{{host.<key>.name}}`), beyond its group's `{{host.name}}`: `host.` not within a longer name
+/// (`{{event.host.name}}` is an event's).
+fn reads_host(texts: &str) -> bool {
+    texts.match_indices("host.").any(|(i, _)| {
+        let part = |c: char| c.is_alphanumeric() || matches!(c, '_' | '.' | '@' | '[' | ']' | '-');
+        let before = texts.get(..i).and_then(|b| b.chars().next_back());
+        let rest: String = texts.get(i + "host.".len()..).unwrap_or_default().chars().take_while(|c| part(*c)).collect();
+        !before.is_some_and(part) && rest != "name"
+    })
+}
+
+/// A group's variables of its host and its service (Datadog's "Customize the notification based on
+/// the group"), where `texts` reads them: grouped by `host`, the host as the infrastructure's last
+/// inventory has it ([`super::infra::Infra::last`]: a monitor's evaluation, on the blocking pool,
+/// reads it as it is, and `Monitors::run` asks for one where a message reads a host's own
+/// variables) ([`host_vars`]); grouped by `service`, its Service Catalog definition
+/// ([`service_vars`]). Also the prefixes read (`host`, `service`), so what the host or the service
+/// lacks says nothing.
+fn group_vars(group: &[(String, String)], texts: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let (mut out, mut read) = (Vec::new(), Vec::new());
+    let value = |k: &str| group.iter().find(|(g, _)| g == k).map(|(_, v)| v.as_str());
+    if let Some(name) = value("host")
+        && reads_host(texts)
+    {
+        read.push("host".to_owned());
+        if let Some(inventory) = super::infra::get().and_then(|i| i.last())
+            && let Some(h) = inventory.host(name)
+        {
+            out.extend(host_vars(h));
+        }
+    }
+    if let Some(service) = value("service")
+        && texts.contains("service.")
+    {
+        read.push("service".to_owned());
+        if let Some(k) = super::catalog::get().and_then(|c| c.definition(service)) {
+            out.extend(service_vars(&k.definition));
+        }
+    }
+    (out, read)
+}
+
+/// A host's variables, Datadog's for a monitor grouped by `host`: `{{host.ip}}` (the Agent's
+/// inventory's `ip_address`, else its resource's `host.ip`); `{{host.metadata_agent_version}}`,
+/// `_machine`, `_platform` and `_processor` (the Agent's host metadata, Datadog's own `meta` fields,
+/// else what kiln knows of its platform); and each of its tags, of every source
+/// (`{{host.role.name}}`, Datadog's `is_match` example's), several values sorted, by commas.
+fn host_vars(h: &super::infra::Host) -> Vec<(String, String)> {
+    let p = h.platform();
+    let agent = h.agent.as_deref();
+    let meta = |k: &str| agent.and_then(|a| a.meta.get(k)).and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+    let ip = agent.and_then(|a| a.field("ip_address")).or_else(|| h.tags.iter().find(|(k, _)| k == "host.ip").map(|(_, v)| v.clone()));
+    let mut out = vec![
+        ("host.ip".to_owned(), ip.unwrap_or_default()),
+        ("host.metadata_agent_version".to_owned(), p.agent_version.unwrap_or_default()),
+        ("host.metadata_machine".to_owned(), meta("machine").or(p.arch).unwrap_or_default()),
+        ("host.metadata_platform".to_owned(), meta("platform").or(p.os).unwrap_or_default()),
+        ("host.metadata_processor".to_owned(), meta("processor").or(p.cpu_model).unwrap_or_default()),
+    ];
+    let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for t in h.tags_by_source().into_values().flatten() {
+        let (k, v) = t.split_once(':').unwrap_or((t.as_str(), ""));
+        if !k.is_empty() {
+            tags.entry(k.to_owned()).or_default().push(v.to_owned());
+        }
+    }
+    for (k, mut values) in tags {
+        values.sort_unstable();
+        values.dedup();
+        out.push((format!("host.{k}.name"), values.join(",")));
+    }
+    out
+}
+
+/// A service's variables, Datadog's for a monitor grouped by `service`, from its Service Catalog
+/// definition (§10.8): `{{service.team}}`; `{{service.links}}`, each link `name: url`, by commas,
+/// and `{{service.docs}}`, those of type `doc` (its schema's docs since v2.1); and one by its name,
+/// `{{service.links[Runbook]}}`, `{{service.docs[API]}}`: its URL.
+fn service_vars(d: &super::catalog::definition::Definition) -> Vec<(String, String)> {
+    let said = |l: &super::catalog::definition::Link| format!("{}: {}", l.name, l.url);
+    let docs = || d.links.iter().filter(|l| l.kind == "doc");
+    let mut out = vec![
+        ("service.team".to_owned(), d.team.clone().unwrap_or_default()),
+        ("service.links".to_owned(), d.links.iter().map(said).collect::<Vec<_>>().join(", ")),
+        ("service.docs".to_owned(), docs().map(said).collect::<Vec<_>>().join(", ")),
+    ];
+    out.extend(d.links.iter().map(|l| (format!("service.links[{}]", l.name), l.url.clone())));
+    out.extend(docs().map(|l| (format!("service.docs[{}]", l.name), l.url.clone())));
     out
 }
 
@@ -1400,6 +1494,9 @@ impl Monitors {
         if issue.is_some() {
             extra.push(("issue.link".into(), link.clone()));
         }
+        let (of_group, read) = group_vars(&g.group, &texts);
+        extra.extend(of_group);
+        blank.extend(read);
         // Datadog's `{{#is_unknown}}`: a service check's group in NO DATA by its UNKNOWN runs.
         let unknown = to == State::NoData && extra.iter().any(|(k, v)| k == "check_status" && v == checks::name(checks::UNKNOWN));
         // The group's latest records, searched for only where its message reads them or its
@@ -1583,6 +1680,11 @@ impl Monitors {
         }
     }
 
+    /// Whether a monitor's message (or its escalation) reads a host's own variables ([`reads_host`]).
+    fn reads_hosts(&self) -> bool {
+        lock(&self.defs).values().any(|m| reads_host(&m.message) || m.options.escalation_message.as_deref().is_some_and(reads_host))
+    }
+
     /// An incident's change told to its handles (`@slack-ops`, …) as a monitor's notifications go:
     /// its declaring and each change of its state or severity, one PagerDuty incident or Opsgenie
     /// alert an incident (its public id), resolved as it is; its severity its priority.
@@ -1672,6 +1774,16 @@ impl Monitors {
             });
             let next = match leading {
                 Some(store) => {
+                    // A message that reads a host's own variables reads the infrastructure's last
+                    // inventory as the evaluation finds it: one asked for first (made again in the
+                    // background once it is past its freshness), else none would be made unless the
+                    // hosts' page were open.
+                    if self.reads_hosts()
+                        && let Some(i) = super::infra::get()
+                        && let Err(e) = i.inventory().await
+                    {
+                        tracing::debug!(error = ?e, "the hosts' inventory was not made for monitors' messages");
+                    }
                     let me = Arc::clone(&self);
                     match crate::rt::blocking(move || {
                         me.tick(&store, crate::util::now_ms());
@@ -2060,6 +2172,69 @@ mod tests {
         let (vars, read) = ms.composite_vars(&store, &c, &host("web1"), "", 2);
         let var = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         anyhow::ensure!(var("a.value") == Some("0.25") && var("a.status") == Some("OK") && var("b.value") == Some("5.5") && var("b.status") == Some("Alert") && read.is_empty(), "{vars:?}");
+        Ok(())
+    }
+
+    /// Datadog's variables of a group by host and by service: the host's IP, its Agent's metadata
+    /// (Datadog's own `meta` fields) and its tags of every source, several values sorted; the
+    /// service's team, its links and docs, and each by its name; and which messages read a host's own
+    /// variables (asking the hosts' inventory for them), `{{host.name}}` being the group's.
+    #[test]
+    fn a_group_s_host_and_service_variables_are_datadog_s() -> anyhow::Result<()> {
+        use crate::observe::infra::{Figures, Host, agent::AgentHost};
+        let agent = AgentHost {
+            meta: serde_json::from_value(serde_json::json!({ "agent_version": "7.84.4", "machine": "amd64", "platform": "linux", "processor": "Intel(R) Xeon(R) Platinum 8375C" }))?,
+            inventory: serde_json::from_value(serde_json::json!({ "ip_address": "10.0.4.17" }))?,
+            tags_by_source: [("Datadog".to_owned(), vec!["role:db_postgres".to_owned(), "role:db_cassandra".to_owned(), "env:prod".to_owned()])].into(),
+            ..AgentHost::default()
+        };
+        let h = Host {
+            name: "db-1".into(),
+            aliases: Vec::new(),
+            apps: Vec::new(),
+            sources: Vec::new(),
+            last_reported_ms: None,
+            seen_ms: 0,
+            series: 0,
+            figures: Figures::default(),
+            tags: vec![("cloud.region".into(), "eu-west-1".into())],
+            agent: Some(Arc::new(agent)),
+            runner: None,
+            mute: None,
+        };
+        let is = |vars: &[(String, String)], k: &str, want: &str| vars.iter().any(|(n, x)| n == k && x == want);
+        let v = host_vars(&h);
+        for (k, want) in [
+            ("host.ip", "10.0.4.17"),
+            ("host.metadata_agent_version", "7.84.4"),
+            ("host.metadata_machine", "amd64"),
+            ("host.metadata_platform", "linux"),
+            ("host.metadata_processor", "Intel(R) Xeon(R) Platinum 8375C"),
+            ("host.role.name", "db_cassandra,db_postgres"),
+            ("host.env.name", "prod"),
+            ("host.cloud.region.name", "eu-west-1"),
+        ] {
+            anyhow::ensure!(is(&v, k, want), "{k}: {v:?}");
+        }
+        let d: crate::observe::catalog::definition::Definition = serde_json::from_value(serde_json::json!({
+            "schema-version": "v2.2",
+            "dd-service": "web",
+            "team": "payments",
+            "links": [{ "name": "Runbook", "type": "runbook", "url": "https://wiki.example/web?a=1&b=2" }, { "name": "API", "type": "doc", "url": "https://docs.example/api" }],
+        }))?;
+        let v = service_vars(&d);
+        for (k, want) in [
+            ("service.team", "payments"),
+            ("service.links", "Runbook: https://wiki.example/web?a=1&b=2, API: https://docs.example/api"),
+            ("service.docs", "API: https://docs.example/api"),
+            ("service.links[Runbook]", "https://wiki.example/web?a=1&b=2"),
+            ("service.docs[API]", "https://docs.example/api"),
+        ] {
+            anyhow::ensure!(is(&v, k, want), "{k}: {v:?}");
+        }
+        for (text, reads) in [("{{host.name}} is down", false), ("{{host.ip}}", true), (r#"{{#is_match "host.role.name" "db"}}x{{/is_match}}"#, true), ("{{event.host.name}}", false), ("{{ host.metadata_platform }}", true)] {
+            anyhow::ensure!(reads_host(text) == reads, "{text}: not {reads}");
+        }
         Ok(())
     }
 }

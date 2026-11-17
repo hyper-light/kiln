@@ -1660,7 +1660,10 @@ mod tests {
         assert_eq!(render("{{#is_unknown}}u{{/is_unknown}}", Transition { from: State::Ok, to: State::NoData }, &Vars { unknown: true, ..v.clone() }), "u");
         assert_eq!(r("{{first_triggered_at}} {{last_triggered_at_epoch}} {{triggered_duration_sec}}"), format!("2021-05-31 14:19:00+00:00 {} 1800", at(14, 27)));
         assert_eq!(r("{{local_time 'last_triggered_at' 'Asia/Tokyo'}}"), "2021-05-31 23:27:00+09:00");
-        assert_eq!(r("{{comparator}} {{threshold}} {{warn_threshold}} {{alert_recovery_threshold}} {{warn_recovery_threshold}} {{ok_threshold}}"), "> 90 80 85 80 ");
+        // The comparator a variable, so its `>` HTML-encoded as what any variable says is (Datadog's
+        // "Character escape"); `{{{…}}}` says it raw, and the message's own text stays as written.
+        assert_eq!(r("{{comparator}} {{threshold}} {{warn_threshold}} {{alert_recovery_threshold}} {{warn_recovery_threshold}} {{ok_threshold}}"), "&gt; 90 80 85 80 ");
+        assert_eq!(r("value > {{{comparator}}} {{threshold}}"), "value > > 90");
         assert_eq!(r(r#"{{eval "last_triggered_at_epoch-15*60*1000"}}"#), (at(14, 27) - 900_000).to_string());
         assert_eq!(r(r#"{{#is_exact_match (eval "int(last_triggered_at_epoch / 3600000 % 24)") "8" "14"}}day shift{{/is_exact_match}}"#), "day shift");
         assert_eq!(
@@ -1686,6 +1689,12 @@ mod tests {
             render(r#"{{check.name}} {{{check.name}}} {{log.link}} {{role.name}} [{{log.attributes.gone}}] {{log.message}} {{eval "1.00001"}} {{span.message}}"#, alert, &w),
             format!("https://status.example.com/check?service=web&amp;region=us-east {url} https://kiln/observe/logs?q=a&range=1h db_cassandra,db_postgres [] a &lt; b 1 {{{{span.message}}}}")
         );
+        // An item by its name, as its page's `{{service.links[Runbook]}}`, a name with a space too;
+        // a service's variable its definition lacks, empty.
+        let items = vec![("service.links[Runbook]".to_owned(), "https://wiki/r".to_owned()), ("service.links[On-call Runbook]".to_owned(), "https://wiki/o".to_owned())];
+        let read = vec!["service".to_owned()];
+        let s = Vars { extra: &items, blank: &read, ..v.clone() };
+        assert_eq!(render("{{service.links[Runbook]}} {{service.links[On-call Runbook]}} [{{service.team}}] {{service.name}}", alert, &s), "https://wiki/r https://wiki/o [] ad server");
         // No recursion: deep brackets read; unclosed sections and blocks never panic.
         assert_eq!(r(&format!("{{{{eval \"{}1{}\"}}}}", "(".repeat(100_000), ")".repeat(100_000))), "1");
         let _ = r(&("{{#is_match \"host.name\" \"db\"}}".repeat(10_000) + "{{{{raw}}}}x{{!--"));
