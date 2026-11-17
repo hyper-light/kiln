@@ -462,12 +462,12 @@ A launch gives a `Run`: stdin given to it in order, what it says (its output, th
 signals (refused `Unsupported` where its boundary delivers none), and a kill (its end, unless it had
 one, is `Killed`). It says where its boundary holds it, the same each time it's asked: its
 boundary's own name for it (`id`: a microVM's, as its runtime names it; none for a process of the
-machine's, which its pid names), and the link its stdio rides into its boundary, as each end says
-its TLS 1.3 handshake negotiated (`link`: a microVM's Shards agent control, kiln plan
+machine's, which its pid names), and the agent-control link it is driven over into its boundary, as
+each end says its TLS 1.3 handshake negotiated (`link`: a microVM's Shards agent control, kiln plan
 01a1cd8e862e7169a074db3d5fa33f3d step 11, the controller's word and the endpoint's own report, and
-the lanes its controller was granted on it as it dialed, by Shards' names). A
-link is awaited: it's said once it's made, none at once for a process of the machine's, whose stdio
-are its pipes, and none where its link ends before it's made.
+the lanes its controller was granted on it, by Shards' names, its stdio's among them where they ride
+it). A link is awaited: it's said once it's made, none at once for a process of the machine's, whose
+stdio are its pipes, and none where its link ends before it's made.
 
 A run's network and folders change while it runs (`change`; kiln plan 01a1dd2e…, P6b.4, through Hex's
 wire calls for Shards' P6b.1 and P6b.2): a host port published to a member's port and unpublished,

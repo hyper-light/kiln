@@ -435,11 +435,13 @@ pub enum Refusal {
     Ended,
 }
 
-/// The link a run's stdio rides into its boundary (a microVM's: Shards' agent control, kiln plan
-/// 01a1cd8e862e7169a074db3d5fa33f3d step 11), as each end says it negotiated
+/// The agent-control link a run is driven over into its boundary (a microVM's: Shards' agent control,
+/// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 11), as each end says it negotiated
 /// ([`kiln_ci::facts::Negotiated`]): the controller's, on the machine, and the endpoint's own report
-/// from inside; and the lanes its controller was granted on it as it dialed, by Shards' names
-/// (`control`, `stdout:0`, `stderr:0`, `stdin:0`, `exec`, `socket`, `mcp:0`).
+/// from inside; and the lanes its controller was granted on it, by Shards' names (`control`,
+/// `stdout:0`, `stderr:0`, `stdin:0`, `exec`, `log:run`, `socket`, `mcp:0`). Its stdio ride it where
+/// their lanes are among them; elsewhere they come another way (a Hex-held run's, its run host's
+/// member streams).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub controller: kiln_ci::facts::Negotiated,
@@ -583,10 +585,10 @@ pub trait Run: Send + Sync {
     /// Its boundary's own name for it, where its boundary names its runs (a microVM's, as its runtime
     /// names it); none for a process of the machine's, which its pid names. The same each time.
     fn id(&self) -> Option<String>;
-    /// The link its stdio rides into its boundary, as each end says it negotiated, once it's made: it
-    /// waits for the link's handshake and its endpoint's report. None at once for a run whose stdio
-    /// ride no link (a process of the machine's, whose stdio are its pipes), and none where its link
-    /// ends before it's made. Asked again, it says the same.
+    /// The agent-control link it is driven over into its boundary ([`Link`]), as each end says it
+    /// negotiated, once it's made: it waits for the link's handshake and its endpoint's report. None
+    /// at once for a run driven over no link (a process of the machine's, whose stdio are its pipes),
+    /// and none where its link ends before it's made. Asked again, it says the same.
     fn link(&self) -> BoxFuture<'_, Option<Link>>;
     /// Changes its network or its folders while it runs ([`Change`]): taken, else refused: `Ended`
     /// once it has ended, `Unsupported` where its boundary takes no change live (`Holds::live`, and

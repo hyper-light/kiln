@@ -108,14 +108,16 @@ the machine's network) is replaced by an Agentfile image's members.
   "host_pid": null, "control": {"controller": {"suite", "group"}, "endpoint": {"suite", "group"},
   "lanes": ["control", "stdout:0", "stderr:0", "stdin:0", "exec", "socket", "mcp:0" …]}}`.
   `host_pid` is read from its run's handle and always said, so a check reads it rather than an
-  absence. `control` is the link its stdio rides into the microVM, as each end says its TLS 1.3
-  handshake negotiated (rustls's names, or the IANA code where rustls has none): the controller's on
-  the machine and the endpoint's own report from inside (Shards' agent control, step 11), and the
-  lanes its controller was granted on it as it dialed (`Dialed::lanes`, Shards' names). It's
-  absent until that link is made (`Run::link`, awaited once, never polled), and today's stdio are
-  Shards' run pipes, which ride no link: an orchestrator's run binds its agent-control endpoint with
-  no member stream (Shards' D252, `api_run.rs` `bind_control`), so Hex takes its members' stdio from
-  the image channel (`take_input`, `take_output`) and `HexRun::link` says none.
+  absence. `control` is the agent-control link its run is driven over into the microVM, as each end
+  says its TLS 1.3 handshake negotiated (rustls's names, or the IANA code where rustls has none): the
+  controller's on the machine and the endpoint's own report from inside (Shards' agent control, step
+  11), and every lane its controller was granted on it, by Shards' names (`Linked::report`'s lanes,
+  `Granted::name`), `mcp:<member>` among them for each member whose MCP bridge the run serves (D254).
+  It's absent until that link is made (`Run::link`, awaited once, never polled). A Hex-held run's is
+  Hex's controller's (`HexRun::link`, Hex's `Runtime::link`): Hex drives its members' signals and MCP
+  lanes over it and takes their stdio from the image channel (`take_input`, `take_output`), asking its
+  endpoint for no member stream (Shards' D252), so its lanes are `control`, `exec`, `log:run` and each
+  `mcp:<member>`, none of its stdio.
 - **kiln's record of what it started for it** (`starts`): each start of its harness, when (`at`),
   where (`runs`, as it was as it started) and how it ended (`ended`: when, and its exit code where it
   was seen), kept with the session and handed to kiln's next image with it. A harness that ran and

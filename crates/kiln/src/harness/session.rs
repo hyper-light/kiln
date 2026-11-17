@@ -85,8 +85,8 @@ pub enum Runs {
         /// a microVM's member being no process of the machine's. Said even so, so a check reads it
         /// rather than an absence.
         host_pid: Option<u32>,
-        /// The agent-control link its stdio rides into the microVM, as each end says it negotiated
-        /// (Shards' `control::Link`, step 11), once it rides one: none before.
+        /// The agent-control link its run is driven over into the microVM, as each end says it
+        /// negotiated (Shards' `control::LinkReport`, step 11), once it's made: none before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(test, ts(optional))]
         control: Option<Link>,
@@ -155,8 +155,8 @@ impl Granted {
     }
 }
 
-/// The link a session's harness's stdio rides into its microVM, as each end says its TLS 1.3
-/// handshake negotiated (`kiln_seams::sandbox::Link`).
+/// The agent-control link a session's harness is driven over into its microVM, as each end says its
+/// TLS 1.3 handshake negotiated (`kiln_seams::sandbox::Link`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentLink"))]
@@ -165,8 +165,8 @@ pub struct Link {
     pub controller: kiln_ci::facts::Negotiated,
     /// The endpoint's own report, from inside the microVM.
     pub endpoint: kiln_ci::facts::Negotiated,
-    /// The lanes its controller was granted on it as it dialed, by Shards' names (`control`,
-    /// `stdout:0`, `stderr:0`, `stdin:0`, `exec`, `socket`, `mcp:0`). Always said.
+    /// The lanes its controller was granted on it, by Shards' names (`control`, `stdout:0`,
+    /// `stderr:0`, `stdin:0`, `exec`, `log:run`, `socket`, `mcp:0`). Always said.
     #[serde(default)]
     pub lanes: Vec<String>,
 }
@@ -187,7 +187,7 @@ impl From<kiln_seams::sandbox::Link> for Link {
 pub struct Start {
     /// Unix ms kiln started it, or took it over from its image before (an in-place upgrade).
     pub at: i64,
-    /// Where it ran, as `runs` said as it started (the link its stdio comes to ride is `runs`').
+    /// Where it ran, as `runs` said as it started (the link it comes to be driven over is `runs`').
     pub runs: Runs,
     /// How it ended: none while it runs, and none once it's handed on to kiln's next image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1831,7 +1831,7 @@ impl Session {
         core.touch_state();
     }
 
-    /// The link its harness's stdio rides into its microVM was made: where it runs says it.
+    /// The agent-control link its harness is driven over was made: where it runs says it.
     fn linked(&self, link: Link) {
         let mut core = self.core.lock();
         if let Some(Runs::Microvm { control, .. }) = core.state.runs.as_mut() {
@@ -2947,14 +2947,14 @@ enum Ev {
     Preview(Option<(String, Vec<super::model::FileDiff>)>),
     Exit(Option<i32>),
     Fx(Option<Done>),
-    /// The link its harness's stdio rides into its microVM was made, or never will be.
+    /// The agent-control link its harness is driven over was made, or never will be.
     Linked(Option<kiln_seams::sandbox::Link>),
     Tick,
     /// Headroom has room for work it held (docs/headroom.md).
     Room,
 }
 
-/// The link a boundary's run's stdio rides into it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
+/// The agent-control link a boundary's run is driven over (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
 /// step 17), awaited once: said once it's made; never, for a process of the machine's.
 fn link_made(held: Option<Arc<crate::sandbox::held::Held>>) -> futures::future::Fuse<futures::future::BoxFuture<'static, Option<kiln_seams::sandbox::Link>>> {
     async move {
@@ -5249,7 +5249,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 let mut forcing = false;
                 // Where this machine keeps what's an agent's own: whose each file it changes is.
                 let roots = std::sync::Arc::new(super::whose::Roots::of(&spec));
-                // The link its stdio rides into its microVM, said once it's made.
+                // The agent-control link it's driven over, said once it's made.
                 let mut linking = link_made(p.boundary());
                 // Its run's boundary as its end records it (P7.1's measures): kept apart from `p`, which a switch in
                 // its microVM hands on to the next harness's launch (P6c.5), and read again as a resume replaces `p`.

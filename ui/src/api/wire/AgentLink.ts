@@ -3,8 +3,8 @@
 import type { Negotiated } from "./Negotiated";
 
 /**
- * The link a session's harness's stdio rides into its microVM, as each end says its TLS 1.3
- * handshake negotiated (`kiln_seams::sandbox::Link`).
+ * The agent-control link a session's harness is driven over into its microVM, as each end says its
+ * TLS 1.3 handshake negotiated (`kiln_seams::sandbox::Link`).
  */
 export type AgentLink = { 
 /**
@@ -16,7 +16,7 @@ controller: Negotiated,
  */
 endpoint: Negotiated, 
 /**
- * The lanes its controller was granted on it as it dialed, by Shards' names (`control`,
- * `stdout:0`, `stderr:0`, `stdin:0`, `exec`, `socket`, `mcp:0`). Always said.
+ * The lanes its controller was granted on it, by Shards' names (`control`, `stdout:0`,
+ * `stderr:0`, `stdin:0`, `exec`, `log:run`, `socket`, `mcp:0`). Always said.
  */
 lanes: Array<string>, };

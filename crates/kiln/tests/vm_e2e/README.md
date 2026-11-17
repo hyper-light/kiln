@@ -178,8 +178,10 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    Shards slice, as its agent names them: `/runs/in`, `/runs/vm`, `/runs/image`, `/runs/host_pid`,
    `/runs/control/{controller,endpoint}/{suite,group}`, `/runs/control/lanes` and `/starts`. Read from
    `GET /api/harness/sessions/<id>`, through `VM_E2E_LINKS`' `agent-control` entry, and by
-   `check_no_host_pid` and `check_starts`. The link's ends say nothing until it carries the stdio
-   (Shards' control link and kiln's re-vendor). Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
+   `check_no_host_pid` and `check_starts`. On a Hex-held run the link's ends say nothing until kiln
+   vendors Hex's `Runtime::link` (Hex's `root/s35-link`, on Shards' `Linked::report`, 8c9c03cc4), which
+   `HexRun::link` maps (kiln's `p/s35-link`); that link carries none of its stdio, which Hex takes from
+   the image channel. Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
    `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch
    (`p/s17-launch-seam-v1`, 64dfab21f) reads its process's `host_pid()` inside (`session.rs` 4328 and
    4724) and says none of it; Shards' `control::Controller` (`crates/remote/src/control/drive.rs`)
