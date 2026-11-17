@@ -5,9 +5,9 @@
  * (`?type=composite`); a monitor's own page edits it, mutes it, deletes it.
  */
 import * as React from "react";
-import { BellOff, Bell, Pencil, Trash2 } from "lucide-react";
+import { BellOff, Bell, ChevronDown, Pencil, Trash2 } from "lucide-react";
 import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
-import { observeApi, type CompositeOf, type Monitor, type MonitorCheck, type MonitorIn } from "@/api/observe";
+import { observeApi, type CompositeOf, type Monitor, type MonitorCheck, type MonitorIn, type MonitorOptions, type NotificationPreset, type OnMissingData, type RenotifyStatus } from "@/api/observe";
 import { SERIES } from "@/components/charts/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
@@ -85,6 +85,55 @@ const SERVICE_CHECK = "service check";
 const isCheckQuery = (q: string) => /^\s*"/.test(q);
 /** A service check monitor's group's value: its latest run's status. */
 const CHECK_CODES = ["OK", "WARNING", "CRITICAL", "UNKNOWN"] as const;
+
+/** A monitor of logs, spans, events or Error Tracking's, by its query: what Datadog's `on_missing_data`
+ * and `group_retention_duration` are of. */
+const RECORDS = /^\s*(logs|spans|trace-analytics|events|error-tracking)\(/;
+/** The states Datadog tells again, as a monitor's states name them; unless it says, alert and no data. */
+const RENOTIFY: { value: RenotifyStatus; state: string }[] = [
+  { value: "alert", state: "ALERT" },
+  { value: "warn", state: "WARN" },
+  { value: "no data", state: "NO DATA" },
+];
+const RENOTIFY_DEFAULT: RenotifyStatus[] = ["alert", "no data"];
+/** `timeout_h`'s hours: Datadog's 1 to 24, or never. */
+const TIMEOUT_HOURS = Array.from({ length: 24 }, (_, i) => i + 1);
+/** Datadog's `on_missing_data`, its default unsaid. */
+const MISSING: { value: "" | Exclude<OnMissingData, "default">; label: string }[] = [
+  { value: "", label: "Counts as 0, or keeps its state" },
+  { value: "show_no_data", label: "Shows NO DATA" },
+  { value: "show_and_notify_no_data", label: "Shows NO DATA, told" },
+  { value: "resolve", label: "Resolves" },
+];
+/** Datadog's `notification_preset_name`, `show_all` unsaid: kiln's notices show no query, handles or
+ * snapshot, so what the others drop is their footer's link back. */
+const PRESETS: { value: "" | Exclude<NotificationPreset, "show_all">; label: string }[] = [
+  { value: "", label: "Everything" },
+  { value: "hide_query", label: "Not its query" },
+  { value: "hide_handles", label: "Not its handles" },
+  { value: "hide_query_and_handles", label: "Neither query nor handles" },
+  { value: "hide_handles_and_footer", label: "No handles, no footer" },
+  { value: "show_only_snapshot", label: "Only a snapshot" },
+  { value: "hide_all", label: "Nothing more" },
+];
+const sameSet = <T,>(a: T[], b: T[]) => a.length === b.length && a.every((x) => b.includes(x));
+
+/** How a monitor is told again, in a line. */
+const toldAgain = (o: MonitorOptions) =>
+  o.renotify_interval
+    ? [`every ${o.renotify_interval} min`, o.renotify_statuses?.length && `in ${o.renotify_statuses.join(", ")}`, o.renotify_occurrences && `${o.renotify_occurrences}× at most`].filter(Boolean).join(" · ")
+    : "once";
+
+/** What its notice shows besides its message, where it differs, in a line. */
+const noticeSaid = (o: MonitorOptions) =>
+  [
+    o.include_tags === false && "no group in its title",
+    o.notification_preset_name && o.notification_preset_name !== "show_all" && PRESETS.find((p) => p.value === o.notification_preset_name)?.label,
+    o.enable_logs_sample && "its latest logs",
+    o.notify_audit && "its changes told",
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
 const blank = (query: string, type: string | null): Monitor => ({
   id: "",
@@ -210,8 +259,17 @@ function MonitorView({ id }: { id: string }) {
                         : "after two windows"
                     : "keeps its state",
                 },
-                { label: "Told again", value: m.options.renotify_interval ? `every ${m.options.renotify_interval} min` : "once" },
+                ...(m.options.on_missing_data && m.options.on_missing_data !== "default"
+                  ? [{ label: "A group without data", value: MISSING.find((x) => x.value === m.options.on_missing_data)?.label }]
+                  : []),
+                ...(m.options.timeout_h ? [{ label: "Resolves", value: `after ${m.options.timeout_h} h without data` }] : []),
+                ...(m.options.group_retention_duration ? [{ label: "Forgets a group", value: `after ${m.options.group_retention_duration}` }] : []),
+                { label: "Told again", value: toldAgain(m.options) },
                 { label: "Evaluated", value: `every ${m.options.every ?? 60} s${m.options.evaluation_delay ? `, ${m.options.evaluation_delay} s late` : ""}` },
+                ...(m.options.new_group_delay ? [{ label: "New groups wait", value: `${m.options.new_group_delay} s` }] : []),
+                ...(m.options.require_full_window ? [{ label: "Its window", value: "full, or not evaluated" }] : []),
+                ...(m.options.notify_by?.length ? [{ label: "Tells", value: m.options.notify_by.includes("*") ? "one notice for all" : `by ${m.options.notify_by.join(", ")}` }] : []),
+                ...(noticeSaid(m.options) ? [{ label: "Its notice", value: noticeSaid(m.options) }] : []),
               ]}
             />
             <pre className="mt-4 whitespace-pre-wrap rounded-md bg-[#0d0e10] p-3 font-mono text-[11.5px] text-[#c8cad0]">{m.message || "No message."}</pre>
@@ -388,11 +446,67 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
   const [renotify, setRenotify] = React.useState(str(initial.options.renotify_interval));
   const [delay, setDelay] = React.useState(str(initial.options.evaluation_delay));
   const [every, setEvery] = React.useState(str(initial.options.every));
+  const o = initial.options;
+  const [missing, setMissing] = React.useState<string>(o.on_missing_data && o.on_missing_data !== "default" ? o.on_missing_data : "");
+  const [timeoutH, setTimeoutH] = React.useState(str(o.timeout_h));
+  const [retention, setRetention] = React.useState(o.group_retention_duration ?? "");
+  const [statuses, setStatuses] = React.useState<RenotifyStatus[]>(o.renotify_statuses ?? RENOTIFY_DEFAULT);
+  const [occurrences, setOccurrences] = React.useState(str(o.renotify_occurrences));
+  const [escalation, setEscalation] = React.useState(o.escalation_message ?? "");
+  const [newGroupDelay, setNewGroupDelay] = React.useState(str(o.new_group_delay));
+  const [fullWindow, setFullWindow] = React.useState(o.require_full_window ?? false);
+  const [notifyBy, setNotifyBy] = React.useState((o.notify_by ?? []).join(", "));
+  const [includeTags, setIncludeTags] = React.useState(o.include_tags ?? true);
+  const [preset, setPreset] = React.useState<string>(o.notification_preset_name && o.notification_preset_name !== "show_all" ? o.notification_preset_name : "");
+  const [samples, setSamples] = React.useState(o.enable_logs_sample ?? false);
+  const [audit, setAudit] = React.useState(o.notify_audit ?? false);
+  const escalationId = React.useId();
+  // Which of Datadog's options its kind takes: a monitor of records' (a formula's of logs, spans or
+  // events too), a log monitor's, a metric monitor's.
+  const records = !composite && (RECORDS.test(query) || (o.variables ?? []).some((v) => v.data_source !== "metrics"));
+  const logs = !composite && /^\s*logs\(/.test(query);
+  const metric = !composite && !isCheck && !records;
   const [checked, setCheck] = React.useState<{ of: string; c: MonitorCheck } | null>(null);
-  const form = [name, kind, query, parts, cond, message, tags, priority, crit, okRuns, warning, critRec, warnRec, noData, noDataMin, renotify, delay, every];
+  const form = [
+    name,
+    kind,
+    query,
+    parts,
+    cond,
+    message,
+    tags,
+    priority,
+    crit,
+    okRuns,
+    warning,
+    critRec,
+    warnRec,
+    noData,
+    noDataMin,
+    renotify,
+    delay,
+    every,
+    missing,
+    timeoutH,
+    retention,
+    statuses,
+    occurrences,
+    escalation,
+    newGroupDelay,
+    fullWindow,
+    notifyBy,
+    includeTags,
+    preset,
+    samples,
+    audit,
+  ];
   const opening = useOpening(form);
   const navigate = useNavigate();
 
+  const notifyByTags = notifyBy
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
   /** What is sent as the query: a composite's condition with its monitors' ids. */
   const sent = (): { query: string } | { error: string } => (composite ? lettersToIds(cond.trim(), parts) : { query: query.trim() });
   const body = (q: string): MonitorIn => ({
@@ -406,12 +520,30 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
       .filter(Boolean),
     priority: num(priority),
     options: {
-      thresholds: isCheck ? { critical: num(crit), warning: num(warning), ok: num(okRuns) } : { warning: num(warning), critical_recovery: num(critRec), warning_recovery: num(warnRec) },
-      notify_no_data: noData,
+      // What the form does not show (a formula's variables, a cumulative window's start, an anomaly
+      // monitor's windows, a dynamic threshold) kept as it was.
+      ...o,
+      thresholds: isCheck
+        ? { ...o.thresholds, critical: num(crit), warning: num(warning), ok: num(okRuns) }
+        : { ...o.thresholds, critical: null, warning: num(warning), critical_recovery: num(critRec), warning_recovery: num(warnRec) },
+      notify_no_data: noData && !(records && missing),
       no_data_timeframe: num(noDataMin),
       renotify_interval: num(renotify),
+      renotify_statuses: renotify.trim() && !sameSet(statuses, RENOTIFY_DEFAULT) ? statuses : null,
+      renotify_occurrences: num(occurrences),
+      escalation_message: escalation.trim() ? escalation : null,
       evaluation_delay: num(delay),
       every: num(every),
+      timeout_h: num(timeoutH),
+      require_full_window: metric && fullWindow,
+      new_group_delay: num(newGroupDelay),
+      include_tags: includeTags ? null : false,
+      on_missing_data: records && missing ? (missing as OnMissingData) : null,
+      notify_audit: audit,
+      notify_by: notifyByTags.length ? notifyByTags : null,
+      group_retention_duration: records && retention.trim() ? retention.trim() : null,
+      notification_preset_name: preset ? (preset as NotificationPreset) : null,
+      enable_logs_sample: logs && samples,
     },
   });
   // What a check is of. One shows only under it: a check that comes after an edit was of what was
@@ -560,14 +692,88 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
       <aside className="space-y-4">
         <HeldFields held={saving && !initial.id}>
           <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
-            <input type="checkbox" className="check" checked={noData} onChange={(e) => setNoData(e.target.checked)} /> Say when data stops
+            <input type="checkbox" className="check" checked={noData && !(records && missing)} disabled={records && Boolean(missing)} onChange={(e) => setNoData(e.target.checked)} /> Say when data
+            stops
           </label>
-          {noData && <TextField label="After minutes without data" inputMode="numeric" value={noDataMin} onChange={(e) => setNoDataMin(e.target.value)} placeholder="two windows" />}
+          {noData && !(records && missing) && (
+            <TextField label="After minutes without data" inputMode="numeric" value={noDataMin} onChange={(e) => setNoDataMin(e.target.value)} placeholder="two windows" />
+          )}
           <TextField label="Tell again every (minutes)" inputMode="numeric" value={renotify} onChange={(e) => setRenotify(e.target.value)} placeholder="once" />
           <TextField label="Evaluate every (seconds)" inputMode="numeric" value={every} onChange={(e) => setEvery(e.target.value)} placeholder="60" />
           <TextField label="Wait for late data (seconds)" inputMode="numeric" value={delay} onChange={(e) => setDelay(e.target.value)} placeholder="0" />
           <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="team:ci, service:api" />
           <SelectField label="Priority" value={priority} onChange={setPriority} options={[{ value: "", label: "None" }, ...[1, 2, 3, 4, 5].map((p) => ({ value: String(p), label: `P${p}` }))]} />
+          <Fold title="Missing data" set={[records && missing, timeoutH, records && retention.trim()].filter(Boolean).length}>
+            {records && (
+              <SelectField
+                label="A group without data"
+                value={missing}
+                onChange={(v) => {
+                  setMissing(v);
+                  if (v) setNoData(false);
+                }}
+                options={MISSING}
+              />
+            )}
+            <SelectField
+              label="Resolves after, without data"
+              value={timeoutH}
+              onChange={setTimeoutH}
+              options={[{ value: "", label: "Never" }, ...TIMEOUT_HOURS.map((h) => ({ value: String(h), label: h === 1 ? "1 hour" : `${h} hours` }))]}
+            />
+            {records && <TextField label="Forgets a group after" value={retention} onChange={(e) => setRetention(e.target.value)} placeholder="a day" hint="60m to 72h: 1h, 2d" />}
+          </Fold>
+          <Fold title="Telling again" set={[!sameSet(statuses, RENOTIFY_DEFAULT), occurrences.trim(), escalation.trim()].filter(Boolean).length}>
+            <fieldset>
+              <legend className="field-label">Told again in</legend>
+              <div className="flex flex-wrap gap-x-4 gap-y-2">
+                {RENOTIFY.map((r) => (
+                  <label key={r.value} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      className="check"
+                      checked={statuses.includes(r.value)}
+                      onChange={(e) => setStatuses(e.target.checked ? [...statuses, r.value] : statuses.filter((x) => x !== r.value))}
+                    />
+                    <StateBadge state={r.state} />
+                  </label>
+                ))}
+              </div>
+              {!renotify.trim() && <p className="field-hint">Once it is told again every so many minutes.</p>}
+            </fieldset>
+            <TextField label="At most (times)" inputMode="numeric" value={occurrences} onChange={(e) => setOccurrences(e.target.value)} placeholder="no end" />
+            <div>
+              <label htmlFor={escalationId} className="field-label">
+                Escalation message
+              </label>
+              <div className="field">
+                <textarea id={escalationId} rows={3} className="font-mono" value={escalation} onChange={(e) => setEscalation(e.target.value)} placeholder="Said after the message, told again" />
+              </div>
+            </div>
+          </Fold>
+          <Fold title="Groups" set={[newGroupDelay.trim(), metric && fullWindow, notifyBy.trim()].filter(Boolean).length}>
+            <TextField label="New groups wait (seconds)" inputMode="numeric" value={newGroupDelay} onChange={(e) => setNewGroupDelay(e.target.value)} placeholder="0" />
+            {metric && (
+              <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+                <input type="checkbox" className="check" checked={fullWindow} onChange={(e) => setFullWindow(e.target.checked)} /> Only a full window
+              </label>
+            )}
+            <TextField label="Tell by" value={notifyBy} onChange={(e) => setNotifyBy(e.target.value)} placeholder="each group" hint="Some of its group tags; * for one notice" />
+          </Fold>
+          <Fold title="The notice" set={[!includeTags, preset, logs && samples, audit].filter(Boolean).length}>
+            <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+              <input type="checkbox" className="check" checked={includeTags} onChange={(e) => setIncludeTags(e.target.checked)} /> Its group in the title
+            </label>
+            <SelectField label="Shows besides its message" value={preset} onChange={setPreset} options={PRESETS} />
+            {logs && (
+              <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+                <input type="checkbox" className="check" checked={samples} onChange={(e) => setSamples(e.target.checked)} /> Its group&apos;s latest logs
+              </label>
+            )}
+            <label className="flex items-center gap-2 text-[13px] text-[#c8cad0]">
+              <input type="checkbox" className="check" checked={audit} onChange={(e) => setAudit(e.target.checked)} /> Its changes told to its mentions
+            </label>
+          </Fold>
         </HeldFields>
         <div className="flex gap-2 pt-2">
           <Button type="submit" disabled={!name.trim() || (composite ? !cond.trim() : !query.trim())} pending={saving}>
@@ -585,6 +791,27 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
         </div>
       </aside>
     </form>
+  );
+}
+
+/** Some of a form's settings, folded in place under their name: open as the form opens while any of
+ * them is set (how many, beside its name), and as you leave it. */
+function Fold({ title, set, children }: { title: string; set: number; children: React.ReactNode }) {
+  const [open, setOpen] = React.useState(set > 0);
+  const body = React.useId();
+  return (
+    <div className="border-t border-[#20232b] pt-3">
+      <div className="section-fold" data-open={open || undefined}>
+        <button type="button" className="section-toggle font-mono text-[9px] tracking-[0.1em] text-[#8f939e] uppercase" aria-expanded={open} aria-controls={body} onClick={() => setOpen(!open)}>
+          {title}
+          {set > 0 && <span className="tracking-normal text-[#c8cad0] normal-case">{set} set</span>}
+          <ChevronDown size={14} className="section-chev" aria-hidden="true" />
+        </button>
+      </div>
+      <div id={body} className={open ? "mt-3 space-y-4" : undefined}>
+        {open && children}
+      </div>
+    </div>
   );
 }
 

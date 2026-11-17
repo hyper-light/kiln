@@ -160,14 +160,48 @@ export interface ObserveStatus {
 
 export type MonitorState = "OK" | "WARN" | "ALERT" | "NO DATA";
 
+/** A state Datadog's `renotify_statuses` names. */
+export type RenotifyStatus = "alert" | "warn" | "no data";
+
+/** Datadog's `on_missing_data`: what a group the evaluation finds no data of comes to. */
+export type OnMissingData = "default" | "show_no_data" | "show_and_notify_no_data" | "resolve";
+
+/** Datadog's `notification_preset_name`: what a notification shows besides its message. */
+export type NotificationPreset = "show_all" | "hide_query" | "hide_handles" | "hide_all" | "hide_query_and_handles" | "show_only_snapshot" | "hide_handles_and_footer";
+
 export interface MonitorOptions {
   /** A service check monitor's critical, warning, ok and unknown: runs of that status in a row. */
   thresholds: { critical?: number | null; warning?: number | null; critical_recovery?: number | null; warning_recovery?: number | null; ok?: number | null; unknown?: number | null };
   notify_no_data: boolean;
   no_data_timeframe?: number | null;
   renotify_interval?: number | null;
+  /** The states told again each interval (alert and no data unless said), how many times at the most, and what is said after the message then. */
+  renotify_statuses?: RenotifyStatus[] | null;
+  renotify_occurrences?: number | null;
+  escalation_message?: string | null;
   evaluation_delay?: number | null;
   every?: number | null;
+  /** Hours without data after which a group in ALERT or WARN resolves, 0 to 24. */
+  timeout_h?: number | null;
+  /** A metric monitor's: a group evaluated only once its window is full. */
+  require_full_window?: boolean;
+  /** Seconds a new group (one not seen for a day) is not evaluated. */
+  new_group_delay?: number | null;
+  /** Whether a notification's title names its group (yes unless said). */
+  include_tags?: boolean | null;
+  /** A monitor of logs, spans, events or Error Tracking's. */
+  on_missing_data?: OnMissingData | null;
+  /** The handles its message mentions told it was created, modified or deleted. */
+  notify_audit?: boolean;
+  /** Some of the query's group tags, its notifications by them (each its groups' worst); `["*"]`: one for all. */
+  notify_by?: string[] | null;
+  /** A monitor of logs, spans, events or Error Tracking's: how long a group without data is kept, `60m` to `72h`. */
+  group_retention_duration?: string | null;
+  notification_preset_name?: NotificationPreset | null;
+  /** A log monitor's: its notifications of trouble list its group's latest logs. */
+  enable_logs_sample?: boolean;
+  /** A formula monitor's queries by their names: of metrics, or of logs, spans or events. */
+  variables?: { name: string; data_source: string }[];
 }
 
 export interface MonitorGroup {
