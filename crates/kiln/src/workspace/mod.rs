@@ -90,13 +90,23 @@ pub fn live(infos: Vec<crate::harness::session::Info>) -> Vec<(String, Workspace
 }
 
 /// What a start on a person's shell takes from it once its machine has read the shell (`harness::host::shell_context`:
-/// its folder `cwd` and its environment `env`): the folder and the environment where the start named none.
-pub fn from_shell(spec: &mut crate::harness::session::Spec, (cwd, env): (Option<String>, Vec<(String, String)>), _live: &[(String, Workspace)]) {
+/// its folder `cwd` and its environment `env`): the folder and the environment where the start named none; and, where
+/// the folder lies in a workspace an agent of this machine works in now (`live`), that agent's volume ([`sharing`]),
+/// at the shell's own place in it. The server chose the start's workspace before this machine read the shell's folder
+/// (`Registry::open_as`), so a start that asked for a volume of its own, still to be made, takes the one it is in: a
+/// volume is never laid over a volume (Slates refuses a base on one of its own mounts, its A-227), as one started in
+/// another agent's folder works in that agent's volume (W2). A person's choice of the folder itself, and a workspace
+/// decided already, are kept.
+pub fn from_shell(spec: &mut crate::harness::session::Spec, (cwd, env): (Option<String>, Vec<(String, String)>), live: &[(String, Workspace)]) {
     if spec.cwd.is_none() {
         spec.cwd = cwd;
     }
     if spec.env.is_empty() {
         spec.env = env;
+    }
+    let own_to_make = spec.workspace.as_ref().is_some_and(|w| w.kind == "volume" && w.made.is_none() && w.owner.is_none());
+    if own_to_make && let Some(shared) = spec.cwd.as_deref().and_then(|cwd| sharing(cwd, live)) {
+        spec.workspace = Some(shared);
     }
 }
 
