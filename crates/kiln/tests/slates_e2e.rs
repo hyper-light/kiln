@@ -463,6 +463,14 @@ pub fn is_manifest(word: &str) -> bool {
     word.len() == 64 && word.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// The paths kiln's word on a workspace (`agents.workspace`) lists as drifted: each entry of its `drift` as Slates
+/// words it, a line (`/README.md (Modified)`) or a typed drift (`{"path": "/README.md", "kind": ...}`, slates-api's
+/// `Drift`).
+pub fn drifted(workspace: &Value) -> Vec<String> {
+    let entries = workspace.get("drift").and_then(Value::as_array).into_iter().flatten();
+    entries.filter_map(|d| d.as_str().or_else(|| d.get("path").and_then(Value::as_str))).map(str::to_owned).collect()
+}
+
 /// The manifest of the approval request kiln answered the agent's own landing with, as the stand-in said it
 /// (`LAND_APPROVAL <manifest>`).
 pub fn approval_said(lines: &[String]) -> Option<String> {
@@ -961,6 +969,14 @@ mod checks {
         assert!(check_turn(&with(&ok, "LAND_APPROVAL", Some("LAND_REFUSED plan mode")), "p.txt", Mode::Ask).is_err(), "refused outright");
     }
 
+    /// Drift is read whether kiln lists it as Slates' lines or as its typed drifts.
+    #[test]
+    fn g266_a_workspaces_drift_is_read_as_lines_or_typed_drifts() {
+        assert_eq!(drifted(&json!({"drift": ["/README.md (Modified)"]})), ["/README.md (Modified)"]);
+        assert_eq!(drifted(&json!({"drift": [{"path": "/README.md", "kind": "modified"}, {"kind": "gone"}]})), ["/README.md"]);
+        assert!(drifted(&json!({"drift": []})).is_empty() && drifted(&json!({"workspace": null})).is_empty());
+    }
+
     #[test]
     fn g266_claudes_modes_name_the_drives_two_agents() {
         assert_eq!(Mode::ALL.map(Mode::claude), ["bypassPermissions", "default"]);
@@ -1324,8 +1340,7 @@ mod bare_metal {
         let persons = b"the person's\n".to_vec();
         std::fs::write(project.path().join(APPENDED.0), &persons)?;
         let ws = op(f, "agents.workspace", &json!({"agent": id}))?;
-        let drift: Vec<&str> = ws.get("drift").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-        anyhow::ensure!(drift.iter().any(|d| d.contains(APPENDED.0)), "its drift doesn't name {}: {ws}", APPENDED.0);
+        anyhow::ensure!(drifted(&ws).iter().any(|d| d.contains(APPENDED.0)), "its drift doesn't name {}: {ws}", APPENDED.0);
         // Its landing, written or not as kiln and Slates judge it: what each said is kept for the failure's words.
         let said = match mode {
             Mode::Bypass => {
