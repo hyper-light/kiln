@@ -4416,16 +4416,17 @@ impl Registry {
         // works in now works in that one; one whose start named none gets a volume of its own, and a machine that can't
         // make one refuses the start, naming what it lacks (`lineage::NoWorkspace`), rather than run it in its plain
         // folder: no second path (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
-        // its boundary's sharing decides, and a conversation taken up stays in the folder its harness keeps it by
-        // (`resume`). One started in a person's shell (`shell`) works on a volume too: the shell's folder, read on its
-        // machine as it starts, is the one laid over, and its environment is moved onto the mount with it
-        // (`workspace::prepare`, `kinds::launch`), so nothing of it names the person's folder (I11).
+        // its boundary's sharing decides. One started in a person's shell (`shell`) works on a volume too: the shell's
+        // folder, read on its machine as it starts, is the one laid over, and its environment is moved onto the mount
+        // with it (`workspace::prepare`, `kinds::launch`), so nothing of it names the person's folder (I11); and so does
+        // a conversation taken up (`resume`), its harness's record of it moved to where the harness looks from the
+        // mount's folder (`harness::homes::rehome`, I12).
         if spec.isolation.is_none() && spec.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
             let here = loc.target();
             let live: Vec<(String, crate::workspace::Workspace)> = self.list().into_iter().filter(|i| Location::of_target(&i.target).target() == here).filter_map(|i| i.workspace.filter(|w| w.made.is_some()).map(|w| (i.id, w))).collect();
             if let Some(shared) = spec.cwd.as_deref().and_then(|cwd| crate::workspace::sharing(cwd, &live)) {
                 spec.workspace = Some(shared);
-            } else if spec.workspace.is_none() && spec.resume.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
+            } else if spec.workspace.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
                 crate::harness::lineage::workspaces_on(hub, target).await?;
                 spec.workspace = Some(crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() });
             }
