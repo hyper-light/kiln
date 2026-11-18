@@ -481,7 +481,7 @@ pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), Strin
         }
     }
     let said = |tag: &str| lines.iter().find(|l| l.starts_with(tag));
-    for (tag, what) in [("LAND_FAIL ", "its own landing reached no answer"), ("LAND_REFUSED ", "its own landing was refused")] {
+    for (tag, what) in [("LAND_FAIL ", "its own landing reached no answer"), ("LAND_REFUSED ", "its own landing was refused"), ("LAND_CONFLICTED ", "its own landing met conflicts")] {
         if let Some(l) = said(tag) {
             return Err(format!("{what} ({mode:?}): {l}"));
         }
@@ -548,13 +548,16 @@ pub fn workspace_of(info: &Value) -> Result<Made, String> {
 }
 
 /// A landing's outcome, as kiln answers `agents.land` (the contract's draft 3): one of Slates' typed outcomes
-/// (slates-api, g262), named by the answer's `outcome`.
+/// (slates-api's `LandOutcome`, g262: `Written`, `ApprovalRequired`, `Conflicted`, `Refused`), named by the answer's
+/// `outcome` in snake case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Written to the folder: Slates' landing outcome rides in `written`.
+    /// Written to the folder: Slates' landing report rides in `written`.
     Written,
     /// Held for a person's approval: Slates' presentation in `approval`, naming the manifest an approval binds.
     ApprovalRequired { manifest: String },
+    /// Its presentation met conflicts (a path changed on disk since the volume read it): each typed in `conflicts`.
+    Conflicted { conflicts: Value },
     /// Refused, a closed reason in `refusal`.
     Refused { refusal: Value },
 }
@@ -568,6 +571,7 @@ pub fn outcome_of(answer: &Value) -> Result<Outcome, String> {
             let manifest = answer.pointer("/approval/manifest").and_then(Value::as_str).filter(|m| is_manifest(m));
             manifest.map(|m| Outcome::ApprovalRequired { manifest: m.to_owned() }).ok_or_else(|| format!("its approval request names no manifest: {answer}"))
         }
+        Some("conflicted") => Ok(Outcome::Conflicted { conflicts: answer.get("conflicts").cloned().unwrap_or(Value::Null) }),
         Some("refused") => Ok(Outcome::Refused { refusal: answer.get("refusal").cloned().unwrap_or(Value::Null) }),
         _ => Err(format!("kiln's answer names no landing outcome: {answer}")),
     }
@@ -929,6 +933,8 @@ mod checks {
         assert!(check_turn(&with(&ok, "LAND_WRITTEN", Some("LAND_REFUSED a mode that forbids writing")), "p.txt", Mode::Bypass).is_err(), "a landing refused");
         assert!(check_turn(&with(&ok, "LAND_WRITTEN", Some("LAND_FAIL no kiln MCP server was given to this harness")), "p.txt", Mode::Bypass).is_err(), "an ask that reached no kiln");
         assert!(check_turn(&with(&ok, "LAND_WRITTEN", None), "p.txt", Mode::Bypass).is_err(), "a landing never said");
+        let conflicted = with(&ok, "LAND_WRITTEN", Some(r#"LAND_CONFLICTED {"outcome": "conflicted"}"#));
+        assert!(check_turn(&conflicted, "p.txt", Mode::Bypass).is_err_and(|e| e.contains("conflicts")), "a landing that met conflicts");
     }
 
     /// An agent whose mode asks passes only with its ask to raise its own mode answered, its own landing held as an
@@ -989,7 +995,10 @@ mod checks {
         let written_answer = json!({"outcome": "written", "written": {"landing": 7, "written": 3, "conflicts": 0}});
         let held = json!({"outcome": "approval_required", "approval": {"manifest": MANIFEST, "summary": {"bytes": 12}, "entries": [], "conflicts": []}});
         let refused = json!({"outcome": "refused", "refusal": {"reason": "mode_forbids_writing"}});
+        let conflicted = json!({"outcome": "conflicted", "conflicts": [{"path": "/README.md", "class": "changed_on_disk"}]});
         assert_eq!(outcome_of(&written_answer), Ok(Outcome::Written));
+        assert_eq!(outcome_of(&conflicted), Ok(Outcome::Conflicted { conflicts: json!([{"path": "/README.md", "class": "changed_on_disk"}]) }));
+        assert!(approval_manifest(&conflicted).is_err() && written(&conflicted).is_err(), "conflicts are neither a request nor a write");
         assert_eq!(outcome_of(&held), Ok(Outcome::ApprovalRequired { manifest: MANIFEST.to_owned() }));
         assert_eq!(outcome_of(&refused), Ok(Outcome::Refused { refusal: json!({"reason": "mode_forbids_writing"}) }));
         assert!(outcome_of(&json!({"outcome": "approval_required", "approval": {"manifest": "ab12"}})).is_err(), "a manifest no hash");
@@ -1077,8 +1086,8 @@ mod stand_in {
     /// A kiln MCP server of the test's own (stdio, a JSON-RPC message a line): its answer to initialize names the agent
     /// it serves (`a1`), and it answers `agents_land` as kiln does for an agent in the landing permission `FAKE_POLICY`
     /// names (the contract's draft 3): `write`, written at once, its approval too; `ask`, an approval request naming the
-    /// manifest `ab` 32 times, the agent's own approval refused as the tool's error; `refuse`, refused as a JSON-RPC
-    /// error. An agent's raise of its own mode (`agents_broadcast`'s `set_mode`) is refused as the tool's error, and any
+    /// manifest `ab` 32 times, the agent's own approval refused as the tool's error; `conflict`, its presentation's
+    /// conflicts; `refuse`, refused as a JSON-RPC error. An agent's raise of its own mode (`agents_broadcast`'s `set_mode`) is refused as the tool's error, and any
     /// call naming an agent other than `a1` is refused. Each call is written to `FAKE_LOG` as `{"tool", "arguments"}`, a
     /// line each.
     const FAKE_KILN: &str = r#"
@@ -1115,6 +1124,8 @@ for line in sys.stdin:
         say({"id": m["id"], "result": tool({"outcome": "approval_required", "approval": {"manifest": MANIFEST, "summary": {}, "entries": [], "conflicts": []}})})
     elif POLICY == "ask":
         say({"id": m["id"], "result": tool("approving its own landing is its person's to do", True)})
+    elif POLICY == "conflict":
+        say({"id": m["id"], "result": tool({"outcome": "conflicted", "conflicts": [{"path": "/README.md", "class": "changed_on_disk"}]})})
     else:
         say({"id": m["id"], "error": {"code": -32000, "message": "agents_land: a mode that forbids writing"}})
 "#;
@@ -1168,6 +1179,10 @@ for line in sys.stdin:
         anyhow::ensure!(said.iter().any(|l| l.starts_with("LAND_SELF_REFUSED ") && l.contains("person")), "{said:?}");
         crate::check_turn(&said, "p.txt", crate::Mode::Ask).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(crate::check_turn(&said, "p.txt", crate::Mode::Bypass).is_err(), "held for a person is no bypass agent's turn");
+
+        let (said, _) = landing_turn("conflict", crate::Mode::Bypass)?;
+        anyhow::ensure!(said.iter().any(|l| l.starts_with("LAND_CONFLICTED ") && l.contains("README.md")), "{said:?}");
+        anyhow::ensure!(crate::Mode::ALL.iter().all(|m| crate::check_turn(&said, "p.txt", *m).is_err()), "a landing that met conflicts passes for neither mode: {said:?}");
 
         let (said, asked) = landing_turn("refuse", crate::Mode::Bypass)?;
         anyhow::ensure!(asked == [call("agents_land", json!({"agent": "a1"}))], "refused, nothing more asked: {asked:?}");
