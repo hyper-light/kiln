@@ -1306,26 +1306,26 @@ mod tests {
     /// table (f3f618f2, kiln 68eda5b1, 2026-11-18).
     #[test]
     fn w3_a_volume_is_never_destroyed_while_its_mount_is_in_the_table() -> anyhow::Result<()> {
-        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
         #[derive(Default)]
         struct Fake {
-            mounted: Cell<bool>,
+            mounted: AtomicBool,
             refuses: bool,
             lies: bool,
-            unmounts: Cell<u32>,
-            destroyed: Cell<u32>,
+            unmounts: AtomicU32,
+            destroyed: AtomicU32,
         }
         impl TakeDown for Fake {
             async fn mounted(&self) -> bool {
-                self.mounted.get()
+                self.mounted.load(Relaxed)
             }
             async fn unmount(&self) -> anyhow::Result<()> {
-                self.unmounts.set(self.unmounts.get() + 1);
+                self.unmounts.fetch_add(1, Relaxed);
                 match (self.refuses, self.lies) {
                     (true, _) => anyhow::bail!("Slates' unmount: umount couldn't run: No such file or directory (os error 2)"),
                     (false, true) => Ok(()),
                     (false, false) => {
-                        self.mounted.set(false);
+                        self.mounted.store(false, Relaxed);
                         Ok(())
                     }
                 }
@@ -1337,24 +1337,24 @@ mod tests {
                 "nothing lsof can see".to_owned()
             }
             async fn destroy(&self) -> anyhow::Result<()> {
-                self.destroyed.set(self.destroyed.get() + 1);
+                self.destroyed.fetch_add(1, Relaxed);
                 Ok(())
             }
         }
         crate::rt::block_on(async {
             for (refuses, lies) in [(true, false), (false, true)] {
-                let stuck = Fake { mounted: Cell::new(true), refuses, lies, ..Fake::default() };
+                let stuck = Fake { mounted: AtomicBool::new(true), refuses, lies, ..Fake::default() };
                 let kept = take_down(&stuck, "/state/workspaces/kiln-a", Duration::ZERO).await;
-                anyhow::ensure!(stuck.destroyed.get() == 0, "refuses {refuses}, lies {lies}: destroyed under a mount the table holds");
+                anyhow::ensure!(stuck.destroyed.load(Relaxed) == 0, "refuses {refuses}, lies {lies}: destroyed under a mount the table holds");
                 let stays = kept.as_ref().err().and_then(|e| e.downcast_ref::<MountStays>()).cloned();
                 anyhow::ensure!(stays.as_ref().is_some_and(|s| s.mount == "/state/workspaces/kiln-a"), "refuses {refuses}, lies {lies}: {kept:?}");
             }
-            let goes = Fake { mounted: Cell::new(true), ..Fake::default() };
+            let goes = Fake { mounted: AtomicBool::new(true), ..Fake::default() };
             take_down(&goes, "/state/workspaces/kiln-b", Duration::ZERO).await?;
-            anyhow::ensure!((goes.unmounts.get(), goes.destroyed.get()) == (1, 1), "unmounted once, then destroyed");
+            anyhow::ensure!((goes.unmounts.load(Relaxed), goes.destroyed.load(Relaxed)) == (1, 1), "unmounted once, then destroyed");
             let none = Fake::default();
             take_down(&none, "/state/workspaces/kiln-c", Duration::ZERO).await?;
-            anyhow::ensure!((none.unmounts.get(), none.destroyed.get()) == (0, 1), "nothing mounted: destroyed, nothing asked");
+            anyhow::ensure!((none.unmounts.load(Relaxed), none.destroyed.load(Relaxed)) == (0, 1), "nothing mounted: destroyed, nothing asked");
             Ok(())
         })
     }
