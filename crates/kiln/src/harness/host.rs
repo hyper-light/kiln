@@ -2805,6 +2805,7 @@ impl Host {
         if let Some(s) = s {
             free_claim(s.spec.lock().claim.clone());
             s.close();
+            let closed = std::time::Instant::now();
             // Its workspace ends with it, once no other agent here works in it (a child in its parent's volume, or a
             // parent its child outlived: docs/agentic.md W3) and no archived one keeps it (an archive keeps its
             // agent's workspace for its restore, [`Host::archive`]): the last of them ends it.
@@ -2812,12 +2813,17 @@ impl Host {
             let others: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
             if !others.iter().any(|o| crate::workspace::same_volume(o.spec.lock().workspace.as_ref(), spec.workspace.as_ref())) {
                 let archives = self.archive_dir();
+                let ending = Arc::clone(&s);
                 crate::rt::spawn(async move {
                     let probe = spec.clone();
                     // Unread, it's kept: an archived agent's work is never lost to a failed look.
                     let kept = crate::rt::blocking(move || archived_keep(archives.as_deref(), probe.workspace.as_ref())).await.unwrap_or(true);
                     if !kept {
-                        crate::workspace::release(&spec);
+                        // Its processes gone first: its harness works in the mount, which can't come down under it
+                        // (macOS refused it busy, and there's no lazy unmount there). How long their end took, from its
+                        // close, is how long what they left behind may still hold it (`workspace::release`).
+                        ending.close_wait().await;
+                        crate::workspace::release(&spec, closed.elapsed()).await;
                     }
                 });
             }

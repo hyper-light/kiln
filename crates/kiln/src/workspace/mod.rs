@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Workspace {
     /// `volume`: a Slates volume laid over its folder (its own, or another agent's it works in: `owner`); `folder`:
-    /// the folder itself, as a person asked, or because its machine can't make a volume (`why_not`).
+    /// the folder itself, as a person asked.
     pub kind: String,
     /// The folder it's laid over: its repository's top (else the folder itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,25 +56,10 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub owner: Option<String>,
-    /// Why it works in its folder though its start named no workspace: its machine can't make a volume, as it said
-    /// ([`by_default`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub why_not: Option<String>,
 }
 
 /// The kinds of workspace an agent may ask for: its folder itself, or a volume of its own.
 pub const KINDS: &[&str] = &["folder", "volume"];
-
-/// What an agent works in when its start named no workspace (the person's decision, 2026-11-18, kiln goal
-/// 01a1ec34599974448aed2672bafaf9a2: kiln's bare-metal engine runs every harness and agent on a Slates volume;
-/// docs/agentic.md W2): a volume of its own where its machine can make one (`can`), else its folder, saying why.
-pub fn by_default(can: Result<(), String>) -> Workspace {
-    match can {
-        Ok(()) => Workspace { kind: "volume".to_owned(), ..Workspace::default() },
-        Err(why) => Workspace { kind: "folder".to_owned(), why_not: Some(why), ..Workspace::default() },
-    }
-}
 
 /// The workspace an agent works in when its folder `cwd` lies in one that an agent of its machine works in now
 /// (`live`: each such agent's id and workspace): that one, the agent's folder its own place in it. A volume is never
@@ -90,7 +75,6 @@ pub fn sharing(cwd: &str, live: &[(String, Workspace)]) -> Option<Workspace> {
             sub: beneath(cwd, &made.mount),
             made: Some(made.clone()),
             owner: Some(w.owner.clone().unwrap_or_else(|| id.clone())),
-            why_not: None,
         })
     })
 }
@@ -246,14 +230,14 @@ pub fn needs_preparing(spec: &crate::harness::session::Spec) -> bool {
 }
 
 /// Ends agent session `spec`'s workspace for good, when it has a volume: the volume and what it held go
-/// with the session. Its caller asks this of the last agent working in it alone ([`same_volume`]).
-pub fn release(spec: &crate::harness::session::Spec) {
+/// with the session. Its caller asks this of the last agent working in it alone ([`same_volume`]), once its processes
+/// are gone, giving how long their end took as how long what they left behind may still hold the mount
+/// (`slates::remove`).
+pub async fn release(spec: &crate::harness::session::Spec, patience: std::time::Duration) {
     let Some(m) = spec.workspace.as_ref().and_then(|w| w.made.clone()) else { return };
-    crate::rt::spawn(async move {
-        if let Err(e) = slates::remove(&m).await {
-            tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "an ended agent's workspace stayed");
-        }
-    });
+    if let Err(e) = slates::remove(&m, patience).await {
+        tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "an ended agent's workspace stayed");
+    }
 }
 
 /// What the server asks the machine about an agent's folder.
@@ -543,17 +527,6 @@ mod tests {
         Workspace { kind: "volume".into(), over: Some(over.into()), made: Some(made(volume, mount)), ..Workspace::default() }
     }
 
-    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (W2): a start that names no workspace gets a volume where its machine
-    /// can make one, and its folder where it can't, with the machine's word for why.
-    #[test]
-    fn w2_a_start_that_names_nothing_gets_a_volume_where_its_machine_can_make_one() {
-        assert_eq!(by_default(Ok(())), Workspace { kind: "volume".into(), ..Workspace::default() });
-        let folder = by_default(Err("fusermount3 isn't installed (the fuse3 package)".into()));
-        assert_eq!(folder.kind, "folder");
-        assert_eq!(folder.why_not.as_deref(), Some("fusermount3 isn't installed (the fuse3 package)"));
-        assert!(folder.made.is_none() && folder.owner.is_none());
-    }
-
     /// W2: an agent whose folder lies in another agent's volume works in that volume, at its place there, the volume's
     /// owner the agent that made it (also for an agent started in turn in a sharer's folder); a folder outside every
     /// mount, or beside one (`kiln-a2` is not beneath `kiln-a`), shares nothing.
@@ -604,7 +577,8 @@ mod tests {
         assert!(same_volume(Some(&parent), child.as_ref()));
         assert!(!same_volume(Some(&parent), Some(&volume_at("v2", "/w/kiln-b", "/src"))));
         assert!(!same_volume(Some(&parent), None));
-        assert!(!same_volume(Some(&by_default(Ok(()))), Some(&by_default(Ok(())))), "volumes not made yet are no volume");
+        let unmade = || Workspace { kind: "volume".into(), ..Workspace::default() };
+        assert!(!same_volume(Some(&unmade()), Some(&unmade())), "volumes not made yet are no volume");
         let spec = |w: Option<Workspace>| crate::harness::session::Spec { workspace: w, ..Default::default() };
         assert_eq!(made_alone(&spec(Some(parent.clone()))), parent.made);
         assert_eq!(made_alone(&spec(child)), None, "its parent's volume goes on");
@@ -668,7 +642,7 @@ mod tests {
     /// W2: an agent in its folder, whatever the reason, has no workspace of its own to ask about.
     #[test]
     fn w2_an_agent_in_its_folder_has_no_volume_to_ask_about() {
-        let folder = by_default(Err("no Slates here".into()));
+        let folder = Workspace { kind: "folder".into(), ..Workspace::default() };
         let refused = own_of(Some(&folder));
         assert!(refused.contains("its folder itself"), "{refused}");
         assert!(own_of(None).contains("its folder itself"));

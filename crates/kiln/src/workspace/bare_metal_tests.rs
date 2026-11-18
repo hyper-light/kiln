@@ -198,7 +198,7 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
         let spec = Spec { kind: kind.id.into(), cwd: Some(src.to_string_lossy().into_owned()), name: Some(format!("{} on a volume", kind.name)), program: Some(missing.clone()), ..Spec::default() };
         let info = started.open(spec).await?;
         let w = info.workspace.clone().ok_or_else(|| anyhow::anyhow!("{}: no workspace", kind.id))?;
-        anyhow::ensure!(w.kind == "volume" && w.why_not.is_none() && w.owner.is_none(), "{}: {w:?}", kind.id);
+        anyhow::ensure!(w.kind == "volume" && w.owner.is_none(), "{}: {w:?}", kind.id);
         anyhow::ensure!(w.over.as_deref() == Some(top.as_str()), "{}: laid over {:?}, not {top}", kind.id, w.over);
         let made = made_of(&info)?;
         anyhow::ensure!(mounted(&made.mount), "{}: nothing mounted at {}", kind.id, made.mount);

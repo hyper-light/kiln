@@ -636,10 +636,9 @@ async fn change(cx: Cx, v: Value) -> Out {
 }
 
 /// An agent's workspace as its views show it: its kind, the folder it's laid over and its place there, its volume and
-/// where it's mounted; whose volume it is when another agent's (`owner`), and why it works in its folder when its start
-/// named nothing and its machine can't make a volume (`why_not`).
+/// where it's mounted; whose volume it is when another agent's (`owner`).
 fn workspace_shown(w: &crate::workspace::Workspace) -> Value {
-    json!({"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount), "owner": w.owner, "why_not": w.why_not})
+    json!({"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount), "owner": w.owner})
 }
 
 async fn workspace(cx: Cx, v: Value) -> Out {
@@ -3095,8 +3094,10 @@ for line in sys.stdin:
     /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2): what an agent works in when its start names no
     /// workspace is the server's `[agents] workspace`: on a server that says `folder` (a test's, a lab's) its folder
     /// itself, nothing made for it; and a person's `folder` is kept as asked on a server whose default is a volume, its
-    /// machine asked nothing about one, as is the folder of one started in a person's shell. None needs Slates, so this
-    /// holds on every machine.
+    /// machine asked nothing about one, as is the folder of one started in a person's shell; and where its machine can't
+    /// make a volume the start is refused, naming what it lacks (`lineage::NoWorkspace`), never run in its folder instead
+    /// (the coordinator's ruling of 2026-11-18: that fallback was a second path). None needs Slates, so this holds on
+    /// every machine.
     #[test]
     fn w2_a_start_naming_no_workspace_follows_the_servers_setting_and_a_folder_asked_for_is_kept() -> anyhow::Result<()> {
         run(async {
@@ -3124,6 +3125,13 @@ for line in sys.stdin:
             let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: Some("t1".into()), ..Default::default() };
             let shelled = hub.harness.open(&hub, "local", spec, 1).await?;
             anyhow::ensure!(shelled.first().is_some_and(|i| i.workspace.is_none()), "{shelled:?}");
+            // A machine that can't make a volume (here its kiln is older than workspaces) refuses a start that names
+            // none, typed, naming what it lacks: it never runs the agent in its plain folder instead (no second path).
+            hub.put_agent(crate::hub::tests::live_runner("old", "linux", "x86_64"));
+            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), ..Default::default() };
+            let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
+            let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<lineage::NoWorkspace>());
+            anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "{refused:?}");
             Ok(())
         })
     }

@@ -42,7 +42,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -184,6 +184,8 @@ pub fn mount_kind() -> Option<&'static str> {
 
 /// What a machine says of its workspaces, in its facts.
 pub type Facts = kiln_ci::facts::Workspaces;
+/// What a machine lacks for workspaces, typed ([`Facts::missing`]).
+pub use kiln_ci::facts::WorkspaceMissing;
 
 /// The Slates kiln links: the revision of it vendor/MANIFEST.toml takes, which vendor/slates holds
 /// (docs/vendoring.md).
@@ -204,15 +206,29 @@ pub async fn facts() -> Facts {
     let slates = linked();
     let mount = match slates_api::mount::available() {
         Ok(kind) => mount_word(kind),
-        Err(fault) => return Facts { slates, why_not: Some(fault.to_string()), ..Facts::default() },
+        Err(fault) => return Facts { slates, why_not: Some(fault.to_string()), missing: Some(missing_of(&fault)), ..Facts::default() },
     };
     let Some(mount) = mount else {
-        return Facts { slates, why_not: Some("Slates offers no mount here that kiln makes".to_owned()), ..Facts::default() };
+        return Facts { slates, why_not: Some("Slates offers no mount here that kiln makes".to_owned()), missing: Some(WorkspaceMissing::Mount), ..Facts::default() };
     };
     if HERE.get().is_none() {
-        return Facts { slates, mount: Some(mount.to_owned()), why_not: Some("this kiln keeps no workspaces".to_owned()), ..Facts::default() };
+        return Facts { slates, mount: Some(mount.to_owned()), why_not: Some("this kiln keeps no workspaces".to_owned()), missing: Some(WorkspaceMissing::Workspaces), ..Facts::default() };
     }
-    Facts { available: true, slates, mount: Some(mount.to_owned()), running: up().await, why_not: None }
+    Facts { available: true, slates, mount: Some(mount.to_owned()), running: up().await, why_not: None, missing: None }
+}
+
+/// What a machine lacks for workspaces, as Slates' typed answer to whether it can mount names it (`mount::available`).
+fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
+    match fault {
+        slates_api::MountFault::Unsupported { missing } => match missing {
+            slates_api::MountMissing::Fusermount3 => WorkspaceMissing::Fusermount3,
+            slates_api::MountMissing::FuseDevice => WorkspaceMissing::FuseDevice,
+            slates_api::MountMissing::WinFsp => WorkspaceMissing::WinFsp,
+            slates_api::MountMissing::MountNfs => WorkspaceMissing::MountNfs,
+            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared | slates_api::MountMissing::LazyUnmount => WorkspaceMissing::Mount,
+        },
+        _ => WorkspaceMissing::Mount,
+    }
 }
 
 /// Runs `f` against the machine's instance on kiln's blocking pool, on a client of its own that
@@ -518,18 +534,90 @@ async fn let_go(path: String) -> anyhow::Result<()> {
     }
 }
 
-/// Workspace `m` gone: unmounted, its volume destroyed and its mount point removed. What it held
-/// is lost. A mount still in use (something the agent left running works there) is let go lazily
-/// on Linux, and its volume destroyed all the same: nothing is kept for an agent that has ended.
-pub async fn remove(m: &Made) -> anyhow::Result<()> {
+/// What came of taking a workspace's mount down ([`unmount_patiently`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Unmounted {
+    /// It's gone.
+    Gone,
+    /// Still there once the patience ran out: the last refusal, in its words.
+    StillHeld(String),
+}
+
+/// Asks `ask` to take a mount down while `held` says it's still there: again after a pause as long as the last ask took,
+/// doubling, for as long as `patience`. What uses a workspace right after its agent ended (a process of its tree on its
+/// way out, the kernel's last reference to a file it had open) goes in about the time its agent's own end took, which is
+/// what its caller gives as `patience`; a refusal then isn't the agent's leftovers. The last refusal, where it's still
+/// held after that.
+async fn unmount_patiently<A, F>(mut ask: A, held: impl Fn() -> bool, patience: Duration) -> Unmounted
+where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let began = Instant::now();
+    let mut pause: Option<Duration> = None;
+    loop {
+        let asked = Instant::now();
+        let refused = match ask().await {
+            Ok(()) => return Unmounted::Gone,
+            Err(e) => format!("{e:#}"),
+        };
+        if !held() {
+            return Unmounted::Gone;
+        }
+        let took = asked.elapsed();
+        let next = pause.map_or(took, |p| p.saturating_mul(2)).max(took);
+        if began.elapsed().saturating_add(next) > patience {
+            return Unmounted::StillHeld(refused);
+        }
+        crate::rt::sleep(next).await;
+        pause = Some(next);
+    }
+}
+
+/// What holds the mount at `mount` open, as `lsof` names it (`<pid> <command>`, each), for kiln to say of a workspace
+/// that stays mounted; what kept `lsof` from saying, where it couldn't.
+#[cfg(unix)]
+async fn holders(mount: &str) -> String {
+    let mount = mount.to_owned();
+    let listed = crate::rt::blocking(move || Command::new("lsof").args(["-F", "pc", "--"]).arg(&mount).output()).await;
+    match listed {
+        Ok(Ok(out)) => {
+            let mut held = Vec::new();
+            let mut pid = String::new();
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                match line.split_at_checked(1) {
+                    Some(("p", p)) => p.clone_into(&mut pid),
+                    Some(("c", command)) => held.push(format!("{pid} {command}")),
+                    _ => {}
+                }
+            }
+            if held.is_empty() { "nothing lsof can see".to_owned() } else { held.join(", ") }
+        }
+        Ok(Err(e)) => format!("lsof couldn't run: {e}"),
+        Err(e) => format!("{e:#}"),
+    }
+}
+
+/// See the Unix arm: Windows has no `lsof`, and a WinFsp drive is the daemon's own to detach.
+#[cfg(not(unix))]
+async fn holders(_mount: &str) -> String {
+    "what holds a drive isn't asked on Windows".to_owned()
+}
+
+/// Workspace `m` gone: unmounted, its volume destroyed and its mount point removed. What it held is lost. A mount still in
+/// use is asked again for as long as `patience` (its agent's own end took that long: [`unmount_patiently`]); still in
+/// use then, it's let go lazily on Linux, and elsewhere stays mounted, kiln saying what holds it. Its volume is destroyed
+/// all the same: nothing is kept for an agent that has ended.
+pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
     let dir = PathBuf::from(&m.mount);
-    if !m.mount.is_empty()
-        && is_mount(&dir)
-        && let Err(e) = unmount(m.mount.clone()).await
-    {
-        tracing::info!(mount = %m.mount, error = %format!("{e:#}"), "an ended agent's workspace is still in use: let go lazily");
-        if let Err(e) = let_go(m.mount.clone()).await {
-            tracing::info!(mount = %m.mount, error = %format!("{e:#}"), "an ended agent's workspace stays mounted until what uses it ends");
+    if !m.mount.is_empty() && is_mount(&dir) {
+        let held = || is_mount(&dir);
+        if let Unmounted::StillHeld(refused) = unmount_patiently(|| unmount(m.mount.clone()), held, patience).await {
+            let holders = holders(&m.mount).await;
+            match let_go(m.mount.clone()).await {
+                Ok(()) => tracing::info!(mount = %m.mount, %refused, %holders, ?patience, "an ended agent's workspace was still in use past its agent's end: let go lazily"),
+                Err(e) => tracing::warn!(mount = %m.mount, %refused, %holders, ?patience, error = %format!("{e:#}"), "an ended agent's workspace stays mounted: what holds it holds it past its agent's end"),
+            }
         }
     }
     let volume = volume_id(&m.volume)?;
@@ -948,6 +1036,48 @@ mod tests {
             statement: Vec::new(),
             signature: None,
         })
+    }
+
+    /// W3 (the coordinator's macOS proof, 2026-11-18: an ended agent's volume stayed mounted, its first unmount refused
+    /// busy and none after it): an ended agent's mount is asked to go again while what used it is on its way out, for as
+    /// long as its agent's own end took, each pause as long as the last ask took and doubling; gone at the first ask that
+    /// takes it down, or once it's no longer mounted; still held after that, the last refusal comes back for kiln to say
+    /// with what holds it; asked once where nothing ran in it.
+    #[test]
+    fn w3_an_ended_agents_mount_is_asked_again_while_what_used_it_goes() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        crate::rt::block_on(async {
+            let asks = AtomicU32::new(0);
+            let busy_until = |free_at: u32| {
+                let n = asks.fetch_add(1, Ordering::Relaxed);
+                async move { if n < free_at { anyhow::bail!("Resource busy") } else { Ok(()) } }
+            };
+            let gone = unmount_patiently(|| busy_until(2), || true, Duration::from_secs(60)).await;
+            anyhow::ensure!(gone == Unmounted::Gone && asks.load(Ordering::Relaxed) == 3, "taken down at its third ask: {gone:?} after {asks:?}");
+            asks.store(0, Ordering::Relaxed);
+            let once = unmount_patiently(|| busy_until(u32::MAX), || true, Duration::ZERO).await;
+            anyhow::ensure!(once == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) == 1, "no patience: asked once: {once:?} after {asks:?}");
+            asks.store(0, Ordering::Relaxed);
+            let went = unmount_patiently(|| busy_until(u32::MAX), || false, Duration::from_secs(60)).await;
+            anyhow::ensure!(went == Unmounted::Gone && asks.load(Ordering::Relaxed) == 1, "no longer mounted: gone, asked no more: {went:?} after {asks:?}");
+            asks.store(0, Ordering::Relaxed);
+            let held = unmount_patiently(|| busy_until(u32::MAX), || true, Duration::from_millis(50)).await;
+            anyhow::ensure!(held == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) > 1, "asked again, then held: {held:?} after {asks:?}");
+            Ok(())
+        })
+    }
+
+    /// W2: what a machine lacks for workspaces is typed from Slates' own typed answer (`mount::available`), so a start
+    /// there is refused naming it; every missing piece Slates names has its kiln name.
+    #[test]
+    fn w2_what_a_machine_lacks_for_workspaces_is_typed_from_slates_answer() {
+        use slates_api::{MountFault, MountMissing};
+        let of = |missing| missing_of(&MountFault::Unsupported { missing });
+        assert_eq!(of(MountMissing::Fusermount3), WorkspaceMissing::Fusermount3);
+        assert_eq!(of(MountMissing::FuseDevice), WorkspaceMissing::FuseDevice);
+        assert_eq!(of(MountMissing::WinFsp), WorkspaceMissing::WinFsp);
+        assert_eq!(of(MountMissing::MountNfs), WorkspaceMissing::MountNfs);
+        assert_eq!(missing_of(&MountFault::NoNfsListener), WorkspaceMissing::Mount, "any other refusal: a mount kiln makes");
     }
 
     /// W1: kiln speaks the contract it was written against; a re-vendor that moves it fails here, beside the matches

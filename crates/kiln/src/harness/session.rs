@@ -2157,11 +2157,44 @@ fn grant_of(kind: &Kind, c: &Command) -> Option<super::lineage::Level> {
     Some(super::lineage::level(kind.id, mode).unwrap_or(super::lineage::Level::Ask))
 }
 
-/// Records the grant command `c` gives session `s` ([`grant_of`]) in its spec (carried as it's restarted, moved or taken
-/// up) and its state (which carries it to the server's copy: `Info::apply`), and has its workspace's write policy follow
-/// it (`workspace::follow_grant`).
+/// The grant permission control `id`, set to `value`, gives session `core` once its adapter has taken it (the person's
+/// rule, 2026-11-18; docs/agentic.md W6): Codex's approvals and sandbox name kiln's own mode for the pair, which its
+/// adapter computes as it takes them (never Codex's word on it), and an ACP agent's mode option names its mode in its own
+/// words; a pair or a word kiln can't place asks. None for a control that sets no permission. Kiln sends one only as a
+/// person asks: an agent's is refused before it's sent (`lineage::may_command`), so it's a person's grant, as their
+/// `set_mode` is ([`grant_of`]).
+pub(super) fn control_grant(kind: &Kind, core: &Core, id: &str, value: Option<&serde_json::Value>) -> Option<super::lineage::Level> {
+    let meta = serde_json::to_value(&core.meta).ok();
+    if !super::lineage::permission_control(meta.as_ref(), id) {
+        return None;
+    }
+    let placed = match kind.protocol {
+        Protocol::CodexAppServer => super::lineage::level(kind.id, &core.state.mode),
+        Protocol::Acp(_) => value.and_then(serde_json::Value::as_str).and_then(|v| super::lineage::level(kind.id, v)),
+        _ => None,
+    };
+    Some(placed.unwrap_or(super::lineage::Level::Ask))
+}
+
+/// The id and value of the control command `c` sets, when it's one ([`control_grant`] judges it once it's taken).
+fn control_set(c: &Command) -> Option<(String, Option<serde_json::Value>)> {
+    match c {
+        Command::Control { id, value } => Some((id.clone(), value.clone())),
+        _ => None,
+    }
+}
+
+/// Records the grant command `c` gives session `s` ([`grant_of`]) ([`record_grant`]).
 fn granted_by(s: &Session, kind: &Kind, c: &Command) {
-    let Some(level) = grant_of(kind, c) else { return };
+    if let Some(level) = grant_of(kind, c) {
+        record_grant(s, level);
+    }
+}
+
+/// Records grant `level` in session `s`'s spec (carried as it's restarted, moved or taken up) and its state (which
+/// carries it to the server's copy: `Info::apply`), and has its workspace's write policy follow it
+/// (`workspace::follow_grant`).
+fn record_grant(s: &Session, level: super::lineage::Level) {
     let workspace = {
         let mut spec = s.spec.lock();
         spec.launched = Some(level);
@@ -5608,16 +5641,27 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                     }
                                 }
                                 let c = match prepare(&files, c).await { Ok(command) => command, Err(error) => { preparation_failed(&s, error).await; continue; } };
-                                let mut core = s.core.lock();
-                                // No room on its machine for it to go to work: a skill run waits
-                                // for room (`super::limit`).
-                                if matches!(c, Command::SkillRun { .. }) && !core.has_room() {
-                                    for_room.push(c);
-                                }
-                                // Paused (or at its stop point), or no room on its machine for it
-                                // to go to work: a message waits in the queue.
-                                else if let Some(c) = super::pause::let_through(&mut core, c) {
-                                    adapter.command(&mut core, c);
+                                let control = control_set(&c);
+                                let granted = {
+                                    let mut core = s.core.lock();
+                                    // No room on its machine for it to go to work: a skill run waits
+                                    // for room (`super::limit`).
+                                    if matches!(c, Command::SkillRun { .. }) && !core.has_room() {
+                                        for_room.push(c);
+                                        None
+                                    }
+                                    // Paused (or at its stop point), or no room on its machine for it
+                                    // to go to work: a message waits in the queue.
+                                    else if let Some(c) = super::pause::let_through(&mut core, c) {
+                                        adapter.command(&mut core, c);
+                                        // A permission control a person set is their grant, as it stands once taken.
+                                        control.and_then(|(id, value)| control_grant(kind, &core, &id, value.as_ref()))
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(level) = granted {
+                                    record_grant(&s, level);
                                 }
                             }
                         }
@@ -6220,7 +6264,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     c => {
                         granted_by(&s, kind, &c);
-                        adapter.command(&mut s.core.lock(), c);
+                        let control = control_set(&c);
+                        let granted = {
+                            let mut core = s.core.lock();
+                            adapter.command(&mut core, c);
+                            control.and_then(|(id, value)| control_grant(kind, &core, &id, value.as_ref()))
+                        };
+                        if let Some(level) = granted {
+                            record_grant(&s, level);
+                        }
                     }
                 },
                 }

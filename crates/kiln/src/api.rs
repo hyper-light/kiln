@@ -6198,7 +6198,8 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
 
 /// The harnesses each machine offers; `?target=` narrows it to one ("local", "agent:<name>").
 /// Where agents can have workspaces of their own (docs/agentic.md, W), by target (`local`,
-/// `agent:<name>`): `{available, why_not?, mount?}` for the server and each connected runner.
+/// `agent:<name>`): `{available, why_not?, missing?}` for the server and each connected runner, `missing` what the
+/// machine lacks, typed (`kiln_ci::facts::WorkspaceMissing`).
 async fn harness_workspaces(hub: &Hub) -> Response {
     let mut out = serde_json::Map::new();
     let mut targets = vec!["local".to_owned()];
@@ -6206,7 +6207,7 @@ async fn harness_workspaces(hub: &Hub) -> Response {
     for t in targets {
         let v = match crate::harness::lineage::workspaces_on(hub, &t).await {
             Ok(()) => json!({"available": true}),
-            Err(why) => json!({"available": false, "why_not": why}),
+            Err(no) => json!({"available": false, "why_not": no.said, "missing": no.missing}),
         };
         out.insert(t, v);
     }
@@ -6875,7 +6876,7 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
         None => {}
         Some("folder") => body.spec.workspace = Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }),
         Some("volume") => {
-            crate::harness::lineage::workspaces_on(hub, &body.target).await.map_err(|why| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+            crate::harness::lineage::workspaces_on(hub, &body.target).await.map_err(|no| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
             body.spec.workspace = Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });
         }
         Some(other) => return Err(err(StatusCode::BAD_REQUEST, format!("a workspace is \"folder\" or \"volume\", not {other:?}"))),
@@ -6927,7 +6928,10 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let attention_kind = if body.spec.prompt.is_some() { "message" } else { "command" };
     let infos = hub.harness.open_as(hub, &body.target, body.spec, count, &body.ids).await.map_err(|e| {
-        let status = if e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
+        // Taken already, or its machine can't give it a workspace of its own (what it lacks named): a conflict with how
+        // things stand, not a bad request.
+        let conflict = e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() || e.downcast_ref::<crate::harness::lineage::NoWorkspace>().is_some();
+        let status = if conflict { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
         err(status, format!("{e:#}"))
     })?;
     // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`), and

@@ -268,9 +268,11 @@ instance carries `--instance <name>`.
 
 **W2 Every agent on a volume (the person's decision, 2026-11-18, kiln goal 01a1ec34…).** kiln's bare-metal
 engine runs every harness and agent on a Slates volume: a start that names no `workspace` gets **its own Slates
-volume** wherever its machine can make one, whoever starts it (a person, an agent, a plan, a goal stack), and works in
-its folder, saying why (`workspace.why_not`, the machine's own word), only where the machine can't. `workspace`:
-`volume` asks for one (refused, saying why, where the machine can't make one) and `folder` (the folder itself) is a
+volume**, whoever starts it (a person, an agent, a plan, a goal stack). Where its machine can't make one, the start is
+refused, naming what the machine lacks (`lineage::NoWorkspace`: `fusermount3`, `/dev/fuse`, WinFsp, `mount_nfs`, a
+kiln new enough, as the runner's facts type it, `workspaces.missing`); no agent runs in its plain folder instead, which
+would be a second path. `workspace`: `volume` asks for one (refused the same way where the machine can't make one) and
+`folder` (the folder itself) is a
 person's explicit choice, kept as made, in Mission control's composer (More options, where Own volume is now the
 choice made) and `agents.start`. Several agents on one folder each get their own. An agent started in another
 agent's folder on that agent's machine (a child placed in its parent's folder, above all) works in that agent's
@@ -332,7 +334,10 @@ agent's change of any permission control (Codex's approvals and sandbox, an ACP 
 (`State::launched`, which the session moves only on a `set_mode` it takes, and which carries it to the
 server's copy; its spec carries it through restarts and moves): kiln sends one only as a person asks,
 any mode, or as an agent may, so a person's raise of an agent's mode is a grant and its landings follow
-it, and a mode lowered by anyone is the grant from then. Its volume's write policy follows the grant
+it, and a mode lowered by anyone is the grant from then. So is a person's change of a permission control
+(Codex's approvals and sandbox: kiln's own mode for the pair, as its adapter computes it on taking the
+control, never Codex's word; an ACP agent's mode option: its mode word), which kiln sends only for a
+person (`session::control_grant`). Its volume's write policy follows the grant
 too (`workspace::follow_grant`, under kiln's launcher secret; a volume another agent owns keeps its
 owner's). A session an older kiln began has no launch level recorded and is held to its harness's own
 default.

@@ -4413,8 +4413,9 @@ impl Registry {
         let loc = Location::of_target(target);
         // Where it works, on its machine's host (the person's decision, 2026-11-18, kiln goal
         // 01a1ec34599974448aed2672bafaf9a2; docs/agentic.md W2): one whose folder lies in a workspace an agent there
-        // works in now works in that one; one whose start named none gets a volume of its own where its machine can make
-        // one, else its folder, saying why (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
+        // works in now works in that one; one whose start named none gets a volume of its own, and a machine that can't
+        // make one refuses the start, naming what it lacks (`lineage::NoWorkspace`), rather than run it in its plain
+        // folder: no second path (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
         // its boundary's sharing decides; a conversation taken up stays in the folder its harness keeps it by
         // (`resume`); and an agent started in a person's shell (`shell`) works beside them in the shell's folder, as the
         // composer shows it, since it takes the shell's environment, whose `PWD` names that folder.
@@ -4424,7 +4425,8 @@ impl Registry {
             if let Some(shared) = spec.cwd.as_deref().and_then(|cwd| crate::workspace::sharing(cwd, &live)) {
                 spec.workspace = Some(shared);
             } else if spec.workspace.is_none() && spec.resume.is_none() && spec.shell.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
-                spec.workspace = Some(crate::workspace::by_default(crate::harness::lineage::workspaces_on(hub, target).await));
+                crate::harness::lineage::workspaces_on(hub, target).await?;
+                spec.workspace = Some(crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() });
             }
         }
         // How much its launcher lets it do unasked, kept as given whatever it or its harness says later (the person's
@@ -4480,8 +4482,9 @@ impl Registry {
                         Ok(s) => s,
                         Err(e) => {
                             // What was made for it goes with it: asked again under its id, it's made anew.
+                            // Nothing ran in it, so nothing of it is on its way out: asked to go once.
                             if let Some(m) = made
-                                && let Err(gone) = crate::workspace::slates::remove(&m).await
+                                && let Err(gone) = crate::workspace::slates::remove(&m, std::time::Duration::ZERO).await
                             {
                                 tracing::warn!(volume = %m.volume, error = %format!("{gone:#}"), "the workspace of an agent that couldn't start stayed");
                             }

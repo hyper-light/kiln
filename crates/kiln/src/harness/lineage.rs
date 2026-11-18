@@ -1313,24 +1313,47 @@ impl Kept {
     }
 }
 
-/// Whether agents on `target` (`local`, `agent:<machine>`) can have workspaces of their own: its
-/// kiln asks its machine about folders, and its machine has Slates and can mount a volume.
-pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
+/// Why agents can't have workspaces of their own on a machine: what it lacks, typed, and the machine's own words for it.
+/// A start there is refused for it, whether it asked for a volume or named no workspace (docs/agentic.md W2): every agent
+/// on a machine's host works in a volume of its own, and none runs in its plain folder instead (no second path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoWorkspace {
+    /// What the machine lacks.
+    pub missing: crate::workspace::slates::WorkspaceMissing,
+    /// What it said of it.
+    pub said: String,
+}
+
+impl std::fmt::Display for NoWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.said)
+    }
+}
+
+impl std::error::Error for NoWorkspace {}
+
+/// Whether agents on `target` can have workspaces of their own: refused, typed, saying what that machine lacks
+/// ([`NoWorkspace`]).
+pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), NoWorkspace> {
+    use crate::workspace::slates::WorkspaceMissing;
     let facts = match target.strip_prefix("agent:") {
         None => crate::workspace::slates::facts().await,
         Some(machine) => {
             let caps = hub.instances.load().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
             if !caps {
-                return Err(format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)));
+                return Err(NoWorkspace { missing: WorkspaceMissing::KilnUpgrade, said: format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)) });
             }
             let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone()));
             match said {
                 Some(f) => f,
-                None => return Err(format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine))),
+                None => return Err(NoWorkspace { missing: WorkspaceMissing::Facts, said: format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine)) }),
             }
         }
     };
-    if facts.available { Ok(()) } else { Err(facts.why_not.unwrap_or_else(|| "Slates isn't installed there".to_owned())) }
+    if facts.available {
+        return Ok(());
+    }
+    Err(NoWorkspace { missing: facts.missing.unwrap_or(WorkspaceMissing::Unnamed), said: facts.why_not.unwrap_or_else(|| "Slates isn't installed there".to_owned()) })
 }
 
 /// Whether `target` names the machine `info` runs on.
@@ -1808,7 +1831,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
                 return Err(not_installed(hub, target, kind));
             }
             if volume {
-                workspaces_on(hub, target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+                workspaces_on(hub, target).await.map_err(|no| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
             }
             // Before anything starts, so its claims are let go: a fallback's pick is checked too.
             if isolated {

@@ -1059,9 +1059,9 @@ Every route needs `agents.run`. An agent is named by its id or the start of it (
 lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
 as are the goal stack's operations (`goals.*`); what ends, stops or steers an agent always names it.
 kiln's MCP server tells each agent its id. `workspace` is `volume` (a Slates volume of its own:
-what it gets when it names none, where its machine can make one) or `folder` (the folder itself);
-in a result it is `{kind, over, sub, volume, mount, owner, why_not}`: `owner` when it works in
-another agent's volume, `why_not` when it works in its folder because its machine can't make one,
+what it gets when it names none; a machine that can't make one refuses the start, 409, naming what
+it lacks) or `folder` (the folder itself, a person's explicit choice); in a result it is
+`{kind, over, sub, volume, mount, owner}`: `owner` when it works in another agent's volume,
 and `null` for one isolated in a microVM, a conversation taken up (`resume`), one started in a person's shell
 (`shell`), or one started before
 volumes were the default; `branch` and
@@ -1308,7 +1308,8 @@ agent's folder on that agent's machine works in that agent's volume:
   free: Slates mounts a WinFsp volume at a drive letter alone). Nothing needs installing but WinFsp:
   Slates is built into kiln (vendored, and driven through its library, never a `slates` command),
   and kiln's own executable runs its anchor and daemon (`kiln slates-role`). `GET
-  /api/harness/workspaces` says which machines can, and why each other can't. kiln keeps one Slates
+  /api/harness/workspaces` says which machines can, and why each other can't (`why_not`, and
+  `missing`: what it lacks, typed); an agent's start there is refused, naming it. kiln keeps one Slates
   instance, `kiln`, per machine (two shards).
 
 ## From an Agentfile, in a microVM of its own
