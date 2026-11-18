@@ -1225,6 +1225,7 @@ mod tests {
                 over: Some(over.to_string_lossy().into_owned()),
                 sub: String::new(),
                 made: Some(crate::workspace::slates::Made { mount: mine.to_string_lossy().into_owned(), ..Default::default() }),
+                ..Default::default()
             }),
             ..spec(cwd)
         };
