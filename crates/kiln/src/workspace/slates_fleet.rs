@@ -289,11 +289,14 @@ pub fn check_address(address: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A runner's word that its node is in the fleet: where its peers reach it, and the certificate it holds (DER, base64).
+/// A runner's word that its node is in the fleet: where its peers reach it, the certificate it holds (DER, base64), and,
+/// once its daemon serves, the fleet member id it serves as (K4: what a move of a volume to it names).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeAnnouncement {
     pub address: String,
     pub certificate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<u64>,
 }
 
 /// What a runner sends `POST /api/agents/slates-fleet/members`: its machine's proof (its current certificate, and a
@@ -305,14 +308,16 @@ pub struct Announce {
     pub node: NodeAnnouncement,
 }
 
-/// A node of the fleet as the server lists it: its machine, where it's reached, its failure domain and its
-/// certificate (DER, base64).
+/// A node of the fleet as the server lists it: its machine, where it's reached, its failure domain, its certificate
+/// (DER, base64), and the member id its daemon serves as, once its runner said it (K4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     pub machine: String,
     pub address: String,
     pub domain: u64,
     pub certificate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<u64>,
 }
 
 /// What the server answers: the fleet's name and its nodes whose runners are connected, by machine.
@@ -336,7 +341,7 @@ pub fn admit(pki: &Pki, ask: &Announce) -> anyhow::Result<Member> {
         dns_names(&der).is_some_and(|names| names == [FLEET.to_owned(), scope_name(FLEET, domain)]),
         "that certificate isn't {machine}'s node's: it doesn't name the fleet {FLEET} for {machine}'s domain"
     );
-    Ok(Member { machine, address: ask.node.address.clone(), domain, certificate: ask.node.certificate.clone() })
+    Ok(Member { machine, address: ask.node.address.clone(), domain, certificate: ask.node.certificate.clone(), member: ask.node.member })
 }
 
 /// The fleet's nodes as their runners last said, by machine (one each: a runner's newer word replaces its older), held
@@ -363,7 +368,7 @@ impl Directory {
 pub fn announcement(identity: &NodeIdentity, address: &str) -> anyhow::Result<NodeAnnouncement> {
     check_address(address)?;
     let der = std::fs::read(&identity.certificate).with_context(|| format!("read {}", identity.certificate.display()))?;
-    Ok(NodeAnnouncement { address: address.to_owned(), certificate: b64(&der) })
+    Ok(NodeAnnouncement { address: address.to_owned(), certificate: b64(&der), member: None })
 }
 
 /// The runner's side of discovery (module docs): its node's word, with `machine`'s proof, to the server at
@@ -519,9 +524,17 @@ pub fn checked(manifest: &Path, machine: &str) -> anyhow::Result<slates_api::rol
     Ok(selection)
 }
 
-/// A runner's start (module docs): the fleet selection its machine's instance starts with, when the operator chose it;
-/// none when not.
-pub async fn join(source: &Source) -> anyhow::Result<Option<slates_api::role::FleetSelection>> {
+/// What a runner's start joined with ([`join`]): the fleet selection its instance starts with, and its node's word, said
+/// again with its member id once its daemon serves ([`report_member`]).
+#[derive(Debug, Clone)]
+pub struct Joined {
+    pub selection: slates_api::role::FleetSelection,
+    pub node: NodeAnnouncement,
+}
+
+/// A runner's start (module docs): what its machine's instance joins the fleet with, when the operator chose it; none
+/// when not.
+pub async fn join(source: &Source) -> anyhow::Result<Option<Joined>> {
     let Some(place) = ask_place(source).await? else {
         return Ok(None);
     };
@@ -531,7 +544,14 @@ pub async fn join(source: &Source) -> anyhow::Result<Option<slates_api::role::Fl
     let manifest = write_manifest(&source.dir, &identity, &source.machine_name, &members, place.f)?;
     let selection = checked(&manifest, &source.machine_name)?;
     tracing::info!(manifest = %manifest.display(), nodes = members.members.len(), f = place.f, "this runner's Slates joins kiln's Slates fleet");
-    Ok(Some(selection))
+    Ok(Some(Joined { selection, node }))
+}
+
+/// The runner's word said again with the member id its daemon serves as since this start (K4): a daemon started again
+/// is a new member, so its runner says it at every start.
+pub async fn report_member(source: &Source, node: &NodeAnnouncement, member: u64) -> anyhow::Result<()> {
+    let node = NodeAnnouncement { member: Some(member), ..node.clone() };
+    discover(&source.server_url, &source.ca_pem, &source.machine_name, &source.machine, &node).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -843,6 +863,27 @@ mod tests {
         // This node's key replaced by another's: Slates' start would refuse it, and so does the check, first.
         std::fs::copy(scratch.path().join("bench-b").join(KEY), dir.join(KEY))?;
         assert!(checked(&manifest, "bench-a").is_err());
+        Ok(())
+    }
+
+    /// K4: a runner's word carries the member id its daemon serves as, once it serves, and the server's list carries it
+    /// for a move to name; a newer word replaces it (a daemon started again is a new member, said again once it serves).
+    #[test]
+    fn k4_a_nodes_member_id_rides_its_runners_word() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
+        let directory = Directory::default();
+        let (leaf, identity) = node(&pki, scratch.path(), "bench-a")?;
+        let mut said = word("bench-a", &leaf, &identity, "10.0.0.1:17300")?;
+        let member_of = |d: &Directory| d.members(|_| true).members.first().and_then(|m| m.member);
+        directory.admit(admit(&pki, &said)?);
+        assert_eq!(member_of(&directory), None, "not serving yet");
+        said.node.member = Some(42);
+        directory.admit(admit(&pki, &said)?);
+        assert_eq!(member_of(&directory), Some(42));
+        said.node.member = None;
+        directory.admit(admit(&pki, &said)?);
+        assert_eq!(member_of(&directory), None, "started again: said again once it serves");
         Ok(())
     }
 }
