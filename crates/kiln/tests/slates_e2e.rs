@@ -650,7 +650,7 @@ pub fn written(answer: &Value) -> Result<(), String> {
 /// said refusing it.
 pub fn op(f: &vm_e2e::Fixture, name: &str, input: &Value) -> anyhow::Result<Value> {
     let (code, body) = common::http_within(f.port, "POST", &format!("/api/ops/{name}"), &f.admin, Some(input), OP_WITHIN)?;
-    anyhow::ensure!(code == 200, "{name} {input}: {code} {body}\n{}", f.runner_log());
+    anyhow::ensure!(code == 200, "{name} {input}: {code} {body}\n{}\n{}", f.runner_log(), slates_log(&f.dir));
     Ok(serde_json::from_str(&body)?)
 }
 
@@ -760,7 +760,7 @@ pub fn drive(d: &Drive<'_>) -> anyhow::Result<()> {
         let project = Project::new(&d.dir.join(mode.word()))?;
         drive_agent(d, &project, mode, &mut looks)?;
     }
-    looks.check().map_err(|e| anyhow::anyhow!("{:?}: {e}\n{}", d.engine, d.f.runner_log()))
+    looks.check().map_err(|e| anyhow::anyhow!("{:?}: {e}\n{}\n{}", d.engine, d.f.runner_log(), slates_log(d.dir)))
 }
 
 /// The runner links the Slates this checkout vendors, at its pinned commit ([`links_the_pin`]).
@@ -787,7 +787,7 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     let (info, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
     let lines = vm_e2e::said(&events);
     let what = format!("{engine:?} session {id} ({mode:?})");
-    let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}", f.runner_log());
+    let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}", f.runner_log(), slates_log(dir));
     check_edits(&lines, &probe).map_err(fail)?;
     let made = workspace_of(&info).map_err(fail)?;
     anyhow::ensure!(canonical(Path::new(&made.over)) == project.path(), "{what}: its volume lies over {}, not its project {}", made.over, project.dir);
@@ -851,6 +851,17 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
         mount_gone(&canonical(Path::new(mount))).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
     }
     Ok(())
+}
+
+/// How many of the end lines of each Slates log a failed drive says.
+pub const SLATES_LOG_LINES: usize = 80;
+
+/// The end of each Slates instance's own log under the drive's folder `dir` (kiln's `<state>/slates-anchor.log`: its
+/// anchor's and its daemon's words, a runner's state folder each), so a drive that fails says what Slates said.
+pub fn slates_log(dir: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(dir) else { return String::new() };
+    let logs = entries.flatten().map(|e| e.path().join("slates-anchor.log")).filter(|p| p.is_file());
+    logs.map(|p| format!("--- the end of {} ---\n{}", p.display(), common::tail(&p, SLATES_LOG_LINES))).collect::<Vec<_>>().join("\n")
 }
 
 /// Waits, a bounded while ([`OP_WITHIN`]), for the Slates mount at `at` to leave the host's table, as an ended session's
@@ -1051,6 +1062,23 @@ mod checks {
         assert!(links_the_pin(Some("slates 0b850153f"), Some("dbf53afa2")).is_err_and(|e| e.contains("not the Slates this kiln pins")));
         assert!(links_the_pin(said.as_deref(), None).is_err_and(|e| e.contains("vendors none")));
         assert_eq!(linked_slates(&json!({"agents": [{"name": "m1", "facts": {"workspaces": {"slates": "slates x"}}}]}), "m1").as_deref(), Some("slates x"));
+    }
+
+    /// A failed drive says the end of each Slates log under its folder, a runner's state folder each, and nothing where
+    /// none is.
+    #[test]
+    fn g266_a_failed_drive_says_the_end_of_each_slates_log_under_its_folder() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(slates_log(dir.path()), "", "no runner state, no log");
+        std::fs::create_dir_all(dir.path().join("slatesvm-state"))?;
+        std::fs::create_dir_all(dir.path().join("project"))?;
+        let lines: Vec<String> = (0..SLATES_LOG_LINES + 20).map(|n| format!("anchor line {n}")).collect();
+        std::fs::write(dir.path().join("slatesvm-state").join("slates-anchor.log"), lines.join("\n"))?;
+        let said = slates_log(dir.path());
+        assert!(said.starts_with("--- the end of ") && said.contains("slatesvm-state"), "{said}");
+        assert!(said.contains(&format!("anchor line {}", SLATES_LOG_LINES + 19)) && !said.contains("anchor line 19\n"), "only its end: {said}");
+        assert_eq!(said.lines().count(), SLATES_LOG_LINES + 1, "a header and the end lines");
+        Ok(())
     }
 
     /// Drift is read whether kiln lists it as Slates' lines or as its typed drifts.
