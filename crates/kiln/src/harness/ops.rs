@@ -3130,7 +3130,7 @@ for line in sys.stdin:
             hub.put_agent(crate::hub::tests::live_runner("old", "linux", "x86_64"));
             let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), ..Default::default() };
             let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
-            let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<lineage::NoWorkspace>());
+            let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
             anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "{refused:?}");
             Ok(())
         })
