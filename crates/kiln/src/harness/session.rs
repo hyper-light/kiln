@@ -1809,6 +1809,11 @@ pub struct Session {
     ended: std::sync::atomic::AtomicBool,
     ended_changed: crate::rt::Changed,
     pub(crate) owned_reach: Mutex<std::collections::HashMap<String, std::sync::Arc<crate::reach::owned::Run>>>,
+    /// Its environment (docs/agents.md, "Environments"), its secrets' values opened: taken out of its
+    /// spec as it opens (`Spec::agentenv`), replaced by `Command::Agentenv`, and given to its harness
+    /// at its every start here (a restart, a crash's). In this process's memory alone: no record of
+    /// it (`resume_spec`, the host's record, a move, a hand-over) carries it.
+    agentenv: Mutex<Option<super::agentenv::Resolved>>,
 }
 
 impl Session {
@@ -2100,6 +2105,26 @@ impl Session {
         s.max_subagents = core.state.max_subagents;
         s
     }
+}
+
+/// An environment as a session's timeline names it; none, the machine's user's.
+fn agentenv_words(agentenv: Option<&super::agentenv::Resolved>) -> String {
+    match agentenv {
+        Some(e) => format!("Environment {} (version {})", e.name, e.version),
+        None => "The machine's user's environment".to_owned(),
+    }
+}
+
+/// Its environment's `machine` variables the machine's user hasn't (`user`), said in its timeline as
+/// its harness starts with each left unset (docs/agents.md, "What one is").
+fn unset_machine_vars(s: &Session, env: &super::agentenv::Resolved, user: &[(String, String)]) {
+    let missing = super::agentenv::missing(env, user);
+    if missing.is_empty() {
+        return;
+    }
+    let names: Vec<String> = missing.iter().map(|(k, of)| if k == of { k.clone() } else { format!("{k} (from {of})") }).collect();
+    let text = format!("This machine's user has no {}: environment {} leaves {} unset", names.join(", "), env.name, if missing.len() == 1 { "it" } else { "them" });
+    s.core.lock().upsert(&format!("agentenv-unset:{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text });
 }
 
 /// Stop what it left running that kiln took back over: one (its task id), or all of them.
@@ -2546,7 +2571,7 @@ fn named_ahead(meta: &mut super::model::Meta, kind: &Kind, model: Option<&str>) 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
 /// previous image of this process handed over).
 #[allow(clippy::too_many_arguments)]
-fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
+fn begin(id: String, mut spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
     core.session_id.clone_from(&id);
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
@@ -2629,6 +2654,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         starts: Vec::new(),
     };
     let (ctl, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+    // Its environment, out of its spec before anything can record it.
+    let agentenv = spec.agentenv.take();
     let s = Arc::new(Session {
         id,
         spec: Mutex::new(spec),
@@ -2646,6 +2673,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         ended: std::sync::atomic::AtomicBool::new(false),
         ended_changed: crate::rt::Changed::new(),
         owned_reach: Mutex::new(std::collections::HashMap::new()),
+        agentenv: Mutex::new(agentenv),
     });
     let run = Arc::clone(&s);
     // On the shard that owns it, where its lane runs and its frames are taken (runner-fan): its pipes are served there too
@@ -3545,6 +3573,8 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &crate::m
             super::core::Effect::AllowBypass => s.spec.lock().allow_bypass = true,
             super::core::Effect::Run { job, args } => {
                 let mut spec = s.spec.lock().clone();
+                // Its harness's own CLI runs as its harness does: with its environment.
+                spec.agentenv = s.agentenv.lock().clone();
                 let tx = done.clone();
                 // Nothing of an isolated session's harness runs on this host (kiln goal 3cd82843, r734: a stand-in
                 // antigravity in a microVM had the host's `agy models` and `agy --version` run): its CLI's answer is its
@@ -5175,6 +5205,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             on_change();
         }
         let mut spec = if first { s.spec.lock().clone() } else { s.resume_spec() };
+        // Its environment, for this start alone: this copy of its spec goes nowhere else.
+        spec.agentenv = s.agentenv.lock().clone();
         if let Some(at) = rewind_to.take() {
             spec.resume_at = at;
         }
@@ -5221,11 +5253,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
                 let isolated = spec.isolation.is_some();
-                // It runs with its user's login shell's environment (its PATH, and an API key it
-                // signs in by: `kinds::set_env`): that shell is asked first, unless what it said is
-                // kept (until one of its startup files changes).
-                if blocked.is_none() && !isolated {
-                    crate::reach::serve::login_env().await;
+                // It runs with its user's environment as it is now (its PATH, and an API key it signs
+                // in by: `kinds::set_env`), its login shell's among it (asked, unless what it said is
+                // kept until one of its startup files changes); and its environment's `machine`
+                // variables are read from it, in a microVM too. One its user hasn't is said.
+                if blocked.is_none() && (!isolated || spec.agentenv.is_some()) {
+                    let user = super::agentenv::refresh().await;
+                    if let Some(env) = &spec.agentenv {
+                        unset_machine_vars(&s, env, &user.vars);
+                    }
                 }
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).
                 if blocked.is_none() && !isolated {
@@ -5434,6 +5470,24 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 if s.core.lock().state.status == Status::Exited {
                                     rewind_to = Some(None);
                                 }
+                            }
+                            // Its environment replaced: its harness takes it as it starts, so it starts again
+                            // (the conversation goes on) once nothing is under way, unless told to wait.
+                            Command::Agentenv { agentenv, restart } => {
+                                let words = agentenv_words(agentenv.as_ref());
+                                *s.agentenv.lock() = agentenv;
+                                let mut core = s.core.lock();
+                                let text = if restart {
+                                    let when = if settled_core(&core) { "now" } else { "once this turn ends" };
+                                    core.hold = true;
+                                    reloading = true;
+                                    format!("{words} — {} starts again with it {when}; the conversation goes on", kind.name)
+                                } else {
+                                    format!("{words} — {} takes it when it next starts", kind.name)
+                                };
+                                core.upsert(&format!("agentenv:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                                drop(core);
+                                on_change();
                             }
                             Command::ForceStop => {
                                 // You ended the turn: a restart before it's back doesn't take it up again.
@@ -6097,6 +6151,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         }
                         start_asked = true;
                     }
+                    // Its environment replaced while its harness is down: it starts with it, now where
+                    // asked to (as a restart), else at its next start.
+                    Command::Agentenv { agentenv, restart } => {
+                        let text = format!("{} — {} starts with it {}", agentenv_words(agentenv.as_ref()), kind.name, if restart { "now" } else { "when it next starts" });
+                        *s.agentenv.lock() = agentenv;
+                        s.core.lock().upsert(&format!("agentenv:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                        on_change();
+                        if restart {
+                            if s.core.lock().has_room() {
+                                break;
+                            }
+                            start_asked = true;
+                        }
+                    }
                     Command::Snapshot => {
                         for u in s.snapshot() {
                             let _ = sink.send((s.id.clone(), u)).await;
@@ -6477,6 +6545,7 @@ mod tests {
             ended: std::sync::atomic::AtomicBool::new(false),
             ended_changed: crate::rt::Changed::new(),
             owned_reach: Mutex::new(std::collections::HashMap::new()),
+            agentenv: Mutex::new(None),
         };
         (s, rx)
     }
@@ -7407,6 +7476,76 @@ for line in sys.stdin:
             let words: Vec<&str> = given.iter().filter_map(|p| p.pointer("/prompt/0/text").and_then(Value::as_str)).collect();
             anyhow::ensure!(words.first() == Some(&PICK_UP), "its agent was given {given:?}");
             anyhow::Ok(())
+        })
+    }
+
+    /// docs/agents.md, "Environments": a session's environment, its secret's value among it, is taken
+    /// out of its spec as it opens, so nothing that records or moves it carries it (its spec, what
+    /// resumes it, the host's record); its harness starts with it, and with the one a person applies
+    /// (`Command::Agentenv`), started again on its conversation for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_sessions_environment_is_its_harnesss_in_memory_alone_and_applied_by_a_restart() -> anyhow::Result<()> {
+        use super::super::agentenv::{Base, Resolved, Set};
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let program = dir.path().join("acp.py");
+            let seen = dir.path().join("seen");
+            // Says the variable it started with, then serves ACP as an idle agent does.
+            std::fs::write(&program, r##"#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["ACP_SEEN"], "a") as f:
+    f.write(os.environ.get("AGENTENV_PROBE", "-") + "\n")
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+    elif method in ("session/new", "session/load"):
+        result = {"sessionId": "s1"} if method == "session/new" else {}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"##)?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+            let env = |value: &str| Resolved { id: "e1".into(), name: "work".into(), version: 1, base: Base::User, vars: vec![("AGENTENV_PROBE".into(), Set::Value(value.into()))] };
+            let (sink, updates) = async_channel::unbounded();
+            let files = attachment_files(dir.path().to_owned());
+            let s = start(crate::util::new_id(), Spec {
+                kind: "gemini".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
+                reach: Some("off".into()), env: vec![("ACP_SEEN".into(), seen.to_string_lossy().into_owned())], agentenv: Some(env("fake-secret-1")),
+                ..Spec::default()
+            }, sink, Arc::new(|| {}), files)?;
+            let lines = || std::fs::read_to_string(&seen).unwrap_or_default().lines().map(str::to_owned).collect::<Vec<_>>();
+            let mut was = Status::Starting;
+            // Until its harness has said it started `n` times and the session is idle.
+            let mut started = async |n: usize| -> anyhow::Result<()> {
+                while lines().len() < n || was != Status::Idle {
+                    if let (_, Update::State { state }) = updates.recv().await? {
+                        was = state.status;
+                    }
+                }
+                Ok(())
+            };
+            let result = crate::rt::timeout(Duration::from_secs(60), async {
+                started(1).await?;
+                anyhow::ensure!(lines() == ["fake-secret-1"], "its harness started with {:?}", lines());
+                // Nothing that records it, or goes with it, has its environment.
+                let spec = serde_json::to_string(&*s.spec.lock())?;
+                let kept = [spec, serde_json::to_string(&s.resume_spec())?];
+                anyhow::ensure!(kept.iter().all(|k| !k.contains("fake-secret") && !k.contains("agentenv")), "{kept:?}");
+                anyhow::ensure!(s.command(Command::Agentenv { agentenv: Some(env("fake-secret-2")), restart: true }), "the session took no command");
+                started(2).await?;
+                anyhow::ensure!(lines() == ["fake-secret-1", "fake-secret-2"], "started again with {:?}", lines());
+                anyhow::ensure!(s.resume_spec().agentenv.is_none() && !serde_json::to_string(&s.resume_spec())?.contains("fake-secret"));
+                anyhow::Ok(())
+            }).await;
+            s.close();
+            let _ = crate::rt::timeout(Duration::from_secs(10), async { while !matches!(updates.recv().await, Ok((_, Update::Closed)) | Err(_)) {} }).await;
+            result.map_err(|_| anyhow::anyhow!("timed out; its harness saw {:?}, the session {was:?}", lines()))?
         })
     }
 
