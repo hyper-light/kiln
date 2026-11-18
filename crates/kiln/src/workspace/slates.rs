@@ -512,10 +512,37 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     if m.mount.is_empty() {
         return Ok(());
     }
-    if is_mount(Path::new(&m.mount)) {
+    if mounted_as_made(m).await? {
         return Ok(());
     }
     mount_at(m).await
+}
+
+/// Whether workspace `m`'s own volume is mounted where it says: its folder holds a mount (Unix: no other workspace
+/// mounts at a workspace's folder); on Windows its drive letter holds a Slates drive that its volume reports
+/// ([`holds_own_drive`]), since a letter is any workspace's to take.
+async fn mounted_as_made(m: &Made) -> anyhow::Result<bool> {
+    let point = PathBuf::from(&m.mount);
+    if !cfg!(windows) {
+        return Ok(is_mount(&point));
+    }
+    let volume = volume_id(&m.volume)?;
+    let own = call("status", move |i| i.status(volume)).await?.mounts;
+    Ok(holds_own_drive(is_mount(&point), &own, &m.mount))
+}
+
+/// Whether drive letter `point` holds its workspace's own volume (Windows): the drive is Slates' (`drive_is_slates`)
+/// and the volume's own mounts as Slates reports them (`own`) name it. A letter is any workspace's to take, so a drive
+/// this volume left behind and another workspace's took since is never taken for its own: neither used as its mount at
+/// a restart nor taken down at its end.
+fn holds_own_drive(drive_is_slates: bool, own: &[slates_api::MountReport], point: &str) -> bool {
+    drive_is_slates && attachment_at(own, point).is_some()
+}
+
+/// The attachment of `own` (a volume's mounts, as Slates reports them) that serves drive letter `point`, in either
+/// case: what to detach to take that drive down, and nothing of another volume's.
+fn attachment_at(own: &[slates_api::MountReport], point: &str) -> Option<u64> {
+    own.iter().find(|mount| mount.path.eq_ignore_ascii_case(point)).map(|mount| mount.attachment)
 }
 
 /// Mounts workspace `m` at its point, which holds nothing of it now: a folder made for it (Unix), or a drive letter
@@ -548,23 +575,26 @@ fn another_letter_may_serve(refused: &slates_api::Error, taken_now: bool) -> boo
     taken_now || matches!(refused, slates_api::Error::Host(slates_api::HostFault::Target(slates_api::TargetRefusal::DriveLetterTaken)))
 }
 
-/// Takes the mount at `path` away: with the OS's own unmount, which needs no daemon (Unix); or by
-/// ending its attachment (Windows, where the drive is the daemon's own). On Windows Slates finds
-/// the drive among its volumes' mounts, and names each volume it couldn't ask (one its recovery
-/// couldn't rebuild): those are logged, since their mounts are unknown.
-async fn unmount(path: String) -> anyhow::Result<()> {
+/// Takes workspace `m`'s mount away: with the OS's own unmount, which needs no daemon (Unix); or by
+/// ending its own volume's attachment at its drive (Windows, where the drive is the daemon's own:
+/// [`attachment_at`]). Never Slates' `Instance::unmount` by the letter there, which detaches
+/// whichever volume reports the letter first: another workspace's, where this one's drive went and
+/// another's took the letter since.
+async fn unmount(m: &Made) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
+        let path = m.mount.clone();
         crate::rt::blocking(move || slates_api::mount::unmount(&path)).await?.map_err(|e| anyhow::anyhow!("Slates' unmount: {e}"))
     }
     #[cfg(not(unix))]
     {
-        let unmounted = call("unmount", move |i| i.unmount(&path)).await?;
-        if !unmounted.unreported.is_empty() {
-            let unreported: Vec<String> = unmounted.unreported.iter().map(ToString::to_string).collect();
-            tracing::info!(unreported = %unreported.join("; "), "Slates unmounted a workspace's drive but couldn't ask every volume for its mounts");
-        }
-        Ok(())
+        let volume = volume_id(&m.volume)?;
+        let point = m.mount.clone();
+        call("unmount", move |i| match attachment_at(&i.status(volume)?.mounts, &point) {
+            Some(attachment) => i.detach(attachment),
+            None => Ok(()),
+        })
+        .await
     }
 }
 
@@ -654,16 +684,17 @@ async fn holders(_mount: &str) -> String {
     "what holds a drive isn't asked on Windows".to_owned()
 }
 
-/// Workspace `m` gone: unmounted, its volume destroyed and its mount point removed. What it held is lost. A mount still in
+/// Workspace `m` gone: unmounted (on Windows only a drive its own volume reports, [`mounted_as_made`]), its volume
+/// destroyed and its mount point removed. What it held is lost. A mount still in
 /// use is asked again for as long as `patience` (its agent's own end took that long: [`unmount_patiently`]); still in
 /// use then, it's let go on a Unix host, detached on Linux and forced on macOS ([`let_go`]), kiln saying what held it,
 /// and a Windows drive stays mounted, kiln saying so. Its volume is destroyed all the same: nothing is kept for an agent
 /// that has ended.
 pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
     let dir = PathBuf::from(&m.mount);
-    if !m.mount.is_empty() && is_mount(&dir) {
+    if !m.mount.is_empty() && mounted_as_made(m).await? {
         let held = || is_mount(&dir);
-        if let Unmounted::StillHeld(refused) = unmount_patiently(|| unmount(m.mount.clone()), held, patience).await {
+        if let Unmounted::StillHeld(refused) = unmount_patiently(|| unmount(m), held, patience).await {
             let holders = holders(&m.mount).await;
             match let_go(m.mount.clone()).await {
                 Ok(how) => tracing::info!(mount = %m.mount, %refused, %holders, ?patience, let_go = ?how, "an ended agent's workspace was still in use past its agent's end: let go"),
@@ -1154,6 +1185,24 @@ mod tests {
         assert!(another_letter_may_serve(&not_allowed, true), "a drive took the letter meanwhile: the next one");
         let refused = Error::Host(HostFault::Target(TargetRefusal::MountRefused { errno: Some(5) }));
         assert!(!another_letter_may_serve(&refused, false));
+    }
+
+    /// W1 (kiln goal 01a1ec34599974448aed2672bafaf9a2, Windows): a drive letter is any workspace's to take, so a
+    /// workspace's drive is its own only when its own volume reports a mount there. A Slates drive at its letter that its
+    /// volume doesn't report (its drive went, and another workspace's took the letter since) is neither used as its
+    /// mount at a restart nor taken down at its end; the attachment its end detaches is its volume's own at that letter,
+    /// in either case. Before, a Slates drive at the letter was taken as the workspace's whatever volume it served.
+    #[test]
+    fn w1_a_windows_workspaces_drive_is_its_own_only_when_its_volume_reports_it() {
+        let at = |attachment, path: &str| slates_api::MountReport { attachment, path: path.to_owned() };
+        let own = [at(7, "J:"), at(9, "K:")];
+        assert!(holds_own_drive(true, &own, "K:"));
+        assert!(holds_own_drive(true, &own, "k:"), "a drive letter in either case");
+        assert!(!holds_own_drive(true, &[at(7, "J:")], "K:"), "a Slates drive its volume doesn't report: another workspace's");
+        assert!(!holds_own_drive(true, &[], "K:"));
+        assert!(!holds_own_drive(false, &own, "K:"), "its volume's record of a drive that isn't there now");
+        assert_eq!(attachment_at(&own, "k:"), Some(9), "its own attachment at the letter");
+        assert_eq!(attachment_at(&own, "L:"), None, "none of its own there: nothing to detach");
     }
 
     /// W2: what a machine lacks for workspaces is typed from Slates' own typed answer (`mount::available`), so a start

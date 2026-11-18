@@ -188,14 +188,7 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     let cwd = PathBuf::from(crate::harness::session::resolve_cwd(spec.cwd.as_deref()));
     anyhow::ensure!(cwd.is_dir(), "{} isn't a folder on this machine", cwd.display());
     // The whole repository, so git works in it as it does in the folder; the agent where it was asked to be.
-    let (over, sub) = match git::facts(&cwd).await {
-        Ok(f) => {
-            let top = PathBuf::from(&f.top);
-            let sub = cwd.strip_prefix(&top).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-            (top, sub)
-        }
-        Err(_) => (cwd.clone(), String::new()),
-    };
+    let (over, sub) = repo_place(&cwd).await;
     // The whole id: kiln's ids start with the time they were made, so two agents started together
     // share their beginnings (Slates' names are unique on the machine).
     let whole: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
@@ -218,6 +211,27 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     }
     spec.workspace = Some(Workspace { kind: w.kind, over: Some(over.to_string_lossy().into_owned()), sub, made: Some(made), ..Workspace::default() });
     Ok(())
+}
+
+/// The folder a workspace for `cwd` is laid over, and `cwd`'s place beneath it (a workspace's `sub`): its repository's
+/// top and git's own place for it ([`git::prefix`], in this system's separators), or `cwd` itself where no repository
+/// holds it. The place is git's, never `cwd` with the top taken off its front: git names the top by its real path, which
+/// a path spelled with a symbolic link, or on Windows with a short 8.3 name (a runner's `%TEMP%`) or a name in another
+/// case, does not share, and the agent then started at its volume's top instead of in its folder.
+async fn repo_place(cwd: &Path) -> (PathBuf, String) {
+    match git::facts(cwd).await {
+        Ok(f) => {
+            let sub = git::prefix(cwd).await.map(|prefix| beneath_top(&prefix)).unwrap_or_default();
+            (PathBuf::from(&f.top), sub)
+        }
+        Err(_) => (cwd.to_path_buf(), String::new()),
+    }
+}
+
+/// git's place for a folder (`crates/kiln/`, [`git::prefix`]) as a path in this system's separators (`crates\kiln` on
+/// Windows), empty at the top.
+fn beneath_top(prefix: &str) -> String {
+    prefix.split('/').filter(|name| !name.is_empty()).collect::<PathBuf>().to_string_lossy().into_owned()
 }
 
 /// The volume a start made for its agent alone, which goes with it when it can't start after all: none when its
@@ -527,6 +541,38 @@ mod tests {
 
     fn volume_at(volume: &str, mount: &str, over: &str) -> Workspace {
         Workspace { kind: "volume".into(), over: Some(over.into()), made: Some(made(volume, mount)), ..Workspace::default() }
+    }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2; Windows): an agent's folder keeps its place in its repository on its
+    /// volume however its path is spelled. git names the repository's top by its real path, so a folder spelled through
+    /// a symbolic link (Unix) or with a name in another case (Windows; a runner's `%TEMP%` in its short 8.3 form is the
+    /// same case) had no place beneath it, and the agent started at its volume's top instead of in its folder. Do: a
+    /// repository with `src/deep`, reached by another spelling of its top. Expect `src/deep` beneath git's top.
+    #[test]
+    fn w3_an_agents_folder_keeps_its_place_in_its_repository_however_its_path_is_spelled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("repo");
+        std::fs::create_dir_all(real.join("src").join("deep"))?;
+        let no_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let made = std::process::Command::new("git").args(["init", "-q"]).current_dir(&real).env("GIT_CONFIG_GLOBAL", no_config).env("GIT_CONFIG_NOSYSTEM", "1").status()?;
+        anyhow::ensure!(made.success(), "git init: {made}");
+        // The same folder spelled otherwise: through a link on Unix, its name in capitals on Windows.
+        #[cfg(unix)]
+        let spelled = {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link)?;
+            link
+        };
+        #[cfg(not(unix))]
+        let spelled = dir.path().join("REPO");
+        let deep = spelled.join("src").join("deep");
+        let (over, sub) = crate::rt::block_on(async move { Ok(repo_place(&deep).await) })?;
+        anyhow::ensure!(sub == Path::new("src").join("deep").to_string_lossy(), "its place beneath {}: {sub:?}", over.display());
+        let same = std::fs::canonicalize(over.join(&sub))? == std::fs::canonicalize(real.join("src").join("deep"))?;
+        anyhow::ensure!(same, "{} beneath {} is the folder asked for", sub, over.display());
+        assert_eq!(beneath_top(""), "", "at the top");
+        assert_eq!(beneath_top("crates/kiln/"), Path::new("crates").join("kiln").to_string_lossy());
+        Ok(())
     }
 
     /// W2: an agent whose folder lies in another agent's volume works in that volume, at its place there, the volume's
