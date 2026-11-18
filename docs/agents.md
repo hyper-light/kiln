@@ -1279,17 +1279,17 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   case nothing is written until they agree. Only a person writes it: an agent's `agents.land` with
   a plan is refused. Slates takes a person's go-ahead from kiln on macOS and Windows; not on Linux
   yet (Slates can't take a grant from outside its anchor's own session there), and the plan says so.
-  Slates' command line leaves out one path per landing, so kiln leaves out `.git` and writes only
-  what git sees changed: when the agent's build output or dependencies would be written too, the
-  plan says to put the work up for review instead.
+  kiln leaves out `.git` and writes only what git sees changed: when the agent's build output or
+  dependencies would be written too, the plan says to put the work up for review instead.
 - **How long it lasts.** As long as the agent: ended for good, its volume goes with it. It outlives
   the runner's restarts and upgrades (Slates' anchor runs apart from the runner: its own systemd
   user unit on Linux), but not the machine's (Slates keeps volumes in memory). An agent in one
   doesn't move to another machine yet.
-- **Where it can.** A machine with Slates installed (`slates` on `PATH`, or kiln's own under the
-  runner's state directory) and a mount it can make: FUSE through `fusermount3` on Linux, NFS on
-  loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
-  can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
+- **Where it can.** Any machine with a mount it can make: FUSE through `fusermount3` on Linux, NFS
+  on loopback on macOS. Nothing needs installing: Slates is built into kiln (vendored, and driven
+  through its library, never a `slates` command), and kiln's own executable runs its anchor and
+  daemon (`kiln slates-role`). `GET /api/harness/workspaces` says which machines can, and why each
+  other can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
 
 ## From an Agentfile, in a microVM of its own
 

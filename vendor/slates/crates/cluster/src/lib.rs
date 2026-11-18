@@ -1,0 +1,1321 @@
+//! The cluster plane (§4.8, D-14) — the **asynchronous dispatch** that ships a register record to its
+//! candidate holders over the fleet transport and commits at a quorum. The ownership split (Ada's, the
+//! cluster milestone): `slates-db` owns synchronous acceptance and the register protocol (the
+//! [`Acceptor`], [`Placement`], [`Quorum`], the record and its identity); `slates-transport` carries
+//! the mutually-authenticated request/reply; and this crate owns the dispatch, the collection, the
+//! deadline (with progress-based extension, §4.8 "late work" — a commit whose quorum is still filling
+//! is given more time rather than declared failed), and the cancellation. Both a local and a remote
+//! holder run the *same* acceptance rules —
+//! the owner holds locally through its own [`Acceptor`], each remote holder through one reached over
+//! the transport.
+//!
+//! First milestone (this crate's scope): register commits **within one validated configuration
+//! generation**. The caller supplies a validated configuration and owner-authority snapshot (the
+//! [`Acceptor`]s' [`Authority`](slates_db::register::Authority) and the candidate set); SWIM/Lifeguard
+//! membership, the configuration group, takeover and the mirror are the rest of the cluster plane and
+//! are owed. The evidence the tests produce is "production endpoints and holder logic over simulated
+//! UDP": one process may simulate several holders, but that is still an `f = 1` protocol topology;
+//! real network/process deployment is a further gate.
+//!
+//! Correctness the dispatch preserves: a slow or dead holder never blocks quorum (each request runs in
+//! its own task; the collection stops at `f + 1` distinct binding acknowledgements or at a deadline),
+//! and a deadline reached after partial acceptance is reported as **uncertain** — it never claims the
+//! write did not happen, and the record's identity is unchanged so a retry is idempotent at the holders
+//! that already accepted (§4.8 "network receipt is not acceptance"; a retry preserves record identity).
+//!
+//! Membership ([`membership`]): the SWIM/Lifeguard failure-detection view that maintains which hosts
+//! are alive — the neighbourhood the configuration and placement draw from — and the `detector`
+//! protocol-period machine that probes members and drives that view alive → suspect → dead. The
+//! configuration group ([`config_group`]) turns that view into the versioned
+//! [`Configuration`] each request carries: it reconciles the
+//! neighbourhood to the alive membership, advancing the version so a stale request is refused (the
+//! `f = 0` degenerate of the fleet consensus, which is owed).
+
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
+pub mod config_group;
+pub mod content;
+pub mod envelope;
+pub mod fleet;
+mod fold;
+pub mod lease_renewal;
+pub mod live;
+pub mod member_plane;
+pub mod membership;
+pub mod multilog;
+pub mod progress;
+pub mod raft;
+pub mod raft_wire;
+pub mod root_group;
+pub mod routing;
+pub mod sealed;
+pub mod timing;
+
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::task::Waker;
+
+use slates_db::ledger::{self, LedgerAcceptor, LedgerPromise};
+use slates_db::register::{
+  Acceptor, Ack, Configuration, HostId, Placement, Prepare, Quorum, Record, Refusal,
+  decode_refusal, encode_refusal,
+};
+use slates_rt::error::RtError;
+use slates_rt::futures::{cancel, detach, idle, now_ns, spawn_child, within};
+use slates_transport::connection::Priority;
+use slates_transport::endpoint::Endpoint;
+
+use crate::progress::{DeadlineExtender, ExtensionOutcome, ProgressWitness};
+
+/// The stream a record request rides on a holder connection.
+/// Format: a request **kind** (the low bits of each exchange's fresh stream id,
+/// `slates_transport::streams::compose`); the holder's `serve_once` dispatches on it, so the
+/// value is a label distinct from the plane's other kinds, not a tunable. Records ride the `Control` class.
+pub const RECORD_STREAM: u64 = 1;
+
+/// A refusal committing a record across the cluster.
+#[derive(Debug)]
+pub enum ClusterError {
+  /// The runtime refused to spawn or drive a dispatch task.
+  Runtime(RtError),
+  /// Every holder responded but too few acknowledged to reach the quorum — the write is **not**
+  /// placed, and (because every holder answered) it is known not to have committed.
+  NotPlaced {
+    /// What was acknowledged (fewer than `f + 1` distinct candidates).
+    placement: Placement,
+  },
+  /// The deadline elapsed before a quorum acknowledged. The outcome is **uncertain**: some holders may
+  /// have accepted and stored the record. The record's identity is unchanged, so a retry is idempotent
+  /// at any holder that already accepted; it must not be treated as "nothing happened".
+  Uncertain {
+    /// What had been acknowledged when the deadline elapsed.
+    placement: Placement,
+  },
+}
+
+impl std::fmt::Display for ClusterError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      ClusterError::Runtime(e) => write!(f, "cluster dispatch runtime error: {e:?}"),
+      ClusterError::NotPlaced { placement } => {
+        write!(
+          f,
+          "not placed: {} of the quorum acknowledged",
+          placement.acked.len()
+        )
+      }
+      ClusterError::Uncertain { placement } => write!(
+        f,
+        "uncertain: the deadline elapsed with {} acknowledgement(s); a retry is idempotent",
+        placement.acked.len()
+      ),
+    }
+  }
+}
+
+impl std::error::Error for ClusterError {}
+
+impl From<RtError> for ClusterError {
+  fn from(e: RtError) -> Self {
+    ClusterError::Runtime(e)
+  }
+}
+
+/// Serves one register record on a holder: receives the record over the transport, runs it through the
+/// holder's [`Acceptor`] (which authorizes the owner and generation, fences the epoch, refuses a
+/// conflicting committed value, and **stores** the accepted value before acknowledging), and replies
+/// with the binding [`Ack`] — or an empty reply if the acceptor refuses, so the owner counts nothing.
+/// The holder loops this for successive records; the `acceptor` is its persistent store.
+pub async fn serve_record(
+  endpoint: &mut Endpoint,
+  acceptor: &mut Acceptor,
+) -> Result<(), slates_transport::endpoint::EndpointError> {
+  endpoint
+    .serve_once(|_, request| match Record::decode(&request) {
+      Ok(record) => match acceptor.accept(&record) {
+        Ok(ack) => ack.encode(),
+        // A sender on an older configuration is refused `ConfigurationStale` carrying this holder's newer
+        // version, which rides back so the sender refreshes and retries (§4.8 the piggyback rule); every
+        // other refusal is an empty reply the sender counts as no acknowledgement ([`encode_refusal`]).
+        Err(error) => encode_refusal(&error),
+      },
+      Err(_) => Vec::new(),
+    })
+    .await
+}
+
+/// The timing budget for a commit's dispatch, the caller's to derive (owed — a measured RTT budget;
+/// nothing here is a hidden constant): the deadline before an unfinished commit is reported uncertain,
+/// the interval the collection loop parks between wake-ups, and the **progress-extension policy** (§4.8
+/// "late work"). A commit whose quorum is still filling as it nears the deadline is granted a bounded
+/// extension rather than declared uncertain; a stalled one (no new acknowledgement within the stall
+/// window) is left to time out. The degenerate is [`hard`](CommitBudget::hard): no extension, so the
+/// deadline is absolute — the behaviour every `f = 0` / laptop caller uses, the *same* code path a
+/// fleet runs with extensions enabled (R8: the extender always runs, with a zero budget at the
+/// degenerate).
+#[derive(Clone, Copy, Debug)]
+pub struct CommitBudget {
+  /// How long to wait for a quorum before reporting the commit uncertain (the initial deadline, which a
+  /// granted extension grows).
+  pub deadline_ns: u64,
+  /// The poll interval the collection loop sleeps between checking for acknowledgements.
+  pub poll_interval_ns: u64,
+  /// The fraction of the current deadline (as the integer ratio `numerator / denominator`, so no float
+  /// enters the decision) at which an extension is first considered.
+  lookahead_numerator: u64,
+  lookahead_denominator: u64,
+  /// How much each granted extension adds to the deadline.
+  extension_ns: u64,
+  /// How many extensions a single dispatch may be granted before its deadline is absolute.
+  max_extensions: u32,
+  /// The span of no new acknowledgement after which a dispatch is judged stalled, not merely slow.
+  stall_window_ns: u64,
+}
+
+impl CommitBudget {
+  /// A hard-deadline budget: the dispatch waits until `deadline_ns` and is then reported uncertain, with
+  /// no progress extension. This is the degenerate — `max_extensions = 0`, so the extension policy
+  /// reduces to the absolute deadline — that the laptop and every current caller use; the `f > 0` caller
+  /// that wants late-work tolerance builds one with [`with_extension`](CommitBudget::with_extension).
+  /// `poll_interval_ns` is the collection loop's park between wake-ups.
+  pub fn hard(deadline_ns: u64, poll_interval_ns: u64) -> CommitBudget {
+    CommitBudget {
+      deadline_ns,
+      poll_interval_ns,
+      // No extension: the lookahead falls at the deadline itself (1/1) and zero grants are allowed, so
+      // the extender returns Continue until `deadline_ns` and Expire at it — an absolute deadline.
+      lookahead_numerator: 1,
+      lookahead_denominator: 1,
+      extension_ns: 0,
+      max_extensions: 0,
+      // Never consulted while `max_extensions` is 0 (no extension is ever considered); set to the
+      // deadline so the field is never a smaller hidden bound than the deadline it accompanies.
+      stall_window_ns: deadline_ns,
+    }
+  }
+
+  /// A progress-extending budget (§4.8 "late work"): a dispatch still gathering acknowledgements as it
+  /// passes the `lookahead_numerator / lookahead_denominator` fraction of its deadline is granted up to
+  /// `max_extensions` extensions of `extension_ns` each, provided its acknowledged set advanced within
+  /// `stall_window_ns`; one that stalled after gathering stops there, and one that has gathered nothing is
+  /// left to time out at the current deadline, unextended ([`DispatchWait::judge`]). Every value is
+  /// the caller's to derive from the operation's class (its measured per-holder RTT and quorum width);
+  /// nothing here is a hidden constant.
+  pub fn with_extension(
+    deadline_ns: u64,
+    poll_interval_ns: u64,
+    lookahead_numerator: u64,
+    lookahead_denominator: u64,
+    extension_ns: u64,
+    max_extensions: u32,
+    stall_window_ns: u64,
+  ) -> CommitBudget {
+    CommitBudget {
+      deadline_ns,
+      poll_interval_ns,
+      lookahead_numerator,
+      lookahead_denominator,
+      extension_ns,
+      max_extensions,
+      stall_window_ns,
+    }
+  }
+
+  /// The extension policy this budget describes, as a fresh [`DeadlineExtender`] seeded at `deadline_ns`.
+  fn extender(&self) -> DeadlineExtender {
+    DeadlineExtender::new(
+      self.deadline_ns,
+      self.lookahead_numerator,
+      self.lookahead_denominator,
+      self.extension_ns,
+      self.max_extensions,
+    )
+  }
+
+  /// The longest the collection loop can wait under this budget — the base deadline plus every extension it
+  /// may grant. A dispatch task bounds its own wait ([`request_within`]) by this, so it hands its holder's
+  /// session back no later than the loop stops waiting for it, and a reply arriving during a granted
+  /// extension is still received rather than cut off at the base deadline. At the [`hard`](CommitBudget::hard)
+  /// degenerate (no extensions) this is exactly the base deadline. Public so a caller bounds a single
+  /// exchange it drives itself (a content fetch) by the same span its quorum dispatches use.
+  pub fn max_deadline_ns(&self) -> u64 {
+    self.deadline_ns.saturating_add(
+      self
+        .extension_ns
+        .saturating_mul(u64::from(self.max_extensions)),
+    )
+  }
+}
+
+/// The dispatch collection loop's wait-and-decide step (§4.8 "late work"), shared by the commit
+/// ([`collect_bound`]) and ledger promotion loops so both age a slow dispatch the same
+/// way. It parks one poll interval, then judges from the dispatch's own progress — the size of its
+/// acknowledged (or promised) set — whether a dispatch that has reached its deadline is still filling
+/// its quorum (extend) or has stalled / spent its extension budget (time out). The [`hard`] budget's
+/// zero extension budget makes this an absolute deadline, so the laptop's behaviour is unchanged (R8).
+///
+/// [`hard`]: CommitBudget::hard
+pub struct DispatchWait {
+  extender: DeadlineExtender,
+  witness: ProgressWitness,
+  poll_interval_ns: u64,
+  started_ns: u64,
+}
+
+impl DispatchWait {
+  /// A wait seeded from `budget`, its clock started at `now` (the moment collection begins, so the
+  /// elapsed time the extender measures is time spent gathering acknowledgements).
+  pub fn new(budget: CommitBudget, now: u64) -> DispatchWait {
+    DispatchWait {
+      extender: budget.extender(),
+      witness: ProgressWitness::new(budget.stall_window_ns, now),
+      poll_interval_ns: budget.poll_interval_ns,
+      started_ns: now,
+    }
+  }
+
+  /// Called after draining replies: judges whether the dispatch may keep waiting with the
+  /// current acknowledgement count, then parks one poll interval if it may. A completed
+  /// sleep always returns `true` so the caller drains replies delivered during that sleep
+  /// before judging expiration again. Otherwise a reply already in the channel loses to
+  /// the timer (§4.8; `docs/bugs/2026-09-20-collectors-expire-before-reading-queued-replies.md`).
+  ///
+  /// The park ends at the poll interval or at the first wake, whichever comes first: every dispatch task
+  /// wakes its collector once it has handed its reply over ([`ReplyTx::send`]), so a quorum is seen the
+  /// moment its last acknowledgement lands rather than at the next poll. Parked a whole interval, a commit
+  /// over loopback cost the interval however fast the holders answered: 10.1 ms at the median at the daemon's
+  /// 10 ms poll and 1.08 ms at a 100 µs one, over a 11.5 µs round trip (`replication_bench`, 2026-11-04). A
+  /// wake from anything else only ends the park early; the caller drains, judges and parks again.
+  pub async fn keep_waiting(&mut self, gathered: usize) -> bool {
+    if !self.judge(gathered, now_ns()) {
+      return false;
+    }
+    // A park that cannot be timed (off a shard) cannot bound the wait: the dispatch stops waiting rather than spin.
+    within(self.poll_interval_ns, idle()).await.is_ok()
+  }
+
+  /// The decision [`keep_waiting`](DispatchWait::keep_waiting) takes before parking,
+  /// pure in the clock: records `gathered` as the dispatch's progress at `now_ns` and asks the extender
+  /// whether the dispatch may keep waiting. Separated from the sleep so the rule is testable at N=1
+  /// against an injected clock — the way the extender and the witness are.
+  ///
+  /// A dispatch that has gathered nothing is given its whole current deadline for a first reply: the
+  /// extender's lookahead is where an extension is decided, and nothing gathered is no evidence of a stall,
+  /// so such a dispatch is never extended but is not stopped before its deadline either. One that gathered
+  /// and then went a stall window without more stops where the extender judges it. Until 2026-09-29 a
+  /// dispatch with nothing gathered stopped at the lookahead, three quarters of its deadline: a consensus
+  /// round whose one live voter answered in the last quarter never collected it, so after a leader's loss
+  /// the candidate nearest that voter failed every pre-election
+  /// (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`).
+  pub fn judge(&mut self, gathered: usize, now_ns: u64) -> bool {
+    self
+      .witness
+      .observe(u64::try_from(gathered).unwrap_or(u64::MAX), now_ns);
+    let elapsed = now_ns.saturating_sub(self.started_ns);
+    match self.extender.evaluate(elapsed, &self.witness, now_ns) {
+      ExtensionOutcome::Expire => gathered == 0 && elapsed < self.extender.deadline_ns(),
+      ExtensionOutcome::Continue | ExtensionOutcome::Extend { .. } => true,
+    }
+  }
+
+  /// The dispatch's progress witness, for a test to feed an acknowledgement it observed at a given time.
+  pub fn witness_mut(&mut self) -> &mut ProgressWitness {
+    &mut self.witness
+  }
+}
+
+/// What one timed exchange produced ([`request_within`]): the peer's reply bytes — empty when it refused,
+/// the deadline won, or the transport failed — and the exchange's **round trip**: `Some(elapsed)` when the
+/// peer answered inside the deadline (a refusal included: it completed a round trip), `None` when the
+/// deadline won, the transport failed, or the deadline could not be armed — Karn's rule, a timed-out exchange is no round-trip sample. The
+/// round trip is what the fleet's per-peer path estimate feeds on (`timing::PathRtt`, §4.8 "election
+/// timeout ≥ 10 × broadcast RTT p99"): a consensus round's replies, timely and late, each measure the
+/// path to the voter that answered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimedReply {
+  /// The reply bytes (empty on a refusal, a timeout, or a transport error).
+  pub bytes: Vec<u8>,
+  /// The exchange's round trip in nanoseconds when the peer answered inside the deadline.
+  pub round_trip_ns: Option<u64>,
+}
+
+/// What a dispatch task reports back to the owner's collection loop: a holder's timed reply (empty bytes
+/// if it refused; its round trip when it answered) *and its endpoint returned boxed* (an endpoint is
+/// large), so the connection is reused across commits — its packet-number space stays continuous across a
+/// retry, RFC 9000 §12.3. The deadline is no longer a message: it is the collection loop's own
+/// progress-extension decision ([`DispatchWait`]), so a report is always a holder's reply.
+pub struct Reply(pub HostId, pub TimedReply, pub Box<Endpoint>);
+
+/// The sending end of a dispatch's reply channel: each dispatch task sends its [`Reply`] here and then wakes the
+/// task that made the channel — the collecting loop, parked in [`DispatchWait::keep_waiting`] — so the loop reads
+/// the reply now, not at its next poll. The waker is the collector's own task word ([`slates_rt::waker`]), copied,
+/// with no reference count; a wake that reaches a task which has moved on is a spurious wake its waits absorb, and
+/// one that reaches a task which has ended misses on the slot's generation. Off a shard there is no task to wake
+/// and the channel behaves as a plain one.
+#[derive(Clone)]
+pub(crate) struct ReplyTx {
+  tx: Sender<Reply>,
+  collector: Option<Waker>,
+}
+
+impl ReplyTx {
+  /// Hands `reply` to the collector and wakes it. A collector that has gone (the receiver dropped) loses
+  /// nothing it still wanted.
+  pub(crate) fn send(&self, reply: Reply) {
+    let _ = self.tx.send(reply);
+    if let Some(collector) = &self.collector {
+      collector.wake_by_ref();
+    }
+  }
+}
+
+/// A reply channel whose sends wake the task calling this — the dispatch's collector ([`ReplyTx`]).
+pub(crate) fn reply_channel() -> (ReplyTx, Receiver<Reply>) {
+  let (tx, rx) = channel::<Reply>();
+  let collector =
+    slates_rt::futures::current_task().map(|task| slates_rt::waker::waker_for(task.0));
+  (ReplyTx { tx, collector }, rx)
+}
+
+/// The holder replies still in flight when a dispatch returned at quorum (or timed out): the receiving end
+/// of the dispatch's reply channel, kept open so each straggler task — bounded by the dispatch's full span
+/// ([`CommitBudget::max_deadline_ns`], the same bound the collection loop used) — hands its **session** back
+/// here when it finishes, instead of having it dropped by a cancellation. The caller recovers the sessions
+/// later ([`Stragglers::recover`]) and reuses them, so an early quorum costs no slow holder its session
+/// (re-establishing one means a fresh handshake and the peer replacing its session). The straggler's
+/// reply itself is not folded (the dispatch already resolved without it); a commit re-ships to that holder
+/// next period over the recovered session, idempotently. Empty when nothing was dispatched.
+#[derive(Debug)]
+pub struct Stragglers {
+  // At most two channels per dispatch: content offers and the chunk transfers they start. All other
+  // dispatches use only the first slot; no user-scaled channel list is retained.
+  replies: [Option<std::sync::mpsc::Receiver<Reply>>; 2],
+}
+
+impl Stragglers {
+  /// No stragglers: nothing was dispatched, as for a local quorum at `f = 0`.
+  pub fn none() -> Self {
+    Self {
+      replies: [None, None],
+    }
+  }
+
+  /// Keeps a dispatch's reply channel until every task has returned its session.
+  pub fn pending(replies: std::sync::mpsc::Receiver<Reply>) -> Self {
+    Self {
+      replies: [Some(replies), None],
+    }
+  }
+
+  /// Content has two channels. An offer still in flight when collection stops returns its session here
+  /// alongside the chunk transfers it started (§4.10; AUD-29-55).
+  pub(crate) fn two_rounds(
+    offers: std::sync::mpsc::Receiver<Reply>,
+    puts: std::sync::mpsc::Receiver<Reply>,
+  ) -> Self {
+    Self {
+      replies: [Some(offers), Some(puts)],
+    }
+  }
+
+  /// Recovers finished sessions and reports whether all dispatch tasks returned.
+  /// Never blocks; a caller polls each period and reuses the returned sessions.
+  pub fn recover(&mut self) -> (Vec<(HostId, Endpoint)>, bool) {
+    let (replies, complete) = self.recover_replies();
+    (
+      replies
+        .into_iter()
+        .map(|(host, _, endpoint)| (host, endpoint))
+        .collect(),
+      complete,
+    )
+  }
+
+  /// Recovers replies together with sessions so a late acknowledgement can still
+  /// advance its bound operation. The caller validates reply kind and identity:
+  /// a late content offer returns a session but is not a put acknowledgement.
+  /// A task that times out returns an empty reply and its session as usual.
+  pub fn recover_replies(&mut self) -> (Vec<(HostId, TimedReply, Endpoint)>, bool) {
+    let mut recovered = Vec::new();
+    for pending in &mut self.replies {
+      let Some(replies) = pending.as_ref() else {
+        continue;
+      };
+      loop {
+        match replies.try_recv() {
+          Ok(Reply(host, reply, endpoint)) => recovered.push((host, reply, *endpoint)),
+          Err(TryRecvError::Empty) => break,
+          Err(TryRecvError::Disconnected) => {
+            *pending = None;
+            break;
+          }
+        }
+      }
+    }
+    (recovered, self.replies.iter().all(Option::is_none))
+  }
+
+  /// Waits for every straggler to report, then returns what they brought back (as [`Stragglers::recover_replies`]) and
+  /// whether all have reported. For a caller about to end the task that made the dispatch: a straggler's request is a
+  /// child of that task, and a task's end cancels its children, so a request still in flight then is dropped with the
+  /// session in it and never reported, and the session's slot stays lent for good. Each request is bounded by its
+  /// dispatch's deadline, so this waits at most that. Checked once per timer tick, the finest park there is; a task off a
+  /// shard, which cannot be timed, gets what has come back so far and `false`.
+  pub async fn settle(&mut self) -> (Vec<(HostId, TimedReply, Endpoint)>, bool) {
+    let mut settled = Vec::new();
+    loop {
+      let (replies, done) = self.recover_replies();
+      settled.extend(replies);
+      if done {
+        return (settled, true);
+      }
+      // Shape: one tick of the shard's timer wheel (`sleep` rounds up to it).
+      if slates_rt::futures::sleep(1).await.is_err() {
+        return (settled, false);
+      }
+    }
+  }
+}
+
+/// Runs one request/reply on `endpoint` (its `request`), racing it against `deadline_ns`, and returns the
+/// timed reply ([`TimedReply`]: the bytes, empty on a timeout or a transport error, and the round trip when
+/// the peer answered) **together with the endpoint, kept whatever the outcome**. This is what lets a
+/// dispatch task *always* hand its holder's session back to the collection
+/// loop — a straggler that never replies still returns its endpoint at the deadline rather than blocking
+/// until it is cancelled and its session dropped. A dropped session costs a fresh handshake to replace,
+/// so keeping it is what lets the caller retry a
+/// load-timed-out commit or promotion over the same warm session instead of stranding the object
+/// (`docs/bugs/2026-09-10-swim-stale-ack.md` records the same discipline for the SWIM probe). The deadline
+/// is the collection loop's own bound — its full progress-extended span
+/// ([`CommitBudget::max_deadline_ns`]) — so a reply that arrives while the loop is still extending is not
+/// cut off early. Shared by the record and content dispatch here and the daemon's configuration plane (the
+/// council's Raft over its own stream), so the timed, session-preserving request discipline is one.
+pub async fn request_within(
+  mut endpoint: Endpoint,
+  stream_id: u64,
+  priority: Priority,
+  request: &[u8],
+  deadline_ns: u64,
+) -> (TimedReply, Endpoint) {
+  let sent_ns = now_ns();
+  let before = endpoint.last_exchange();
+  // A delivered reply is preferred over the deadline when both are ready; a deadline that cannot be armed
+  // (off a shard) fails the exchange like a transport error, never as a timeout (AUD-29-39).
+  let reply =
+    slates_rt::futures::within(deadline_ns, endpoint.request(stream_id, priority, request))
+      .await
+      .ok()
+      .flatten()
+      .and_then(Result::ok);
+  if reply.is_none() {
+    // The deadline won: the `request` future was dropped mid-exchange. Abandon the exchange so its
+    // half-sent frames do not ride the next flush on this reused session and reach the peer folded into an
+    // unrelated request (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`); the peer is told
+    // to stop its reply (`StopSending`), and any late copy of it is dropped by the closed stream's tombstone.
+    endpoint.abandon_begun_since(before);
+  }
+  // The round trip is measured only for an exchange the peer answered (Karn's rule): a reply that came
+  // back is a sample of the path, however empty; a deadline or a transport error is not.
+  let round_trip_ns = reply.is_some().then(|| now_ns().saturating_sub(sent_ns));
+  (
+    TimedReply {
+      bytes: reply.unwrap_or_default(),
+      round_trip_ns,
+    },
+    endpoint,
+  )
+}
+
+/// What [`requests_within`] brought back: each request's reply in order (`None` for one not begun, not answered
+/// within the deadline, or failed), and how the batch streamed — the stream bytes the session consumed between the
+/// first turn that consumed any and the last, and the time between those turns. Timed at the receiver over the
+/// interval the bytes were arriving in, it leaves out the request's round trip and the wait for the first byte, and
+/// it is the same however the sender interleaves the replies' streams.
+#[derive(Clone, Debug, Default)]
+pub struct BatchReplies {
+  /// The replies, in the order of the requests.
+  pub replies: Vec<Option<Vec<u8>>>,
+  /// The stream bytes consumed after the first turn that consumed any.
+  pub streamed_bytes: u64,
+  /// Nanoseconds from that turn to the last that consumed any.
+  pub streamed_ns: u64,
+}
+
+/// [`request_within`] for several requests on one session at once: each begun as its own exchange (so they share
+/// the path's congestion window and a loss in one is recovered by the acknowledgements of the next, not by a
+/// probe timeout per request). The batch is given up only once it **stalls** — no byte consumed and no reply
+/// completed for `stall_ns` — never at a fixed deadline: a batch's transfer is as long as the path makes it, and a
+/// deadline estimated from its size and a measured rate refused live transfers whenever the estimate ran fast (a
+/// cross-region read failed after 2.6 s, 2026-10-07). The progress-aware rule of the record dispatch
+/// ([`DispatchWait`]), at the byte. Returns the replies and how they streamed ([`BatchReplies`]) **together with the
+/// endpoint**, kept whatever the outcome, its unanswered exchanges abandoned. The answered prefix is what a caller
+/// reading consecutive windows keeps.
+pub async fn requests_within(
+  mut endpoint: Endpoint,
+  stream_id: u64,
+  priority: Priority,
+  requests: &[Vec<u8>],
+  stall_ns: u64,
+) -> (BatchReplies, Endpoint) {
+  let exchanges = begin_prefix(&mut endpoint, stream_id, priority, requests);
+  let mut replies: Vec<Option<Vec<u8>>> = vec![None; requests.len()];
+  let mut streaming = Streaming::from(endpoint.bytes_consumed());
+  let mut progress_ns = now_ns();
+  loop {
+    if streaming.observe(endpoint.bytes_consumed(), now_ns()) {
+      progress_ns = now_ns();
+    }
+    let (open, completed) = take_completed_replies(&mut endpoint, &exchanges, &mut replies);
+    if completed {
+      progress_ns = now_ns();
+    }
+    let quiet_ns = now_ns().saturating_sub(progress_ns);
+    if !open || quiet_ns >= stall_ns {
+      break;
+    }
+    // One turn of the session, within what is left of the stall budget; `Endpoint::drive` is cancel-safe, so a
+    // turn cut off by the budget loses nothing. A turn that cannot be timed (off a shard) or fails ends the batch as
+    // a transport error would.
+    match slates_rt::futures::within(stall_ns.saturating_sub(quiet_ns), endpoint.drive()).await {
+      Ok(Some(Ok(()))) | Ok(None) => {}
+      Ok(Some(Err(_))) | Err(_) => break,
+    }
+  }
+  for (exchange, reply) in exchanges.iter().zip(replies.iter()) {
+    if let (Some(id), None) = (exchange, reply) {
+      endpoint.abandon(*id);
+    }
+  }
+  let (streamed_bytes, streamed_ns) = streaming.measured();
+  (
+    BatchReplies {
+      replies,
+      streamed_bytes,
+      streamed_ns,
+    },
+    endpoint,
+  )
+}
+
+/// Begins one exchange per request on `endpoint`, in order, stopping at the first the session refuses (its stream
+/// credit's typed backlog): each exchange's id, `None` from the refusal on, so the replies a caller keeps are a prefix.
+fn begin_prefix(
+  endpoint: &mut Endpoint,
+  stream_id: u64,
+  priority: Priority,
+  requests: &[Vec<u8>],
+) -> Vec<Option<u64>> {
+  let mut exchanges: Vec<Option<u64>> = Vec::with_capacity(requests.len());
+  for request in requests {
+    let begun = exchanges.last().is_none_or(Option::is_some);
+    exchanges.push(
+      begun
+        .then(|| endpoint.begin(stream_id, priority, request).ok())
+        .flatten(),
+    );
+  }
+  exchanges
+}
+
+/// Takes every reply of `exchanges` that has arrived whole into `replies`: whether any exchange is still open, and
+/// whether any reply completed on this call.
+fn take_completed_replies(
+  endpoint: &mut Endpoint,
+  exchanges: &[Option<u64>],
+  replies: &mut [Option<Vec<u8>>],
+) -> (bool, bool) {
+  let mut open = false;
+  let mut completed = false;
+  for (exchange, reply) in exchanges.iter().zip(replies.iter_mut()) {
+    let (Some(id), None) = (exchange, reply.as_ref()) else {
+      continue;
+    };
+    match endpoint.take_reply(*id) {
+      Some(bytes) => {
+        *reply = Some(bytes);
+        completed = true;
+      }
+      None => open = true,
+    }
+  }
+  (open, completed)
+}
+
+/// How a batch streamed ([`BatchReplies`]): the session's consumed bytes and the time at the first turn that consumed
+/// any, and at the latest that did.
+struct Streaming {
+  at_start: u64,
+  first: Option<(u64, u64)>,
+  last: Option<(u64, u64)>,
+}
+
+impl Streaming {
+  /// Before the batch: the session had consumed `at_start` bytes.
+  fn from(at_start: u64) -> Streaming {
+    Streaming {
+      at_start,
+      first: None,
+      last: None,
+    }
+  }
+
+  /// Notes the session's consumed count at `now_ns`; whether it moved since the last note.
+  fn observe(&mut self, consumed: u64, now_ns: u64) -> bool {
+    if consumed <= self.last.map_or(self.at_start, |(_, bytes)| bytes) {
+      return false;
+    }
+    let seen = (now_ns, consumed);
+    self.first = self.first.or(Some(seen));
+    self.last = Some(seen);
+    true
+  }
+
+  /// The bytes consumed after the first turn that consumed any, and the nanoseconds from it to the last.
+  fn measured(&self) -> (u64, u64) {
+    self
+      .first
+      .zip(self.last)
+      .map_or((0, 0), |((from_ns, from), (to_ns, to))| {
+        (to.saturating_sub(from), to_ns.saturating_sub(from_ns))
+      })
+  }
+}
+
+/// Ships each `(host, request)` to that host on `stream` over its borrowed session, concurrently — one
+/// child task per session, each bounded by the budget's full span and handing its timed reply and endpoint
+/// back whatever the outcome ([`request_within`]) — and returns the replies that arrived before the round's
+/// progress-aware stop, each with its endpoint, **and the round's [`Stragglers`]**: the still-open reply
+/// channel through which every child not yet reported hands its reply and endpoint when it finishes. The
+/// caller records both as a dispatch it settles each period, so a slow or dead voter never serializes the
+/// reachable ones, and a slow-but-live one costs neither its session nor its reply. This is the
+/// configuration council's and root group's fan-out in the daemon (a heartbeat to a dead follower must not
+/// delay the live ones, so it is the same concurrent, session-preserving shape as a record commit,
+/// [`commit_record`]) and the fabric harness's (`tests/wan_election.rs`), so the two prove one shape. Each
+/// child is detached once the round returns, so a per-period round never accumulates task slots (banned
+/// item 8): a reported child is already terminal, and an unreported one finishes at [`request_within`]'s
+/// deadline and self-reaps, having reported through the channel.
+///
+/// Collects **progress-aware**, not to the flat deadline ([`DispatchWait`], the policy the record commit
+/// uses): a round is done when every child has reported, or when it has *stalled* — no new reply within the
+/// stall window. Decisive under a membership change: a dead voter that is still a voter until the council
+/// retires it never replies, and waiting the full extended deadline for it every period would stall the
+/// very retirement that removes it (`docs/bugs/2026-09-12-broadcast-waits-out-dead-voter.md`). The stop
+/// must also leave a round time for its **first** reply: with a one-period base deadline every reply of a
+/// round to voters more than three quarters of a period away was still in flight at the stop — and since
+/// a late pre-vote reply is dropped, no such council could elect
+/// (`docs/bugs/2026-09-14-consensus-round-expires-inside-the-wan-rtt.md`); the caller derives the budget's
+/// base from the measured path ([`timing::round_budget`]).
+pub async fn broadcast(
+  requests: Vec<(HostId, Vec<u8>, Endpoint)>,
+  stream: u64,
+  priority: Priority,
+  budget: CommitBudget,
+) -> (Vec<(HostId, TimedReply, Endpoint)>, Stragglers) {
+  if requests.is_empty() {
+    return (Vec::new(), Stragglers::none());
+  }
+  let deadline_ns = budget.max_deadline_ns();
+  let (tx, rx) = reply_channel();
+  let mut tasks = Vec::new();
+  for (host, request, endpoint) in requests {
+    let tx = tx.clone();
+    if let Ok(task) = spawn_child(async move {
+      let (reply, endpoint) =
+        request_within(endpoint, stream, priority, &request, deadline_ns).await;
+      tx.send(Reply(host, reply, Box::new(endpoint)));
+    }) {
+      tasks.push(task);
+    }
+    // A spawn failure drops the cloned `tx` and the moved endpoint: that voter yields no reply, stays
+    // outstanding on the caller's dispatch and is marked lost when it settles, and the channel still
+    // disconnects once the rest end.
+  }
+  drop(tx); // so the channel disconnects when the last child has reported
+  let mut replies = Vec::with_capacity(tasks.len());
+  let mut wait = DispatchWait::new(budget, now_ns());
+  let mut all_reported = false;
+  loop {
+    loop {
+      match rx.try_recv() {
+        Ok(Reply(host, reply, endpoint)) => replies.push((host, reply, *endpoint)),
+        Err(TryRecvError::Empty) => break,
+        Err(TryRecvError::Disconnected) => {
+          all_reported = true;
+          break;
+        }
+      }
+    }
+    if all_reported || !wait.keep_waiting(replies.len()).await {
+      break;
+    }
+  }
+  // A child that has not reported is a voter replying late, or timing out at its own deadline. Do **not**
+  // join it here — that would wait out the very deadline the progress-aware stop exists to avoid. Detach
+  // every child (a reported one is already terminal; an unreported one self-reaps at its deadline) and keep
+  // the channel open as the round's stragglers: the late reply and its endpoint arrive there, and the
+  // caller's settle folds the one and returns the other. Nothing is dropped, so nothing is orphaned.
+  for task in tasks {
+    let _ = detach(task);
+  }
+  (replies, Stragglers::pending(rx))
+}
+
+/// What a quorum collection gathered: the replying holders' endpoints for reuse, and whether the deadline
+/// was reached.
+pub(crate) struct Collected {
+  /// The replying holders' endpoints, for reuse.
+  pub reusable: Vec<(HostId, Endpoint)>,
+  /// Whether the budget's deadline was reached before the quorum.
+  pub timed_out: bool,
+}
+
+/// Collects replies until quorum or the deadline: records into `acked` each reply from a distinct
+/// candidate that `binds` (the caller's check that the reply is *this* dispatch's acknowledgement from
+/// *that* holder — a record acknowledgement's identity binding, a content acknowledgement's manifest
+/// binding), keeps every replying holder's endpoint for reuse, times each binding acknowledgement from
+/// `dispatched_ns` (the round's dispatch, on the shard clock), and returns what it gathered. Recovers
+/// the endpoints of tasks that finished after the loop. Shared by every quorum dispatch (records,
+/// content) so the binding-and-quorum discipline is one.
+pub(crate) async fn collect_bound(
+  rx: &mut std::sync::mpsc::Receiver<Reply>,
+  shape: &Placement,
+  quorum: Quorum,
+  budget: CommitBudget,
+  dispatched_ns: u64,
+  acked: &mut Vec<HostId>,
+  mut binds: impl FnMut(HostId, &[u8]) -> bool,
+) -> Collected {
+  let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
+  let mut timed_out = false;
+  let mut wait = DispatchWait::new(budget, dispatched_ns);
+  while !shape.placed_with(acked, quorum) {
+    match rx.try_recv() {
+      Ok(Reply(host, reply, endpoint)) => {
+        reusable.push((host, *endpoint));
+        if shape.candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply.bytes) {
+          acked.push(host);
+        }
+      }
+      // Nothing to receive: park a poll interval and let the progress-extension policy decide whether a
+      // dispatch at its deadline is still filling its quorum (keep waiting) or has stalled (time out).
+      Err(TryRecvError::Empty) => {
+        if !wait.keep_waiting(acked.len()).await {
+          timed_out = true;
+          break;
+        }
+      }
+      Err(TryRecvError::Disconnected) => break,
+    }
+  }
+  // Recover the endpoint of any task that already finished, so it too is reused.
+  while let Ok(Reply(host, _, endpoint)) = rx.try_recv() {
+    reusable.push((host, *endpoint));
+  }
+  Collected {
+    reusable,
+    timed_out,
+  }
+}
+
+/// A commit's outcome and the holder connections still open for the next commit — a holder that
+/// replied before the quorum or deadline hands its [`Endpoint`] back, so a retry reuses the same
+/// connection (continuous packet numbers) rather than re-establishing; a holder still in flight at the
+/// return (a straggler past an early quorum) hands its session back later through `stragglers`.
+pub struct Committed {
+  /// Whether the write placed (a [`Placement`]) or why not (a [`ClusterError`]).
+  pub outcome: Result<Placement, ClusterError>,
+  /// The holder connections still open, for reuse on the next commit.
+  pub reusable: Vec<(HostId, Endpoint)>,
+  /// The holders still in flight at the return, whose sessions the caller recovers later.
+  pub stragglers: Stragglers,
+  /// The newest configuration version a holder named when it refused this record as
+  /// [`ConfigurationStale`](slates_db::register::RegisterError::ConfigurationStale) — `Some(version)` only
+  /// when a holder is on a strictly newer configuration than this sender (§4.8 the piggyback rule). The
+  /// caller refreshes its configuration toward it and retries within the operation's budget; `None` when no
+  /// holder was ahead. Purely a hint off the reply — it never affects whether the record placed.
+  pub stale_version: Option<u64>,
+}
+
+/// Commits `record` across its `candidates` (§4.8 "records are sent to all candidates; committed at
+/// `f + 1`"). The owner (`owner`) holds it locally through `owner_acceptor`; the `remote_holders` (a
+/// connected [`Endpoint`] per remaining candidate) are each shipped the record concurrently — one task
+/// per holder, so a slow holder never serializes the others — and the loop collects **distinct,
+/// binding** acknowledgements until the placement is `placed(quorum)` or the budget's deadline expires,
+/// polling at the budget's interval between wake-ups. A commit whose quorum is still filling as it nears
+/// the deadline is granted the budget's progress extension rather than declared uncertain (§4.8 "late
+/// work"); a stalled one is left to time out. It returns a [`Committed`]: on quorum the [`Placement`];
+/// on the deadline [`ClusterError::Uncertain`] (partial acceptance may have occurred); if every holder
+/// answered short of quorum [`ClusterError::NotPlaced`] — together with the holder connections that
+/// replied, handed back for reuse (so a retry reuses the same connection and its continuous
+/// packet-number space). Holders still in flight at the return are **not** cancelled: each is bounded by
+/// the dispatch's full span and hands its session back through [`Committed::stragglers`] when it finishes,
+/// so an early quorum costs no slow holder its session. The budget is the caller's to derive (owed — a
+/// measured RTT budget); nothing here is a hidden constant.
+pub async fn commit_record(
+  owner: HostId,
+  owner_acceptor: &mut Acceptor,
+  placement: &Placement,
+  record: &Record,
+  quorum: Quorum,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> Committed {
+  commit_record_on(
+    RECORD_STREAM,
+    owner,
+    owner_acceptor,
+    placement,
+    record,
+    quorum,
+    remote_holders,
+    budget,
+  )
+  .await
+}
+
+/// [`commit_record`] over a chosen stream id, so a record class the holder must serve differently
+/// — a green's merge record (§4.16), which the holder recomputes before it accepts — is dispatched
+/// by its kind on the wire, never told apart from a head record by inspecting the value bytes. The
+/// commit rule is the same: the owner's hold, the dispatch, `f + 1` bound acknowledgements.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_record_on(
+  stream: u64,
+  owner: HostId,
+  owner_acceptor: &mut Acceptor,
+  placement: &Placement,
+  record: &Record,
+  quorum: Quorum,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> Committed {
+  commit_record_sent_as(
+    stream,
+    owner,
+    owner_acceptor,
+    placement,
+    record,
+    record.encode(),
+    quorum,
+    remote_holders,
+    budget,
+  )
+  .await
+}
+
+/// [`commit_record_on`] with the bytes each holder is sent chosen by the caller (`sent`): a record class whose
+/// message carries more than the record — a green's merge record travels with the inputs it names (§4.16
+/// "Commit", one exchange a version) — while the acknowledgement still binds the record alone.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_record_sent_as(
+  stream: u64,
+  owner: HostId,
+  owner_acceptor: &mut Acceptor,
+  placement: &Placement,
+  record: &Record,
+  sent: Vec<u8>,
+  quorum: Quorum,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> Committed {
+  let mut acked: Vec<HostId> = Vec::new();
+  // The owner's local hold — it is a candidate among the holders (§4.8 "the owner among them").
+  if owner_acceptor.accept(record).is_ok() && placement.candidates.contains(&owner) {
+    acked.push(owner);
+  }
+
+  let build = |acked: &[HostId]| Placement {
+    candidates: placement.candidates.clone(),
+    acked: acked.to_vec(),
+    mirror_acked: None,
+    joint: placement.joint.clone(),
+  };
+
+  // A local hold may already commit (f = 0: one candidate, the owner) — then no dispatch is needed.
+  if placement.placed_with(&acked, quorum) {
+    return Committed {
+      outcome: Ok(build(&acked)),
+      reusable: Vec::new(),
+      stragglers: Stragglers::none(),
+      stale_version: None,
+    };
+  }
+
+  // Dispatch each remote holder in its own task, reporting to one channel; the collection loop below
+  // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
+  // the calling task, so they end with it (no orphans), and each is bounded by the dispatch's span.
+  let (tx, mut rx) = reply_channel();
+  let record_bytes = sent;
+  let deadline_ns = budget.max_deadline_ns();
+  let mut tasks = Vec::new();
+  for (host, endpoint) in remote_holders {
+    let tx = tx.clone();
+    let bytes = record_bytes.clone();
+    let spawned = spawn_child(async move {
+      // Bounded by the collection loop's full span, and hands the endpoint back whatever the outcome, so a
+      // straggler that never replies still returns its session rather than having it dropped when this task
+      // is cancelled — the caller can then retry a load-timed-out commit over the same warm session.
+      let (reply, endpoint) =
+        request_within(endpoint, stream, Priority::Control, &bytes, deadline_ns).await;
+      tx.send(Reply(host, reply, Box::new(endpoint)));
+    });
+    match spawned {
+      Ok(task) => tasks.push(task),
+      Err(e) => return spawn_failed(&tasks, e),
+    }
+  }
+  drop(tx); // so the channel disconnects once every task has ended
+
+  // The newest configuration version any holder named when it refused this record as stale (§4.8 the
+  // piggyback rule). The collection closure — an `FnMut` polled once per reply — keeps the running maximum in
+  // this local, which is read after the round; a plain `&mut` capture (not a `Cell`) so the future the sim
+  // runtime drives stays `Send` across the collection's await.
+  let mut stale_seen: Option<u64> = None;
+  // The record class's acknowledgement latencies are gathered too; the record commit re-ships
+  // idempotently every period, so nothing here hedges on them yet (the content class is the hedged one).
+  let Collected {
+    reusable,
+    timed_out,
+  } = collect_bound(
+    &mut rx,
+    placement,
+    quorum,
+    budget,
+    now_ns(),
+    &mut acked,
+    |host, reply| {
+      if Ack::decode(reply).is_ok_and(|ack| ack.holder == host && ack.binds(record)) {
+        return true;
+      }
+      // Not an acknowledgement. A holder on a newer configuration rides its current version back; keep the
+      // newest across the round so the caller refreshes toward it and retries within the operation's budget.
+      if let Some(Refusal::ConfigurationStale { version }) = decode_refusal(reply) {
+        stale_seen = Some(stale_seen.map_or(version, |seen| seen.max(version)));
+      }
+      false
+    },
+  )
+  .await;
+
+  // Detach every dispatch task so its slot is reaped when it terminates, not held (joinable) until this
+  // caller finishes — and the caller is the perpetual record-plane coordinator, so an un-detached slot would
+  // leak forever, one per dispatched holder per period (banned item 8: no unbounded task growth). A task that
+  // already replied is reaped now; a straggler still in flight self-reaps on completion, having handed its
+  // session back over the channel `stragglers` drains — detaching does not cancel it, so the early-quorum and
+  // timed-out stragglers still finish and return their sessions.
+  for task in &tasks {
+    let _ = detach(*task);
+  }
+
+  // Whatever is still running is left to finish — a straggler cut off by a cancellation (an early quorum
+  // at f > 1, or a commit that timed out just before its reply) would lose its session, which the
+  // per-peer-socket mesh cannot re-establish. Each straggler is bounded by the dispatch's full span and
+  // hands its session back through the channel, which the caller drains from `stragglers`.
+  let stragglers = Stragglers::pending(rx);
+
+  let placement = build(&acked);
+  let outcome = if placement.placed(quorum) {
+    Ok(placement)
+  } else if timed_out {
+    Err(ClusterError::Uncertain { placement })
+  } else {
+    Err(ClusterError::NotPlaced { placement })
+  };
+  Committed {
+    outcome,
+    reusable,
+    stragglers,
+    stale_version: stale_seen,
+  }
+}
+
+/// Commits `record` using a validated [`Configuration`] as the authority interface (§4.8 "epoch
+/// allocation derives from configuration authority") — the caller consumes one validated snapshot
+/// rather than loose parameters. The quorum, the candidate holders (rendezvous over the
+/// configuration's neighbourhood for the record's object), and the owner all come from it; the
+/// per-holder authority (generation = the configuration's version, and the owner) is what the
+/// `owner_acceptor` and each remote holder's acceptor already enforce, so a record inconsistent with
+/// the configuration fails acceptance and gathers no quorum. This is where SWIM/Lifeguard membership
+/// and the configuration group (owed) will publish the [`Configuration`] this reads.
+pub async fn commit_under_configuration(
+  configuration: &Configuration,
+  record: &Record,
+  owner_acceptor: &mut Acceptor,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> Committed {
+  let placement = configuration.place(record.object);
+  commit_record(
+    configuration.owner,
+    owner_acceptor,
+    &placement,
+    record,
+    configuration.quorum,
+    remote_holders,
+    budget,
+  )
+  .await
+}
+
+/// The [`Committed`] returned when a dispatch task could not be spawned: the runtime error, the tasks
+/// already started cancelled, and no endpoints recoverable (they moved into the spawned futures).
+fn spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Committed {
+  for task in tasks {
+    let _ = cancel(*task);
+  }
+  Committed {
+    outcome: Err(ClusterError::Runtime(error)),
+    reusable: Vec::new(),
+    stragglers: Stragglers::none(),
+    stale_version: None,
+  }
+}
+
+// ── Phase one of a single-value register's takeover ──────────────────────────────────────────────────
+//
+// A single-value register's phase one (volume heads, merge records) runs one batched round per retired host in
+// the daemon (`slates_server::takeover`), which holds the per-object state it needs — the holds, the retired
+// hosts' lineage, the lease gate — and drives it over these sessions. The per-object promotion this module
+// once drove (one round per object, run by a successor that already held it) could not take over an object a
+// surviving candidate never received, and is gone
+// (`docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`). Stream id 2, its
+// wire kind, is retired and not reused.
+
+/// The stream a *ledger* phase-one prepare rides on a holder connection — distinct from every other RPC kind on
+/// the connection, so a holder serving several tells them apart.
+/// Format: one stream id per RPC kind on a connection; the holder's serve accepts whichever arrives.
+const LEDGER_PROMOTE_STREAM: u64 = 3;
+
+/// A confirmed ledger promotion: the holders that promised, and the log the new owner adopts — per
+/// position, the identity carried under the highest epoch across the phase-one quorum ([`ledger::adopt`]).
+/// The committed prefix of this log is every record that had committed under the old owner (Continuity),
+/// because the phase-one quorum intersects every prior `f + 1` commit quorum.
+pub struct LedgerPromotion {
+  /// The candidates that returned a binding promise (a phase-one quorum).
+  pub promised: Vec<HostId>,
+  /// The adopted log, dense by position — the committed prefix and any adopted uncommitted tail.
+  pub adopted: Vec<[u8; 32]>,
+}
+
+/// A ledger promotion's outcome and the holder connections still open for reuse. On a quorum of promises the [`LedgerPromotion`] (the adopted log and the
+/// promising set); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`].
+/// The new owner completes the takeover by re-committing the adopted log and only then serving.
+pub struct LedgerPromoted {
+  /// The promotion result: the adopted log and promising set, or why it did not confirm.
+  pub outcome: Result<LedgerPromotion, ClusterError>,
+  /// The holders still in flight at the return, whose sessions the caller recovers later.
+  pub stragglers: Stragglers,
+  /// The holder connections still open, for the adoption re-commit that follows.
+  pub reusable: Vec<(HostId, Endpoint)>,
+}
+
+/// The holder side of ledger phase one: serve one [`Prepare`], replying with this holder's whole log (a
+/// [`LedgerPromise`]) after raising its fence. A prepare the holder refuses (foreign generation,
+/// unauthorised owner, stale epoch) or that does not decode replies with empty bytes, which the new owner
+/// does not count toward its quorum. The `acceptor` is the holder's persistent ledger store for the object.
+pub async fn serve_ledger_promotion(
+  endpoint: &mut Endpoint,
+  acceptor: &mut LedgerAcceptor,
+) -> Result<(), slates_transport::endpoint::EndpointError> {
+  endpoint
+    .serve_once(|_, request| match Prepare::decode(&request) {
+      Ok(prepare) => match acceptor.prepare(&prepare) {
+        Ok(promise) => promise.encode(),
+        Err(_) => Vec::new(),
+      },
+      Err(_) => Vec::new(),
+    })
+    .await
+}
+
+/// Collects ledger promises until a phase-one quorum promised or the deadline: records each distinct,
+/// binding promise's holder into `promised` and its whole log into `logs` (the set the new owner adopts
+/// across), keeps every replying holder's endpoint for reuse, and returns the reusable endpoints and
+/// whether the deadline was reached. The same progress-extension policy the commit and single-value
+/// promotion use bounds the wait.
+async fn collect_ledger_promises(
+  rx: &mut std::sync::mpsc::Receiver<Reply>,
+  prepare: &Prepare,
+  candidates: &[HostId],
+  quorum: Quorum,
+  budget: CommitBudget,
+  promised: &mut Vec<HostId>,
+  logs: &mut Vec<Vec<ledger::Record>>,
+) -> (Vec<(HostId, Endpoint)>, bool) {
+  let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
+  let mut timed_out = false;
+  let mut wait = DispatchWait::new(budget, now_ns());
+  while !quorum.committed(promised.len()) {
+    match rx.try_recv() {
+      Ok(Reply(host, reply, endpoint)) => {
+        reusable.push((host, *endpoint));
+        if let Ok(promise) = LedgerPromise::decode(&reply.bytes)
+          && promise.holder == host
+          && promise.binds(prepare)
+          && candidates.contains(&host)
+          && !promised.contains(&host)
+        {
+          promised.push(host);
+          logs.push(promise.log);
+        }
+      }
+      // Nothing to receive: park a poll interval and let the progress-extension policy decide whether a
+      // promotion at its deadline is still filling its quorum (keep waiting) or has stalled (time out).
+      Err(TryRecvError::Empty) => {
+        if !wait.keep_waiting(promised.len()).await {
+          timed_out = true;
+          break;
+        }
+      }
+      Err(TryRecvError::Disconnected) => break,
+    }
+  }
+  while let Ok(Reply(host, _, endpoint)) = rx.try_recv() {
+    reusable.push((host, *endpoint));
+  }
+  (reusable, timed_out)
+}
+
+/// Runs ledger phase one for `prepare` across its `candidates` (§4.8 "each new owner runs phase one in one
+/// batched round"), for a ledger register (a green's merge-record log). The new owner (`new_owner`)
+/// promises locally through `owner_acceptor` (it is a candidate — the surviving holder the takeover
+/// named); the `remote_holders` are each sent the prepare concurrently — one task per holder — and the
+/// loop collects distinct, binding promises, each a holder's whole log, until a quorum promised or the
+/// budget's deadline expires (the same §4.8 "late work" progress extension the commit uses). On a quorum
+/// it adopts, per position, the record under the highest epoch across the promising quorum
+/// ([`ledger::adopt`]); the adopted log's committed prefix is every record that had committed under the
+/// old owner (Continuity), because a phase-one quorum and every prior `f + 1` commit quorum both intersect
+/// at `f + 1` of `2f + 1`. It returns a [`LedgerPromoted`]: on a quorum the adopted log (safe to re-commit
+/// and serve); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`] —
+/// with the replying holders' connections for the adoption re-commit. Holders still in flight at the return
+/// hand their sessions back through [`LedgerPromoted::stragglers`] rather than being cancelled. The
+/// budget is the caller's to derive (owed — a measured RTT budget); nothing here is a hidden constant.
+pub async fn promote_ledger_record(
+  new_owner: HostId,
+  owner_acceptor: &mut LedgerAcceptor,
+  candidates: &[HostId],
+  prepare: &Prepare,
+  quorum: Quorum,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> LedgerPromoted {
+  let mut promised: Vec<HostId> = Vec::new();
+  let mut logs: Vec<Vec<ledger::Record>> = Vec::new();
+  // The new owner's own hold: it promises to itself, raising its fence and reporting its whole log.
+  if let Ok(local) = owner_acceptor.prepare(prepare)
+    && candidates.contains(&new_owner)
+  {
+    promised.push(new_owner);
+    logs.push(local.log);
+  }
+
+  // A local promise may already be a quorum (f = 0: one candidate, the new owner) — no dispatch needed.
+  if quorum.committed(promised.len()) {
+    return LedgerPromoted {
+      outcome: Ok(LedgerPromotion {
+        promised,
+        adopted: ledger::adopt(&logs),
+      }),
+      reusable: Vec::new(),
+      stragglers: Stragglers::none(),
+    };
+  }
+
+  // Dispatch each remote holder in its own task, reporting to one channel; the collection loop bounds the
+  // wait itself (its progress-extension policy). Children of the calling task, so they end with it (no
+  // orphans), each bounded by the dispatch's span.
+  let (tx, mut rx) = reply_channel();
+  let prepare_bytes = prepare.encode();
+  let deadline_ns = budget.max_deadline_ns();
+  let mut tasks = Vec::new();
+  for (host, endpoint) in remote_holders {
+    let tx = tx.clone();
+    let bytes = prepare_bytes.clone();
+    let spawned = spawn_child(async move {
+      // Bounded and endpoint-preserving (see `request_within`), so a holder's session survives a timeout.
+      let (reply, endpoint) = request_within(
+        endpoint,
+        LEDGER_PROMOTE_STREAM,
+        Priority::Control,
+        &bytes,
+        deadline_ns,
+      )
+      .await;
+      tx.send(Reply(host, reply, Box::new(endpoint)));
+    });
+    match spawned {
+      Ok(task) => tasks.push(task),
+      Err(e) => return ledger_promote_spawn_failed(&tasks, e),
+    }
+  }
+  drop(tx); // so the channel disconnects once every task has ended
+
+  let (reusable, timed_out) = collect_ledger_promises(
+    &mut rx,
+    prepare,
+    candidates,
+    quorum,
+    budget,
+    &mut promised,
+    &mut logs,
+  )
+  .await;
+
+  // Detach every dispatch task so its slot is reaped on termination, not held (joinable) until this
+  // perpetual caller finishes — an un-detached slot would leak, one per holder per ledger takeover (banned
+  // item 8). Detaching does not cancel: a straggler still promising self-reaps on completion, having handed
+  // its session back over the channel `stragglers` drains.
+  for task in &tasks {
+    let _ = detach(*task);
+  }
+
+  // Whatever is still running is left to finish (bounded by the dispatch's span) and hands its session
+  // back through the channel — recovered by the caller from `stragglers`, never dropped.
+  let stragglers = Stragglers::pending(rx);
+
+  let outcome = if quorum.committed(promised.len()) {
+    Ok(LedgerPromotion {
+      promised,
+      adopted: ledger::adopt(&logs),
+    })
+  } else if timed_out {
+    Err(ClusterError::Uncertain {
+      placement: Placement {
+        candidates: candidates.to_vec(),
+        acked: promised,
+        mirror_acked: None,
+        joint: Vec::new(),
+      },
+    })
+  } else {
+    Err(ClusterError::NotPlaced {
+      placement: Placement {
+        candidates: candidates.to_vec(),
+        acked: promised,
+        mirror_acked: None,
+        joint: Vec::new(),
+      },
+    })
+  };
+  LedgerPromoted {
+    outcome,
+    reusable,
+    stragglers,
+  }
+}
+
+/// The [`LedgerPromoted`] returned when a dispatch task could not be spawned: the runtime error, the tasks
+/// already started cancelled, and no endpoints recoverable (they moved into the spawned futures).
+fn ledger_promote_spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> LedgerPromoted {
+  for task in tasks {
+    let _ = cancel(*task);
+  }
+  LedgerPromoted {
+    outcome: Err(ClusterError::Runtime(error)),
+    reusable: Vec::new(),
+    stragglers: Stragglers::none(),
+  }
+}

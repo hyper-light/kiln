@@ -1,0 +1,1114 @@
+//! The records of a partition (§4.8's data model, §4.4's `Volume` catalog part, §4.13's
+//! principals and access lists, §4.15's grant, landing-lease and landing records, §4.14's
+//! audit record). Every record has one canonical encoding through `Wire`, which is what the
+//! log, the snapshots and (from Phase 8) the register puts carry; the schema hash of each
+//! travels in front of it so a changed definition is refused, never misread.
+
+use slates_wire::Wire;
+
+/// A volume id: 128 random bits whose high half names the creator host (§4.8 "Lookup").
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct VolumeId {
+  /// The bytes.
+  pub bytes: [u8; 16],
+}
+
+/// A snapshot id, unique within its volume.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SnapshotId {
+  /// The value.
+  pub value: u64,
+}
+
+/// A principal, established at rendezvous (§4.13). A host account means something only on its host (A-237): a uid, a
+/// SID and a consumer enrolled under an account each carry the host whose account it is, by that host's certificate
+/// anchor (`slates_server::deploy`'s blake3 of the node certificate, stable across the host's restarts, never the
+/// per-boot member id). So one uid on two hosts is two principals, a forwarded request is scoped by the authenticated
+/// session's anchor ([`Principal::rehosted`]), and an owner or access entry names (host, account). A certificate names
+/// itself on every host.
+#[derive(Wire, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Principal {
+  /// A Unix user of a host.
+  Uid {
+    /// The host whose user it is, by its certificate anchor.
+    host: crate::HostId,
+    /// The uid.
+    uid: u32,
+  },
+  /// A Windows SID of a host.
+  Sid {
+    /// The host whose account it is, by its certificate anchor.
+    host: crate::HostId,
+    /// The SID text.
+    sid: String,
+  },
+  /// A TLS leaf certificate, by the BLAKE3 of its bytes.
+  Certificate {
+    /// The hash.
+    hash: [u8; 32],
+  },
+  /// An **enrolled consumer** under a host account (§4.13 "Principals": "a trusted enrollment
+  /// establishes `ConsumerId` and scoped rights for a workload under that account"): the workload
+  /// bound its channel at rendezvous with the capability its enrollment minted, so two agents sharing a
+  /// uid are two principals here, each with only the rights an access list names for it.
+  Consumer {
+    /// The host whose account the consumer was enrolled under, by its certificate anchor.
+    host: crate::HostId,
+    /// The host account (uid) the consumer was enrolled under.
+    account: u32,
+    /// The consumer's id, minted at enrollment.
+    consumer: u64,
+  },
+}
+
+/// Format: the bit that marks a tenant id hashed from a principal. Since A-237 every tenant is hashed (a host account
+/// with its host), and the bit stays so no hashed tenant is ever a bare uid.
+const HASHED_TENANT: u64 = 1 << 63;
+
+impl Principal {
+  /// The tenant a volume owned by this principal seals under (A-92; A-9: the host account): a uid, or a consumer's host
+  /// account; a SID or a certificate by a namespaced hash of its identity, marked with the top bit so it never names the
+  /// same tenant as a uid. Here, beside the records, so a volume's destroy can tell when its tenant has no volume left.
+  pub fn tenant(&self) -> u64 {
+    let hashed = |kind: &[u8], identity: &[&[u8]]| {
+      let mut hasher = blake3::Hasher::new();
+      hasher.update(b"slates tenant v2");
+      hasher.update(kind);
+      for part in identity {
+        hasher.update(part);
+      }
+      let mut word = [0u8; size_of::<u64>()];
+      if let Some(head) = hasher.finalize().as_bytes().get(..size_of::<u64>()) {
+        word.copy_from_slice(head);
+      }
+      u64::from_le_bytes(word) | HASHED_TENANT
+    };
+    // A host account seals under its host as well (A-237): one uid on two hosts is two tenants.
+    match self {
+      Principal::Uid { host, uid } => hashed(b"uid", &[&host.0.to_le_bytes(), &uid.to_le_bytes()]),
+      Principal::Consumer { host, account, .. } => {
+        hashed(b"uid", &[&host.0.to_le_bytes(), &account.to_le_bytes()])
+      }
+      Principal::Sid { host, sid } => hashed(b"sid", &[&host.0.to_le_bytes(), sid.as_bytes()]),
+      Principal::Certificate { hash } => hashed(b"certificate", &[hash]),
+    }
+  }
+
+  /// The host whose account this principal is (A-237); `None` for a certificate, which names itself on every host.
+  pub fn host(&self) -> Option<crate::HostId> {
+    match self {
+      Principal::Uid { host, .. }
+      | Principal::Sid { host, .. }
+      | Principal::Consumer { host, .. } => Some(*host),
+      Principal::Certificate { .. } => None,
+    }
+  }
+
+  /// This principal as the host `host` authenticated it (A-237): a host account's host replaced by `host`, a
+  /// certificate as it is. The owner of a forwarded request scopes its principal by the session's authenticated
+  /// anchor this way, never by the host the origin's request names.
+  #[must_use]
+  pub fn rehosted(&self, host: crate::HostId) -> Principal {
+    match self {
+      Principal::Uid { uid, .. } => Principal::Uid { host, uid: *uid },
+      Principal::Sid { sid, .. } => Principal::Sid {
+        host,
+        sid: sid.clone(),
+      },
+      Principal::Consumer {
+        account, consumer, ..
+      } => Principal::Consumer {
+        host,
+        account: *account,
+        consumer: *consumer,
+      },
+      Principal::Certificate { hash } => Principal::Certificate { hash: *hash },
+    }
+  }
+
+  /// The index key: a kind byte then the identity bytes.
+  pub fn key(&self) -> Vec<u8> {
+    /// Format: the kind bytes of the principal key.
+    const KIND_UID: u8 = 1;
+    /// Format: see `KIND_UID`.
+    const KIND_SID: u8 = 2;
+    /// Format: see `KIND_UID`.
+    const KIND_CERTIFICATE: u8 = 3;
+    /// Format: see `KIND_UID`.
+    const KIND_CONSUMER: u8 = 4;
+    let mut out = Vec::new();
+    match self {
+      Principal::Uid { host, uid } => {
+        out.push(KIND_UID);
+        out.extend_from_slice(&host.0.to_le_bytes());
+        out.extend_from_slice(&uid.to_le_bytes());
+      }
+      Principal::Sid { host, sid } => {
+        out.push(KIND_SID);
+        out.extend_from_slice(&host.0.to_le_bytes());
+        out.extend_from_slice(sid.as_bytes());
+      }
+      Principal::Certificate { hash } => {
+        out.push(KIND_CERTIFICATE);
+        out.extend_from_slice(hash);
+      }
+      Principal::Consumer {
+        host,
+        account,
+        consumer,
+      } => {
+        out.push(KIND_CONSUMER);
+        out.extend_from_slice(&host.0.to_le_bytes());
+        out.extend_from_slice(&account.to_le_bytes());
+        out.extend_from_slice(&consumer.to_le_bytes());
+      }
+    }
+    out
+  }
+}
+
+/// An enrolled consumer's durable record (§4.13): who enrolled it (the account), the secret capability
+/// it attests with, and whether a human has revoked it. Replayed with the log, so the binding a session
+/// resumes under is the one the human established. The capability lives in the anchor segment under the
+/// same trust boundary as the daemon's grant-issuer secret: mapped only by the supervisor, the daemon and
+/// the anchor's user — the workload proves *knowledge* of it over the ring (a keyed hash of its channel's
+/// client id), and the capability itself never crosses a channel after the one delivery to the human.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerRecord {
+  /// The consumer id.
+  pub consumer: u64,
+  /// The host account it was enrolled under.
+  pub account: u32,
+  /// The consumer's secret capability — the key its attestation proofs are made under.
+  pub secret: [u8; 32],
+  /// Revoked by a human: every later effect refuses.
+  pub revoked: bool,
+}
+
+/// Rights on a volume (§4.13).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Rights {
+  /// Attach for reading, snapshot reads, status, read_base, versions, export.
+  pub read: bool,
+  /// Attach for writing, the mutating verbs, snapshot, clone, submit, rebase, pin, rewitness,
+  /// materialize.
+  pub write: bool,
+  /// Resize, destroy, archive, changing the list, revoking leases.
+  pub admin: bool,
+}
+
+/// One access-list entry.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AccessEntry {
+  /// The principal.
+  pub principal: Principal,
+  /// Its rights.
+  pub rights: Rights,
+}
+
+/// Bounded or dynamic (§4.2).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeClass {
+  /// Reserved at creation.
+  Bounded {
+    /// The limit in bytes.
+    limit: u64,
+  },
+  /// Grown from measured rates up to a maximum.
+  Dynamic {
+    /// The maximum in bytes.
+    max: u64,
+  },
+}
+
+/// The name-equivalence policy.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamePolicy {
+  /// Byte-exact names.
+  Exact,
+  /// Folded (normalization and case), as APFS.
+  Fold,
+}
+
+/// The volume's role in the merge plane (§4.16).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+  /// An ordinary volume.
+  Plain,
+  /// A work volume over a green.
+  Work {
+    /// The green.
+    green: VolumeId,
+    /// The base version.
+    base_version: u64,
+    /// Whether increments stream.
+    stream: bool,
+  },
+  /// A green volume.
+  Green {
+    /// Whether increments need evidence.
+    require_evidence: bool,
+    /// The head version.
+    head_version: u64,
+  },
+}
+
+/// The policy a volume was created with.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRecord {
+  /// The size class.
+  pub size: SizeClass,
+  /// The name policy.
+  pub names: NamePolicy,
+  /// Whether unlocked memory refuses.
+  pub require_locked: bool,
+  /// The role.
+  pub role: Role,
+  /// Whether the volume is live-shipped (§4.10, A-200): each of its publications is shipped to its candidates and a
+  /// barrier is answered only once the owner and `f` of them hold it. False at creation; set by `LiveShip`.
+  /// Appended.
+  pub live_shipped: bool,
+  /// The holder set the volume's live shipper ships to, under its epoch (A-240): committed at `f + 1` through the
+  /// catalog register before the shipper's first entry, so a takeover counts phase one's reports from exactly the hosts
+  /// a durable entry is held by. `None` until a shipper commits one. Appended.
+  pub live_holders: Option<LiveHolders>,
+}
+
+/// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host
+/// ids, fixed for the shipper's life.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LiveHolders {
+  /// The shipper's epoch.
+  pub epoch: u64,
+  /// The hosts it ships to.
+  pub holders: Vec<u64>,
+}
+
+/// What the volume sits on (§4.15).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum BaseRecord {
+  /// Nothing beneath.
+  Scratch,
+  /// A host directory, re-opened at recovery from this path (never a string on a hot path).
+  Path {
+    /// The path.
+    path: String,
+  },
+  /// Nothing beneath: an image volume, holding the disk image of `volume`'s `snapshot` (§4.6, A-160). It pins the
+  /// snapshot, as a clone does, so the merge of its image can clone the snapshot it was built from; it shares no
+  /// record with it. Appended.
+  Image {
+    /// The volume imaged.
+    volume: VolumeId,
+    /// The snapshot imaged.
+    snapshot: SnapshotId,
+  },
+}
+
+/// The volume state machine (§4.4).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeState {
+  /// Being created.
+  Creating,
+  /// Serving.
+  Live,
+  /// A snapshot in progress.
+  Sealing,
+  /// A granted landing writing the target.
+  Landing,
+  /// The live tree dropped, a compressed snapshot kept.
+  Archived,
+  /// Coming back from an archive.
+  Restoring,
+  /// Being torn down.
+  Destroying,
+  /// Gone (tombstone).
+  Destroyed,
+}
+
+/// A destroyed volume's register tombstone (§4.4 destroy "tombstone the id"; AUD-29-43): the sequence its
+/// replicated registers are closed at. The owner ships it to every candidate holder as the object's final
+/// register value, so a holder releases what it held for the volume and a takeover adopts the destruction
+/// instead of the last live head; once every candidate holds it the owner ships the retirement at the next
+/// sequence and, when every candidate holds that too, drops the tombstone (`Op::TombstoneRetired`). Until
+/// then it occupies the volume's slot in the partition's volume capacity, so tombstones are bounded by the
+/// same derived cap volumes are.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tombstone {
+  /// The destroyed volume.
+  pub volume: VolumeId,
+  /// The register sequence the tombstone is written at: one past every sequence the volume's registers
+  /// used (its head epoch and, for a green, its newest version).
+  pub sequence: u64,
+}
+
+/// A volume's lease (§4.4 "Leases and fencing", D-16).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LeaseRecord {
+  /// The holder.
+  pub holder: Principal,
+  /// The fencing epoch.
+  pub epoch: u64,
+  /// Expires at, monotonic ns.
+  pub expires_ns: u64,
+}
+
+/// The catalog record of a volume.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct VolumeRecord {
+  /// The id.
+  pub id: VolumeId,
+  /// The name, scoped to the host and user.
+  pub name: String,
+  /// The owning shard.
+  pub owner_shard: u16,
+  /// The policy.
+  pub policy: PolicyRecord,
+  /// The base.
+  pub base: BaseRecord,
+  /// The head snapshot.
+  pub head: SnapshotId,
+  /// The head epoch.
+  pub epoch: u64,
+  /// Bytes referenced.
+  pub referenced_bytes: u64,
+  /// Bytes unique.
+  pub unique_bytes: u64,
+  /// The state.
+  pub state: VolumeState,
+  /// The lease, when held.
+  pub lease: Option<LeaseRecord>,
+  /// The owner principal.
+  pub owner: Principal,
+  /// The access list.
+  pub access: Vec<AccessEntry>,
+  /// Created at, monotonic ns.
+  pub created_ns: u64,
+  /// The catalog register's sequence (§4.8 "catalog entries are registers the owner writes under that
+  /// epoch"): 0 at creation, raised by every op that changes what a successor must rebuild — the policy,
+  /// the access list, the base — so the owner ships each change as a newer record and a takeover adopts the
+  /// newest (AUD-29-17). Raised in `apply`, so replay reproduces it.
+  pub catalog_version: u64,
+}
+
+/// Where a snapshot's records and content are held (§4.8).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PlacementState {
+  /// The owner only.
+  Local,
+  /// Acknowledged by f+1 candidates in the region, and in the mirror when listed.
+  Placed {
+    /// The acknowledging hosts in the region.
+    region: Vec<u64>,
+    /// The acknowledging hosts in the mirror.
+    mirror: Option<Vec<u64>>,
+  },
+}
+
+/// A snapshot record.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotRecord {
+  /// The id.
+  pub id: SnapshotId,
+  /// The volume.
+  pub volume: VolumeId,
+  /// The epoch it sealed.
+  pub epoch: u64,
+  /// The identity once hashed.
+  pub identity: Option<[u8; 32]>,
+  /// The placement.
+  pub placed: PlacementState,
+  /// Taken at, monotonic ns.
+  pub taken_ns: u64,
+}
+
+/// A lineage edge: a clone and its origin.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LineageEdge {
+  /// The clone.
+  pub child: VolumeId,
+  /// The origin volume.
+  pub origin_volume: VolumeId,
+  /// The origin snapshot.
+  pub origin_snapshot: SnapshotId,
+}
+
+/// Who attached.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum Consumer {
+  /// An SDK client.
+  Sdk {
+    /// The client id.
+    client: u32,
+  },
+  /// A bridge mount.
+  Bridge,
+  /// The launcher.
+  Launcher,
+  /// An OCI binding borrowing a host mount (§4.6): it survives the issuing client and ends
+  /// with explicit detach, the source mount, or the volume. The parent must be a bridge
+  /// attachment of the same volume; dependencies cannot form chains or cycles.
+  Mount {
+    /// The owning host mount's attachment id.
+    attachment: u64,
+  },
+  /// A guest device (§4.6 virtio-fs; AUD-29-68): the harness's VMM, admitted for the authenticated consumer
+  /// the record's principal names. It ends with the device: the guest's hangup, a revocation, a detach, the
+  /// volume's destroy, and the daemon's process (recovery ends it, as it ends a FUSE mount). Appended.
+  Guest,
+  /// A client of another host, its attachment recorded on this owner (§4.10, A-222): `host` is the forwarding peer's
+  /// authenticated member id, never a claim of the request's. It ends with a detach routed by its volume, its host's
+  /// reap of `client` (`RemoteReap`), the host's retirement, and the volume's destroy; a silent holder's write lease
+  /// ends at its term (D-16). Appended.
+  Remote {
+    /// The member id of the client's host.
+    host: u64,
+    /// The client's id on that host.
+    client: u32,
+  },
+  /// A CLI attachment (§4.7, A-230): one a process makes and exits, for later processes to name, so it outlives the
+  /// client that made it. It holds a term, the failover SLO as the write lease's does, renewed by every verb that names
+  /// it, and ends at the term's lapse: an abandoned one releases its volume's write lease within one term. Appended.
+  Termed {
+    /// When its term lapses, on the shard's monotonic clock.
+    expires_ns: u64,
+  },
+}
+
+/// The form of an attachment. Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum AttachForm {
+  /// Under the root mount.
+  Root,
+  /// At a chosen path.
+  ChosenPath {
+    /// The path.
+    path: String,
+  },
+  /// A container bind (§4.6 A-9): the verified host mount point bound by the OCI runtime at a path
+  /// inside the container; the authorized binding the record carries.
+  Oci {
+    /// The host mount point (the bind's source).
+    source: String,
+    /// The container path (the bind's destination).
+    destination: String,
+    /// Whether the bind is read-only.
+    read_only: bool,
+  },
+  /// A Linux FUSE mount (§4.6 "Linux"; AUD-29-64) at its mount point. Kept apart from a chosen-path host
+  /// mount because its device is the daemon process's own: recovery keeps it only when the anchor held the
+  /// device across the restart and the kernel can resend (A-61), and ends it otherwise, where an NFS host mount
+  /// reconnects to the restarted daemon.
+  FuseMount {
+    /// The mount point.
+    path: String,
+  },
+  /// A host mount presenting only one directory of the volume (§4.6 scoped exports; AUD-29-76): the
+  /// directory's inode, and the mount point once the kernel mount is bound.
+  ScopedMount {
+    /// The directory's inode number: the export's root.
+    scope: u64,
+    /// The mount point, once bound.
+    mount_point: Option<String>,
+  },
+  /// A Linux FUSE mount presenting only one directory of the volume (§4.6 scoped exports; AUD-29-76): ended by
+  /// recovery as a `FuseMount` is, held to its directory as a `ScopedMount` is.
+  ScopedFuseMount {
+    /// The mount point.
+    path: String,
+    /// The directory's inode number: the mount's root.
+    scope: u64,
+  },
+  /// A guest device's tag (`mount -t virtiofs <tag>` in the guest), with the directory it presents when it
+  /// presents one (AUD-29-76). Appended.
+  GuestTag {
+    /// The tag.
+    tag: String,
+    /// The directory's inode number, when the device presents one directory.
+    scope: Option<u64>,
+  },
+  /// A Linux FUSE mount shared with other local users' processes (`allow_other`): what a container bind on
+  /// Linux borrows (§4.6 A-9). Ended by recovery as a `FuseMount` is. Appended.
+  SharedFuseMount {
+    /// The mount point.
+    path: String,
+    /// The directory's inode number, when the mount presents one directory.
+    scope: Option<u64>,
+  },
+  /// A host mount bound to one Unix identity (§4.6 A-115): it serves requests whose caller is `uid`, and to every
+  /// other caller, the superuser's included, only attributes and an `ACCESS` that grants nothing, so no kernel's
+  /// cache of what one identity read through it serves another. Optionally one directory. Appended.
+  BoundMount {
+    /// The identity served.
+    uid: u32,
+    /// The directory's inode number, when the mount presents one directory.
+    scope: Option<u64>,
+    /// The mount point, once bound.
+    mount_point: Option<String>,
+  },
+  /// A Shards microVM's fs device served over an anonymous stream (§4.6, the Shards route): the daemon keeps one end
+  /// of a socket pair and serves the attachment on it, and the other end went to whoever attached. The stream is the
+  /// daemon process's own, so recovery ends the record as it ends a guest device's. Optionally one directory.
+  /// Appended.
+  ShardsFs {
+    /// The directory's inode number, when the stream presents one directory.
+    scope: Option<u64>,
+  },
+  /// A Windows WinFsp volume at a drive letter (§4.6 "Windows"). The WinFsp file system is the daemon process's own,
+  /// so recovery ends the record as it ends a FUSE mount the anchor did not hold. Appended.
+  WinFspMount {
+    /// The drive letter and its colon (`S:`).
+    path: String,
+  },
+}
+
+impl AttachForm {
+  /// The host mount point a mounted form names: a chosen-path host mount's or a FUSE mount's.
+  pub fn mount_point(&self) -> Option<&str> {
+    match self {
+      Self::ChosenPath { path }
+      | Self::FuseMount { path }
+      | Self::ScopedFuseMount { path, .. }
+      | Self::SharedFuseMount { path, .. }
+      | Self::WinFspMount { path } => Some(path),
+      Self::ScopedMount { mount_point, .. } | Self::BoundMount { mount_point, .. } => {
+        mount_point.as_deref()
+      }
+      Self::Root | Self::Oci { .. } | Self::GuestTag { .. } | Self::ShardsFs { .. } => None,
+    }
+  }
+
+  /// The directory a scoped mount presents, if this form is one.
+  pub fn scope(&self) -> Option<u64> {
+    match self {
+      Self::ScopedMount { scope, .. } | Self::ScopedFuseMount { scope, .. } => Some(*scope),
+      Self::GuestTag { scope, .. }
+      | Self::SharedFuseMount { scope, .. }
+      | Self::BoundMount { scope, .. }
+      | Self::ShardsFs { scope } => *scope,
+      _ => None,
+    }
+  }
+
+  /// The one Unix identity a bound mount serves (§4.6 A-115); `None` for a form that serves every caller.
+  pub fn bound_uid(&self) -> Option<u32> {
+    match self {
+      Self::BoundMount { uid, .. } => Some(*uid),
+      _ => None,
+    }
+  }
+
+  /// The mount point of a FUSE form (whole, scoped or shared): a mount the daemon's own process holds, so it
+  /// ends with it.
+  pub fn fuse_mount_point(&self) -> Option<&str> {
+    match self {
+      Self::FuseMount { path }
+      | Self::ScopedFuseMount { path, .. }
+      | Self::SharedFuseMount { path, .. } => Some(path),
+      _ => None,
+    }
+  }
+
+  /// The mount point of a mount the daemon itself established (a FUSE form or a WinFsp volume), which a later bind
+  /// leaves as it is: the daemon named it, so no client's report of where it is replaces it.
+  pub fn daemon_mount_point(&self) -> Option<&str> {
+    match self {
+      Self::WinFspMount { path } => Some(path),
+      _ => self.fuse_mount_point(),
+    }
+  }
+
+  /// Whether a container runtime's processes may reach this mount (`allow_other`).
+  pub fn shared_with_other_users(&self) -> bool {
+    matches!(self, Self::SharedFuseMount { .. })
+  }
+}
+
+/// An attachment record.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentRecord {
+  /// The id.
+  pub id: u64,
+  /// The volume.
+  pub volume: VolumeId,
+  /// The consumer.
+  pub consumer: Consumer,
+  /// The snapshot, for a read-only attachment.
+  pub snapshot: Option<SnapshotId>,
+  /// The form.
+  pub form: AttachForm,
+  /// The principal.
+  pub principal: Principal,
+  /// The rights this attachment was granted, from the volume's access list at attach time (§4.13; AUD-01):
+  /// what the attachment authorizes at a host mount, so an NFS request served through it runs under these
+  /// rights — never the unconditional read/write the edge used to fabricate. The owner holds every right.
+  pub rights: Rights,
+  /// The attachment's **mount capability token** (§4.6, §4.13; AUD-01): a random secret minted when the
+  /// attachment is created, returned to the authorized consumer by `attach`, and presented at the NFS
+  /// mount so the edge authorizes the connection as this attachment's consumer with its `rights` — the
+  /// bearer capability the loopback edge needs, since a supplied `AUTH_SYS` uid and loopback reachability
+  /// are not consumer authority. Zero for an attachment that establishes no host mount (an SDK record form,
+  /// a green pin), which the NFS edge never authorizes.
+  pub token: [u8; 16],
+}
+
+/// A request that ran and waits for a version of a green to commit (§4.16 "Commit", A-252), as a snapshot carries it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AwaitingCompletion {
+  /// The sequence.
+  pub sequence: u32,
+  /// The green.
+  pub green: VolumeId,
+  /// The version it waits for.
+  pub version: u64,
+}
+
+/// A completion record (RIFL, §4.9). The idempotency key is **globally unique**: `origin` is the host whose
+/// client issued the request — this node's own host for a local client, and the *authenticated* forwarding
+/// peer for a cross-node forwarded verb (§4.8 "Lookup") — so a forwarded request from another node's client
+/// can never collide with a local client that happens to share its (per-node) id.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct CompletionRecord {
+  /// The host id (`HostId.0`) whose client issued the request — this node for a local client, the
+  /// authenticated forwarding peer for a cross-node forwarded verb. Part of the idempotency key, so per-node
+  /// client ids stay globally unique. Stored as the raw `u64` (host ids serialize as `u64`; `HostId` is an
+  /// in-memory wrapper).
+  pub origin: u64,
+  /// The client.
+  pub client: u32,
+  /// The sequence.
+  pub sequence: u32,
+  /// The reply bytes.
+  pub result: Vec<u8>,
+}
+
+/// The surface a grant came from (§4.15).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum GrantSurface {
+  /// The command line.
+  Cli,
+  /// A confirmation surface of a harness.
+  Confirmation {
+    /// The harness.
+    harness: String,
+  },
+}
+
+/// A grant's scope.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum GrantScope {
+  /// One landing of the manifest.
+  Once,
+  /// Every landing of the volume into the target for the session.
+  Session {
+    /// The session.
+    session: u64,
+  },
+}
+
+/// A grant's state.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantState {
+  /// Usable.
+  Issued,
+  /// Used by its landing.
+  Consumed,
+  /// Past its term or session.
+  Expired,
+  /// Revoked by the human.
+  Revoked,
+}
+
+/// A grant record.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GrantRecord {
+  /// The id.
+  pub id: u64,
+  /// The principal it was made for.
+  pub principal: Principal,
+  /// The surface.
+  pub surface: GrantSurface,
+  /// The volume.
+  pub volume: VolumeId,
+  /// The snapshot.
+  pub snapshot: SnapshotId,
+  /// The canonical target.
+  pub target: String,
+  /// The manifest hash it binds.
+  pub manifest: [u8; 32],
+  /// The scope.
+  pub scope: GrantScope,
+  /// Issued at, monotonic ns.
+  pub issued_ns: u64,
+  /// Expires at, monotonic ns.
+  pub expires_ns: u64,
+  /// The state.
+  pub state: GrantState,
+  /// The target directory's device when the landing was presented: with `principal` (the consumer),
+  /// `volume`, `snapshot` and `target`, the grant's whole binding (§4.13 "Grants": the target identity), so
+  /// a grant rebuilt after a restart binds the directory the human approved and not whatever holds its path
+  /// then (AUD-29-01, AUD-29-06; appended for append-only evolution, as is the field after it).
+  pub target_device: u64,
+  /// The target directory's inode on that device.
+  pub target_inode: u64,
+}
+
+/// The landing lease on a canonical target: one record per target, kept by the control partition (§4.15
+/// "Ownership facts"; AUD-29-03).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LandingLeaseRecord {
+  /// The target: its canonical identity's key (`slates_land::grant::lease_key`, the directory's device and
+  /// inode), so every alias of one directory names one record.
+  pub target: String,
+  /// The holder: the landing attempt that took it.
+  pub holder: u64,
+  /// The fencing generation: the take's log sequence on the control partition, so it only grows — across
+  /// releases, which remove the record, and restarts.
+  pub generation: u64,
+  /// Expires at, monotonic ns.
+  pub expires_ns: u64,
+}
+
+/// The landing state machine (§4.15).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandingState {
+  /// Building the manifest.
+  Planning,
+  /// Presented; no grant yet.
+  AwaitingGrant,
+  /// Verdicts being computed.
+  Validating,
+  /// Writing.
+  Writing,
+  /// Syncing.
+  Syncing,
+  /// Advancing witnesses.
+  Advancing,
+  /// Done.
+  Done,
+  /// Some entries failed; the rest landed.
+  Partial,
+  /// Refused before any write.
+  Refused,
+  /// Stopped mid-way; every entry old or new.
+  Aborted,
+}
+
+/// A landing record.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LandingRecord {
+  /// The id.
+  pub id: u64,
+  /// The volume.
+  pub volume: VolumeId,
+  /// The snapshot.
+  pub snapshot: SnapshotId,
+  /// The target.
+  pub target: String,
+  /// The manifest hash.
+  pub manifest: [u8; 32],
+  /// The grant, once bound.
+  pub grant: Option<u64>,
+  /// The state.
+  pub state: LandingState,
+  /// Entries written.
+  pub written: u32,
+  /// Entries in conflict.
+  pub conflicts: u32,
+}
+
+/// What the audit log records (§4.14, §4.15).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditKind {
+  /// A grant was issued.
+  GrantIssued,
+  /// A grant was revoked.
+  GrantRevoked,
+  /// A manifest was planned.
+  LandingPlanned,
+  /// Verdicts were computed.
+  LandingValidated,
+  /// One entry landed.
+  EntryWritten,
+  /// One entry was refused.
+  EntryRefused,
+  /// The landing reached a terminal state.
+  LandingFinished,
+}
+
+/// One audit record; content-free except the manifest hash.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AuditRecord {
+  /// Sequence number.
+  pub seq: u64,
+  /// Monotonic ns.
+  pub at_ns: u64,
+  /// The kind.
+  pub kind: AuditKind,
+  /// The principal.
+  pub principal: Principal,
+  /// The grant, when one is bound.
+  pub grant: Option<u64>,
+  /// The landing.
+  pub landing: Option<u64>,
+  /// The manifest.
+  pub manifest: Option<[u8; 32]>,
+  /// The terminal state, for `LandingFinished`.
+  pub outcome: Option<LandingState>,
+}
+
+/// An NFSv4 open held at its file's owner partition (§4.6 A-37): what `slates_bridge_nfs::v4::files`
+/// keeps for it, so a restart rebuilds the owner's file state and the client's state ids stay valid.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsOpenRecord {
+  /// The state id's `other`.
+  pub other: [u8; 12],
+  /// The client holding it.
+  pub clientid: u64,
+  /// The open-owner.
+  pub owner: Vec<u8>,
+  /// The uid that made the open. Part of the open's identity: an open-owner is opaque data the client
+  /// chooses, so it carries no authority between users, and a restored open must know whose it was.
+  pub uid: u32,
+  /// The file handle it opened.
+  pub fh: Vec<u8>,
+  /// The share access.
+  pub access: u32,
+  /// The share deny.
+  pub deny: u32,
+  /// The state id's current seqid.
+  pub seqid: u32,
+}
+
+/// An NFSv4 delegation held at its file's owner (RFC 8881 §10.4; §4.6 A-78): durable, as an open is (A-37), because
+/// the anchor keeps a mount across a daemon restart and a client keeps trusting its cache while it holds one.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsDelegationRecord {
+  /// The delegation state id's `other`.
+  pub other: [u8; 12],
+  /// The client holding it.
+  pub clientid: u64,
+  /// The file handle it delegates.
+  pub fh: Vec<u8>,
+  /// Whether it is a write delegation (`OPEN_DELEGATE_WRITE`); a read delegation otherwise.
+  pub write: bool,
+  /// The state id's current seqid.
+  pub seqid: u32,
+}
+
+/// One byte range of an NFSv4 lock state: `[start, end)`, `end == u64::MAX` reaching the file's end.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfsLockRange {
+  /// The first byte.
+  pub start: u64,
+  /// One past the last byte, or `u64::MAX`.
+  pub end: u64,
+  /// A write (exclusive) lock; a read (shared) lock otherwise.
+  pub write: bool,
+}
+
+/// An NFSv4 lock state held at its file's owner partition (§4.6 A-37).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsLockRecord {
+  /// The state id's `other`.
+  pub other: [u8; 12],
+  /// The client holding it.
+  pub clientid: u64,
+  /// The lock-owner.
+  pub owner: Vec<u8>,
+  /// The file handle.
+  pub fh: Vec<u8>,
+  /// The open it was created from.
+  pub open: [u8; 12],
+  /// The state id's current seqid.
+  pub seqid: u32,
+  /// Its ranges, ascending.
+  pub ranges: Vec<NfsLockRange>,
+}
+
+/// An NFSv4 client held at the listener's partition (§4.6 A-37): its id, owner, verifier, principal
+/// and next CREATE_SESSION sequence, so a restarted listener still knows it and its state ids stay
+/// valid; its sessions are records of their own ([`NfsSessionRecord`], A-127).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsClientRecord {
+  /// The client id.
+  pub clientid: u64,
+  /// The client owner (`co_ownerid`).
+  pub owner: Vec<u8>,
+  /// Format: the owner's verifier, an NFSv4 `verifier4` (8 bytes, RFC 7863).
+  pub verifier: [u8; 8],
+  /// The principal that established it.
+  pub principal: u32,
+  /// The next CREATE_SESSION sequence it must send.
+  pub create_seq: u32,
+}
+
+/// An NFSv4.1 channel's attributes as negotiated (RFC 8881 §18.36, `channel_attrs4`), as a session record carries them
+/// (A-127).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfsChannelRecord {
+  /// `ca_headerpadsize`.
+  pub header_pad: u32,
+  /// `ca_maxrequestsize`.
+  pub max_request: u32,
+  /// `ca_maxresponsesize`.
+  pub max_response: u32,
+  /// `ca_maxresponsesize_cached`.
+  pub max_response_cached: u32,
+  /// `ca_maxoperations`.
+  pub max_operations: u32,
+  /// `ca_maxrequests`: the slot count.
+  pub max_requests: u32,
+}
+
+/// A session's back channel as its record carries it (A-127): the client's callback program, the RPC credential its
+/// callbacks carry (an encoded `opaque_auth` the client listed), and the minor version they name.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsCallbackRecord {
+  /// The callback program number.
+  pub program: u32,
+  /// The encoded credential.
+  pub credential: Vec<u8>,
+  /// The minor version callbacks name.
+  pub minor: u32,
+}
+
+/// An NFSv4.1 session held at its client's listener partition (A-127): enough for a restarted listener to serve it
+/// again, so a client retries on its own slots after a daemon restart and carries on with no CREATE_SESSION. Its
+/// slots' sequence ids are not kept: a restored slot takes its next request as it comes.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsSessionRecord {
+  /// Format: the session id, an NFSv4.1 `sessionid4` (16 bytes, RFC 8881 §2.10.3).
+  pub sessionid: [u8; 16],
+  /// The client it belongs to.
+  pub clientid: u64,
+  /// The CREATE_SESSION sequence id that created it.
+  pub sequence: u32,
+  /// The fore channel.
+  pub fore: NfsChannelRecord,
+  /// The back channel.
+  pub back: NfsChannelRecord,
+  /// The back channel's callback, when the client asked for one.
+  pub callback: Option<NfsCallbackRecord>,
+}
+
+/// An NFSv4.1 call record held at the partition of the shard that served its calls (A-127): the session slot it
+/// answers for, the client it belongs to, and the record's bytes (`slates_bridge_nfs::v4::replay`, opaque here). It
+/// rides the file-state transaction a call of it changed, so a compound retried after a restart is answered with what
+/// it did, never run again.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsCallRecord {
+  /// Format: the session slot: an NFSv4.1 session id (16 bytes) then the slot as a big-endian word.
+  pub key: [u8; 20],
+  /// The client the session belongs to.
+  pub clientid: u64,
+  /// The record's bytes.
+  pub record: Vec<u8>,
+}
+
+/// An NFSv4 purge a shard owes every owner shard (2026-10-10): a dropped client's file state and call records, or a
+/// destroyed session's call records. Recorded in the same transaction as the drop that makes it owed, and settled once
+/// every owner acknowledged it, so a death between the two cannot leave a dropped client's locks at an owner with no
+/// lease left to expire them.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NfsPurgeRecord {
+  /// The client.
+  pub clientid: u64,
+  /// Format: the destroyed session's id (16 bytes), or `None` for the dropped client's whole state.
+  pub session: Option<[u8; 16]>,
+}
+
+/// A volume name held at its name's partition for a volume another partition holds (§4.8 "Lookup", A-236): a clone
+/// lives beside its origin, for copy-on-write, while its name hashes elsewhere. The name's partition is where the name
+/// is looked up and where its uniqueness is decided, so it holds this alias, which points at the clone. An alias is
+/// reserved before the clone is made and confirmed after: a reserved one holds the name (a create of it is refused) but
+/// resolves nothing until confirmed, and a daemon's recovery confirms or releases every reserved one by asking the
+/// clone's partition whether the clone exists under this name.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NameAliasRecord {
+  /// The name.
+  pub name: String,
+  /// The volume it names, on the partition its id encodes.
+  pub volume: VolumeId,
+  /// Whether the clone was made and the alias confirmed; until then the alias holds the name and resolves nothing.
+  pub confirmed: bool,
+}
+
+/// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;
+/// seal.md §3.3).
+pub const SEAL_KEY_RECORD_BYTES: usize = 61;
+
+/// Whose sealing key a record holds (A-92): a tenant's key (the host account, A-9), its naming key, or a volume's
+/// lineage key.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SealKeyOwner {
+  /// A tenant's key, wrapped by the node's root.
+  Tenant {
+    /// The tenant: a host account, or the namespaced hash of a principal with no numeric account.
+    account: u64,
+  },
+  /// A volume's naming key (seal.md §7: keyed names for its chunks), wrapped by the volume's lineage key, so it travels
+  /// with the volume to a successor (A-92 piece 4c).
+  Naming {
+    /// The volume.
+    volume: VolumeId,
+  },
+  /// A volume's lineage key, wrapped by its tenant's key.
+  Lineage {
+    /// The volume.
+    volume: VolumeId,
+  },
+  /// The node's ML-KEM-1024 recipient key pair (seal.md §6), sealed whole under the node's root: what a successor
+  /// unwraps a taken-over volume's lineage key with. Recorded in partition 0 only. Appended.
+  Recipient,
+  /// A pair key between an owner shard and a candidate node (A-92 piece 4b), wrapped by this node's root. On the owner
+  /// shard `host` is the candidate and `partition` the owner's own; on the candidate (partition 0) `host` is the
+  /// owner and `partition` the owner's shard. Appended.
+  Pair {
+    /// The other node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+  },
+  /// A pair key another node's owner shard delivered to this node (A-92 piece 4b), on its control shard (partition 0),
+  /// wrapped by this node's root: `host` the owner, `partition` the owner's shard. Kept apart from [`Self::Pair`], this
+  /// node's own key with that node: when this node's owner shard is partition 0 as well, the two shared one owner
+  /// until 2026-10-09, and whichever was recorded first made the other "another key for a recorded pair", refused for
+  /// good (an owner's heads then never covered that holder, and its mirror shipments were never owed). Appended.
+  PairReceived {
+    /// The owner node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+  },
+  /// A pair key an earlier incarnation of `host` delivered for `partition` (A-92 piece 4b), kept on this node's control
+  /// shard while a head or live log this node holds is still sealed under it, so the volumes of a node that came back
+  /// with fresh RAM at the same anchor (its keys gone, a new pair made) can still be taken over: `key` is its id, which
+  /// a head's key entry names as its wrapping key. Appended.
+  PairRetired {
+    /// The owner node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+    /// The retired key's id.
+    key: [u8; 16],
+  },
+}
+
+/// Format: the most bytes a sealed recipient record holds: hyper-seal's `Recipient::seal` of a hybrid recipient is one
+/// STREAM file of 5,027 bytes (header 114, id 16, ML-KEM-1024 decapsulation key 3,168 and encapsulation key 1,568,
+/// P-384 scalar 48 and public point 97, tag 16), bounded at the next power of two.
+pub const SEAL_RECIPIENT_RECORD_MAX: usize = 8192;
+
+/// A sealing key, wrapped by its parent (A-92; seal.md §3.3): its owner, its own id (what its children's records name
+/// as their parent), and hyper-seal's 61-byte wrapped record. The key's bytes never appear here.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct SealKeyRecord {
+  /// Whose key.
+  pub owner: SealKeyOwner,
+  /// The key's own id.
+  pub id: [u8; 16],
+  /// The wrapped record: [`SEAL_KEY_RECORD_BYTES`] long, or for the node's recipient its sealed form, at most
+  /// [`SEAL_RECIPIENT_RECORD_MAX`].
+  pub record: Vec<u8>,
+}

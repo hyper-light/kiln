@@ -1,0 +1,722 @@
+//! A large granted landing does not monopolize its owner shard (AUD-29-25; §4.15, §4.3, R9): the landing runs
+//! as an owned run stepped in slices of half the shard's step quantum, and the shard serves its other clients
+//! between them. Before the sliced run, the landing was one synchronous call on the shard, and a verb that
+//! arrived while it ran waited for all of it.
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
+// The daemon's NFS loopback transport and a real landing target: macOS and Linux.
+#![cfg(unix)]
+
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
+
+use slates_client::driver::{Begin, Driver, Event, Ticket};
+use slates_client::{
+  Client, ClientError, CreateSpec, Filter, Intent, Landing, SizeClass, VolumeId,
+};
+use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+mod common;
+use common::client::{connect, deadlines, scratch};
+use common::landing::approve;
+use common::nfs::{create, mount, write};
+use common::target::target_dir;
+
+/// Shape: one shard, so the landing and the probing client share it — the shard is the subject.
+const TEST_SHARDS: u16 = 1;
+/// Shape: the volume's name.
+const VOLUME: &str = "fair-landing";
+/// Shape: the volume the lease probe takes and gives back its write lease on.
+const LEASED: &str = "fair-leased";
+/// Shape: files in the landing — each a temporary created, written, synced and linked on the disk, so the
+/// landing's host work spans many slices on any disk.
+const FILES: usize = 600;
+/// Shape: the probes of each kind taken before the landing, for their service time on this machine.
+const BASELINE_PROBES: usize = 32;
+
+/// The kinds of work the shard serves beside the landing: a read, a provisioning (a volume created and
+/// destroyed), and a write lease taken and given back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+  Read,
+  Provision,
+  Lease,
+}
+
+/// Format: the probe kinds, in the order the prober cycles through them.
+const PROBES: [Probe; 3] = [Probe::Read, Probe::Provision, Probe::Lease];
+
+/// One probe's latency: its round trips through the shard.
+fn probe(
+  client: &mut slates_client::Client,
+  kind: Probe,
+  round: usize,
+  leased: slates_client::VolumeId,
+) -> Duration {
+  let began = Instant::now();
+  match kind {
+    Probe::Read => {
+      client.list().unwrap();
+    }
+    Probe::Provision => {
+      let id = client
+        .create(&scratch(&format!("fair-probe-{round}")))
+        .unwrap();
+      client.destroy(id).unwrap();
+    }
+    Probe::Lease => {
+      let attached = client.attach(leased, None, Intent::Write).unwrap();
+      client.detach(attached.attachment).unwrap();
+    }
+  }
+  began.elapsed()
+}
+
+/// The `ppm`-th quantile (parts per million) of `samples`, exactly: the `⌈n × ppm / 10⁶⌉`-th smallest.
+fn quantile(samples: &mut [Duration], ppm: u64) -> Duration {
+  /// Format: parts per million.
+  const PPM: u64 = 1_000_000;
+  samples.sort_unstable();
+  let n = u64::try_from(samples.len()).unwrap();
+  let rank = (n * ppm).div_ceil(PPM).max(1);
+  samples[usize::try_from(rank).unwrap() - 1]
+}
+
+/// Writes `count` small files into the volume `volume` through the daemon's NFS transport.
+fn write_files(daemon: &Daemon, volume: &str, count: usize) {
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability(volume).unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let mut xid = 2u32;
+  for n in 0..count {
+    let file = create(&mut stream, &root, &format!("f{n:04}"), xid);
+    write(&mut stream, &file, format!("file {n}").as_bytes(), xid + 1);
+    xid += 2;
+  }
+}
+
+/// The barriers the daemon ran on threads of their own (A-132's counter).
+fn barriers_away(daemon: &Daemon) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("landing.barriers_away")
+    .copied()
+    .unwrap_or(0)
+}
+
+/// The landing is done with every file written, it took barriers, and every one ran on a thread of its own, none on
+/// the shard (A-132): `away` barriers counted by the daemon.
+fn assert_landed_with_every_barrier_away(landed: &Result<Landing, ClientError>, away: u64) {
+  let Ok(Landing::Landed(outcome)) = landed else {
+    panic!("the granted landing: {landed:?}");
+  };
+  assert_eq!(outcome.state, "done");
+  assert_eq!(outcome.written, u64::try_from(FILES).unwrap());
+  assert!(
+    outcome.barriers > 0,
+    "the landing took barriers: {outcome:?}"
+  );
+  assert_eq!(
+    away, outcome.barriers,
+    "every barrier ran on a thread of its own (A-132)"
+  );
+}
+
+/// Prints each probe kind's quantiles inside the landing (`began`, lasting `took`) beside its baseline, asserts
+/// every kind was answered more than once while the landing ran, and returns the longest probe inside it.
+fn report_probes(
+  during: &[(Probe, Instant, Duration)],
+  baseline: &[(Probe, Duration)],
+  began: Instant,
+  took: Duration,
+) -> Duration {
+  let mut longest_probe = Duration::ZERO;
+  for kind in PROBES {
+    let mut inside: Vec<Duration> = during
+      .iter()
+      .filter(|(k, at, probe)| *k == kind && *at >= began && *at + *probe <= began + took)
+      .map(|(_, _, probe)| *probe)
+      .collect();
+    let mut before: Vec<Duration> = baseline
+      .iter()
+      .filter(|(k, _)| *k == kind)
+      .map(|(_, probe)| *probe)
+      .collect();
+    assert!(
+      inside.len() > 1,
+      "the shard answered {kind:?} probes while the landing ran: {}",
+      inside.len()
+    );
+    let max = quantile(&mut inside, 1_000_000);
+    eprintln!(
+      "{kind:?}: {} probes inside the landing — p50 {:?}, p99 {:?}, p999 {:?}, max {max:?}; before it max {:?}",
+      inside.len(),
+      quantile(&mut inside, 500_000),
+      quantile(&mut inside, 990_000),
+      quantile(&mut inside, 999_000),
+      quantile(&mut before, 1_000_000)
+    );
+    longest_probe = longest_probe.max(max);
+  }
+  longest_probe
+}
+
+/// AUD-29-25 acceptance and its percentile lane. Do: write 600 files through the daemon's NFS transport into
+/// a one-shard volume, take each probe's baseline latency, then land the volume into a fresh directory under
+/// a grant on one thread while another client keeps probing the same shard — reads, provisioning (create and
+/// destroy) and a write lease taken and given back, in turn. Expect: the landing is done with every file
+/// written and ran in many slices; every kind of probe was answered while it ran; no probe waited for the
+/// whole landing; no slice ran past its budget by more than its own last unit (the daemon counts any that
+/// did); every barrier the landing took ran on a thread of its own, never in a slice (A-132: the daemon's count of
+/// barriers away equals the landing's barriers, and there were some); and the run publishes, per probe kind and for
+/// the slices, p50/p99/p999/max, with the shard's longest step — the recorded lane (`docs/wip/BENCHMARKS.md`, "The
+/// landing's percentile lane").
+#[test]
+fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-fairland-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "fairland"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = target_dir();
+  // The product's own deadlines: a granted landing longer than the reply deadline is waited for while the
+  // daemon lives (until 2026-10-01 the client answered `Stalled` after one second of it).
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let volume = client.create(&scratch(VOLUME)).unwrap();
+  write_files(&daemon, VOLUME, FILES);
+
+  let mut prober = connect(&instance);
+  let leased = prober.create(&scratch(LEASED)).unwrap();
+  let mut round = 0usize;
+  let mut baseline = Vec::new();
+  for _ in 0..BASELINE_PROBES {
+    for kind in PROBES {
+      baseline.push((kind, probe(&mut prober, kind, round, leased)));
+      round += 1;
+    }
+  }
+  let grant = approve(&mut client, &secret, volume, None, &target.path);
+  let target_path = target.path.clone();
+  let landing = std::thread::spawn(move || {
+    let began = Instant::now();
+    let landed = client.land(volume, None, &target_path, Filter::default(), Some(grant));
+    (began, began.elapsed(), landed)
+  });
+  let mut during = Vec::new();
+  while !landing.is_finished() {
+    let kind = PROBES[round % PROBES.len()];
+    let at = Instant::now();
+    let took = probe(&mut prober, kind, round, leased);
+    during.push((kind, at, took));
+    round += 1;
+  }
+  let (began, took, landed) = landing.join().unwrap();
+  let slices = daemon.landing_slices().unwrap();
+  let away = barriers_away(&daemon);
+  let longest_step = daemon
+    .shard_pulses()
+    .iter()
+    .map(|pulse| pulse.longest_step_ns)
+    .max()
+    .unwrap_or(0);
+  drop(prober);
+  daemon.stop();
+
+  assert_landed_with_every_barrier_away(&landed, away);
+  eprintln!(
+    "landing of {FILES} files: {took:?} in {} slices of a {} ns budget: p50 {} ns, p99 {} ns, p999 {} ns, \
+     max {} ns; {} past budget; {away} barriers away; the shard's longest step {longest_step} ns",
+    slices.slices,
+    slices.budget_ns,
+    slices.p50_ns,
+    slices.p99_ns,
+    slices.p999_ns,
+    slices.max_ns,
+    slices.past_budget
+  );
+  let longest_probe = report_probes(&during, &baseline, began, took);
+  assert!(
+    slices.slices > 1,
+    "the landing ran in slices: {}",
+    slices.slices
+  );
+  assert_eq!(
+    slices.past_budget, 0,
+    "every slice ended within its own last unit of its budget"
+  );
+  assert!(
+    longest_probe < took,
+    "no probe waited for the whole landing ({longest_probe:?} of {took:?})"
+  );
+  assert!(
+    Duration::from_nanos(slices.max_ns) * 2 <= took,
+    "no slice was more than half the landing ({} ns of {took:?})",
+    slices.max_ns
+  );
+}
+
+/// Shape: the files of the calibration landing that measures this machine's per-file landing cost — enough
+/// that the mean is many units, not one unit's noise.
+const CALIBRATION_FILES: usize = 500;
+/// Shape: how many times the span it must outlast a sized landing is made to last, so a disk faster than the
+/// calibration measured still outlasts it.
+const OUTLAST_FACTOR: u32 = 2;
+/// Shape: the most files a sized landing is given — sixteen calibrations; a disk so fast that more would be
+/// needed skips the test loudly rather than writing without bound.
+const MOST_FILES: usize = CALIBRATION_FILES * 16;
+/// Shape: the quota one of a sized landing's files is given: ext4's default bytes per inode (`mke2fs` `inode_ratio`).
+/// Far above both what a file's few inline bytes are charged and the bytes per inode a shard's layout gives (about
+/// 2.4 KB, A-109), so the inode allowance, not the bytes, never refuses one of the files.
+const QUOTA_PER_FILE: usize = 16 << 10;
+/// Derived: the most a sized landing's volume may grow to — each of the most files ([`MOST_FILES`], doubled
+/// once more by a landing that must be made again) given [`QUOTA_PER_FILE`]. A volume's inode allowance is its
+/// quota's share of the shard's slab (§4.2, A-109, `verbs::inode_allowance`), so this takes a share of the slab, never
+/// all of it. Before A-109 the allowance was quota over `size_of::<Inode>()`, and this sizing reserved a 7.5 GB
+/// runner's whole slab (910,222 slots against 828,504), so the landing could not retain one version for its
+/// snapshot (`NoSpace`, 2026-10-01).
+const SIZED_VOLUME_BYTES: u64 = (MOST_FILES * 2 * QUOTA_PER_FILE) as u64;
+
+/// A volume for a sized landing: grown as its files arrive, up to what the most files need (a bounded volume
+/// would reserve the whole bound at creation).
+fn sized(name: &str) -> CreateSpec {
+  CreateSpec {
+    size: SizeClass::Dynamic {
+      max: SIZED_VOLUME_BYTES,
+    },
+    ..scratch(name)
+  }
+}
+
+/// Creates a sized volume, or reports a loud skip when the shard's budget cannot hold it (a typed
+/// `BudgetExceeded`: a machine too small for the landing this disk's speed calls for).
+fn create_sized(client: &mut Client, name: &str, files: usize) -> Option<VolumeId> {
+  match client.create(&sized(name)) {
+    Ok(volume) => Some(volume),
+    Err(ClientError::Refused(slates_client::Refusal::BudgetExceeded { available })) => {
+      eprintln!(
+        "SKIP: the shard's budget ({available} bytes available) cannot hold a volume for {files} files"
+      );
+      None
+    }
+    Err(e) => panic!("creating {name}: {e:?}"),
+  }
+}
+
+/// One calibration landing of `files` files (its own volume, grant and target): how long it took. A refusal
+/// reports what the daemon knew, so a machine-dependent refusal (the runners answered `NoSpace`, 2026-10-01,
+/// where this machine lands) names its stage and the derived configuration in the CI log.
+fn calibration_landing(
+  daemon: &Daemon,
+  client: &mut Client,
+  secret: &[u8; 32],
+  name: &str,
+  files: usize,
+) -> Duration {
+  let volume = client.create(&sized(name)).unwrap();
+  write_files(daemon, name, files);
+  let target = target_dir();
+  let grant = approve(client, secret, volume, None, &target.path);
+  let began = Instant::now();
+  let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
+  let took = began.elapsed();
+  assert!(
+    matches!(landed, Ok(Landing::Landed(_))),
+    "the calibration landing: {landed:?}; volume {:?}; refusals {:?}; config {:?}",
+    client.status(volume),
+    daemon.refusals_on_every_shard(),
+    daemon.config(),
+  );
+  // Its charge goes back to the shard for the landing it sizes.
+  client.destroy(volume).unwrap();
+  took
+}
+
+/// How many files a landing needs to last [`OUTLAST_FACTOR`] times `span` on this machine. Two calibration
+/// landings, of [`CALIBRATION_FILES`] files and twice that, measure the **marginal** per-file cost: a landing's
+/// fixed costs (its grant, its plan, the recovery publication at its end) are paid once by each and cancel,
+/// where dividing one landing's time by its files spread them over every file and undersized the landing on a
+/// fast disk (2026-10-01: a sized landing finished inside the term it had to outlast). The fixed costs only
+/// lengthen the real landing. `None` when more than [`MOST_FILES`] would be needed — the disk outruns the
+/// test's bound.
+fn files_to_outlast(
+  daemon: &Daemon,
+  client: &mut Client,
+  secret: &[u8; 32],
+  span: Duration,
+) -> Option<usize> {
+  files_lasting(per_file_cost(daemon, client, secret), span)
+}
+
+/// The marginal cost of one file of a granted landing on this machine, from two calibration landings
+/// ([`files_to_outlast`]).
+fn per_file_cost(daemon: &Daemon, client: &mut Client, secret: &[u8; 32]) -> Duration {
+  /// Shape: the calibration volumes' names.
+  const SMALL: &str = "calibration-landing";
+  const LARGE: &str = "calibration-landing-twice";
+  let small = calibration_landing(daemon, client, secret, SMALL, CALIBRATION_FILES);
+  let large = calibration_landing(daemon, client, secret, LARGE, CALIBRATION_FILES * 2);
+  // Scheduling noise can make the larger landing no slower; its own average is then the only measure there is.
+  let per_file = match large.checked_sub(small) {
+    Some(marginal) if !marginal.is_zero() => marginal / u32::try_from(CALIBRATION_FILES).unwrap(),
+    _ => large / u32::try_from(CALIBRATION_FILES * 2).unwrap(),
+  };
+  eprintln!(
+    "calibration: {CALIBRATION_FILES} files in {small:?}, twice that in {large:?} ({per_file:?} per file at the margin)"
+  );
+  per_file
+}
+
+/// How many files at `per_file` last [`OUTLAST_FACTOR`] times `span`; `None` past [`MOST_FILES`].
+fn files_lasting(per_file: Duration, span: Duration) -> Option<usize> {
+  let wanted = span * OUTLAST_FACTOR;
+  let files = usize::try_from(wanted.as_nanos().div_ceil(per_file.as_nanos().max(1))).unwrap();
+  eprintln!("{files} files to last {wanted:?} at {per_file:?} a file");
+  (files <= MOST_FILES).then_some(files.max(CALIBRATION_FILES))
+}
+
+/// Shape: the keepalive test's shortest lease term (the daemon's failover bound): a second, which the landing
+/// outlasts. On a quiet machine its half-term renewal margin, 500 ms, is past the longest gap a landing goes
+/// between two looks at its lease. A busy one goes longer, so the term the test runs is derived from the gap
+/// ([`term_for_gap`]) and this is only its floor.
+const SHORT_TERM_NS: u64 = 1_000_000_000;
+/// Shape: how many times the longest lease gap a landing was measured to go the renewal margin is made, so a
+/// landing that goes a little longer in the run than in its calibration still renews in time.
+const LEASE_GAP_HEADROOM: u64 = 2;
+
+/// Derived: the lease term whose renewal margin (half of it, `RENEW_AT_REMAINING_PERMILLE` in
+/// `crates/server/src/landing.rs`) is [`LEASE_GAP_HEADROOM`] times `gap_ns`, the longest a landing was measured to go
+/// between two looks at its lease, and never shorter than [`SHORT_TERM_NS`]. A fixed second failed under load:
+/// with two spinners a logical CPU on an 18-core Mac, a landing went 1,205 ms between two looks, and its entries
+/// after the lapse were skipped `LeaseEnded` (2026-11-07).
+fn term_for_gap(gap_ns: u64) -> u64 {
+  gap_ns
+    .saturating_mul(LEASE_GAP_HEADROOM)
+    .saturating_mul(2)
+    .max(SHORT_TERM_NS)
+}
+
+/// A daemon whose landing lease term (its failover bound) is `term_ns`, bootstrapped, and a client to it.
+fn daemon_with_term(term_ns: Option<u64>) -> (Daemon, Client) {
+  let profile = common::machine_profile();
+  let instance = format!(
+    "srv-renewland-{}-{}",
+    std::process::id(),
+    term_ns.unwrap_or(0)
+  );
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let config = match term_ns {
+    Some(term_ns) => config.with_failover_slo(term_ns),
+    None => config,
+  };
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", &format!("renewland-{}", term_ns.unwrap_or(0))),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let client = connect(&instance);
+  (daemon, client)
+}
+
+/// Shape: the renewals one landing must count before it is known, on the daemon's clock, to have outlasted the term
+/// it began under. A landing renews once half its lease's term has passed, at a slice boundary
+/// (`RENEW_AT_REMAINING_PERMILLE`), so its first renewal is at least half a term after the lease was taken and its
+/// second at least half the renewed term after that: a whole term past the take.
+const RENEWALS_PAST_THE_TERM: u64 = 2;
+
+/// AUD-29-25 (the lease keepalive). Do: on a daemon with the default term, measure this machine's per-file
+/// landing cost and the longest gap a landing goes between two looks at its lease (two calibration landings);
+/// then, on a daemon whose term is derived from that gap ([`term_for_gap`]), land enough files to last twice the
+/// term under a grant, doubling them until one landing renews its lease [`RENEWALS_PAST_THE_TERM`] times, which
+/// places its leased run past the term it began under on the daemon's clock. Expect: that landing is done with every
+/// file written; without the renewal its entries past the term were skipped (`LeaseEnded`) and it ended partial.
+///
+/// Two judgments come from the daemon, never the client's clock:
+/// - **Whether the landing outlasted its term:** by its renewals (bug-sweep's `b61ca46c`). The client's whole call
+///   also holds the request, the plan, the checks before the lease and the reply. CI run 40095492759 counted 6,833
+///   files in 1.011 s under a 1 s term, 0 renewals, done: a landing that never needed a renewal, counted as one that
+///   failed to make one.
+/// - **Whether its renewals could be made in time:** by the longest gap it went between two looks at its lease. A run
+///   whose gap reached its margin lapsed as a paused holder must; it tested a lapse, not the keepalive, so it is made
+///   again with the term that gap needs.
+///
+/// A landing that ended partial with every look inside its margin is the failure itself and ends the loop.
+#[test]
+fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
+  let (daemon, mut client) = daemon_with_term(None);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let per_file = per_file_cost(&daemon, &mut client, &secret);
+  let mut term_ns = term_for_gap(daemon.landing_slices().unwrap().longest_lease_gap_ns);
+  drop(client);
+  daemon.stop();
+  let mut files = 0;
+  let (outcome, renewed, gap_ns) = loop {
+    let term = Duration::from_nanos(term_ns);
+    files = files.max(files_lasting(per_file, term).unwrap_or(usize::MAX));
+    if files > MOST_FILES {
+      eprintln!(
+        "SKIP: no landing of up to {MOST_FILES} files renewed its lease {RENEWALS_PAST_THE_TERM} times within its margin here"
+      );
+      return;
+    }
+    let (daemon, mut client) = daemon_with_term(Some(term_ns));
+    let secret = daemon.segment().issuer_secret().unwrap();
+    let name = format!("{VOLUME}-{files}");
+    let Some(volume) = create_sized(&mut client, &name, files) else {
+      daemon.stop();
+      return;
+    };
+    write_files(&daemon, &name, files);
+    let target = target_dir();
+    let grant = approve(&mut client, &secret, volume, None, &target.path);
+    let began = Instant::now();
+    let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
+    let took = began.elapsed();
+    let renewed = daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("landing.lease_renewed")
+      .copied()
+      .unwrap_or(0);
+    let gap_ns = daemon.landing_slices().unwrap().longest_lease_gap_ns;
+    drop(client);
+    daemon.stop();
+    let Ok(Landing::Landed(outcome)) = landed else {
+      panic!("the granted landing: {landed:?}");
+    };
+    eprintln!(
+      "landing of {files} files: {took:?} on the client's clock under a {term_ns} ns term, {renewed} renewals, \
+       longest lease gap {gap_ns} ns: {} written, {}",
+      outcome.written, outcome.state
+    );
+    if gap_ns.saturating_mul(2) >= term_ns {
+      // The landing went past its renewal margin between two looks: the lease lapsed, as it must for a holder
+      // paused past its term, and the keepalive was not what was measured. Again with the term that gap needs.
+      term_ns = term_for_gap(gap_ns);
+      continue;
+    }
+    // Every look was inside the margin: a landing that lost entries to its term is the failure itself, whatever its
+    // renewals, and one that renewed past the term is the proof. Either ends the loop.
+    if renewed >= RENEWALS_PAST_THE_TERM || outcome.state != "done" {
+      break (outcome, renewed, gap_ns);
+    }
+    // A landing that did not outlast its term proves nothing: the landing's cost grows faster than its file
+    // count (measured 2026-10-01), so no calibration alone sizes it.
+    files = files.saturating_mul(2);
+  };
+  assert!(
+    gap_ns.saturating_mul(2) < term_ns,
+    "it looked at its lease within the margin"
+  );
+  assert_eq!(outcome.state, "done");
+  assert_eq!(outcome.written, u64::try_from(files).unwrap());
+  assert!(
+    renewed >= RENEWALS_PAST_THE_TERM,
+    "the lease was renewed past the term between slices ({renewed})"
+  );
+}
+
+/// Shape: the volume an impatient call lands beside the patient one.
+const IMPATIENT: &str = "impatient-landing";
+/// Shape: how long the loop waits for both landings to end: a minute, far past two landings measured at
+/// about 1.5 s each (`docs/wip/BENCHMARKS.md`, "The landing's percentile lane"), so a lost reply fails the test
+/// rather than hanging it.
+const BOTH_END_WITHIN: Duration = Duration::from_secs(60);
+
+/// How each call ended and when, on the loop's clock.
+type Ended = std::collections::BTreeMap<Ticket, (Duration, Result<Option<Landing>, ClientError>)>;
+
+/// A granted landing's begin, for the driver to send (and resend after a reconnect).
+fn land_begin(volume: VolumeId, target: String, grant: u64) -> Begin {
+  Box::new(move |client: &mut Client| {
+    client.land_begin(volume, None, &target, Filter::default(), Some(grant))
+  })
+}
+
+/// Runs an event loop over `driver` — pump, tick when the driver asks, end each call by its event — until
+/// every one of `tickets` has ended or [`BOTH_END_WITHIN`] passes, as an SDK's loop does.
+fn drive(client: &mut Client, driver: &mut Driver, tickets: &[Ticket]) -> Ended {
+  let started = Instant::now();
+  let mut ended = Ended::new();
+  let mut next_tick = Instant::now();
+  while tickets.iter().any(|ticket| !ended.contains_key(ticket))
+    && started.elapsed() < BOTH_END_WITHIN
+  {
+    let mut events = driver.pump(client);
+    if Instant::now() >= next_tick {
+      events.extend(driver.tick(client));
+    }
+    for event in events {
+      match event {
+        Event::Ready { ticket, word } => {
+          let landed = client.land_poll(word);
+          driver.finish(ticket);
+          ended.insert(ticket, (started.elapsed(), landed));
+        }
+        Event::Failed { ticket, error } => {
+          ended.insert(ticket, (started.elapsed(), Err(error)));
+        }
+      }
+    }
+    next_tick = Instant::now()
+      + Duration::from_nanos(driver.next_wake_ns(client).unwrap_or(deadlines().reply_ns));
+    std::hint::spin_loop();
+  }
+  ended
+}
+
+/// The async driver's wait for long work (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
+/// to a landing still at work). Do: land two volumes, each sized by a calibration landing to last twice the reply
+/// deadline, under grants through one async driver, driven by an event loop as an SDK drives it, both landings
+/// outlasting the reply deadline. Expect: both are waited for past it and end with their landing done and every file
+/// written, since a call waits while its daemon lives (A-232). Until 2026-11-13 one call was submitted patient
+/// (`submit_patient`, as both SDKs' `land` was) and the other plain, which the driver waited for only because a
+/// granted landing was a request the daemon defers (`Client::defers`, since 2026-10-07); before that the plain call
+/// ended `Stalled` at its deadline. Both are plain submissions now, the driver's one path.
+#[test]
+fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-patientland-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "patientland"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let reply = Duration::from_nanos(deadlines().reply_ns);
+  let Some(estimate) = files_to_outlast(&daemon, &mut client, &secret, reply) else {
+    daemon.stop();
+    eprintln!(
+      "SKIP: this disk lands faster than {MOST_FILES} files can outlast the {reply:?} reply deadline"
+    );
+    return;
+  };
+  // As the keepalive test: a scenario whose plain call did not stall proves nothing, so the files are doubled
+  // and both landings made again, up to the most files.
+  let mut files = estimate;
+  let (impatient_at, impatient_end, patient_at, patient_end) = loop {
+    let Some(ended) = patient_and_plain(&daemon, &mut client, &secret, files) else {
+      daemon.stop();
+      return;
+    };
+    let (impatient_at, impatient_end, patient_at, patient_end) = ended;
+    eprintln!(
+      "{files} files; reply deadline {reply:?}; plain call ended at {impatient_at:?}: {impatient_end:?}; patient call at {patient_at:?}"
+    );
+    if impatient_at > reply && patient_at > reply {
+      break (impatient_at, impatient_end, patient_at, patient_end);
+    }
+    files = files.saturating_mul(2);
+    if files > MOST_FILES {
+      daemon.stop();
+      eprintln!(
+        "SKIP: no pair of landings of up to {MOST_FILES} files both outlasted the {reply:?} reply deadline here"
+      );
+      return;
+    }
+  };
+  daemon.stop();
+  assert!(
+    patient_at > reply && impatient_at > reply,
+    "both landings outlasted the reply deadline (patient {patient_at:?}, plain {impatient_at:?})"
+  );
+  for (which, end) in [("patient", patient_end), ("plain", impatient_end)] {
+    let Ok(Some(Landing::Landed(outcome))) = end else {
+      panic!("the {which} landing is waited for and done: {end:?}");
+    };
+    assert_eq!(outcome.state, "done", "the {which} landing");
+    assert_eq!(
+      outcome.written,
+      u64::try_from(files).unwrap(),
+      "the {which} landing"
+    );
+  }
+}
+
+/// What one patient-and-plain scenario ended with: the plain call's end and when, then the patient call's.
+type Scenario = (
+  Duration,
+  Result<Option<Landing>, ClientError>,
+  Duration,
+  Result<Option<Landing>, ClientError>,
+);
+
+/// One scenario of [`an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for`]: two volumes of
+/// `files` files landed under grants through one async driver, one call patient and one plain. `None` (a loud
+/// skip already printed) when the shard cannot hold the volumes.
+fn patient_and_plain(
+  daemon: &Daemon,
+  client: &mut Client,
+  secret: &[u8; 32],
+  files: usize,
+) -> Option<Scenario> {
+  let (patient_name, plain_name) = (format!("{VOLUME}-{files}"), format!("{IMPATIENT}-{files}"));
+  let patient_volume = create_sized(client, &patient_name, files)?;
+  let impatient_volume = create_sized(client, &plain_name, files)?;
+  write_files(daemon, &patient_name, files);
+  write_files(daemon, &plain_name, files);
+  let (patient_target, impatient_target) = (target_dir(), target_dir());
+  let patient_grant = approve(client, secret, patient_volume, None, &patient_target.path);
+  let impatient_grant = approve(
+    client,
+    secret,
+    impatient_volume,
+    None,
+    &impatient_target.path,
+  );
+  let mut driver = Driver::new(client);
+  let patient = driver
+    .submit(
+      client,
+      land_begin(patient_volume, patient_target.path.clone(), patient_grant),
+    )
+    .unwrap();
+  let impatient = driver
+    .submit(
+      client,
+      land_begin(
+        impatient_volume,
+        impatient_target.path.clone(),
+        impatient_grant,
+      ),
+    )
+    .unwrap();
+  let mut ended = drive(client, &mut driver, &[patient, impatient]);
+  let (impatient_at, impatient_end) = ended.remove(&impatient).expect("the plain call ended");
+  let (patient_at, patient_end) = ended.remove(&patient).expect("the patient call ended");
+  // Their charges go back to the shard for a larger scenario.
+  let _ = client.destroy(patient_volume);
+  let _ = client.destroy(impatient_volume);
+  Some((impatient_at, impatient_end, patient_at, patient_end))
+}

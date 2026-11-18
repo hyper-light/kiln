@@ -1,0 +1,851 @@
+//! A UDP datagram received asynchronously through the runtime's driver (§4.10a): a task awaits
+//! `recv_from`, which registers read-readiness with the shard's driver and yields; a second task
+//! sends after a short runtime sleep, the socket becomes readable, the driver wakes the receiver, and
+//! the datagram arrives. This is the fleet transport's substrate proven end to end on the
+//! readiness-native driver (kqueue here on macOS; epoll on Linux) — no foreign runtime.
+
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
+
+use std::sync::mpsc::channel;
+use std::time::Duration;
+
+// The address types come from the runtime's own re-export (`core::net`'s, the same ones `rustix::net`
+// re-exports) so the test builds on every platform — including Windows, where a real datagram round
+// trip here exercises the IOCP driver's AFD readiness reactor (`crate::afd`).
+use slates_rt::runtime::{Runtime, RuntimeConfig};
+use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+/// Shape: how long a test waits for the runtime to shut down before it reports the shard's state and
+/// fails, rather than hanging the binary. A shutdown cancels a handful of tasks: milliseconds.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// Shape: the gap between the two pulse reads a stalled shutdown reports, long enough for a running
+/// shard to step many times and a parked one to wake at least once for a timer.
+const PULSE_GAP: Duration = Duration::from_millis(200);
+
+/// One read of a shard's pulse: steps, waits, spawns, completions, and whether it has exited.
+fn pulse(shard: u16) -> String {
+  slates_rt::registry::with_entry(shard, |entry| {
+    format!(
+      "steps {} waits {} spawns {} completed {} exited {}",
+      entry.pulse.steps(),
+      entry.pulse.waits(),
+      entry.pulse.spawns(),
+      entry.pulse.completed(),
+      entry.exited.load(std::sync::atomic::Ordering::Acquire)
+    )
+  })
+  .unwrap_or_else(|| "no entry".to_owned())
+}
+
+/// Shuts the runtime down, or reports the shard's pulse (read twice, [`PULSE_GAP`] apart: steps that
+/// climb are a shard spinning, waits that climb a shard parking and waking, neither a shard held inside
+/// one call) when the shutdown outlasts [`SHUTDOWN_WAIT`], instead of hanging the test binary.
+fn shutdown_within(rt: Runtime, context: &str) -> Result<(), String> {
+  let shard = rt.shard_ids()[0];
+  let (done_tx, done_rx) = channel();
+  let stopper = std::thread::spawn(move || {
+    let counters = rt.shutdown().unwrap();
+    let _ = done_tx.send(counters);
+  });
+  if done_rx.recv_timeout(SHUTDOWN_WAIT).is_ok() {
+    stopper.join().unwrap();
+    return Ok(());
+  }
+  let first = pulse(shard.0);
+  // The gap is a wait on the stopper, so a shutdown that ends inside it is still a shutdown.
+  if done_rx.recv_timeout(PULSE_GAP).is_ok() {
+    stopper.join().unwrap();
+    return Ok(());
+  }
+  let second = pulse(shard.0);
+  Err(format!(
+    "{context}: the runtime did not shut down within {SHUTDOWN_WAIT:?}; pulse {first}, then {second}"
+  ))
+}
+
+fn config() -> RuntimeConfig {
+  RuntimeConfig {
+    shards: 1,
+    tasks_per_shard: 64,
+    timers_per_shard: 64,
+    ring_entries: 64,
+    step_budget_ns: 1_000_000_000,
+    timer_tick_ns: 100_000,
+    batch: 64,
+    pin: false,
+    cores: Vec::new(),
+    page_bytes: 4096,
+    spin_ns: 0,
+    wake_tracking: None,
+  }
+}
+
+/// A task's `recv_from` awaits through the driver until a datagram arrives; a second task sends it.
+#[test]
+fn a_udp_datagram_is_received_through_the_driver() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+
+  // The receiver is bound before the tasks so the sender knows where to send.
+  let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let target = receiver.local_addr().unwrap();
+  assert_ne!(target.port(), 0, "the OS assigned a port");
+
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let mut buf = [0u8; 64];
+    let outcome = receiver
+      .recv_from(&mut buf)
+      .await
+      .map(|(n, from)| (buf[..n].to_vec(), from));
+    let _ = tx.send(outcome);
+  })
+  .unwrap();
+
+  // The sender waits a runtime tick (letting the receiver register read-readiness on the driver),
+  // then sends from outside the runtime's socket set: the receiver's socket becomes readable, the
+  // driver wakes it, and recv_from returns.
+  let (sent_tx, sent_rx) = channel();
+  rt.spawn_on(id, async move {
+    slates_rt::futures::sleep(5_000_000).await.unwrap();
+    let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let _ = sent_tx.send(sender.send_to(b"ping", target));
+  })
+  .unwrap();
+
+  match rx.recv_timeout(Duration::from_secs(5)) {
+    Ok(Ok((bytes, from))) => {
+      assert_eq!(bytes, b"ping", "the datagram's bytes arrived");
+      assert_eq!(from.ip(), &Ipv4Addr::LOCALHOST, "from a loopback sender");
+    }
+    Ok(Err(e)) => panic!("recv_from failed: {e:?}"),
+    Err(e) => {
+      let sent = sent_rx.try_recv();
+      let before = pulse(id.0);
+      let shutdown = shutdown_within(rt, "after the receive timed out");
+      panic!("timed out ({e}); the send: {sent:?}; pulse at the timeout: {before}; {shutdown:?}");
+    }
+  }
+  shutdown_within(rt, "after the datagram arrived").unwrap();
+}
+
+/// RFC 8899 §3 (§4.10a path MTU discovery) on macOS: every datagram socket the runtime makes sets the
+/// don't-fragment bit (`IP_DONTFRAG`), so a probe too large for the path is dropped rather than
+/// fragmented. No send on this host can show the bit by size: macOS caps a UDP datagram at
+/// `net.inet.udp.maxdgram` (9,216 bytes by default, measured 2026-09-28), below the loopback MTU (16,384),
+/// so an oversized send is refused `EMSGSIZE` with or without the bit. The test checks both: the option
+/// reads back set, and an oversized send is refused typed (`EMSGSIZE`, the local limit the prober reads as
+/// "too big here") while a floor-sized one sends.
+#[cfg(target_os = "macos")]
+#[test]
+fn every_datagram_socket_sets_dont_fragment_and_an_oversized_send_is_refused() {
+  /// Shape: larger than macOS's default UDP datagram cap (9,216).
+  const OVERSIZED: usize = 16_500;
+  /// Shape: the path floor every QUIC path carries (RFC 9000 §14.1).
+  const FLOOR: usize = 1_200;
+  let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let target = receiver.local_addr().unwrap();
+  let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  match sender.send_to(&vec![0u8; OVERSIZED], target) {
+    Err(slates_rt::error::RtError::DriverRefused { code, .. }) => {
+      assert_eq!(code, Some(libc::EMSGSIZE), "refused as too large")
+    }
+    other => panic!("an oversized datagram must be refused: {other:?}"),
+  }
+  assert_eq!(sender.send_to(&vec![0u8; FLOOR], target).unwrap(), FLOOR);
+  let fd = sender.into_owned().unwrap();
+  let mut set: libc::c_int = 0;
+  let mut len = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap();
+  // SAFETY: `IP_DONTFRAG` is an `int`; the out pointer and its length name one live local `c_int`, and
+  // the descriptor is open for the call.
+  let outcome = unsafe {
+    libc::getsockopt(
+      std::os::fd::AsRawFd::as_raw_fd(&fd),
+      libc::IPPROTO_IP,
+      libc::IP_DONTFRAG,
+      (&raw mut set).cast::<libc::c_void>(),
+      &raw mut len,
+    )
+  };
+  assert_eq!(outcome, 0, "the option reads back");
+  assert_eq!(set, 1, "the don't-fragment bit is set");
+}
+
+/// RFC 8899 §3 on Linux: the runtime's datagram socket runs `IP_PMTUDISC_PROBE` — the don't-fragment bit
+/// set, the kernel's own path-MTU cache ignored so the transport's probes decide. Loopback's MTU (65,536)
+/// exceeds any UDP payload, so no size can show the refusal there; the option is read back instead.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_datagram_socket_probes_with_the_dont_fragment_bit() {
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let fd = socket.into_owned().unwrap();
+  assert_eq!(
+    rustix::net::sockopt::ip_mtu_discover(&fd).unwrap(),
+    rustix::net::sockopt::Ipv4PathMtuDiscovery::PROBE
+  );
+}
+
+/// AC (§4.10a; docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md): a
+/// caller that binds a port and hands the runtime a duplicate of that socket keeps the port from the moment
+/// it learned it — no other socket can bind it while the caller's handle lives, even after the adopted
+/// socket is dropped — and the adopted socket receives through the driver like one the runtime bound. The
+/// race the adoption closes: learning a port by binding, releasing it, and binding it again by number.
+#[test]
+fn an_adopted_socket_receives_and_its_port_is_never_released_in_between() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let port = held.local_addr().unwrap().port();
+  let adopted = UdpSocket::adopt(held.try_clone().unwrap().into()).unwrap();
+  assert_eq!(
+    adopted.local_addr().unwrap().port(),
+    port,
+    "adopted as bound"
+  );
+  assert!(
+    std::net::UdpSocket::bind(("127.0.0.1", port)).is_err(),
+    "no other socket can take the port while it is held"
+  );
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let mut buf = [0u8; 64];
+    let outcome = adopted
+      .recv_from(&mut buf)
+      .await
+      .map(|(n, _)| buf.get(..n).map(<[u8]>::to_vec));
+    let _ = tx.send(outcome);
+  })
+  .unwrap();
+  rt.spawn_on(id, async move {
+    slates_rt::futures::sleep(5_000_000).await.unwrap();
+    let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let _ = sender.send_to(b"adopted", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+  })
+  .unwrap();
+  let received = rx.recv_timeout(Duration::from_secs(5));
+  shutdown_within(rt, "after the adopted receive").unwrap();
+  assert_eq!(
+    received.unwrap().unwrap().as_deref(),
+    Some(&b"adopted"[..]),
+    "the adopted socket receives through the driver"
+  );
+  // The runtime (and the adopted socket with it) is gone; the caller's handle still holds the port.
+  assert!(
+    std::net::UdpSocket::bind(("127.0.0.1", port)).is_err(),
+    "the port stays held by the caller after the adopted socket closed"
+  );
+  drop(held);
+}
+
+/// Format: this test's name, which the re-invoked binary runs as the child.
+const INHERITANCE_TEST: &str = "a_child_started_while_a_socket_is_open_keeps_no_copy_of_it";
+/// Format: the argument making the re-invoked binary the child, which libtest takes as a name filter that matches no
+/// test: the child holds whatever it inherited until its input closes.
+const HOLDER: &str = "role=holder";
+/// Format: the line the child prints once it runs its own code, which only a child whose exec has finished can do. The
+/// parent looks for it anywhere in a line, since libtest prints `test <name> ... ` before it without a line break.
+const HOLDING: &str = "slates-rt-test: holding";
+
+/// AC (§4.10a; docs/wip/platforms.md, A-182's sibling): do bind a socket, start a child process while it is open, wait
+/// until the child runs its own code, close the socket, then bind its port again. The child is this binary re-invoked
+/// through the standard library, which on Windows starts every child inheriting each inheritable handle of this process,
+/// and it holds what it inherited until its input closes. Expect the port free at once: no child keeps a copy of the
+/// socket (Windows: `WSA_FLAG_NO_HANDLE_INHERIT`; Unix: close-on-exec). Until 2026-10-26 the Windows socket was made by
+/// `socket()`, inheritable, so any process a daemon started held its fleet port after the daemon closed it.
+///
+/// Why the wait: close-on-exec closes a child's copy during its exec, not before the spawn returns. Linux v6.11 releases
+/// a vfork parent, and so the standard library's `posix_spawn`, in `exec_mmap` (`exec_mm_release` → `mm_release` →
+/// `complete_vfork_done`), before `begin_new_exec` reaches `do_close_on_exec` (fs/exec.c, kernel/fork.c); master closes
+/// them first. GitHub's Ubuntu runner showed it: the port was still bound right after the spawn returned, in both CI
+/// lanes that ran this (2026-10-26). A child running its own code has finished its exec.
+#[test]
+fn a_child_started_while_a_socket_is_open_keeps_no_copy_of_it() {
+  if std::env::args().any(|argument| argument == HOLDER) {
+    println!("{HOLDING}");
+    let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+    std::process::exit(0);
+  }
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let port = socket.local_addr().unwrap().port();
+  let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    .args(["--exact", INHERITANCE_TEST, "--nocapture", HOLDER])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .unwrap();
+  let holding = std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap()))
+    .map_while(Result::ok)
+    .any(|line| line.contains(HOLDING));
+  assert!(holding, "the child runs its own code, its exec finished");
+  drop(socket);
+  let rebound = std::net::UdpSocket::bind(("127.0.0.1", port));
+  drop(child.stdin.take());
+  let ended = child.wait().unwrap();
+  assert!(
+    rebound.is_ok(),
+    "the port is free once the socket closes, so the child holds no copy: {rebound:?}"
+  );
+  assert!(
+    ended.success(),
+    "the child ended when its input closed: {ended}"
+  );
+}
+
+/// AC (§4.10a; docs/wip/platforms.md, A-182's sibling): do (Windows) bind a socket to the wildcard address, then bind
+/// another socket, with no option at all, to the same port on the loopback address, as a local process taking a fleet
+/// node's datagrams would. Expect the second bind refused `WSAEACCES`: the port is the first socket's on every address
+/// (`SO_EXCLUSIVEADDRUSE`). Without it Windows binds the second socket, the more specific address, and hands it the
+/// datagrams sent to that address. Measured 2026-10-26 on jupiter (Windows 10.0.26200), for UDP and TCP alike: beside a
+/// default socket on `0.0.0.0` the plain loopback bind succeeds. A second bind of the very address the first holds is
+/// refused either way (`WSAEADDRINUSE` plain, `WSAEACCES` with `SO_REUSEADDR`), so that case cannot tell the two apart.
+#[cfg(windows)]
+#[test]
+fn no_other_socket_can_bind_a_windows_datagram_sockets_port() {
+  use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_UDP, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN,
+    SOCKET_ERROR, WSAEACCES, WSAGetLastError, bind, closesocket, socket,
+  };
+  // The runtime's bind starts Winsock in this process.
+  let first = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+  let port = first.local_addr().unwrap().port();
+  // SAFETY: a plain socket creation, checked against INVALID_SOCKET and closed below.
+  let other = unsafe { socket(i32::from(AF_INET), SOCK_DGRAM, IPPROTO_UDP) };
+  assert_ne!(other, INVALID_SOCKET);
+  let address = SOCKADDR_IN {
+    sin_family: AF_INET,
+    sin_port: port.to_be(),
+    sin_addr: IN_ADDR {
+      S_un: IN_ADDR_0 {
+        S_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+      },
+    },
+    sin_zero: [0; 8],
+  };
+  // SAFETY: a live SOCKADDR_IN passed with its own length.
+  let bound = unsafe {
+    bind(
+      other,
+      (&raw const address).cast::<SOCKADDR>(),
+      i32::try_from(size_of::<SOCKADDR_IN>()).unwrap(),
+    )
+  };
+  // SAFETY: reads this thread's last Winsock error, before anything else can set it.
+  let error = unsafe { WSAGetLastError() };
+  // SAFETY: the socket made above, closed once.
+  unsafe { closesocket(other) };
+  assert_eq!(
+    (bound, error),
+    (SOCKET_ERROR, WSAEACCES),
+    "the port is the first socket's alone, on every address"
+  );
+  drop(first);
+}
+
+/// AC (§4.10a, typed refusals): adoption takes only a bound datagram socket — a stream socket is refused
+/// by kind, not adopted and left to fail on its first receive.
+#[test]
+fn adopting_a_stream_socket_is_refused() {
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  let owned: slates_rt::udp::OwnedDatagram = listener.into();
+  match UdpSocket::adopt(owned) {
+    Err(slates_rt::error::RtError::DriverRefused { call, .. }) => {
+      assert_eq!(call, "adopt(SO_TYPE)", "refused by the socket's kind")
+    }
+    other => panic!("a stream socket must be refused by kind, got {other:?}"),
+  }
+}
+
+/// AC (§4.3; docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md): a socket is awaited **again** after
+/// its first datagram — the shape of every receive loop (the fleet's serve sockets, a mount's stream) —
+/// and the driver re-arms its readiness rather than refusing the second registration. A receiver awaits
+/// two datagrams on one socket, each sent only after it blocked (so each await registers with the
+/// driver); the second must arrive as the first did. On the epoll driver (Linux with io_uring refused, as
+/// under a container's default seccomp profile) the second registration was `EEXIST` before the fix, so
+/// the second await failed and the loop ended; kqueue and io_uring re-arm per await and passed either way.
+#[test]
+fn a_second_receive_on_the_same_socket_registers_readiness_again() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let target = receiver.local_addr().unwrap();
+
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let mut buf = [0u8; 64];
+    let first = receiver
+      .recv_from(&mut buf)
+      .await
+      .map(|(n, _)| buf[..n].to_vec());
+    let _ = tx.send(first);
+    let second = receiver
+      .recv_from(&mut buf)
+      .await
+      .map(|(n, _)| buf[..n].to_vec());
+    let _ = tx.send(second);
+  })
+  .unwrap();
+  // Two sends, each after the receiver has blocked on its await (a runtime sleep apart).
+  let (sent_tx, sent_rx) = channel();
+  rt.spawn_on(id, async move {
+    let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    slates_rt::futures::sleep(5_000_000).await.unwrap();
+    let _ = sent_tx.send(sender.send_to(b"first", target));
+    slates_rt::futures::sleep(20_000_000).await.unwrap();
+    let _ = sent_tx.send(sender.send_to(b"second", target));
+  })
+  .unwrap();
+
+  for expected in [&b"first"[..], &b"second"[..]] {
+    match rx.recv_timeout(Duration::from_secs(5)) {
+      Ok(Ok(bytes)) => assert_eq!(bytes, expected),
+      Ok(Err(e)) => panic!("recv_from of {expected:?} failed: {e:?}"),
+      Err(e) => {
+        let sent: Vec<_> = sent_rx.try_iter().collect();
+        let before = pulse(id.0);
+        let shutdown = shutdown_within(rt, "after a receive timed out");
+        panic!(
+          "timed out waiting for {expected:?} ({e}); the sends: {sent:?}; pulse at the timeout: {before}; {shutdown:?}"
+        );
+      }
+    }
+  }
+  shutdown_within(rt, "after both datagrams arrived").unwrap();
+}
+
+/// The simulated UDP fabric delivers deterministically at N=1 (§4.10a "sim arm first"): a receiver
+/// awaits recv_from (registering fabric interest), a sender delivers, and the datagram arrives — the
+/// whole plane with no OS network, driven to idle. Uses `slates_rt::sim::SimRuntime`.
+#[test]
+fn a_simulated_udp_datagram_is_received() {
+  use slates_rt::sim::SimRuntime;
+
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let (port_tx, port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      // The receiver's bound port, told to the sender before awaiting.
+      let _ = port_tx.send(socket.local_addr().unwrap().port());
+      let mut buf = [0u8; 64];
+      let outcome = socket
+        .recv_from(&mut buf)
+        .await
+        .map(|(n, from)| (buf[..n].to_vec(), from));
+      let _ = result_tx.send(outcome);
+    })
+    .unwrap();
+
+  sim
+    .spawn_on(id, async move {
+      // The receiver runs first (spawn order) and sends its port before awaiting, so it is ready.
+      let port = loop {
+        if let Ok(p) = port_rx.try_recv() {
+          break p;
+        }
+        slates_rt::futures::sleep(1_000).await.unwrap();
+      };
+      let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = sender.send_to(b"simping", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+
+  match result_rx.try_recv() {
+    Ok(Ok((bytes, from))) => {
+      assert_eq!(bytes, b"simping", "the simulated datagram arrived");
+      assert_ne!(from.port(), 0, "with the sender's fabric port");
+    }
+    other => panic!("the simulated recv did not complete: {other:?}"),
+  }
+}
+
+// ── The fabric's latency model (§4.8 A-9: "independently delayed … messages") ────────────────────────
+
+/// Shape: the one-way delay of the modelled inter-region path — 80 ms, half the 162 ms P50 round trip
+/// Microsoft publishes for Japan East → East US (30 days ending 2026-07-30; `docs/wip/wan-timeout.md`).
+const ONE_WAY_NS: u64 = 80_000_000;
+/// Shape: the path's jitter, ± 20 ms around the one-way delay — a quarter of it, the spread the
+/// WAN proof was asked for.
+const JITTER_NS: u64 = 20_000_000;
+/// Shape: how far apart the sender spaces its datagrams — 5 ms, well inside the ± 20 ms jitter, so a
+/// model that allowed reordering would overtake often and one that keeps a flow in order is provably
+/// clamping rather than merely lucky.
+const SEND_GAP_NS: u64 = 5_000_000;
+/// Shape: the datagrams one flow sends — enough for the seeded jitter to draw an overtake when the model
+/// allows it (a run at this count showed several), few enough to keep the run short.
+const FLOW_LENGTH: usize = 32;
+
+/// Sends `FLOW_LENGTH` datagrams `SEND_GAP_NS` apart, each stamped with its virtual send time, and returns
+/// each datagram's (arrival, stamp) pair as the receiver saw them, in arrival order.
+fn run_stamped_flow(seed: u64, delay: slates_rt::sim::SimPath) -> Vec<(u64, u64)> {
+  use slates_rt::sim::{SimRuntime, sim_udp_set_path};
+
+  let mut sim = SimRuntime::new(&config(), seed).unwrap();
+  sim_udp_set_path(delay);
+  let id = sim.shard_ids()[0];
+  let (port_tx, port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = port_tx.send(socket.local_addr().unwrap().port());
+      let mut arrivals = Vec::with_capacity(FLOW_LENGTH);
+      let mut buf = [0u8; 8];
+      for _ in 0..FLOW_LENGTH {
+        let (n, _) = socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(n, 8, "a whole stamp arrived");
+        let stamp = u64::from_le_bytes(buf);
+        arrivals.push((slates_rt::futures::now_ns(), stamp));
+      }
+      let _ = result_tx.send(arrivals);
+    })
+    .unwrap();
+
+  sim
+    .spawn_on(id, async move {
+      let port = loop {
+        if let Ok(p) = port_rx.try_recv() {
+          break p;
+        }
+        slates_rt::futures::sleep(1_000).await.unwrap();
+      };
+      let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let dest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+      for _ in 0..FLOW_LENGTH {
+        let stamp = slates_rt::futures::now_ns();
+        let _ = sender.send_to(&stamp.to_le_bytes(), dest);
+        slates_rt::futures::sleep(SEND_GAP_NS).await.unwrap();
+      }
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+  result_rx
+    .try_recv()
+    .expect("the receiver saw the whole flow")
+}
+
+/// AC (§4.3 the simulation driver; §4.8 A-9 "independently delayed … messages"): over a modelled path of
+/// 80 ms ± 20 ms one way, every datagram arrives on the virtual clock between 60 ms and 100 ms after it was
+/// sent — never before its delay, never past its jitter — and the flow arrives in the order it was sent
+/// even though the sends are spaced closer than the jitter (the model keeps a flow in order unless told
+/// otherwise). The zero-delay fabric is the test above, unchanged.
+#[test]
+fn a_delayed_simulated_datagram_arrives_within_its_jitter_and_in_order() {
+  use slates_rt::sim::SimPath;
+
+  let arrivals = run_stamped_flow(7, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
+  assert_eq!(arrivals.len(), FLOW_LENGTH, "every datagram arrived");
+  let mut seen_below_delay_floor = false;
+  for (arrived, stamp) in &arrivals {
+    let flight = arrived.saturating_sub(*stamp);
+    assert!(
+      (ONE_WAY_NS - JITTER_NS..=ONE_WAY_NS + JITTER_NS).contains(&flight),
+      "a datagram flew {flight} ns; the path is {ONE_WAY_NS} ± {JITTER_NS} ns"
+    );
+    seen_below_delay_floor |= flight < ONE_WAY_NS;
+  }
+  assert!(
+    seen_below_delay_floor && arrivals.iter().any(|(a, s)| a - s > ONE_WAY_NS),
+    "the jitter was drawn on both sides of the delay (non-vacuity: the model jittered)"
+  );
+  let stamps: Vec<u64> = arrivals.iter().map(|(_, stamp)| *stamp).collect();
+  let mut sorted = stamps.clone();
+  sorted.sort_unstable();
+  assert_eq!(stamps, sorted, "the flow arrived in send order");
+}
+
+/// AC (§4.8 A-9 "reordered messages"): when the model says a path may reorder, the seeded jitter overtakes
+/// at least once within the flow — the same sends, spaced closer than the jitter, now arrive out of order —
+/// so a consumer's reorder handling can be exercised deterministically.
+#[test]
+fn a_reordering_path_overtakes_within_one_flow() {
+  use slates_rt::sim::SimPath;
+
+  let arrivals = run_stamped_flow(7, SimPath::reordering(ONE_WAY_NS, JITTER_NS));
+  assert_eq!(arrivals.len(), FLOW_LENGTH, "every datagram arrived");
+  let stamps: Vec<u64> = arrivals.iter().map(|(_, stamp)| *stamp).collect();
+  let overtakes = stamps.windows(2).filter(|pair| pair[1] < pair[0]).count();
+  assert!(
+    overtakes > 0,
+    "the reordering model let a later datagram overtake an earlier one at least once"
+  );
+}
+
+/// AC (D-20, deterministic simulation): the jitter is drawn from the simulation's seeded generator, so two
+/// runs with one seed produce the same arrival times to the nanosecond, and a different seed draws a
+/// different sequence — a failure history replays exactly.
+#[test]
+fn the_jitter_is_seeded_so_a_run_replays_exactly() {
+  use slates_rt::sim::SimPath;
+
+  let first = run_stamped_flow(7, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
+  let again = run_stamped_flow(7, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
+  assert_eq!(first, again, "one seed, one history");
+  let other = run_stamped_flow(8, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
+  assert_ne!(first, other, "another seed draws another jitter sequence");
+}
+
+/// Shape: when the scenario releases the blocked sender, in virtual nanoseconds — a millisecond in, so the
+/// send has certainly found its port blocked and is waiting.
+const RELEASE_AT_NS: u64 = 1_000_000;
+/// Shape: the releasing task's poll for the sender's port, in virtual nanoseconds — a thousandth of the release
+/// time, so it learns the port long before it releases it.
+const PORT_POLL_NS: u64 = RELEASE_AT_NS / 1_000;
+
+/// AUD-29-61 (local send pressure). Do: on the simulated fabric, block a sender's port (the kernel's send
+/// buffer full); try a send, then send awaiting writability while a second task releases the port a
+/// millisecond later. Expect: the plain send is the typed `WouldBlock` and the try is `None`, with nothing
+/// sent; the awaiting send completes only after the release; the receiver gets the datagram exactly once.
+/// Before, a would-block was an ordinary send error, the same as a failed socket.
+#[test]
+fn a_send_under_local_pressure_waits_for_writability_and_sends_once() {
+  use slates_rt::error::RtError;
+  use slates_rt::sim::{SimRuntime, sim_udp_block_sends, sim_udp_release_sends};
+
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let (ports_tx, ports_rx) = channel();
+  let (sent_tx, sent_rx) = channel();
+  let (received_tx, received_rx) = channel();
+
+  sim
+    .spawn_on(id, async move {
+      let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let to = SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver.local_addr().unwrap().port());
+      let from = sender.local_addr().unwrap().port();
+      sim_udp_block_sends(from);
+      let _ = ports_tx.send(from);
+      let plain = sender.send_to(b"pressure", to);
+      let tried = sender.try_send_to(b"pressure", to);
+      let sent = sender.send_to_writable(b"pressure", to).await;
+      let at = slates_rt::futures::now_ns();
+      let _ = sent_tx.send((plain, tried, sent, at));
+      let mut buf = [0u8; 64];
+      let mut received = Vec::new();
+      while let Ok(Some((n, _))) = receiver.try_recv_from(&mut buf) {
+        received.push(buf[..n].to_vec());
+      }
+      let _ = received_tx.send(received);
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let port = loop {
+        if let Ok(port) = ports_rx.try_recv() {
+          break port;
+        }
+        slates_rt::futures::sleep(PORT_POLL_NS).await.unwrap();
+      };
+      slates_rt::futures::sleep(RELEASE_AT_NS).await.unwrap();
+      sim_udp_release_sends(port);
+    })
+    .unwrap();
+  sim.run_until_idle();
+
+  let (plain, tried, sent, at) = sent_rx.try_recv().expect("the sender finished");
+  assert!(
+    matches!(plain, Err(RtError::WouldBlock { call: "sendto" })),
+    "{plain:?}"
+  );
+  assert_eq!(tried, Ok(None));
+  assert_eq!(sent, Ok(b"pressure".len()));
+  assert!(
+    at >= RELEASE_AT_NS,
+    "the awaiting send completed only after the release ({at} ns)"
+  );
+  assert_eq!(
+    received_rx.try_recv().unwrap(),
+    vec![b"pressure".to_vec()],
+    "the datagram arrived exactly once"
+  );
+}
+
+/// Shape: how long the unreachable-port test waits for the live peer's datagram on loopback, where it takes
+/// microseconds: long enough for a loaded runner, short enough to fail a lost datagram promptly.
+const LIVE_WAIT: Duration = Duration::from_secs(5);
+
+/// Sends to a port nothing listens on from `receiver`, then has a live peer send to `receiver`, and reads until the
+/// peer's datagram comes: every read must be a datagram or nothing waiting, never an error.
+fn receive_after_an_unreachable_send(receiver: &UdpSocket) -> Result<Vec<u8>, String> {
+  let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let closed_port = closed.local_addr().unwrap().port();
+  drop(closed);
+  receiver
+    .send_to(
+      b"to nobody",
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, closed_port),
+    )
+    .map_err(|e| format!("the send to the closed port was refused: {e}"))?;
+  let peer = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let to = receiver.local_addr().unwrap();
+  peer.send_to(b"live", to).unwrap();
+  let started = std::time::Instant::now();
+  let mut buf = [0u8; 64];
+  while started.elapsed() < LIVE_WAIT {
+    match receiver.try_recv_from(&mut buf) {
+      Ok(Some((n, _))) => return Ok(buf[..n].to_vec()),
+      Ok(None) => std::thread::yield_now(),
+      Err(e) => {
+        return Err(format!("a read after the unreachable send failed: {e}"));
+      }
+    }
+  }
+  Err(format!(
+    "the live peer's datagram did not come within {LIVE_WAIT:?}"
+  ))
+}
+
+/// §4.10a, the fleet's handshakes (conformance run 42150662467, windows-latest: a three-node fleet never formed in
+/// 40 s, its nodes probing one or two peers after a handshake's `recvfrom` failed with WSAECONNRESET, 10054). Do send
+/// from a socket to a closed port, then send to that socket from a live peer, and read. Expect the peer's datagram
+/// whole and no read refused, for a socket the runtime bound and one it adopted. On Windows the ICMP port-unreachable
+/// the closed port answers surfaces as WSAECONNRESET on the socket's next `recvfrom` unless `SIO_UDP_CONNRESET` is off
+/// (Microsoft Learn, "WSAIoctl", `SIO_UDP_CONNRESET`); Linux and macOS report no ICMP error to an unconnected socket.
+#[test]
+fn a_socket_that_sent_to_a_closed_port_still_receives_from_a_live_peer() {
+  let bound = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  assert_eq!(
+    receive_after_an_unreachable_send(&bound).as_deref(),
+    Ok(&b"live"[..]),
+    "a bound socket"
+  );
+  let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let adopted = UdpSocket::adopt(held.into()).unwrap();
+  assert_eq!(
+    receive_after_an_unreachable_send(&adopted).as_deref(),
+    Ok(&b"live"[..]),
+    "an adopted socket"
+  );
+}
+
+/// §4.10a, the receive loops' rule (2026-11-07). Do: make a datagram socket unreadable for good under the runtime —
+/// on Unix replace its descriptor with a pipe's, so it is no socket; on Windows shut it down for receiving — and read
+/// it. Expect a refusal that names the socket gone (`RtError::receive_refusal`), the one kind a receive loop ends on.
+#[test]
+fn a_receive_on_a_socket_that_is_gone_names_it_gone() {
+  let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  #[cfg(unix)]
+  let socket = {
+    use std::os::fd::AsRawFd;
+    let fd = held.as_raw_fd();
+    let socket = UdpSocket::adopt(held.into()).unwrap();
+    let mut ends = [0i32; 2];
+    // SAFETY: `ends` is this frame's own pair of ints, written by the call.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    // SAFETY: `fd` is the adopted socket's descriptor, open for the socket's life; replacing it with the pipe's read
+    // end is the test's point, and the adopted socket closes the pipe end it then holds when it drops.
+    assert_eq!(unsafe { libc::dup2(ends[0], fd) }, fd);
+    // SAFETY: the pipe's two original ends, this test's own, closed once.
+    unsafe {
+      libc::close(ends[0]);
+      libc::close(ends[1]);
+    }
+    socket
+  };
+  #[cfg(windows)]
+  let socket = {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SD_RECEIVE, shutdown};
+    let raw = usize::try_from(held.as_raw_socket()).unwrap();
+    // SAFETY: the held socket's own handle, live for the call.
+    let shut = unsafe { shutdown(raw, SD_RECEIVE) };
+    assert_eq!(shut, 0);
+    UdpSocket::adopt(held.into()).unwrap()
+  };
+  let mut buf = [0u8; 16];
+  let refusal = socket.try_recv_from(&mut buf).unwrap_err();
+  assert_eq!(
+    refusal.receive_refusal(),
+    slates_rt::error::ReceiveRefusal::SocketGone,
+    "{refusal}"
+  );
+}
+
+/// A socket bound off a shard is an OS socket, and the simulation driver cannot watch it: it took the descriptor for
+/// the fabric port of the same number, where no datagram ever arrives, so a task awaiting it was woken only by its own
+/// timers. The cluster's live tests bound their sessions' sockets on the test thread and ran that way, every turn ended
+/// by a probe timeout, and a lone request over a rate-limited link never finished (2026-11-08,
+/// `docs/bugs/2026-11-08-an-os-socket-awaited-on-the-simulation-driver-woke-only-on-its-timers.md`). Do await an
+/// OS socket's readability and writability on the simulation runtime. Expect each refused, typed, at once.
+#[test]
+fn an_os_socket_awaited_on_the_simulation_driver_is_refused() {
+  use slates_rt::sim::SimRuntime;
+
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let (tx, rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let readable = socket.readable().await;
+      let writable = socket.writable().await;
+      let _ = tx.send((readable, writable));
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let outcome = rx.try_recv();
+  assert!(
+    matches!(
+      outcome,
+      Ok((
+        Err(slates_rt::error::RtError::BadConfig { .. }),
+        Err(slates_rt::error::RtError::BadConfig { .. })
+      ))
+    ),
+    "both waits refused at once, not left to a fabric port (none answered: the task was still waiting): {outcome:?}"
+  );
+}
+
+/// The mirror: a fabric port awaited on a real driver would be registered as the OS descriptor of the same number
+/// (port 1 is a process's standard output). Do bind a socket on the simulation runtime and await it on a real one.
+/// Expect both waits refused, typed.
+#[test]
+fn a_fabric_port_awaited_on_a_real_driver_is_refused() {
+  use slates_rt::sim::SimRuntime;
+
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let sim_id = sim.shard_ids()[0];
+  let (socket_tx, socket_rx) = channel();
+  sim
+    .spawn_on(sim_id, async move {
+      let _ = socket_tx.send(UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap());
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let socket = socket_rx.try_recv().unwrap();
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let readable = socket.readable().await;
+    let writable = socket.writable().await;
+    let _ = tx.send((readable, writable));
+  })
+  .unwrap();
+  let outcome = rx.recv_timeout(Duration::from_secs(5));
+  shutdown_within(rt, "after the fabric port's waits").unwrap();
+  assert!(
+    matches!(
+      outcome,
+      Ok((
+        Err(slates_rt::error::RtError::BadConfig { .. }),
+        Err(slates_rt::error::RtError::BadConfig { .. })
+      ))
+    ),
+    "both waits refused at once: {outcome:?}"
+  );
+}

@@ -1,0 +1,2140 @@
+//! A shared memory object: RAM-backed, created without a filesystem entry, mapped by more than
+//! one process (§4.2, §4.7, D-10; `research/low-latency-ipc-and-runtime.md` §2.2). The anchor
+//! segment, the profile cache and every client region are one of these.
+//!
+//! - Linux: `memfd_create`; shared by passing the descriptor (inheritance or `SCM_RIGHTS`).
+//! - macOS: `shm_open` with a per-user name under the 31-character limit, mode 0600; shared by
+//!   name; the creator unlinks the name when it drops the object.
+//! - Windows: a pagefile-backed section `Local\<name>`; shared by name within the session.
+//!
+//! The mapping is a full read-write view. On Unix it is `memmap2`'s file-backed map (the one
+//! `unsafe` call, whose invariant is that the object is ours to map: nothing truncates it while
+//! a view lives, and every other mapper follows the same rule); on Windows the section view from
+//! `MapViewOfFile`.
+//!
+//! **No reference into the mapping is ever handed out** (AUD-29-09). Another process writes the same
+//! bytes, so a `&[u8]` over them would promise Rust an immutability the other process does not keep. The
+//! layout's concurrent words are declared when the object is created or opened ([`Words`]) and reached
+//! only through [`SharedObject::atomic_u64`] and [`SharedObject::atomic_u32`], for a declared word of
+//! exactly that width. Every other byte crosses the boundary by copy — [`SharedObject::read`] and
+//! [`SharedObject::write`], through the mapping's raw pointer — and a copy that touches a declared word is
+//! refused. So a plain access and an atomic one, or two atomic widths, never meet on the same bytes, and
+//! the protocol the words carry (a slot released by its sequence word) is what orders the copies. Until
+//! 2026-09-30 the object handed out whole-map byte slices beside atomic views of words inside them.
+//!
+//! Hermeticity: tmpfs pages, `shm_open` objects and pagefile-backed sections are all pageable;
+//! the caller locks what must never reach a disk with [`SharedObject::lock`], and the RAM-only
+//! policy reports what it could not lock (D-12).
+//!
+//! A [`SparseObject`] is the same object for a layout far larger than what it will hold at once — the
+//! anchor segment's rings and snapshot slots, the content object (§4.8) — backed only where it is
+//! touched. A `memfd` or `shm_open` object is backed page by page on first touch already. A Windows
+//! pagefile section is charged its whole size against the commit limit at creation, so a sparse one is
+//! created `SEC_RESERVE` and its pages committed as they are reached: a 167 GB anchor layout on a
+//! 16 GB runner was refused `ERROR_NO_SYSTEM_RESOURCES` (CI run 36202635768). A reserved page is not
+//! readable until committed, so a sparse object is reached only by ranges, each committed before its
+//! slice exists; it has no whole-object view.
+
+use std::sync::atomic::{AtomicU32, AtomicU64};
+
+use crate::error::{LayoutRefusal, MemError};
+use crate::words::{Layout, RunId, SpanId, SpanRun, Width, WordRun, Words, refused};
+
+/// One range of a memory object mapped on its own, for the DAX object's views (`crate::dax_object`).
+#[cfg(unix)]
+pub(crate) use platform::{RangeView, ReadView};
+
+/// How an object is handed to another process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Handoff {
+  /// A descriptor number the child inherits (Linux).
+  Descriptor(i32),
+  /// A name the other process opens (macOS, Windows).
+  Name(String),
+}
+
+/// A shared memory object and its full view, reached by copy and through its declared words.
+pub struct SharedObject {
+  inner: platform::Inner,
+  len: usize,
+  words: Layout,
+}
+
+impl std::fmt::Debug for SharedObject {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SharedObject")
+      .field("len", &self.len)
+      .finish()
+  }
+}
+
+impl SharedObject {
+  /// Creates an unnamed Windows paging-file section (A-198). Only a held handle can hand it to a successor;
+  /// no process can find it by name. The layout has the same copy-only ownership discipline as every shared object.
+  #[cfg(windows)]
+  pub fn unnamed(len: usize, words: Words) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::create_unnamed(len)?;
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// Maps a Windows section inherited from the supervising anchor, taking ownership of its handle (A-198).
+  #[cfg(windows)]
+  pub fn from_held_handle(
+    handle: std::os::windows::io::OwnedHandle,
+    len: usize,
+    words: Words,
+  ) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::from_held_handle(handle, len)?;
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// The section handle's value, lent for the anchor to duplicate out of this process. This object keeps ownership.
+  #[cfg(windows)]
+  pub fn handle_value(&self) -> Result<u64, MemError> {
+    self.inner.handle_value()
+  }
+
+  /// Creates an object of `len` bytes named `name` (the name matters on macOS and Windows,
+  /// where it is the handoff; on Linux it is the descriptor's label), whose concurrent words are `words`.
+  pub fn create(name: &str, len: usize, words: Words) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::create(name, len)?;
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// Opens an object another process created, from its handoff, expecting `len` bytes laid out with
+  /// `words` (the creator's layout: both sides declare the same).
+  pub fn open(handoff: &Handoff, len: usize, words: Words) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::open(handoff, len)?;
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// Maps the object behind a descriptor another process handed this one (macOS, GAP-A9-9: a client's region arrives as
+  /// a Mach fileport, never by a name), expecting `len` bytes laid out with `words`. The object owns the descriptor.
+  #[cfg(unix)]
+  pub fn from_descriptor(
+    fd: std::os::fd::OwnedFd,
+    len: usize,
+    words: Words,
+  ) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::from_descriptor(fd, len)?;
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// Removes this object's name (macOS), keeping its mapping and descriptor: from here no process can open it by name,
+  /// and only a descriptor this process hands on reaches it (GAP-A9-9). An object that has no name, or whose name is
+  /// gone already, is left as it is.
+  #[cfg(target_os = "macos")]
+  pub fn unlink_name(&mut self) -> Result<(), MemError> {
+    self.inner.unlink_name()
+  }
+
+  /// This object with `words` declared: for an opener that learns the layout from a header it first read
+  /// by copy (a client region's rings). By value, so no atomic view of the old layout can outlive the
+  /// change; the new layout is checked like a created one, so a hostile header that would overlap or
+  /// misalign words is refused.
+  pub fn declare(self, words: Words) -> Result<SharedObject, MemError> {
+    let words = words.layout(self.len)?;
+    Ok(SharedObject { words, ..self })
+  }
+
+  /// The handoff another process uses to open an object created under `name` on a platform
+  /// that shares by name (macOS, Windows); on Linux objects are shared by descriptor only.
+  pub fn handoff_for_name(name: &str) -> Option<Handoff> {
+    platform::handoff_for_name(name)
+  }
+
+  /// What to hand a child process so it can [`SharedObject::open`] this object. On Linux the
+  /// descriptor is duplicated without `CLOEXEC` so a spawned child inherits it; the caller
+  /// closes nothing (the duplicate lives in the child).
+  pub fn handoff(&self) -> Result<Handoff, MemError> {
+    self.inner.handoff()
+  }
+
+  /// A borrow of the object's descriptor, for mapping a range of it into a VMM's DAX cache region (§4.6). Unix only
+  /// (the DAX window is a Linux/vhost-user feature); no reference to the bytes is formed.
+  #[cfg(unix)]
+  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.inner.as_fd()
+  }
+
+  /// The mapped length.
+  pub fn len(&self) -> usize {
+    self.len
+  }
+
+  /// Whether the map is empty.
+  pub fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// Copies the `into.len()` bytes at `offset` out, for the side that owns them under the layout's
+  /// protocol; refused past the end or touching a declared word.
+  pub fn read(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {
+    check_copy(&self.words, offset, into.len(), self.len)?;
+    copy_out(&self.inner, offset, into);
+    Ok(())
+  }
+
+  /// Copies `from` in at `offset`, for the side that owns those bytes under the layout's protocol;
+  /// refused past the end or touching a declared word.
+  pub fn write(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
+    check_copy(&self.words, offset, from.len(), self.len)?;
+    copy_in(&mut self.inner, offset, from);
+    Ok(())
+  }
+
+  /// Copies the `into.len()` racy bytes at `offset` out, byte by byte through `AtomicU8`: for bytes the other side
+  /// may write meanwhile. Refused unless the span lies wholly inside one declared racy span.
+  pub fn read_racy(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {
+    check_racy(&self.words, offset, into.len(), self.len)?;
+    racy_out(&self.inner, offset, into);
+    Ok(())
+  }
+
+  /// Copies `from` in at `offset` byte by byte through `AtomicU8`: for bytes the other side may read meanwhile.
+  /// Refused unless the span lies wholly inside one declared racy span.
+  pub fn write_racy(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
+    check_racy(&self.words, offset, from.len(), self.len)?;
+    racy_in(&self.inner, offset, from);
+    Ok(())
+  }
+
+  /// The declared 64-bit word at `offset`, as an atomic.
+  pub fn atomic_u64(&self, offset: usize) -> Result<&AtomicU64, MemError> {
+    check_word(&self.words, offset, Width::U64)?;
+    word_view(&self.inner, offset)
+  }
+
+  /// The declared 32-bit word at `offset`, as an atomic.
+  pub fn atomic_u32(&self, offset: usize) -> Result<&AtomicU32, MemError> {
+    check_word(&self.words, offset, Width::U32)?;
+    word_view(&self.inner, offset)
+  }
+
+  /// The id of the declared run `run`, resolved once so a hot path reaches its words in constant time.
+  pub fn resolve(&self, run: &WordRun) -> Result<RunId, MemError> {
+    resolve(&self.words, run)
+  }
+
+  /// Word `index` of the declared 64-bit run `id`, as an atomic, in constant time.
+  pub fn run_u64(&self, id: RunId, index: usize) -> Result<&AtomicU64, MemError> {
+    word_view(&self.inner, run_word(&self.words, id, index, Width::U64)?)
+  }
+
+  /// Word `index` of the declared 32-bit run `id`, as an atomic, in constant time.
+  pub fn run_u32(&self, id: RunId, index: usize) -> Result<&AtomicU32, MemError> {
+    word_view(&self.inner, run_word(&self.words, id, index, Width::U32)?)
+  }
+
+  /// The id of the declared span run `span`, resolved once so a hot path copies its spans in constant
+  /// time.
+  pub fn resolve_span(&self, span: &SpanRun) -> Result<SpanId, MemError> {
+    self
+      .words
+      .resolve_span(span)
+      .ok_or_else(|| refused(0, 0, LayoutRefusal::NotAWord))
+  }
+
+  /// Copies `into.len()` bytes out of span `index` of the declared span run `id`, in constant time: the
+  /// layout proved every span of the run clear of its words when it was built.
+  pub fn read_span(&self, id: SpanId, index: usize, into: &mut [u8]) -> Result<(), MemError> {
+    copy_out(
+      &self.inner,
+      span_at(&self.words, id, index, into.len())?,
+      into,
+    );
+    Ok(())
+  }
+
+  /// Copies `from` into span `index` of the declared span run `id`, in constant time.
+  pub fn write_span(&mut self, id: SpanId, index: usize, from: &[u8]) -> Result<(), MemError> {
+    let at = span_at(&self.words, id, index, from.len())?;
+    copy_in(&mut self.inner, at, from);
+    Ok(())
+  }
+
+  /// Locks the whole object into RAM (D-12); the refusal names the OS call.
+  pub fn lock(&mut self) -> Result<(), MemError> {
+    self.inner.lock()
+  }
+}
+
+/// A shared memory object exactly one process reaches, through this value only: the storage a region
+/// backs with anchor-owned RAM (`Region::shared`), whose arena hands out references to its bytes. Its one
+/// constructor carries the promise; its views are then safe.
+pub struct ExclusiveObject(SharedObject, usize);
+
+impl std::fmt::Debug for ExclusiveObject {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_tuple("ExclusiveObject").field(&self.0).finish()
+  }
+}
+
+impl ExclusiveObject {
+  /// `object`, as storage no one else reaches.
+  ///
+  /// # Safety
+  ///
+  /// While this value lives, no other process maps or reaches the object's bytes, and no other value
+  /// in this one does: the anchor that keeps the object across a daemon restart holds it without touching
+  /// it, and a restarted daemon wraps it only after the one before it has exited. The object must declare
+  /// no words. A shared object two processes use at once is reached through its copies and words instead
+  /// (AUD-29-09).
+  pub unsafe fn new(object: SharedObject) -> ExclusiveObject {
+    ExclusiveObject(object, 0)
+  }
+
+  /// The bytes `[offset, offset + len)` of the object `handoff` names, mapped on their own, as storage no
+  /// one else reaches (A-64: one shard's arena range of the anchor's content object). `offset` must be a
+  /// multiple of [`mapping_granule`] (refused [`MemError::OutOfRange`] otherwise), and the system refuses a span
+  /// past the object. On Windows
+  /// the range is committed whole when it is mapped.
+  ///
+  /// # Safety
+  ///
+  /// As for [`ExclusiveObject::new`], for these bytes: while this value lives, no other mapping in any process
+  /// reaches `[offset, offset + len)`. Other views of the object may exist, provided they never touch this
+  /// range: the daemon's copies of the content object reach its write log and image slots only, and the
+  /// anchor that keeps the object never touches its bytes.
+  pub unsafe fn open_range(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<ExclusiveObject, MemError> {
+    // Checked here, the same on every platform: Unix's map would round the offset down and Windows refuses it.
+    let granule = platform::mapping_granule()?;
+    if !offset.is_multiple_of(granule.max(1)) {
+      return Err(MemError::OutOfRange { offset, len });
+    }
+    let words = Words::new().layout(len)?;
+    let inner = platform::open_range(handoff, offset, len)?;
+    Ok(ExclusiveObject(SharedObject { inner, len, words }, offset))
+  }
+
+  /// The whole map.
+  pub fn bytes(&self) -> &[u8] {
+    self.0.inner.bytes()
+  }
+
+  /// The whole map, writable.
+  pub fn bytes_mut(&mut self) -> &mut [u8] {
+    self.0.inner.bytes_mut()
+  }
+
+  /// The object's handoff, for the process that re-wraps it after this one.
+  pub fn handoff(&self) -> Result<Handoff, MemError> {
+    self.0.handoff()
+  }
+
+  /// A borrow of the object's descriptor, for the virtio-fs DAX window mapping a content block's pages into a VMM's
+  /// cache region (§4.6). Unix only; no reference to the bytes is formed, so the arena's exclusivity is kept.
+  #[cfg(unix)]
+  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.0.as_fd()
+  }
+
+  /// This view's byte offset within its descriptor: 0 for a whole object ([`ExclusiveObject::new`]), the
+  /// [`ExclusiveObject::open_range`] offset for a shard's sub-range of the anchor content object (A-64).
+  /// A descriptor consumer — the virtio-fs DAX window or a same-kernel client (§4.6) — maps a block's
+  /// pages at `base() + the block's in-view offset`, since `as_fd()` is the whole object, not this view.
+  #[must_use]
+  pub fn base(&self) -> usize {
+    self.1
+  }
+
+  /// Locks the whole object into RAM (D-12).
+  pub fn lock(&mut self) -> Result<(), MemError> {
+    self.0.lock()
+  }
+}
+
+/// The granule a mapping's offset must be a multiple of: the base page on Unix, the allocation granularity on
+/// Windows. A range [`ExclusiveObject::open_range`] maps starts on one.
+pub fn mapping_granule() -> Result<usize, MemError> {
+  platform::mapping_granule()
+}
+
+/// A shared memory object backed only where it is touched (see the module doc): the anchor segment and
+/// the content object. Reached by ranges; each range is committed (Windows) before its slice exists,
+/// so no view ever spans an uncommitted page. `!Sync`, on every platform alike: the commit record is
+/// this process's and this thread's, and a type that is `Sync` on one platform only would let a
+/// cross-thread use compile where it is not tested.
+pub struct SparseObject {
+  inner: platform::Inner,
+  len: usize,
+  commits: platform::Commits,
+  words: Layout,
+  /// The page a discard gives back whole.
+  page: usize,
+  /// Where a discard leaves the kernel's reusable mark (macOS, A-110), the ranges that may carry one: written only
+  /// after the mark is cleared ([`SparseObject::prepare`]), since a marked page that is written stays the kernel's to
+  /// take. The whole object at creation and at opening, because marks are on the object's pages and outlive the
+  /// process that set them (a restarted daemon over the anchor's object). Empty where a discard leaves none.
+  reusable: crate::ranges::UnitSet,
+}
+
+/// The ranges of a shared object of `len` bytes that may carry a reusable mark when it is mapped: all of it where a
+/// discard leaves one (an earlier holder may have discarded any range), none elsewhere.
+fn possibly_marked(len: usize, page: usize) -> crate::ranges::UnitSet {
+  if crate::region::A_WRITE_NEEDS_THE_MARK_CLEARED {
+    crate::ranges::UnitSet::whole(len, page)
+  } else {
+    crate::ranges::UnitSet::new(0, page)
+  }
+}
+
+impl std::fmt::Debug for SparseObject {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SparseObject")
+      .field("len", &self.len)
+      .finish()
+  }
+}
+
+impl SparseObject {
+  /// Reserves an unnamed Windows section for bounded held records (A-198). Only touched ranges consume commit;
+  /// the anchor transfers the existing section by handle rather than publishing a name.
+  #[cfg(windows)]
+  pub fn unnamed(len: usize, words: Words) -> Result<Self, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::create_sparse_unnamed(len)?;
+    let commits = platform::Commits::new(len)?;
+    let page = platform::mapping_granule()?.max(1);
+    Ok(Self {
+      inner,
+      len,
+      words,
+      commits,
+      page,
+      reusable: possibly_marked(len, page),
+    })
+  }
+
+  /// Adopts the anchor's unnamed reserved section after its previous writer exited (A-198). Committing a range
+  /// already committed by that writer preserves its bytes, as for a named sparse object.
+  #[cfg(windows)]
+  pub fn from_held_handle(
+    handle: std::os::windows::io::OwnedHandle,
+    len: usize,
+    words: Words,
+  ) -> Result<Self, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::from_held_handle(handle, len)?;
+    let commits = platform::Commits::new(len)?;
+    let page = platform::mapping_granule()?.max(1);
+    Ok(Self {
+      inner,
+      len,
+      words,
+      commits,
+      page,
+      reusable: possibly_marked(len, page),
+    })
+  }
+
+  /// The owned Windows section's handle value, borrowed until an acknowledged duplicate or receive view is made.
+  #[cfg(windows)]
+  pub fn handle_value(&self) -> Result<u64, MemError> {
+    self.inner.handle_value()
+  }
+
+  /// Creates a sparse object of `len` bytes named `name` (the name matters where it is the handoff),
+  /// whose concurrent words are `words`.
+  pub fn create(name: &str, len: usize, words: Words) -> Result<SparseObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::create_sparse(name, len)?;
+    let commits = platform::Commits::new(len)?;
+    let page = platform::mapping_granule()?.max(1);
+    Ok(SparseObject {
+      inner,
+      len,
+      commits,
+      words,
+      page,
+      reusable: possibly_marked(len, page),
+    })
+  }
+
+  /// Opens a sparse object another process created, from its handoff, expecting `len` bytes laid out
+  /// with `words`.
+  pub fn open(handoff: &Handoff, len: usize, words: Words) -> Result<SparseObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::open(handoff, len)?;
+    let commits = platform::Commits::new(len)?;
+    let page = platform::mapping_granule()?.max(1);
+    Ok(SparseObject {
+      inner,
+      len,
+      commits,
+      words,
+      page,
+      reusable: possibly_marked(len, page),
+    })
+  }
+
+  /// What to hand another process so it can [`SparseObject::open`] this object.
+  pub fn handoff(&self) -> Result<Handoff, MemError> {
+    self.inner.handoff()
+  }
+
+  /// The mapped length.
+  pub fn len(&self) -> usize {
+    self.len
+  }
+
+  /// Whether the map is empty.
+  pub fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// Copies the `into.len()` bytes at `offset` out (committed first); refused past the end or touching a
+  /// declared word.
+  pub fn read(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {
+    check_copy(&self.words, offset, into.len(), self.len)?;
+    self.commits.commit(&self.inner, offset, into.len())?;
+    copy_out(&self.inner, offset, into);
+    Ok(())
+  }
+
+  /// Copies `from` in at `offset` (committed first); refused past the end or touching a declared word.
+  pub fn write(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
+    check_copy(&self.words, offset, from.len(), self.len)?;
+    self.prepare(offset, from.len())?;
+    self.commits.commit(&self.inner, offset, from.len())?;
+    copy_in(&mut self.inner, offset, from);
+    Ok(())
+  }
+
+  /// Zeroes the `len` bytes at `offset` in place, a page-sized piece at a time (no buffer as long as the range): the
+  /// pages stay resident for the writes that follow. Refused as [`SparseObject::write`] is.
+  pub fn zero(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+    /// Shape: the zeros written per call (a page on every target slates builds for).
+    const ZERO_PIECE: usize = 4096;
+    check_copy(&self.words, offset, len, self.len)?;
+    let end = offset.saturating_add(len);
+    let zeros = [0u8; ZERO_PIECE];
+    let mut at = offset;
+    while at < end {
+      let piece = end.saturating_sub(at).min(ZERO_PIECE);
+      self.write(at, zeros.get(..piece).unwrap_or_default())?;
+      at = at.saturating_add(piece);
+    }
+    Ok(())
+  }
+
+  /// Gives the whole pages inside `offset .. offset + len` back to the OS (A-105, A-117): on Linux the range becomes a
+  /// hole that reads zeros and costs no RAM until written again; on macOS its pages are marked reusable (A-110), out
+  /// of the footprint at once, reading what they held until the kernel takes them and zeros after, and recorded so the
+  /// next write clears the mark first; on Windows its committed pages leave the working set (`DiscardVirtualMemory`),
+  /// reading what they held or zeros, and a write simply keeps the page it wrote, so no record is needed and no write
+  /// ever clears a neighbouring byte. For a range nothing reads until it is written again (a cleared write log, a
+  /// stale checkpoint slot), so the partial pages at its ends need nothing. The bytes given back, zero where the OS
+  /// took none. Refused as [`SparseObject::write`] is.
+  pub fn discard(&mut self, offset: usize, len: usize) -> Result<usize, MemError> {
+    check_copy(&self.words, offset, len, self.len)?;
+    if crate::region::A_WRITE_NEEDS_THE_MARK_CLEARED {
+      return Ok(self.mark_reusable(offset, len));
+    }
+    Ok(self.inner.discard(&self.commits, offset, len))
+  }
+
+  /// Marks the whole pages inside `offset .. offset + len` reusable and records them: the bytes marked.
+  fn mark_reusable(&mut self, offset: usize, len: usize) -> usize {
+    let page = self.page;
+    let end = offset.saturating_add(len).min(self.len);
+    let first = offset.next_multiple_of(page);
+    let last = end.saturating_sub(end.checked_rem(page).unwrap_or(0));
+    if first >= last {
+      return 0;
+    }
+    let Some(pages) = self.inner.bytes_mut().get_mut(first..last) else {
+      return 0;
+    };
+    match crate::region::discard_slice(pages, true) {
+      crate::region::Discarded::Marked => {
+        self.reusable.mark(first, last);
+        last.saturating_sub(first)
+      }
+      crate::region::Discarded::Hole => last.saturating_sub(first),
+      crate::region::Discarded::Refused => 0,
+    }
+  }
+
+  /// Clears the reusable mark from every page of `offset .. offset + len` that may carry one (A-110), before it is
+  /// written: widened to whole words of the record within each recorded run, so one call clears a word of pages, as
+  /// [`crate::region::Region::prepare`] does. Nothing to do where no mark is recorded. Refused when the OS refuses,
+  /// the pages still recorded, so the write does not happen.
+  fn prepare(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+    if self.reusable.is_empty() {
+      return Ok(());
+    }
+    let size = self.len;
+    let word = self.reusable.word_bytes().max(1);
+    let start = offset.saturating_sub(offset.checked_rem(word).unwrap_or(0));
+    let end = offset
+      .saturating_add(len)
+      .checked_next_multiple_of(word)
+      .map_or(size, |end| end.min(size));
+    let mut at = start;
+    while let Some((from, reach)) = self.reusable.next_run_within(at, end) {
+      let (first, last) = (from.max(start), reach.min(end));
+      if let Some(pages) = self.inner.bytes_mut().get_mut(first..last) {
+        crate::region::reuse_slice(pages).map_err(|code| MemError::OsRefused {
+          call: "madvise(MADV_FREE_REUSE)",
+          code,
+        })?;
+      }
+      self.reusable.take(first, last);
+      at = last;
+    }
+    Ok(())
+  }
+
+  /// Copies the `into.len()` racy bytes at `offset` out, byte by byte through `AtomicU8` (committed first):
+  /// for a seqlock reader, which validates the copy against the generation after. Refused unless the span
+  /// lies wholly inside one declared racy span.
+  pub fn read_racy(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {
+    check_racy(&self.words, offset, into.len(), self.len)?;
+    self.commits.commit(&self.inner, offset, into.len())?;
+    racy_out(&self.inner, offset, into);
+    Ok(())
+  }
+
+  /// Copies `from` in at `offset` byte by byte through `AtomicU8` (committed first): for a seqlock writer.
+  /// Refused unless the span lies wholly inside one declared racy span.
+  pub fn write_racy(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
+    check_racy(&self.words, offset, from.len(), self.len)?;
+    self.prepare(offset, from.len())?;
+    self.commits.commit(&self.inner, offset, from.len())?;
+    racy_in(&self.inner, offset, from);
+    Ok(())
+  }
+
+  /// Locks bytes `offset .. offset + len` into RAM (committed first) and, on Linux, keeps them out of core dumps
+  /// (`MADV_DONTDUMP`): the page a secret lives on (A-92: the node's sealing root key in the anchor's supervision
+  /// block). A range past the object is refused `OutOfRange`, and a lock the OS refuses (its locked-memory limit)
+  /// names the call; the caller then never puts a secret there.
+  pub fn lock_range(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+    let out_of_range = MemError::OutOfRange {
+      offset,
+      len: self.len,
+    };
+    let end = offset.checked_add(len).ok_or(out_of_range.clone())?;
+    if end > self.len {
+      return Err(out_of_range);
+    }
+    self.commits.commit(&self.inner, offset, len)?;
+    self.inner.lock_range(offset, len)
+  }
+
+  /// The declared 64-bit word at `offset`, committed first, as an atomic.
+  pub fn atomic_u64(&self, offset: usize) -> Result<&AtomicU64, MemError> {
+    check_word(&self.words, offset, Width::U64)?;
+    self
+      .commits
+      .commit(&self.inner, offset, Width::U64.bytes())?;
+    word_view(&self.inner, offset)
+  }
+
+  /// The declared 32-bit word at `offset`, committed first, as an atomic.
+  pub fn atomic_u32(&self, offset: usize) -> Result<&AtomicU32, MemError> {
+    check_word(&self.words, offset, Width::U32)?;
+    self
+      .commits
+      .commit(&self.inner, offset, Width::U32.bytes())?;
+    word_view(&self.inner, offset)
+  }
+
+  /// The id of the declared run `run`, resolved once so a hot path reaches its words in constant time.
+  pub fn resolve(&self, run: &WordRun) -> Result<RunId, MemError> {
+    resolve(&self.words, run)
+  }
+
+  /// Word `index` of the declared 64-bit run `id`, committed first, as an atomic, in constant time.
+  pub fn run_u64(&self, id: RunId, index: usize) -> Result<&AtomicU64, MemError> {
+    let offset = run_word(&self.words, id, index, Width::U64)?;
+    self
+      .commits
+      .commit(&self.inner, offset, Width::U64.bytes())?;
+    word_view(&self.inner, offset)
+  }
+}
+
+/// A copy of `len` bytes at `offset` in an object of `object_len` bytes laid out with `words`: inside the
+/// object, and touching no declared word.
+fn check_copy(
+  words: &Layout,
+  offset: usize,
+  len: usize,
+  object_len: usize,
+) -> Result<(), MemError> {
+  match offset.checked_add(len) {
+    Some(end) if end <= object_len => {}
+    _ => return Err(refused(offset, len, LayoutRefusal::OutOfRange)),
+  }
+  if words.touches(offset, len) {
+    return Err(refused(offset, len, LayoutRefusal::TouchesWord));
+  }
+  Ok(())
+}
+
+/// A racy copy of `len` bytes at `offset`: inside the object and wholly inside one declared racy span.
+fn check_racy(
+  words: &Layout,
+  offset: usize,
+  len: usize,
+  object_len: usize,
+) -> Result<(), MemError> {
+  match offset.checked_add(len) {
+    Some(end) if end <= object_len => {}
+    _ => return Err(refused(offset, len, LayoutRefusal::OutOfRange)),
+  }
+  if !words.racy_covers(offset, len) {
+    return Err(refused(offset, len, LayoutRefusal::NotAWord));
+  }
+  Ok(())
+}
+
+/// Copies the `into.len()` bytes at `offset` out (inside the map; the caller checked).
+fn copy_out(inner: &platform::Inner, offset: usize, into: &mut [u8]) {
+  // SAFETY: `[offset, offset + into.len())` lies inside the live map (the caller checked) and is
+  // committed where the platform commits; the source is the mapping's raw pointer, never a reference, and
+  // `into` is this process's own buffer, so the two cannot overlap. These are plain bytes, which the
+  // layout's protocol gives the copying side for the copy (no declared word is touched: checked).
+  unsafe {
+    std::ptr::copy_nonoverlapping(inner.base().add(offset), into.as_mut_ptr(), into.len());
+  }
+}
+
+/// Copies `from` in at `offset` (inside the map; the caller checked).
+fn copy_in(inner: &mut platform::Inner, offset: usize, from: &[u8]) {
+  // SAFETY: as for `copy_out`, in the other direction; `&mut` is this process's only writer through the
+  // object.
+  unsafe {
+    std::ptr::copy_nonoverlapping(from.as_ptr(), inner.base().add(offset), from.len());
+  }
+}
+
+/// Copies declared racy bytes out through `AtomicU8`, relaxed (the seqlock's generation orders them).
+fn racy_out(inner: &platform::Inner, offset: usize, into: &mut [u8]) {
+  let base = inner.base().wrapping_add(offset);
+  for (index, byte) in into.iter_mut().enumerate() {
+    // SAFETY: the byte lies inside the live map (the caller checked the span) and is a declared racy
+    // byte, which every access on either side reaches only through `AtomicU8` (the layout refuses a plain
+    // copy of it and any wider atomic over it); `AtomicU8` has no alignment requirement and every bit
+    // pattern is valid.
+    *byte = unsafe {
+      &*base
+        .wrapping_add(index)
+        .cast::<std::sync::atomic::AtomicU8>()
+    }
+    .load(std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
+/// Copies `from` into declared racy bytes through `AtomicU8`, relaxed.
+fn racy_in(inner: &platform::Inner, offset: usize, from: &[u8]) {
+  let base = inner.base().wrapping_add(offset);
+  for (index, byte) in from.iter().enumerate() {
+    // SAFETY: as in `racy_out`.
+    unsafe {
+      &*base
+        .wrapping_add(index)
+        .cast::<std::sync::atomic::AtomicU8>()
+    }
+    .store(*byte, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
+/// The offset of span `index` of span run `id` for a copy of `len` bytes: constant time, and only a span
+/// the layout declared (validated inside the object and clear of every word when the layout was built).
+fn span_at(layout: &Layout, id: SpanId, index: usize, len: usize) -> Result<usize, MemError> {
+  layout
+    .span(id)
+    .and_then(|span| span.span(index, len))
+    .ok_or_else(|| refused(index, len, LayoutRefusal::NotAWord))
+}
+
+/// `run`'s id in `layout`, or the refusal for a run it does not declare.
+fn resolve(layout: &Layout, run: &WordRun) -> Result<RunId, MemError> {
+  layout
+    .resolve(run)
+    .ok_or_else(|| refused(run.first_offset(), 0, LayoutRefusal::NotAWord))
+}
+
+/// The offset of word `index` of run `id` of `width` in `layout`: constant time, and only a word the
+/// layout declared (validated in range and aligned when the layout was built).
+fn run_word(layout: &Layout, id: RunId, index: usize, width: Width) -> Result<usize, MemError> {
+  layout
+    .run(id)
+    .and_then(|run| run.word(index, width))
+    .ok_or_else(|| refused(index, width.bytes(), LayoutRefusal::NotAWord))
+}
+
+/// An atomic view of `width` at `offset`: only a declared word of exactly that width.
+fn check_word(words: &Layout, offset: usize, width: Width) -> Result<(), MemError> {
+  if words.holds(offset, width) {
+    Ok(())
+  } else {
+    Err(refused(offset, width.bytes(), LayoutRefusal::NotAWord))
+  }
+}
+
+/// The atomic types a shared word is viewed as: each has every bit pattern valid, and its size equal
+/// to its alignment.
+trait Word {}
+impl Word for AtomicU32 {}
+impl Word for AtomicU64 {}
+
+/// The declared word at `offset` (checked by the caller: inside the map, aligned to `W`, declared of `W`'s
+/// width, touched by no copy) as the atomic `W`.
+fn word_view<W: Word>(inner: &platform::Inner, offset: usize) -> Result<&W, MemError> {
+  let word = inner.base().wrapping_add(offset);
+  if !(word as usize).is_multiple_of(align_of::<W>()) {
+    return Err(refused(offset, size_of::<W>(), LayoutRefusal::Misaligned));
+  }
+  // SAFETY: the word lies inside a map that lives as long as `inner` (the caller checked the range),
+  // aligned to `W` (checked above), and is a declared word of `W`'s width, which the layout guarantees no
+  // copy touches and no other width views; `W` is an atomic integer, valid for every bit pattern. No Rust
+  // reference to the map's bytes exists to alias it: the object hands out none.
+  Ok(unsafe { &*word.cast::<W>() })
+}
+
+#[cfg(unix)]
+mod platform {
+  use std::os::fd::OwnedFd;
+
+  use super::Handoff;
+  use crate::error::MemError;
+
+  pub(super) struct Inner {
+    map: Mapped,
+    fd: OwnedFd,
+    /// The object's name (macOS: what a handoff carries, known to the creator and to an
+    /// opener alike, so an attached process can hand the object on again).
+    #[cfg(target_os = "macos")]
+    name: String,
+    /// Whether this process created the object (macOS: the creator unlinks the name on drop).
+    #[cfg(target_os = "macos")]
+    creator: bool,
+  }
+
+  #[cfg(target_os = "macos")]
+  impl Drop for Inner {
+    fn drop(&mut self) {
+      if self.creator {
+        let _ = rustix::shm::unlink(self.name.as_str());
+      }
+    }
+  }
+
+  fn refused(call: &'static str, e: rustix::io::Errno) -> MemError {
+    MemError::OsRefused {
+      call,
+      code: Some(e.raw_os_error()),
+    }
+  }
+
+  /// A shared object's mapping, placed at an address where a huge page can form behind it.
+  ///
+  /// A huge page behind a memory object is addressed twice over — by where it sits in this process and by
+  /// where it sits in the object — and the kernel forms one only where the two agree, `address ≡ offset`
+  /// modulo the huge page. `mmap` left to choose returns whatever address suits it, which on Linux is a
+  /// 64 KiB boundary: measured 2026-10-20 on 6.12.76 (aarch64), 13 of 16 objects came back incongruent, and a
+  /// `MADV_COLLAPSE` over an incongruent span is refused `EINVAL` whether it is the address or the offset that
+  /// is huge-aligned. A DAX object's range placement (A-193, `crate::dax_object`) *is* that collapse, and left to
+  /// luck it would hold only on the runs where `mmap` happened to land right, as §4.6's former L1 sandbox did:
+  /// 8 of 8 volumes got one or none of them did, by address. So the window is placed:
+  /// a reservation is taken with a huge page of slack, the object is mapped over the congruent address inside
+  /// it, and the reservation is given back whole at drop. The slack costs address space and no memory.
+  ///
+  /// The address is kept exposed rather than as a pointer, as the Windows view is, so the object is `Send`
+  /// (a mapping belongs to the process, not a thread) without an unsafe impl.
+  pub(super) struct Mapped {
+    /// The reservation the window was placed inside: what `munmap` is given back, whole, at drop.
+    reservation: usize,
+    /// The reservation's length — the window plus one grain of slack.
+    span: usize,
+    /// The placed window: the object's `len` bytes, at an address congruent with their offset in it.
+    window: usize,
+    len: usize,
+  }
+
+  impl std::ops::Deref for Mapped {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+      // SAFETY: `window` is this object's own live mapping of `len` bytes, placed in `map` and unmapped only by
+      // `Drop`, so it is mapped for at least as long as this borrow.
+      unsafe {
+        std::slice::from_raw_parts(
+          std::ptr::with_exposed_provenance::<u8>(self.window),
+          self.len,
+        )
+      }
+    }
+  }
+
+  impl std::ops::DerefMut for Mapped {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+      // SAFETY: as `Deref`, and `&mut self` makes this the only borrow of those bytes.
+      unsafe {
+        std::slice::from_raw_parts_mut(
+          std::ptr::with_exposed_provenance_mut::<u8>(self.window),
+          self.len,
+        )
+      }
+    }
+  }
+
+  impl Drop for Mapped {
+    fn drop(&mut self) {
+      // SAFETY: the reservation is this object's own mapping, made in `map` and not unmapped since; it covers
+      // the placed window, and no reference into either outlives `self`.
+      let _ = unsafe {
+        rustix::mm::munmap(
+          std::ptr::with_exposed_provenance_mut::<std::ffi::c_void>(self.reservation),
+          self.span,
+        )
+      };
+    }
+  }
+
+  /// What a mapping may do with its object's bytes.
+  #[derive(Clone, Copy)]
+  enum Access {
+    /// Read and write: every object this process owns, and every view of one.
+    ReadWrite,
+    /// Read alone: an object another process owns and has sealed against this one's writes ([`ReadView`]).
+    ReadOnly,
+  }
+
+  fn map(fd: &OwnedFd, offset: usize, len: usize, access: Access) -> Result<Mapped, MemError> {
+    let protection = match access {
+      Access::ReadWrite => rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+      Access::ReadOnly => rustix::mm::ProtFlags::READ,
+    };
+    let file_offset = u64::try_from(offset).map_err(|_| MemError::OsRefused {
+      call: "mmap",
+      code: None,
+    })?;
+    // Derived: the grain the address and the offset must agree on is this host's huge page, because that is the
+    // mapping a DAX object's placement collapses to (A-193) — but only where this object is long enough to hold one. An object
+    // shorter than a huge page can never be backed by one, and a host without huge pages has none to be
+    // congruent with; either way the grain is the page, which every mapping meets already. That matters because
+    // the slack a placement reserves is one grain and a client's ring is its own object (`ipc/src/region.rs`):
+    // reserving a huge page of address space per session would spend what i686, a tested target with about
+    // 3 GB of it, does not have. The same arithmetic throughout, asking for nothing it cannot use.
+    let page = rustix::param::page_size().max(1);
+    let grain = slates_machine::facts::huge_page_bytes()
+      .and_then(|bytes| usize::try_from(bytes).ok())
+      .filter(|huge| *huge <= len)
+      .unwrap_or(page)
+      .max(page);
+    let span = len.checked_add(grain).ok_or(MemError::OsRefused {
+      call: "mmap",
+      code: None,
+    })?;
+    // SAFETY: an anonymous reservation asked for at no particular address and reachable through nothing
+    // (`PROT_NONE`). No byte of it is read or written; it exists to own an address range long enough that a
+    // congruent window fits inside, and `Mapped::drop` gives it back whole.
+    let reservation = unsafe {
+      rustix::mm::mmap_anonymous(
+        std::ptr::null_mut(),
+        span,
+        rustix::mm::ProtFlags::empty(),
+        rustix::mm::MapFlags::PRIVATE,
+      )
+    }
+    .map_err(|e| refused("mmap", e))?;
+    let reserved_at = reservation.expose_provenance();
+    // The first address at or after the reservation that is congruent with this range's offset in the object.
+    let into = grain
+      .saturating_add(offset.checked_rem(grain).unwrap_or(0))
+      .saturating_sub(reserved_at.checked_rem(grain).unwrap_or(0))
+      .checked_rem(grain)
+      .unwrap_or(0);
+    let window = reserved_at.saturating_add(into);
+    // SAFETY: `window .. window + len` lies inside the reservation this call owns — `into` is less than one
+    // grain and the reservation is `len + grain` long — so `MAP_FIXED` replaces this call's own `PROT_NONE`
+    // slack and no other mapping. The object behind `fd` is a memory object this module created or opened by
+    // the handoff its creator gave, or one a daemon handed this process sealed against resizing (`ReadView`); by
+    // this module's rule no process truncates it while a view lives, and every concurrent word is reached through
+    // the atomic views. The map borrows nothing that outlives it.
+    let placed = unsafe {
+      rustix::mm::mmap(
+        std::ptr::with_exposed_provenance_mut::<std::ffi::c_void>(window),
+        len,
+        protection,
+        rustix::mm::MapFlags::SHARED | rustix::mm::MapFlags::FIXED,
+        fd,
+        file_offset,
+      )
+    };
+    match placed {
+      Ok(at) => {
+        let mapped = Mapped {
+          reservation: reserved_at,
+          span,
+          window: at.expose_provenance(),
+          len,
+        };
+        advise_huge_object(&mapped);
+        Ok(mapped)
+      }
+      Err(e) => {
+        // Nothing was placed in the reservation, so it is this call's to give straight back.
+        // SAFETY: `reservation` is the mapping this call just made and nothing holds a reference into it.
+        let _ = unsafe { rustix::mm::munmap(reservation, span) };
+        Err(refused("mmap", e))
+      }
+    }
+  }
+
+  /// Asks for transparent huge pages behind a shared object's mapping (Linux), as a private `Region` does when its
+  /// caller asks. A DAX object's ranges are placed in huge pages (A-193), and where the host's `shmem_enabled` is
+  /// `advise` the kernel allocates them at the fill's own faults only for a mapping that asked ("advise: only
+  /// allocate huge pages if requested with madvise(MADV_HUGEPAGE)", the kernel's `transhuge.rst`); the placement's
+  /// `MADV_COLLAPSE` forms what the faults did not.
+  ///
+  /// Unconditional, and harmless where it cannot apply: measured on Linux 7.2, a 64 KiB and a 1 MiB mapping
+  /// both take the advice with `OK` and receive **zero** huge pages, while an 8 MiB one comes back fully
+  /// backed — the kernel simply ignores what it cannot honour. That is also why the advice is not a *claim*:
+  /// whether a mapping actually got huge pages is `ShmemPmdMapped` in `/proc/self/smaps`, which the placement tests
+  /// read for every page the DAX object reports placed (`DaxObject::page_pmd_bytes`) rather than trusting this call.
+  #[cfg(target_os = "linux")]
+  fn advise_huge_object(map: &Mapped) {
+    // A refusal here costs nothing: the mapping is correct either way, and the only consequence is base pages.
+    // SAFETY: the range is this object's own live mapping; the advice changes no byte of it and no other map.
+    let _ = unsafe {
+      rustix::mm::madvise(
+        std::ptr::with_exposed_provenance_mut::<std::ffi::c_void>(map.window),
+        map.len,
+        rustix::mm::Advice::LinuxHugepage,
+      )
+    };
+  }
+
+  /// The paired arm: no transparent huge pages to ask for off Linux (macOS offers user programs no superpages,
+  /// Appendix C; Windows large pages need a privilege slates never requires, R10).
+  #[cfg(not(target_os = "linux"))]
+  fn advise_huge_object(_map: &Mapped) {}
+
+  pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {
+    let created = create_object(name)?;
+    let size = u64::try_from(len).map_err(|_| MemError::OsRefused {
+      call: "ftruncate",
+      code: None,
+    })?;
+    #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
+    // structural: allow — sizing the memory object just created (no filesystem entry; D-10).
+    rustix::fs::ftruncate(&created.fd, size).map_err(|e| refused("ftruncate", e))?;
+    let map = map(&created.fd, 0, len, Access::ReadWrite)?;
+    Ok(Inner {
+      map,
+      fd: created.fd,
+      #[cfg(target_os = "macos")]
+      name: created.name,
+      #[cfg(target_os = "macos")]
+      creator: true,
+    })
+  }
+
+  pub(super) fn open(handoff: &Handoff, len: usize) -> Result<Inner, MemError> {
+    open_range(handoff, 0, len)
+  }
+
+  /// The object behind `fd`, which this process was handed, mapped whole; it carries no name, so nothing is unlinked at
+  /// its drop.
+  pub(super) fn from_descriptor(fd: OwnedFd, len: usize) -> Result<Inner, MemError> {
+    let map = map(&fd, 0, len, Access::ReadWrite)?;
+    Ok(Inner {
+      map,
+      fd,
+      #[cfg(target_os = "macos")]
+      name: String::new(),
+      #[cfg(target_os = "macos")]
+      creator: false,
+    })
+  }
+
+  #[cfg(target_os = "macos")]
+  impl Inner {
+    /// Unlinks the name this process created the object under, once: the drop has nothing left to unlink.
+    pub(super) fn unlink_name(&mut self) -> Result<(), MemError> {
+      if !self.creator {
+        return Ok(());
+      }
+      self.creator = false;
+      rustix::shm::unlink(self.name.as_str()).map_err(|e| refused("shm_unlink", e))
+    }
+  }
+
+  /// `[offset, offset + len)` of the object `handoff` names, mapped on its own.
+  pub(super) fn open_range(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<Inner, MemError> {
+    let fd = open_object(handoff)?;
+    let map = map(&fd, offset, len, Access::ReadWrite)?;
+    Ok(Inner {
+      map,
+      fd,
+      #[cfg(target_os = "macos")]
+      name: match handoff {
+        Handoff::Name(name) => name.clone(),
+        Handoff::Descriptor(_) => String::new(),
+      },
+      #[cfg(target_os = "macos")]
+      creator: false,
+    })
+  }
+
+  struct Created {
+    fd: OwnedFd,
+    #[cfg(target_os = "macos")]
+    name: String,
+  }
+
+  #[cfg(target_os = "linux")]
+  fn create_object(name: &str) -> Result<Created, MemError> {
+    let fd = rustix::fs::memfd_create(
+      name,
+      rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )
+    .map_err(|e| refused("memfd_create", e))?;
+    // Sealed against shrinking, which costs nothing: nothing in slates shrinks a memory object — the single
+    // `ftruncate` is the sizing one below, and a grow is unaffected by this seal — and the seal keeps any other holder
+    // of the descriptor (the anchor hands objects across processes) from cutting it under this process's mapping,
+    // which would make the next access a `SIGBUS`. It was added for `UDMABUF_CREATE`, which refuses a memfd without
+    // `F_SEAL_SHRINK` (A-138); since A-168 nothing carves a udmabuf, and the seal stays for the reason above. Sealing
+    // here rather than at a call site keeps the property true of every object, so no caller has to remember it.
+    rustix::fs::fcntl_add_seals(&fd, rustix::fs::SealFlags::SHRINK)
+      .map_err(|e| refused("fcntl_add_seals", e))?;
+    Ok(Created { fd })
+  }
+
+  #[cfg(target_os = "linux")]
+  fn open_object(handoff: &Handoff) -> Result<OwnedFd, MemError> {
+    match handoff {
+      Handoff::Descriptor(raw) if *raw >= 0 => {
+        use std::os::fd::BorrowedFd;
+        // The handed-off number is inherited state of this process, never owned here: it is
+        // **duplicated** (close-on-exec, so a child of this process does not inherit the duplicate)
+        // and the duplicate is what this object owns and closes. A process attaches one handoff
+        // more than once — the daemon reads the anchor's published profile before it starts, and
+        // every shard maps the segment again — and two owners of one number closed it twice (the
+        // second drop aborted the process under Rust's I/O-safety check; the daemon's shard mapping
+        // found the number already closed: `mmap` EBADF).
+        // Record: docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md.
+        // SAFETY: the number names a descriptor the parent handed to this process by inheritance;
+        // it stays open for the process's life (nothing here closes it), and the borrow lasts only
+        // for the duplication.
+        let inherited = unsafe { BorrowedFd::borrow_raw(*raw) };
+        rustix::io::fcntl_dupfd_cloexec(inherited, 0).map_err(|e| refused("dup", e))
+      }
+      _ => Err(MemError::OsRefused {
+        call: "handoff",
+        code: None,
+      }),
+    }
+  }
+
+  /// The object's kernel name: the caller's name cleaned, with the uid as the per-user
+  /// suffix; a name that would not fit the limit is replaced by a 64-bit hash of the whole
+  /// name (truncation once made two clients' regions one object: GAPS §8d).
+  #[cfg(target_os = "macos")]
+  fn object_name(name: &str) -> String {
+    /// Format: the POSIX shared-memory name limit on macOS (`PSHMNAMLEN`, 31).
+    const NAME_LIMIT: usize = 31;
+    /// Format: the FNV-1a 64-bit offset basis and prime (Fowler, Noll, Vo).
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    /// Format: the FNV-1a 64-bit prime.
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let uid = rustix::process::getuid().as_raw();
+    let suffix = format!("-{uid}");
+    let clean: String = name
+      .chars()
+      .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+      .collect();
+    if clean.len().saturating_add(suffix.len()).saturating_add(1) <= NAME_LIMIT {
+      return format!("/{clean}{suffix}");
+    }
+    let mut hash = FNV_OFFSET;
+    for byte in name.bytes() {
+      hash ^= u64::from(byte);
+      hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("/{hash:016x}{suffix}")
+  }
+
+  #[cfg(target_os = "macos")]
+  pub(super) fn handoff_for_name(name: &str) -> Option<Handoff> {
+    Some(Handoff::Name(object_name(name)))
+  }
+
+  #[cfg(not(target_os = "macos"))]
+  pub(super) fn handoff_for_name(_name: &str) -> Option<Handoff> {
+    None
+  }
+
+  #[cfg(target_os = "macos")]
+  fn create_object(name: &str) -> Result<Created, MemError> {
+    use rustix::fs::Mode;
+    use rustix::shm::OFlags;
+    let name = object_name(name);
+    // A stale object from a crashed earlier process is removed first; the name is per user.
+    let _ = rustix::shm::unlink(name.as_str());
+    // structural: allow — shm_open creates a kernel object in RAM, not a filesystem entry (D-10).
+    let fd = rustix::shm::open(
+      name.as_str(),
+      // structural: allow — flags of the shared-memory object, not of a file.
+      OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
+      Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|e| refused("shm_open", e))?;
+    Ok(Created { fd, name })
+  }
+
+  #[cfg(target_os = "macos")]
+  fn open_object(handoff: &Handoff) -> Result<OwnedFd, MemError> {
+    use rustix::fs::Mode;
+    use rustix::shm::OFlags;
+    match handoff {
+      // structural: allow — opening the shared-memory object another process created (D-10).
+      Handoff::Name(name) => rustix::shm::open(
+        name.as_str(),
+        // structural: allow — the object's access mode, not a file's.
+        OFlags::RDWR,
+        Mode::RUSR | Mode::WUSR,
+      )
+      .map_err(|e| refused("shm_open", e)),
+      Handoff::Descriptor(_) => Err(MemError::OsRefused {
+        call: "handoff",
+        code: None,
+      }),
+    }
+  }
+
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  fn create_object(_name: &str) -> Result<Created, MemError> {
+    Err(MemError::OsRefused {
+      call: "memory object",
+      code: None,
+    })
+  }
+
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  fn open_object(_handoff: &Handoff) -> Result<OwnedFd, MemError> {
+    Err(MemError::OsRefused {
+      call: "memory object",
+      code: None,
+    })
+  }
+
+  /// The offset granule of a mapping: the base page.
+  pub(super) fn mapping_granule() -> Result<usize, MemError> {
+    Ok(rustix::param::page_size())
+  }
+
+  /// One range of a memory object, mapped on its own by the placed `mmap` every object here uses: a DAX object's views
+  /// (`crate::dax_object`), which cannot map their object whole. The mapping is unmapped when the view drops. No
+  /// reference to its bytes leaves this crate: the DAX object reaches them through atomics at [`RangeView::base`], and
+  /// on Linux lends `RangeView::pages_mut` (which exists there alone, so it is named, not linked) to a page-giving
+  /// `madvise` alone, which reads and writes no byte through it.
+  pub(crate) struct RangeView(Mapped);
+
+  impl RangeView {
+    /// Maps `len` bytes of the object behind `fd` from `offset`, read and write, shared.
+    pub(crate) fn map(fd: &OwnedFd, offset: usize, len: usize) -> Result<RangeView, MemError> {
+      map(fd, offset, len, Access::ReadWrite).map(RangeView)
+    }
+
+    /// The view's first byte, as the raw address the mapping returned (no reference to its bytes is formed).
+    pub(crate) fn base(&self) -> *mut u8 {
+      std::ptr::with_exposed_provenance_mut(self.0.window)
+    }
+
+    /// The view's length in bytes.
+    pub(crate) fn len(&self) -> usize {
+      self.0.len
+    }
+
+    /// The view's pages, for an `madvise` that gives them back (Linux's hole punch), and nothing else.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pages_mut(&mut self) -> &mut [u8] {
+      &mut self.0
+    }
+
+    /// Asks the kernel to make the whole view one huge page now (`MADV_COLLAPSE`, Linux 6.1), for a DAX object's range a
+    /// guest maps (§4.6, the backed route's L1). The pages are lent to that `madvise` alone, which reads and writes no
+    /// byte through them, as `RangeView::pages_mut` lends them to a hole punch on Linux. `Ok` where the kernel answered
+    /// that every huge-page-aligned span of the view is PMD-mapped; refused with why where it declined, and off Linux.
+    pub(crate) fn collapse_huge(&mut self) -> Result<(), crate::region::CollapseDeclined> {
+      crate::region::collapse_huge(&self.0)
+    }
+
+    /// The bytes of this view's mapping that the kernel maps with PMD entries, from `/proc/self/smaps`: a reading about
+    /// the view's own mapping, `None` where there is no such reading (off Linux, or no entry begins at the view).
+    pub(crate) fn pmd_bytes(&self) -> Option<u64> {
+      slates_machine::facts::huge_backed_bytes(self.0.window)
+    }
+  }
+
+  /// An object another process owns, mapped whole and read alone: a same-kernel client's view of the copy of one file a
+  /// daemon handed it (`crate::dax_object::PeerView`, §4.6 A-171). Its owner writes the bytes at any moment, so, as for
+  /// [`RangeView`], no reference to them leaves this crate: they are loaded through atomics at [`ReadView::base`]. It
+  /// offers no store, and the kernel would fault one: the mapping is `PROT_READ`.
+  pub(crate) struct ReadView(Mapped);
+
+  impl ReadView {
+    /// Maps the first `len` bytes of the object behind `fd`, read alone, shared.
+    pub(crate) fn map(fd: &OwnedFd, len: usize) -> Result<ReadView, MemError> {
+      map(fd, 0, len, Access::ReadOnly).map(ReadView)
+    }
+
+    /// The view's first byte, as the raw address the mapping returned (no reference to its bytes is formed).
+    pub(crate) fn base(&self) -> *mut u8 {
+      std::ptr::with_exposed_provenance_mut(self.0.window)
+    }
+
+    /// The view's length in bytes.
+    pub(crate) fn len(&self) -> usize {
+      self.0.len
+    }
+  }
+
+  /// A sparse object is the same object here: a `memfd` or `shm_open` page is backed on first touch.
+  pub(super) fn create_sparse(name: &str, len: usize) -> Result<Inner, MemError> {
+    create(name, len)
+  }
+
+  /// Nothing to commit here: pages are backed as they are touched. Holds the same `!Sync` marker the
+  /// Windows record does, so the sparse object's auto traits are the same on every platform.
+  pub(super) struct Commits(std::marker::PhantomData<std::cell::Cell<()>>);
+
+  impl Commits {
+    pub(super) fn new(_len: usize) -> Result<Commits, MemError> {
+      Ok(Commits(std::marker::PhantomData))
+    }
+
+    pub(super) fn commit(
+      &self,
+      _inner: &Inner,
+      _offset: usize,
+      _len: usize,
+    ) -> Result<(), MemError> {
+      Ok(())
+    }
+  }
+
+  impl Inner {
+    /// The map's first byte, as the raw pointer the mapping returned (no reference to its bytes is formed).
+    pub(super) fn base(&self) -> *mut u8 {
+      self.map.as_ptr().cast_mut()
+    }
+
+    /// The whole map, for [`super::ExclusiveObject`] only (its constructor's contract makes it sound).
+    pub(super) fn bytes(&self) -> &[u8] {
+      &self.map
+    }
+
+    /// The whole map, writable, for [`super::ExclusiveObject`] only.
+    pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
+      &mut self.map
+    }
+
+    /// A borrow of the object's descriptor (its `memfd`/`shm` fd), for a caller that maps a range of the object
+    /// *elsewhere* — the virtio-fs DAX window mapping a content block's pages into a VMM's cache region (§4.6). No
+    /// reference to the bytes is formed; the borrow lasts only as long as `&self`.
+    pub(super) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+      use std::os::fd::AsFd;
+      self.fd.as_fd()
+    }
+
+    /// Gives the whole pages inside `offset .. offset + len` back to the OS, leaving a hole that reads as zeros in
+    /// every mapping of the object (`MADV_REMOVE`, which on a memfd is a hole punch): the bytes given back,
+    /// zero (nothing changed) where there is no whole page or the OS refused.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    pub(super) fn discard(&mut self, _commits: &Commits, offset: usize, len: usize) -> usize {
+      let page = rustix::param::page_size().max(1);
+      let Some(end) = offset.checked_add(len).filter(|end| *end <= self.map.len()) else {
+        return 0;
+      };
+      let first = offset.next_multiple_of(page);
+      let last = end.saturating_sub(end.checked_rem(page).unwrap_or(0));
+      let Some(interior) = self
+        .map
+        .get_mut(first..last)
+        .filter(|interior| !interior.is_empty())
+      else {
+        return 0;
+      };
+      // SAFETY: `interior` is a live, page-aligned run of whole pages of this object's own shared mapping, borrowed
+      // mutably for the call; `MADV_REMOVE` replaces exactly those bytes with zeros (in this mapping and every other
+      // of the object), which is what the caller asks for. No lock is held on this map's pages (a sparse object is
+      // never locked).
+      unsafe {
+        rustix::mm::madvise(
+          interior.as_mut_ptr().cast(),
+          interior.len(),
+          rustix::mm::Advice::LinuxRemove,
+        )
+      }
+      .map_or(0, |()| last.saturating_sub(first))
+    }
+
+    /// No page goes back here (a POSIX shared memory object has no hole to punch; Miri models no `madvise`): the
+    /// caller writes the zeros itself.
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    pub(super) fn discard(&mut self, _commits: &Commits, _offset: usize, _len: usize) -> usize {
+      0
+    }
+
+    pub(super) fn lock(&mut self) -> Result<(), MemError> {
+      crate::region::lock_bytes_whole(&mut self.map).map_err(|e| MemError::OsRefused {
+        call: "mlock",
+        code: e.raw_os_error(),
+      })
+    }
+
+    pub(super) fn lock_range(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+      crate::region::lock_bytes_range(&mut self.map, offset, len).map_err(|e| MemError::OsRefused {
+        call: "mlock",
+        code: e.raw_os_error(),
+      })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
+      use std::os::fd::{AsFd, IntoRawFd};
+      // A duplicate without CLOEXEC, for a child to inherit; the number is what it receives.
+      let dup = rustix::io::dup(self.fd.as_fd()).map_err(|e| refused("dup", e))?;
+      rustix::io::fcntl_setfd(&dup, rustix::io::FdFlags::empty())
+        .map_err(|e| refused("fcntl", e))?;
+      Ok(Handoff::Descriptor(dup.into_raw_fd()))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
+      let _ = &self.fd;
+      if self.name.is_empty() {
+        return Err(MemError::OsRefused {
+          call: "handoff of an object opened without a name",
+          code: None,
+        });
+      }
+      Ok(Handoff::Name(self.name.clone()))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
+      let _ = &self.fd;
+      Err(MemError::OsRefused {
+        call: "handoff",
+        code: None,
+      })
+    }
+  }
+}
+
+#[cfg(windows)]
+mod platform {
+  use std::ffi::c_void;
+
+  use std::cell::Cell;
+  use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+  };
+
+  use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, DiscardVirtualMemory, FILE_MAP_ALL_ACCESS, MEM_COMMIT,
+    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW, PAGE_PROTECTION_FLAGS,
+    PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile, VirtualAlloc, VirtualLock,
+  };
+  use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+  use super::Handoff;
+  use crate::error::MemError;
+
+  /// The section and its view. The view is kept as its exposed address, not a pointer, so
+  /// the object is `Send` (a mapping belongs to the process, not a thread) without an unsafe
+  /// impl; the pointer is recovered with the provenance the exposure recorded.
+  pub(super) struct Inner {
+    handle: usize,
+    view: usize,
+    len: usize,
+    name: String,
+  }
+
+  impl Inner {
+    fn view_ptr(&self) -> *mut c_void {
+      std::ptr::with_exposed_provenance_mut(self.view)
+    }
+
+    fn handle(&self) -> HANDLE {
+      std::ptr::with_exposed_provenance_mut(self.handle)
+    }
+  }
+
+  impl Drop for Inner {
+    fn drop(&mut self) {
+      // SAFETY: the view and handle were created or opened by this module and are ours.
+      unsafe {
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+          Value: self.view_ptr(),
+        });
+        CloseHandle(self.handle());
+      }
+    }
+  }
+
+  fn wide(name: &str) -> Vec<u16> {
+    format!("Local\\{name}")
+      .encode_utf16()
+      .chain(std::iter::once(0))
+      .collect()
+  }
+
+  fn os(call: &'static str) -> MemError {
+    MemError::OsRefused {
+      call,
+      code: std::io::Error::last_os_error().raw_os_error(),
+    }
+  }
+
+  /// Closes a section handle this module created or opened and has not handed to an `Inner`.
+  fn close(handle: HANDLE) {
+    // SAFETY: the handle is ours, and nothing else holds or closes it.
+    unsafe { CloseHandle(handle) };
+  }
+
+  /// A view of `len` bytes at `offset` of the section `handle` names. The handle stays its caller's on either answer.
+  fn view(handle: HANDLE, offset: usize, len: usize) -> Result<*mut c_void, MemError> {
+    let offset = u64::try_from(offset).unwrap_or(u64::MAX);
+    let high = u32::try_from(offset >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(offset & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    // SAFETY: a read/write view of `len` bytes at `offset` of a section handle this module owns; the
+    // system refuses (null) an offset off its allocation granularity or a span past the section.
+    let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, high, low, len) };
+    if view.Value.is_null() {
+      return Err(os("MapViewOfFile"));
+    }
+    Ok(view.Value)
+  }
+
+  pub(super) fn handoff_for_name(name: &str) -> Option<Handoff> {
+    Some(Handoff::Name(name.to_owned()))
+  }
+
+  pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {
+    create_section(Some(name), len, PAGE_READWRITE)
+  }
+
+  pub(super) fn create_unnamed(len: usize) -> Result<Inner, MemError> {
+    create_section(None, len, PAGE_READWRITE)
+  }
+
+  pub(super) fn from_held_handle(
+    handle: std::os::windows::io::OwnedHandle,
+    len: usize,
+  ) -> Result<Inner, MemError> {
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+    // Mapped first: a refused view drops `handle`, which closes it, and only a view that exists takes ownership.
+    let view = view(handle.as_raw_handle(), 0, len)?;
+    Ok(Inner {
+      handle: handle.into_raw_handle().expose_provenance(),
+      view: view.expose_provenance(),
+      len,
+      name: String::new(),
+    })
+  }
+
+  /// A section reserved, not committed: its pages are charged against the commit limit only as
+  /// [`Commits::commit`] reaches them.
+  pub(super) fn create_sparse(name: &str, len: usize) -> Result<Inner, MemError> {
+    create_section(Some(name), len, PAGE_READWRITE | SEC_RESERVE)
+  }
+
+  pub(super) fn create_sparse_unnamed(len: usize) -> Result<Inner, MemError> {
+    create_section(None, len, PAGE_READWRITE | SEC_RESERVE)
+  }
+
+  fn create_section(
+    name: Option<&str>,
+    len: usize,
+    protection: PAGE_PROTECTION_FLAGS,
+  ) -> Result<Inner, MemError> {
+    let size = u64::try_from(len).map_err(|_| MemError::OsRefused {
+      call: "CreateFileMappingW",
+      code: None,
+    })?;
+    let high = u32::try_from(size >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(size & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    let wide = name.map(wide);
+    // SAFETY: a pagefile-backed section with a NUL-terminated wide name.
+    let handle = unsafe {
+      CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        std::ptr::null(),
+        protection,
+        high,
+        low,
+        wide.as_ref().map_or(std::ptr::null(), |name| name.as_ptr()),
+      )
+    };
+    if handle.is_null() {
+      return Err(os("CreateFileMappingW"));
+    }
+    // A name that already exists opens that section, at its size, with `ERROR_ALREADY_EXISTS` set:
+    // two creators would share one object silently (two daemons writing one anchor segment). Refused
+    // with the OS code instead; the caller names its objects uniquely.
+    if std::io::Error::last_os_error().raw_os_error() == i32::try_from(ERROR_ALREADY_EXISTS).ok() {
+      close(handle);
+      return Err(MemError::OsRefused {
+        call: "CreateFileMappingW (the name is already a live section)",
+        code: i32::try_from(ERROR_ALREADY_EXISTS).ok(),
+      });
+    }
+    let view = view(handle, 0, len).inspect_err(|_| close(handle))?;
+    Ok(Inner {
+      handle: handle.expose_provenance(),
+      view: view.expose_provenance(),
+      len,
+      name: name.unwrap_or_default().to_owned(),
+    })
+  }
+
+  pub(super) fn open(handoff: &Handoff, len: usize) -> Result<Inner, MemError> {
+    open_view(handoff, 0, len)
+  }
+
+  /// `[offset, offset + len)` of the section `handoff` names, mapped on its own and committed whole: a
+  /// sparse section's pages are not readable until committed, and an exclusive range is reached by
+  /// reference, so it cannot commit page by page as the copies do.
+  pub(super) fn open_range(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<Inner, MemError> {
+    let inner = open_view(handoff, offset, len)?;
+    Commits::new(len)?.commit(&inner, 0, len)?;
+    Ok(inner)
+  }
+
+  /// The offset granule of a mapping: the allocation granularity.
+  pub(super) fn mapping_granule() -> Result<usize, MemError> {
+    Commits::new(0).map(|commits| commits.granule)
+  }
+
+  fn open_view(handoff: &Handoff, offset: usize, len: usize) -> Result<Inner, MemError> {
+    let Handoff::Name(name) = handoff else {
+      return Err(MemError::OsRefused {
+        call: "handoff",
+        code: None,
+      });
+    };
+    let wide = wide(name);
+    // SAFETY: a NUL-terminated wide name of a section in this session's namespace.
+    let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide.as_ptr()) };
+    if handle.is_null() {
+      return Err(os("OpenFileMappingW"));
+    }
+    let view = view(handle, offset, len).inspect_err(|_| close(handle))?;
+    Ok(Inner {
+      handle: handle.expose_provenance(),
+      view: view.expose_provenance(),
+      len,
+      name: name.clone(),
+    })
+  }
+
+  /// Which granules of a sparse section this process has committed: one bit per allocation granule
+  /// (the machine's, from `GetSystemInfo`), so a range already committed costs no system call. The
+  /// commit itself is the section's, seen by every view in every process; a granule another process
+  /// committed is committed again here once, harmlessly (`VirtualAlloc` of committed pages succeeds).
+  pub(super) struct Commits {
+    granule: usize,
+    /// The machine's page, the unit a discard gives back.
+    page: usize,
+    bits: Box<[Cell<u64>]>,
+  }
+
+  impl Commits {
+    pub(super) fn new(len: usize) -> Result<Commits, MemError> {
+      // SAFETY: `GetSystemInfo` fills the one `SYSTEM_INFO` it is given, a live local.
+      let info = unsafe {
+        let mut info: SYSTEM_INFO = std::mem::zeroed();
+        GetSystemInfo(&mut info);
+        info
+      };
+      let granule = usize::try_from(info.dwAllocationGranularity)
+        .unwrap_or(0)
+        .max(usize::try_from(info.dwPageSize).unwrap_or(0));
+      if granule == 0 {
+        return Err(MemError::OsRefused {
+          call: "GetSystemInfo (no allocation granularity)",
+          code: None,
+        });
+      }
+      let granules = len.div_ceil(granule);
+      let words = granules.div_ceil(u64::BITS as usize);
+      Ok(Commits {
+        granule,
+        page: usize::try_from(info.dwPageSize).unwrap_or(granule).max(1),
+        bits: (0..words).map(|_| Cell::new(0)).collect(),
+      })
+    }
+
+    /// The bitmap word holding `granule` and its bit in that word.
+    fn position(granule: usize) -> (usize, u64) {
+      let bits = usize::try_from(u64::BITS).unwrap_or(1);
+      let word = granule.checked_div(bits).unwrap_or(0);
+      let bit = u32::try_from(granule.checked_rem(bits).unwrap_or(0)).unwrap_or(0);
+      (word, 1u64.checked_shl(bit).unwrap_or(0))
+    }
+
+    fn is_committed(&self, granule: usize) -> bool {
+      let (word, bit) = Self::position(granule);
+      self
+        .bits
+        .get(word)
+        .is_some_and(|word| word.get() & bit != 0)
+    }
+
+    fn mark(&self, granule: usize) {
+      let (word, bit) = Self::position(granule);
+      if let Some(word) = self.bits.get(word) {
+        word.set(word.get() | bit);
+      }
+    }
+
+    /// Commits every granule `[offset, offset + len)` touches that this process has not, one
+    /// `VirtualAlloc` per run of uncommitted granules.
+    pub(super) fn commit(&self, inner: &Inner, offset: usize, len: usize) -> Result<(), MemError> {
+      if len == 0 {
+        return Ok(());
+      }
+      let granule_of = |at: usize| at.checked_div(self.granule).unwrap_or(0);
+      let first = granule_of(offset);
+      // `len >= 1`; a range past `usize::MAX` saturates and is clamped to the view below.
+      let last = granule_of(offset.saturating_add(len).saturating_sub(1));
+      let mut granule = first;
+      while granule <= last {
+        if self.is_committed(granule) {
+          granule = granule.saturating_add(1);
+          continue;
+        }
+        let run_start = granule;
+        while granule <= last && !self.is_committed(granule) {
+          granule = granule.saturating_add(1);
+        }
+        let start = run_start.saturating_mul(self.granule);
+        let end = granule.saturating_mul(self.granule).min(inner.len);
+        // A run starting at or past the view's end has nothing to commit; refused rather than formed into a
+        // pointer past the view (callers pass ranges inside it, so this never runs).
+        let Some(span) = end.checked_sub(start).filter(|span| *span > 0) else {
+          return Err(MemError::TooLarge {
+            len: offset.saturating_add(len),
+            max: inner.len,
+          });
+        };
+        // SAFETY: `[start, end)` lies inside this process's view of the section (`end` is clamped to
+        // its length and `start < end` was just checked); committing pages of a view of a `SEC_RESERVE`
+        // section is the documented use, and committing a page already committed is allowed.
+        let committed = unsafe {
+          VirtualAlloc(
+            inner.view_ptr().cast::<u8>().add(start).cast(),
+            span,
+            MEM_COMMIT,
+            PAGE_READWRITE,
+          )
+        };
+        if committed.is_null() {
+          return Err(os("VirtualAlloc(MEM_COMMIT)"));
+        }
+        for marked in run_start..granule {
+          self.mark(marked);
+        }
+      }
+      Ok(())
+    }
+  }
+
+  impl Inner {
+    /// The view's first byte, as the raw pointer the view returned (no reference to its bytes is formed).
+    pub(super) fn base(&self) -> *mut u8 {
+      self.view_ptr().cast::<u8>()
+    }
+
+    /// The whole view, for [`super::ExclusiveObject`] only.
+    pub(super) fn bytes(&self) -> &[u8] {
+      // SAFETY: the view is `len` readable bytes for as long as `self` lives, and `ExclusiveObject`'s
+      // constructor keeps every other access away while the slice does.
+      unsafe { std::slice::from_raw_parts(self.base(), self.len) }
+    }
+
+    /// The whole view, writable, for [`super::ExclusiveObject`] only.
+    pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
+      // SAFETY: as for `bytes`, and `&mut self` is the only borrow of the view in this process.
+      unsafe { std::slice::from_raw_parts_mut(self.base(), self.len) }
+    }
+
+    /// Gives the whole pages inside `offset .. offset + len` that this process committed back to the OS
+    /// (`DiscardVirtualMemory`): they leave the working set at once with their contents dropped, and the
+    /// section stays charged for them. A page holds what it held or zeros until it is next written, which keeps it.
+    /// A reserved page holds nothing, and the call refuses a range that has one, so only committed granules are named;
+    /// a granule only another process committed has no page in this working set. The bytes given back.
+    pub(super) fn discard(&mut self, commits: &Commits, offset: usize, len: usize) -> usize {
+      let Some(end) = offset.checked_add(len).filter(|end| *end <= self.len) else {
+        return 0;
+      };
+      let first = offset.next_multiple_of(commits.page);
+      let last = end.saturating_sub(end.checked_rem(commits.page).unwrap_or(0));
+      let mut given_back = 0usize;
+      let mut at = first;
+      let granule_of = |at: usize| at.checked_div(commits.granule).unwrap_or(0);
+      while at < last {
+        let run_start = at;
+        let committed = commits.is_committed(granule_of(at));
+        while at < last && commits.is_committed(granule_of(at)) == committed {
+          at = granule_of(at)
+            .saturating_add(1)
+            .saturating_mul(commits.granule)
+            .min(last);
+        }
+        if committed {
+          let span = at.saturating_sub(run_start);
+          // SAFETY: `run_start .. at` lies inside this process's view of the section (`last <= end <= self.len`), a
+          // run of whole, committed pages; the call changes only those pages' contents, which the caller gave up, and
+          // no reference to them is live (a sparse object reaches its bytes by copy, each through its own commit).
+          let refused =
+            unsafe { DiscardVirtualMemory(self.base().wrapping_add(run_start).cast(), span) };
+          if refused == 0 {
+            given_back = given_back.saturating_add(span);
+          }
+        }
+      }
+      given_back
+    }
+
+    pub(super) fn lock(&mut self) -> Result<(), MemError> {
+      // SAFETY: the view is ours and `len` bytes long.
+      let ok = unsafe { VirtualLock(self.view_ptr(), self.len) };
+      if ok == 0 {
+        return Err(os("VirtualLock"));
+      }
+      Ok(())
+    }
+
+    /// Locks `offset .. offset + len` of the view (the caller checked the range is inside it). Windows keeps no
+    /// locked page out of a crash dump, so locking is the whole of it here.
+    pub(super) fn lock_range(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+      let start = self.base().wrapping_add(offset).cast::<std::ffi::c_void>();
+      // SAFETY: `start .. start + len` lies inside the view (`SharedObject::lock_range` checked it), which is ours
+      // and committed; locking changes no byte.
+      let ok = unsafe { VirtualLock(start, len) };
+      if ok == 0 {
+        return Err(os("VirtualLock"));
+      }
+      Ok(())
+    }
+
+    pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
+      if self.name.is_empty() {
+        return Err(MemError::OsRefused {
+          call: "an unnamed section needs a held-handle handoff",
+          code: None,
+        });
+      }
+      Ok(Handoff::Name(self.name.clone()))
+    }
+
+    pub(super) fn handle_value(&self) -> Result<u64, MemError> {
+      u64::try_from(self.handle).map_err(|_| MemError::OsRefused {
+        call: "a section handle wider than u64",
+        code: None,
+      })
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::atomic::Ordering;
+
+  use super::*;
+  use crate::words::WordRun;
+
+  /// Shape: the test object's length.
+  const LEN: usize = 4096;
+
+  /// A small layout: a 32-bit word at 4, a 64-bit word at 8, a racy span at 64..128.
+  fn test_words() -> Words {
+    Words::new()
+      .with(WordRun::one(4, Width::U32))
+      .with(WordRun::one(8, Width::U64))
+      .with(WordRun::racy(64, 64))
+  }
+
+  fn reason(result: Result<(), MemError>) -> Option<LayoutRefusal> {
+    match result {
+      Err(MemError::LayoutRefused { reason, .. }) => Some(reason),
+      _ => None,
+    }
+  }
+
+  /// A-117 on macOS (A-110's mark on the shared content object). Do: fill 64 MiB of a sparse object, zero and discard
+  /// it, then write it again through a second mapping opened afterwards (a restarted daemon over the anchor's object).
+  /// Expect: the discard takes the footprint down by most of it (measured 67 -> 3 MiB on a shared object, 2026-10-08);
+  /// the second mapping's writes count in the footprint again, which happens only when the mark was cleared first (a
+  /// marked page written stays the kernel's to take, A-110), though its own record never saw the discard; and the
+  /// bytes read back as written.
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no madvise or shared memory
+  fn a_discarded_range_leaves_the_footprint_and_a_later_mapping_clears_it_before_writing() {
+    const BYTES: usize = 64 << 20;
+    const MOST_OF_IT: u64 = (BYTES / 2) as u64;
+    let _serial = crate::test_serial::Guard::take();
+    let footprint = crate::test_serial::footprint;
+    let name = format!("slates-mem-reusable-{}", std::process::id());
+    let mut first = SparseObject::create(&name, BYTES, Words::new()).unwrap();
+    let piece = vec![0xABu8; 1 << 20];
+    for at in (0..BYTES).step_by(piece.len()) {
+      first.write(at, &piece).unwrap();
+    }
+    first.zero(0, BYTES).unwrap();
+    let written = footprint().unwrap();
+    assert_eq!(first.discard(0, BYTES).unwrap(), BYTES);
+    let discarded = footprint().unwrap();
+    assert!(
+      written.saturating_sub(discarded) >= MOST_OF_IT,
+      "the discard left the footprint: {written} -> {discarded}"
+    );
+    let mut second = SparseObject::open(&first.handoff().unwrap(), BYTES, Words::new()).unwrap();
+    let again = vec![0xCDu8; 1 << 20];
+    for at in (0..BYTES).step_by(again.len()) {
+      second.write(at, &again).unwrap();
+    }
+    let rewritten = footprint().unwrap();
+    assert!(
+      rewritten.saturating_sub(discarded) >= MOST_OF_IT,
+      "the later mapping cleared the marks before writing: {discarded} -> {rewritten}"
+    );
+    let mut back = vec![0u8; 1 << 20];
+    first.read(BYTES - back.len(), &mut back).unwrap();
+    assert!(
+      back.iter().all(|byte| *byte == 0xCD),
+      "the bytes read back as written"
+    );
+  }
+
+  /// AUD-29-09. Do: create an object with declared words, copy bytes in, store a word, and read both
+  /// through a second mapping. Expect: the copies and the word cross; an atomic view of an undeclared
+  /// offset, of the other width, or past the end is refused `NotAWord`; a copy that would touch a word is
+  /// refused `TouchesWord` and leaves the word as it was.
+  #[test]
+  #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
+  fn a_shared_object_crosses_by_copies_and_declared_words_only() {
+    let mut a = SharedObject::create(
+      &format!("slates-mem-shared-test-a-{}", std::process::id()),
+      LEN,
+      test_words(),
+    )
+    .unwrap();
+    a.write(200, &[1, 2, 3, 4]).unwrap();
+    a.atomic_u64(8)
+      .unwrap()
+      .store(0xdead_beef, Ordering::Release);
+    let b = SharedObject::open(&a.handoff().unwrap(), LEN, test_words()).unwrap();
+    let mut back = [0u8; 4];
+    b.read(200, &mut back).unwrap();
+    assert_eq!(back, [1, 2, 3, 4]);
+    assert_eq!(
+      b.atomic_u64(8).unwrap().load(Ordering::Acquire),
+      0xdead_beef
+    );
+    assert!(a.atomic_u32(4).is_ok());
+    for refused in [
+      a.atomic_u64(16).map(drop),
+      a.atomic_u64(LEN).map(drop),
+      a.atomic_u32(8).map(drop),
+    ] {
+      assert_eq!(reason(refused), Some(LayoutRefusal::NotAWord));
+    }
+    assert_eq!(
+      reason(a.write(6, &[0xFF; 8])),
+      Some(LayoutRefusal::TouchesWord)
+    );
+    assert_eq!(
+      b.atomic_u64(8).unwrap().load(Ordering::Acquire),
+      0xdead_beef,
+      "the refused copy wrote nothing"
+    );
+    assert_eq!(
+      reason(b.read(0, &mut [0u8; 16])),
+      Some(LayoutRefusal::TouchesWord)
+    );
+  }
+
+  /// AUD-29-09 (the hot path's constant-time copies). Do: declare a ring's slot bodies as a span run
+  /// beside its sequence words; copy a body into span 3 and read it back through a second mapping; ask
+  /// for span 4 of four, and a copy longer than a span; declare a span run that overlaps a word. Expect:
+  /// the body crosses; the out-of-run span and the long copy refused `NotAWord`; the overlapping
+  /// declaration refused `TouchesWord` at create, before any mapping exists.
+  #[test]
+  #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
+  fn a_declared_span_copies_in_constant_time_and_never_over_a_word() {
+    let seq = WordRun::strided(0, 64, 4, Width::U64);
+    let bodies = crate::words::SpanRun::strided(8, 64, 4, 56);
+    let words = || Words::new().with(seq).with_span(bodies);
+    let mut a = SharedObject::create(
+      &format!("slates-mem-span-test-{}", std::process::id()),
+      LEN,
+      words(),
+    )
+    .unwrap();
+    let span = a.resolve_span(&bodies).unwrap();
+    a.write_span(span, 3, b"slot three body").unwrap();
+    let b = SharedObject::open(&a.handoff().unwrap(), LEN, words()).unwrap();
+    let span_b = b.resolve_span(&bodies).unwrap();
+    let mut back = [0u8; 15];
+    b.read_span(span_b, 3, &mut back).unwrap();
+    assert_eq!(&back, b"slot three body");
+    assert_eq!(
+      reason(b.read_span(span_b, 4, &mut back)),
+      Some(LayoutRefusal::NotAWord)
+    );
+    assert_eq!(
+      reason(a.write_span(span, 0, &[0u8; 57])),
+      Some(LayoutRefusal::NotAWord),
+      "a copy longer than the span"
+    );
+    let over = Words::new()
+      .with(seq)
+      .with_span(crate::words::SpanRun::strided(4, 64, 4, 56));
+    assert!(matches!(
+      SharedObject::create(
+        &format!("slates-mem-span-over-{}", std::process::id()),
+        LEN,
+        over
+      ),
+      Err(MemError::LayoutRefused {
+        reason: LayoutRefusal::TouchesWord,
+        ..
+      })
+    ));
+  }
+
+  /// AUD-29-09. Do: create an object whose layout overlaps two widths on one byte, and open one with a
+  /// word past its end. Expect: both refused before any mapping is handed out.
+  #[test]
+  #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
+  fn a_layout_that_would_mix_accesses_is_refused_at_create() {
+    let overlapping = test_words().with(WordRun::one(12, Width::U32));
+    let created = SharedObject::create(
+      &format!("slates-mem-shared-test-overlap-{}", std::process::id()),
+      LEN,
+      overlapping,
+    );
+    assert!(matches!(
+      created,
+      Err(MemError::LayoutRefused {
+        reason: LayoutRefusal::Overlap,
+        ..
+      })
+    ));
+    let past = Words::new().with(WordRun::one(LEN, Width::U64));
+    assert!(matches!(
+      SharedObject::create(
+        &format!("slates-mem-shared-test-past-{}", std::process::id()),
+        LEN,
+        past
+      ),
+      Err(MemError::LayoutRefused {
+        reason: LayoutRefusal::OutOfRange,
+        ..
+      })
+    ));
+  }
+
+  /// §4.8 and AUD-29-09: a sparse object is reached by copies far into a large layout, its racy span only
+  /// by racy copies, and a second mapping sees all of it. Do: write plain bytes deep inside, a racy
+  /// payload and a word; reopen by the handoff. Expect: each back through its own access; a plain copy of
+  /// the racy span and a racy copy of plain bytes both refused; a copy ending past the object refused.
+  #[test]
+  #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
+  fn a_sparse_object_is_reached_by_its_declared_accesses_through_a_second_mapping() {
+    /// Shape: a layout far larger than what the test touches, as the anchor segment is.
+    const SPARSE_LEN: usize = 1 << 30;
+    /// Shape: an offset deep inside it.
+    const FAR: usize = SPARSE_LEN - (1 << 20);
+    let mut a = SparseObject::create(
+      &format!("slates-mem-sparse-test-{}", std::process::id()),
+      SPARSE_LEN,
+      test_words(),
+    )
+    .unwrap();
+    a.write(FAR, &[4, 3, 2, 1]).unwrap();
+    a.write_racy(64, b"published").unwrap();
+    a.atomic_u64(8).unwrap().store(0x5eed, Ordering::Release);
+    let b = SparseObject::open(&a.handoff().unwrap(), SPARSE_LEN, test_words()).unwrap();
+    let mut far = [0u8; 4];
+    b.read(FAR, &mut far).unwrap();
+    assert_eq!(far, [4, 3, 2, 1]);
+    let mut payload = [0u8; 9];
+    b.read_racy(64, &mut payload).unwrap();
+    assert_eq!(&payload, b"published");
+    assert_eq!(b.atomic_u64(8).unwrap().load(Ordering::Acquire), 0x5eed);
+    let mut untouched = [9u8; 8];
+    b.read(1 << 20, &mut untouched).unwrap();
+    assert_eq!(untouched, [0; 8], "an untouched range reads zeros");
+    assert_eq!(
+      reason(b.read(64, &mut [0u8; 4])),
+      Some(LayoutRefusal::TouchesWord)
+    );
+    assert_eq!(
+      reason(b.read_racy(FAR, &mut [0u8; 4])),
+      Some(LayoutRefusal::NotAWord)
+    );
+    assert_eq!(
+      reason(b.read(SPARSE_LEN - 2, &mut [0u8; 4])),
+      Some(LayoutRefusal::OutOfRange)
+    );
+  }
+
+  /// AC (docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md): one handoff is attached more
+  /// than once by one process (the daemon reads the anchor's profile, then starts, then maps per shard),
+  /// and each attach owns its own descriptor — dropping two of them closes two duplicates, never the
+  /// inherited number twice (which aborted the process), and a third attach still finds the number open
+  /// (which failed `EBADF` before). Linux only: the other platforms hand off a name and open it afresh.
+  #[test]
+  #[cfg(target_os = "linux")]
+  #[cfg_attr(miri, ignore)] // memfd_create shared memory is not modelled by Miri
+  fn two_attaches_from_one_handoff_each_own_their_descriptor() {
+    let mut a = SharedObject::create("slates-mem-shared-test-twice", LEN, Words::new()).unwrap();
+    a.write(0, &[9, 8, 7, 6]).unwrap();
+    let handoff = a.handoff().unwrap();
+    let read = |object: &SharedObject| {
+      let mut back = [0u8; 4];
+      object.read(0, &mut back).unwrap();
+      back
+    };
+    let first = SharedObject::open(&handoff, LEN, Words::new()).unwrap();
+    let second = SharedObject::open(&handoff, LEN, Words::new()).unwrap();
+    assert_eq!(read(&first), [9, 8, 7, 6]);
+    assert_eq!(read(&second), [9, 8, 7, 6]);
+    drop(first);
+    drop(second);
+    let third =
+      SharedObject::open(&handoff, LEN, Words::new()).expect("the inherited number is still open");
+    assert_eq!(read(&third), [9, 8, 7, 6]);
+  }
+}

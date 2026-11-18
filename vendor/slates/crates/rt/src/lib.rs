@@ -1,0 +1,86 @@
+//! `slates-rt` — the runtime: a thread-per-core executor with arena task slots and `Copy` waker
+//! encodings, an intrusive run queue, a hierarchical timing wheel, per-shard inbound rings with
+//! cross-shard wake kicks, the OS drivers behind one completion seam, and a deterministic
+//! simulation driver (design §4.3, D-7, D-9).
+//!
+//! The doctrine, in one paragraph. A task belongs to one shard for its whole life; nothing is
+//! work-stolen and nothing is reference counted. A `Waker` is a `RawWaker` whose data pointer is
+//! the packed `shard:16 | slot:24 | generation:24` word of the task's handle, so `clone` and
+//! `drop` are no-ops and `wake` from the owning shard pushes the slot onto the local run queue,
+//! `wake` from another shard pushes the word onto that pair's single-producer ring and kicks the
+//! target's driver, and `wake` from a foreign thread goes through the target's multi-producer ring
+//! (embassy-executor's model on std [C: embassy-executor src/raw; B: `RawWakerVTable` docs]). A
+//! stale generation is ignored. Timers live in a hierarchical timing wheel [A: Varghese & Lauck,
+//! SOSP'87] whose tick is derived from the measured wake cost. Every operation is cancel-safe by
+//! construction: resources live in arenas keyed by handle, so dropping a future releases nothing
+//! it did not own; a parent's completion cancels and joins its children (hecate's task-lifecycle
+//! law). The drivers (io_uring or epoll, kqueue, IOCP) share one seam: block until a kick, a
+//! completion or a deadline; the simulation driver replaces time and the kick with seeded,
+//! single-threaded stand-ins so a whole cluster runs deterministically in one process (D-20).
+//!
+//! `LocalWaker` is still a nightly-only API on Rust 1.98 (`local_waker`, #118959), so the
+//! executor uses `Waker` with a vtable that is thread-safe by construction; the `Copy` encoding
+//! costs nothing to clone, which is what `LocalWaker` would have saved (Phase 0 task 6).
+//!
+//! Modules: [`error`], [`control`], [`waker`], [`registry`], [`parking`] (the kick-if-parked
+//! protocol and its loom model), [`room`] (a sender told when a full control channel has room, and its loom model),
+//! [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
+//! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
+//! sockets ([`udp`] everywhere and `tcp` on Unix — the NFS mount server's, over one shared readiness
+//! future), and the OS drivers.
+
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
+mod attribution;
+pub mod control;
+pub mod driver;
+pub mod error;
+pub mod futures;
+mod interest;
+mod netsys;
+pub mod parking;
+// A Windows pipe end on the runtime (A-179): its decisions are pure and tested on every host (`pipe_state`, public on
+// every host so cfg-free callers can name its answers); its Win32 calls are Windows' alone (`pipe`, and the IOCP
+// driver).
+#[cfg(target_os = "windows")]
+pub mod pipe;
+pub mod pipe_state;
+pub mod queue;
+pub mod readiness;
+pub mod registry;
+pub mod room;
+pub mod runtime;
+pub mod shard;
+pub mod sim;
+pub mod task;
+mod thread_clock;
+pub use thread_clock::{CpuReading, RunReading, RunState, process_runnable};
+// Async TCP on every platform, through the socket seam (`netsys`): the NFS servers, the MCP HTTP edge and the
+// network export ride it (`docs/wip/platforms.md`, gap 1).
+pub mod tcp;
+pub mod timer;
+pub mod udp;
+pub mod waker;
+
+#[cfg(target_os = "windows")]
+mod afd;
+#[cfg(target_os = "linux")]
+pub mod epoll;
+#[cfg(target_os = "windows")]
+pub mod iocp;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub mod kqueue;
+
+pub use driver::{Driver, DriverKind};
+pub use error::RtError;
+pub use registry::SlotHolder;
+pub use runtime::{Runtime, RuntimeConfig, ShardCapacity, WakeTracking};
+pub use shard::{ShardId, TaskId};
+pub use sim::SimRuntime;
+pub use task::Outcome;
+pub use task::{Admission, AdmissionReceipt};

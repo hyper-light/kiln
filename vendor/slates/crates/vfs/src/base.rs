@@ -1,0 +1,4048 @@
+//! The base plane of an overlay volume (§4.5, §4.15, D-25; Phase 1 task 10): a host directory
+//! serves every untouched entry on demand through the read-only seam ([`crate::host`]); the
+//! first write copies an entry up and records the witnessed base (the stat fingerprint and the
+//! BLAKE3 of the bytes the edit was based on); deletes leave whiteouts; renamed base directories
+//! record their origin (a redirect); drift is detected by fingerprints under the racy rule and
+//! reported, never absorbed; watcher hints make reports prompt and are never the truth. A clean
+//! file — an untouched base entry — exports a verified content digest ([`Overlay::digest`],
+//! §4.15): the BLAKE3 of the bytes the disk holds, verified current at the export by the file's
+//! identity and fingerprint, refused typed rather than ever stale.
+//!
+//! Ownership: the host is owned by whoever opened the base directory (the shard in Phase 2, the
+//! test here) and lent to each operation as `&mut dyn HostFs`; a volume holds only handles and
+//! tables ([`BasePlane`]), so clones of an overlay snapshot share one host without sharing
+//! anything mutable (D-7, D-8). Every base-aware verb lives on [`Overlay`], a borrow of a volume
+//! and a host together; the plain `Volume` verbs stay exact for scratch volumes and for entries
+//! already copied up, and refuse (`BaseUnavailable`) where they would need the disk.
+//!
+//! Invariants: the overlay's directory nodes hold exactly the entries the volume touched
+//! (looked up, listed, created, whiteouted) and the diverged set is the witnessed, created,
+//! whiteouted and redirected ones (AC-1.10); an unwitnessed entry always shows the live disk;
+//! a witnessed entry's unpinned bytes are read only after an `fstat` matches the witness, else
+//! the read is `BaseDrift` and the entry is `lost` (AC-1.11); memory after `create` is one
+//! directory handle and empty tables (AC-1.9).
+
+#[path = "base_recovery.rs"]
+mod recovery;
+pub use recovery::BaseImage;
+#[path = "base_versions.rs"]
+mod versions;
+use versions::{Version, Versioned};
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use slates_mem::Handle;
+
+use crate::dir::{BaseDirState, Child, DirNode};
+use crate::error::VfsError;
+use crate::host::{
+  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
+};
+use crate::ids::{Epoch, InodeNo, SnapshotId};
+use crate::inode::{
+  BaseBody, Body, FileTag, Fingerprint, Home, Inode, Kind, WindowsAttributes, Witness,
+};
+use crate::journal::Op;
+use crate::volume::{DirRow, Located, Store, Volume, VolumeConfig};
+
+/// When a base-plane table is written (A-48): the head's epoch, which labels the new value, and the newest
+/// live snapshot's, which decides whether the value it replaces can still be read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WitnessClock {
+  head: Epoch,
+  newest: Option<Epoch>,
+}
+
+/// A path a landing advanced (§4.15 step 9), and for a file it wrote, the witness of what it wrote: the
+/// fingerprint its own write left on the disk and the identity of the bytes (A-49).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Landed {
+  /// The path, as the landed source names it.
+  pub path: String,
+  /// For a written file: the landed file's witness.
+  pub written: Option<Witness>,
+}
+
+/// How the head's entry at a landed path compares with the landed snapshot's (A-49).
+enum Since {
+  /// The head holds it exactly as the snapshot did: the same object at the same version.
+  Unchanged,
+  /// A file the head changed since, now inode `no` at `name` in directory `dir`.
+  ChangedFile {
+    no: InodeNo,
+    dir: InodeNo,
+    name: Box<str>,
+  },
+  /// A file the head deleted since: a whiteout at `name` in directory `dir`.
+  Deleted { dir: InodeNo, name: Box<str> },
+  /// Anything else.
+  Other,
+}
+
+/// Format: a directory's own two links (`.` and its name); each subdirectory adds one (POSIX).
+const ROOT_LINKS: u32 = 2;
+
+/// How an overlay volume is created: the root directory handle the caller opened, the host's
+/// facts about it, and the large-file class boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct BaseConfig {
+  /// The base directory, opened by the caller (`O_DIRECTORY|O_NOFOLLOW`); never closed by the
+  /// volume.
+  pub root: HostDir,
+  /// The filesystem facts the drift rules need.
+  pub facts: HostFacts,
+  /// Derived: files up to this size are copied up whole; larger ones keep their descriptor and
+  /// pin only the written windows. Until Phase 7 measures the CDC threshold that D-6 names as
+  /// this boundary, the caller passes the profile's `arena_region_bytes` (one mapped region),
+  /// so a whole small-class copy-up never spans a region.
+  pub large_class_bytes: u64,
+}
+
+/// A directory's cached listing: the host handle, the fingerprint the entries were read under,
+/// The listed entry `name` names under `policy`, found by binary search: a listing is kept sorted by
+/// `(policy.hash, policy.fold)` of its names ([`Overlay::load_listing`]), the order this compares in —
+/// the hash first, the folded name (which may allocate) only on a tie. A relist prunes every overlay
+/// entry against the listing, so a linear search made each relist O(entries × listed); the racy listing
+/// rule (2026-09-30) relists inside a changed directory's timestamp window, so each relist must be cheap.
+fn listed_entry<'e>(
+  entries: &'e [BaseEntry],
+  policy: crate::names::NameEquivalence,
+  name: &str,
+) -> Option<&'e BaseEntry> {
+  let hash = policy.hash(name);
+  let folded = policy.fold(name);
+  let at = entries
+    .binary_search_by(|entry| {
+      policy
+        .hash(&entry.name)
+        .cmp(&hash)
+        .then_with(|| policy.fold(&entry.name).cmp(&folded))
+    })
+    .ok()?;
+  entries.get(at)
+}
+
+/// and the entries in the volume's canonical order.
+#[derive(Debug)]
+pub(crate) struct Listing {
+  pub(crate) dir: HostDir,
+  /// The immutable source path below the base root, independent of overlay renames.
+  source: Vec<String>,
+  fingerprint: Option<Fingerprint>,
+  entries: Option<Vec<BaseEntry>>,
+  /// The host's clock when the entries were read (`HostFs::now_ns`, the fingerprints' own
+  /// domain), for the racy rule (§4.5): a witness is racy when the listing was read within the
+  /// timestamp granularity of the file's last change, a comparison that only means something
+  /// between two readings of the filesystem's clock.
+  read_at_ns: i64,
+  watch: WatchState,
+  /// Reopened by a recovery and not yet listed by this daemon (A-151): the untouched entries beneath were numbered by a
+  /// daemon that died. On a filesystem that records no birth time their files cannot be told from files that took their
+  /// numbers since, so the first listing gives each one a new number, and until then none is opened by its name.
+  restored: bool,
+}
+
+/// What changed on disk beneath a witnessed entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, slates_wire::Wire)]
+pub enum DriftKind {
+  /// Same inode, different bytes or attributes.
+  Modified,
+  /// The entry is gone.
+  Deleted,
+  /// Another inode sits at the path.
+  Replaced,
+  /// A file became a directory or the reverse.
+  TypeChanged,
+}
+
+/// What `status` reports for an overlay volume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseStatus {
+  /// Every witnessed entry whose disk no longer matches its witness, by path.
+  pub drift: Vec<(String, DriftKind)>,
+  /// Every witnessed entry whose re-check the host refused now (an I/O error reading the disk), by path, with the
+  /// refusal: not known to match, so never reported as if it did (2026-10-07; the re-check's refusal was dropped).
+  pub unverified: Vec<(String, VfsError)>,
+  /// The watcher's state.
+  pub watcher: WatchState,
+}
+
+/// Why an entry is in the diverged set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Divergence {
+  /// Created by the volume (no base beneath, or an opaque directory over a removed one).
+  Created,
+  /// A base entry copied up: the volume holds a witness for it.
+  Witnessed,
+  /// A base name deleted by the volume.
+  Whiteout,
+  /// A base directory renamed by the volume; the path is the new one.
+  Redirect,
+}
+
+/// A moved base directory retains its origin; a directory with no live base is created.
+/// Scratch directories use `None`, while overlay replacements use `Opaque` (AC-1.10).
+fn directory_divergence(node: &DirNode) -> Option<Divergence> {
+  if node.origin.is_some() {
+    Some(Divergence::Redirect)
+  } else if matches!(node.base, BaseDirState::None | BaseDirState::Opaque) {
+    Some(Divergence::Created)
+  } else {
+    None
+  }
+}
+
+/// One diverged entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diverged {
+  /// The path in the volume.
+  pub path: String,
+  /// Why.
+  pub kind: Divergence,
+}
+
+/// A walk of a volume's diverged set in progress (AC-1.10; §4.3 "Bounded work everywhere"): the directories still to
+/// judge and what was found so far, so a landing's plan steps the walk a directory a unit and never walks a large tree
+/// in one call. Over a snapshot (`Volume::diverged_walk_in`) its handles name frozen nodes; over the head they may go
+/// stale between units, and a stale one is passed over.
+#[derive(Debug)]
+pub struct DivergedWalk {
+  snapshot: Option<SnapshotId>,
+  stack: Vec<(String, Handle<DirNode>)>,
+  out: Vec<Diverged>,
+}
+
+impl DivergedWalk {
+  fn new(snapshot: Option<SnapshotId>, root: Handle<DirNode>) -> DivergedWalk {
+    DivergedWalk {
+      snapshot,
+      stack: vec![(String::new(), root)],
+      out: Vec::new(),
+    }
+  }
+}
+
+/// A clean file's verified content digest (§4.15): the BLAKE3 of the bytes the disk holds for an
+/// untouched base entry and their length, verified against the file's identity and fingerprint
+/// at the moment of export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Digest {
+  /// BLAKE3 of the file's bytes.
+  pub identity: [u8; 32],
+  /// The length digested, in bytes.
+  pub size: u64,
+}
+
+/// A digest hash in progress across cooperative slices (§4.15; clean-digest.md §7 "cooperative
+/// slicing"): a large clean base file is hashed a bounded slice per shard step ([`Overlay::
+/// digest_advance`]) rather than in one step, so the owner shard is never held for the whole file at
+/// the machine's BLAKE3 throughput. The state is **pure data** — the running BLAKE3 hasher, the byte
+/// offset reached, the file's inode and the fingerprint captured at [`Overlay::digest_begin`] — and
+/// holds no host resource, so a partial digest an abandoning client leaves behind is simply dropped.
+/// Each slice re-opens the file and re-checks the fingerprint, so an outsider edit part-way through is
+/// caught (`DigestUnverified`), never hashed into a torn identity.
+#[derive(Clone, Debug)]
+pub struct PartialDigest {
+  no: InodeNo,
+  fingerprint: Fingerprint,
+  size: u64,
+  done: u64,
+  hasher: blake3::Hasher,
+}
+
+impl PartialDigest {
+  /// The bytes hashed so far, and the total — a progress fraction for the operator.
+  pub fn progress(&self) -> (u64, u64) {
+    (self.done, self.size)
+  }
+}
+
+/// What [`Overlay::digest_begin`] resolved: a digest ready at once (a cache hit, or nothing to
+/// re-verify), or a hash to advance in slices.
+pub enum DigestStart {
+  /// The digest is known now (the reused cache entry).
+  Ready(Digest),
+  /// A hash to carry forward with [`Overlay::digest_advance`]; boxed, since its running BLAKE3 state
+  /// is kilobytes against the ready digest's forty bytes (one allocation per digest begun).
+  Pending(Box<PartialDigest>),
+}
+
+/// The digest verb's counters (§4.15: "validated by a counter and a byte oracle"): every path
+/// the verb and its cache can take, so a test asserts the one it drove moved and a silently dead
+/// reuse path can never pass as a working one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DigestStats {
+  /// Digests computed by reading and hashing the file.
+  pub computed: u64,
+  /// Exports served from a kept digest after the disk re-verified its fingerprint (the reuse
+  /// path).
+  pub revalidated: u64,
+  /// Kept digests dropped because the volume was about to mutate, or removed, the entry
+  /// (§4.15 "invalidated before any mutation").
+  pub invalidated: u64,
+  /// Kept digests dropped because the disk no longer matched them (a listing refresh, an export's
+  /// re-check, or a watcher hint's revalidation).
+  pub stale: u64,
+  /// Exports refused `DigestUnverified`: the file changed while it was being digested.
+  pub unverified: u64,
+  /// Digests not kept because the shard's cache was at its bound (`DigestCacheFull`).
+  pub cache_full: u64,
+  /// Digests not kept because they were computed inside the racy window (§4.5): a same-tick
+  /// write could change the bytes without moving the fingerprint.
+  pub racy_uncached: u64,
+  /// Kept digests re-verified against the disk because a watcher hint named their directory
+  /// (§4.15 "watcher hints backed by revalidation"); the stale ones count under `stale` too.
+  pub hint_rechecked: u64,
+  /// Kept digests dropped because the watcher overflowed (§4.15 "watcher overflow invalidates
+  /// affected cache knowledge").
+  pub dropped_on_overflow: u64,
+  /// Digests held now.
+  pub cached: u64,
+}
+
+/// One kept digest: the directory the entry is homed in (a watcher hint names a directory), the
+/// fingerprint the digest was verified under, and the identity of the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CachedDigest {
+  home: InodeNo,
+  fingerprint: Fingerprint,
+  identity: [u8; 32],
+}
+
+/// A cache record as the shard's budget sizes it: the key and the kept digest.
+pub(crate) type DigestRecord = (InodeNo, CachedDigest);
+
+/// The divisor between the inode table's bytes and the clean-file digest cache's (§4.15 "bounded
+/// cache discovery"). The inode table is a sixth of a shard's reserve (the daemon's
+/// `STORE_TABLE_DIVISOR`), so the cache is about one percent of the reserve — a planned
+/// optimization's share ("no performance gain is assumed"), to be re-derived from the measured
+/// digest hit rate once the fast path it serves is measured.
+/// Shape: one sixteenth of the inode table's bytes.
+const DIGEST_SHARE_OF_INODE_TABLE: usize = 16;
+
+/// Derived: the digest records a shard may keep — the bytes of a sixteenth of its inode table over
+/// one record's size — so the cache is bounded by the same reserve the tables are sized from
+/// (§4.2) and never grows with the base tree.
+pub fn digest_capacity(max_inodes: usize) -> slates_machine::Derived<usize> {
+  slates_machine::derived!(
+    max_inodes
+      .saturating_mul(std::mem::size_of::<Inode>())
+      .checked_div(DIGEST_SHARE_OF_INODE_TABLE)
+      .and_then(|bytes| bytes.checked_div(std::mem::size_of::<DigestRecord>()))
+      .unwrap_or(0),
+    "max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>()",
+    ["store.max_inodes", "reserve_per_shard"]
+  )
+}
+
+/// The shard's digest-cache budget (§4.15 "bounded cache discovery", §4.2): one counted capacity
+/// every overlay volume on the shard keeps its verified digests under, so the caches together
+/// never exceed their derived share. At the bound admission refuses `DigestCacheFull` — the
+/// digest is still exported, only not kept — and the plane counts the refusal.
+#[derive(Debug)]
+pub struct DigestBudget {
+  capacity: usize,
+  live: usize,
+}
+
+impl DigestBudget {
+  /// A budget of `capacity` records, none kept.
+  pub(crate) fn new(capacity: usize) -> Self {
+    Self { capacity, live: 0 }
+  }
+
+  /// The records the shard may keep.
+  pub fn capacity(&self) -> usize {
+    self.capacity
+  }
+
+  /// The records kept now, across every volume on the shard.
+  pub fn live(&self) -> usize {
+    self.live
+  }
+
+  /// Takes one record's slot, or refuses at the bound.
+  fn take(&mut self) -> Result<(), VfsError> {
+    if self.live >= self.capacity {
+      return Err(VfsError::DigestCacheFull);
+    }
+    self.live = self.live.saturating_add(1);
+    Ok(())
+  }
+
+  /// Returns one record's slot.
+  fn give(&mut self) {
+    self.live = self.live.saturating_sub(1);
+  }
+}
+
+/// A live base entry an attached transport must expire from its kernel's cache: a watcher hint
+/// said the directory holding it changed beneath the volume, so its name and attributes may no
+/// longer be what the kernel holds (§4.6). Only untouched entries — an unwitnessed file or
+/// symlink, a merged subdirectory — follow the disk; the volume's own entries are unaffected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleBaseEntry {
+  /// The directory the entry hangs in.
+  pub dir: InodeNo,
+  /// The entry's name there.
+  pub name: Box<str>,
+  /// The entry's inode.
+  pub child: InodeNo,
+}
+
+/// What a hint left stale for a transport: the hinted directories themselves (their attributes,
+/// and a listing cache if the transport keeps one) and the live entries beneath them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StaleBaseEntries {
+  /// The hinted directories.
+  pub dirs: Vec<InodeNo>,
+  /// The live entries beneath them.
+  pub entries: Vec<StaleBaseEntry>,
+}
+
+/// Entries a fresh listing lacks (by name) and unwitnessed files it still lists with their
+/// fingerprints.
+type Stale = (Vec<String>, Vec<(InodeNo, Fingerprint, String)>);
+
+/// Which copy-up a mutation needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyUp {
+  /// Bytes will change: the small class is read whole, the large class keeps its descriptor.
+  Content,
+  /// Only attributes change: the witness is recorded and nothing is pinned.
+  Metadata,
+}
+
+/// The base plane's tables, owned by the volume.
+#[derive(Debug)]
+pub struct BasePlane {
+  root: HostDir,
+  facts: HostFacts,
+  large_class_bytes: u64,
+  /// Listings by directory inode number.
+  pub(crate) listings: BTreeMap<InodeNo, Listing>,
+  /// The base directories a recovery could not reacquire as the ones the image recorded (§4.8's failure matrix): gone
+  /// from the disk, unreadable, or another directory at the path. Their untouched entries refuse `BaseUnavailable`
+  /// while the volume's own entries in them serve; each keeps its record, so the next image carries it and a later
+  /// recovery tries again. Disjoint from [`Self::listings`]; bounded by the image's directories.
+  pub(crate) unavailable: BTreeMap<InodeNo, UnavailableDir>,
+  /// Witnesses by inode number, versioned by epoch so a snapshot reads its own (A-48).
+  witnesses: Versioned<InodeNo, Witness>,
+  /// Where on the disk each witness was taken: the base directory's inode number and the
+  /// entry name there. A renamed base file keeps its bytes at the old disk path (§4.5), so
+  /// drift checks and descriptors follow this, not the volume's current name. Versioned with the
+  /// witnesses, so every witness a snapshot reads keeps its home.
+  witness_homes: Versioned<InodeNo, (InodeNo, Box<str>)>,
+  /// Drift by inode number.
+  drift: BTreeMap<InodeNo, DriftKind>,
+  /// One per change to [`Self::drift`]: the base plane's durable-change token
+  /// ([`Self::durable_change_token`]) counts it beside the versioned tables' writes, so an overlay publication
+  /// takes a delta — which carries no base-plane state — only while the whole durable base plane is unchanged.
+  drift_writes: u64,
+  /// Open file descriptors by inode number (large-class copies and read-through).
+  descriptors: BTreeMap<InodeNo, HostFile>,
+  /// Descriptors taken out of `descriptors` by a reclaim that had no host to close them with (the volume reclaims an
+  /// inode on its own): closed when the next [`Overlay`] borrow ends. Bounded by `descriptors`, which each left.
+  closing: Vec<HostFile>,
+  /// The base entry each whiteout hides, by (directory inode, name): its fingerprint at the
+  /// removal, the landing's witnessed base for a delete (§4.15). Versioned by epoch (A-48).
+  whiteouts: Versioned<(InodeNo, Box<str>), Fingerprint>,
+  /// The base directory each redirect moved, by the directory's inode: its fingerprint at the
+  /// rename, the landing's witnessed base for the rename. Versioned by epoch (A-48).
+  redirects: Versioned<InodeNo, Fingerprint>,
+  watch: WatchState,
+  /// Directories whose listings a hint invalidated and whose witnessed entries want a check.
+  recheck: BTreeSet<InodeNo>,
+  recheck_all: bool,
+  /// The digest verb's counters.
+  digest_stats: DigestStats,
+  /// Kept digests by the clean file's inode number (§4.15), each holding a slot of the shard's
+  /// [`DigestBudget`]; dropped before any mutation of the entry and whenever the disk no longer
+  /// matches.
+  digests: BTreeMap<InodeNo, CachedDigest>,
+  /// The kept digests homed in each directory, so a watcher hint naming a directory revalidates
+  /// exactly the digests beneath it.
+  digests_by_dir: BTreeMap<InodeNo, BTreeSet<InodeNo>>,
+  /// The hint sequence: one more per watcher hint drained, so an attached transport can ask
+  /// which directories were hinted since it last delivered kernel invalidations (§4.6 "A drift
+  /// report or a watcher hint on a base path invalidates the kernel's entry and attributes").
+  hint_seq: u64,
+  /// The hint sequence at which each loaded directory's listing was last invalidated by a hint.
+  /// Bounded by the listings table: pruned to the loaded directories on every drain.
+  stale_since: BTreeMap<InodeNo, u64>,
+}
+
+/// A base directory a recovery could not reacquire ([`BasePlane::unavailable`]): its recorded source and fingerprint,
+/// kept for the next image, and the errno its untouched entries are refused with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnavailableDir {
+  pub(crate) source: Vec<String>,
+  pub(crate) fingerprint: Fingerprint,
+  pub(crate) errno: i32,
+}
+
+/// Format: the errno a base directory that is no longer the recorded one is refused with, `ENOENT` (2 on Linux and
+/// macOS, and Windows' `ERROR_FILE_NOT_FOUND`): the directory the image recorded is not there, whether removed or
+/// replaced by another at the path (§4.8, A-153).
+pub(crate) const GONE_DIRECTORY_ERRNO: i32 = 2;
+
+/// The errno a base directory recovery could not reopen is refused with: the host's own, or [`GONE_DIRECTORY_ERRNO`]
+/// when the host says only that it is not there as a directory.
+pub(crate) fn unavailable_errno(error: HostError) -> i32 {
+  match error {
+    HostError::Unavailable(errno) | HostError::OwnMount(errno) => errno,
+    HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
+      GONE_DIRECTORY_ERRNO
+    }
+  }
+}
+
+impl BasePlane {
+  /// Queues `file`, forgotten by a reclaim with no host, to be closed when the next overlay borrow ends.
+  pub(crate) fn queue_close(&mut self, file: HostFile) {
+    self.closing.push(file);
+  }
+
+  fn new(config: BaseConfig, root_no: InodeNo) -> Self {
+    let mut listings = BTreeMap::new();
+    listings.insert(
+      root_no,
+      Listing {
+        dir: config.root,
+        source: Vec::new(),
+        fingerprint: None,
+        entries: None,
+        read_at_ns: 0,
+        watch: WatchState::Unavailable,
+        restored: false,
+      },
+    );
+    Self {
+      root: config.root,
+      facts: config.facts,
+      large_class_bytes: config.large_class_bytes,
+      listings,
+      unavailable: BTreeMap::new(),
+      witnesses: Versioned::default(),
+      witness_homes: Versioned::default(),
+      drift: BTreeMap::new(),
+      drift_writes: 0,
+      descriptors: BTreeMap::new(),
+      closing: Vec::new(),
+      whiteouts: Versioned::default(),
+      redirects: Versioned::default(),
+      watch: WatchState::Unavailable,
+      recheck: BTreeSet::new(),
+      recheck_all: false,
+      digest_stats: DigestStats::default(),
+      digests: BTreeMap::new(),
+      digests_by_dir: BTreeMap::new(),
+      hint_seq: 0,
+      stale_since: BTreeMap::new(),
+    }
+  }
+
+  /// The base filesystem's timestamp granularity plus the measured clock resolution (§4.5's
+  /// racy window; `HostFacts`): the window inside which a revalidation of a live entry cannot
+  /// tell a change apart, hence the longest a transport may cache a live base entry's name and
+  /// attributes (§4.6 "Live source names/attributes/content cannot have an indefinite kernel
+  /// cache lifetime").
+  pub fn timestamp_granularity_ns(&self) -> u64 {
+    self.facts.timestamp_granularity_ns.max(1)
+  }
+
+  /// The hint sequence now (see [`Overlay::take_stale_base_entries`]).
+  pub fn hint_seq(&self) -> u64 {
+    self.hint_seq
+  }
+
+  /// How many base directories a recovery could not reacquire, whose untouched entries refuse `BaseUnavailable`
+  /// ([`Self::unavailable`]).
+  pub fn unavailable_dirs(&self) -> usize {
+    self.unavailable.len()
+  }
+
+  /// A clone's plane: the same root and facts, its own listings, and the witnesses of the snapshot it
+  /// was made from — frozen at `epoch` — never the origin's head's (A-48). Before 2026-09-30 a clone of an
+  /// older snapshot took the head's, so after a rewitness its old-based bytes were judged against the
+  /// newer witness.
+  pub(crate) fn for_clone(&self, root_no: InodeNo, epoch: Epoch) -> Self {
+    let mut plane = Self::new(
+      BaseConfig {
+        root: self.root,
+        facts: self.facts,
+        large_class_bytes: self.large_class_bytes,
+      },
+      root_no,
+    );
+    plane.witnesses = self.witnesses.view_at(epoch);
+    plane.witness_homes = self.witness_homes.view_at(epoch);
+    plane.whiteouts = self.whiteouts.view_at(epoch);
+    plane.redirects = self.redirects.view_at(epoch);
+    plane
+  }
+
+  /// A token that changes whenever any durable base-plane state a delta publication does not carry has been written
+  /// since it was last read: the witnesses, their homes, the whiteouts and the redirects (each counts its own writes,
+  /// including an in-place head overwrite), and the drift set. An overlay's publication takes a delta (which carries
+  /// no base plane) only while this token equals what its last committed publication saw, so a copy-up, whiteout,
+  /// rename or drift forces the next publication to be the whole image — the only record that carries the base plane
+  /// (A-48). Listings are not counted: recovery re-reads them from the host.
+  pub(crate) fn durable_change_token(&self) -> u64 {
+    self
+      .witnesses
+      .writes()
+      .wrapping_add(self.witness_homes.writes())
+      .wrapping_add(self.whiteouts.writes())
+      .wrapping_add(self.redirects.writes())
+      .wrapping_add(self.drift_writes)
+  }
+
+  /// The witness of an inode, if it was copied up.
+  pub fn witness(&self, no: InodeNo) -> Option<Witness> {
+    self.witnesses.head(&no).copied()
+  }
+
+  /// Whether the inode is witnessed.
+  pub fn is_witnessed(&self, no: InodeNo) -> bool {
+    self.witnesses.head_has(&no)
+  }
+
+  /// The witness of an inode as a snapshot frozen at `epoch` holds it (A-48).
+  pub fn witness_at(&self, no: InodeNo, epoch: Epoch) -> Option<Witness> {
+    self.witnesses.at(&no, epoch).copied()
+  }
+
+  /// Records a witness and the disk home it was taken at, as the head's (`at`: the volume's witness
+  /// clock). A witness taken with no home keeps the one it had.
+  fn record_witness(
+    &mut self,
+    no: InodeNo,
+    witness: Witness,
+    home: Option<(InodeNo, Box<str>)>,
+    at: WitnessClock,
+  ) {
+    self.witnesses.set(no, Some(witness), at.head, at.newest);
+    if let Some(home) = home {
+      self.witness_homes.set(no, Some(home), at.head, at.newest);
+    }
+  }
+
+  /// Forgets an inode's witness and its home, as the head's.
+  fn forget_witness(&mut self, no: InodeNo, at: WitnessClock) {
+    self.witnesses.remove(&no, at.head, at.newest);
+    self.witness_homes.remove(&no, at.head, at.newest);
+  }
+
+  /// Records the fingerprint of the base entry a whiteout at `(dir, name)` hides, as the head's.
+  fn record_whiteout(
+    &mut self,
+    dir: InodeNo,
+    name: &str,
+    fingerprint: Fingerprint,
+    at: WitnessClock,
+  ) {
+    self
+      .whiteouts
+      .set((dir, name.into()), Some(fingerprint), at.head, at.newest);
+  }
+
+  /// Forgets the whiteout at `(dir, name)`, as the head's.
+  fn forget_whiteout(&mut self, dir: InodeNo, name: &str, at: WitnessClock) {
+    self
+      .whiteouts
+      .remove(&(dir, name.into()), at.head, at.newest);
+  }
+
+  /// Records the fingerprint of the base directory a redirect moved, as the head's.
+  fn record_redirect(&mut self, no: InodeNo, fingerprint: Fingerprint, at: WitnessClock) {
+    self
+      .redirects
+      .set(no, Some(fingerprint), at.head, at.newest);
+  }
+
+  /// Forgets a directory's redirect, as the head's.
+  fn forget_redirect(&mut self, no: InodeNo, at: WitnessClock) {
+    self.redirects.remove(&no, at.head, at.newest);
+  }
+
+  /// Drops the versions no remaining snapshot reads: `live` are the epochs of the volume's snapshots
+  /// after a destroy (A-48's bound).
+  pub(crate) fn prune_versions(&mut self, live: &[Epoch]) {
+    self.witnesses.prune(live);
+    self.witness_homes.prune(live);
+    self.whiteouts.prune(live);
+    self.redirects.prune(live);
+  }
+
+  /// The versions the witness tables hold, over every table: the measure of A-48's bound.
+  pub fn witness_versions(&self) -> usize {
+    self
+      .witnesses
+      .version_count()
+      .saturating_add(self.witness_homes.version_count())
+      .saturating_add(self.whiteouts.version_count())
+      .saturating_add(self.redirects.version_count())
+  }
+
+  /// The digest verb's counters, for the tests that must see a path move.
+  pub fn digest_stats(&self) -> DigestStats {
+    self.digest_stats
+  }
+
+  /// Drops an inode's kept digest, returning its slot to the shard; whether one was kept. The
+  /// caller counts why.
+  fn forget_digest(&mut self, store: &mut Store, no: InodeNo) -> bool {
+    let Some(cached) = self.digests.remove(&no) else {
+      return false;
+    };
+    if let Some(homed) = self.digests_by_dir.get_mut(&cached.home) {
+      homed.remove(&no);
+      if homed.is_empty() {
+        self.digests_by_dir.remove(&cached.home);
+      }
+    }
+    store.digests.give();
+    self.digest_stats.cached = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
+    true
+  }
+
+  /// Keeps a verified digest under a slot of the shard's budget, or refuses `DigestCacheFull` at
+  /// the bound; an earlier digest of the inode is replaced, never double-counted.
+  fn remember_digest(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    cached: CachedDigest,
+  ) -> Result<(), VfsError> {
+    self.forget_digest(store, no);
+    store.digests.take()?;
+    self.digests.insert(no, cached);
+    self
+      .digests_by_dir
+      .entry(cached.home)
+      .or_default()
+      .insert(no);
+    self.digest_stats.cached = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
+    Ok(())
+  }
+
+  /// Drops every kept digest (a destroy, a watcher overflow): every slot goes back to the shard;
+  /// how many were dropped.
+  pub(crate) fn drop_all_digests(&mut self, store: &mut Store) -> u64 {
+    let dropped = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
+    for _ in 0..self.digests.len() {
+      store.digests.give();
+    }
+    self.digests.clear();
+    self.digests_by_dir.clear();
+    self.digest_stats.cached = 0;
+    dropped
+  }
+
+  /// The names the base listing of directory `no` found, or `None` when the listing has not been
+  /// read (the directory still shows the live disk). What [`crate::coverage`] checks a frozen node
+  /// against.
+  pub(crate) fn listed_names(&self, no: InodeNo) -> Option<Vec<Box<str>>> {
+    let entries = self.listings.get(&no)?.entries.as_ref()?;
+    Some(entries.iter().map(|entry| entry.name.clone()).collect())
+  }
+}
+
+/// Whether a directory node is an untouched merged base directory: it shows the disk, holds nothing of the volume's
+/// own and was never moved, so dropping it loses nothing the volume did.
+fn untouched_merged_dir(store: &Store, dir: Handle<DirNode>) -> bool {
+  store
+    .dirs
+    .get(dir)
+    .is_ok_and(|n| n.base == BaseDirState::Merged && n.is_empty() && n.origin.is_none())
+}
+
+fn host_refusal(e: HostError) -> VfsError {
+  match e {
+    HostError::NotFound => VfsError::NotFound,
+    HostError::NotDirectory => VfsError::NotDirectory,
+    HostError::NotFile => VfsError::IsDirectory,
+    HostError::StaleHandle => VfsError::StaleHandle,
+    HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
+  }
+}
+
+impl Volume {
+  /// Creates an overlay volume over an opened host directory: one handle recorded, empty
+  /// tables, no walk, no hashing, no copy (AC-1.9).
+  pub fn create_overlay(
+    store: &mut Store,
+    config: VolumeConfig,
+    base: BaseConfig,
+  ) -> Result<Volume, VfsError> {
+    let mut vol = Volume::create(store, config)?;
+    let root = vol.root();
+    store.dirs.get_mut(root)?.base = BaseDirState::Merged;
+    let root_no = store.dirs.get(root)?.inode;
+    vol.base = Some(BasePlane::new(base, root_no));
+    Ok(vol)
+  }
+
+  /// Whether the volume has a base.
+  pub fn is_overlay(&self) -> bool {
+    self.base.is_some()
+  }
+
+  /// Whether inode `no` follows the live disk: an untouched (unwitnessed) base file or symlink, or
+  /// a merged directory whose listing is the base's. A transport may cache such an object's name
+  /// and attributes only for the base filesystem's timestamp granularity, never indefinitely
+  /// (§4.6 "only pinned/immutable views can justify retention without a source check"); every
+  /// other object is the volume's own and is invalidated explicitly when it changes.
+  pub fn is_live_source(&self, store: &Store, no: InodeNo) -> bool {
+    let Some(plane) = self.base.as_ref() else {
+      return false;
+    };
+    match self.inode(store, no).map(|i| &i.body) {
+      Ok(Body::Base(_)) => !plane.is_witnessed(no),
+      Ok(Body::Directory(dir)) => store
+        .dirs
+        .get(*dir)
+        .is_ok_and(|node| node.base == BaseDirState::Merged),
+      _ => false,
+    }
+  }
+
+  /// The base plane's tables, for inspection.
+  pub fn base_plane(&self) -> Option<&BasePlane> {
+    self.base.as_ref()
+  }
+
+  /// Borrows the volume together with its host for base-aware operations.
+  pub fn with_host<'a>(&'a mut self, host: &'a mut dyn HostFs) -> Overlay<'a> {
+    Overlay { vol: self, host }
+  }
+
+  /// The diverged set (AC-1.10): witnessed, created, whiteouted and redirected entries, by
+  /// path, over the loaded nodes only (cost proportional to what the volume touched). [`DivergedWalk`] run to its end.
+  pub fn diverged(&self, store: &Store) -> Vec<Diverged> {
+    let mut walk = self.diverged_walk();
+    loop {
+      if let Some(diverged) = self.diverged_unit(store, &mut walk) {
+        return diverged;
+      }
+    }
+  }
+
+  /// The diverged set as snapshot `id` froze it (A-48): its tree, its inode versions and the witnesses
+  /// it read, never the head's. [`DivergedWalk`] run to its end.
+  pub fn diverged_in(&self, store: &Store, id: SnapshotId) -> Result<Vec<Diverged>, VfsError> {
+    let mut walk = self.diverged_walk_in(id)?;
+    loop {
+      if let Some(diverged) = self.diverged_unit(store, &mut walk) {
+        return Ok(diverged);
+      }
+    }
+  }
+
+  /// A walk of the head's diverged set, stepped a directory a unit ([`Volume::diverged_unit`]). The head moves between
+  /// units, so a walk that must see one state walks a snapshot ([`Volume::diverged_walk_in`]).
+  pub fn diverged_walk(&self) -> DivergedWalk {
+    DivergedWalk::new(None, self.root)
+  }
+
+  /// A walk of snapshot `id`'s diverged set, stepped a directory a unit ([`Volume::diverged_unit`]).
+  pub fn diverged_walk_in(&self, id: SnapshotId) -> Result<DivergedWalk, VfsError> {
+    let (_, root) = self.snapshot_info(id)?;
+    Ok(DivergedWalk::new(Some(id), root))
+  }
+
+  /// One unit of `walk`: one directory's entries judged; the whole diverged set, sorted by path, once the last
+  /// directory is done. A directory gone meanwhile (a stale handle of a walk over the head) is passed over, as the
+  /// one-call walk passed it.
+  pub fn diverged_unit(&self, store: &Store, walk: &mut DivergedWalk) -> Option<Vec<Diverged>> {
+    let Some((prefix, dir)) = walk.stack.pop() else {
+      let mut out = std::mem::take(&mut walk.out);
+      out.sort_by(|a, b| a.path.cmp(&b.path));
+      return Some(out);
+    };
+    let plane = self.base.as_ref();
+    let epoch = walk
+      .snapshot
+      .and_then(|id| self.snapshot_info(id).ok())
+      .map(|(epoch, _)| epoch);
+    let witnessed = |no: InodeNo| match (walk.snapshot, epoch) {
+      (Some(_), Some(epoch)) => plane.is_some_and(|b| b.witness_at(no, epoch).is_some()),
+      (Some(_), None) => false,
+      (None, _) => plane.is_some_and(|b| b.is_witnessed(no)),
+    };
+    let is_base = |no: InodeNo| {
+      let body = match walk.snapshot {
+        Some(id) => self.inode_in(store, id, no).map(|i| &i.body),
+        None => self.inode(store, no).map(|i| &i.body),
+      };
+      matches!(body, Ok(Body::Base(_) | Body::BaseLink(_)))
+    };
+    let Ok(node) = store.dirs.get(dir) else {
+      return None;
+    };
+    let mut found = Vec::new();
+    let mut deeper = Vec::new();
+    for e in node.iter(&store.blocks) {
+      let path = format!("{prefix}/{}", e.name);
+      match e.child {
+        Child::Whiteout => found.push(Diverged {
+          path,
+          kind: Divergence::Whiteout,
+        }),
+        Child::Dir(h) => {
+          if let Ok(child) = store.dirs.get(h) {
+            if let Some(kind) = directory_divergence(child) {
+              found.push(Diverged {
+                path: path.clone(),
+                kind,
+              });
+            }
+            deeper.push((path, h));
+          }
+        }
+        Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+          if witnessed(no) {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Witnessed,
+            });
+          } else if !is_base(no) {
+            found.push(Diverged {
+              path,
+              kind: Divergence::Created,
+            });
+          }
+        }
+      }
+    }
+    walk.out.extend(found);
+    walk.stack.extend(deeper);
+    None
+  }
+
+  /// The fingerprint of the base entry a whiteout at `dir/name` hides, recorded at the
+  /// removal (the landing's witnessed base for a delete).
+  pub fn whiteout_witness(&self, store: &Store, dir: &str, name: &str) -> Option<Fingerprint> {
+    let located = self.resolve(store, dir).ok()?;
+    let Child::Dir(h) = located.child else {
+      return None;
+    };
+    let dir_no = store.dirs.get(h).ok()?.inode;
+    self
+      .base
+      .as_ref()?
+      .whiteouts
+      .head(&(dir_no, name.into()))
+      .copied()
+  }
+
+  /// The fingerprint of the base directory a redirect at `path` moved, recorded at the rename.
+  pub fn redirect_witness(&self, store: &Store, path: &str) -> Option<Fingerprint> {
+    let located = self.resolve(store, path).ok()?;
+    let Child::Dir(h) = located.child else {
+      return None;
+    };
+    let no = store.dirs.get(h).ok()?.inode;
+    self.base.as_ref()?.redirects.head(&no).copied()
+  }
+
+  /// [`Self::whiteout_witness`] as snapshot `id` holds it (A-48).
+  pub fn whiteout_witness_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    dir: &str,
+    name: &str,
+  ) -> Option<Fingerprint> {
+    let (epoch, _) = self.snapshot_info(id).ok()?;
+    let located = self.resolve_in(store, id, dir).ok()?;
+    let Child::Dir(h) = located.child else {
+      return None;
+    };
+    let dir_no = store.dirs.get(h).ok()?.inode;
+    self
+      .base
+      .as_ref()?
+      .whiteouts
+      .at(&(dir_no, name.into()), epoch)
+      .copied()
+  }
+
+  /// [`Self::redirect_witness`] as snapshot `id` holds it (A-48).
+  pub fn redirect_witness_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    path: &str,
+  ) -> Option<Fingerprint> {
+    let (epoch, _) = self.snapshot_info(id).ok()?;
+    let located = self.resolve_in(store, id, path).ok()?;
+    let Child::Dir(h) = located.child else {
+      return None;
+    };
+    let no = store.dirs.get(h).ok()?.inode;
+    self.base.as_ref()?.redirects.at(&no, epoch).copied()
+  }
+
+  /// The witness of inode `no` as snapshot `id` holds it (A-48).
+  pub fn witness_in(&self, id: SnapshotId, no: InodeNo) -> Option<Witness> {
+    let (epoch, _) = self.snapshot_info(id).ok()?;
+    self.base.as_ref()?.witness_at(no, epoch)
+  }
+
+  /// The clock the base plane's versioned tables are written at: the head's epoch and the newest live
+  /// snapshot's (A-48).
+  pub(crate) fn witness_clock(&self) -> WitnessClock {
+    WitnessClock {
+      head: self.epoch,
+      newest: self
+        .last_snapshot
+        .and_then(|id| self.snapshot_info(id).ok())
+        .map(|(epoch, _)| epoch),
+    }
+  }
+
+  /// Whether the base beneath `dir` holds `name` (loaded listing only; the caller loads it).
+  pub(crate) fn base_listing_has(&self, dir_no: InodeNo, name: &str) -> bool {
+    let policy = self.policy;
+    self
+      .base
+      .as_ref()
+      .and_then(|b| b.listings.get(&dir_no))
+      .and_then(|l| l.entries.as_ref())
+      .is_some_and(|entries| listed_entry(entries, policy, name).is_some())
+  }
+
+  /// Whether a directory is empty enough to remove or to be replaced by a rename (the one check both
+  /// use, AUD-29-16): no live overlay entry, and every base name under it whiteouted. A merged
+  /// directory's base listing must be loaded, which the overlay verbs do before asking; one that is not
+  /// is refused `BaseUnavailable` (the host is needed to list it), never taken for empty — until
+  /// 2026-09-30 an unread listing answered "empty" and rename replaced a directory with disk children.
+  pub(crate) fn empty_for_rmdir(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+  ) -> Result<bool, VfsError> {
+    let node = store.dirs.get(dir)?;
+    if node.live_len(&store.blocks) > 0 {
+      return Ok(false);
+    }
+    if node.base != BaseDirState::Merged {
+      return Ok(true);
+    }
+    let policy = self.policy;
+    let Some(entries) = self
+      .base
+      .as_ref()
+      .and_then(|b| b.listings.get(&node.inode))
+      .and_then(|l| l.entries.as_ref())
+    else {
+      return Err(VfsError::BaseUnavailable(0));
+    };
+    Ok(entries.iter().all(|e| {
+      node
+        .lookup(&store.blocks, policy, &e.name)
+        .is_some_and(|x| x.child == Child::Whiteout)
+    }))
+  }
+
+  /// Closes the descriptor an inode held, when its last link goes; a digest kept for it is
+  /// dropped with it (the entry left the volume: invalidated).
+  pub(crate) fn base_forget(&mut self, store: &mut Store, no: InodeNo) -> Option<HostFile> {
+    let plane = self.base.as_mut()?;
+    if plane.forget_digest(store, no) {
+      plane.digest_stats.invalidated = plane.digest_stats.invalidated.saturating_add(1);
+    }
+    if plane.drift.remove(&no).is_some() {
+      plane.drift_writes = plane.drift_writes.saturating_add(1);
+    }
+    let descriptor = plane.descriptors.remove(&no);
+    let at = self.witness_clock();
+    if let Some(plane) = self.base.as_mut() {
+      plane.forget_witness(no, at);
+    }
+    descriptor
+  }
+}
+
+/// A pin in progress (§4.4 `pin`; [`Overlay::pin_unit`]): the directories still to list, by absolute path, and the
+/// files listed and not yet pinned, by inode number, so a walk stepped a slice at a time holds no handle between its
+/// slices. Its size is the walk's frontier: the subdirectories of the directories listed so far and the files of the
+/// last listing, never the tree.
+#[derive(Debug, Default)]
+pub struct PinWalk {
+  dirs: Vec<String>,
+  files: Vec<InodeNo>,
+  pinned: usize,
+}
+
+impl PinWalk {
+  /// A walk of the named subtrees, or of the whole base when none are named.
+  pub fn new(paths: Option<&[String]>) -> PinWalk {
+    let mut dirs: Vec<String> = paths.map_or_else(|| vec!["/".to_owned()], <[String]>::to_vec);
+    // Popped from the end: reversed, so the named subtrees are walked in the order named.
+    dirs.reverse();
+    PinWalk {
+      dirs,
+      files: Vec::new(),
+      pinned: 0,
+    }
+  }
+
+  /// The files pinned so far.
+  pub fn pinned(&self) -> usize {
+    self.pinned
+  }
+}
+
+/// The absolute path of `name` in the directory at `parent`.
+fn child_path(parent: &str, name: &str) -> String {
+  if parent.ends_with('/') {
+    format!("{parent}{name}")
+  } else {
+    format!("{parent}/{name}")
+  }
+}
+
+/// A volume borrowed together with its host: the base-aware verbs.
+pub struct Overlay<'a> {
+  vol: &'a mut Volume,
+  host: &'a mut dyn HostFs,
+}
+
+/// An overlay borrow closes the descriptors a reclaim forgot (`BasePlane::closing`) when it ends, so every verb run
+/// through it closes what it reclaimed, and a reclaim with no host closes at the next borrow. Before 2026-10-07 a
+/// reclaim dropped the descriptor unclosed: a file descriptor leaked per unlinked base file on a real disk.
+impl Drop for Overlay<'_> {
+  fn drop(&mut self) {
+    let Some(plane) = self.vol.base.as_mut() else {
+      return;
+    };
+    for file in std::mem::take(&mut plane.closing) {
+      self.host.close_file(file);
+    }
+  }
+}
+
+impl Overlay<'_> {
+  /// The volume.
+  pub fn volume(&mut self) -> &mut Volume {
+    self.vol
+  }
+
+  /// [`Volume::snapshot_is_complete`], judged with the host: a merged directory whose listing this daemon has not read
+  /// since a recovery (each is read again on first use, A-153) is read now from the host, uncached, so the snapshot is
+  /// judged by what its directories hold, not by a plane that has not listed them yet. Uncached, so a recovered
+  /// directory's first listing still renumbers its untouched entries where it is meant to (A-151). A directory recovery
+  /// could not reacquire refuses `BaseUnavailable`. Until 2026-11-08 a pinned overlay's snapshot was refused as a green's
+  /// base after any restart (`ConsistentBaseUnavailable`).
+  pub fn snapshot_is_complete(&mut self, store: &Store, id: SnapshotId) -> Result<bool, VfsError> {
+    let host = &mut *self.host;
+    let vol = &*self.vol;
+    vol.snapshot_is_complete_under(store, id, &mut |no| {
+      let Some(plane) = vol.base_plane() else {
+        return Ok(None);
+      };
+      if let Some(names) = plane.listed_names(no) {
+        return Ok(Some(names));
+      }
+      if let Some(gone) = plane.unavailable.get(&no) {
+        return Err(VfsError::BaseUnavailable(gone.errno));
+      }
+      let Some(listing) = plane.listings.get(&no) else {
+        return Ok(None);
+      };
+      let entries = host.list(listing.dir).map_err(host_refusal)?;
+      Ok(Some(entries.into_iter().map(|entry| entry.name).collect()))
+    })
+  }
+
+  fn plane(&mut self) -> Result<&mut BasePlane, VfsError> {
+    self.vol.base.as_mut().ok_or(VfsError::NotOverlay)
+  }
+
+  fn granularity(&self) -> u64 {
+    self
+      .vol
+      .base
+      .as_ref()
+      .map_or(1, |b| b.facts.timestamp_granularity_ns.max(1))
+  }
+
+  // ---------------------------------------------------------------- listings
+
+  /// Loads or refreshes the listing of a merged directory: the directory's fingerprint is
+  /// compared on every use and the entries are re-read when it moved or a hint invalidated
+  /// them; unloaded (unwitnessed) entries the disk no longer has leave the node.
+  fn load_listing(&mut self, store: &mut Store, dir: Handle<DirNode>) -> Result<(), VfsError> {
+    let dir_no = store.dirs.get(dir)?.inode;
+    // The read time is taken from the host's clock, never the volume's: the racy rule compares
+    // it with the files' timestamps, which live in the host's domain (the daemon's `HostClock`
+    // counts from its own creation, so a subtraction across the two domains called every
+    // witness racy — docs/bugs/2026-09-14-racy-rule-compares-monotonic-with-wall-clock.md).
+    let now = self.host.now_ns();
+    let policy = self.vol.policy;
+    let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+    let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
+    if let Some(gone) = plane.unavailable.get(&dir_no) {
+      return Err(VfsError::BaseUnavailable(gone.errno));
+    }
+    let listing = plane
+      .listings
+      .get_mut(&dir_no)
+      .ok_or(VfsError::NotOverlay)?;
+    if listing.watch == WatchState::Unavailable {
+      listing.watch = self.host.watch(listing.dir);
+      if listing.watch == WatchState::Live && plane.watch == WatchState::Unavailable {
+        plane.watch = WatchState::Live;
+      }
+    }
+    let fingerprint = self
+      .host
+      .fingerprint_dir(listing.dir)
+      .map_err(host_refusal)?;
+    // The racy rule for listings (§4.5, as for a file's witness): an unchanged fingerprint proves the
+    // listing current only when it was read more than one timestamp granularity after the directory last
+    // changed; within that window a child added in the same tick leaves the fingerprint as it was, so the
+    // directory is listed again. Until 2026-09-30 a listing read in the tick of a change was trusted, and
+    // a rename replaced a directory whose outsider child it never saw (AUD-29-16 sibling).
+    let changed_at = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+    let racy = listing.read_at_ns.saturating_sub(changed_at) <= granularity;
+    if listing.entries.is_some() && listing.fingerprint == Some(fingerprint) && !racy {
+      return Ok(());
+    }
+    let mut entries = self.host.list(listing.dir).map_err(host_refusal)?;
+    entries.sort_by(|a, b| {
+      (policy.hash(&a.name), policy.fold(&a.name))
+        .cmp(&(policy.hash(&b.name), policy.fold(&b.name)))
+    });
+    let restored = listing.restored;
+    listing.fingerprint = Some(fingerprint);
+    listing.read_at_ns = now;
+    listing.entries = Some(entries);
+    self.prune_unloaded(store, dir, restored)?;
+    if restored
+      && let Some(listing) = self
+        .vol
+        .base
+        .as_mut()
+        .and_then(|plane| plane.listings.get_mut(&dir_no))
+    {
+      listing.restored = false;
+    }
+    self.refresh_dir_nlink(store, dir)
+  }
+
+  /// A merged directory's link count is two plus its subdirectories, overlay and base alike
+  /// (POSIX); it is known once the listing is, and the core keeps it in step from then on.
+  /// Found by the landing oracle (2026-09-05): a base directory materialized with a count of
+  /// two lost its last link when its base subdirectory was removed, and its own `rmdir` then
+  /// refused `NotFound`.
+  fn refresh_dir_nlink(&mut self, store: &mut Store, dir: Handle<DirNode>) -> Result<(), VfsError> {
+    let dir = self.vol.head_dir(store, dir)?;
+    let policy = self.vol.policy;
+    let (dir_no, mut count) = {
+      let node = store.dirs.get(dir)?;
+      let own = node
+        .iter(&store.blocks)
+        .filter(|e| matches!(e.child, Child::Dir(_)))
+        .count();
+      (
+        node.inode,
+        ROOT_LINKS.saturating_add(u32::try_from(own).unwrap_or(u32::MAX)),
+      )
+    };
+    let base_subdirs: Vec<Box<str>> = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.listings.get(&dir_no))
+      .and_then(|l| l.entries.as_ref())
+      .map(|entries| {
+        entries
+          .iter()
+          .filter(|e| e.kind == HostKind::Dir)
+          .map(|e| e.name.clone())
+          .collect()
+      })
+      .unwrap_or_default();
+    let node = store.dirs.get(dir)?;
+    for name in &base_subdirs {
+      if node.lookup(&store.blocks, policy, name).is_none() {
+        count = count.saturating_add(1);
+      }
+    }
+    let handle = self.vol.make_current_inode(store, dir_no)?;
+    store.inodes.get_mut(handle)?.attrs.nlink = count;
+    Ok(())
+  }
+
+  /// Brings a node's unwitnessed base entries in line with the fresh listing: an untouched entry shows the live disk,
+  /// so one the disk no longer has leaves the node, one whose name the disk gave another file leaves it too (A-151), and
+  /// one the disk changed in place takes the listing's attributes. `restored` says this is the first listing since a
+  /// recovery reopened the directory ([`Listing::restored`]).
+  fn prune_unloaded(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    restored: bool,
+  ) -> Result<(), VfsError> {
+    let (mut gone, changed) = self.stale_entries(store, dir)?;
+    for (no, fp, name) in changed {
+      // A name the disk gave another file is a new entry (A-151): the inode leaves the name, open or not, held by its
+      // references, and the name serves the disk's file as a new inode on its next lookup. Until 2026-09-30 every inode
+      // was refreshed in place onto the new file, so an opener read bytes it never opened; until A-151 (2026-10-22) one
+      // this process did not count open still was, so a handle opened before a takeover read the outsider's file.
+      if self.names_another_file(store, no, fp) || (restored && self.unprovable(no, fp)) {
+        self.release_detached(no);
+        gone.push(name);
+        continue;
+      }
+      self.refresh_unloaded(store, no, fp)?;
+    }
+    for name in gone {
+      self.drop_unloaded(store, dir, &name)?;
+    }
+    Ok(())
+  }
+
+  /// The node's entries the fresh listing lacks (by name) and the unwitnessed files it still
+  /// lists (with their listed fingerprints).
+  fn stale_entries(&self, store: &Store, dir: Handle<DirNode>) -> Result<Stale, VfsError> {
+    let dir_no = store.dirs.get(dir)?.inode;
+    let policy = self.vol.policy;
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+    let Some(entries) = plane.listings.get(&dir_no).and_then(|l| l.entries.as_ref()) else {
+      return Ok((Vec::new(), Vec::new()));
+    };
+    let mut gone = Vec::new();
+    let mut changed = Vec::new();
+    for e in store.dirs.get(dir)?.iter(&store.blocks) {
+      let listed = listed_entry(entries, policy, e.name);
+      match (listed, e.child) {
+        (Some(l), Child::File(no)) if l.kind == HostKind::File && self.unloaded_file(store, no) => {
+          changed.push((no, l.fingerprint, e.name.to_owned()));
+        }
+        // An untouched base symlink the disk replaced (`ln -sf` makes a new link at the name, so its change time
+        // moves) or turned into another kind leaves the node, and the next lookup serves the disk's entry: its target
+        // was read once, with the listing, and the live disk is what an untouched entry shows (§4.5; 2026-10-08).
+        (Some(l), Child::Symlink(no))
+          if self.unloaded_file(store, no) && self.listed_link_changed(store, no, l) =>
+        {
+          gone.push(e.name.to_owned());
+        }
+        // An untouched file or merged directory whose name the disk now gives another kind leaves the node the same
+        // way, and the next lookup serves the disk's entry (until 2026-10-08 the old kind stayed, serving a file the
+        // disk no longer had at a name that was now a directory).
+        (Some(l), Child::File(no)) if l.kind != HostKind::File && self.unloaded_file(store, no) => {
+          gone.push(e.name.to_owned());
+        }
+        (Some(l), Child::Dir(h)) if l.kind != HostKind::Dir && untouched_merged_dir(store, h) => {
+          gone.push(e.name.to_owned());
+        }
+        (Some(_), _) => {}
+        (None, Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no))
+          if self.unloaded_file(store, no) =>
+        {
+          gone.push(e.name.to_owned());
+        }
+        (None, Child::Dir(h)) => {
+          if untouched_merged_dir(store, h) {
+            gone.push(e.name.to_owned());
+          }
+        }
+        (None, _) => {}
+      }
+    }
+    Ok((gone, changed))
+  }
+
+  /// Whether the disk's entry at an untouched base symlink's name is no longer the link it was read from: another
+  /// kind, or a link whose size or times differ from the ones the inode took from the listing.
+  fn listed_link_changed(&self, store: &Store, no: InodeNo, listed: &BaseEntry) -> bool {
+    let fp = listed.fingerprint;
+    listed.kind != HostKind::Symlink
+      || self.vol.inode(store, no).map_or(true, |inode| {
+        (inode.attrs.size, inode.attrs.mtime, inode.attrs.ctime)
+          != (fp.size, fp.mtime_ns, fp.ctime_ns)
+      })
+  }
+
+  /// Whether the disk's file at an untouched entry's name, listed as `fp`, is not the file inode `no` was made from
+  /// (A-151). The descriptor the inode holds decides when it holds one, by device and inode number: a number a
+  /// descriptor holds is never reused, and an `fstat` that fails proves nothing, so it counts as another file. Without
+  /// one the file the inode recorded decides ([`BaseBody::file`]: the device, the number and the birth time).
+  fn names_another_file(&mut self, store: &Store, no: InodeNo, fp: Fingerprint) -> bool {
+    if let Some(held) = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|plane| plane.descriptors.get(&no).copied())
+    {
+      return !self
+        .host
+        .fstat(held)
+        .is_ok_and(|now| now.dev == fp.dev && now.ino == fp.ino);
+    }
+    !self
+      .made_from(store, no)
+      .is_some_and(|file| file == FileTag::of(&fp))
+  }
+
+  /// Whether an entry a recovery restored cannot be proven the file its inode was made from (A-151): it holds no
+  /// descriptor and the filesystem records no birth time (`fp`'s is zero), so a number reused since the inode was made
+  /// cannot be ruled out.
+  fn unprovable(&self, no: InodeNo, fp: Fingerprint) -> bool {
+    fp.birth_ns == 0
+      && !self
+        .vol
+        .base
+        .as_ref()
+        .is_some_and(|plane| plane.descriptors.contains_key(&no))
+  }
+
+  /// The descriptor of an inode that left its name (A-151): kept while a handle holds the inode open, since the opener
+  /// reads the file it opened through it (POSIX); closed at once otherwise, since nothing reads the inode without
+  /// opening it again, and that open is refused ([`Self::descriptor`]). So a replaced file the kernel merely caches
+  /// holds none of the host's descriptors until its last reference goes.
+  fn release_detached(&mut self, no: InodeNo) {
+    if self.vol.is_open(no) {
+      return;
+    }
+    if let Some(plane) = self.vol.base.as_mut()
+      && let Some(file) = plane.descriptors.remove(&no)
+    {
+      self.host.close_file(file);
+    }
+  }
+
+  /// The disk file an untouched base inode was made from ([`BaseBody::file`], A-151); `None` for any other inode, a
+  /// witnessed one included, whose disk bytes its witness judges instead.
+  fn made_from(&self, store: &Store, no: InodeNo) -> Option<FileTag> {
+    if self
+      .vol
+      .base
+      .as_ref()
+      .is_some_and(|plane| plane.is_witnessed(no))
+    {
+      return None;
+    }
+    match &self.vol.inode(store, no).ok()?.body {
+      Body::Base(body) => Some(body.file),
+      _ => None,
+    }
+  }
+
+  /// Whether the directory holding inode `no` was reopened by a recovery and not yet listed since
+  /// ([`Listing::restored`]).
+  fn in_restored_listing(&self, store: &Store, no: InodeNo) -> bool {
+    let Some(parent) = self
+      .vol
+      .inode(store, no)
+      .ok()
+      .and_then(|inode| inode.home)
+      .map(|home| home.parent())
+    else {
+      return false;
+    };
+    self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|plane| plane.listings.get(&parent))
+      .is_some_and(|listing| listing.restored)
+  }
+
+  /// Whether an inode is an untouched base entry (unwitnessed, base-backed or a base symlink,
+  /// one link).
+  fn unloaded_file(&self, store: &Store, no: InodeNo) -> bool {
+    let witnessed = self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    !witnessed
+      && self
+        .vol
+        .inode(store, no)
+        .is_ok_and(|i| matches!(i.body, Body::Base(_) | Body::BaseLink(_)) && i.attrs.nlink == 1)
+  }
+
+  /// Removes an untouched entry the disk no longer has from the node (no whiteout, no journal).
+  fn drop_unloaded(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let located = self.vol.lookup(store, dir, name)?;
+    // Its content, when a snapshot pins it, is retained (§4.2): secured before the entry goes.
+    let retention = self.vol.retention_of_drop(store, located.inode)?;
+    self.vol.secure_retention(store, retention)?;
+    let dropped = self.drop_unloaded_secured(store, dir, name, located);
+    self.vol.settle_retention(store);
+    dropped
+  }
+
+  /// The removal proper, under a secured retention.
+  fn drop_unloaded_secured(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    located: crate::volume::Located,
+  ) -> Result<(), VfsError> {
+    let d = self.vol.make_current_dir(store, dir)?;
+    let mut retired = crate::dirtree::Retired::new();
+    let epoch = self.vol.epoch;
+    let policy = self.vol.policy;
+    let cutover = store.dir_cutover;
+    let _ = store.dirs.get_mut(d)?.remove(
+      &mut store.blocks,
+      epoch,
+      &mut retired,
+      policy,
+      name,
+      cutover,
+    )?;
+    self.vol.retire_blocks(store, retired)?;
+    match located.child {
+      // The directory's node goes with its inode (`Volume::release_body`), as `rmdir`'s does.
+      Child::Dir(_) => {
+        self.vol.drop_link(store, located.inode)?;
+        self.vol.drop_link(store, located.inode)?;
+        if let Some(plane) = self.vol.base.as_mut()
+          && let Some(l) = plane.listings.remove(&located.inode)
+        {
+          self.host.close_dir(l.dir);
+        }
+      }
+      _ => self.vol.drop_link(store, located.inode)?,
+    }
+    Ok(())
+  }
+
+  /// An unwitnessed base inode whose name still names the file it was made from follows the disk: its attributes take
+  /// the listing's, so an in-place edit shows through.
+  fn refresh_unloaded(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    fp: Fingerprint,
+  ) -> Result<(), VfsError> {
+    // A held descriptor stays: the name still names the file it holds (`names_another_file`), and an in-place edit
+    // shows through its `fstat`. Until 2026-09-30 every relist closed it, and a file opened, then unlinked through the
+    // mount after a relist, lost its bytes: the reopen by name found the name gone (AUD-29-16 sibling, found by the
+    // racy listing rule).
+    // A relist refreshes every untouched entry, changed or not; a kept digest is stale knowledge
+    // only when the listing's fingerprint no longer matches the one it was verified under.
+    let moved = self
+      .plane()?
+      .digests
+      .get(&no)
+      .is_some_and(|kept| kept.fingerprint != fp);
+    if moved && self.plane()?.forget_digest(store, no) {
+      let stats = &mut self.plane()?.digest_stats;
+      stats.stale = stats.stale.saturating_add(1);
+    }
+    self.adopt_fingerprint(store, no, fp)
+  }
+
+  /// An untouched entry takes the disk's fingerprint: its attributes and its base length. A change it takes is the
+  /// disk's bytes changing beneath the file's Shards backings, which are refilled (Shards part 3, step 4).
+  fn adopt_fingerprint(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    fp: Fingerprint,
+  ) -> Result<(), VfsError> {
+    let handle = self.vol.make_current_inode(store, no)?;
+    let inode = store.inodes.get_mut(handle)?;
+    let changed = inode.adopt_observed(
+      fp.size,
+      Some((fp.mode, fp.uid, fp.gid, fp.windows)),
+      fp.mtime_ns,
+      fp.ctime_ns,
+    );
+    if let Body::Base(b) = &mut inode.body {
+      b.base_len = fp.size;
+    }
+    if changed {
+      store.shards_backings.mark_stale(self.vol.prefix, no);
+    }
+    Ok(())
+  }
+
+  /// The attributes of an inode, live for an unwitnessed base entry (its directory's listing
+  /// validated and its descriptor `fstat`ed), as a bridge's `getattr` needs them.
+  pub fn stat(&mut self, store: &mut Store, no: InodeNo) -> Result<crate::inode::Attrs, VfsError> {
+    Ok(self.observe(store, no)?.attrs)
+  }
+
+  /// The kind, attributes and change counter of an inode, live as [`Self::stat`] makes them: an
+  /// outsider's edit the refresh took has moved the counter (A-38).
+  pub fn observe(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+  ) -> Result<crate::volume::Observed, VfsError> {
+    self.follow_live_disk(store, no)?;
+    // A merged directory's link count is known once its listing is (`refresh_dir_nlink`). A directory recovery could not
+    // reacquire keeps the count it was recovered with: it is the volume's own node, which holds its overlay entries and
+    // answers for itself, while only its untouched base entries refuse (§4.8's failure matrix).
+    if let Body::Directory(dir) = self.vol.inode(store, no)?.body
+      && store.dirs.get(dir)?.base == BaseDirState::Merged
+      && !self
+        .vol
+        .base
+        .as_ref()
+        .is_some_and(|plane| plane.unavailable.contains_key(&no))
+    {
+      self.load_listing(store, dir)?;
+    }
+    self.vol.observe(store, no)
+  }
+
+  /// For an unwitnessed base entry: validates the directory's listing (one `fstat` of the
+  /// directory; a changed one reloads and refreshes the entry) and takes the size from the
+  /// descriptor, so an in-place change shows through too.
+  fn follow_live_disk(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let (is_base, witnessed) = {
+      let inode = self.vol.inode(store, no)?;
+      (
+        matches!(inode.body, Body::Base(_)),
+        self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no)),
+      )
+    };
+    if !is_base || witnessed {
+      return Ok(());
+    }
+    if let Some(parent) = self.vol.inode(store, no)?.home.map(|h| h.parent())
+      && let Ok(dir) = self.vol.current_dir(store, parent)
+    {
+      self.load_listing(store, dir)?;
+    }
+    if !matches!(self.vol.inode(store, no)?.body, Body::Base(_)) {
+      return Ok(());
+    }
+    let file = self.descriptor(store, no)?;
+    let fp = self.host.fstat(file).map_err(host_refusal)?;
+    let handle = self.vol.make_current_inode(store, no)?;
+    let inode = store.inodes.get_mut(handle)?;
+    let changed = inode.adopt_observed(fp.size, None, fp.mtime_ns, fp.ctime_ns);
+    if let Body::Base(b) = &mut inode.body {
+      b.base_len = fp.size;
+    }
+    // The disk's bytes changed beneath the file's Shards backings: they are refilled (Shards part 3, step 4).
+    if changed {
+      store.shards_backings.mark_stale(self.vol.prefix, no);
+    }
+    Ok(())
+  }
+
+  /// The listing entry named `name` beneath `dir`, if the base has it.
+  fn base_entry(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<Option<BaseEntry>, VfsError> {
+    if store.dirs.get(dir)?.base != BaseDirState::Merged {
+      return Ok(None);
+    }
+    self.load_listing(store, dir)?;
+    let dir_no = store.dirs.get(dir)?.inode;
+    let policy = self.vol.policy;
+    Ok(
+      self
+        .vol
+        .base
+        .as_ref()
+        .and_then(|b| b.listings.get(&dir_no))
+        .and_then(|l| l.entries.as_ref())
+        .and_then(|es| listed_entry(es, policy, name).cloned()),
+    )
+  }
+
+  /// Gives a base entry its inode and its place in the node: an unloaded `Base` body for a
+  /// file, a merged node for a directory, the target for a symlink. Not a mutation of the
+  /// delta: nothing is journaled and no timestamp moves.
+  fn materialize(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    entry: &BaseEntry,
+  ) -> Result<Located, VfsError> {
+    let dir = self.vol.make_current_dir(store, dir)?;
+    let parent_no = store.dirs.get(dir)?.inode;
+    let no = self.vol.next_no(store)?;
+    let fp = entry.fingerprint;
+    let epoch = self.vol.epoch;
+    let child = match entry.kind {
+      HostKind::File => {
+        let mut inode = Inode::new(
+          no,
+          epoch,
+          Kind::File,
+          fp.mode,
+          Body::Base(BaseBody {
+            base_len: fp.size,
+            file: FileTag::of(&fp),
+            ..BaseBody::default()
+          }),
+        );
+        inode.attrs.size = fp.size;
+        inode.attrs.mtime = fp.mtime_ns;
+        inode.attrs.ctime = fp.ctime_ns;
+        (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        // The disk's Windows attribute bits, as an untouched base entry reports them (A-262).
+        inode.windows = WindowsAttributes::from_image(fp.windows);
+        inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
+        let handle = store.inodes.insert(inode)?;
+        self.vol.table_set(store, no, handle)?;
+        Child::File(no)
+      }
+      HostKind::Symlink => {
+        let parent_dir = self.listing_dir(parent_no)?;
+        let target = self
+          .host
+          .read_link(parent_dir, &entry.name)
+          .map_err(host_refusal)?;
+        let mut inode = Inode::new(no, epoch, Kind::Symlink, fp.mode, Body::BaseLink(target));
+        inode.attrs.size = fp.size;
+        // The disk's times, as a base file takes them (until 2026-10-08 a base symlink reported time zero).
+        inode.attrs.mtime = fp.mtime_ns;
+        inode.attrs.ctime = fp.ctime_ns;
+        (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        inode.windows = WindowsAttributes::from_image(fp.windows);
+        inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
+        let handle = store.inodes.insert(inode)?;
+        self.vol.table_set(store, no, handle)?;
+        Child::Symlink(no)
+      }
+      HostKind::Dir => {
+        let parent_dir = self.listing_dir(parent_no)?;
+        let opened = self
+          .host
+          .open_dir(parent_dir, &entry.name)
+          .map_err(host_refusal)?;
+        let mut node = DirNode::new(epoch, Some(parent_no), no, &entry.name);
+        node.base = BaseDirState::Merged;
+        let child = store.dirs.insert(node)?;
+        let mut inode = Inode::new(no, epoch, Kind::Dir, fp.mode, Body::Directory(child));
+        inode.attrs.nlink = 2;
+        (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
+        inode.windows = WindowsAttributes::from_image(fp.windows);
+        inode.attrs.mtime = fp.mtime_ns;
+        inode.attrs.ctime = fp.ctime_ns;
+        let handle = store.inodes.insert(inode)?;
+        self.vol.table_set(store, no, handle)?;
+        let plane = self.plane()?;
+        let mut source = plane
+          .listings
+          .get(&parent_no)
+          .ok_or(VfsError::RecoveryIncomplete)?
+          .source
+          .clone();
+        source.push(entry.name.to_string());
+        plane.listings.insert(
+          no,
+          Listing {
+            dir: opened,
+            source,
+            fingerprint: None,
+            entries: None,
+            read_at_ns: 0,
+            watch: WatchState::Unavailable,
+            restored: false,
+          },
+        );
+        Child::Dir(child)
+      }
+      HostKind::Other => return Err(VfsError::NotFound),
+    };
+    self.vol.dir_insert(store, dir, &entry.name, child)?;
+    Ok(Located { child, inode: no })
+  }
+
+  fn listing_dir(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+    if let Some(gone) = plane.unavailable.get(&dir_no) {
+      return Err(VfsError::BaseUnavailable(gone.errno));
+    }
+    plane
+      .listings
+      .get(&dir_no)
+      .map(|l| l.dir)
+      .ok_or(VfsError::NotOverlay)
+  }
+
+  // ---------------------------------------------------------------- namespace
+
+  /// A lookup that consults the base beneath a merged directory: an overlay entry wins, a
+  /// whiteout is `ENOENT`, otherwise the listing (a hit gets its inode now).
+  pub fn lookup(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<Located, VfsError> {
+    match self.vol.lookup(store, dir, name) {
+      // An untouched entry shows the live disk: the directory's listing is validated (one
+      // `fstat` of the directory) and the entry looked up again, in case the disk lost it.
+      Ok(l) if self.is_unloaded(store, &l) => {
+        let d = self.vol.head_dir(store, dir)?;
+        self.load_listing(store, d)?;
+        match self.vol.lookup(store, d, name) {
+          Ok(l) => return Ok(l),
+          Err(VfsError::NotFound) => {}
+          Err(e) => return Err(e),
+        }
+      }
+      Ok(l) => return Ok(l),
+      Err(VfsError::NotFound) => {}
+      Err(e) => return Err(e),
+    }
+    let dir = self.vol.head_dir(store, dir)?;
+    let node = store.dirs.get(dir)?;
+    if node.base != BaseDirState::Merged
+      || node
+        .lookup(&store.blocks, self.vol.policy, name)
+        .is_some_and(|e| e.child == Child::Whiteout)
+    {
+      return Err(VfsError::NotFound);
+    }
+    let Some(entry) = self.base_entry(store, dir, name)? else {
+      return Err(VfsError::NotFound);
+    };
+    self.materialize(store, dir, &entry)
+  }
+
+  /// Whether a located entry is an untouched base entry (unwitnessed, base-backed).
+  fn is_unloaded(&self, store: &Store, located: &Located) -> bool {
+    match located.child {
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+        self.unloaded_file(store, no)
+      }
+      Child::Dir(_) | Child::Whiteout => false,
+    }
+  }
+
+  /// Resolves an absolute path through merged directories.
+  pub fn resolve(&mut self, store: &mut Store, path: &str) -> Result<Located, VfsError> {
+    let root = self.vol.root();
+    let mut last = Located {
+      child: Child::Dir(root),
+      inode: store.dirs.get(root)?.inode,
+    };
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+      let Child::Dir(d) = last.child else {
+        return Err(VfsError::NotDirectory);
+      };
+      last = self.lookup(store, d, part)?;
+    }
+    Ok(last)
+  }
+
+  /// Lists a directory with its base merged in: every base entry not shadowed by an overlay
+  /// entry or a whiteout gets its inode, then the node lists in canonical order.
+  pub fn readdir<'s>(
+    &mut self,
+    store: &'s mut Store,
+    dir: Handle<DirNode>,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.merge_base(store, dir)?;
+    self.vol.readdir(store, dir)
+  }
+
+  /// One page of a directory with its base merged in ([`Volume::readdir_page`]): the base listing is merged
+  /// first, then the page is read from the node — so the page holds base entries in their place in the
+  /// canonical order (§4.5; AUD-29-86).
+  pub fn readdir_page_no<'s>(
+    &mut self,
+    store: &'s mut Store,
+    dir_no: InodeNo,
+    from_hash: u64,
+    limit: usize,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    let dir = self.merge_base(store, dir)?;
+    self.vol.readdir_page(store, dir, from_hash, limit)
+  }
+
+  /// Gives every base entry of `dir` not shadowed by an overlay entry or a whiteout its inode; the head's
+  /// node for `dir` afterwards.
+  fn merge_base(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+  ) -> Result<Handle<DirNode>, VfsError> {
+    let dir = self.vol.head_dir(store, dir)?;
+    if store.dirs.get(dir)?.base == BaseDirState::Merged {
+      self.load_listing(store, dir)?;
+      let dir_no = store.dirs.get(dir)?.inode;
+      let entries: Vec<BaseEntry> = self
+        .vol
+        .base
+        .as_ref()
+        .and_then(|b| b.listings.get(&dir_no))
+        .and_then(|l| l.entries.clone())
+        .unwrap_or_default();
+      let policy = self.vol.policy;
+      for e in entries {
+        let current = self.vol.head_dir(store, dir)?;
+        if store
+          .dirs
+          .get(current)?
+          .lookup(&store.blocks, policy, &e.name)
+          .is_none()
+          && e.kind != HostKind::Other
+        {
+          self.materialize(store, current, &e)?;
+        }
+      }
+    }
+    self.vol.head_dir(store, dir)
+  }
+
+  /// Whether `name` exists beneath `dir` in the overlay or the base (for the create verbs).
+  fn exists(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<bool, VfsError> {
+    match self.lookup(store, dir, name) {
+      Ok(_) => Ok(true),
+      Err(VfsError::NotFound) => Ok(false),
+      Err(e) => Err(e),
+    }
+  }
+
+  /// `create_file` that refuses a name the base holds.
+  pub fn create_file(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    if self.exists(store, dir, name)? {
+      return Err(VfsError::AlreadyExists);
+    }
+    self.vol.create_file(store, dir, name, mode)
+  }
+
+  /// Creates a FIFO/socket name while respecting existing base names (A-26).
+  pub fn mknod_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+    kind: Kind,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.entry_dir(store, dir_no)?;
+    if self.exists(store, dir, name)? {
+      return Err(VfsError::AlreadyExists);
+    }
+    self.vol.mknod_no(store, dir_no, name, mode, kind)
+  }
+
+  /// `mkdir` that refuses a name the base holds; a directory created in an overlay volume is
+  /// opaque (only overlay entries show), including one recreated over a whiteout.
+  pub fn mkdir(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    mode: u32,
+  ) -> Result<Handle<DirNode>, VfsError> {
+    if self.exists(store, dir, name)? {
+      return Err(VfsError::AlreadyExists);
+    }
+    let created = self.vol.mkdir(store, dir, name, mode)?;
+    store.dirs.get_mut(created)?.base = BaseDirState::Opaque;
+    Ok(created)
+  }
+
+  /// `symlink` that refuses a name the base holds.
+  pub fn symlink(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    target: &str,
+  ) -> Result<InodeNo, VfsError> {
+    if self.exists(store, dir, name)? {
+      return Err(VfsError::AlreadyExists);
+    }
+    self.vol.symlink(store, dir, name, target)
+  }
+
+  /// `link` that refuses a name the base holds; a link to an unwitnessed base file copies its
+  /// witness up first (the link count is a metadata change).
+  pub fn link(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    target: InodeNo,
+  ) -> Result<(), VfsError> {
+    if self.exists(store, dir, name)? {
+      return Err(VfsError::AlreadyExists);
+    }
+    // The link's own refusals first, so a link that would be refused never witnesses its target
+    // (AUD-29-40: the witness was journaled and kept by a refused link).
+    self.vol.admit_link(store, dir, name, target)?;
+    self.copy_up(store, target, CopyUp::Metadata)?;
+    self.vol.link(store, dir, name, target)
+  }
+
+  /// `unlink` over a merged directory: a base name leaves a whiteout, journaled as such.
+  pub fn unlink(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let located = self.lookup(store, dir, name)?;
+    if matches!(located.child, Child::Dir(_)) {
+      return Err(VfsError::IsDirectory);
+    }
+    let dir = self.vol.head_dir(store, dir)?;
+    let base = self.base_entry(store, dir, name)?;
+    self.vol.unlink(store, dir, name)?;
+    self.remember_whiteout(store, dir, name, base.as_ref());
+    Ok(())
+  }
+
+  /// Records the fingerprint a whiteout hides, when the removal left one.
+  fn remember_whiteout(
+    &mut self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    base: Option<&BaseEntry>,
+  ) {
+    let Some(entry) = base else { return };
+    let Ok(dir) = self.vol.head_dir(store, dir) else {
+      return;
+    };
+    let Ok(node) = store.dirs.get(dir) else {
+      return;
+    };
+    let left = node
+      .lookup(&store.blocks, self.vol.policy, name)
+      .is_some_and(|e| e.child == Child::Whiteout);
+    let at = self.vol.witness_clock();
+    if left && let Some(plane) = self.vol.base.as_mut() {
+      plane.record_whiteout(node.inode, name, entry.fingerprint, at);
+    }
+  }
+
+  /// `rmdir` over a merged directory: empty means no live overlay entry and every base name
+  /// whiteouted; the removed name leaves a whiteout.
+  pub fn rmdir(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let located = self.lookup(store, dir, name)?;
+    let Child::Dir(child) = located.child else {
+      return Err(VfsError::NotDirectory);
+    };
+    if store.dirs.get(child)?.base == BaseDirState::Merged {
+      self.load_listing(store, child)?;
+    }
+    let child = self.vol.head_dir(store, child)?;
+    if !self.vol.empty_for_rmdir(store, child)? {
+      return Err(VfsError::NotEmpty);
+    }
+    let dir = self.vol.head_dir(store, dir)?;
+    let base = self.base_entry(store, dir, name)?;
+    let removed_no = located.inode;
+    self.vol.rmdir(store, dir, name)?;
+    self.remember_whiteout(store, dir, name, base.as_ref());
+    let at = self.vol.witness_clock();
+    if let Some(plane) = self.vol.base.as_mut() {
+      plane.forget_redirect(removed_no, at);
+      if let Some(l) = plane.listings.remove(&removed_no) {
+        self.host.close_dir(l.dir);
+      }
+    }
+    Ok(())
+  }
+
+  /// `rename` over merged directories: a base file copies its witness up and leaves a
+  /// whiteout; a base directory records its origin (a redirect) and leaves a whiteout.
+  pub fn rename(
+    &mut self,
+    store: &mut Store,
+    from_dir: Handle<DirNode>,
+    from_name: &str,
+    to_dir: Handle<DirNode>,
+    to_name: &str,
+  ) -> Result<(), VfsError> {
+    let source = self.lookup(store, from_dir, from_name)?;
+    // The target, served from the base when it lives there: only its absence lets the rename go on
+    // without it; any other refusal (a stale handle, the host, admission) refuses the rename unchanged.
+    // A merged directory target has its base listing loaded, so the volume's emptiness check sees the
+    // disk children it has not been asked about yet (AUD-29-16).
+    match self.lookup(store, to_dir, to_name) {
+      Ok(target) => {
+        if let Child::Dir(target_dir) = target.child
+          && store.dirs.get(target_dir)?.base == BaseDirState::Merged
+        {
+          self.load_listing(store, target_dir)?;
+        }
+      }
+      Err(VfsError::NotFound) => {}
+      Err(refusal) => return Err(refusal),
+    }
+    let from_dir = self.vol.head_dir(store, from_dir)?;
+    let to_dir = self.vol.head_dir(store, to_dir)?;
+    let from_base = self.base_entry(store, from_dir, from_name)?;
+    let _ = self.base_entry(store, to_dir, to_name)?;
+    // The rename's own refusals first, so a rename that would be refused never witnesses its source
+    // (AUD-29-40: the witness was journaled and kept by a refused rename).
+    if self
+      .vol
+      .admit_rename(store, from_dir, from_name, to_dir, to_name)?
+      .is_none()
+    {
+      return Ok(());
+    }
+    let origin = match (source.child, &from_base) {
+      (Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no), Some(_)) => {
+        self.copy_up(store, no, CopyUp::Metadata)?;
+        None
+      }
+      (Child::Dir(h), Some(_)) => {
+        let node = store.dirs.get(h)?;
+        (node.base == BaseDirState::Merged && node.origin.is_none())
+          .then(|| self.vol.path_of(store, from_dir, from_name))
+      }
+      _ => None,
+    };
+    self
+      .vol
+      .rename(store, from_dir, from_name, to_dir, to_name)?;
+    self.remember_whiteout(store, from_dir, from_name, from_base.as_ref());
+    if let Some(from) = origin {
+      let moved = self.vol.lookup(store, to_dir, to_name)?;
+      if let Child::Dir(h) = moved.child {
+        let h = self.vol.make_current_dir_node(store, h)?;
+        store.dirs.get_mut(h)?.origin = Some(from.clone().into());
+        let at = self.vol.witness_clock();
+        if let (Some(entry), Some(plane)) = (from_base.as_ref(), self.vol.base.as_mut()) {
+          plane.record_redirect(moved.inode, entry.fingerprint, at);
+        }
+        let to_path = self.vol.path_of(store, to_dir, to_name);
+        self.vol.record(
+          &mut store.metadata,
+          Op::Redirect { from: from.into() },
+          to_path,
+          Some(moved.inode),
+          0,
+        );
+      }
+    }
+    Ok(())
+  }
+
+  // ---------------------------------------------------------------- content
+
+  /// Looks `name` up in the directory named by inode number `dir_no`, serving base entries.
+  pub fn lookup_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<Located, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.lookup(store, dir, name)
+  }
+
+  /// The entries of the directory named by inode number `dir_no`, base entries merged.
+  pub fn readdir_no<'s>(
+    &mut self,
+    store: &'s mut Store,
+    dir_no: InodeNo,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.readdir(store, dir)
+  }
+
+  /// Reads through pinned extents and the disk; a witnessed entry's disk bytes are read only
+  /// after an `fstat` matches the witness, else `BaseDrift` (AC-1.11).
+  pub fn read(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
+    self.follow_live_disk(store, no)?;
+    let (base_len, lost, size, covered) = match &self.vol.inode(store, no)?.body {
+      Body::Base(b) => {
+        let end = off.saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        let covered = b
+          .pinned
+          .iter()
+          .any(|e| e.off <= off && end <= e.off.saturating_add(e.len));
+        (
+          b.base_len,
+          b.lost,
+          self.vol.inode(store, no)?.attrs.size,
+          covered,
+        )
+      }
+      _ => return self.vol.read(store, no, off, buf),
+    };
+    if off >= size {
+      return Ok(0);
+    }
+    // A lost entry still serves the agent's own pinned bytes; anything else would be torn.
+    if lost && !(covered || off >= base_len) {
+      return Err(VfsError::BaseDrift);
+    }
+    let want = usize::try_from(
+      size
+        .saturating_sub(off)
+        .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+    )
+    .unwrap_or(0);
+    let out = buf.get_mut(..want).unwrap_or_default();
+    out.fill(0);
+    // Disk bytes first (within the valid base length), then the pinned extents over them.
+    if off < base_len && !covered {
+      let disk_want = usize::try_from(base_len.saturating_sub(off))
+        .unwrap_or(usize::MAX)
+        .min(out.len());
+      if let Some(disk) = out.get_mut(..disk_want) {
+        self.read_disk(store, no, off, disk)?;
+      }
+    }
+    if let Body::Base(b) = &self.vol.inode(store, no)?.body {
+      for e in &b.pinned {
+        store.content.read_extent_into(e, off, out)?;
+      }
+    }
+    Ok(want)
+  }
+
+  /// A file's bytes as snapshot `id` holds them (A-49): its own pinned extents, and the base's unpinned
+  /// ranges from the disk — read only while the disk still holds the snapshot's witnessed base, else
+  /// `BaseDrift`. A landing of the snapshot reads these after its verdict found the disk to be that base, so
+  /// the disk's bytes there are the snapshot's. The head's drift state is neither read nor changed.
+  pub fn read_in(
+    &mut self,
+    store: &mut Store,
+    id: SnapshotId,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
+    let inode = self.vol.inode_in(store, id, no)?;
+    let (base_len, lost, size, pinned) = match &inode.body {
+      Body::Base(b) => (b.base_len, b.lost, inode.attrs.size, b.pinned.clone()),
+      _ => return self.vol.read_in(store, id, no, off, buf),
+    };
+    if off >= size {
+      return Ok(0);
+    }
+    let want = usize::try_from(
+      size
+        .saturating_sub(off)
+        .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+    )
+    .unwrap_or(0);
+    let end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
+    let covered = pinned
+      .iter()
+      .any(|e| e.off <= off && end <= e.off.saturating_add(e.len));
+    if lost && !(covered || off >= base_len) {
+      return Err(VfsError::BaseDrift);
+    }
+    let out = buf.get_mut(..want).ok_or(VfsError::Invalid)?;
+    out.fill(0);
+    if off < base_len && !covered {
+      let disk_want = usize::try_from(
+        base_len
+          .saturating_sub(off)
+          .min(u64::try_from(want).unwrap_or(u64::MAX)),
+      )
+      .unwrap_or(0);
+      let witness = self.vol.witness_in(id, no).ok_or(VfsError::BaseDrift)?;
+      let disk = out.get_mut(..disk_want).ok_or(VfsError::Invalid)?;
+      self.read_disk_witnessed(store, no, &witness, off, disk)?;
+    }
+    for e in &pinned {
+      store.content.read_extent_into(e, off, out)?;
+    }
+    Ok(want)
+  }
+
+  /// Fills `out` from the disk at `off` through the inode's descriptor while the disk file is still the one
+  /// `witness` fingerprinted, else `BaseDrift`; nothing of the head's drift state is touched.
+  fn read_disk_witnessed(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    witness: &Witness,
+    off: u64,
+    out: &mut [u8],
+  ) -> Result<(), VfsError> {
+    let file = self.descriptor(store, no)?;
+    if self.host.fstat(file).map_err(host_refusal)? != witness.fingerprint {
+      return Err(VfsError::BaseDrift);
+    }
+    let mut done = 0usize;
+    while let Some(rest) = out.get_mut(done..).filter(|rest| !rest.is_empty()) {
+      let at = off.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
+      let n = self.host.read_at(file, at, rest).map_err(host_refusal)?;
+      if n == 0 {
+        break;
+      }
+      done = done.saturating_add(n);
+    }
+    Ok(())
+  }
+
+  /// Fills `out` from the disk at `off` through the inode's descriptor, after the drift check
+  /// when the entry is witnessed.
+  fn read_disk(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    out: &mut [u8],
+  ) -> Result<(), VfsError> {
+    let witnessed = self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    let file = self.descriptor(store, no)?;
+    if witnessed {
+      self.check_drift(store, no)?;
+    }
+    let mut done = 0usize;
+    while let Some(unread) = out.get_mut(done..).filter(|unread| !unread.is_empty()) {
+      let n = self
+        .host
+        .read_at(
+          file,
+          off.saturating_add(u64::try_from(done).unwrap_or(0)),
+          unread,
+        )
+        .map_err(host_refusal)?;
+      if n == 0 {
+        break;
+      }
+      done = done.saturating_add(n);
+    }
+    Ok(())
+  }
+
+  /// `write` with copy-up: the small class is read whole first, the large class pins the
+  /// touched windows from disk, then the plain write applies.
+  pub fn write(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    bytes: &[u8],
+  ) -> Result<usize, VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    let end = off.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    self.pin_windows(store, no, off, end)?;
+    self.vol.write(store, no, off, bytes)
+  }
+
+  /// `admit_allocation` with copy-up (A-108): the charge counts the windows still on the disk, which the slices pin.
+  pub fn admit_allocation(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    self.vol.admit_allocation(store, no, off, end)
+  }
+
+  /// `allocate` with copy-up (A-108): the slice's windows are pinned from the disk first, so the zeros fill only what
+  /// neither the volume nor the base holds.
+  pub fn allocate(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    self.pin_windows(store, no, off, end)?;
+    self.vol.allocate(store, no, off, end)
+  }
+
+  /// `truncate` with copy-up.
+  pub fn truncate(&mut self, store: &mut Store, no: InodeNo, len: u64) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    self.vol.truncate(store, no, len)
+  }
+
+  /// `edit` with copy-up: the whole file is pinned first, as its tail is rewritten.
+  pub fn edit(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    at: u64,
+    delete_len: u64,
+    bytes: &[u8],
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    let size = self.vol.inode(store, no)?.attrs.size;
+    self.pin_windows(store, no, 0, size)?;
+    self.vol.edit(store, no, at, delete_len, bytes)
+  }
+
+  /// [`Volume::set_windows_attributes`] with a metadata-only copy-up (A-262): an untouched base file's bits are what
+  /// the disk reports until a caller sets its own.
+  pub fn set_windows_attributes(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    attributes: crate::inode::WindowsAttributes,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.set_windows_attributes(store, no, attributes)
+  }
+
+  /// `chmod` with a metadata-only copy-up.
+  pub fn chmod(&mut self, store: &mut Store, no: InodeNo, mode: u32) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.chmod(store, no, mode)
+  }
+
+  /// Copies a file up before a guest maps it to write (§4.6 DAX rights; Shards part 3, step 4), as its first write
+  /// would: its witness is the disk as it is now. From then on what the volume serves for it changes only through the
+  /// write boundary, or is refused `BaseDrift`, so the guest's map can be compared with it. An untouched file follows
+  /// the disk, and a write-back comparing a map against it would take each outsider's change for the guest's.
+  pub fn witness_content(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)
+  }
+
+  /// The open descriptor of a base-backed inode, opened through its home if needed. An untouched inode's must name the
+  /// file the inode was made from (A-151): one that left its name, one whose name now names another file, and one a
+  /// recovery restored on a filesystem that records no birth time (its file cannot be proven) are refused
+  /// `StaleHandle`, never served another file's bytes. A kernel's path walk that meets `ESTALE` looks the name up
+  /// again, and finds the disk's file as a new inode.
+  fn descriptor(&mut self, store: &Store, no: InodeNo) -> Result<HostFile, VfsError> {
+    if let Some(f) = self.vol.base.as_ref().and_then(|b| b.descriptors.get(&no)) {
+      return Ok(*f);
+    }
+    let made_from = self.made_from(store, no);
+    let (dir, name) = match self.home_of(store, no) {
+      Ok(home) => home,
+      Err(VfsError::NotFound) if made_from.is_some() => return Err(VfsError::StaleHandle),
+      Err(refused) => return Err(refused),
+    };
+    let file = match self.host.open_file(dir, &name) {
+      Ok(file) => file,
+      Err(HostError::NotFound) if made_from.is_some() => return Err(VfsError::StaleHandle),
+      Err(refused) => return Err(host_refusal(refused)),
+    };
+    if let Some(made_from) = made_from {
+      let unproven = self.in_restored_listing(store, no);
+      match self.host.fstat(file) {
+        Ok(opened) if FileTag::of(&opened) == made_from && !(unproven && opened.birth_ns == 0) => {}
+        verdict => {
+          self.host.close_file(file);
+          return Err(verdict.err().map_or(VfsError::StaleHandle, host_refusal));
+        }
+      }
+    }
+    self.plane()?.descriptors.insert(no, file);
+    Ok(file)
+  }
+
+  /// The host directory and entry name of a file inode on the disk: where its witness was
+  /// taken when it has one, else its home in the volume.
+  fn home_of(&mut self, store: &Store, no: InodeNo) -> Result<(HostDir, String), VfsError> {
+    if let Some((parent, name)) = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.witness_homes.head(&no).cloned())
+    {
+      let host_dir = self.listing_dir(parent)?;
+      return Ok((host_dir, name.to_string()));
+    }
+    let inode = self.vol.inode(store, no)?;
+    let home = inode.home.ok_or(VfsError::NotOverlay)?;
+    let dir = self.vol.current_dir(store, home.parent())?;
+    let name = store
+      .dirs
+      .get(dir)?
+      .name_of(&store.blocks, home.hash, no)
+      .ok_or(VfsError::NotFound)?
+      .to_owned();
+    let host_dir = self.listing_dir(home.parent())?;
+    Ok((host_dir, name))
+  }
+
+  /// Copies an entry up (§4.5): `fstat` the descriptor, apply the racy rule against the
+  /// listing's read time, hash the bytes, record the witness; the small class becomes content,
+  /// the large class keeps its descriptor. Already witnessed or not base-backed: nothing.
+  pub(crate) fn copy_up(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    kind: CopyUp,
+  ) -> Result<(), VfsError> {
+    let Some(plane) = self.vol.base.as_ref() else {
+      return Ok(());
+    };
+    if plane.is_witnessed(no) {
+      return Ok(());
+    }
+    if let Body::BaseLink(target) = &self.vol.inode(store, no)?.body {
+      // A base symlink's copy-up is its target becoming the volume's own: nothing is read from the disk (the target
+      // was read with the listing), and the link is a created one from here on, so a rename lands it at its new name
+      // and the whiteout left at the old name removes the disk's.
+      let target = target.clone();
+      let handle = self.vol.make_current_inode(store, no)?;
+      let prev = store.inodes.get(handle)?.version;
+      store.inodes.get_mut(handle)?.body = Body::Symlink(target);
+      let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+      self
+        .vol
+        .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
+      return Ok(());
+    }
+    let is_base = matches!(self.vol.inode(store, no)?.body, Body::Base(_));
+    if !is_base {
+      return Ok(());
+    }
+    // §4.15 "invalidated before any mutation": every mutation of a base entry — content or
+    // metadata — copies it up first, so the digest kept for it is dropped here, before the
+    // witness is recorded and before the mutation is visible.
+    if self.plane()?.forget_digest(store, no) {
+      let stats = &mut self.plane()?.digest_stats;
+      stats.invalidated = stats.invalidated.saturating_add(1);
+    }
+    let (host_dir, name) = self.home_of(store, no)?;
+    let file = self.host.open_file(host_dir, &name).map_err(host_refusal)?;
+    let fp = self.host.fstat(file).map_err(host_refusal)?;
+    let home_parent = self.vol.inode(store, no)?.home.map(|h| h.parent());
+    // The racy rule (§4.5) asks whether the file's timestamp tick is still open when this fingerprint is taken: then a
+    // later edit inside the same tick would leave it unchanged, and only the bytes' hash can tell. Asked of the host's
+    // clock now, after the `fstat`, never of the listing's older read time. A file edited after the listing would
+    // otherwise saturate that difference to zero and be racy for good, every later read of it hashing the whole file
+    // (until 2026-10-24).
+    let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+    let racy = self.host.now_ns().saturating_sub(fp.mtime_ns) <= granularity;
+    let bytes = self.read_whole(file, fp.size)?;
+    let identity = *blake3::hash(&bytes).as_bytes();
+    let witness = Witness {
+      fingerprint: fp,
+      identity,
+      witnessed_at: self.vol.clock.monotonic_ns(),
+      racy,
+    };
+    let large = fp.size
+      > self
+        .vol
+        .base
+        .as_ref()
+        .map_or(u64::MAX, |b| b.large_class_bytes);
+    let handle = self.vol.make_current_inode(store, no)?;
+    let prev = store.inodes.get(handle)?.version;
+    let changed = {
+      let inode = store.inodes.get_mut(handle)?;
+      let changed = inode.adopt_observed(
+        fp.size,
+        Some((fp.mode, fp.uid, fp.gid, fp.windows)),
+        fp.mtime_ns,
+        fp.ctime_ns,
+      );
+      if let Body::Base(b) = &mut inode.body {
+        b.witness = Some(Box::new(witness));
+        b.base_len = fp.size;
+      }
+      changed
+    };
+    // The witness is the disk as it is now: a Shards backing filled before the disk changed is refilled to it (Shards
+    // part 3, step 4).
+    if changed {
+      store.shards_backings.mark_stale(self.vol.prefix, no);
+    }
+    let at = self.vol.witness_clock();
+    let home = home_parent.map(|home| (home, name.clone().into()));
+    self.plane()?.record_witness(no, witness, home, at);
+    if kind == CopyUp::Content && !large {
+      // The small class: the bytes come in whole and the body becomes plain content.
+      self.host.close_file(file);
+      self.plane()?.descriptors.remove(&no);
+      let handle = self.vol.make_current_inode(store, no)?;
+      let charge = self.vol.write_charge(store, no, 0, fp.size)?;
+      store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
+      if !self
+        .vol
+        .quota
+        .admit(self.vol.bytes.total(), charge, &mut store.budget)
+      {
+        return Err(VfsError::NoSpace);
+      }
+      // The copy lands whole or not at all (T-1.1): checked for room before the base body is replaced.
+      let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      self.vol.write_room(store, 0, len)?;
+      let before = crate::volume::content_by_epoch(store, handle);
+      store.inodes.get_mut(handle)?.body = Body::Inline(Vec::new());
+      self
+        .vol
+        .reconcile(before, crate::volume::EpochContent::Empty);
+      if !bytes.is_empty() {
+        self.vol.apply_write_whole(store, handle, 0, &bytes)?;
+      }
+    } else {
+      self.plane()?.descriptors.insert(no, file);
+    }
+    let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+    self
+      .vol
+      .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
+    Ok(())
+  }
+
+  fn read_whole(&mut self, file: HostFile, size: u64) -> Result<Vec<u8>, VfsError> {
+    let mut bytes = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
+    let mut done = 0usize;
+    while let Some(unread) = bytes.get_mut(done..).filter(|unread| !unread.is_empty()) {
+      let n = self
+        .host
+        .read_at(file, u64::try_from(done).unwrap_or(0), unread)
+        .map_err(host_refusal)?;
+      if n == 0 {
+        break;
+      }
+      done = done.saturating_add(n);
+    }
+    bytes.truncate(done);
+    Ok(bytes)
+  }
+
+  /// Pins the chunk windows of `[off, end)` of a large-class base body: each window not yet
+  /// pinned is read from disk (after the drift check) into an extent of the volume's own.
+  fn pin_windows(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<(), VfsError> {
+    let (base_len, pinned): (u64, Vec<u64>) = match &self.vol.inode(store, no)?.body {
+      Body::Base(b) => (b.base_len, b.pinned.iter().map(|e| e.off).collect()),
+      _ => return Ok(()),
+    };
+    let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
+    let first = off.checked_div(chunk).unwrap_or(0);
+    let last = end.saturating_sub(1).checked_div(chunk).unwrap_or(0);
+    if off >= end {
+      return Ok(());
+    }
+    // Only a window that still lives on the disk needs the disk (and the drift check first);
+    // bytes the volume already pinned are its own whatever the disk does beneath them.
+    let wanted: Vec<u64> = (first..=last)
+      .map(|w| w.saturating_mul(chunk))
+      .filter(|start| *start < base_len && !pinned.contains(start))
+      .collect();
+    if wanted.is_empty() {
+      return Ok(());
+    }
+    self.check_drift(store, no)?;
+    let file = self.descriptor(store, no)?;
+    for start in wanted {
+      let len = usize::try_from(base_len.saturating_sub(start).min(chunk)).unwrap_or(0);
+      let mut bytes = vec![0u8; len];
+      let mut done = 0usize;
+      while done < len {
+        let Some(unread) = bytes.get_mut(done..) else {
+          break;
+        };
+        let n = self
+          .host
+          .read_at(
+            file,
+            start.saturating_add(u64::try_from(done).unwrap_or(0)),
+            unread,
+          )
+          .map_err(host_refusal)?;
+        if n == 0 {
+          break;
+        }
+        done = done.saturating_add(n);
+      }
+      bytes.truncate(done);
+      let charge = u64::try_from(bytes.len()).unwrap_or(0);
+      store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
+      if !self
+        .vol
+        .quota
+        .admit(self.vol.bytes.total(), charge, &mut store.budget)
+      {
+        return Err(VfsError::NoSpace);
+      }
+      let handle = self.vol.make_current_inode(store, no)?;
+      let before = crate::volume::content_by_epoch(store, handle);
+      let epoch = self.vol.epoch;
+      let mut open = store
+        .content
+        .open(start, bytes.len(), epoch, self.vol.locked)?;
+      store.content.write_open(&mut open, 0, &bytes)?;
+      if let Some(extent) = store.content.seal(open, self.vol.seal_key)?
+        && let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body
+      {
+        crate::volume::insert_extent(&mut b.pinned, extent);
+      }
+      self
+        .vol
+        .reconcile(before, crate::volume::content_by_epoch(store, handle));
+    }
+    Ok(())
+  }
+
+  // ---------------------------------------------------------------- digests
+
+  /// `digest` (§4.15): the verified content digest of a clean file — an untouched base entry,
+  /// whose bytes are exactly the disk's. The path resolves through the overlay (an absent or
+  /// whiteouted name is `NotFound`, a directory `IsDirectory`); an entry the volume diverged, or
+  /// a symlink, refuses `DigestNotClean`; then the file is verified current (its listing
+  /// validated, the path opened afresh and matched by identity to the descriptor the volume
+  /// holds), hashed in bounded windows, and its fingerprint compared again after the read, so a
+  /// file changing under the hash refuses `DigestUnverified` rather than export a digest of torn
+  /// bytes. A read, never a mutation: nothing is journaled and the entry does not diverge.
+  pub fn digest(&mut self, store: &mut Store, path: &str) -> Result<Digest, VfsError> {
+    // The convenience form: begin, then hash the whole file in one call (the whole size as the
+    // slice budget). The daemon uses the cooperative [`Self::digest_begin`]/[`Self::digest_advance`]
+    // split instead, so a large file's hash yields the shard between slices.
+    match self.digest_begin(store, path)? {
+      DigestStart::Ready(digest) => Ok(digest),
+      DigestStart::Pending(mut partial) => loop {
+        if let Some(digest) = self.digest_advance(store, &mut partial, u64::MAX)? {
+          return Ok(digest);
+        }
+      },
+    }
+  }
+
+  /// Begins a clean-file digest (§4.15): resolves the path, refuses a non-clean or non-file entry,
+  /// verifies the file is current, and reuses a kept digest whose fingerprint the disk still matches
+  /// (`DigestStart::Ready`). Otherwise it returns the hash to advance in cooperative slices
+  /// (`DigestStart::Pending`), carrying the fingerprint the slices re-check against — no bytes are
+  /// hashed yet, so `begin` itself is O(1).
+  pub fn digest_begin(&mut self, store: &mut Store, path: &str) -> Result<DigestStart, VfsError> {
+    let located = self.resolve(store, path)?;
+    let no = match located.child {
+      Child::File(no) => no,
+      Child::Dir(_) => return Err(VfsError::IsDirectory),
+      Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) => {
+        return Err(VfsError::DigestNotClean);
+      }
+      Child::Whiteout => return Err(VfsError::NotFound),
+    };
+    if !self.is_clean(store, no) {
+      return Err(VfsError::DigestNotClean);
+    }
+    let (_file, fingerprint) = self.verify_current(store, no)?;
+    // Discovery (§4.15): a kept digest is reused only after the disk re-verified the fingerprint
+    // it was computed under — the fingerprint is the truth, the cache never is; a kept digest
+    // the disk no longer matches is stale knowledge, dropped before anything else happens.
+    let kept = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.digests.get(&no).copied());
+    if let Some(cached) = kept {
+      if cached.fingerprint == fingerprint {
+        let stats = &mut self.plane()?.digest_stats;
+        stats.revalidated = stats.revalidated.saturating_add(1);
+        return Ok(DigestStart::Ready(Digest {
+          identity: cached.identity,
+          size: fingerprint.size,
+        }));
+      }
+      if self.plane()?.forget_digest(store, no) {
+        let stats = &mut self.plane()?.digest_stats;
+        stats.stale = stats.stale.saturating_add(1);
+      }
+    }
+    Ok(DigestStart::Pending(Box::new(PartialDigest {
+      no,
+      fingerprint,
+      size: fingerprint.size,
+      done: 0,
+      hasher: blake3::Hasher::new(),
+    })))
+  }
+
+  /// Advances a [`PartialDigest`] by up to `budget` bytes (§4.15; clean-digest.md §7): re-opens the
+  /// file and re-checks its fingerprint — an outsider edit part-way through the hash is
+  /// `DigestUnverified`, never hashed into a torn identity — then reads and hashes the next slice.
+  /// Returns the finished [`Digest`] once the whole file is hashed (re-verified and kept), or `None`
+  /// when more slices remain. A caller loops this with its own per-step budget so the hash of a
+  /// large file never holds the shard for the whole file at the machine's BLAKE3 throughput.
+  pub fn digest_advance(
+    &mut self,
+    store: &mut Store,
+    partial: &mut PartialDigest,
+    budget: u64,
+  ) -> Result<Option<Digest>, VfsError> {
+    let file = self.reopen_verified(store, partial.no, partial.fingerprint)?;
+    self.hash_slice(store, file, partial, budget)?;
+    if partial.done < partial.size {
+      return Ok(None);
+    }
+    // The whole file is hashed; re-verify once more against the disk and keep the identity.
+    self.reopen_verified(store, partial.no, partial.fingerprint)?;
+    let identity = *partial.hasher.finalize().as_bytes();
+    let stats = &mut self.plane()?.digest_stats;
+    stats.computed = stats.computed.saturating_add(1);
+    self.keep_digest(store, partial.no, partial.fingerprint, identity)?;
+    Ok(Some(Digest {
+      identity,
+      size: partial.size,
+    }))
+  }
+
+  /// Re-opens the file `no` names and refuses `DigestUnverified` (counted) unless its fingerprint
+  /// still equals `expected` — the disk, not the cache, is the authority across the slices of a
+  /// cooperative digest. The returned handle is the volume's cached descriptor, owned by the
+  /// descriptor cache (invalidated on a base change), never closed by the caller.
+  fn reopen_verified(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    expected: Fingerprint,
+  ) -> Result<HostFile, VfsError> {
+    let (file, fingerprint) = self.verify_current(store, no)?;
+    if fingerprint != expected {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    }
+    Ok(file)
+  }
+
+  /// Reads and hashes up to `budget` bytes of `file` from `partial.done`, updating the hasher and
+  /// the offset. A short read before the fingerprinted size is `DigestUnverified` (the file shrank
+  /// under the hash). One window per read, so the memory is bounded whatever the budget.
+  fn hash_slice(
+    &mut self,
+    store: &Store,
+    file: HostFile,
+    partial: &mut PartialDigest,
+    budget: u64,
+  ) -> Result<(), VfsError> {
+    let window = store.content.chunk_bytes().max(1);
+    let window_len = u64::try_from(window).unwrap_or(u64::MAX);
+    let mut buf = vec![0u8; window];
+    let mut hashed_this_slice: u64 = 0;
+    while partial.done < partial.size && hashed_this_slice < budget {
+      let remaining = partial.size.saturating_sub(partial.done);
+      let want = usize::try_from(
+        remaining
+          .min(window_len)
+          .min(budget.saturating_sub(hashed_this_slice)),
+      )
+      .unwrap_or(window)
+      .min(window);
+      let n = self
+        .host
+        .read_at(file, partial.done, buf.get_mut(..want).unwrap_or_default())
+        .map_err(host_refusal)?;
+      if n == 0 {
+        return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+      }
+      partial.hasher.update(buf.get(..n).unwrap_or_default());
+      let n = u64::try_from(n).unwrap_or(u64::MAX);
+      partial.done = partial.done.saturating_add(n);
+      hashed_this_slice = hashed_this_slice.saturating_add(n);
+    }
+    Ok(())
+  }
+
+  /// Keeps a freshly verified digest for reuse, unless the racy rule (§4.5) forbids it: a digest
+  /// computed while the file's timestamp tick is still open — within the filesystem's granularity
+  /// of the host's clock — could be silently invalidated by a same-tick write the fingerprint
+  /// cannot show, so it is exported but never kept. At the shard's bound the digest is not kept
+  /// either; both are counted, neither refuses the export.
+  fn keep_digest(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    fingerprint: Fingerprint,
+    identity: [u8; 32],
+  ) -> Result<(), VfsError> {
+    let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+    let last_change = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+    if self.host.now_ns().saturating_sub(last_change) <= granularity {
+      let stats = &mut self.plane()?.digest_stats;
+      stats.racy_uncached = stats.racy_uncached.saturating_add(1);
+      return Ok(());
+    }
+    let Some(home) = self.vol.inode(store, no)?.home.map(|h| h.parent()) else {
+      return Ok(());
+    };
+    let cached = CachedDigest {
+      home,
+      fingerprint,
+      identity,
+    };
+    match self.plane()?.remember_digest(store, no, cached) {
+      Ok(()) => Ok(()),
+      Err(VfsError::DigestCacheFull) => {
+        let stats = &mut self.plane()?.digest_stats;
+        stats.cache_full = stats.cache_full.saturating_add(1);
+        Ok(())
+      }
+      Err(other) => Err(other),
+    }
+  }
+
+  /// Whether an entry is clean (§4.15): an untouched base file, so its bytes are exactly the
+  /// disk's — the complement of the diverged set for files: base-backed and unwitnessed.
+  fn is_clean(&self, store: &Store, no: InodeNo) -> bool {
+    let witnessed = self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    !witnessed
+      && matches!(
+        self.vol.inode(store, no).map(|i| &i.body),
+        Ok(Body::Base(_))
+      )
+  }
+
+  /// The descriptor and fingerprint of a clean file as the disk holds it right now (§4.15
+  /// "verified current"). The directory's listing is validated first (`follow_live_disk`); then
+  /// the path is opened afresh and its identity compared with the descriptor the volume holds,
+  /// because a file replaced beneath a held descriptor inside the directory's timestamp
+  /// granularity leaves the listing's fingerprint unchanged and the old inode alive behind the
+  /// descriptor — the one case the listing cannot tell. Two `fstat`s of one inode that disagree
+  /// mean it is changing now.
+  fn verify_current(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+  ) -> Result<(HostFile, Fingerprint), VfsError> {
+    self.follow_live_disk(store, no)?;
+    let (dir, name) = self.home_of(store, no)?;
+    let fresh = self.host.open_file(dir, &name).map_err(host_refusal)?;
+    let at_path = match self.host.fstat(fresh) {
+      Ok(fp) => fp,
+      Err(e) => {
+        self.host.close_file(fresh);
+        return Err(host_refusal(e));
+      }
+    };
+    let held = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.descriptors.get(&no).copied());
+    let Some(held) = held else {
+      self.plane()?.descriptors.insert(no, fresh);
+      return Ok((fresh, at_path));
+    };
+    let served = match self.host.fstat(held) {
+      Ok(fp) => fp,
+      Err(e) => {
+        self.host.close_file(fresh);
+        return Err(host_refusal(e));
+      }
+    };
+    if (served.dev, served.ino) != (at_path.dev, at_path.ino) {
+      // The path holds another inode now: the descriptor serves a file the disk has replaced.
+      // An untouched entry shows the live disk, so the volume adopts the new inode and rereads
+      // the directory at its next use (its listing still names the old fingerprint).
+      self.host.close_file(held);
+      self.plane()?.descriptors.insert(no, fresh);
+      if self.plane()?.forget_digest(store, no) {
+        let stats = &mut self.plane()?.digest_stats;
+        stats.stale = stats.stale.saturating_add(1);
+      }
+      self.adopt_fingerprint(store, no, at_path)?;
+      // Another file serves the entry now, whatever its attributes say: its Shards backings are refilled (Shards part
+      // 3, step 4).
+      store.shards_backings.mark_stale(self.vol.prefix, no);
+      self.invalidate_listing_of(store, no);
+      return Ok((fresh, at_path));
+    }
+    self.host.close_file(fresh);
+    if served != at_path {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    }
+    Ok((held, served))
+  }
+
+  /// Marks the listing of an entry's home directory for a reread at its next use.
+  fn invalidate_listing_of(&mut self, store: &Store, no: InodeNo) {
+    let Some(parent) = self
+      .vol
+      .inode(store, no)
+      .ok()
+      .and_then(|i| i.home)
+      .map(|h| h.parent())
+    else {
+      return;
+    };
+    if let Some(l) = self
+      .vol
+      .base
+      .as_mut()
+      .and_then(|b| b.listings.get_mut(&parent))
+    {
+      l.entries = None;
+    }
+  }
+
+  /// Counts a digest refusal on the path it names and hands it back.
+  fn count_digest_refusal(&mut self, refusal: VfsError) -> VfsError {
+    if let Some(plane) = self.vol.base.as_mut()
+      && refusal == VfsError::DigestUnverified
+    {
+      plane.digest_stats.unverified = plane.digest_stats.unverified.saturating_add(1);
+    }
+    refusal
+  }
+
+  /// A watcher hint named a directory: every digest kept for a file homed there is re-verified
+  /// against the disk now — the hint triggers the check, the fingerprint decides (§4.15 "watcher
+  /// hints backed by revalidation"; "hints alone never prove a source unchanged") — and one the
+  /// disk no longer matches is dropped as stale. Bounded by the digests kept beneath the
+  /// directory, which the shard's budget bounds.
+  fn revalidate_digests_under(&mut self, store: &mut Store, dir_no: InodeNo) {
+    let kept: Vec<InodeNo> = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.digests_by_dir.get(&dir_no))
+      .map(|homed| homed.iter().copied().collect())
+      .unwrap_or_default();
+    for no in kept {
+      let Some(cached) = self
+        .vol
+        .base
+        .as_ref()
+        .and_then(|b| b.digests.get(&no).copied())
+      else {
+        continue;
+      };
+      let now = self.fingerprint_at_path(store, no);
+      let Some(plane) = self.vol.base.as_mut() else {
+        return;
+      };
+      plane.digest_stats.hint_rechecked = plane.digest_stats.hint_rechecked.saturating_add(1);
+      if now != Some(cached.fingerprint) && plane.forget_digest(store, no) {
+        plane.digest_stats.stale = plane.digest_stats.stale.saturating_add(1);
+      }
+    }
+  }
+
+  /// The fingerprint of the entry at its disk path right now, or `None` when the path no longer
+  /// holds a file the host can open.
+  fn fingerprint_at_path(&mut self, store: &Store, no: InodeNo) -> Option<Fingerprint> {
+    let (dir, name) = self.home_of(store, no).ok()?;
+    let file = self.host.open_file(dir, &name).ok()?;
+    let fingerprint = self.host.fstat(file).ok();
+    self.host.close_file(file);
+    fingerprint
+  }
+
+  // ---------------------------------------------------------------- drift
+
+  /// Re-checks a witnessed entry against the disk (§4.5): what the held descriptor serves is
+  /// compared first, and an in-place change there marks the body `lost` and refuses reads with
+  /// `BaseDrift` (the bytes would be torn); then the path is compared, and an entry deleted,
+  /// replaced or retyped there is recorded as drift while the descriptor keeps serving the
+  /// witnessed inode (its data is alive). Each drift is journaled once.
+  pub(crate) fn check_drift(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let Some(witness) = self.vol.base.as_ref().and_then(|b| b.witness(no)) else {
+      return Ok(());
+    };
+    let lost = matches!(&self.vol.inode(store, no)?.body, Body::Base(b) if b.lost);
+    if lost {
+      return Err(VfsError::BaseDrift);
+    }
+    // 1. The inode the descriptor serves.
+    if let Some(file) = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.descriptors.get(&no).copied())
+    {
+      let served = self.host.fstat(file).map_err(host_refusal)?;
+      let same = served == witness.fingerprint
+        && (!witness.racy || self.identity_of(file, served.size)? == witness.identity);
+      if !same {
+        return Err(self.mark_lost(store, no));
+      }
+    }
+    // 2. The path on the disk.
+    let at_path = match self.home_of(store, no) {
+      Ok((dir, name)) => match self.host.open_file(dir, &name) {
+        Ok(file) => {
+          let fp = self.host.fstat(file);
+          self.host.close_file(file);
+          Some(fp.map_err(host_refusal)?)
+        }
+        Err(HostError::NotFound) => None,
+        Err(HostError::NotFile | HostError::NotDirectory) => {
+          self.record_drift(store, no, DriftKind::TypeChanged);
+          return Ok(());
+        }
+        Err(e) => return Err(host_refusal(e)),
+      },
+      Err(_) => None,
+    };
+    match at_path {
+      None => self.record_drift(store, no, DriftKind::Deleted),
+      Some(fp) if fp.ino != witness.fingerprint.ino => {
+        self.record_drift(store, no, DriftKind::Replaced)
+      }
+      Some(fp) if fp != witness.fingerprint => {
+        // The same inode changed in place; a held descriptor would have seen it above, so
+        // this is a small-class entry whose bytes are safe in memory: drift, not a loss.
+        self.record_drift(store, no, DriftKind::Modified);
+      }
+      Some(_) if witness.racy => {
+        if self.identity_now(store, no)? != Some(witness.identity) {
+          self.record_drift(store, no, DriftKind::Modified);
+        }
+      }
+      Some(_) => {}
+    }
+    Ok(())
+  }
+
+  /// The BLAKE3 of an open file's bytes.
+  fn identity_of(&mut self, file: HostFile, size: u64) -> Result<[u8; 32], VfsError> {
+    let bytes = self.read_whole(file, size)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+  }
+
+  /// Records a drift of `kind` for the inode (once per kind) and journals it.
+  fn record_drift(&mut self, store: &mut Store, no: InodeNo, kind: DriftKind) {
+    let fresh = self.vol.base.as_mut().is_some_and(|b| {
+      let changed = b.drift.insert(no, kind) != Some(kind);
+      if changed {
+        b.drift_writes = b.drift_writes.saturating_add(1);
+      }
+      changed
+    });
+    if fresh {
+      let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+      self
+        .vol
+        .record(&mut store.metadata, Op::Drift, path, Some(no), 0);
+    }
+  }
+
+  /// The descriptor's inode changed in place: the unpinned bytes are gone; the body is lost
+  /// and every read of it refuses.
+  fn mark_lost(&mut self, store: &mut Store, no: InodeNo) -> VfsError {
+    self.record_drift(store, no, DriftKind::Modified);
+    if let Ok(handle) = self.vol.make_current_inode(store, no)
+      && let Ok(inode) = store.inodes.get_mut(handle)
+      && let Body::Base(b) = &mut inode.body
+    {
+      b.lost = true;
+    }
+    VfsError::BaseDrift
+  }
+
+  /// The BLAKE3 of the entry's bytes as the disk holds them now.
+  fn identity_now(&mut self, store: &Store, no: InodeNo) -> Result<Option<[u8; 32]>, VfsError> {
+    let Ok((dir, name)) = self.home_of(store, no) else {
+      return Ok(None);
+    };
+    let file = self.host.open_file(dir, &name).map_err(host_refusal)?;
+    let fp = self.host.fstat(file).map_err(host_refusal);
+    let bytes = fp.and_then(|fp| self.read_whole(file, fp.size));
+    self.host.close_file(file);
+    Ok(Some(*blake3::hash(&bytes?).as_bytes()))
+  }
+
+  /// Re-checks the witnessed entries `targets` against the disk. A re-check the host refused is not a pass: its
+  /// directory waits for the next drain, so the entry is checked again rather than forgotten (bounded: the set of
+  /// directories). Drift found is recorded by the check itself.
+  fn recheck_witnessed(
+    &mut self,
+    store: &mut Store,
+    targets: Vec<InodeNo>,
+  ) -> Result<(), VfsError> {
+    for no in targets {
+      match self.check_drift(store, no) {
+        Ok(()) | Err(VfsError::BaseDrift) => {}
+        Err(_) => {
+          if let Some(home) = self.vol.inode(store, no).ok().and_then(|inode| inode.home) {
+            self.plane()?.recheck.insert(home.parent());
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.
+  pub fn status(&mut self, store: &mut Store) -> Result<BaseStatus, VfsError> {
+    self.process_hints(store)?;
+    let witnessed: Vec<InodeNo> = self
+      .vol
+      .base
+      .as_ref()
+      .map(|b| b.witnesses.iter_head().map(|(no, _)| *no).collect())
+      .unwrap_or_default();
+    let mut unverified = Vec::new();
+    for no in witnessed {
+      match self.check_drift(store, no) {
+        // Drift found is recorded by the check itself and listed below.
+        Ok(()) | Err(VfsError::BaseDrift) => {}
+        Err(refusal) => unverified.push((
+          self
+            .vol
+            .path_of_inode(store, no)
+            .unwrap_or_else(|| format!("inode {}", no.0)),
+          refusal,
+        )),
+      }
+    }
+    unverified.sort_by(|a, b| a.0.cmp(&b.0));
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+    let mut drift: Vec<(String, DriftKind)> = plane
+      .drift
+      .iter()
+      .map(|(no, kind)| {
+        (
+          self
+            .vol
+            .path_of_inode(store, *no)
+            .unwrap_or_else(|| format!("inode {}", no.0)),
+          *kind,
+        )
+      })
+      .collect();
+    drift.sort();
+    Ok(BaseStatus {
+      drift,
+      unverified,
+      watcher: plane.watch,
+    })
+  }
+
+  /// Asks for the recall of every delegation held on an untouched base entry the watcher's hints may have changed:
+  /// the entry a hint names, every one homed in a directory a nameless hint names, or every one after an overflow. RFC 8881 §10.2: "operations done outside the
+  /// NFSv4.1 protocol ... also need to result in delegation recall". An untouched entry shows the disk, so an
+  /// outsider's edit beneath it changes what the volume serves, and a holder that is not told keeps serving its own
+  /// cached bytes; a copied-up entry's bytes are the volume's own and are not recalled (its drift is reported instead,
+  /// §4.15). Bounded by the delegation table (one pass over this volume's delegated inodes per drain with a nameless
+  /// hint) and by the named entries (one lookup each). Measured 2026-10-08: one outsider's append beneath a delegated
+  /// directory recalled all 153 of its files when hints named only directories.
+  fn recall_hinted(
+    &self,
+    store: &mut Store,
+    all: bool,
+    whole: &BTreeSet<InodeNo>,
+    named: &BTreeSet<(InodeNo, Box<str>)>,
+  ) {
+    if !all && whole.is_empty() && named.is_empty() {
+      return;
+    }
+    let untouched = |store: &Store, no: InodeNo| {
+      self.vol.base.as_ref().is_some_and(|b| !b.is_witnessed(no))
+        && self
+          .vol
+          .inode(store, no)
+          .is_ok_and(|inode| matches!(inode.body, Body::Base(_) | Body::BaseLink(_)))
+    };
+    if all || !whole.is_empty() {
+      for no in store.recall_gate.delegated_in(self.vol.prefix()) {
+        let no = InodeNo(no);
+        let in_whole = all
+          || self.vol.inode(store, no).is_ok_and(|inode| {
+            inode
+              .home
+              .is_some_and(|home| whole.contains(&home.parent()))
+          });
+        if in_whole && untouched(store, no) {
+          store.recall_gate.recall(no.0);
+        }
+      }
+    }
+    for (dir_no, name) in named {
+      let entry = self
+        .vol
+        .current_dir(store, *dir_no)
+        .and_then(|dir| self.vol.lookup(store, dir, name));
+      if let Ok(located) = entry
+        && untouched(store, located.inode)
+      {
+        store.recall_gate.recall(located.inode.0);
+      }
+    }
+  }
+
+  /// Drains the watcher's hints: a changed directory invalidates its listing, marks it stale for
+  /// every attached transport's kernel cache (see [`Overlay::take_stale_base_entries`]),
+  /// re-checks the witnessed entries homed there and re-verifies the digests kept beneath it
+  /// (§4.15); an overflow does all of these for every loaded directory and drops every kept
+  /// digest.
+  pub fn process_hints(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    let before = self.vol.base.as_ref().map_or(0, |plane| plane.hint_seq);
+    let drained = self.drain_hints(store);
+    // A hint drained marks base directories stale for every transport's kernel cache: a transport parked on the volume
+    // is woken to deliver them now, not at its kernel's next request (§4.6 cache posture). Driven by the sequence
+    // having moved, and after the drain whatever it answered, so a refusal partway cannot strand the wake.
+    if self.vol.base.as_ref().map_or(0, |plane| plane.hint_seq) != before {
+      self.vol.change.changed();
+    }
+    drained
+  }
+
+  /// [`Self::process_hints`]'s drain, without the wake.
+  fn drain_hints(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    let hints = self.host.hints();
+    let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
+    if !hints.is_empty() {
+      // The stale marks are bounded by the loaded directories: a mark for a directory whose
+      // listing is gone is dropped before new ones are added.
+      let loaded = &plane.listings;
+      plane.stale_since.retain(|no, _| loaded.contains_key(no));
+    }
+    // The recalls the hints ask (A-122): every untouched entry of a directory a nameless hint names, or the named
+    // entry alone.
+    let mut whole: BTreeSet<InodeNo> = BTreeSet::new();
+    let mut named: BTreeSet<(InodeNo, Box<str>)> = BTreeSet::new();
+    for hint in hints {
+      plane.hint_seq = plane.hint_seq.saturating_add(1);
+      let (dir, entry) = match hint {
+        Hint::Changed(dir) => (dir, None),
+        Hint::Entry(dir, name) => (dir, Some(name)),
+        Hint::Overflow => {
+          plane.watch = WatchState::Overflowed;
+          let seq = plane.hint_seq;
+          for (no, l) in &mut plane.listings {
+            l.entries = None;
+            plane.stale_since.insert(*no, seq);
+          }
+          plane.recheck_all = true;
+          continue;
+        }
+      };
+      let hit = plane
+        .listings
+        .iter()
+        .find(|(_, l)| l.dir == dir)
+        .map(|(no, _)| *no);
+      if let Some(no) = hit {
+        if let Some(l) = plane.listings.get_mut(&no) {
+          l.entries = None;
+        }
+        plane.recheck.insert(no);
+        plane.stale_since.insert(no, plane.hint_seq);
+        match entry {
+          Some(name) => {
+            named.insert((no, name));
+          }
+          None => {
+            whole.insert(no);
+          }
+        }
+      }
+    }
+    let all = std::mem::take(&mut plane.recheck_all);
+    let dirs = std::mem::take(&mut plane.recheck);
+    self.recall_hinted(store, all, &whole, &named);
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+    let witnessed: Vec<InodeNo> = plane.witnesses.iter_head().map(|(no, _)| *no).collect();
+    let targets: Vec<InodeNo> = witnessed
+      .into_iter()
+      .filter(|no| {
+        all
+          || self
+            .vol
+            .inode(store, *no)
+            .ok()
+            .and_then(|i| i.home)
+            .is_some_and(|h| dirs.contains(&h.parent()))
+      })
+      .collect();
+    self.recheck_witnessed(store, targets)?;
+    if all {
+      let dropped = self.plane()?.drop_all_digests(store);
+      let stats = &mut self.plane()?.digest_stats;
+      stats.dropped_on_overflow = stats.dropped_on_overflow.saturating_add(dropped);
+    } else {
+      for dir_no in dirs {
+        self.revalidate_digests_under(store, dir_no);
+      }
+    }
+    Ok(())
+  }
+
+  // ---------------------------------------------------------------- landing
+
+  /// After a landing (§4.15 step 9): every path that landed leaves the overlay. A written file
+  /// becomes an untouched base entry again (the disk holds it now; the next read comes from
+  /// there), a landed whiteout or opaque marker is forgotten, a landed redirect clears its
+  /// origin. A scratch volume becomes an overlay over the target (`Base::Path`) first.
+  ///
+  /// A landing of a snapshot (`source`, A-49) advances the head relative to what it landed: an entry the
+  /// head still holds exactly as the snapshot did leaves the overlay; a file the head changed since stays
+  /// private and is rebased onto what landed (its witness becomes the landed file, so the later edit lands
+  /// next as a replacement of it, not a conflict with it); a head whiteout of a landed file keeps deleting
+  /// it, against the landed fingerprint; anything else the head changed stays as it is, for a later landing's
+  /// verdict to decide.
+  pub fn land_advance(
+    &mut self,
+    store: &mut Store,
+    landed: &[Landed],
+    base: Option<BaseConfig>,
+    source: Option<SnapshotId>,
+  ) -> Result<(), VfsError> {
+    self.land_advance_begin(store, base)?;
+    for entry in landed {
+      self.land_advance_one(store, entry, source)?;
+    }
+    self.land_advance_end();
+    Ok(())
+  }
+
+  /// The one-time setup of a landing's advance (A-133): the overlay's base plane, if a fresh (non-overlay) volume is
+  /// gaining one. The per-entry advance ([`Overlay::land_advance_one`]) and its end ([`Overlay::land_advance_end`])
+  /// follow, so a large landing's O(entries) advance is sliced across the shard's steps rather than held in one.
+  pub fn land_advance_begin(
+    &mut self,
+    store: &mut Store,
+    base: Option<BaseConfig>,
+  ) -> Result<(), VfsError> {
+    if self.vol.base.is_none() {
+      let base = base.ok_or(VfsError::NotOverlay)?;
+      let root = self.vol.root();
+      store.dirs.get_mut(root)?.base = BaseDirState::Merged;
+      let root_no = store.dirs.get(root)?.inode;
+      self.vol.base = Some(BasePlane::new(base, root_no));
+    }
+    Ok(())
+  }
+
+  /// One entry of a landing's advance (A-133): the overlay surgery for a single landed path — pure in-memory, no
+  /// durable op, so a crash before the completion commits rebuilds the un-advanced overlay and the resume re-lands.
+  /// Each entry is independent, re-evaluated against the current head, so slicing the loop across the shard's steps
+  /// is equivalent to one call ([`Overlay::land_advance`]).
+  pub fn land_advance_one(
+    &mut self,
+    store: &mut Store,
+    entry: &Landed,
+    source: Option<SnapshotId>,
+  ) -> Result<(), VfsError> {
+    match source {
+      None => self.forget_landed(store, &entry.path),
+      Some(id) => self.advance_from_snapshot(store, id, entry),
+    }
+  }
+
+  /// The one-time end of a landing's advance (A-133): every base listing is now stale, since the landing changed the
+  /// directories beneath, so each is re-read from the disk on its next access.
+  pub fn land_advance_end(&mut self) {
+    if let Some(plane) = self.vol.base.as_mut() {
+      for l in plane.listings.values_mut() {
+        l.entries = None;
+      }
+    }
+  }
+
+  /// One path a landing of snapshot `id` advanced, applied to the head by how the head's entry there
+  /// compares with the snapshot's.
+  fn advance_from_snapshot(
+    &mut self,
+    store: &mut Store,
+    id: SnapshotId,
+    landed: &Landed,
+  ) -> Result<(), VfsError> {
+    match self.head_against_snapshot(store, id, &landed.path)? {
+      Since::Unchanged => self.forget_landed(store, &landed.path),
+      Since::ChangedFile { no, dir, name } => match landed.written {
+        Some(written) => self.rebase_file(store, no, dir, &name, written),
+        None => Ok(()),
+      },
+      Since::Deleted { dir, name } => {
+        if let Some(written) = landed.written {
+          let at = self.vol.witness_clock();
+          if let Some(plane) = self.vol.base.as_mut() {
+            plane.record_whiteout(dir, &name, written.fingerprint, at);
+          }
+        }
+        Ok(())
+      }
+      Since::Other => Ok(()),
+    }
+  }
+
+  /// How the head's entry at `path` compares with snapshot `id`'s.
+  fn head_against_snapshot(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    path: &str,
+  ) -> Result<Since, VfsError> {
+    let (dir_path, name) = match path.rfind('/') {
+      Some(0) => ("/", path.get(1..).unwrap_or_default()),
+      Some(i) => (
+        path.get(..i).unwrap_or_default(),
+        path.get(i.saturating_add(1)..).unwrap_or_default(),
+      ),
+      None => ("/", path),
+    };
+    let policy = self.vol.policy;
+    let then = match self.vol.resolve_in(store, id, dir_path)?.child {
+      Child::Dir(h) => store
+        .dirs
+        .get(h)?
+        .lookup(&store.blocks, policy, name)
+        .map(|e| e.child),
+      _ => None,
+    };
+    let Ok(Located {
+      child: Child::Dir(head_dir),
+      ..
+    }) = self.vol.resolve(store, dir_path)
+    else {
+      return Ok(Since::Other);
+    };
+    let head_dir = self.vol.head_dir(store, head_dir)?;
+    let dir_no = store.dirs.get(head_dir)?.inode;
+    let now = store
+      .dirs
+      .get(head_dir)?
+      .lookup(&store.blocks, policy, name)
+      .map(|e| e.child);
+    Ok(match (then, now) {
+      (
+        Some(Child::File(a) | Child::Symlink(a) | Child::Fifo(a) | Child::Socket(a)),
+        Some(Child::File(b) | Child::Symlink(b) | Child::Fifo(b) | Child::Socket(b)),
+      ) if a == b
+        && self.vol.inode_in(store, id, a)?.version == self.vol.inode(store, b)?.version =>
+      {
+        Since::Unchanged
+      }
+      (Some(Child::Whiteout), Some(Child::Whiteout)) => Since::Unchanged,
+      (Some(Child::Dir(x)), Some(Child::Dir(y)))
+        if store.dirs.get(x)?.inode == store.dirs.get(y)?.inode =>
+      {
+        Since::Unchanged
+      }
+      (Some(Child::File(_)), Some(Child::File(no))) => Since::ChangedFile {
+        no,
+        dir: dir_no,
+        name: name.into(),
+      },
+      (Some(Child::File(_)), Some(Child::Whiteout)) => Since::Deleted {
+        dir: dir_no,
+        name: name.into(),
+      },
+      _ => Since::Other,
+    })
+  }
+
+  /// A head file changed since the landed snapshot, rebased onto what landed: its witness becomes the
+  /// landed file, at the landed name. A file whose body still reads base ranges from the disk keeps its
+  /// witness (its unpinned bytes are the old base's, which the landed file may not hold): a later landing's
+  /// verdict decides it.
+  fn rebase_file(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    dir: InodeNo,
+    name: &str,
+    written: Witness,
+  ) -> Result<(), VfsError> {
+    if matches!(self.vol.inode(store, no)?.body, Body::Base(_)) {
+      return Ok(());
+    }
+    let at = self.vol.witness_clock();
+    let Some(plane) = self.vol.base.as_mut() else {
+      return Ok(());
+    };
+    if plane.forget_digest(store, no) {
+      plane.digest_stats.invalidated = plane.digest_stats.invalidated.saturating_add(1);
+    }
+    plane.record_witness(no, written, Some((dir, name.into())), at);
+    if plane.drift.remove(&no).is_some() {
+      plane.drift_writes = plane.drift_writes.saturating_add(1);
+    }
+    if let Some(stale) = plane.descriptors.remove(&no) {
+      self.host.close_file(stale);
+    }
+    Ok(())
+  }
+
+  /// One landed path leaves the overlay.
+  fn forget_landed(&mut self, store: &mut Store, path: &str) -> Result<(), VfsError> {
+    let (dir_path, name) = match path.rsplit_once('/') {
+      Some(("", name)) => ("/", name),
+      Some((dir_path, name)) => (dir_path, name),
+      None => ("/", path),
+    };
+    let Ok(dir_located) = self.vol.resolve(store, dir_path) else {
+      return Ok(());
+    };
+    let Child::Dir(dir) = dir_located.child else {
+      return Ok(());
+    };
+    let dir = self.vol.head_dir(store, dir)?;
+    let dir_no = store.dirs.get(dir)?.inode;
+    let Some(entry) = store
+      .dirs
+      .get(dir)?
+      .lookup(&store.blocks, self.vol.policy, name)
+    else {
+      return Ok(());
+    };
+    match entry.child {
+      Child::Whiteout => {
+        // The base no longer has the name: nothing to hide.
+        self.drop_entry(store, dir, name)?;
+        let at = self.vol.witness_clock();
+        if let Some(plane) = self.vol.base.as_mut() {
+          plane.forget_whiteout(dir_no, name, at);
+        }
+      }
+      Child::Dir(h) => {
+        let h = self.vol.make_current_dir_node(store, h)?;
+        let node = store.dirs.get_mut(h)?;
+        node.origin = None;
+        node.base = BaseDirState::Merged;
+        let no = node.inode;
+        let at = self.vol.witness_clock();
+        if let Some(plane) = self.vol.base.as_mut() {
+          plane.forget_redirect(no, at);
+          plane.forget_whiteout(dir_no, name, at);
+          // The directory is on the disk now: its listing is read from there.
+          if !plane.listings.contains_key(&no)
+            && let Some(parent) = plane.listings.get(&dir_no).map(|l| l.dir)
+            && let Ok(opened) = self.host.open_dir(parent, name)
+          {
+            let mut source = plane
+              .listings
+              .get(&dir_no)
+              .ok_or(VfsError::RecoveryIncomplete)?
+              .source
+              .clone();
+            source.push(name.to_owned());
+            plane.listings.insert(
+              no,
+              Listing {
+                dir: opened,
+                source,
+                fingerprint: None,
+                entries: None,
+                read_at_ns: 0,
+                watch: WatchState::Unavailable,
+                restored: false,
+              },
+            );
+          }
+        }
+      }
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+        // The disk holds the bytes: the entry leaves the overlay. The next lookup reloads it
+        // from the listing as an untouched base entry, and its cached bytes go with it — retained
+        // (§4.2) when a snapshot still pins them, secured before anything changes.
+        let retention = self.vol.retention_of_drop(store, no)?;
+        self.vol.secure_retention(store, retention)?;
+        if let Some(f) = self.vol.base_forget(store, no) {
+          self.host.close_file(f);
+        }
+        let dropped = self
+          .drop_entry(store, dir, name)
+          .and_then(|()| self.vol.drop_link(store, no));
+        self.vol.settle_retention(store);
+        dropped?;
+      }
+    }
+    Ok(())
+  }
+
+  /// Removes an entry from a node without a whiteout or a journal record.
+  fn drop_entry(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let d = self.vol.make_current_dir(store, dir)?;
+    let mut retired = crate::dirtree::Retired::new();
+    let epoch = self.vol.epoch;
+    let policy = self.vol.policy;
+    let cutover = store.dir_cutover;
+    let _ = store.dirs.get_mut(d)?.remove(
+      &mut store.blocks,
+      epoch,
+      &mut retired,
+      policy,
+      name,
+      cutover,
+    )?;
+    self.vol.retire_blocks(store, retired)
+  }
+
+  // ---------------------------------------------------------------- verbs
+
+  /// `read_base`: the entry as the disk holds it right now, through the base's directories by
+  /// name; a read, never a write.
+  pub fn read_base(&mut self, path: &str) -> Result<Vec<u8>, VfsError> {
+    let root = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?.root;
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let Some((name, dirs)) = parts.split_last() else {
+      return Err(VfsError::IsDirectory);
+    };
+    let mut opened = Vec::new();
+    let mut dir = root;
+    let result = (|| {
+      for d in dirs {
+        dir = self.host.open_dir(dir, d).map_err(host_refusal)?;
+        opened.push(dir);
+      }
+      let file = self.host.open_file(dir, name).map_err(host_refusal)?;
+      let fp = self.host.fstat(file).map_err(host_refusal);
+      let bytes = fp.and_then(|fp| self.read_whole(file, fp.size));
+      self.host.close_file(file);
+      bytes
+    })();
+    for d in opened {
+      self.host.close_dir(d);
+    }
+    result
+  }
+
+  /// `rewitness`: re-witness the named drifted entries (all drifted when none are named) to
+  /// the disk as it is now; the volume's content is untouched; their drift records clear.
+  ///
+  /// A large entry's unpinned bytes are then read from the disk's file as it is now, so they can change beneath its
+  /// Shards backings (Shards part 3, step 4). A backing a guest maps only to read is refilled. One it maps to write
+  /// holds stores not yet written back, which a refill would lose and the next write-back would take the old bytes
+  /// around for. So while any named entry has such a backing, the whole call is refused `DaxMapped`, before anything
+  /// changes.
+  pub fn rewitness(
+    &mut self,
+    store: &mut Store,
+    paths: Option<&[String]>,
+  ) -> Result<Vec<String>, VfsError> {
+    let targets: Vec<InodeNo> = match paths {
+      Some(paths) => {
+        let mut v = Vec::new();
+        for p in paths {
+          v.push(self.resolve(store, p)?.inode);
+        }
+        v
+      }
+      None => self
+        .vol
+        .base
+        .as_ref()
+        .map(|b| b.drift.keys().copied().collect())
+        .unwrap_or_default(),
+    };
+    if targets
+      .iter()
+      .any(|no| store.shards_backings.mapped_writable(self.vol.prefix, *no))
+    {
+      return Err(VfsError::DaxMapped);
+    }
+    let mut done = Vec::new();
+    for no in targets {
+      if let Some(f) = self.plane()?.descriptors.remove(&no) {
+        self.host.close_file(f);
+      }
+      let (dir, name) = self.home_of(store, no)?;
+      let file = self.host.open_file(dir, &name).map_err(host_refusal)?;
+      let fp = self.host.fstat(file).map_err(host_refusal)?;
+      // The racy rule as at a copy-up (§4.5, A-162): the host's clock after this `fstat` says whether the file's tick is
+      // still open, and a later edit inside it could leave the fingerprint unchanged. Until 2026-10-24 every re-witness
+      // was recorded not racy, and such an edit went unseen.
+      let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+      let racy = self.host.now_ns().saturating_sub(fp.mtime_ns) <= granularity;
+      let bytes = self.read_whole(file, fp.size)?;
+      let witness = Witness {
+        fingerprint: fp,
+        identity: *blake3::hash(&bytes).as_bytes(),
+        witnessed_at: self.vol.clock.monotonic_ns(),
+        racy,
+      };
+      let at = self.vol.witness_clock();
+      let plane = self.plane()?;
+      plane.record_witness(no, witness, None, at);
+      if plane.drift.remove(&no).is_some() {
+        plane.drift_writes = plane.drift_writes.saturating_add(1);
+      }
+      let handle = self.vol.make_current_inode(store, no)?;
+      let prev = store.inodes.get(handle)?.version;
+      let keep_descriptor = if let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body {
+        b.witness = Some(Box::new(witness));
+        b.lost = false;
+        b.base_len = fp.size;
+        true
+      } else {
+        false
+      };
+      if keep_descriptor {
+        self.plane()?.descriptors.insert(no, file);
+        store.shards_backings.mark_stale(self.vol.prefix, no);
+      } else {
+        self.host.close_file(file);
+      }
+      let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+      self.vol.record(
+        &mut store.metadata,
+        Op::Witness,
+        path.as_str(),
+        Some(no),
+        prev,
+      );
+      done.push(path);
+    }
+    Ok(done)
+  }
+
+  /// `pin`: read the named subtrees (the whole base when none are named) into the store and
+  /// witness them; cost proportional to what is pinned, reported as the entry count. The whole walk at once, by
+  /// [`Overlay::pin_unit`] to its end; a daemon steps the same walk a slice at a time instead (§4.3).
+  pub fn pin(&mut self, store: &mut Store, paths: Option<&[String]>) -> Result<usize, VfsError> {
+    let mut walk = PinWalk::new(paths);
+    loop {
+      if let Some(pinned) = self.pin_unit(store, &mut walk)? {
+        return Ok(pinned);
+      }
+    }
+  }
+
+  /// One unit of a pin's walk: a file of a listed directory pinned (copied up whole and witnessed), else the next
+  /// directory listed (its files queued, its subdirectories queued by path). `Some(pinned)` once nothing is left. A
+  /// unit's work is one file or one listing, never a subtree, so a caller bounding its slices against the clock
+  /// overruns by one unit at most. The walk holds no handle between units: a directory is resolved again by its path
+  /// when its turn comes, so one copied on write by another verb between two slices is read as it now stands, and a
+  /// file by its inode number.
+  pub fn pin_unit(
+    &mut self,
+    store: &mut Store,
+    walk: &mut PinWalk,
+  ) -> Result<Option<usize>, VfsError> {
+    if let Some(no) = walk.files.pop() {
+      self.copy_up(store, no, CopyUp::Content)?;
+      let size = self.vol.inode(store, no)?.attrs.size;
+      self.pin_windows(store, no, 0, size)?;
+      walk.pinned = walk.pinned.saturating_add(1);
+      return Ok(None);
+    }
+    let Some(path) = walk.dirs.pop() else {
+      return Ok(Some(walk.pinned));
+    };
+    match self.resolve(store, &path)?.child {
+      Child::Dir(handle) => {
+        let rows: Vec<(Kind, InodeNo, String)> = self
+          .readdir(store, handle)?
+          .iter()
+          .map(|row| (row.kind, row.inode, row.name.to_owned()))
+          .collect();
+        for (kind, no, name) in rows {
+          match kind {
+            Kind::Dir => walk.dirs.push(child_path(&path, &name)),
+            Kind::File => walk.files.push(no),
+            Kind::Symlink | Kind::Fifo | Kind::Socket => {}
+          }
+        }
+      }
+      Child::File(no) => walk.files.push(no),
+      Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
+    }
+    Ok(None)
+  }
+
+  // ------------------------------------------------- metadata copy-ups and by-inode verbs
+
+  /// A read-only open of an untouched base file is answered from the daemon's descriptor on the
+  /// backing file (§4.6 "Base files"): the descriptor is opened now, through the entry's home,
+  /// so it keeps the inode's data alive if the name is unlinked or renamed over while the file is
+  /// open — unlink-while-open on a base file serves the bytes the opener saw, never `ENOENT`.
+  /// A witnessed, copied-up or non-base inode needs nothing here.
+  pub fn open_base(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let untouched = matches!(self.vol.inode(store, no)?.body, Body::Base(_))
+      && !self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    if !untouched {
+      return Ok(());
+    }
+    self.descriptor(store, no).map(|_| ())
+  }
+
+  /// `chown` with a metadata-only copy-up: the witness is recorded and nothing is pinned (§4.5
+  /// "Metadata-only changes copy up the witness and pin nothing"), so the landing has the base
+  /// the ownership change was made against.
+  pub fn chown(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    uid: u32,
+    gid: u32,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.chown(store, no, uid, gid)
+  }
+
+  /// `set_times` with a metadata-only copy-up (the same rule as [`Overlay::chown`]).
+  pub fn set_times(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+    btime: Option<i64>,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.set_times(store, no, atime, mtime, ctime, btime)
+  }
+
+  /// The by-inode-number forms of the base-aware namespace verbs, for the bridge (which speaks
+  /// inode numbers, not handles — the same shape as the plain `Volume::*_no` wrappers). Every
+  /// metadata mutation of a merged directory goes through these, never the plain verbs, so a
+  /// base name gets its whiteout (with the listing reloaded first), a base entry gets its witness,
+  /// and a name the base holds is refused (§4.6 "Base lookups and metadata mutations go through the
+  /// same overlay rules as reads and writes"; AC-1.17).
+  pub fn create_file_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.entry_dir(store, dir_no)?;
+    self.create_file(store, dir, name, mode)
+  }
+
+  /// `mkdir` by inode number; the new directory's inode number (see [`Overlay::create_file_no`]).
+  pub fn mkdir_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.entry_dir(store, dir_no)?;
+    let handle = self.mkdir(store, dir, name, mode)?;
+    Ok(store.dirs.get(handle)?.inode)
+  }
+
+  /// `symlink` by inode number (see [`Overlay::create_file_no`]).
+  pub fn symlink_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    target: &str,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.entry_dir(store, dir_no)?;
+    self.symlink(store, dir, name, target)
+  }
+
+  /// `link` by inode number (see [`Overlay::create_file_no`]).
+  pub fn link_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    target: InodeNo,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.entry_dir(store, dir_no)?;
+    self.link(store, dir, name, target)
+  }
+
+  /// `unlink` by inode number (see [`Overlay::create_file_no`]).
+  pub fn unlink_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.unlink(store, dir, name)
+  }
+
+  /// `rmdir` by inode number (see [`Overlay::create_file_no`]).
+  pub fn rmdir_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.rmdir(store, dir, name)
+  }
+
+  /// `rename` by inode numbers (see [`Overlay::create_file_no`]).
+  pub fn rename_no(
+    &mut self,
+    store: &mut Store,
+    from_dir_no: InodeNo,
+    from_name: &str,
+    to_dir_no: InodeNo,
+    to_name: &str,
+  ) -> Result<(), VfsError> {
+    let from = self.vol.current_dir(store, from_dir_no)?;
+    let to = self.vol.entry_dir(store, to_dir_no)?;
+    self.rename(store, from, from_name, to, to_name)
+  }
+
+  // ---------------------------------------------------------------- kernel coherence
+
+  /// The directories a watcher hint invalidated since hint sequence `since`, with the live
+  /// entries beneath them, for a transport to expire from its kernel's cache before the daemon
+  /// answers another request (§4.6). Hints are drained first ([`Overlay::process_hints`]). Only
+  /// entries the kernel can hold are listed: the materialized untouched files and symlinks and
+  /// the merged subdirectories of each hinted directory — bounded by what the volume has loaded,
+  /// never the base's whole tree. The caller keeps `since` and advances it to
+  /// [`BasePlane::hint_seq`] once delivered; the marks stay for other transports.
+  pub fn take_stale_base_entries(
+    &mut self,
+    store: &mut Store,
+    since: u64,
+  ) -> Result<StaleBaseEntries, VfsError> {
+    self.process_hints(store)?;
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+    let dirs: Vec<InodeNo> = plane
+      .stale_since
+      .iter()
+      .filter(|(_, seq)| **seq > since)
+      .map(|(no, _)| *no)
+      .collect();
+    let mut stale = StaleBaseEntries::default();
+    for dir_no in dirs {
+      let Ok(dir) = self.vol.current_dir(store, dir_no) else {
+        continue;
+      };
+      stale.dirs.push(dir_no);
+      for entry in store.dirs.get(dir)?.iter(&store.blocks) {
+        let child = match entry.child {
+          Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no)
+            if self.unloaded_file(store, no) =>
+          {
+            no
+          }
+          Child::Dir(handle) => match store.dirs.get(handle) {
+            Ok(node) if node.base == BaseDirState::Merged => node.inode,
+            _ => continue,
+          },
+          _ => continue,
+        };
+        stale.entries.push(StaleBaseEntry {
+          dir: dir_no,
+          name: entry.name.into(),
+          child,
+        });
+      }
+    }
+    Ok(stale)
+  }
+}

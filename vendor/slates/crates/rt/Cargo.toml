@@ -1,0 +1,42 @@
+[package]
+name = "slates-rt"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Runtime: thread-per-core executor with arena tasks, Copy wakers, an intrusive run queue, a hierarchical timing wheel, per-shard rings, OS drivers behind one completion seam, and a deterministic simulation driver (design §4.3, D-7, D-9)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-mem = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+rustix = { workspace = true }
+
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+# loom builds only under `RUSTFLAGS="--cfg loom"` for the parking protocol's interleaving model
+# (AC-0.7); the memory crate's rings swap to loom's atomics under the same flag.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[dev-dependencies]
+iai-callgrind = { workspace = true }
+
+# Only the instruction-count command builds Valgrind's client-request bindings. Ordinary
+# tests and Miri must not acquire a C binding-generator dependency from a benchmark.
+[features]
+instruction-counts = ["iai-callgrind/client_requests"]
+
+[[bench]]
+name = "callgrind"
+harness = false
+required-features = ["instruction-counts"]
+
+[lints]
+workspace = true

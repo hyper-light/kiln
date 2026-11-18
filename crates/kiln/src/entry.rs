@@ -543,6 +543,13 @@ pub fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some(kiln::runner::firecracker::CALL_ARG) {
         return kiln::runner::firecracker::call_main(std::env::args_os().nth(2));
     }
+    // Slates' anchor and daemon (docs/agentic.md, W1): kiln carries Slates as a library and is its
+    // own Slates executable, so an instance's processes are this binary in Slates' roles
+    // (`kiln slates-role --instance <name> anchor`), run by Slates' own main and runtime.
+    if std::env::args_os().nth(1).is_some_and(|a| a == kiln::workspace::slates::ROLE_ARG) {
+        let args: Vec<String> = std::env::args_os().skip(2).map(|a| a.to_string_lossy().into_owned()).collect();
+        return kiln::workspace::slates::role_main(&args);
+    }
     // A headroom pacer's guard (docs/headroom.md, "Failing safe"): a small process of its own that
     // starts again what its pacer stopped once the pacer ends, however it ends; it needs no runtime.
     if std::env::args_os().nth(1).is_some_and(|a| a == kiln::headroom::GUARD_ARG) {

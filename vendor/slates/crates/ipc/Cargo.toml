@@ -1,0 +1,45 @@
+[package]
+name = "slates-ipc"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Local IPC: shared-memory command and completion rings per client, the wake word per OS, the rendezvous that creates no filesystem entry, peer authentication, the completion fd (design §4.7, D-10; Phase 2 task 3)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-mem = { workspace = true }
+slates-wire = { workspace = true }
+# The attestation proof a consumer presents (`delivery::attest_proof`, §4.13): a keyed BLAKE3 over the
+# channel's client id under the delivered capability. Its backend follows `slates-machine`'s
+# (`pure-hash` forwards the pure-Rust one for a Windows cross-lint from a host without MSVC).
+blake3 = { workspace = true }
+
+# loom builds only under `RUSTFLAGS="--cfg loom"` for the doorbell protocol's interleaving model
+# (`doorbell.rs`, AC-0.7), as the runtime's parking protocol is modeled.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+libc = { workspace = true }
+
+# The Shards stream's socket route (`route`, A-161): its exchange is keyed by HKDF-SHA256 from a single-use secret and
+# sealed with AES-256-GCM, from the one crypto library. macOS only, the one platform that needs the route, so the crate
+# keeps no C dependency on the targets it is cross-linted for.
+[target.'cfg(target_os = "macos")'.dependencies]
+aws-lc-rs = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+# Test-only: the completion-bridge test polls the loopback socket for readiness with `WSAPoll`, which
+# needs the WinSock binding the lib itself does not use (the lib's socket is std's `TcpStream`). A
+# dev-dependency keeps it out of the lib build and off downstream crates.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+
+[lints]
+workspace = true
