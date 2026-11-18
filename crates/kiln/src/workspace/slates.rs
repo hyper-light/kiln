@@ -910,11 +910,13 @@ pub fn outcome_json(o: &LandOutcome) -> Value {
 
 /// A presentation as kiln's plan shows it (`agents.land` with no manifest): the plan an approval
 /// binds (its manifest, what it writes), the conflicts that hold it back with no manifest to
-/// approve, how it went when nothing needed an approval, or the policy's refusal.
+/// approve (their paths, which the UI lists, and each typed in `conflicted`, which the server
+/// answers as the landing's outcome), how it went when nothing needed an approval, or the policy's
+/// refusal.
 fn plan_json(o: &LandOutcome) -> Value {
     match o {
         LandOutcome::ApprovalRequired(a) => json!({"grant_required": true, "landing": a.presentation, "manifest": a.manifest_text(), "summary": summary_json(&a.summary), "conflicts": []}),
-        LandOutcome::Conflicted(conflicts) => json!({"grant_required": true, "conflicts": conflicts.iter().map(|c| c.path.clone()).collect::<Vec<_>>()}),
+        LandOutcome::Conflicted(conflicts) => json!({"grant_required": true, "conflicts": conflicts.iter().map(|c| c.path.clone()).collect::<Vec<_>>(), "conflicted": conflicts_json(conflicts)}),
         LandOutcome::Written(report) => json!({"grant_required": false, "outcome": report_json(report)}),
         LandOutcome::Refused(refusal) => json!({"grant_required": true, "refused": refusal_json(refusal)}),
     }
@@ -1052,6 +1054,19 @@ mod tests {
         let max = volume_max();
         assert_eq!(max % (1 << 30), 0, "whole GiB: {max}");
         assert!((1..=MAX_VOLUME_GIB).contains(&(max >> 30)), "{max}");
+    }
+
+    /// W6: a plan that met conflicts carries each conflict typed (`conflicted`: its path and class, as `outcome_json`
+    /// names them), beside the paths the UI reads (`conflicts`), and no manifest: the server answers it `conflicted`
+    /// from these (`harness::ops::typed_landing`), never as an approval nobody could give.
+    #[test]
+    fn w6_a_plan_that_met_conflicts_carries_each_typed_and_no_manifest() {
+        let met = LandOutcome::Conflicted(vec![LandingConflict { path: "/README.md".into(), class: slates_api::ConflictClass::ModifyModify, planned: None }]);
+        let plan = plan_json(&met);
+        assert_eq!(plan.get("conflicts"), Some(&json!(["/README.md"])), "{plan}");
+        assert_eq!(plan.get("conflicted"), Some(&json!([{"path": "/README.md", "class": "ModifyModify"}])), "{plan}");
+        assert_eq!(plan.get("conflicted"), outcome_json(&met).get("conflicts"), "typed as a landing's own outcome types them");
+        assert!(plan.get("manifest").is_none(), "{plan}");
     }
 
     #[test]
