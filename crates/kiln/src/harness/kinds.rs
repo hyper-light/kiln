@@ -588,7 +588,8 @@ fn set_env(p: &mut Process, spec: &Spec) {
 /// [`set_env`], with `user` the machine's user's environment.
 fn set_env_over(p: &mut Process, spec: &Spec, user: &[(String, String)]) {
     let agentenv = spec.agentenv.as_ref();
-    if agentenv.is_some_and(|e| e.base == super::agentenv::Base::Clean) {
+    let clean = agentenv.is_some_and(|e| e.base == super::agentenv::Base::Clean);
+    if clean {
         // Nothing of the runner's own, nor the rest of its user's: only what a harness needs, as
         // its user has it.
         p.env_clear();
@@ -626,7 +627,9 @@ fn set_env_over(p: &mut Process, spec: &Spec, user: &[(String, String)]) {
     if let Some(path) = joined_path(search_path().as_deref(), users) {
         p.env("PATH", path);
     }
-    for (k, v) in &spec.env {
+    // The shell `kiln spawn` took the environment of is its user's side too: a clean base has none
+    // of it, only what its environment names (docs/agents.md, "Where they apply").
+    for (k, v) in spec.env.iter().filter(|_| !clean) {
         if !kilns(std::ffi::OsStr::new(k)) && !matches!(k.as_str(), "TERM" | "COLUMNS" | "LINES") {
             p.env(k, v);
         }
@@ -677,7 +680,7 @@ fn config_dir_over(spec: &Spec, user: &[(String, String)]) -> String {
     let dir = match from_agentenv {
         // Set by its environment, or taken away there: Claude Code's own default.
         Some(v) => v,
-        None => spec.env.iter().rev().find(|(k, _)| k == NAME).map(|(_, v)| v.clone()).or_else(|| user.iter().rev().find(|(k, _)| k == NAME && !clean).map(|(_, v)| v.clone())),
+        None => spec.env.iter().rev().chain(user.iter().rev()).find(|(k, _)| k == NAME && !clean).map(|(_, v)| v.clone()),
     };
     dir.filter(|d| !d.trim().is_empty()).unwrap_or_else(|| crate::os::home_dir().join(".claude").to_string_lossy().into_owned())
 }
@@ -1746,7 +1749,8 @@ mod tests {
     #[test]
     fn a_clean_environment_gives_a_harness_only_what_it_needs() -> anyhow::Result<()> {
         use super::super::agentenv::{Base, Set};
-        let spec = Spec { kind: "claude".into(), agentenv: Some(agentenv(Base::Clean, vec![("ADDED", Set::Value("a".into()))])), ..Spec::default() };
+        // `env`: the shell `kiln spawn` took the environment of, its user's side too.
+        let spec = Spec { kind: "claude".into(), env: pairs(&[("SPAWN_SHELLS", "y")]), agentenv: Some(agentenv(Base::Clean, vec![("ADDED", Set::Value("a".into()))])), ..Spec::default() };
         let user = pairs(&[("HOME", "/home/clean"), ("LANG", "C.UTF-8"), ("PATH", "/usr/bin:/bin"), ("USERS_OWN", "x")]);
         let mut p = Process::new("/usr/bin/env");
         set_env_over(&mut p, &spec, &user);
@@ -1756,7 +1760,7 @@ mod tests {
         for k in ["HOME", "LANG", "PATH", "ADDED"] {
             anyhow::ensure!(names.contains(&k), "{k} missing: {names:?}");
         }
-        anyhow::ensure!(!names.iter().any(|k| *k == "USERS_OWN" || k.starts_with("CARGO")), "more than it needs: {names:?}");
+        anyhow::ensure!(!names.iter().any(|k| *k == "USERS_OWN" || *k == "SPAWN_SHELLS" || k.starts_with("CARGO")), "more than it needs: {names:?}");
         Ok(())
     }
 

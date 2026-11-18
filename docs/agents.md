@@ -209,7 +209,13 @@ than their case or are refused there). `from`:
 
 A session's environment, top wins: kiln's own (`KILN_AGENT`, its sockets; `KILN_*` from nowhere
 else, above), the environment's variables, the shell `kiln spawn` took the environment of, the base,
-the runner's own. The search path is the machine's as above unless the environment sets `PATH`.
+the runner's own. The search path is the machine's as above unless the environment sets `PATH`. A
+`clean` base takes nothing of its user's side, the shell `kiln spawn` took included: only what its
+environment names over what a harness needs.
+
+An agent another agent starts, and a branch, runs with its parent's environment unless its start
+names one. A runner keeps a session's environment in its memory alone: after the runner starts
+again, hands its sessions to a newer process, or a session moves, the server sends it again.
 
 A session in a microVM takes an environment's `machine` and `value` variables into its harness's
 member, as they are: nothing else of the machine's environment goes in (below), and its base is its
