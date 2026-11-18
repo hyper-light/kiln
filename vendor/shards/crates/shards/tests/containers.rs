@@ -8693,8 +8693,10 @@ fn a_logs_history_is_what_its_user_set() {
     );
     let shown = shards(&["configure", "disk"]);
     assert!(shown.stdout.contains("log-history         131072\n"), "{shown}");
-    // A file its user broke by hand: no run, until it is reset.
-    std::fs::write(home.join("disk"), "# by hand\nlog-history lots\n").unwrap();
+    // A file its user broke by hand, the one `shards` reads: its newest version, which on
+    // Windows `configure disk` lands beside the name (platform `write_in`). No run, until it
+    // is reset.
+    std::fs::write(common::newest(&home, "disk"), "# by hand\nlog-history lots\n").unwrap();
     let broken = shards(&["run", "--rm", "--pull", "never", &image, "exit", "0"]);
     assert_ne!(broken.status, Some(0), "{broken}");
     assert!(broken.stderr.contains("disk:2: "), "{broken}");
@@ -11376,7 +11378,16 @@ fn an_interrupted_save_leaves_nothing_behind() {
             });
         }
         let mut save = common::interruptible(&mut save).spawn().unwrap();
-        eventually(&home, "the save's temporary file", || !left().is_empty());
+        // The save's client among its party: it makes the file before it starts the home's
+        // daemon, none there before it, and a party of that daemon and this test's VM
+        // processes alone was gone 3.3 ms in, the file not yet made (CI 44205094460,
+        // windows-2022).
+        let mut patience = Patience::client(save.id(), &home);
+        while left().is_empty() {
+            assert!(patience.holds(), "the save's temporary file");
+            std::thread::sleep(patience.next_look());
+        }
+        patience.done();
         #[cfg(unix)]
         {
             // SAFETY: kill(2) of the client this test started.
@@ -12030,9 +12041,7 @@ fn stalling_registry() -> (
             let Ok(mut tcp) = tcp else { return };
             let (b, e) = (b.clone(), e.clone());
             std::thread::spawn(move || {
-                let mut first = [0u8; 1];
-                if tcp.peek(&mut first).is_ok_and(|n| n == 1) && first[0] == 0x16 {
-                    let _ = tcp.write_all(common::GO_BAD_REQUEST);
+                if common::answered_tls_as_go(&tcp) {
                     return;
                 }
                 loop {
@@ -12138,9 +12147,7 @@ fn pacing_registry(per: usize, layer: usize) -> (u16, std::sync::Arc<std::sync::
             let Ok(tcp) = tcp else { return };
             let (now, began) = (now.clone(), held.clone());
             std::thread::spawn(move || {
-                let mut first = [0u8; 1];
-                if tcp.peek(&mut first).is_ok_and(|n| n == 1) && first[0] == 0x16 {
-                    let _ = (&tcp).write_all(common::GO_BAD_REQUEST);
+                if common::answered_tls_as_go(&tcp) {
                     return;
                 }
                 let mut reader = BufReader::new(tcp.try_clone().unwrap());
@@ -13139,6 +13146,33 @@ fn a_volume_a_daemon_run_holds_is_cleared_only_once_it_stops() {
         assert!(!data(name).exists(), "{name}");
     }
     assert_eq!(shards(&["remove", "vm", "holder"]).status, Some(0));
+}
+
+/// D281: a volume is removed the moment the run that wrote it returns, as `docker run --rm -v
+/// NAME:/d …` then `docker volume rm NAME` remove one. On Windows the run's end waits for its VM
+/// process's, its share processes and its hold let go of first, which hold its files until then
+/// and NTFS renames no directory beneath (MS-FSA 2.1.4.2): before, CI 44189693085's
+/// windows-2025 removals after a run said "Access is denied. (os error 5)".
+#[test]
+fn a_volume_is_removed_once_the_run_that_wrote_it_returns() {
+    let Some((home, image)) = home("containers-volume-after") else {
+        return;
+    };
+    let shards = |args: &[&str]| shards_in(&home, args);
+    let wrote = run_in(
+        &home,
+        &image,
+        &["--rm", "-u", "0", "-v", "data:/d"],
+        &["fs", "write:/d/f=kept"],
+    );
+    assert_eq!(wrote.status, Some(0), "{wrote}");
+    let removed = shards(&["volume", "rm", "data"]);
+    assert_eq!(
+        (removed.status, removed.stdout.as_str()),
+        (Some(0), "data\n"),
+        "{removed}"
+    );
+    assert_eq!(shards(&["volume", "ls", "-q"]).stdout, "");
 }
 
 /// `--restart` (D39): `on-failure:N` restarts a failing

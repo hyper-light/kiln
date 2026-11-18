@@ -213,7 +213,7 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "85cecd75bb6d7b01520afd2ef9796e05fe770e8b"
+commit = "1799412f9b18598f548a92124da51a5a534a5114"
 path = "vendor/shards"
 take = [
   ".cargo",
@@ -267,7 +267,7 @@ own = ["UPSTREAM.md"]
 [projects.hex]
 kind = "git"
 repository = "https://github.com/hyper-light/hex"
-commit = "071934813d8bac85c2340f4b88be021bea989073"
+commit = "f6192bc9953c84e0092022cf767303eb51a41d9a"
 path = "vendor/hex"
 take = [
   "Cargo.toml",

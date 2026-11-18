@@ -1,0 +1,1210 @@
+Subject: shards-api, shards-ipc: an image run takes shares another server serves (D286, image channel 52)
+Why: kiln's microVM engine shares each agent's slates volume into its guest over slates' own virtio-fs device, a stream handed to Shards with no host mount between (kiln goal 01a1ec34599974448f6b7663ddb07001); upstream on Shards' branch agents/g265-kiln-shards-microvm-served-image-share (4ff40fc99 and 5376b406a on main 4776b2e56; e4e0118c8 and 74d1bc82f on this revision), which ROOT lands after Shards' v0.8.0 tag; dropped once Hex takes a Shards revision that holds it
+
+diff --git a/crates/api/src/image.rs b/crates/api/src/image.rs
+index 7535c206fb64f6e359d3dc5fad35ee6249986bc8..d8d49211d390d331d364ef3381a509595adf8112 100644
+--- a/crates/api/src/image.rs
++++ b/crates/api/src/image.rs
+@@ -215,6 +215,64 @@ pub struct ImageShare {
+     pub members: Option<PlugFor>,
+ }
+ 
++/// A share another server serves, which the guest sees at `at` (D286): the image run's form of a
++/// direct boot's `--slates-fs-fd`, as `slates shards VOLUME --fd N` hands one a slates volume. Its
++/// server answers the guest's FUSE requests on [`stream`](Self::stream), and the mappings of the
++/// share slot's DAX window where it has one (D189), as slates' does; nothing of the host is
++/// opened for it. It is put in a share slot of the run's microVM after its [`ImageShare`]s', and
++/// mounted and given members as one of those is. A run with one boots on a run host of its own,
++/// never a warm one ([`ImagePools`]): a warm host's share process starts before its run's streams
++/// come. A save of its run is refused ([`SaveRefusal::Unsupported`]): its server keeps the
++/// share's state, which a snapshot cannot hold.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ServedShare {
++    pub stream: ServedStream,
++    /// Where the guest sees it: absolute.
++    pub at: String,
++    pub read_only: bool,
++    /// Whether its files may be run from it (D279), as an [`ImageShare`]'s.
++    pub exec: bool,
++    /// The members given it as they start (D277), as an [`ImageShare`]'s.
++    pub members: Option<PlugFor>,
++}
++
++/// The stream a [`ServedShare`]'s server answers on: on Unix a connected stream socket, on
++/// Windows a duplex pipe's end (as `shards run vm --slates-fs-handle` takes one, PM M340). The
++/// run host is given its own copy as the run is asked for, and closes it as the run ends; the
++/// server sees the share end once every copy is closed, this one too, which its holder drops
++/// once the run has started or been refused. Equal to another where it is the same one, and
++/// shown by name alone.
++#[derive(Clone)]
++pub struct ServedStream(Arc<shards_ipc::fd::OwnedFd>);
++
++impl ServedStream {
++    /// `stream`, the served share's end, held from here on.
++    pub fn new(stream: shards_ipc::fd::OwnedFd) -> ServedStream {
++        ServedStream(Arc::new(stream))
++    }
++
++    /// The stream, borrowed: what an [`Images`] boot hands its run host a copy of, as `ImageShards` does with the
++    /// run's request.
++    pub fn as_fd(&self) -> shards_ipc::fd::BorrowedFd<'_> {
++        use shards_ipc::fd::AsFd as _;
++        self.0.as_fd()
++    }
++}
++
++impl std::fmt::Debug for ServedStream {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("ServedStream")
++    }
++}
++
++impl PartialEq for ServedStream {
++    fn eq(&self, other: &ServedStream) -> bool {
++        Arc::ptr_eq(&self.0, &other.0)
++    }
++}
++
++impl Eq for ServedStream {}
++
+ /// An image to boot.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct ImageSpec {
+@@ -311,6 +369,10 @@ pub struct ImageSpec {
+     /// is not internal): else refused. Empty: nothing past the image's grants. Part of what a
+     /// warm host is made for ([`ImagePools`]): its network process is held to it from its start.
+     pub egress_ceiling: Vec<MemberCeiling>,
++    /// Its shares another server serves (D286), each in a share slot after
++    /// [`shares`](Self::shares)', none at a place a share or another served share takes. Empty:
++    /// none. A run with any boots on a run host of its own ([`ServedShare`]).
++    pub served: Vec<ServedShare>,
+ }
+ 
+ /// Each member's ceiling past its microVM as its spec names them (D278): each member once,
+@@ -1301,6 +1363,46 @@ fn plug_roots(roots: &[String]) -> Result<Vec<String>, ImageRefusal> {
+     Ok(granted)
+ }
+ 
++/// Where a share is seen and whom it is given to as they start (D277), a served share's alike
++/// (D286), as its request carries them: refused by field where its place is not absolute, or its
++/// members name none or one twice.
++fn share_to(at: &str, members: Option<&PlugFor>) -> Result<Option<wire::ShareTo>, ImageRefusal> {
++    if !at.starts_with('/') {
++        return Err(ImageRefusal::Spec {
++            what: "a share",
++            why: format!("{at:?}: where the guest sees it is an absolute path"),
++        });
++    }
++    let named = match members {
++        None => return Ok(None),
++        Some(PlugFor::Every) => return Ok(Some(wire::ShareTo::Every)),
++        Some(PlugFor::Members(named)) => named,
++    };
++    let mut to: Vec<wire::ShareMember> = Vec::with_capacity(named.len());
++    for m in named {
++        let m = wire::ShareMember {
++            kind: m.kind,
++            name: m.name.clone(),
++        };
++        if to.contains(&m) {
++            return Err(ImageRefusal::Spec {
++                what: "a share's members",
++                why: format!("{at}: {:?} {} named twice", m.kind, m.name),
++            });
++        }
++        to.push(m);
++    }
++    if to.is_empty() {
++        return Err(ImageRefusal::Spec {
++            what: "a share's members",
++            why: format!(
++                "{at}: given to members it names none of; give it to one, or to none for the run's own root alone"
++            ),
++        });
++    }
++    Ok(Some(wire::ShareTo::Members(to)))
++}
++
+ /// `spec` as the run host reads it, refused here where it could never be run: a member's
+ /// terminal (owed, G24), a share's path that is no UTF-8 or is relative, a variable's key
+ /// that holds `=` or a NUL, an argument that holds a NUL, or a key or file the guest would
+@@ -1394,48 +1496,24 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
+                     s.host.display()
+                 ),
+             })?;
+-        if !s.at.starts_with('/') {
+-            return Err(ImageRefusal::Spec {
+-                what: "a share",
+-                why: format!("{:?}: where the guest sees it is an absolute path", s.at),
+-            });
+-        }
+-        let members = match &s.members {
+-            None => None,
+-            Some(PlugFor::Every) => Some(wire::ShareTo::Every),
+-            Some(PlugFor::Members(named)) => {
+-                let mut to: Vec<wire::ShareMember> = Vec::with_capacity(named.len());
+-                for m in named {
+-                    let m = wire::ShareMember {
+-                        kind: m.kind,
+-                        name: m.name.clone(),
+-                    };
+-                    if to.contains(&m) {
+-                        return Err(ImageRefusal::Spec {
+-                            what: "a share's members",
+-                            why: format!("{}: {:?} {} named twice", s.at, m.kind, m.name),
+-                        });
+-                    }
+-                    to.push(m);
+-                }
+-                if to.is_empty() {
+-                    return Err(ImageRefusal::Spec {
+-                        what: "a share's members",
+-                        why: format!(
+-                            "{}: given to members it names none of; give it to one, or to none for the run's own root alone",
+-                            s.at
+-                        ),
+-                    });
+-                }
+-                Some(wire::ShareTo::Members(to))
+-            }
+-        };
+         shares.push(wire::ShareAt {
+             host: host.into(),
+             at: s.at.clone(),
+             read_only: s.read_only,
+-            members,
++            members: share_to(&s.at, s.members.as_ref())?,
++            exec: s.exec,
++        });
++    }
++    // Its shares another server serves (D286): each one's place and members as a share's; its
++    // stream goes beside the request, never in it (`session::Begun::create`).
++    let mut served = Vec::with_capacity(spec.served.len());
++    for s in &spec.served {
++        served.push(wire::ServedAt {
++            at: s.at.clone(),
++            read_only: s.read_only,
+             exec: s.exec,
++            members: share_to(&s.at, s.members.as_ref())?,
++            handle: None,
+         });
+     }
+     // The instant it becomes is nanoseconds since the Unix epoch in a u64, as `ready-by=`
+@@ -1575,6 +1653,7 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
+         gpu_report: spec.gpu_report,
+         plug_roots: plug_roots(&spec.plug_roots)?,
+         egress_ceiling: ceilings(&spec.egress_ceiling)?,
++        served,
+     };
+     // Past the channel's bound it would never be read; the guest's bound is the same one.
+     request.encode().map_err(|e| ImageRefusal::Spec {
+@@ -1633,6 +1712,7 @@ mod tests {
+             upstream_roots: Vec::new(),
+             plug_roots: Vec::new(),
+             egress_ceiling: Vec::new(),
++            served: Vec::new(),
+             gpu_report: None,
+         }
+     }
+@@ -2067,6 +2147,76 @@ mod tests {
+         assert!(!request(&spec()).unwrap().members[0].input);
+     }
+ 
++    /// D286: a share another server serves rides its request by its place, modes and members
++    /// alone, its stream beside it, never in it. Do: give a spec two, the second read-only,
++    /// its files not to be run, given to its harness. Expect: each carried as asked, in order,
++    /// no handle named, the spec equal to its clone and to no spec of another stream. Do: one
++    /// at a relative place, and one given to its harness twice. Expect: each refused by
++    /// field, as a share's would be.
++    #[test]
++    fn a_served_share_rides_its_request_by_place_alone() {
++        let served = |at: &str, read_only, exec, members| ServedShare {
++            stream: ServedStream::new(std::io::pipe().unwrap().0.into()),
++            at: at.into(),
++            read_only,
++            exec,
++            members,
++        };
++        let mut s = spec();
++        s.served = vec![
++            served("/proj", false, true, None),
++            served(
++                "/data",
++                true,
++                false,
++                Some(PlugFor::Members(vec![MemberName::harness("codex")])),
++            ),
++        ];
++        assert_eq!(
++            request(&s).unwrap().served,
++            [
++                wire::ServedAt {
++                    at: "/proj".into(),
++                    read_only: false,
++                    exec: true,
++                    members: None,
++                    handle: None,
++                },
++                wire::ServedAt {
++                    at: "/data".into(),
++                    read_only: true,
++                    exec: false,
++                    members: Some(wire::ShareTo::Members(vec![wire::ShareMember {
++                        kind: MemberKind::Harness,
++                        name: "codex".into(),
++                    }])),
++                    handle: None,
++                },
++            ]
++        );
++        assert_eq!(s.clone(), s);
++        let mut other = s.clone();
++        other.served[0].stream = ServedStream::new(std::io::pipe().unwrap().0.into());
++        assert_ne!(other, s);
++        let refused = |s: &ImageSpec| match request(s) {
++            Err(ImageRefusal::Spec { what, .. }) => what,
++            other => panic!("{other:?}"),
++        };
++        let mut s = spec();
++        s.served = vec![served("proj", false, true, None)];
++        assert_eq!(refused(&s), "a share");
++        s.served = vec![served(
++            "/proj",
++            false,
++            true,
++            Some(PlugFor::Members(vec![
++                MemberName::harness("codex"),
++                MemberName::harness("codex"),
++            ])),
++        )];
++        assert_eq!(refused(&s), "a share's members");
++    }
++
+     /// D271: the plug roots a spec grants ride its request as granted, each a top-level
+     /// directory of the members' view; one that is relative, nested, one of init's own or
+     /// granted twice is refused by field before any run host starts, as the guest would refuse
+diff --git a/crates/api/src/image/pool.rs b/crates/api/src/image/pool.rs
+index 44102a4b671a7c7cdbe8fcf59a0254d8b294e3be..daad732531ba66212d500d474df62d9a37fbeb38 100644
+--- a/crates/api/src/image/pool.rs
++++ b/crates/api/src/image/pool.rs
+@@ -179,7 +179,10 @@ fn sized(request: &wire::Request) -> wire::Request {
+ }
+ 
+ fn pool_of(spec: &ImageSpec, request: &wire::Request) -> Result<Option<Of>, ImageRefusal> {
+-    if request.gpu_report.is_some() {
++    // A run asking its GPU report (D233), or with shares another server serves (D286), is no
++    // pool's: a warm host's VM process frames no report its run names later, and its share
++    // process starts before its run's streams come.
++    if request.gpu_report.is_some() || !request.served.is_empty() {
+         return Ok(None);
+     }
+     let request = sized(request);
+@@ -1956,6 +1959,7 @@ mod tests {
+             upstream_roots: Vec::new(),
+             plug_roots: Vec::new(),
+             egress_ceiling: Vec::new(),
++            served: Vec::new(),
+             gpu_report: None,
+         }
+     }
+@@ -1979,6 +1983,7 @@ mod tests {
+             upstream_roots: Vec::new(),
+             plug_roots: Vec::new(),
+             egress_ceiling: Vec::new(),
++            served: Vec::new(),
+             gpu_report: None,
+         }
+     }
+@@ -2177,6 +2182,38 @@ mod tests {
+         room.balanced();
+     }
+ 
++    /// D286 through D253's pools: a run with a share another server serves gets a host of its
++    /// own and starts no warm one, as a warm host's share process starts before its run's
++    /// streams come; the same run serving none is pooled as every run is.
++    #[test]
++    fn a_run_with_a_served_share_gets_a_host_of_its_own_and_no_pool() {
++        let (hosted, room) = (Hosted::default(), Room::fits(4));
++        let pools = Pooling::new(hosted.clone(), room.clone(), KEEP_TEST).unwrap();
++        let served = wire::Request {
++            served: vec![wire::ServedAt {
++                at: "/proj".into(),
++                read_only: false,
++                exec: true,
++                members: None,
++                handle: None,
++            }],
++            ..request(1, None)
++        };
++        let run = boot(&pools, &served);
++        let other = boot(&pools, &served);
++        assert_eq!(hosted.log().fresh, 2);
++        drop((run, other));
++        assert_eq!(hosted.log().begun, 0, "no warm host for a run that is no pool's");
++        assert!(pools.held().is_empty());
++        let pooled = boot(&pools, &request(1, None));
++        hosted.until("the run serving none warms its pool's host", |l| {
++            l.fresh == 3 && l.begun == 1
++        });
++        drop(pooled);
++        drop(pools);
++        room.balanced();
++    }
++
+     /// D253's room: a size a spec leaves to `shards run` (`0`) is the size `shards run` gives
+     /// it on this host, so its spec pools with the one that names that size, its warm host's
+     /// exemplar and its claim that size; and a run of it takes the other's warm host.
+diff --git a/crates/api/src/image/session.rs b/crates/api/src/image/session.rs
+index 80fdbc4c3fcc1a2576e429860fd9a3d165b65e5a..8f316580109560eb0617e7746aa4975bf9e20c46 100644
+--- a/crates/api/src/image/session.rs
++++ b/crates/api/src/image/session.rs
+@@ -1031,6 +1031,18 @@ pub(crate) struct Host {
+     pub(crate) said: Output,
+ }
+ 
++/// `served`'s streams sent on a run host's links socket `links` (D286): `SERVED_SHARES` messages
++/// of `shards_ipc::MAX_FDS` descriptors at most and no payload, in order, as its host takes them
++/// before its request.
++#[cfg(unix)]
++fn send_served(links: &std::os::unix::net::UnixStream, served: &[super::ServedShare]) -> io::Result<()> {
++    let fds: Vec<_> = served.iter().map(|s| s.stream.as_fd()).collect();
++    for batch in fds.chunks(shards_ipc::MAX_FDS) {
++        shards_ipc::send(links, shards_ipc::kind::SERVED_SHARES, &[], batch)?;
++    }
++    Ok(())
++}
++
+ /// The read end of a run host's answers' or diagnostics' pipe, as its reader waits on it
+ /// beside its watcher's word (`UntilGone`): on Unix, a pipe polled beside another; on
+ /// Windows, a named pipe's overlapped end, whose read an event cancels (std's anonymous
+@@ -1260,12 +1272,16 @@ impl Begun {
+     /// Sends the host the run `request` (`CREATE`), its leases' `lessor` (D242) and the
+     /// references its grants name set first, and its members whose stdin it asks for named,
+     /// for their flows to be made with its start (`take`): none of them can be asked of or
+-    /// answered sooner than the request.
++    /// answered sooner than the request. Its shares another server serves (D286) go first,
++    /// `served`'s streams in the request's order ([`Begun::hand_served`]).
+     pub(super) fn create(
+         &self,
+         lessor: Option<RunLessor>,
+         request: &wire::Request,
++        served: &[super::ServedShare],
+     ) -> Result<(), ImageRefusal> {
++        let handed = self.hand_served(request, served)?;
++        let request = handed.as_ref().unwrap_or(request);
+         *lock(&self.shared.lessor) = lessor;
+         *lock(&self.shared.granted) = request.credentials.iter().map(|g| g.reference.clone()).collect();
+         *lock(&self.shared.sign_ins) = request.sign_ins.clone();
+@@ -1282,6 +1298,59 @@ impl Begun {
+         self.send(wire::to_host::CREATE, request)
+     }
+ 
++    /// `served`, the streams of the run's shares another server serves (D286), handed to its
++    /// host before its request, one for each of `request`'s, in its order: on Unix on the host's
++    /// links socket (`SERVED_SHARES`, `shards_ipc::MAX_FDS` a message), whose copies its host
++    /// holds once sent, this process keeping its own until the run has started (M24: XNU flushes
++    /// a socket in flight that no process holds); on Windows each pipe duplicated into the host's
++    /// process, whose value the request then names (the request so made). A count that is not
++    /// the request's is refused by field.
++    fn hand_served(
++        &self,
++        request: &wire::Request,
++        served: &[super::ServedShare],
++    ) -> Result<Option<wire::Request>, ImageRefusal> {
++        if served.len() != request.served.len() {
++            return Err(ImageRefusal::Spec {
++                what: "the served shares",
++                why: format!(
++                    "{} streams for {} served shares",
++                    served.len(),
++                    request.served.len()
++                ),
++            });
++        }
++        if served.is_empty() {
++            return Ok(None);
++        }
++        let os = |e: io::Error| ImageRefusal::Os {
++            what: "a served share's stream",
++            kind: e.kind(),
++        };
++        #[cfg(unix)]
++        {
++            let links = self
++                .shared
++                .links
++                .as_ref()
++                .ok_or_else(|| ImageRefusal::Host("it holds no links socket".into()))?;
++            send_served(links, served).map_err(os)?;
++            Ok(None)
++        }
++        #[cfg(windows)]
++        {
++            let mut handed = request.clone();
++            for (at, share) in handed.served.iter_mut().zip(served) {
++                let value = self.host.give(share.stream.as_fd()).map_err(os)?;
++                at.handle = Some(u64::try_from(value).map_err(|_| ImageRefusal::Os {
++                    what: "a served share's stream",
++                    kind: io::ErrorKind::InvalidData,
++                })?);
++            }
++            Ok(Some(handed))
++        }
++    }
++
+     /// Sends the host `request`, as a run's (`create`) or a warm host's exemplar (`WARM`). A
+     /// send that meets the host's end (EPIPE or ECONNRESET: it exited, or closed its stdin,
+     /// before it took the request; or a stop took its channel) is that end, followed as the
+@@ -1347,6 +1416,7 @@ impl Begun {
+         mut self,
+         lessor: Option<RunLessor>,
+         request: &wire::Request,
++        served: &[super::ServedShare],
+         patience: Duration,
+         stop: &super::BootStop,
+     ) -> Result<Session, (ImageRefusal, bool)> {
+@@ -1370,7 +1440,7 @@ impl Begun {
+         // Registration precedes CREATE's potentially blocking write. A stop kills
+         // the reader independently of the writer mutex, unblocking this send.
+         shared.step(format_args!("its run's request sending"));
+-        let created = self.create(lessor, request);
++        let created = self.create(lessor, request, served);
+         shared.step(format_args!("its run's request sent"));
+         drop(self);
+         // Started, refused, or gone: whichever comes first, within the caller's patience. A
+@@ -1567,7 +1637,7 @@ impl super::pool::Hosts for ShardsHosts {
+         if lock(&warm.shared.state).exited || warm.host.has_ended() {
+             return Err(Taken::Untaken);
+         }
+-        match warm.started(spec.lessor.clone(), request, patience, stop) {
++        match warm.started(spec.lessor.clone(), request, &spec.served, patience, stop) {
+             Ok(session) => Ok(Box::new(session)),
+             Err((_, true)) => Err(Taken::Unfit),
+             Err((refused, false)) => Err(Taken::Refused(refused)),
+@@ -1715,7 +1785,7 @@ impl Session {
+     ) -> Result<Session, ImageRefusal> {
+         let begun = Begun::begin(spec.binary.as_deref(), &spec.env)?;
+         begun
+-            .started(spec.lessor.clone(), request, patience, stop)
++            .started(spec.lessor.clone(), request, &spec.served, patience, stop)
+             .map_err(|(refused, _)| refused)
+     }
+ 
+@@ -5792,6 +5862,7 @@ mod tests {
+             upstream_roots: Vec::new(),
+             plug_roots: Vec::new(),
+             egress_ceiling: Vec::new(),
++            served: Vec::new(),
+             gpu_report: None,
+             shares: Vec::new(),
+             nesting: false,
+@@ -6202,6 +6273,52 @@ mod tests {
+         assert_eq!(layer_files(&home), [others], "its run host's layer outlived it");
+     }
+ 
++    /// D286: a run's served shares' streams go on its host's links socket in their order,
++    /// `shards_ipc::MAX_FDS` a message at most and no payload, as its host takes them before
++    /// its request. Do: send one more than a message carries. Expect: two `SERVED_SHARES`
++    /// messages, the first full, each descriptor the very socket sent in its place (a byte
++    /// written to its peer read from it).
++    #[cfg(unix)]
++    #[test]
++    fn served_streams_go_on_the_links_socket_in_order_a_message_at_most_its_bound() {
++        use std::io::Write as _;
++        use std::os::unix::net::UnixStream;
++        let (links, host) = UnixStream::pair().unwrap();
++        let pairs: Vec<(UnixStream, UnixStream)> = (0..=shards_ipc::MAX_FDS)
++            .map(|_| UnixStream::pair().unwrap())
++            .collect();
++        let served: Vec<super::super::ServedShare> = pairs
++            .iter()
++            .enumerate()
++            .map(|(i, (ours, _))| super::super::ServedShare {
++                stream: super::super::ServedStream::new(ours.try_clone().unwrap().into()),
++                at: format!("/s{i}"),
++                read_only: false,
++                exec: true,
++                members: None,
++            })
++            .collect();
++        send_served(&links, &served).unwrap();
++        for (i, (_, peer)) in pairs.iter().enumerate() {
++            (&*peer).write_all(&[u8::try_from(i).unwrap()]).unwrap();
++        }
++        let mut sizes = Vec::new();
++        let mut read = Vec::new();
++        while read.len() < pairs.len() {
++            let message = shards_ipc::recv(&host).unwrap().unwrap();
++            assert_eq!(message.kind, shards_ipc::kind::SERVED_SHARES);
++            assert!(message.payload.is_empty());
++            sizes.push(message.fds.len());
++            for fd in message.fds {
++                let mut byte = [0u8; 1];
++                UnixStream::from(fd).read_exact(&mut byte).unwrap();
++                read.push(usize::from(byte[0]));
++            }
++        }
++        assert_eq!(sizes, [shards_ipc::MAX_FDS, 1]);
++        assert_eq!(read, (0..pairs.len()).collect::<Vec<_>>());
++    }
++
+     /// Do boot through a run host that makes a writable layer's file and exits before its run
+     /// starts, as one that fails or is killed does. Expect: the boot refused, its host gone,
+     /// and no file of the host's left in its home's `layers`, another host's kept.
+diff --git a/crates/api/src/image/wire.rs b/crates/api/src/image/wire.rs
+index 92b5d66781f5c828636cc4e56039b963ae5baaaa..6672b7a05fcbd97016ec8b6009749d5c365684cd 100644
+--- a/crates/api/src/image/wire.rs
++++ b/crates/api/src/image/wire.rs
+@@ -141,8 +141,13 @@ pub use shards_abi::run::nesting::Ready;
+ /// orchestrator made holding nowhere; 51, a run whose agent-control endpoint, or its members'
+ /// first stdio lanes, its run host's budget has no room for refused typed before its members
+ /// start ([`Cause::Capacity`], D252), so that a side that reads no such cause refuses the run as
+-/// it is asked, rather than its refusal breaking the channel.
+-pub const VERSION: u8 = 51;
++/// it is asked, rather than its refusal breaking the channel; 52, the run's shares another server
++/// serves ([`Request::served`], D286): each a stream its orchestrator hands the run host (on Unix
++/// on its links socket before the request, `shards_ipc::kind::SERVED_SHARES`; on Windows
++/// duplicated into its process, [`ServedAt::handle`]), put in a share slot of its microVM after
++/// its own shares', so that a side that serves none refuses the run as it is asked, rather than
++/// starting its members without the directory their orchestrator gave them.
++pub const VERSION: u8 = 52;
+ 
+ /// The run host's links socket's descriptor on Unix (version 50, D285 slice 4): the first past
+ /// its standard streams, given it as it starts with [`LINKS_ARG`] on its command line, on which
+@@ -662,6 +667,28 @@ pub struct ShareMember {
+     pub name: String,
+ }
+ 
++/// A share another server serves, which the guest sees at a path (D286): its stream comes beside
++/// the request, never in it, and is put in a share slot of the run's microVM after its own shares'
++/// (`shards{n + i}` where the run has n of those), as a direct boot's `--slates-fs-fd` is. The
++/// server answers the guest's FUSE requests, and a DAX window's mappings where the slot has one
++/// (D189), on it. Appended in version 52.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ServedAt {
++    /// Where the guest sees it: absolute.
++    pub at: String,
++    pub read_only: bool,
++    /// Whether its files may be run from it: where not, each mount of it is `noexec` (D279).
++    pub exec: bool,
++    /// The members given it too as they start, as a share's are ([`ShareAt::members`], D277).
++    pub members: Option<ShareTo>,
++    /// On Windows, its stream's handle in the run host's process, a duplex pipe its orchestrator
++    /// duplicated there (`shards_ipc::Child::give`), the run host's to own; none on Unix, where
++    /// the streams come on the run host's links socket ([`LINKS_FD`]) before the request, in the
++    /// request's order (`shards_ipc::kind::SERVED_SHARES`). Never part of a pool's exemplar
++    /// ([`Request::exemplar`]).
++    pub handle: Option<u64>,
++}
++
+ /// The run an orchestrator asks for.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Request {
+@@ -712,6 +739,9 @@ pub struct Request {
+     /// The most each member may be given past its image's grants as the run goes (D278), each
+     /// member once; empty, nothing past them. Appended in version 39.
+     pub egress_ceiling: Vec<MemberCeiling>,
++    /// Its shares another server serves (D286), in the order their streams come; empty for
++    /// none. Appended in version 52.
++    pub served: Vec<ServedAt>,
+ }
+ 
+ /// What a run's agent-control endpoint takes and serves (D252): the one key it takes, its
+@@ -1250,7 +1280,8 @@ pub enum SaveRefusal {
+     Destination = 0,
+     /// The run is in no state to save: a save of it under way, or its microVM gone.
+     State = 1,
+-    /// This host's microVMs take no snapshots (`shards_vmm::vm::SNAPSHOTS`).
++    /// This host's microVMs take no snapshots (`shards_vmm::vm::SNAPSHOTS`), or the run holds
++    /// what no snapshot keeps: a share another server serves ([`Request::served`], D286).
+     Unsupported = 2,
+     /// It was not made, in the words of what failed: its VM's (what its snapshot cannot keep
+     /// whole, its guest not going quiet) or its files' writing.
+@@ -1895,6 +1926,23 @@ impl Writer {
+             }
+         }
+     }
++    /// Whom a share is given to as they start (D277), a served share's too (D286): 0 the run's
++    /// own root alone, 1 every member that runs, 2 those named, each its kind and name.
++    fn share_to(&mut self, to: Option<&ShareTo>) -> Result<(), WireError> {
++        match to {
++            None => self.u8(0),
++            Some(ShareTo::Every) => self.u8(1),
++            Some(ShareTo::Members(named)) => {
++                self.u8(2);
++                self.count(named.len())?;
++                for m in named {
++                    self.u8(m.kind as u8);
++                    self.text(&m.name)?;
++                }
++            }
++        }
++        Ok(())
++    }
+     /// A capture's access reference and its placeholder, then 1 and its refresh token's
+     /// placeholder where it has one, else 0 (D242, step 8).
+     fn captured(&mut self, c: &Captured) -> Result<(), WireError> {
+@@ -2145,6 +2193,37 @@ impl<'a> Reader<'a> {
+             tag => Err(WireError::Tag { what: "a flag", tag }),
+         }
+     }
++    /// Whom a share is given to as they start, as [`Writer::share_to`] wrote it (D277, D286):
++    /// refused for a named list of none, or one named twice, as the run host would refuse it.
++    fn share_to(&mut self) -> Result<Option<ShareTo>, WireError> {
++        match self.u8()? {
++            0 => Ok(None),
++            1 => Ok(Some(ShareTo::Every)),
++            2 => {
++                // Each at least its kind's byte and its name's length.
++                let n = self.count(1 + 4)?;
++                let mut named: Vec<ShareMember> = Vec::with_capacity(n);
++                for _ in 0..n {
++                    let m = ShareMember {
++                        kind: member_kind(self.u8()?)?,
++                        name: self.text()?,
++                    };
++                    if named.contains(&m) {
++                        return Err(WireError::ShareMembers);
++                    }
++                    named.push(m);
++                }
++                if named.is_empty() {
++                    return Err(WireError::ShareMembers);
++                }
++                Ok(Some(ShareTo::Members(named)))
++            }
++            tag => Err(WireError::Tag {
++                what: "a share's members",
++                tag,
++            }),
++        }
++    }
+     /// A count no larger than the bytes left could hold, each item at least `least` bytes:
+     /// a hostile count allocates nothing it cannot fill.
+     pub(crate) fn count(&mut self, least: usize) -> Result<usize, WireError> {
+@@ -2651,21 +2730,9 @@ impl Request {
+         for root in &self.plug_roots {
+             w.text(root)?;
+         }
+-        // Each share's members, in the shares' order, appended in version 37 (D277): 0 the
+-        // run's own root alone, 1 every member that runs, 2 those named, each its kind and name.
++        // Each share's members, in the shares' order, appended in version 37 (D277).
+         for share in &self.shares {
+-            match &share.members {
+-                None => w.u8(0),
+-                Some(ShareTo::Every) => w.u8(1),
+-                Some(ShareTo::Members(named)) => {
+-                    w.u8(2);
+-                    w.count(named.len())?;
+-                    for m in named {
+-                        w.u8(m.kind as u8);
+-                        w.text(&m.name)?;
+-                    }
+-                }
+-            }
++            w.share_to(share.members.as_ref())?;
+         }
+         // Each member's ceiling past its microVM, appended in version 39 (D278): its kind, its
+         // name and its reach.
+@@ -2685,6 +2752,22 @@ impl Request {
+         if let Some(control) = &self.control {
+             w.u8(u8::from(control.stdio));
+         }
++        // Its shares another server serves, appended in version 52 (D286): each where the guest
++        // sees it, its modes, its members as a share's, and its handle's flag and value.
++        w.count(self.served.len())?;
++        for s in &self.served {
++            w.text(&s.at)?;
++            w.u8(u8::from(s.read_only));
++            w.u8(u8::from(s.exec));
++            w.share_to(s.members.as_ref())?;
++            match s.handle {
++                None => w.u8(0),
++                Some(value) => {
++                    w.u8(1);
++                    w.u64(value);
++                }
++            }
++        }
+         w.done()
+     }
+ 
+@@ -2894,38 +2977,9 @@ impl Request {
+         for _ in 0..n {
+             plug_roots.push(r.text()?);
+         }
+-        // Each share's members, appended in version 37 (D277): refused for a named list of
+-        // none, or one named twice, as the run host would refuse it.
++        // Each share's members, appended in version 37 (D277).
+         for share in &mut shares {
+-            share.members = match r.u8()? {
+-                0 => None,
+-                1 => Some(ShareTo::Every),
+-                2 => {
+-                    // Each at least its kind's byte and its name's length.
+-                    let n = r.count(1 + 4)?;
+-                    let mut named: Vec<ShareMember> = Vec::with_capacity(n);
+-                    for _ in 0..n {
+-                        let m = ShareMember {
+-                            kind: member_kind(r.u8()?)?,
+-                            name: r.text()?,
+-                        };
+-                        if named.contains(&m) {
+-                            return Err(WireError::ShareMembers);
+-                        }
+-                        named.push(m);
+-                    }
+-                    if named.is_empty() {
+-                        return Err(WireError::ShareMembers);
+-                    }
+-                    Some(ShareTo::Members(named))
+-                }
+-                tag => {
+-                    return Err(WireError::Tag {
+-                        what: "a share's members",
+-                        tag,
+-                    });
+-                }
+-            };
++            share.members = r.share_to()?;
+         }
+         // Each member's ceiling, appended in version 39 (D278): each at least its kind's byte,
+         // its name's length, its three lists' counts and its names' flag; a member named twice
+@@ -2954,6 +3008,24 @@ impl Request {
+         if let Some(control) = control.as_mut() {
+             control.stdio = r.flag()?;
+         }
++        // Its shares another server serves, appended in version 52 (D286): each at least its
++        // place's length, its two flags, its members' tag and its handle's flag.
++        let n = r.count(4 + 1 + 1 + 1 + 1)?;
++        let mut served = Vec::with_capacity(n);
++        for _ in 0..n {
++            let at = r.text()?;
++            let read_only = r.flag()?;
++            let exec = r.flag()?;
++            let members = r.share_to()?;
++            let handle = if r.flag()? { Some(r.u64()?) } else { None };
++            served.push(ServedAt {
++                at,
++                read_only,
++                exec,
++                members,
++                handle,
++            });
++        }
+         r.end()?;
+         Ok(Request {
+             image,
+@@ -2974,6 +3046,7 @@ impl Request {
+             gpu_report,
+             plug_roots,
+             egress_ceiling,
++            served,
+         })
+     }
+ }
+@@ -4033,7 +4106,9 @@ impl Request {
+     /// report's scope (D233) and its plug roots (D271, its members' domains' setup alone) taken
+     /// out, what alone may differ between the runs of one microVM; none of a run's secrets is
+     /// in it. Everything else is the microVM's: its image, size, command, ports, network,
+-    /// shares, nesting, credential grants and GPUs.
++    /// shares, nesting, credential grants and GPUs; and its shares another server serves
++    /// (D286), each a share slot, less its handle, a value of one run's (no pool hosts such a
++    /// run today: its streams come with it, after a warm host's share process started).
+     pub fn exemplar(&self) -> Request {
+         Request {
+             members: Vec::new(),
+@@ -4041,6 +4116,14 @@ impl Request {
+             control: None,
+             gpu_report: None,
+             plug_roots: Vec::new(),
++            served: self
++                .served
++                .iter()
++                .map(|s| ServedAt {
++                    handle: None,
++                    ..s.clone()
++                })
++                .collect(),
+             ..self.clone()
+         }
+     }
+@@ -5446,6 +5529,7 @@ mod tests {
+             upstream_roots: Vec::new(),
+             plug_roots: Vec::new(),
+             egress_ceiling: Vec::new(),
++            served: Vec::new(),
+             gpu_report: None,
+         }
+     }
+@@ -5537,13 +5621,13 @@ mod tests {
+         // member's arguments' count (version 18), the sign-ins' count (version 24), the
+         // member's MCP bridge (version 25), the upstream roots' count (version 26), the GPU
+         // report's flag (version 29), the plug roots' count (version 35), the share's members
+-        // (none, version 37), the members' ceilings' count (version 39) and the share's exec flag
+-        // (version 41) last.
++        // (none, version 37), the members' ceilings' count (version 39), the share's exec flag
++        // (version 41) and the served shares' count (version 52) last.
+         assert_eq!(
+-            asked.get(asked.len() - 48..).unwrap(),
++            asked.get(asked.len() - 52..).unwrap(),
+             [
+                 1, 1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
++                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0
+             ],
+             "appended: the grant's flag, the deadline's, the destinations kept (all), the one \
+              member's working directory (none) and its input, the credential grants' count \
+@@ -5553,7 +5637,8 @@ mod tests {
+              the sign-ins' count (zero, version 24), then its MCP bridge (none, version 25), then \
+              the upstream roots' count (zero, version 26), then the GPU report's flag (none, \
+              version 29), then the plug roots' count (zero, version 35), then the members' \
+-             ceilings' count (zero, version 39), then the share's exec flag (yes, version 41)"
++             ceilings' count (zero, version 39), then the share's exec flag (yes, version 41), \
++             then the served shares' count (zero, version 52)"
+         );
+         // Destinations kept by name, the host itself among them (D236), and none.
+         for destinations in [
+@@ -5993,9 +6078,10 @@ mod tests {
+         // terminal's one, the reach's flag, the control ask's, the GPUs' count, its arguments'
+         // count, the sign-ins' count, its MCP bridge, the upstream roots' count, the GPU
+         // report's flag, the plug roots' count, the share's members, the members' ceilings'
+-        // count, version 39's, and the share's exec flag, version 41's, follow it).
++        // count, version 39's, the share's exec flag, version 41's, and the served shares'
++        // count, version 52's, follow it).
+         let mut bad = request().encode().unwrap();
+-        let at = bad.len() - 36;
++        let at = bad.len() - 40;
+         assert_eq!(
+             bad[at], 1,
+             "the member's input flag precedes the credentials' count"
+@@ -6051,10 +6137,10 @@ mod tests {
+             let bytes = with(refused).encode().unwrap();
+             assert_eq!(Request::decode(&bytes), Err(WireError::ShareMembers));
+         }
+-        // The share's members' tag, before the members' ceilings' count (version 39) and the
+-        // share's exec flag (version 41).
++        // The share's members' tag, before the members' ceilings' count (version 39), the
++        // share's exec flag (version 41) and the served shares' count (version 52).
+         let mut bytes = with(None).encode().unwrap();
+-        let at = bytes.len() - 1 - 4 - 1;
++        let at = bytes.len() - 4 - 1 - 4 - 1;
+         bytes[at] = 3;
+         assert_eq!(
+             Request::decode(&bytes),
+@@ -6066,7 +6152,8 @@ mod tests {
+     }
+ 
+     /// Whether each share's files may be run from it (version 41, D279): its flag, in the
+-    /// shares' order, the request's last bytes; a flag of another value refused by type.
++    /// shares' order, before the served shares' count (version 52); a flag of another value
++    /// refused by type.
+     #[test]
+     fn each_shares_exec_rides_the_request_last() {
+         let mut r = request();
+@@ -6079,10 +6166,73 @@ mod tests {
+             ShareAt { exec: true, ..share },
+         ];
+         let bytes = r.encode().unwrap();
+-        assert_eq!(bytes.get(bytes.len() - 2..), Some(&[0, 1][..]));
++        assert_eq!(bytes.get(bytes.len() - 6..), Some(&[0, 1, 0, 0, 0, 0][..]));
+         assert_eq!(Request::decode(&bytes), Ok(r));
+         let mut bad = bytes.clone();
+-        *bad.last_mut().unwrap() = 2;
++        let at = bad.len() - 5;
++        bad[at] = 2;
++        assert_eq!(
++            Request::decode(&bad),
++            Err(WireError::Tag {
++                what: "a flag",
++                tag: 2
++            })
++        );
++    }
++
++    /// The run's shares another server serves (version 52, D286), the request's last field. Do:
++    /// carry one with no handle (a Unix stream's), one with a handle's value (a Windows pipe's),
++    /// given to every member and to members named, read-only and not to be run from. Expect:
++    /// each reads back as written; its exemplar keeps each but its handle. Do: a handle's flag
++    /// of another value, a members' tag no version has, and four billion of them in a few
++    /// bytes. Expect: each refused by type, never read as another request.
++    #[test]
++    fn each_served_share_rides_the_request_last() {
++        let codex = ShareMember {
++            kind: MemberKind::Harness,
++            name: "codex".into(),
++        };
++        let mut r = request();
++        r.served = vec![
++            ServedAt {
++                at: "/home/u/proj".into(),
++                read_only: false,
++                exec: true,
++                members: Some(ShareTo::Members(vec![codex])),
++                handle: None,
++            },
++            ServedAt {
++                at: "/data".into(),
++                read_only: true,
++                exec: false,
++                members: Some(ShareTo::Every),
++                handle: Some(0x0000_0000_0000_0a4c),
++            },
++        ];
++        let bytes = r.encode().unwrap();
++        assert_eq!(Request::decode(&bytes), Ok(r.clone()));
++        let exemplar = r.exemplar();
++        assert_eq!(exemplar.served.len(), 2);
++        assert!(exemplar.served.iter().all(|s| s.handle.is_none()));
++        assert_eq!(
++            exemplar.served.iter().map(|s| s.at.as_str()).collect::<Vec<_>>(),
++            ["/home/u/proj", "/data"]
++        );
++        assert_eq!(
++            r.served
++                .iter()
++                .map(|s| ServedAt {
++                    handle: None,
++                    ..s.clone()
++                })
++                .collect::<Vec<_>>(),
++            exemplar.served
++        );
++        // The second's handle's flag, before its value, the request's last eight bytes.
++        let mut bad = bytes.clone();
++        let at = bad.len() - 8 - 1;
++        assert_eq!(bad[at], 1);
++        bad[at] = 2;
+         assert_eq!(
+             Request::decode(&bad),
+             Err(WireError::Tag {
+@@ -6090,6 +6240,23 @@ mod tests {
+                 tag: 2
+             })
+         );
++        // The second's members' tag, before its handle's flag and value.
++        let mut bad = bytes.clone();
++        let at = bad.len() - 8 - 1 - 1;
++        assert_eq!(bad[at], 1);
++        bad[at] = 3;
++        assert_eq!(
++            Request::decode(&bad),
++            Err(WireError::Tag {
++                what: "a share's members",
++                tag: 3
++            })
++        );
++        // Four billion of them in the count's four bytes, the request's last.
++        let mut hostile = request().encode().unwrap();
++        let at = hostile.len() - 4;
++        hostile[at..].copy_from_slice(&u32::MAX.to_be_bytes());
++        assert_eq!(Request::decode(&hostile), Err(WireError::Short));
+     }
+ 
+     /// A request cut anywhere short, or with a byte past its end, is refused by type; no
+@@ -6158,10 +6325,10 @@ mod tests {
+         }
+         // The reach's flag, before the control ask's, the GPUs' count, the member's arguments'
+         // count, the sign-ins' count, the MCP bridges, the upstream roots' count, the GPU
+-        // report's flag, the plug roots' count, the share's members and the members' ceilings'
+-        // count (version 39) where none is held apart.
++        // report's flag, the plug roots' count, the share's members, the members' ceilings'
++        // count (version 39) and the served shares' count (version 52) where none is held apart.
+         let mut flag = held(None).encode().unwrap();
+-        let at = flag.len() - 29;
++        let at = flag.len() - 33;
+         flag[at] = 2;
+         assert_eq!(
+             Request::decode(&flag),
+@@ -6178,8 +6345,10 @@ mod tests {
+         // one member's arguments' count (version 18), the sign-ins' count (version 24), its MCP
+         // bridge (version 25), the upstream roots' count (version 26), the GPU report's flag
+         // (version 29), the plug roots' count (version 35), the share's members (version 37), the
+-        // members' ceilings' count (version 39) and the share's exec flag (version 41).
+-        let at = kindless.len() - (1 + 4 + "helper".len() + 4 + 1 + 4 + 4 + 4 + 1 + 4 + 1 + 4 + 1 + 4 + 1);
++        // members' ceilings' count (version 39), the share's exec flag (version 41) and the served
++        // shares' count (version 52).
++        let at =
++            kindless.len() - (1 + 4 + "helper".len() + 4 + 1 + 4 + 4 + 4 + 1 + 4 + 1 + 4 + 1 + 4 + 1 + 4);
+         assert_eq!(kindless[at], MemberKind::Agent as u8);
+         kindless[at] = 2;
+         assert_eq!(
+@@ -6192,7 +6361,7 @@ mod tests {
+         // Held apart, with four billion members in a few bytes, in place of the reach's flag
+         // and what follows it.
+         let mut hostile = held(None).encode().unwrap();
+-        hostile.truncate(hostile.len() - 25);
++        hostile.truncate(hostile.len() - 29);
+         hostile.push(1);
+         hostile.extend_from_slice(&u32::MAX.to_be_bytes());
+         assert_eq!(Request::decode(&hostile), Err(WireError::Short));
+@@ -6246,13 +6415,14 @@ mod tests {
+         // (version 29), the plug roots' count (version 35) and the share's members (version 37):
+         // its bytes made no UTF-8.
+         let mut bad = with(&["--resume"], &["ü"]).encode().unwrap();
+-        // ... and the members' ceilings' count (version 39).
+-        let at = bad.len() - 1 - 4 - 1 - 4 - 2 - 4 - 4 - "ü".len();
++        // ... and the members' ceilings' count (version 39) and the served shares' count
++        // (version 52).
++        let at = bad.len() - 4 - 1 - 4 - 1 - 4 - 2 - 4 - 4 - "ü".len();
+         bad[at] = 0xff;
+         assert_eq!(Request::decode(&bad), Err(WireError::Text));
+         // The second member's count, before the sign-ins', said as four billion in no bytes.
+         let mut hostile = with(&[], &[]).encode().unwrap();
+-        hostile.truncate(hostile.len() - 1 - 4 - 1 - 4 - 2 - 4);
++        hostile.truncate(hostile.len() - 4 - 1 - 4 - 1 - 4 - 2 - 4);
+         let at = hostile.len() - 4;
+         hostile[at..].copy_from_slice(&u32::MAX.to_be_bytes());
+         assert_eq!(Request::decode(&hostile), Err(WireError::Short));
+@@ -6388,10 +6558,10 @@ mod tests {
+         // (version 15), the GPUs' count (version 16), its arguments' count (version 18), the
+         // sign-ins' count (version 24), its MCP bridge (version 25), the upstream roots' count
+         // (version 26), the GPU report's flag (version 29), the plug roots' count (version 35)
+-        // the share's members (version 37), the members' ceilings' count (version 39) and the
+-        // share's exec flag (version 41): no flag.
++        // the share's members (version 37), the members' ceilings' count (version 39), the
++        // share's exec flag (version 41) and the served shares' count (version 52): no flag.
+         let mut flag = request().encode().unwrap();
+-        let at = flag.len() - 36;
++        let at = flag.len() - 40;
+         flag[at] = 2;
+         assert_eq!(
+             Request::decode(&flag),
+@@ -6404,10 +6574,10 @@ mod tests {
+         // credential grants' count, the member's terminal, the members' reach, the control ask,
+         // the GPUs' count, the member's arguments' count, the sign-ins' count, its MCP bridge,
+         // the upstream roots' count, the GPU report's flag, the plug roots' count, the share's
+-        // members, the members' ceilings' count (version 39) and the share's exec flag (version
+-        // 41): no list of version 3's and on.
++        // members, the members' ceilings' count (version 39), the share's exec flag (version
++        // 41) and the served shares' count (version 52): no list of version 3's and on.
+         let mut list = request().encode().unwrap();
+-        let at = list.len() - 38;
++        let at = list.len() - 42;
+         list[at] = 2;
+         assert_eq!(
+             Request::decode(&list),
+@@ -6618,9 +6788,10 @@ mod tests {
+             result: Err("x".repeat(run::MAX_PAYLOAD as usize)),
+         };
+         assert_eq!(long.encode(), Err(WireError::TooLong));
+-        // ... and the members' ceilings' count (version 39) after them.
++        // ... and the members' ceilings' count (version 39) and the served shares' count
++        // (version 52) after them.
+         let mut bad = request().encode().unwrap();
+-        let at = bad.len() - 29;
++        let at = bad.len() - 33;
+         assert_eq!(
+             bad[at], 0,
+             "the member's terminal flag precedes the members' reach, the control ask, the GPUs, \
+@@ -6879,6 +7050,7 @@ mod tests {
+             upstream_roots: Vec::new(),
+             plug_roots: Vec::new(),
+             egress_ceiling: Vec::new(),
++            served: Vec::new(),
+             gpu_report: None,
+         };
+         let exemplar = full.exemplar();
+@@ -7139,6 +7311,7 @@ mod tests {
+             upstream_roots: Vec::new(),
+             plug_roots: Vec::new(),
+             egress_ceiling: Vec::new(),
++            served: Vec::new(),
+             gpu_report: None,
+         }
+     }
+@@ -7175,8 +7348,9 @@ mod tests {
+             let request = asked(control);
+             assert_eq!(Request::decode(&request.encode().unwrap()).unwrap(), request);
+         }
+-        // Its members' stdio asked (version 44): the request's last byte, read as a flag, and
+-        // one of another value refused by type, never read as a default.
++        // Its members' stdio asked (version 44): the request's last byte but the served shares'
++        // count (version 52), read as a flag, and one of another value refused by type, never
++        // read as a default.
+         let stdio = asked(Some(ControlAsk {
+             controller: [9u8; 32],
+             sockets: None,
+@@ -7184,9 +7358,10 @@ mod tests {
+         }))
+         .encode()
+         .unwrap();
+-        assert_eq!(stdio.last(), Some(&1));
++        let at = stdio.len() - 4 - 1;
++        assert_eq!(stdio[at], 1);
+         let mut bad = stdio.clone();
+-        *bad.last_mut().unwrap() = 2;
++        bad[at] = 2;
+         assert!(matches!(
+             Request::decode(&bad),
+             Err(WireError::Tag {
+@@ -7194,9 +7369,10 @@ mod tests {
+                 tag: 2
+             })
+         ));
+-        // None asked: one byte past v13's encoding, its absence.
++        // None asked: one byte past v13's encoding, its absence, before the served shares' count
++        // (version 52).
+         let none = asked(None).encode().unwrap();
+-        assert_eq!(none.last(), Some(&0));
++        assert_eq!(none.get(none.len() - 4 - 1..), Some(&[0, 0, 0, 0, 0][..]));
+     }
+ 
+     /// Step 11 (b), D252: a started run tells where its endpoint is bound and the microVM's own
+@@ -7296,8 +7472,9 @@ mod tests {
+         // count (version 35) and the share's members (version 37), made one D232's grammar
+         // refuses.
+         let mut unnamed = bytes.clone();
+-        // ... the members' ceilings' count (version 39) and the share's exec flag (version 41).
+-        let at = unnamed.len() - 1 - 1 - 4 - 1 - 4 - 1 - 4 - 4 - 4 - "metal:00000001000002a1".len();
++        // ... the members' ceilings' count (version 39), the share's exec flag (version 41) and the
++        // served shares' count (version 52).
++        let at = unnamed.len() - 4 - 1 - 1 - 4 - 1 - 4 - 1 - 4 - 4 - 4 - "metal:00000001000002a1".len();
+         assert_eq!(unnamed[at], b'm');
+         unnamed[at] = b'x';
+         assert_eq!(Request::decode(&unnamed), Err(WireError::Gpu));
+@@ -7410,11 +7587,24 @@ mod tests {
+         // The second sign-in's CLI, its code after its name, made one no version has; the one
+         // member's MCP bridge's flag (version 25), the upstream roots' count (version 26), the
+         // GPU report's flag (version 29), the plug roots' count (version 35), the share's
+-        // members (version 37), the members' ceilings' count (version 39) and the share's exec
+-        // flag (version 41) after it.
++        // members (version 37), the members' ceilings' count (version 39), the share's exec flag
++        // (version 41) and the served shares' count (version 52) after it.
+         let mut cli = bytes.clone();
+         let at = cli.len()
+-            - (4 + "chatgpt.com".len() + 4 + "api.openai.com".len() + 4 + 1 + 1 + 1 + 4 + 1 + 4 + 1 + 4 + 1);
++            - (4 + "chatgpt.com".len()
++                + 4
++                + "api.openai.com".len()
++                + 4
++                + 1
++                + 1
++                + 1
++                + 4
++                + 1
++                + 4
++                + 1
++                + 4
++                + 1
++                + 4);
+         assert_eq!(cli[at], Cli::Codex.code());
+         cli[at] = 9;
+         assert!(matches!(Request::decode(&cli), Err(WireError::Tag { .. })));
+diff --git a/crates/ipc/src/lib.rs b/crates/ipc/src/lib.rs
+index b5b8780e5222870e7b9d921c6c680e683782a6ef..f3204835da3b9cf279f6ecb7f367dca90a62713b 100644
+--- a/crates/ipc/src/lib.rs
++++ b/crates/ipc/src/lib.rs
+@@ -527,6 +527,12 @@ pub mod kind {
+     /// a range of one protocol's ports, and the way a flow opens. Taken back, every flow it
+     /// let open that no other grant admits ends. Answered as `NET_JOIN` is.
+     pub const NET_PEER_GRANT: u8 = 116;
++    /// Orchestrator → run host, on its links socket (D286, Unix): the streams of the run's
++    /// shares another server serves (`shards_api::image::wire::Request::served`), in the
++    /// request's order, [`MAX_FDS`](super::MAX_FDS) a message at most and no payload, all of
++    /// them sent before the run's request (`CREATE`), which says how many. Not answered: its
++    /// sender holds its copies until the run has started or been refused (M24).
++    pub const SERVED_SHARES: u8 = 117;
+     /// Daemon → a running microVM's VM process: a run joins its network (D119). Its number
+     /// (a big-endian u64, which `EXEC_TAKEN` answers), with the VM's end of the joiner's
+     /// own connection to the daemon, on which the joiner's run goes as a warm VM's does

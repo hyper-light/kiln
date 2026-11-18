@@ -43,7 +43,6 @@ use super::Span;
 use super::conn::{Conn, Ended, Host, WINDOW_LENT};
 use super::packet::{HOST_CID, Header, TYPE_STREAM, op};
 use super::poll::{Interest, Ready, Source};
-use crate::debug;
 use crate::memory::GuestMemory;
 #[cfg(unix)]
 use crate::platform::UnixListener;
@@ -52,6 +51,7 @@ use crate::platform::{AsRawSocket, HostStream, UnixStream};
 use crate::platform::{Listening, PairMaker, Paired, Pipes};
 use crate::snapshot::codec::{self, Reader, Writer};
 use crate::vm::VsockHost;
+use crate::{debug, info};
 
 /// RSTs owed, at most, for the largest rings a guest may negotiate ([`stray_rsts_bound`]).
 const MAX_STRAY_RSTS: usize = stray_rsts_bound(super::QUEUE_SIZE, super::QUEUE_SIZE);
@@ -514,7 +514,7 @@ impl Muxer {
             .min_by_key(|(_, h)| h.heard)
             .map(|(i, _)| i);
         if let Some(i) = silent {
-            debug!("vsock: every slot taken; a host connection silent longest gives its own up");
+            info!("vsock: every slot taken; a host connection silent longest gives its own up");
             self.handshakes.swap_remove(i);
             return;
         }
@@ -526,8 +526,9 @@ impl Muxer {
         if let Some((_, key)) = unanswered
             && let Some(c) = self.conns.remove(&key)
         {
-            debug!(
-                "vsock: every slot taken; a host's request its guest left unanswered longest gives its own up"
+            info!(
+                "vsock: every slot taken; host port {}'s request, which guest port {} left unanswered longest, gives its own up",
+                key.local_port, key.peer_port
             );
             self.lent = self.lent.saturating_sub(u64::from(c.lent()));
             if c.allocated_port {
@@ -595,6 +596,10 @@ impl Muxer {
             return;
         };
         if h.op == op::RST {
+            info!(
+                "vsock: guest port {} reset host port {}",
+                key.peer_port, key.local_port
+            );
             self.remove(key);
             return;
         }
@@ -669,11 +674,18 @@ impl Muxer {
                 if let Some(ring) = ring {
                     conn.ringable(ring);
                 }
+                info!(
+                    "vsock: guest port {} dialled host port {}",
+                    key.peer_port, key.local_port
+                );
                 self.conns.insert(key, conn);
                 self.enqueue(key);
             }
             Err(e) => {
-                debug!("vsock: guest connect to host port {}: {e}", key.local_port);
+                info!(
+                    "vsock: guest port {} dialled host port {}, refused: {e}",
+                    key.peer_port, key.local_port
+                );
                 self.stray_rst(key.local_port, key.peer_port);
             }
         }
@@ -712,6 +724,10 @@ impl Muxer {
             }
             if let Some(h) = h {
                 if h.op == op::RST {
+                    info!(
+                        "vsock: host port {} reset guest port {}",
+                        key.local_port, key.peer_port
+                    );
                     self.remove(key);
                 }
                 return Some(h);
@@ -883,7 +899,7 @@ impl Muxer {
             match pair.look() {
                 Paired::Waiting => return,
                 Paired::Broken => {
-                    debug!("vsock: a host client went before its pair was whole; the pair replaced");
+                    info!("vsock: a pair no client holds whole ({pair:?}) replaced");
                     pair.close_up();
                     (None, listener.pair.take())
                 }
@@ -973,6 +989,7 @@ impl Muxer {
             Ok(Some(Line::Connect(peer_port))) => {
                 let h = self.handshakes.swap_remove(i);
                 let local_port = self.allocate_local_port();
+                info!("vsock: host port {local_port} asks for guest port {peer_port}");
                 let key = Key {
                     local_port,
                     peer_port,
@@ -984,7 +1001,7 @@ impl Muxer {
                 self.enqueue(key);
             }
             Err(e) => {
-                debug!("vsock: host handshake: {e}");
+                info!("vsock: a host connection's handshake: {e}");
                 self.handshakes.swap_remove(i);
             }
         }

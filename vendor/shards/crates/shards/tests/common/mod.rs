@@ -243,6 +243,139 @@ pub fn cannot_snapshot() -> bool {
     false
 }
 
+/// Whether `said`, what a run printed or a daemon's log, tells of a vCPU entry its host
+/// refused that D261's gate takes for its host's (ROOT's ruling of 2026-11-17,
+/// `shards_vmm::vm::limits::the_hosts`): VMX's error 7, on a host that is itself a VM, its
+/// guest having run, or another VM process whose guest had run refused within its host model's
+/// burst width. Then a SKIP line says the refusal, with its evidence, and its witness, even
+/// where `SHARDS_REQUIRE_VMS=1` says VMs must run: such a host runs VMs. Any other refusal is
+/// said with why the gate does not take it, and its test's failure stands. Its witnesses are
+/// read from the records its VM process kept it in, and from the tests' own ([`vcpu_limits`]),
+/// where the machines a test boots in its own process keep theirs. The burst width is waited
+/// out from the refusal's moment first, so that a witness kept just after it is read.
+pub fn host_refused(said: &str) -> bool {
+    let Some((refused, verdict)) = host_refusal(said) else {
+        return false;
+    };
+    match verdict {
+        Ok(witness) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "SKIP: {}: the host's, by D261's gate: {witness}",
+                refused.line
+            );
+            true
+        }
+        Err(not) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "a refused entry D261's gate does not take for its host's ({not}): {}",
+                refused.line
+            );
+            false
+        }
+    }
+}
+
+/// D261's gate's verdict on a refused entry: its witness, or why it is not its host's.
+pub type HostVerdict = Result<shards_vmm::vm::limits::Witness, shards_vmm::vm::limits::NotTheHosts>;
+
+/// The refused entry `said` tells of and D261's gate's verdict on it, as [`host_refused`] reads
+/// them, saying nothing: none where `said` tells of none.
+pub fn host_refusal(said: &str) -> Option<(shards_vmm::vm::limits::Said, HostVerdict)> {
+    use shards_vmm::vm::limits;
+    let refused = limits::Said::find(said)?;
+    let records: Vec<limits::Limits> = refused
+        .file
+        .clone()
+        .map(|file| limits::Limits::kept_in(file, limits::HostModel::here()))
+        .into_iter()
+        .chain([vcpu_limits()])
+        .collect();
+    let width = || {
+        records
+            .iter()
+            .map(limits::Limits::burst_width_us)
+            .max()
+            .unwrap_or_else(limits::measured_width_us)
+    };
+    let wait = refused
+        .refusal
+        .at_us
+        .saturating_add(width())
+        .saturating_sub(limits::now_us());
+    std::thread::sleep(Duration::from_micros(wait));
+    let kept: Vec<limits::Refusal> = records.iter().flat_map(limits::Limits::refusals).collect();
+    let verdict = limits::the_hosts(&refused, &kept, width());
+    Some((refused, verdict))
+}
+
+/// Whether a run that failed, its error `said`, was ended by its VM's host's refusal to enter
+/// it that D261's gate takes for the host's: said SKIP with its evidence ([`host_refused`]), as
+/// boot.rs's tests say theirs. Its VM's refusal is read from its error, or from `home`'s
+/// daemon's log once that log tells its VM's end ([`run_refusal`]), waited for as `home`'s
+/// daemon progresses ([`Patience`]). Anything else, a failure with no refusal of its VM found,
+/// a 125 among them, stays its test's failure (ROOT's ruling of 2026-11-17: the daemon's tests
+/// take boot.rs's gated SKIP).
+pub fn run_host_refused(said: &str, home: &Path) -> bool {
+    let log = || std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default();
+    if shards_vmm::vm::limits::Said::find(said).is_none() {
+        let vms = run_vms(said, &log());
+        if !vms.is_empty() {
+            // A VM that ends refused logs its refusal before its end ([`run_refusal`]).
+            let mut patience = Patience::of(home);
+            while !vms.iter().all(|vm| log().contains(&format!("VM {vm} ended"))) && patience.holds() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            patience.done();
+        }
+    }
+    host_refused(&run_refusal(said, &log()))
+}
+
+/// The lines that tell of a refused entry of the VM of a run that failed, its error `said`:
+/// those its error carries itself, a refusal before or as its command ran reaching its client;
+/// else those its daemon's `log` holds of the VMs it served on ([`run_vms`]), by their pids,
+/// not another VM's the same log holds: a refusal after its run's end reaches its daemon's log
+/// alone (vm_run.rs, a warm VM's own log). None where neither tells of one.
+pub fn run_refusal(said: &str, log: &str) -> String {
+    if shards_vmm::vm::limits::Said::find(said).is_some() {
+        return said.to_string();
+    }
+    let vms = run_vms(said, log);
+    let of_vm: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            shards_vmm::vm::limits::Said::find(line)
+                .is_some_and(|refused| vms.contains(&refused.refusal.machine))
+        })
+        .collect();
+    of_vm.join("\n")
+}
+
+/// The VMs a run that failed, its error `said`, was served on, by their pids: one its error
+/// names as ended (`VM N ended`, before it was ready), and one its daemon's `log` says could not
+/// serve a run in the words its error carries (`container ID: its VM N could not serve its run:
+/// WHY`, as its client heard WHY).
+fn run_vms(said: &str, log: &str) -> Vec<u32> {
+    let named = said.split("VM ").skip(1).filter_map(|rest| {
+        let (pid, after) = rest.split_once(' ')?;
+        after
+            .starts_with("ended")
+            .then(|| pid.parse::<u32>().ok())
+            .flatten()
+    });
+    let unserved = log.lines().filter_map(|line| {
+        let (_, rest) = line.split_once(": its VM ")?;
+        let (pid, why) = rest.split_once(" could not serve its run: ")?;
+        let why = why.trim();
+        (!why.is_empty() && said.contains(why))
+            .then(|| pid.parse::<u32>().ok())
+            .flatten()
+    });
+    named.chain(unserved).collect()
+}
+
 /// Whether the daemon here keeps the snapshots it keeps, its templates, warm pools and saves
 /// (D25, D26, D176): wherever snapshots restore ([`cannot_snapshot`]).
 pub fn pools() -> bool {
@@ -282,16 +415,21 @@ pub mod terminal;
 #[path = "terminal_windows.rs"]
 pub mod terminal;
 
-/// The file `name` of the snapshot generation `dir` points at, as the store reads both:
-/// its pointer, and the file's newest version, which on Windows a file written after its
-/// generation was committed (its working set) lands as (platform `write_in`); the name
-/// itself where none has.
-pub fn snapshot_file(dir: &Path, name: &str) -> PathBuf {
-    let generation = shards_vmm::snapshot::generation(dir).unwrap();
-    let newest = shards_vmm::platform::open_dir(&generation)
+/// The file `name` in `dir` as its readers take it: its newest version, which on Windows a
+/// file written whole lands as (platform `write_in`: `name.~N`, never `name` itself, PM
+/// M345); the name itself where none has.
+pub fn newest(dir: &Path, name: &str) -> PathBuf {
+    let newest = shards_vmm::platform::open_dir(dir)
         .and_then(|d| shards_vmm::platform::newest_in(&d, name))
         .unwrap_or_else(|_| name.to_string());
-    generation.join(newest)
+    dir.join(newest)
+}
+
+/// The file `name` of the snapshot generation `dir` points at, as the store reads both: its
+/// pointer, and the file's newest version ([`newest`]), as a file written after its
+/// generation was committed (its working set) lands on Windows.
+pub fn snapshot_file(dir: &Path, name: &str) -> PathBuf {
+    newest(&shards_vmm::snapshot::generation(dir).unwrap(), name)
 }
 
 /// Plan step 33's leak scan (docs/research/measurements/s33-leak-scan), on what it scans:
@@ -1086,26 +1224,42 @@ pub struct Listed {
 /// answers a standard user logged on over SSH, a network logon, "Access denied"
 /// (0x80041003; root\cimv2 grants remote enable to administrators alone), and tests run
 /// so (step 10's arm64 Windows host) found no warm or restored VM while the daemon's log
-/// said they ran. A process whose command line cannot be read is kept, its command line
-/// empty, and one of shards' is said on stderr, captured with a failing test's output.
+/// said they ran. A process that has ended is not listed, as [`alive`] has it ended: its end
+/// begun, its exit code set (TerminateProcess "initiates termination and returns
+/// immediately"), or its end under way as its command line is read, or gone since the
+/// snapshot ([`command_line`]'s `None`). CI 44189693085 listed such processes as live, the
+/// one look of a test that found them and the next disagreeing: windows-2025 a VM process
+/// [`alive`] had seen end, and windows-2022 VM and network processes whose reads said
+/// STATUS_PROCESS_IS_TERMINATING. A live process whose command line cannot be read is
+/// kept, its command line empty, and one of shards' is said on stderr, captured with a
+/// failing test's output.
 #[cfg(windows)]
 #[allow(clippy::print_stderr)]
 pub fn command_lines() -> Vec<Listed> {
     processes()
         .into_iter()
-        .map(|(pid, parent, name)| {
-            let command = command_line(pid).unwrap_or_else(|e| {
-                if name.to_ascii_lowercase().starts_with("shards") {
-                    eprintln!("the command line of {name} ({pid}) unread: {e}");
+        .filter_map(|(pid, parent, name)| {
+            let read = command_line(pid);
+            // Looked at after its read, so that one listed was live as it was read.
+            if !alive(i32::try_from(pid).unwrap_or(-1)) {
+                return None;
+            }
+            let command = match read {
+                Ok(Some(command)) => command,
+                Ok(None) => return None,
+                Err(e) => {
+                    if name.to_ascii_lowercase().starts_with("shards") {
+                        eprintln!("the command line of {name} ({pid}) unread: {e}");
+                    }
+                    String::new()
                 }
-                String::new()
-            });
-            Listed {
+            };
+            Some(Listed {
                 pid,
                 parent,
                 name,
                 command,
-            }
+            })
         })
         .collect()
 }
@@ -1118,18 +1272,26 @@ pub fn command_lines() -> Vec<Listed> {
 /// followed by its text, and STATUS_INFO_LENGTH_MISMATCH with the size needed in
 /// ReturnLength when the buffer is too small
 /// (<https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntqueryinformationprocess>).
+/// None for a process that has ended: one whose read says STATUS_PROCESS_IS_TERMINATING, "an
+/// attempt was made to access an exiting process" (MS-ERREF 2.3.1), and one gone since its
+/// pid was listed, which OpenProcess opens no more (ERROR_INVALID_PARAMETER, as CI
+/// 44189693085's windows-2022 job said of a network process its snapshot had listed).
 #[cfg(windows)]
-pub fn command_line(pid: u32) -> Result<String, String> {
+pub fn command_line(pid: u32) -> Result<Option<String>, String> {
     use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH,
-        UNICODE_STRING,
+        CloseHandle, ERROR_INVALID_PARAMETER, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
+        STATUS_INFO_LENGTH_MISMATCH, STATUS_PROCESS_IS_TERMINATING, UNICODE_STRING,
     };
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     // SAFETY: a process's handle of one right, closed below.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
-        return Err(format!("OpenProcess: {}", io::Error::last_os_error()));
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(None);
+        }
+        return Err(format!("OpenProcess: {e}"));
     }
     // In u64s, which align the UNICODE_STRING at its start as its pointer needs.
     let mut buffer = vec![0u64; 256];
@@ -1155,6 +1317,9 @@ pub fn command_line(pid: u32) -> Result<String, String> {
             buffer.resize(usize::try_from(needed).unwrap().div_ceil(size_of::<u64>()), 0);
             continue;
         }
+        if status == STATUS_PROCESS_IS_TERMINATING {
+            break Ok(None);
+        }
         if status < 0 {
             break Err(format!(
                 "NtQueryInformationProcess: NTSTATUS {:#010x}",
@@ -1164,15 +1329,151 @@ pub fn command_line(pid: u32) -> Result<String, String> {
         // SAFETY: the call succeeded, so the buffer starts with the UNICODE_STRING it wrote.
         let text = unsafe { buffer.as_ptr().cast::<UNICODE_STRING>().read() };
         if text.Buffer.is_null() || text.Length == 0 {
-            break Ok(String::new());
+            break Ok(Some(String::new()));
         }
         // SAFETY: the string's text, Length bytes in the buffer after it, which lives on.
         let units = unsafe { std::slice::from_raw_parts(text.Buffer, usize::from(text.Length) / 2) };
-        break Ok(String::from_utf16_lossy(units));
+        break Ok(Some(String::from_utf16_lossy(units)));
     };
     // SAFETY: the handle opened above, closed once.
     unsafe { CloseHandle(process) };
     read
+}
+
+/// What is left of `dir`, it and each directory and file under it a line, for a removal of it
+/// that failed to say what held it: on Windows each with the processes that use it, open or
+/// mapped ([`users_of`]), by ID and executable, since NTFS renames no directory under which
+/// anything is open, whatever its sharing (MS-FSA 2.1.5.15.11, 2.1.4.2); elsewhere nothing,
+/// where a removal takes what is open. One gone between its listing and its look, as a VM's
+/// files go while it ends, holds nothing and is left out; one whose users cannot be read says
+/// why (jupiter at 183fe264e3: a file gone so ended its listing in a panic, NotFound).
+#[cfg(windows)]
+pub fn left_of(dir: &Path) -> String {
+    let names: std::collections::HashMap<u32, String> = processes()
+        .into_iter()
+        .map(|(pid, _, name)| (pid, name))
+        .collect();
+    let mut left = vec![dir.to_path_buf()];
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                dirs.push(e.path());
+            }
+            left.push(e.path());
+        }
+    }
+    left.into_iter()
+        .filter_map(|f| match users_of(&f) {
+            Ok(pids) => {
+                let by: Vec<String> = pids
+                    .iter()
+                    .map(|p| format!("{p} {}", names.get(p).map_or("?", String::as_str)))
+                    .collect();
+                Some(format!("{}: used by {}", f.display(), by.join(", ")))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => Some(format!("{}: its users unread: {e}", f.display())),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(not(windows))]
+pub fn left_of(_dir: &Path) -> String {
+    String::new()
+}
+
+/// Every file under `dir`, its subdirectories' among them.
+#[cfg(windows)]
+pub fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => dirs.push(e.path()),
+                Ok(t) if t.is_file() => files.push(e.path()),
+                _ => {}
+            }
+        }
+    }
+    files
+}
+
+/// The processes that use `file`, open or mapped, or a directory, open. The file query works
+/// as a standard user; Restart Manager's RmGetList returned access denied even for that
+/// user's own file on the arm64 Windows test host (PM M414's file-users probe). Opened with
+/// FILE_FLAG_BACKUP_SEMANTICS, which a directory's handle takes ("You must set this flag to
+/// obtain a handle to a directory", CreateFileW).
+#[cfg(windows)]
+pub fn users(file: &Path) -> Vec<u32> {
+    users_of(file).unwrap_or_else(|e| panic!("file users of {}: {e}", file.display()))
+}
+
+/// [`users`], its failure said rather than panicked: NotFound where the file is gone.
+#[cfg(windows)]
+pub fn users_of(file: &Path) -> io::Result<Vec<u32>> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Wdk::Storage::FileSystem::{FileProcessIdsUsingFileInformation, NtQueryInformationFile};
+    use windows_sys::Win32::Foundation::{
+        STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(file)?;
+    // FILE_PROCESS_IDS_USING_FILE_INFORMATION: a ULONG count, padded to a pointer's
+    // alignment, then that many ULONG_PTR process IDs. Both Windows targets are 64-bit.
+    let mut buffer = vec![0usize; 65];
+    loop {
+        let mut block = IO_STATUS_BLOCK::default();
+        let bytes = buffer
+            .len()
+            .checked_mul(size_of::<usize>())
+            .and_then(|b| u32::try_from(b).ok())
+            .ok_or_else(|| io::Error::other("its users' answer past 4 GiB"))?;
+        // SAFETY: an open synchronous file, its status block, and `bytes` writable,
+        // pointer-aligned bytes for the header and the IDs that follow it.
+        let status = unsafe {
+            NtQueryInformationFile(
+                handle.as_raw_handle(),
+                &mut block,
+                buffer.as_mut_ptr().cast(),
+                bytes,
+                FileProcessIdsUsingFileInformation,
+            )
+        };
+        if matches!(
+            status,
+            STATUS_BUFFER_OVERFLOW | STATUS_BUFFER_TOO_SMALL | STATUS_INFO_LENGTH_MISMATCH
+        ) {
+            let grown = buffer
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| io::Error::other("its users' answer past memory"))?;
+            buffer.resize(grown, 0);
+            continue;
+        }
+        if status != 0 {
+            return Err(io::Error::other(format!(
+                "NtQueryInformationFile: NTSTATUS {:#010x}",
+                status.cast_unsigned()
+            )));
+        }
+        // SAFETY: a successful query wrote the ULONG header into this initialized buffer.
+        let count = unsafe { *buffer.as_ptr().cast::<u32>() } as usize;
+        let ids = buffer
+            .get(1..=count)
+            .ok_or_else(|| io::Error::other("its users' count past its answer"))?;
+        return ids
+            .iter()
+            .map(|&pid| u32::try_from(pid).map_err(io::Error::other))
+            .collect();
+    }
 }
 
 /// A handle to process `pid` that may give it handles (PROCESS_DUP_HANDLE), as a VM's
@@ -2122,8 +2423,10 @@ pub fn client_output(cmd: &mut Command, home: Option<&Path>) -> std::process::Ou
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawning a client");
-    let out = collect(Box::new(child.stdout.take().unwrap()));
-    let err = collect(Box::new(child.stderr.take().unwrap()));
+    let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let (out_probe, err_probe) = (probe(&stdout), probe(&stderr));
+    let out = collect(Box::new(stdout));
+    let err = collect(Box::new(stderr));
     let (mut out_got, mut err_got) = ((Vec::new(), false), (Vec::new(), false));
     let mut wait = Wait::begin(kind, child.id(), home, &asked);
     let mut status = None;
@@ -2148,7 +2451,10 @@ pub fn client_output(cmd: &mut Command, home: Option<&Path>) -> std::process::Ou
         }
         match (wait.look(output), status) {
             (Ok(()), _) => {}
+            // What came, or the whole of a stream no process holds any more ([`taken_whole`]).
             (Err(_), Some(status)) => {
+                taken_whole(&out, &out_probe, &mut out_got);
+                taken_whole(&err, &err_probe, &mut err_got);
                 break std::process::Output {
                     status,
                     stdout: out_got.0,
@@ -2195,10 +2501,92 @@ fn quit(child: &mut std::process::Child, home: Option<&Path>) {
     let _ = child.wait();
 }
 
+/// A second handle of a client's pipe's read end, by which [`taken_whole`] tells whether any
+/// process still holds its write end; none where it could not be made.
+#[cfg(unix)]
+pub type Probe = Option<std::os::fd::OwnedFd>;
+
+/// A second handle of a client's pipe's read end, by which [`taken_whole`] tells whether any
+/// process still holds its write end; none where it could not be made.
+#[cfg(windows)]
+pub type Probe = Option<std::os::windows::io::OwnedHandle>;
+
+/// [`Probe`] of `end`, a pipe's read end.
+#[cfg(unix)]
+pub fn probe(end: &impl std::os::fd::AsFd) -> Probe {
+    end.as_fd().try_clone_to_owned().ok()
+}
+
+/// [`Probe`] of `end`, a pipe's read end.
+#[cfg(windows)]
+pub fn probe(end: &impl std::os::windows::io::AsHandle) -> Probe {
+    end.as_handle().try_clone_to_owned().ok()
+}
+
+/// Whether no process holds the write end of the pipe `probe` reads, so that its stream's end
+/// is certain: poll(2)'s POLLHUP of its read end, which a pipe says once its last writer has
+/// closed (Linux fs/pipe.c `pipe_poll`; XNU's poll(2), from `filt_piperead`'s EV_EOF).
+#[cfg(unix)]
+fn writers_gone(probe: &Probe) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let Some(end) = probe else {
+        return false;
+    };
+    let mut look = libc::pollfd {
+        fd: end.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll(2) of one descriptor this holds, with no wait.
+    let ready = unsafe { libc::poll(&raw mut look, 1, 0) };
+    ready == 1 && look.revents & libc::POLLHUP != 0
+}
+
+/// Whether no process holds the write end of the pipe `probe` reads: PeekNamedPipe's
+/// ERROR_BROKEN_PIPE, which Windows says only once the pipe is empty too, so that a pipe with
+/// bytes still to read says nothing and its reader is waited for no more than before.
+#[cfg(windows)]
+fn writers_gone(probe: &Probe) -> bool {
+    use std::os::windows::io::AsRawHandle as _;
+    let Some(end) = probe else {
+        return false;
+    };
+    let mut waiting = 0u32;
+    // SAFETY: a peek of no bytes at a pipe's read end this holds, its count on this stack.
+    let peeked = unsafe {
+        windows_sys::Win32::System::Pipes::PeekNamedPipe(
+            end.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &raw mut waiting,
+            std::ptr::null_mut(),
+        )
+    };
+    peeked == 0 && io::Error::last_os_error().kind() == io::ErrorKind::BrokenPipe
+}
+
+/// What came of a stream [`collect`] reads, taken whole where no process holds its pipe any
+/// more ([`writers_gone`]): its end certain, its reader thread is waited for to it, however late
+/// it runs. A stream a process still holds is taken as it came, its end not waited for. Taken
+/// as it came alone, a client that ended at once on a busy host had both its streams said held
+/// open, their reader threads yet to hand over what their pipes held (CI 44164945050, x86_64
+/// musl: `shards --version`, its status 0 after 40 ms, its kind's W* its own run).
+pub fn taken_whole(rx: &std::sync::mpsc::Receiver<Vec<u8>>, probe: &Probe, got: &mut (Vec<u8>, bool)) {
+    more(rx, got);
+    if got.1 || !writers_gone(probe) {
+        return;
+    }
+    for chunk in rx.iter() {
+        got.0.extend_from_slice(&chunk);
+    }
+    got.1 = true;
+}
+
 /// A stream read on a thread of its own and handed over by channel as it comes, so that a
 /// pipe another process still holds (a VM given a client's stdio) never holds a wait, and
 /// what came before it is kept.
-fn collect(mut r: Box<dyn Read + Send>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+pub fn collect(mut r: Box<dyn Read + Send>) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         let mut b = vec![0u8; 64 * 1024];
@@ -2424,8 +2812,11 @@ impl Said {
 /// answer of its kind on this host), it follows its party's liveness alone; learned, it is
 /// looked at each W* past its start and refused at a look that finds its party made no
 /// progress at all since the look before, its host not holding it. Cold or learned, it is
-/// refused at a look that finds its party gone: none of it running and its daemon saying
-/// nothing, its liveness ended. Its caller gives it no bound (R03).
+/// refused once its party is gone ([`Wait::gone`]): none of it running and its daemon saying
+/// nothing at [`LOOKS_TO_REFUSE`](shards_api::LOOKS_TO_REFUSE) of its looks in a row, its
+/// liveness ended. Its party is read as it begins ([`Wait`]), so that what its caller does
+/// before its first check takes nothing of it: a home's removal takes its daemon's record.
+/// Its caller gives it no bound (R03).
 ///
 /// [`done`]: Patience::done
 pub struct Patience {
@@ -3166,6 +3557,8 @@ fn run_ending(
         .get_envs()
         .find(|(k, _)| *k == "SHARDS_HOME")
         .and_then(|(_, v)| v.map(PathBuf::from));
+    // The home whose daemon serves it, where its context is another home's of this test's.
+    let serving = serving_home(&cmd, home.as_deref());
     let mut child = cmd
         .env("SHARDS_TIMING", "1")
         .stdin(Stdio::null())
@@ -3173,9 +3566,12 @@ fn run_ending(
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawning shards");
-    // Read as it comes ([`collect`]): a command that never ends shows how far it got.
-    let out = collect(Box::new(child.stdout.take().unwrap()));
-    let err = collect(Box::new(child.stderr.take().unwrap()));
+    // Read as it comes ([`collect`]): a command that never ends shows how far it got. Each
+    // pipe probed by a second handle of its read end ([`taken_whole`]).
+    let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let (out_probe, err_probe) = (probe(&stdout), probe(&stderr));
+    let out = collect(Box::new(stdout));
+    let err = collect(Box::new(stderr));
     // What it wrote, each stream with whether it has ended, its every writer gone.
     let (mut out_got, mut err_got) = ((Vec::new(), false), (Vec::new(), false));
     let came = more;
@@ -3189,7 +3585,7 @@ fn run_ending(
             format!("{said}\n(still held open by another process)")
         }
     };
-    let mut wait = Wait::begin(kind, child.id(), home.as_deref(), &asked.join(" "));
+    let mut wait = Wait::begin(kind, child.id(), home.as_deref(), &asked.join(" ")).served_by(serving);
     // Its answer, its client's end, is missing as it begins: its client started just now,
     // so an end its first check finds before any look is its party's answer, which teaches
     // its kind, never one there before it.
@@ -3240,8 +3636,13 @@ fn run_ending(
         match (wait.look(output), status) {
             (Ok(()), _) => {}
             // Its streams' end never came, their holder doing nothing of its own past the
-            // slowest answer of its kind: what came is what it said.
-            (Err(_), Some(status)) => break Ok(finished(status, text(&out_got), text(&err_got), start)),
+            // slowest answer of its kind: what came is what it said, but the whole of a stream
+            // no process holds any more, however late its reader ([`taken_whole`]).
+            (Err(_), Some(status)) => {
+                taken_whole(&out, &out_probe, &mut out_got);
+                taken_whole(&err, &err_probe, &mut err_got);
+                break Ok(finished(status, text(&out_got), text(&err_got), start));
+            }
             (Err(stall), None) => {
                 let said = wait.refused(&stall);
                 let seen = stuck(child.id(), home.as_deref());
@@ -3753,8 +4154,10 @@ pub const STREAM: &str = "a guest's stream";
 /// kept beside the judge's records (`target/judge-records`, under this host's class), which CI
 /// keeps from run to run: each its CPU's model and what it runs under, so that one image's
 /// runners of two models (CI's x86_64 runners: AMD on Azure, Intel on EC2) keep theirs apart.
+/// Read beside what D261 measured of this host model (`Limits::measured_at`), so that a cold
+/// one is sized by its measured known-good count, never by a first boot of its most vCPUs.
 pub fn vcpu_limits() -> shards_vmm::vm::limits::Limits {
-    shards_vmm::vm::limits::Limits::at(
+    shards_vmm::vm::limits::Limits::measured_at(
         workspace()
             .join("target/judge-records")
             .join(host_class())
@@ -3790,6 +4193,72 @@ fn host_class() -> String {
     )
 }
 
+/// The home whose daemon serves `cmd`, a command of `home`'s, where the context it runs in is
+/// another home's of this test's process (ROOT's word, 2026-11-18, D215): the context chosen as
+/// shards chooses it (context.rs `chosen`: `--context NAME`, `-c NAME` or `--context=NAME`
+/// before its command, else `SHARDS_CONTEXT`, else `DOCKER_CONTEXT`, else its home's current
+/// one), its record's address the one that home's daemon listens on (context.rs `LISTENING`),
+/// looked for among the homes beside `home` in this process's test directory. None where it
+/// runs here, or where no home beside its own listens there.
+pub fn serving_home(cmd: &Command, home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    let words: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+    let word = |i: usize| words.get(i).and_then(|w| w.to_str());
+    let (mut given, mut at) = (None, 0usize);
+    loop {
+        match word(at) {
+            Some("--context" | "-c") => {
+                given = word(at.saturating_add(1)).map(str::to_string);
+                at = at.saturating_add(2);
+            }
+            Some(flag) if flag.starts_with("--context=") => {
+                given = Some(flag.trim_start_matches("--context=").to_string());
+                at = at.saturating_add(1);
+            }
+            _ => break,
+        }
+    }
+    // As the command's environment has it, set or removed there, else as this process's has.
+    let env = |name: &str| {
+        let set = cmd
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value);
+        let value = match set {
+            Some(value) => value.and_then(|v| v.to_str()).map(str::to_string),
+            None => std::env::var(name).ok(),
+        };
+        value.filter(|v| !v.is_empty())
+    };
+    let name = given
+        .or_else(|| env("SHARDS_CONTEXT"))
+        .or_else(|| env("DOCKER_CONTEXT"))
+        .or_else(|| {
+            std::fs::read_to_string(home.join("context"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })?;
+    if name == "default" {
+        return None;
+    }
+    let record = std::fs::read_to_string(home.join("contexts").join(&name)).ok()?;
+    let address = record
+        .lines()
+        .find_map(|line| line.strip_prefix("address "))?
+        .trim()
+        .to_string();
+    std::fs::read_dir(home.parent()?)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|dir| {
+            dir.as_path() != home
+                && std::fs::read_to_string(dir.join("listening"))
+                    .is_ok_and(|bound| bound.trim() == address.as_str())
+        })
+}
+
 /// What a wait on a command follows, the ruling's party: what the command prints (its
 /// caller's to tell, [`Wait::look`]), what its home's daemon says ([`Said`]), and the
 /// processes that serve it ([`Members`]), each followed by D215's readers
@@ -3798,6 +4267,18 @@ fn host_class() -> String {
 pub struct Party {
     members: Members,
     home: Option<PathBuf>,
+    /// Its home's daemon as its pid file last named it to a look of this party's, kept past
+    /// the file: a daemon's record goes before its last work and its exit, as it finishes
+    /// (`Daemon::finish`), and with its home as a test removes the home. Windows deletes what
+    /// no process holds open, the record among it, and leaves what the home's microVMs still
+    /// hold (jupiter, bare-metal WHP, at 183fe264e3: daemon.rs'
+    /// `a_restored_microvm_ends_with_its_home` said "no daemon yet" of a home whose daemon
+    /// and restored microVM were still ending).
+    recorded: Option<shards_ipc::Named>,
+    /// The home whose daemon serves its command, where a context of its home's sends the
+    /// command to another home of this test's ([`serving_home`]): that daemon is a member, its
+    /// threads the party's, as its own home's daemon is (ROOT's word, 2026-11-18, D215).
+    serving: Option<PathBuf>,
     said: Option<Said>,
     watched: std::collections::BTreeMap<u32, shards_api::Watch>,
     cpu: Cpu,
@@ -4015,6 +4496,8 @@ impl Party {
         Party {
             members,
             home: home.map(Path::to_path_buf),
+            recorded: None,
+            serving: None,
             said: home.map(Said::of),
             watched: std::collections::BTreeMap::new(),
             cpu: Cpu::Progress,
@@ -4031,11 +4514,24 @@ impl Party {
         self.cpu = cpu;
     }
 
-    /// Its home's daemon now, as its pid file names it by its ID and its start
-    /// (`shards_ipc::Named`, D185): none where the process with that ID is not the one that
-    /// started then, a crashed daemon's ID reused (#77 waits-09).
+    /// Its home's daemon now, as its record names it by its ID and its start
+    /// (`shards_ipc::Named`, D185, [`record`](Self::record)): none where the process with
+    /// that ID is not the one that started then, a crashed daemon's ID reused (#77 waits-09).
     fn daemon(&self) -> Option<u32> {
-        let named = shards_ipc::Named::read(&self.home.as_ref()?.join(shards_ipc::PID))?;
+        let named = self.record()?;
+        named.lives().then_some(named.pid)
+    }
+
+    /// Its home's daemon's record: as its pid file names it now, or, that file gone, as it
+    /// named it to a look of this party's before ([`Party::recorded`]).
+    fn record(&self) -> Option<shards_ipc::Named> {
+        shards_ipc::Named::read(&self.home.as_ref()?.join(shards_ipc::PID)).or(self.recorded)
+    }
+
+    /// The daemon that serves its command from another home ([`Party::serving`]) now, as
+    /// [`daemon`](Self::daemon) reads its own home's.
+    fn serving_daemon(&self) -> Option<u32> {
+        let named = shards_ipc::Named::read(&self.serving.as_ref()?.join(shards_ipc::PID))?;
         named.lives().then_some(named.pid)
     }
 
@@ -4063,18 +4559,23 @@ impl Party {
             #[cfg(unix)]
             Members::Groups(groups) => grouped(&listed, groups).map(|(pid, ..)| *pid).collect(),
         };
+        // Its daemon's record, kept for its looks after its pid file has gone ([`Party::recorded`]).
+        self.recorded = self.record();
         let daemon = self.daemon();
-        let roots: Vec<u32> = own.into_iter().chain(daemon).collect();
+        // The daemon that serves its command from another home, where one does: a member as
+        // its own home's daemon is ([`Party::serving`]).
+        let serving = self.serving_daemon().filter(|pid| Some(*pid) != daemon);
+        let roots: Vec<u32> = own.into_iter().chain(daemon).chain(serving).collect();
         #[cfg(windows)]
         return (roots, std::collections::BTreeSet::new());
         #[cfg(unix)]
         {
-            // Each member, and whether it is its daemon's helper: under the daemon, with no
-            // VM process between them.
+            // Each member, and whether it is a daemon's helper: under its daemon or the
+            // serving one, with no VM process between them.
             let mut tree: Vec<(u32, bool)> = roots.into_iter().map(|pid| (pid, false)).collect();
             let mut i = 0;
             while let Some(&(parent, parent_helps)) = tree.get(i) {
-                let under_daemon = parent_helps || Some(parent) == daemon;
+                let under_daemon = parent_helps || Some(parent) == daemon || Some(parent) == serving;
                 for (pid, ppid, name) in &listed {
                     if *ppid == parent && !tree.iter().any(|(member, _)| member == pid) {
                         tree.push((*pid, under_daemon && !name.starts_with(VM_PROCESS)));
@@ -4358,6 +4859,13 @@ impl Party {
                 if let Some(waits) = waits_in(pid) {
                     said.push_str(&format!(", its threads waiting in {waits}"));
                 }
+                // Each thread's state and wait reason, as Windows' listing keeps them: what a
+                // refusal of a party none of whose threads was runnable waited on (ROOT,
+                // 2026-11-18, CI 44189693085's moved.rs and storm refusals).
+                #[cfg(windows)]
+                if let Some(threads) = shards_api::threads_said(pid) {
+                    said.push_str(&format!(", its threads {threads}"));
+                }
                 if watch.ended() {
                     said.push_str(", its end under way");
                 }
@@ -4387,6 +4895,13 @@ impl Party {
             Cpu::Progress => who,
             Cpu::Liveness => format!("{who}, its CPU its liveness alone"),
         };
+        let who = match (&self.serving, self.serving_daemon()) {
+            (Some(serving), Some(pid)) => format!("{who}, served by daemon {pid} of {}", serving.display()),
+            (Some(serving), None) => {
+                format!("{who}, served from {}, no daemon living there", serving.display())
+            }
+            (None, _) => who,
+        };
         match (&self.home, self.daemon()) {
             (Some(home), Some(daemon)) => format!("{who}, daemon {daemon} of {}", home.display()),
             // One its home's pid file still names, the same process, no longer living: as it
@@ -4395,7 +4910,7 @@ impl Party {
             // zombie while they still hold its files open (fs/file.c `put_files_struct`), its
             // clients' slots among them, which a client waiting on its slot then waits on (CI
             // 44077430171, x86_64 musl, `a_container_outlives_a_daemon_that_dies`).
-            (Some(home), None) => match shards_ipc::Named::read(&home.join(shards_ipc::PID)) {
+            (Some(home), None) => match self.record() {
                 Some(named) if shards_ipc::started(named.pid).is_ok_and(|start| start == named.start) => {
                     format!(
                         "{who}, its daemon {} no longer living in {}: {}",
@@ -4419,6 +4934,11 @@ fn ending(pid: u32) -> String {
     let threads = shards_api::runnable_threads(pid).map_or_else(String::new, |(runnable, threads)| {
         format!(", {runnable} of {threads} threads runnable")
     });
+    #[cfg(windows)]
+    let threads = match shards_api::threads_said(pid) {
+        Some(said) => format!("{threads}, its threads {said}"),
+        None => threads,
+    };
     match process_status(pid) {
         Some(status) => format!("{status}{threads}"),
         None => format!("its state unread{threads}"),
@@ -4971,7 +5491,12 @@ impl Drop for ServerThread {
 /// its host not holding it. Looked at between those too, paced as D215 paces looks
 /// (`shards_api::pause`: a look's own cost against the wait so far), so that what it last
 /// did is known, for its account of itself at a refusal or as the test process is ended
-/// ([`dump_live_waits`]).
+/// ([`dump_live_waits`]). Its first look is as it begins, as D215's judge takes it
+/// (`Judge::begin`), so that its party is what it was then: a process found then is its
+/// party's until it has gone, whatever its caller does before it looks again. Its party is
+/// gone, its liveness ended, once [`LOOKS_TO_REFUSE`](shards_api::LOOKS_TO_REFUSE) of its
+/// looks in a row, each paced so, find none of it running and its daemon saying nothing
+/// ([`gone`](Self::gone)).
 pub struct Wait {
     kind: &'static WaitKind,
     judge: shards_api::Judge<'static>,
@@ -4987,9 +5512,9 @@ pub struct Wait {
     last: (Instant, String),
     /// Whether its last look found its host holding it, and what showed it.
     holding: Option<String>,
-    /// Whether its last look found its party gone: nothing of it running, nor its daemon
-    /// saying anything.
-    gone: bool,
+    /// How many of its looks in a row, its last among them, found its party gone: nothing of
+    /// it running, nor its daemon saying anything.
+    gone: u32,
     /// Its party's CPU since it began.
     work: Duration,
     /// Whether every look since its judge's look before saw its party run or rest unheld
@@ -5092,6 +5617,13 @@ impl Wait {
         self
     }
 
+    /// It as a wait on a command another home's daemon serves, that home `serving`
+    /// ([`serving_home`]): its daemon a member of its party, as its own home's is.
+    fn served_by(mut self, serving: Option<PathBuf>) -> Wait {
+        self.party.serving = serving;
+        self
+    }
+
     /// A wait beginning now on `party`, `asked` naming what it waits for.
     fn on(kind: &'static WaitKind, party: Party, asked: &str) -> Wait {
         let began = Instant::now();
@@ -5100,7 +5632,7 @@ impl Wait {
             let mut own = own.borrow_mut();
             own.0 = own.0.saturating_add(1);
         });
-        Wait {
+        let mut wait = Wait {
             kind,
             judge: shards_api::Judge::begin(&kind.record),
             party,
@@ -5111,7 +5643,7 @@ impl Wait {
             held: None,
             last: (began, "its start".into()),
             holding: None,
-            gone: false,
+            gone: 0,
             work: Duration::ZERO,
             vouched: false,
             read: None,
@@ -5121,7 +5653,18 @@ impl Wait {
             stage: Stage::Begun,
             command: false,
             still: Vec::new(),
-        }
+        };
+        // Its party as it begins, its first look's (`Judge::begin`): read later, it was what
+        // its caller left of it. A home's patience made before the home's removal first
+        // looked after it, the daemon's record removed and Windows' removal stopped by what
+        // the home's restored microVM still held, and found none of its party, gone, 57 ms in
+        // (jupiter, bare-metal WHP, at 183fe264e3: daemon.rs'
+        // `a_restored_microvm_ends_with_its_home`, flaky so). Found now, its daemon and what
+        // descends from it are followed until each has gone. A first look finds its party
+        // anew, which refuses nothing (`Found::Based`); had it refused, its next look, paced
+        // from this one, judges the same stillness again.
+        let _ = wait.looked(false);
+        wait
     }
 
     /// Its answer came (its client's own end, the line or the state it waited for): its
@@ -5248,7 +5791,11 @@ impl Wait {
             self.daemon_ran = looked.daemon_ran;
         }
         self.holding = None;
-        self.gone = looked.found == Found::Gone;
+        self.gone = if looked.found == Found::Gone {
+            self.gone.saturating_add(1)
+        } else {
+            0
+        };
         match looked.found {
             Found::Progressed => {
                 self.last = (now, looked.what.clone());
@@ -5275,9 +5822,15 @@ impl Wait {
                 self.progressed.get_or_insert(ran);
             }
             self.polls = polls;
-            let found = if self.progressed.take().is_some() {
+            // A window's findings are its own: its progress outranks its hold, and neither
+            // carries into the next window. Taken one at a time, a hold its call's spawn
+            // recorded outlived the window its call's first run progressed, and judged the
+            // next one held: every idle call's refusal came a window late, at the fourth
+            // due look, on arm64 Windows and x86_64 alike (judge-trace 44163626733, PM M618).
+            let (progressed, held) = (self.progressed.take(), self.held.take());
+            let found = if progressed.is_some() {
                 Found::Progressed
-            } else if self.held.take().is_some() {
+            } else if held.is_some() {
                 Found::Held
             } else if looked.found == Found::Based {
                 Found::Based
@@ -5329,7 +5882,7 @@ impl Wait {
             format!("{} {}", self.kind.site, self.kind.line)
         };
         format!(
-            "{kind}: {} ({}), {:?} in: its last progress {} {:?} ago; {}; its record {record}{}{}; its members now: {}",
+            "{kind}: {} ({}), {:?} in: its last progress {} {:?} ago; {}; its record {record}{}{}{}; its members now: {}",
             self.asked,
             self.party.named(),
             self.began.elapsed(),
@@ -5351,6 +5904,15 @@ impl Wait {
                     self.still
                 )
             },
+            if self.gone == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; its party found gone at its last {} looks in a row, {} of which refuse it",
+                    self.gone,
+                    shards_api::LOOKS_TO_REFUSE
+                )
+            },
             self.party.states(),
         )
     }
@@ -5368,9 +5930,12 @@ impl Wait {
         self.judge.due().is_some()
     }
 
-    /// Whether its last look found its party gone ([`Party::look`]).
+    /// Whether its party is gone, its liveness ended: found so ([`Party::look`]) by
+    /// [`LOOKS_TO_REFUSE`](shards_api::LOOKS_TO_REFUSE) of its looks in a row, each paced as
+    /// D215 paces looks, so that a cold wait refuses a party only as its rule refuses a still
+    /// one, never at the one look that found none of it (ROOT, 2026-11-18, #36).
     pub fn gone(&self) -> bool {
-        self.gone
+        self.gone >= shards_api::LOOKS_TO_REFUSE
     }
 
     /// What a refusal says of it.
@@ -6030,6 +6595,34 @@ pub fn registry_stalling_blobs(
 pub const GO_BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request";
 
+/// Answers a client that opened with TLS as Go's net/http answers a request it cannot read
+/// (server.go, publicErr), where `stream`'s first byte is a TLS handshake record's: the hello
+/// read first, as Go reads what it is sent before it answers ([`GO_BAD_REQUEST`]), its end
+/// said, and what the client sends read until it closes, so that the connection never closes
+/// with a byte unread (the registry crate's `testing::answered_tls_as_go` alike). A close with
+/// bytes unread resets it (RFC 1122 §4.2.2.13), and the reset lost the client its answer on
+/// Windows: its TLS handshake read os error 10054 (CI 44189693085) where "server gave HTTP
+/// response to HTTPS client", and a fallback to plain HTTP, were due. Whether it did.
+pub fn answered_tls_as_go(stream: &std::net::TcpStream) -> bool {
+    use std::io::{Read as _, Write as _};
+    let mut first = [0u8; 1];
+    if !(stream.peek(&mut first).is_ok_and(|n| n == 1) && first[0] == 0x16) {
+        return false;
+    }
+    let mut tcp = stream;
+    let mut header = [0u8; 5];
+    if tcp.read_exact(&mut header).is_ok() {
+        let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        let mut record = vec![0u8; len];
+        let _ = tcp.read_exact(&mut record);
+    }
+    let _ = tcp.write_all(GO_BAD_REQUEST);
+    let _ = tcp.shutdown(std::net::Shutdown::Write);
+    let mut sink = [0u8; 4096];
+    while matches!(tcp.read(&mut sink), Ok(n) if n > 0) {}
+    true
+}
+
 fn registry_serving(
     image: Served,
     stalls: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
@@ -6072,10 +6665,8 @@ fn registry_serving_at(
             std::thread::spawn(move || {
                 let _serving = Server::begin();
                 // Asked for TLS, it answers as Go's net/http, and so a registry, answers a
-                // request it cannot read (server.go, publicErr).
-                let mut first = [0u8; 1];
-                if stream.peek(&mut first).is_ok_and(|n| n == 1) && first[0] == 0x16 {
-                    let _ = (&stream).write_all(GO_BAD_REQUEST);
+                // request it cannot read ([`answered_tls_as_go`]).
+                if answered_tls_as_go(&stream) {
                     return;
                 }
                 // A head and its body go as two writes: unsent, its head would wait for an
@@ -6175,10 +6766,8 @@ pub fn serve_file(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
             let (body, count) = (body.clone(), count.clone());
             std::thread::spawn(move || {
                 // Asked for TLS, it answers as Go's net/http, and so a registry, answers a
-                // request it cannot read (server.go, publicErr).
-                let mut first = [0u8; 1];
-                if stream.peek(&mut first).is_ok_and(|n| n == 1) && first[0] == 0x16 {
-                    let _ = (&stream).write_all(GO_BAD_REQUEST);
+                // request it cannot read ([`answered_tls_as_go`]).
+                if answered_tls_as_go(&stream) {
                     return;
                 }
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -6696,7 +7285,7 @@ pub fn judged<T: Send>(
     call: impl FnOnce() -> T + Send,
 ) -> Result<T, String> {
     let wait = Wait::on(WaitKind::at(std::panic::Location::caller()), party, asked);
-    judging(wait, Stage::Awaited, asked, stop, call).0
+    judging(wait, Stage::Awaited, asked, stop, call, None).0
 }
 
 /// [`judged`], and its wait's account as it ended, before its answer taught its kind: what
@@ -6711,7 +7300,34 @@ pub fn judged_accounted<T: Send>(
     call: impl FnOnce() -> T + Send,
 ) -> (Result<T, String>, String) {
     let wait = Wait::on(WaitKind::at(std::panic::Location::caller()), party, asked);
-    judging(wait, Stage::Awaited, asked, stop, call)
+    judging(wait, Stage::Awaited, asked, stop, call, None)
+}
+
+/// [`judged_accounted`], its call told once its judge's looks have outlasted their rule: on the
+/// channel its call takes, the due looks that found its party still since it last progressed,
+/// held or based, each as far into the wait as it came, once they are more than
+/// [`shards_api::LOOKS_TO_REFUSE`] and none refused it; the channel closing as its wait ends,
+/// refused or not. Its call's thread is its party's member, so it hears nothing before: each
+/// word wakes it, which its next look takes for progress ([`judging`]). What a test that bounds
+/// a wait on a still party by its judge's own looks reads, where a span of time would be cut
+/// short by a host that holds the looks late (harness.rs
+/// `a_judged_calls_own_work_is_its_progress`).
+#[track_caller]
+pub fn judged_watching<T: Send>(
+    party: Party,
+    asked: &str,
+    call: impl FnOnce(std::sync::mpsc::Receiver<Vec<Duration>>) -> T + Send,
+) -> (Result<T, String>, String) {
+    let wait = Wait::on(WaitKind::at(std::panic::Location::caller()), party, asked);
+    let (still, looks) = std::sync::mpsc::channel();
+    judging(
+        wait,
+        Stage::Awaited,
+        asked,
+        || {},
+        move || call(looks),
+        Some(still),
+    )
 }
 
 /// [`judged`], of a call whose caller knows its answer is there already (what a member that
@@ -6727,7 +7343,7 @@ pub fn judged_there<T: Send>(
     call: impl FnOnce() -> T + Send,
 ) -> Result<T, String> {
     let wait = Wait::on(WaitKind::at(std::panic::Location::caller()), party, asked);
-    judging(wait, Stage::Begun, asked, stop, call).0
+    judging(wait, Stage::Begun, asked, stop, call, None).0
 }
 
 /// Where a judged call's own thread is ([`judging`]).
@@ -6757,6 +7373,7 @@ fn judging<T: Send>(
     asked: &str,
     stop: impl FnOnce(),
     call: impl FnOnce() -> T + Send,
+    mut watch: Option<std::sync::mpsc::Sender<Vec<Duration>>>,
 ) -> (Result<T, String>, String) {
     let calling = std::sync::Mutex::new(Calling::Spawned);
     let thread = || calling.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6803,7 +7420,21 @@ fn judging<T: Send>(
             if let Err(stall) = looked {
                 break wait.refused(&stall);
             }
+            // Its watcher is told once, as its due looks have found its party still more times
+            // than its judge's rule refuses within, none refusing it. Told of each change, its
+            // call's own thread woke to hear it, and that run, its party's member's, was its
+            // next due look's progress: its party never stayed still, so its wait was neither
+            // refused nor told it had outlasted its rule (CI 44164945050 at 95247a79c, harness.rs
+            // `a_judged_calls_own_work_is_its_progress`, to the Tests step's limit on every
+            // Linux and macOS job and on arm64 Windows).
+            if wait.still.len() > shards_api::LOOKS_TO_REFUSE as usize
+                && let Some(still) = watch.take()
+            {
+                let _ = still.send(wait.still.clone());
+            }
         };
+        // Its watcher hears its wait end, refused, before its call is stopped.
+        drop(watch.take());
         stop();
         let _ = worker.join();
         (Err(refused), wait.account())
@@ -8670,10 +9301,8 @@ pub fn writable_registry_requiring(authorization: Option<String>) -> (u16, Arc<s
             let wanted = authorization.clone();
             std::thread::spawn(move || {
                 // Asked for TLS, it answers as Go's net/http, and so a registry, answers a
-                // request it cannot read (server.go, publicErr).
-                let mut first = [0u8; 1];
-                if stream.peek(&mut first).is_ok_and(|n| n == 1) && first[0] == 0x16 {
-                    let _ = (&stream).write_all(GO_BAD_REQUEST);
+                // request it cannot read ([`answered_tls_as_go`]).
+                if answered_tls_as_go(&stream) {
                     return;
                 }
                 let mut reader = BufReader::new(stream.try_clone().unwrap());

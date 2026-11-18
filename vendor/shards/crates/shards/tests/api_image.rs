@@ -165,6 +165,7 @@ fn spec(home: &TempDir, image: &str) -> ImageSpec {
         upstream_roots: Vec::new(),
         plug_roots: Vec::new(),
         egress_ceiling: Vec::new(),
+        served: Vec::new(),
         gpu_report: None,
     }
 }
@@ -447,9 +448,10 @@ fn a_share_at_a_granted_volume_reaches_the_harness() {
 /// the image's `VOLUME` for its harness and given its harness (a share's members narrowing what
 /// a `VOLUME` gives, never widening it), and its run's plug roots its project's top-level
 /// directory, the home's and `/volumes` (D271). Its harness starts in its project, which it
-/// reads at its host path, its files its own (D38), and reads its plugin. Where its host path
-/// is no guest's ([`guest_at`]: Linux's tests keep theirs in `/tmp`, Windows' a `C:\` path),
-/// it is shared beneath `/work` by its name, as kiln shares a Windows project.
+/// reads at its host path, its files its own (D38), and reads its plugin. A Windows host's is
+/// shared at its path as WSL names it, `C:\x` at `/mnt/c/x`, as kiln shares a Windows project
+/// (D235); one no guest's path names ([`guest_at`]: Linux's tests keep theirs in `/tmp`),
+/// beneath `/work` by its name.
 #[test]
 fn a_project_given_its_harness_is_where_it_works() {
     if cannot_run_vms() {
@@ -724,15 +726,17 @@ impl Drop for HostPathDir {
 
 /// Where a run's microVM sees host directory `host`, as kiln shares a project
 /// (`isolated::guest_path`): at its own path where that is a Unix one beneath a root a
-/// run's domains may be given things under ([`plug_root_of`]); else beneath `/work` by its
-/// own name. A Windows path names no Linux one; and a path beneath a directory init keeps
-/// its own is none a share may be at: Linux's tests keep theirs in `/tmp`, each domain's
+/// run's domains may be given things under ([`plug_root_of`]); a Windows drive's at its path
+/// as WSL names it, `C:\x` at `/mnt/c/x` ([`common::at_host_path`], D235). Else, for these
+/// tests alone, beneath `/work` by its own name: a path beneath a directory init keeps its
+/// own is none a share may be at: Linux's tests keep theirs in `/tmp`, each domain's
 /// scratch, at or under which init refuses a share (D139), and a plug root there is refused
 /// (`plug::root_name`; CI run 43876891053: "\"/tmp\": a plug root is one top-level
 /// directory").
 fn guest_at(host: &std::path::Path) -> String {
     match host.to_str() {
         Some(path) if plug_root_of(path).is_some() => path.to_owned(),
+        _ if cfg!(windows) => common::at_host_path(host),
         _ => format!("/work/{}", host.file_name().unwrap().to_string_lossy()),
     }
 }
@@ -3881,6 +3885,7 @@ fn pooled_spec(home: &std::path::Path, image: &str, binary: &std::path::Path) ->
         upstream_roots: Vec::new(),
         plug_roots: Vec::new(),
         egress_ceiling: Vec::new(),
+        served: Vec::new(),
         gpu_report: None,
     }
 }
@@ -4196,6 +4201,17 @@ fn said_all(rx: &std::sync::mpsc::Receiver<String>, wanted: &[String]) -> Vec<St
     seen
 }
 
+/// Writes `text` to `path` whole, beside it first and then renamed into place, as the
+/// member's own `seen` is (testguest's plugged.rs): a member polling for `path` reads it the
+/// moment it is there, and written in place (`std::fs::write` makes the file, then writes
+/// it) a plugged volume's `from-host` was read empty, "from-host " for "from-host first
+/// session" (CI 44138098584, x86_64 Windows, windows-2025).
+fn write_whole(path: &std::path::Path, text: &str) {
+    let part = path.with_extension("part");
+    std::fs::write(&part, text).unwrap();
+    std::fs::rename(&part, path).unwrap();
+}
+
 /// D271, P6b.2: a host directory plugged read-write into a running member is read there and
 /// written back; one plugged read-only refuses the member's writes (EROFS); a volume of the
 /// home's store, made by its plug, is read and written alike, its files kept in the home; each
@@ -4295,7 +4311,7 @@ fn volumes_plugged_live_are_read_and_written_as_asked_and_a_busy_one_stays() {
     })
     .unwrap();
     let data = home.join("volumes").join(volume).join("_data");
-    std::fs::write(data.join("from-host"), "vol host\n").unwrap();
+    write_whole(&data.join("from-host"), "vol host\n");
     let wanted: Vec<String> = [
         "/session/rw from-host rw host",
         "/session/rw from-member ok",
@@ -4375,7 +4391,7 @@ fn an_agents_volume_outlives_its_session_and_is_listed_and_cleared() {
     let first = boot(&home, &s);
     let lines = lines_of(&*first, Channel::Stdout);
     ask(&*first, |g| g.plug(&plug, Duration::MAX)).unwrap();
-    std::fs::write(data.join("from-host"), "first session\n").unwrap();
+    write_whole(&data.join("from-host"), "first session\n");
     said_all(&lines, &wanted);
     first.stop().unwrap();
     drop(first);
@@ -4455,7 +4471,7 @@ fn an_agents_volume_refuses_writes_past_its_bound() {
     };
     ask(&*guest, |g| g.plug(&plug, Duration::MAX)).unwrap();
     let data = home.join("volumes").join(volume).join("_data");
-    std::fs::write(data.join("from-host"), "fill\n").unwrap();
+    write_whole(&data.join("from-host"), "fill\n");
     let mut filled = 0u64;
     for lines in &lines {
         let seen = said_all(lines, &["holding /session/vol".to_string()]);

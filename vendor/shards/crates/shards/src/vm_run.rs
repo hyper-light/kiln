@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use shards_vmm::vm::{
-    self, AfterSnapshot, Config, Console, Disk, ExitReason, Handle, RestoreConfig, Running, SnapshotPolicy,
-    VsockHost,
+    self, AfterSnapshot, Config, Console, Disk, ExitReason, Handle, RECORD_FOR, RestoreConfig, Running,
+    SnapshotPolicy, VsockHost,
 };
 
 use crate::spec::Options;
@@ -94,7 +94,7 @@ const RUN_USAGE: &str = "usage: shards run vm --kernel PATH [--initrd PATH | --i
 
 const RESTORE_USAGE: &str = "usage: shards restore vm DIR [--hold] [--vsock PATH] [--no-console [--console-said N]] [--gpu] [--backing PATH[:ro]]... [--layer PATH [--layer-cloned GENERATION]] [--snapshot-dir DIR [--snapshot-then stop|resume]]
        shards restore vm DIR [--hold] [--backing PATH[:ro]]... [--layer PATH [--layer-cloned GENERATION]] [WORKLOAD OPTIONS] -- COMMAND [ARG...]
-       shards restore vm DIR [--working-set FD] ...
+       shards restore vm DIR [--working-set FD [--record-until FD]] ...
        shards restore vm DIR --warm FD [--backing PATH[:ro]]... [--layer PATH [--layer-cloned GENERATION]]
        shards restore vm DIR --resume FD [--backing PATH[:ro]]... [--layer PATH [--layer-cloned GENERATION]]
        shards restore vm MICROVM [SNAPSHOT]
@@ -114,6 +114,10 @@ const RESTORE_USAGE: &str = "usage: shards restore vm DIR [--hold] [--vsock PATH
                  a newline, to descriptor FD, for its spawner to keep beside the
                  generation: no VM writes its snapshot (D30). A restore of a generation
                  that has one maps it ahead.
+  --record-until: with --working-set and no COMMAND: end the recording, and write the
+                  working set, as soon as a byte or the end arrives on descriptor FD, as a
+                  run's ends when its command answers; without a word, a while after the
+                  start, as before.
   --warm: resume at once and connect, then take one command, with the stdio and connection
           of the client it is for, from the daemon on the Unix socket at descriptor FD.
   --resume: DIR is a run's snapshot, its command running already: take its run's stdio,
@@ -789,6 +793,10 @@ struct Restore {
     /// pipe by): where the working set this restore records goes, for its spawner to keep
     /// (D30).
     working_set_to: Option<LinkArg>,
+    /// `--record-until FD` (Windows: `--record-until NAME`): where its spawner says when a
+    /// restore whose guest runs no command has run what it is for, which ends its
+    /// recording as a run's command's answer ends a run's (D25).
+    record_until: Option<LinkArg>,
     /// `--resume FD`, in place of `--warm FD`: the snapshot is a run's, whose command goes
     /// on (D176).
     resume: bool,
@@ -806,6 +814,7 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
     let mut layer = None;
     let mut layer_cloned = None;
     let mut working_set_to = None;
+    let mut record_until = None;
     let (mut gpu_report, mut gpu_scope) = (None, None);
     // Each word with the value `spec::next_vm_word` gives it, a value only for a flag
     // `spec::RUN_VALUED` or `spec::RESTORE_VALUED` lists, as the command line is read ahead
@@ -839,6 +848,9 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
             "--layer-cloned" => layer_cloned = Some(text(value("--layer-cloned")?)?),
             "--working-set" => {
                 working_set_to = Some(link_arg("--working-set", text(value("--working-set")?)?)?)
+            }
+            "--record-until" => {
+                record_until = Some(link_arg("--record-until", text(value("--record-until")?)?)?)
             }
             "--warm" => warm = Some(link_arg("--warm", text(value("--warm")?)?)?),
             // Its renderer's report as it rejoins its snapshot's selection (D233).
@@ -882,6 +894,13 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
     }
     if warm.is_some() && working_set_to.is_some() {
         return Err("--warm hands its working set to the daemon: no --working-set".into());
+    }
+    if record_until.is_some()
+        && (working_set_to.is_none() || warm.is_some() || !common.workload.argv.is_empty())
+    {
+        return Err(
+            "--record-until ends the recording of a restore whose guest runs no command: it needs --working-set, and no --warm, --resume or command".into(),
+        );
     }
     // A warm restore's report (D233), as a warm boot's: its run host's, which names the scope
     // before it launches it; the snapshot's selection is checked as it restores.
@@ -932,6 +951,7 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
         workload: common.workload,
         warm,
         working_set_to,
+        record_until,
         resume,
         said_to: common.said_to.take(),
         gpu_report,
@@ -1854,6 +1874,7 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
         workload,
         warm,
         working_set_to,
+        record_until,
         resume,
         said_to,
         gpu_report,
@@ -1876,6 +1897,13 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
     let to = match working_set_to.map(WorkingSetTo::new).transpose() {
         Ok(to) => to,
+        Err(e) => {
+            report(e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let until = match record_until.map(|u| handed("--record-until", u)).transpose() {
+        Ok(until) => until,
         Err(e) => {
             report(e);
             return ExitCode::FAILURE;
@@ -1904,7 +1932,7 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
             cfg.vsock = Some(vsock);
             let started = restore_vm(cfg).map_err(vm::StartError::from);
             if let (Ok((handle, _)), Some(to)) = (&started, to)
-                && let Some(h) = to.hand_after(handle, RECORD_FOR)
+                && let Some(h) = to.hand_after(handle, RECORD_FOR, None)
             {
                 let _ = slot.set(h);
             }
@@ -1921,7 +1949,7 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
         wait_for_release(handle);
     }
     let handing = match (&started, to) {
-        (Ok((handle, _)), Some(to)) => to.hand_after(handle, RECORD_FOR),
+        (Ok((handle, _)), Some(to)) => to.hand_after(handle, RECORD_FOR, until),
         _ => None,
     };
     let code = supervise(started, console, false, said_to, InputOwner::Console, None);
@@ -1970,16 +1998,26 @@ impl WorkingSetTo {
         handed("--working-set", given).map(WorkingSetTo)
     }
 
-    /// Hands what `handle` records once `after` has passed since its vCPUs started, or the
-    /// VM has ended ([`Handing::now`]), whichever is first, on a thread of its own: a
-    /// restore has no request to end its recording, as a warm VM's has. None where it
-    /// records nothing.
-    fn hand_after(self, handle: &Handle, after: std::time::Duration) -> Option<Handing> {
+    /// Hands what `handle` records once `after` has passed since its vCPUs started, the VM
+    /// has ended ([`Handing::now`]), or its spawner has said so on `until`
+    /// (`--record-until`, [`told`]), whichever is first, on a thread of its own: a restore
+    /// has no request to end its recording, as a warm VM's has. None where it records
+    /// nothing.
+    fn hand_after(
+        self,
+        handle: &Handle,
+        after: std::time::Duration,
+        until: Option<std::fs::File>,
+    ) -> Option<Handing> {
         if !handle.recording() {
             return None;
         }
         let handle = handle.clone();
         let (done, ended) = std::sync::mpsc::channel::<()>();
+        if let Some(until) = until {
+            // Its thread ends with the word or the process: none waits on it.
+            let _ = told(until, done.clone());
+        }
         let spawned = std::thread::Builder::new()
             .name("working-set".into())
             .spawn(move || {
@@ -2010,6 +2048,29 @@ impl WorkingSetTo {
         self.0
             .write_all(&framed)
             .map_err(|e| format!("handing it to its spawner: {e}"))
+    }
+}
+
+/// Wakes a restore's hand-off on `done` as its spawner says its guest has run what it is
+/// for (`--record-until`, D25): a byte, or the end of `until`, whichever comes first, as a
+/// run's command's answer ends a run's recording. Its thread, where the system made one.
+fn told(
+    mut until: impl std::io::Read + Send + 'static,
+    done: std::sync::mpsc::Sender<()>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let spawned = std::thread::Builder::new()
+        .name("record-until".into())
+        .spawn(move || {
+            let _ = until.read(&mut [0u8; 1]);
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(thread) => Some(thread),
+        Err(e) => {
+            // The recording then ends as it did without the word.
+            shards_vmm::debug!("the recording's end: {e}");
+            None
+        }
     }
 }
 
@@ -2189,6 +2250,10 @@ fn serve_workload(
         static TIMING: workload::Timing = workload::Timing::new();
         let to_guest = &TO_GUEST;
         let warm = matches!(command, Command::Warm(..));
+        // A warm VM restored from a template for its daemon's pool, not a run's save resumed:
+        // where it ends for its template's sake before it takes a run, its status says so
+        // (`shards_ipc::TEMPLATE_FAILED_STATUS`, D26).
+        let refill = matches!(command, Command::Warm(_, false));
         // The run a warm VM took (`warm::receive`, as it says TAKEN): its end goes to its owner
         // once (`warm::Taken::end`), and what its machine used in all once it is down (D260's
         // final use) on a handle of the link of its own, from this thread, beside the
@@ -2209,6 +2274,11 @@ fn serve_workload(
         }
         let (handle, running) = match start(vsock) {
             Ok(started) => started,
+            // Its template's files did not read: the template's fault ([`SNAPSHOT_UNREAD`]).
+            Err(e) if refill && SNAPSHOT_UNREAD.get().is_some() => {
+                report(e);
+                return ExitCode::from(shards_ipc::TEMPLATE_FAILED_STATUS);
+            }
             Err(e) => return failed(e),
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2554,9 +2624,26 @@ fn serve_workload(
         match &reason {
             ExitReason::Error(e) => report(e),
             // The host's hypervisor refused to enter a vCPU (D261): said as the host's, with
-            // what its host model's records hold of its count.
-            ExitReason::Refused(refused) => report(refused),
+            // what its host model's records hold of its count. A warm VM's own log is its
+            // daemon's (review 8.10), where its stderr, its client's as it served, is let go of
+            // by its run's end: said there too, by its VM process, so that the run it could not
+            // serve is told by its refusal (CI 44189693085, x86_64 musl: a pool's run ended 125,
+            // its VM's refusal said nowhere).
+            ExitReason::Refused(refused) => {
+                report(refused);
+                if shards_vmm::log::redirected() {
+                    shards_vmm::warn!("{refused}");
+                }
+            }
             _ => {}
+        }
+        // A warm VM whose guest reset or powered off before it took a run (its kernel
+        // panicking, which `panic=-1` resets; its init ending) failed for its template's
+        // guest, so for its template, said by its status (D26). Its host's refusal to enter
+        // it (D261), its VMM's error and its stop are no fault of its template's.
+        if refill && TAKEN.get().is_none() && matches!(reason, ExitReason::Reset | ExitReason::PowerOff) {
+            report("its guest ended before it took a run");
+            return ExitCode::from(shards_ipc::TEMPLATE_FAILED_STATUS);
         }
         // The guest waits for its status to be read before it powers off, so the relay
         // has finished unless the guest never ran the command.
@@ -2584,21 +2671,6 @@ fn serve_workload(
         }
     }
 }
-
-/// How long a VM records its working set after its command starts, at most, unless the
-/// command answers first: a command still running then has long passed its start. The
-/// whole way from the request to the start is recorded, however long a host takes over
-/// it (a nested KVM host took 28 ms, PM M33).
-/// - HVF: 50 ms. Recording slows the guest about sixfold (a pooled `true` took 9.9 ms
-///   against 1.5, PM M30), so this is some 8 ms of the command's own time, past the 5 ms
-///   a run should take.
-/// - KVM: 1 s. Recording costs nothing, and a nested host took 125 ms to run `true` (PM
-///   M33).
-const RECORD_FOR: std::time::Duration = if shards_vmm::vm::RESTORES_RECORD {
-    std::time::Duration::from_secs(1)
-} else {
-    std::time::Duration::from_millis(50)
-};
 
 /// Saves the working set `after` from now, if the VM still records it then.
 fn end_recording_in(handle: &Handle, after: std::time::Duration) {
@@ -2906,7 +2978,7 @@ fn restore_reported(
             // as an AppContainer may not at one it was not handed (PM M345).
             #[cfg(windows)]
             refuse_unasked(&shards_vmm::snapshot::backing_named(&cfg.dir)?)?;
-            let pinned = shards_vmm::snapshot::read(&cfg.dir)?;
+            let pinned = read_snapshot(&cfg.dir)?;
             refuse_unasked(&shards_vmm::snapshot::backing_of(&pinned))?;
             pinned
         }
@@ -2920,7 +2992,7 @@ fn restore_reported(
             let named = shards_vmm::snapshot::backing_named(&cfg.dir)?;
             add(&mut paths, &named);
             confine(&paths)?;
-            let pinned = shards_vmm::snapshot::read(&cfg.dir)?;
+            let pinned = read_snapshot(&cfg.dir)?;
             if shards_vmm::snapshot::backing_of(&pinned) != named {
                 return Err(format!(
                     "{}: its snapshot was saved again as it was read",
@@ -2931,7 +3003,7 @@ fn restore_reported(
         }
         #[cfg(not(windows))]
         None => {
-            let pinned = shards_vmm::snapshot::read(&cfg.dir)?;
+            let pinned = read_snapshot(&cfg.dir)?;
             add(&mut paths, &shards_vmm::snapshot::backing_of(&pinned));
             confine(&paths)?;
             pinned
@@ -2960,6 +3032,19 @@ fn restore_reported(
             )
         }
     }
+}
+
+/// Whether this process's restore found its snapshot's files unreadable
+/// ([`read_snapshot`]): their fault, its template's where a warm VM restores one, which such
+/// a VM's status tells its daemon ([`serve_workload`], D26), not its host's.
+static SNAPSHOT_UNREAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// The snapshot in `dir`, read and pinned (`shards_vmm::snapshot::read`), a failure kept
+/// ([`SNAPSHOT_UNREAD`]).
+fn read_snapshot(dir: &Path) -> Result<shards_vmm::snapshot::Pinned, String> {
+    shards_vmm::snapshot::read(dir).inspect_err(|_| {
+        let _ = SNAPSHOT_UNREAD.set(());
+    })
 }
 
 /// `path` made whole against the working directory, and normalized as
@@ -3565,15 +3650,21 @@ impl shards_vmm::platform::Stager for SpawnerStages {
         crate::grant_ask::ranges(link, file, len)
     }
 
+    /// Its end waited for with the link let go: the spawner answers this VM's other asks
+    /// meanwhile, its vsock listener's next pair among them, which a resumed VM's device
+    /// waited for as long as the generation's fsyncs took (D30, D272, amended 2026-11-18).
     fn commit(&self, _dir: &Path, name: &str) -> std::io::Result<()> {
-        let grants = GRANTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let link = grants.as_ref().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no spawner to commit a snapshot through",
-            )
-        })?;
-        crate::grant_ask::commit(link, name)
+        let word = {
+            let grants = GRANTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let link = grants.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no spawner to commit a snapshot through",
+                )
+            })?;
+            crate::grant_ask::commit(link, name)?
+        };
+        crate::grant_ask::durable(&word)
     }
 }
 
@@ -4505,6 +4596,52 @@ mod tests {
         let restore = parse_restore(args(&[b"/t", b"--layer", b"/l", b"--layer-cloned", b"--hold"])).unwrap();
         assert_eq!(restore.cfg.layer_cloned.as_deref(), Some("--hold"));
         assert!(!restore.cfg.hold);
+    }
+
+    /// `--record-until` ends the recording of a restore whose guest runs no command (D25): it
+    /// needs `--working-set`, and refuses `--warm` and a command, which end theirs as their
+    /// command answers.
+    #[test]
+    fn record_until_is_a_bare_restores_with_its_working_set() {
+        let restore = |extra: &[&str]| {
+            let w: Vec<&[u8]> = std::iter::once("/t")
+                .chain(extra.iter().copied())
+                .map(str::as_bytes)
+                .collect();
+            parse_restore(args(&w))
+        };
+        let told = restore(&["--working-set", "3", "--record-until", "4"][..]).unwrap();
+        assert_eq!((told.working_set_to, told.record_until), (Some(3), Some(4)));
+        let refused: [&[&str]; 3] = [
+            &["--record-until", "4"],
+            &["--record-until", "4", "--warm", "5"],
+            &["--working-set", "3", "--record-until", "4", "--", "true"],
+        ];
+        for refused in refused {
+            let e = restore(refused)
+                .err()
+                .unwrap_or_else(|| panic!("{refused:?}: taken"));
+            assert!(e.contains("--record-until"), "{refused:?}: {e}");
+        }
+    }
+
+    /// A restore's spawner ends its recording with a byte, or with its pipe's end, and nothing
+    /// ends it before either (`--record-until`, D25).
+    #[test]
+    fn a_spawners_word_ends_a_bare_restores_recording() {
+        for by_byte in [true, false] {
+            let (read, mut write) = std::io::pipe().unwrap();
+            let (done, woken) = std::sync::mpsc::channel();
+            let reader = told(read, done).unwrap();
+            assert_eq!(woken.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+            if by_byte {
+                std::io::Write::write_all(&mut write, b"\n").unwrap();
+            } else {
+                drop(write);
+            }
+            reader.join().unwrap();
+            assert_eq!(woken.try_recv(), Ok(()), "by a byte: {by_byte}");
+        }
     }
 
     fn args(list: &[&[u8]]) -> impl Iterator<Item = OsString> {

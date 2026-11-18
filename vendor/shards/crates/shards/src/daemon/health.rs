@@ -118,7 +118,7 @@ impl std::fmt::Display for Cut {
             Cut::Stalled(stall) => write!(
                 f,
                 "its microVM ran no CPU in {:?} past the slowest answer seen ({:?}), {:?} into the \
-                 wait ({})",
+                 wait ({}){}",
                 stall.over(),
                 stall.slowest(),
                 stall.waited(),
@@ -128,7 +128,8 @@ impl std::fmt::Display for Cut {
                         "the least a microVM ran and still answered: {:?} in {:?}",
                         least.cpu, least.over
                     )
-                )
+                ),
+                stall.account()
             ),
             Cut::Unread { pid, failure } => {
                 write!(f, "its microVM's process {pid} could not be read: {failure}")
@@ -166,6 +167,10 @@ pub(super) struct Answers {
     pub run_send: Record,
     /// A VM's guest times, its `GUEST_TIMED` after its `GUEST_TIME` (`commands::guest_times_of`).
     pub guest_time: Record,
+    /// A run's VM process's end once its command's end has come, which its told end, volumes
+    /// and share processes wait for on Windows (`daemon::await_parked`, D281).
+    #[cfg(windows)]
+    pub vm_end: Record,
     /// A starting VM's launch, its spawn to its first request for access (`daemon::launch`,
     /// macOS): the host's to admit (PM M166), followed by its liveness alone, said once past
     /// its slowest.
@@ -204,6 +209,8 @@ impl Default for Answers {
             held: Record::new(),
             run_send: Record::new(),
             guest_time: Record::new(),
+            #[cfg(windows)]
+            vm_end: Record::new(),
             #[cfg(target_os = "macos")]
             launches: Record::new(),
             #[cfg(target_os = "macos")]
@@ -790,8 +797,9 @@ pub(super) enum Wait<'a> {
     /// since the look before ([`Cut::Stalled`]), or where it could not be read
     /// ([`Cut::Unread`]). A microVM its host holds at a `memory.high` is slowed there for as
     /// long as it is over it, and the answer of one asked to give back what would bring it
-    /// under comes as its host lets it run (D188; PM M467). It begins before its exec is
-    /// asked ([`Begun`]), so its answer, however soon, teaches from the ask.
+    /// under comes as its host lets it run (D188; PM M467). Its clock is taken before its
+    /// exec is asked ([`Begun`]), so its answer, however soon, teaches its time from the ask,
+    /// and its VM process is read only once its wait has lasted W* ([`read_at`]).
     WhileRuns(u32, &'a Record),
     /// A group member's word, judged as WhileRuns, with its refusal told immediately:
     /// the group must not invent an elapsed-time verdict while this wait still progresses,
@@ -800,66 +808,130 @@ pub(super) enum Wait<'a> {
     GroupWord(u32, &'a Record, &'a (dyn Fn(&Cut) + Sync)),
 }
 
-/// A wait for an exec's end, begun before its exec is asked (D188, amended by ci-fixes): its
-/// microVM's process followed from then, or why it could not be, so that no answer can come
-/// before the wait and each one teaches its kind its whole time from the ask. Begun after its
-/// ask, an answer there first taught nothing, and on Windows arm64 its output reader's spawn
-/// outlasted a stand-in's answer every time (CI 43968984258: no give-back learned in ~24k
-/// passes).
+/// A wait for an exec's end, its clock taken before its exec is asked (D188, amended by
+/// ci-fixes and by own-35-ci-green): each answer teaches its kind its time from the ask
+/// ([`teach_answer`]), and its microVM's process is read only once the wait has lasted W*
+/// ([`read_at`], D215's rule). Its process read before the ask, as it was from 2026-11-16,
+/// held every ask for that read: on Windows a ToolHelp snapshot of every process and the
+/// system's records of every process and thread, each read of which took 13.1 to 13.8 ms on
+/// jupiter (PM M606). Read after its ask with no clock before it, as before that, an answer
+/// there first taught nothing, and on Windows arm64 its output reader's spawn outlasted a
+/// stand-in's answer every time (CI 43968984258: no give-back learned in ~24k passes).
 struct Begun<'a> {
     wait: Wait<'a>,
-    follow: Option<Follow<'a>>,
-    cut: Option<Cut>,
+    /// When its exec was asked, near enough: taken before the ask.
+    asked: Instant,
 }
 
 impl<'a> Begun<'a> {
     fn now(wait: Wait<'a>) -> Begun<'a> {
-        let (follow, cut) = match wait {
-            Wait::WhileRuns(vm, record) | Wait::GroupWord(vm, record, _) => match following(vm, record) {
-                Ok(follow) => (follow, None),
-                Err(cut) => (None, Some(cut)),
-            },
-            Wait::Ending | Wait::For(_) => (None, None),
-        };
-        Begun { wait, follow, cut }
+        Begun {
+            wait,
+            asked: Instant::now(),
+        }
+    }
+}
+
+/// What an answer to an ask made at `asked` teaches its kind, `record`: an exec's (D188,
+/// amended 2026-11-17) and a judged exchange's ([`Judged`]; D215, amended 2026-11-17). Its
+/// time from the ask, its slowest, however it was waited for; and, where its party's process
+/// was followed from a look before the answer (`follow`), the work read from then, with its
+/// rate (D215: only work read through an answer teaches R* and C*). An answer that came
+/// before any read of its party ([`read_at`]) teaches its slowest alone, with no read.
+pub(super) fn teach_answer(record: &Record, asked: Instant, follow: Option<&mut Follow<'_>>) {
+    if let Some(follow) = follow {
+        follow.answered();
+    }
+    record.teach_unrated(asked.elapsed());
+}
+
+/// When a judged wait reads its party's process ([`read_at`]).
+pub(super) enum ReadAt {
+    /// Not while its kind has no answer yet: its answer alone, until it comes or its party ends.
+    Never,
+    /// Not before this moment, its wait then W* long: its answer alone until then.
+    Until(Instant),
+    /// Now: its wait has lasted W*.
+    Now,
+}
+
+/// When a wait asked at `asked`, whose kind's answers `record` keeps, first reads its party's
+/// process: only once it has lasted W*, its kind's slowest answer timed from the ask, as
+/// before then its judge could refuse nothing (D215, amended 2026-11-17, ROOT's rulings: one
+/// rule for every judged wait, an exec's, a visit's hold and a judged exchange's). Until then
+/// it waits on its answer alone, and an answer within W* teaches W* alone, with no read of
+/// its party ([`teach_answer`]). The one change in behaviour is that a stalled party is
+/// refused about one W* later; on Windows each read is a ToolHelp snapshot of every process
+/// and the system's records of every process and thread (PM M606: 13.1 to 13.8 ms a read).
+pub(super) fn read_at(record: &Record, asked: Instant) -> ReadAt {
+    let shards_api::Seen::Learned { slowest, .. } = record.seen() else {
+        return ReadAt::Never;
+    };
+    match asked.checked_add(slowest) {
+        Some(due) if Instant::now() < due => ReadAt::Until(due),
+        _ => ReadAt::Now,
     }
 }
 
 /// Waits on `ours` for an exec's end, ending it (SIGKILL) as its wait, `begun`, says, and
-/// waiting on for its end then, so that none outlives its asker.
+/// waiting on for its end then, so that none outlives its asker. A wait that follows its
+/// microVM reads its process only once it has lasted W* ([`read_at`]); an answer read before
+/// then teaches its time from the ask alone ([`teach_answer`]).
 fn await_exit(ours: &shards_ipc::Stream, begun: Begun<'_>) -> Ended {
-    let Begun {
-        wait,
-        mut follow,
-        mut cut,
-    } = begun;
-    if let Some(cut) = &cut {
-        if let Wait::GroupWord(_, _, refused) = wait {
-            refused(cut);
-        }
-        kill(ours);
-    }
-    let status = loop {
+    let Begun { wait, asked } = begun;
+    // Its microVM's process, followed once its wait has lasted W* (within: none where its
+    // process had gone); none before.
+    let mut follow: Option<Option<Follow<'_>>> = None;
+    let mut cut: Option<Cut> = None;
+    let status = 'wait: loop {
         let read_for = match (&cut, wait) {
             // Ended, or with no clock: until its end.
             (Some(_), _) | (None, Wait::Ending) => None,
             (None, Wait::For(timeout)) => Some(timeout),
-            // Until the judge's next look, made first where it is due now: none while the
-            // wait follows liveness alone (its kind cold, or its process gone).
-            (None, Wait::WhileRuns(..) | Wait::GroupWord(..)) => {
+            (None, Wait::WhileRuns(vm, record) | Wait::GroupWord(vm, record, _)) => 'read: {
+                // Until its wait has lasted W*, its answer alone, waited for until then; its
+                // kind with no answer yet, its answer alone throughout. Past W*, its process
+                // followed from then, or the exec ended where its process cannot be read. A
+                // read timeout is never zero, which sockets refuse: none left is past W*.
+                if follow.is_none() {
+                    match read_at(record, asked) {
+                        ReadAt::Never => break 'read None,
+                        ReadAt::Until(due) => {
+                            let left = due.saturating_duration_since(Instant::now());
+                            if !left.is_zero() {
+                                break 'read Some(left);
+                            }
+                        }
+                        ReadAt::Now => {}
+                    }
+                    match following(vm, record) {
+                        Ok(followed) => follow = Some(followed),
+                        Err(why) => {
+                            if let Wait::GroupWord(_, _, refused) = wait {
+                                refused(&why);
+                            }
+                            cut = Some(why);
+                            kill(ours);
+                            continue 'wait;
+                        }
+                    }
+                }
+                // Until the judge's next look, made first where it is due now: none while the
+                // wait follows liveness alone (its process gone).
                 let left = follow
                     .as_ref()
+                    .and_then(Option::as_ref)
                     .and_then(Follow::due)
                     .map(|due| due.saturating_duration_since(Instant::now()));
                 if left.is_some_and(|left| left.is_zero()) {
-                    if let Some(Err(why)) = follow.as_mut().map(Follow::look) {
+                    if let Some(Err(why)) = follow.as_mut().and_then(Option::as_mut).map(Follow::look) {
                         cut = Some(Cut::from(why));
                         if let (Wait::GroupWord(_, _, refused), Some(cut)) = (wait, &cut) {
                             refused(cut);
                         }
                         kill(ours);
                     }
-                    continue;
+                    continue 'wait;
                 }
                 left
             }
@@ -869,9 +941,9 @@ fn await_exit(ours: &shards_ipc::Stream, begun: Begun<'_>) -> Ended {
             Ok(Some(m)) if m.kind == shards_ipc::kind::EXIT => {
                 // Its own answer, not an end the daemon made: its kind learns from it.
                 if cut.is_none()
-                    && let Some(follow) = follow.as_mut()
+                    && let Wait::WhileRuns(_, record) | Wait::GroupWord(_, record, _) = wait
                 {
-                    follow.answered();
+                    teach_answer(record, asked, follow.as_mut().and_then(Option::as_mut));
                 }
                 break m.payload.first().map(|&s| i64::from(s));
             }
@@ -907,11 +979,24 @@ fn await_exit(ours: &shards_ipc::Stream, begun: Begun<'_>) -> Ended {
 /// first answer, and once its party has gone (its socket's end then ends the wait), the
 /// socket's readiness alone; then its party looked at once each W* and the wait ended, typed
 /// ([`Stalled`]), where it ran nothing since the look before or could not be read.
+///
+/// Its clock is taken as it is made, before its ask, and its party's process is read only
+/// once its wait has lasted W*, its kind's slowest answer timed from the ask: before then its
+/// judge could refuse nothing. It is asked only once a look finds its socket not ready
+/// ([`shards_ipc::Judge`]), and an answer within W* teaches its kind its time from the ask
+/// alone, with no read of its party ([`teach_answer`]; D215, amended 2026-11-17, ROOT's
+/// rulings). Read as its wait began, as it was, before its RUN was even sent, its process held
+/// every run's handoff for that read, and the answer read it again: on Windows a ToolHelp
+/// snapshot of every process with each, and the system's records of every process and thread,
+/// each read of which took 13.1 to 13.8 ms on jupiter (PM M606).
 pub(super) struct Judged<'r> {
     pid: u32,
     record: &'r Record,
-    follow: Option<Follow<'r>>,
-    begun: bool,
+    /// When its exchange began, near enough: taken as it was made, before its ask.
+    asked: Instant,
+    /// Its party's process, followed from its first ask past W* (within: none where its
+    /// process had gone); none before.
+    follow: Option<Option<Follow<'r>>>,
 }
 
 impl<'r> Judged<'r> {
@@ -919,30 +1004,42 @@ impl<'r> Judged<'r> {
         Judged {
             pid,
             record,
+            asked: Instant::now(),
             follow: None,
-            begun: false,
         }
     }
 
-    /// When its wait next asks, or why it ends: asked as each wait begins, and at each time it
-    /// named that passed with the socket not ready.
+    /// When its wait next asks, or why it ends: asked once a look finds its socket not ready,
+    /// and at each time it named that passed with the socket not ready still. Until its wait
+    /// has lasted W*, its socket's readiness alone, asked again at W*; a kind with no answer
+    /// yet, its readiness alone throughout. Past W*, its party's process followed from then.
     pub(super) fn judge(&mut self) -> std::io::Result<Option<Instant>> {
-        if !std::mem::replace(&mut self.begun, true) {
-            self.follow = following(self.pid, self.record).map_err(Stalled::error)?;
-            return Ok(self.follow.as_ref().and_then(Follow::due));
+        if self.follow.is_none() {
+            match read_at(self.record, self.asked) {
+                ReadAt::Never => return Ok(None),
+                ReadAt::Until(due) => return Ok(Some(due)),
+                ReadAt::Now => {}
+            }
+            let followed = following(self.pid, self.record).map_err(Stalled::error)?;
+            let due = followed.as_ref().and_then(Follow::due);
+            self.follow = Some(followed);
+            return Ok(due);
         }
-        let Some(follow) = self.follow.as_mut() else {
+        let Some(Some(follow)) = self.follow.as_mut() else {
             return Ok(None);
         };
         follow.look().map_err(|why| Stalled::error(Cut::from(why)))?;
         Ok(follow.due())
     }
 
-    /// Its party answered: its kind learns from the answer.
+    /// Its party answered: its kind learns from the answer, its time from the ask, and the
+    /// work its follow read, where one began ([`teach_answer`]).
     pub(super) fn answered(&mut self) {
-        if let Some(follow) = self.follow.as_mut() {
-            follow.answered();
-        }
+        teach_answer(
+            self.record,
+            self.asked,
+            self.follow.as_mut().and_then(Option::as_mut),
+        );
     }
 }
 
@@ -961,10 +1058,11 @@ impl std::fmt::Display for Stalled {
         match &self.0 {
             Cut::Stalled(stall) => write!(
                 f,
-                "its process ran no CPU in {:?} past the slowest answer seen ({:?}), {:?} into the wait",
+                "its process ran no CPU in {:?} past the slowest answer seen ({:?}), {:?} into the wait{}",
                 stall.over(),
                 stall.slowest(),
-                stall.waited()
+                stall.waited(),
+                stall.account()
             ),
             other => write!(f, "{other}"),
         }
@@ -1061,9 +1159,9 @@ mod tests {
     }
 
     /// An exec whose microVM's process runs nothing, its kind of answer not yet seen, is
-    /// waited for until it answers: a cold wait follows the process's liveness alone, and its
-    /// answer teaches its kind (D215's judge; red with PM M357's `IDLE_VM_CPU`, which ended it
-    /// at its first 10 s, here a fifth of a second).
+    /// waited for until it answers: a cold wait waits on its answer alone, its microVM's
+    /// liveness its connection's end, and its answer teaches its kind (D215's judge; red with
+    /// PM M357's `IDLE_VM_CPU`, which ended it at its first 10 s, here a fifth of a second).
     #[cfg(unix)]
     #[test]
     fn a_cold_wait_follows_its_microvm_while_it_lives() {
@@ -1075,15 +1173,18 @@ mod tests {
         let shards_api::Seen::Learned { slowest, .. } = record.seen() else {
             panic!("its answer taught nothing");
         };
-        assert!(slowest >= after, "{slowest:?}, its wait begun before its ask");
+        assert!(slowest >= after, "{slowest:?}, its time not from its ask");
     }
 
-    /// An answer there before its waiter reads came within its wait, which begins before its
-    /// exec is asked (D188, amended by ci-fixes): it teaches its kind its time from the wait's
-    /// start. Before, a wait begun after its ask learned nothing from such an answer, and a
-    /// microVM that answered faster than its waiter's reader was spawned never taught its kind
-    /// (CI 43968984258, Windows arm64). Its microVM's process is this one, which lives
-    /// throughout.
+    /// An answer there before its waiter reads teaches its kind its time from the ask, whose
+    /// clock is taken before it (D188, amended by ci-fixes and by own-35-ci-green), and its
+    /// slowest alone: its microVM's process is read only once its wait has lasted W*
+    /// ([`read_at`]), and its kind, cold, has no W* yet. Read before the ask, it held every ask
+    /// for the read, on Windows 13.1 to 13.8 ms of the system's records (PM M606), and taught
+    /// this answer the CPU this busy test process ran meanwhile. Waited for with no clock before
+    /// the ask, such an answer taught nothing, and a microVM that answered faster than its
+    /// waiter's reader was spawned never taught its kind (CI 43968984258, Windows arm64). Its
+    /// microVM's process is this one, which lives throughout.
     #[test]
     fn an_answer_there_before_its_waiter_reads_teaches_from_its_ask() {
         let record = Record::new();
@@ -1096,12 +1197,107 @@ mod tests {
         let answered = began.elapsed();
         let ended = await_exit(&ours, begun);
         assert_eq!((ended.status, ended.cut), (Some(7), None));
-        let shards_api::Seen::Learned { slowest, .. } = record.seen() else {
+        let shards_api::Seen::Learned { slowest, rated } = record.seen() else {
             panic!("an answer within its wait taught nothing");
         };
         assert!(
             slowest >= answered,
-            "{slowest:?} from its wait's start, its answer {answered:?} past it"
+            "{slowest:?} from its ask, its answer {answered:?} past it"
+        );
+        assert_eq!(rated, None, "its process read before its waiter first looked");
+    }
+
+    /// A take there at its waiter's first look teaches its kind its time from the ask, whose
+    /// clock its judge takes as it is made, and its slowest alone: shards_ipc's judged waits
+    /// look before they ask their judge, which reads its party's process only at its first ask,
+    /// and none came (D215, amended 2026-11-17). Asked as the wait began, the judge read the
+    /// process before every run's TAKEN, on Windows a ToolHelp snapshot of every process and
+    /// 13.1 to 13.8 ms of the system's records (PM M606), and taught such a take the CPU this
+    /// busy test process ran meanwhile, timed from that read. Its party is this process, which
+    /// lives throughout.
+    #[test]
+    fn a_take_there_at_its_waiters_first_look_teaches_from_its_ask() {
+        let record = Record::new();
+        let (ours, theirs) = shards_ipc::Stream::pair().unwrap();
+        let mut judged = Judged::of(std::process::id(), &record);
+        let began = Instant::now();
+        // The run's way to its VM, which says it took it as it reads it.
+        std::thread::sleep(Duration::from_millis(1));
+        shards_ipc::send(&theirs, shards_ipc::kind::TAKEN, &[], &[]).unwrap();
+        let answered = began.elapsed();
+        let taken = shards_ipc::recv_judged(&ours, &mut || judged.judge())
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.kind, shards_ipc::kind::TAKEN);
+        judged.answered();
+        let shards_api::Seen::Learned { slowest, rated } = record.seen() else {
+            panic!("a take there at its waiter's first look taught nothing");
+        };
+        assert!(
+            slowest >= answered,
+            "{slowest:?} from its ask, its answer {answered:?} past it"
+        );
+        assert_eq!(rated, None, "its process read before its waiter first looked");
+    }
+
+    /// An answer within its kind's W* comes with no read of its party's process: its judge,
+    /// asked as a look finds its socket not ready, reads the process only once its wait has
+    /// lasted W* (D215, amended 2026-11-17, ROOT's ruling), as before then it could refuse
+    /// nothing; until then its wait is the socket's readiness, asked again at W*. The answer
+    /// teaches W* alone. Past W*, its next ask follows the process. Before, its first ask read
+    /// the process, on Windows a ToolHelp snapshot of every process and 13.1 to 13.8 ms of the
+    /// system's records (PM M606), and the answer read it again. Its party is this process,
+    /// which lives throughout.
+    #[test]
+    fn an_answer_within_w_star_reads_no_process() {
+        let record = Record::new();
+        let slowest = Duration::from_secs(10);
+        record.teach_unrated(slowest);
+        let mut judged = Judged::of(std::process::id(), &record);
+        let due = judged.judge().unwrap();
+        assert!(judged.follow.is_none(), "its process read within W*");
+        assert_eq!(due, Some(judged.asked + slowest), "not asked again at W*");
+        judged.answered();
+        assert_eq!(
+            record.seen(),
+            shards_api::Seen::Learned { slowest, rated: None },
+            "an answer within W* taught a rate"
+        );
+        let record = Record::new();
+        let slowest = Duration::from_millis(1);
+        record.teach_unrated(slowest);
+        let mut judged = Judged::of(std::process::id(), &record);
+        std::thread::sleep(slowest * 2);
+        judged.judge().unwrap();
+        assert!(
+            matches!(judged.follow, Some(Some(_))),
+            "past W*, its process not followed"
+        );
+    }
+
+    /// An exec answered within its kind's W* comes with no read of its microVM's process
+    /// (D188, amended 2026-11-17: D215's rule, [`read_at`]): its wait waits on its answer
+    /// alone until W*, and reads only past it, so the answer teaches W* alone. Before, its
+    /// first look that found nothing read the process, and the answer read it again and taught
+    /// the CPU it ran meanwhile: here this test process's, a thread of it busy until it
+    /// answers.
+    #[test]
+    fn an_exec_answered_within_w_star_reads_no_process() {
+        let record = Record::new();
+        let slowest = Duration::from_secs(10);
+        record.teach_unrated(slowest);
+        let ended = waited(Wait::WhileRuns(std::process::id(), &record), |theirs| {
+            let busy = Instant::now();
+            while busy.elapsed() < Duration::from_millis(50) {
+                std::hint::spin_loop();
+            }
+            shards_ipc::send(&theirs, shards_ipc::kind::EXIT, &[7], &[]).unwrap();
+        });
+        assert_eq!((ended.status, ended.cut), (Some(7), None));
+        assert_eq!(
+            record.seen(),
+            shards_api::Seen::Learned { slowest, rated: None },
+            "its process read within W*"
         );
     }
 

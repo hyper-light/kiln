@@ -44,8 +44,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use crate::Identity;
-use crate::judge::{Found, Judge, Record, Seen, Span, Stall};
 use crate::{End, ProcessFailure, Refusal};
+use crate::{Found, Judge, Record, Seen, Span, Stall};
 
 /// What a wait that follows its guest's VM process waits for. This process learns each
 /// apart, as each takes its own time.
@@ -143,7 +143,7 @@ struct Hold {
     stopped: bool,
     /// A thread of it waits uninterruptibly in its kernel as it is looked at (macOS
     /// `TH_STATE_UNINTERRUPTIBLE`, Linux `D`, proc(5)'s "uninterruptible disk sleep"; Windows a
-    /// wait on its host's paging: `os::pages`): its host's own work for it, a disk's flush or
+    /// wait on its host's paging: shards-judge's `threads::pages`): its host's own work for it, a disk's flush or
     /// a page-in, which no rate of its own runs at (PM M600: `shards guest use` spent 52 to
     /// 172 ms of its 69 to 192 ms so on a loaded Mac, F_FULLFSYNC's waits, at 14 to 16 ms of
     /// CPU). Its look vouches for no window of its rate ([`vouches`]), and one that ran
@@ -151,8 +151,9 @@ struct Hold {
     /// ([`disks`](Self::disks)). Windows' wait reasons for a flush are unread here: a flush
     /// waits `Executive`, as a pipe's reader does (PM M606).
     uninterruptible: bool,
-    /// The I/O its host's disks had completed, every disk's summed, read where a thread of it
-    /// waited in its kernel as it was looked at (Linux `/proc/diskstats`, macOS IOKit's
+    /// The I/O its host's disks had completed, every disk's summed, and on Linux the time they
+    /// spent doing I/O, which grows while one is in flight (`os::disks_worked`), read where a
+    /// thread of it waited in its kernel as it was looked at (Linux `/proc/diskstats`, macOS IOKit's
     /// `IOBlockStorageDriver` statistics, Windows each physical disk's IOCTL_DISK_PERFORMANCE:
     /// `os::disks`), none elsewhere or where unread. Its growth since the look before says its
     /// host's disks were working meanwhile: a transaction commit another task runs, whose
@@ -405,6 +406,21 @@ pub struct Watch {
 /// A process's threads as one read saw them, each by its OS's ID for it: its own CPU time,
 /// in nanoseconds, and whether it was runnable on no CPU or running ([`Watch::starved`]).
 pub(crate) type Threads = std::collections::BTreeMap<u64, (u64, bool)>;
+
+/// Each thread of process `pid` as its OS keeps it, for a refusal's account of its party
+/// (`Stall::said`): Windows its state and wait reason (the system's listing, shards-judge's
+/// `threads_said`), Linux its state and the kernel function it sleeps in, macOS its run
+/// state. None where they could not be read.
+fn threads_account(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        shards_judge::threads_said(pid)
+    }
+    #[cfg(unix)]
+    {
+        os::threads_said(pid)
+    }
+}
 
 /// How many of process `pid`'s threads are runnable (running, or waiting for a CPU), of how
 /// many, as [`Watch::starved`] reads them (on Windows, the system's whole listing, as a
@@ -708,7 +724,11 @@ impl<'a> Follow<'a> {
             own: Duration::ZERO,
             work,
         };
-        let judged = self.judge.found_over(found, span).map_err(Unfollowed::Stalled);
+        // Refused, its party's threads read once, as it is: what each was doing.
+        let judged = self
+            .judge
+            .found_over(found, span)
+            .map_err(|stall| Unfollowed::Stalled(stall.said(threads_account(pid))));
         let hold = self.watch.hold;
         self.schedule(&hold, Instant::now());
         judged
@@ -927,27 +947,34 @@ mod os {
     /// delays, in clock ticks (proc(5)).
     const BLKIO_TICKS: usize = 42;
 
-    /// The I/O the host's block devices have completed ([`Hold::disks`](super::Hold)), from
+    /// The work the host's block devices have done ([`Hold::disks`](super::Hold)), from
     /// `/proc/diskstats`; none where it cannot be read.
     pub(super) fn disks() -> Option<u64> {
         std::fs::read_to_string("/proc/diskstats")
             .ok()
-            .map(|text| disks_completed(&text))
+            .map(|text| disks_worked(&text))
     }
 
     /// Of `/proc/diskstats`' `text`, each line's reads, writes, discards (since 4.18) and
-    /// flushes (since 5.5) completed, as many of them as its kernel lists, summed over every
-    /// line (Documentation/admin-guide/iostats.rst: after a line's major, minor and name, its
-    /// fields 1, 5, 12 and 16). A partition's are its disk's too, and a mapped device's its
-    /// disks': only the sum's growth is read, which any of them shows.
-    pub(super) fn disks_completed(text: &str) -> u64 {
-        const COMPLETED: [usize; 4] = [0, 4, 11, 15];
+    /// flushes (since 5.5) completed, and the milliseconds its device has spent doing I/O, as
+    /// many of them as its kernel lists, summed over every line
+    /// (Documentation/admin-guide/iostats.rst: after a line's major, minor and name, its
+    /// fields 1, 5, 12 and 16, and field 10, which "increases so long as field 9 is nonzero",
+    /// field 9 its I/Os in flight). Field 10 is brought up to date as the file is read while a
+    /// device has I/O in flight (block/genhd.c `diskstats_show` calls `update_io_ticks` where
+    /// `bdev_count_inflight` is nonzero, linux v6.18.48), so that a flush in flight through a
+    /// whole look's window, which completes nothing in it, shows its device working: a journal
+    /// commit's waiter in `jbd2_log_wait_commit` (CI 44205094460, x86_64 gnu, referrers.rs:437,
+    /// refused as still 46.7 ms in). A partition's are its disk's too, and a mapped device's
+    /// its disks': only the sum's growth is read, which any of them shows.
+    pub(super) fn disks_worked(text: &str) -> u64 {
+        const WORKED: [usize; 5] = [0, 4, 9, 11, 15];
         text.lines()
             .flat_map(|line| {
                 line.split_ascii_whitespace()
                     .skip(3)
                     .enumerate()
-                    .filter(|(i, _)| COMPLETED.contains(i))
+                    .filter(|(i, _)| WORKED.contains(i))
                     .filter_map(|(_, n)| n.parse::<u64>().ok())
             })
             .fold(0, u64::saturating_add)
@@ -994,6 +1021,31 @@ mod os {
             threads.insert(tid, (ran, state == b'R'));
         }
         Some(threads)
+    }
+
+    /// Each thread of process `pid` as its task's files show it ([`super::threads_account`]):
+    /// its ID, its state (`/proc/<pid>/task/<tid>/stat` field 3, proc(5)), and, not running,
+    /// the kernel function it sleeps in (its `wchan`; "0" where it names none). None where its
+    /// tasks cannot be listed or none of them read.
+    pub(super) fn threads_said(pid: u32) -> Option<String> {
+        let mut said = Vec::new();
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()?.flatten() {
+            let Some(tid) = task.file_name().to_str().and_then(|tid| tid.parse::<u64>().ok()) else {
+                continue;
+            };
+            let dir = task.path();
+            let Some(state) = std::fs::read(dir.join("stat")).ok().and_then(|stat| state(&stat)) else {
+                continue;
+            };
+            let waits = std::fs::read_to_string(dir.join("wchan"))
+                .ok()
+                .filter(|waits| state != b'R' && !waits.is_empty() && waits != "0");
+            said.push(match waits {
+                Some(waits) => format!("{tid} {} in {waits}", char::from(state)),
+                None => format!("{tid} {}", char::from(state)),
+            });
+        }
+        (!said.is_empty()).then(|| said.join(", "))
     }
 
     /// A task's run-queue wait in nanoseconds, its `schedstat`'s second field; none where it
@@ -1302,6 +1354,29 @@ mod os {
         thread_info(id, handle).map(|info| info.pth_run_state)
     }
 
+    /// Each thread of process `pid` as `PROC_PIDTHREADINFO` shows it
+    /// ([`super::threads_account`]): its handle and its run state (`pth_run_state`, mach's
+    /// TH_STATE_*). macOS keeps no wait reason another process may read. None where its threads
+    /// cannot be listed or none of them read.
+    pub(super) fn threads_said(pid: u32) -> Option<String> {
+        let id = libc::c_int::try_from(pid).ok()?;
+        let said: Vec<String> = threads(id)?
+            .into_iter()
+            .filter_map(|handle| {
+                let state = match run_state(id, handle)? {
+                    libc::TH_STATE_RUNNING => "running".to_string(),
+                    libc::TH_STATE_STOPPED => "stopped".to_string(),
+                    libc::TH_STATE_WAITING => "waiting".to_string(),
+                    libc::TH_STATE_UNINTERRUPTIBLE => "waiting uninterruptibly".to_string(),
+                    libc::TH_STATE_HALTED => "halted".to_string(),
+                    other => format!("in state {other}"),
+                };
+                Some(format!("{handle:#x} {state}"))
+            })
+            .collect();
+        (!said.is_empty()).then(|| said.join(", "))
+    }
+
     fn rusage(pid: u32) -> Result<Option<libc::rusage_info_v0>, ProcessFailure> {
         let id = libc::c_int::try_from(pid).map_err(|_| ProcessFailure::PidOutOfRange {
             operation: ProcessOperation::ProcPidRusage,
@@ -1431,17 +1506,13 @@ mod os {
     use super::{Hold, Look};
     use crate::taken::io_failure;
     use crate::{ProcessFailure, ProcessOperation};
+    use shards_judge::threads::{WAITING, each_thread, is_suspension, pages, records, wants_cpu};
     use std::io;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use std::time::Duration;
-    use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
-    use windows_sys::Wdk::System::SystemServices::{
-        FreePage, PageIn, PoolAllocation, Suspended, WrFreePage, WrPageIn, WrPoolAllocation, WrSuspended,
-    };
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES,
-        FILETIME, INVALID_HANDLE_VALUE, STATUS_INFO_LENGTH_MISMATCH, WAIT_FAILED, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        FILETIME, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, QueryDosDeviceW,
@@ -1456,9 +1527,6 @@ mod os {
         PROCESS_SYNCHRONIZE, WaitForSingleObject,
     };
     use windows_sys::Win32::System::WindowsProgramming::QueryProcessCycleTime;
-    use windows_sys::Win32::System::WindowsProgramming::{
-        SYSTEM_PROCESS_INFORMATION, SYSTEM_THREAD_INFORMATION,
-    };
 
     /// A VM process as a wait follows it on Windows: the `shards` that booted it, which holds
     /// it in a Job of its own as its child (D141), and every process that descends from that
@@ -1561,7 +1629,7 @@ mod os {
                 }
                 let (state, reason) = (t.ThreadState, t.WaitReason);
                 threads = threads.saturating_add(1);
-                runnable |= matches!(state, READY | RUNNING | STANDBY);
+                runnable |= wants_cpu(state);
                 paging |= pages(state, reason);
                 suspended = suspended.saturating_add(usize::from(state == WAITING && is_suspension(reason)));
             });
@@ -1824,16 +1892,6 @@ mod os {
         e.raw_os_error().and_then(|c| u32::try_from(c).ok()) == Some(code)
     }
 
-    // A thread's state in its record (`SYSTEM_THREAD_INFORMATION.ThreadState`), as WMI's
-    // Win32_Thread class documents its values: ready (1), running (2) and standby (3) want or
-    // have a CPU; transition (6) waits "for resources other than the processor", its kernel
-    // stack brought back into memory; waiting (5) says on what by its wait reason.
-    const READY: u32 = 1;
-    const RUNNING: u32 = 2;
-    const STANDBY: u32 = 3;
-    const WAITING: u32 = 5;
-    const TRANSITION: u32 = 6;
-
     /// How many of process `pid`'s threads want or have a CPU (ready, running, standby), of
     /// how many, from the system's whole listing ([`records`]), as [`Followed::hold`] reads
     /// its members' ([`super::runnable_threads`]); none where it could not be read or lists
@@ -1844,21 +1902,10 @@ mod os {
         each_thread(&records, |of, t| {
             if of == pid {
                 threads = threads.saturating_add(1);
-                runnable =
-                    runnable.saturating_add(usize::from(matches!(t.ThreadState, READY | RUNNING | STANDBY)));
+                runnable = runnable.saturating_add(usize::from(wants_cpu(t.ThreadState)));
             }
         });
         (threads > 0).then_some((runnable, threads))
-    }
-
-    /// Whether a thread in `state`, waiting for `reason`, waits on its host's paging: its
-    /// kernel stack brought back into memory (transition), a page brought in, or a free page or
-    /// pool found for it ([`on_memory`]). Its host's disks serve each, a page-in being their
-    /// read and a page freed by writing it out, and no count of its process's shows them, so
-    /// such a wait is its host's only while those disks complete I/O ([`Hold::held_since`]), as
-    /// a Linux `D` and a macOS uninterruptible wait are: one that no disk serves is still.
-    pub(super) fn pages(state: u32, reason: u32) -> bool {
-        state == TRANSITION || (state == WAITING && on_memory(reason))
     }
 
     /// The MS-DOS device names of physical disks (`\\.\PhysicalDrive0`, Win32's "Naming Files,
@@ -1964,114 +2011,6 @@ mod os {
         let bytes = |n: i64| u64::try_from(n).unwrap_or(0);
         Some(bytes(performance.BytesRead).saturating_add(bytes(performance.BytesWritten)))
     }
-
-    /// Whether a thread's wait `reason` is on its host's memory: a page brought in, or a free
-    /// page or pool found for it (wdm.h's KWAIT_REASON: PageIn, FreePage, PoolAllocation, and
-    /// their Wr forms).
-    fn on_memory(reason: u32) -> bool {
-        i32::try_from(reason).is_ok_and(|reason| {
-            [
-                FreePage,
-                PageIn,
-                PoolAllocation,
-                WrFreePage,
-                WrPageIn,
-                WrPoolAllocation,
-            ]
-            .contains(&reason)
-        })
-    }
-
-    /// Whether a thread's wait `reason` is its suspension.
-    fn is_suspension(reason: u32) -> bool {
-        i32::try_from(reason).is_ok_and(|reason| [Suspended, WrSuspended].contains(&reason))
-    }
-
-    /// The system's process records (NtQuerySystemInformation, SystemProcessInformation), in
-    /// words of 8 bytes, as they hold pointers; none where they could not be read. Asked again
-    /// with room for what the call said they need, and at least twice the last, until they fit.
-    fn records() -> Option<Vec<u64>> {
-        let mut words: Vec<u64> = Vec::new();
-        loop {
-            let bytes = u32::try_from(words.len().checked_mul(size_of::<u64>())?).ok()?;
-            let mut needed = 0u32;
-            // SAFETY: `bytes` bytes of the words for the call to fill (none, as it is first
-            // asked), and a u32 for the size it needs.
-            let status = unsafe {
-                NtQuerySystemInformation(
-                    SystemProcessInformation,
-                    words.as_mut_ptr().cast(),
-                    bytes,
-                    &raw mut needed,
-                )
-            };
-            if status == STATUS_INFO_LENGTH_MISMATCH {
-                let want = usize::try_from(needed)
-                    .ok()?
-                    .div_ceil(size_of::<u64>())
-                    .max(words.len().saturating_mul(2))
-                    .max(1);
-                words.try_reserve_exact(want.saturating_sub(words.len())).ok()?;
-                words.resize(want, 0);
-                continue;
-            }
-            if status < 0 {
-                return None;
-            }
-            let filled = usize::try_from(needed).ok()?.div_ceil(size_of::<u64>());
-            words.truncate(filled.min(words.len()));
-            return Some(words);
-        }
-    }
-
-    /// Each thread the records in `words` hold: its process's id and its thread's record
-    /// (state, wait reason, times, context switches). A record that would pass the records'
-    /// end ends them.
-    fn each_thread(words: &[u64], mut thread: impl FnMut(u32, &SYSTEM_THREAD_INFORMATION)) {
-        let Some(len) = words.len().checked_mul(size_of::<u64>()) else {
-            return;
-        };
-        // SAFETY: the words' `len` bytes, which any u8 may view, borrowed as long as they are.
-        let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), len) };
-        let process = size_of::<SYSTEM_PROCESS_INFORMATION>();
-        let each = size_of::<SYSTEM_THREAD_INFORMATION>();
-        let mut at = 0usize;
-        while let Some(record) = bytes.get(at..).filter(|record| record.len() >= process) {
-            // SAFETY: `record` holds a whole SYSTEM_PROCESS_INFORMATION, plain data, read where
-            // it lies, aligned or not.
-            let info = unsafe {
-                record
-                    .as_ptr()
-                    .cast::<SYSTEM_PROCESS_INFORMATION>()
-                    .read_unaligned()
-            };
-            let pid = u32::try_from(info.UniqueProcessId as usize).unwrap_or(u32::MAX);
-            for n in 0..usize::try_from(info.NumberOfThreads).unwrap_or(0) {
-                let Some(entry) = n
-                    .checked_mul(each)
-                    .and_then(|offset| offset.checked_add(process))
-                    .and_then(|offset| record.get(offset..))
-                    .filter(|entry| entry.len() >= each)
-                else {
-                    break;
-                };
-                // SAFETY: `entry` holds a whole SYSTEM_THREAD_INFORMATION, plain data, read
-                // where it lies, aligned or not.
-                let t = unsafe {
-                    entry
-                        .as_ptr()
-                        .cast::<SYSTEM_THREAD_INFORMATION>()
-                        .read_unaligned()
-                };
-                thread(pid, &t);
-            }
-            let next = usize::try_from(info.NextEntryOffset).unwrap_or(0);
-            match at.checked_add(next) {
-                Some(after) if next > 0 => at = after,
-                _ => return,
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2140,7 +2079,7 @@ mod starved_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::judge::Rate;
+    use crate::Rate;
 
     /// A process is followed by its pid alone, as the daemon follows its VM process: read
     /// with the start that tells it from a process given its pid later, so that one reaped is
@@ -2201,6 +2140,8 @@ mod tests {
         };
         assert_eq!(stall.slowest(), slowest);
         assert!(stall.over() >= slowest, "{stall:?}");
+        // Its threads said as it was refused: what each was doing (ROOT, 2026-11-18).
+        assert!(stall.threads().is_some_and(|said| !said.is_empty()), "{stall:?}");
         let busy = std::sync::atomic::AtomicBool::new(true);
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -2564,19 +2505,39 @@ mod tests {
         assert!(!vouches(Found::Still, false, &hold(true, None), false, false));
     }
 
-    /// `/proc/diskstats`' completed reads, writes, discards and flushes are summed over its
-    /// lines, as many of those fields as each line's kernel lists (iostats.rst: 11 fields
-    /// before 4.18, 15 since, 17 since 5.5), its other fields left out.
+    /// `/proc/diskstats`' completed reads, writes, discards and flushes, and each device's
+    /// milliseconds spent doing I/O, are summed over its lines, as many of those fields as each
+    /// line's kernel lists (iostats.rst: 11 fields before 4.18, 15 since, 17 since 5.5), its
+    /// other fields left out.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_hosts_completed_io_is_summed_from_every_diskstats_line() {
+    fn a_hosts_disk_work_is_summed_from_every_diskstats_line() {
         let text = concat!(
             "   8       0 sda 10 1 2 3 20 1 2 3 0 4 5 30 1 2 3 40 1\n",
             " 259       1 nvme0n1p1 100 7 7 7 200 7 7 7 7 7 7 300 7 7 7\n",
             "   7       0 loop0 1000 9 9 9 2000 9 9 9 9 9 9\n",
         );
-        assert_eq!(os::disks_completed(text), 3700);
-        assert_eq!(os::disks_completed(""), 0);
+        assert_eq!(os::disks_worked(text), 3720);
+        assert_eq!(os::disks_worked(""), 0);
+    }
+
+    /// A flush in flight through a whole look's window completes nothing in it, while its device
+    /// spends that time doing I/O (iostats.rst's field 10, its field 9 nonzero): a party waiting
+    /// on it in its kernel is held by its host's disk, not still (CI 44205094460, x86_64 gnu: a
+    /// client in `jbd2_log_wait_commit`, refused as still 46.7 ms in).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_flush_in_flight_through_a_look_holds_its_party() {
+        let before = "   8       0 sda 10 0 0 0 20 0 0 0 1 40 40 0 0 0 0 5 0\n";
+        let after = "   8       0 sda 10 0 0 0 20 0 0 0 1 55 55 0 0 0 0 5 0\n";
+        let (from, now) = (os::disks_worked(before), os::disks_worked(after));
+        assert!(now > from, "{from} {now}");
+        let hold = |disks| Hold {
+            uninterruptible: true,
+            disks: Some(disks),
+            ..Hold::default()
+        };
+        assert_eq!(found(false, false, &hold(from), &hold(now)), Found::Held);
     }
 
     /// A process whose thread writes a file and flushes it to its disk again and again
@@ -2649,30 +2610,6 @@ mod tests {
         assert!(!vouches(Found::Progressed, false, &grown, true, false));
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
-    }
-
-    /// On Windows a thread waits in its kernel on its host's paging where its kernel stack is
-    /// brought back into memory (transition) or it waits for a page brought in, a free page or
-    /// pool, their Wr forms too (KWAIT_REASON); not where it is ready, nor where it waits on
-    /// anything else: a flush's and an unanswered pipe's `Executive` (PM M606), a sleep's
-    /// `UserRequest`, a suspension. Before 2026-11-17 a paging wait was its host's hold
-    /// whatever its disks did, so a wait no disk served was never refused.
-    #[cfg(windows)]
-    #[test]
-    fn a_thread_waiting_on_its_hosts_paging_waits_in_its_kernel() {
-        use windows_sys::Wdk::System::SystemServices::{
-            Executive, FreePage, PageIn, PoolAllocation, Suspended, UserRequest, WrPageIn,
-        };
-        let reason = |r: i32| u32::try_from(r).unwrap();
-        let (ready, waiting, transition) = (1, 5, 6);
-        for paged in [PageIn, WrPageIn, FreePage, PoolAllocation] {
-            assert!(os::pages(waiting, reason(paged)), "reason {paged}");
-        }
-        assert!(os::pages(transition, reason(Executive)), "its stack paged out");
-        for other in [Executive, UserRequest, Suspended] {
-            assert!(!os::pages(waiting, reason(other)), "reason {other}");
-        }
-        assert!(!os::pages(ready, reason(PageIn)), "ready");
     }
 
     /// On Windows its host's physical disks are read (IOCTL_DISK_PERFORMANCE on each

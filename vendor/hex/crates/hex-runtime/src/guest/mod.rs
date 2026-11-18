@@ -27,6 +27,7 @@ pub mod rewrite;
 mod route;
 mod run_out;
 pub mod selected;
+mod served;
 mod shared;
 pub mod shares;
 

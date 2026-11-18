@@ -36,7 +36,6 @@ pub mod control;
 pub mod demand;
 pub mod host;
 pub mod image;
-mod judge;
 mod native;
 pub mod networks;
 pub mod physical;
@@ -63,7 +62,6 @@ pub use client::{
     prepare_boot, prepare_native_boot, recorded_console_bytes, recorded_console_bytes_at, vm_process_file,
 };
 pub use host::{CheckRefusal, HostCheck, Unusable, host_check};
-pub use judge::{Found, Judge, LOOKS_TO_REFUSE, Rate, Rated, Record, Seen, Span, Stall};
 #[cfg(windows)]
 pub use native::app_container_records;
 pub use native::{
@@ -71,6 +69,9 @@ pub use native::{
 };
 pub use physical::{GpuName, GpuProbe, GpuProbeError, PhysicalGpu, PhysicalGpuError, ResolvedGpu};
 pub use progress::{Awaited, Bound, Follow, Followed, Unfollowed, Watch, runnable_threads};
+pub use shards_judge::{Found, Judge, LOOKS_TO_REFUSE, Rate, Rated, Record, Seen, Span, Stall};
+#[cfg(windows)]
+pub use shards_judge::{ThreadsHeld, threads_held, threads_said};
 
 /// A guest to boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -740,14 +741,15 @@ impl std::fmt::Display for Refusal {
                     "the guest's VM process ran too slowly to be answering: {:?} into the wait, {:?} \
                  of CPU in the {:?} it was seen to run, below the least a VM process ran here and \
                  still answered ({:?} in {:?}) and more than any answer took ({:?}), past the \
-                 slowest answer seen ({:?})",
+                 slowest answer seen ({:?}){}",
                     stall.waited(),
                     rate.cpu,
                     rate.over,
                     least.cpu,
                     least.over,
                     stall.most().unwrap_or_default(),
-                    stall.slowest()
+                    stall.slowest(),
+                    stall.account()
                 )
             }
             Refusal::Stalled(stall) => write!(
@@ -764,7 +766,8 @@ impl std::fmt::Display for Refusal {
                         least.cpu, least.over
                     )
                 )
-            ),
+            )
+            .and_then(|()| f.write_str(&stall.account())),
             Refusal::Rate(why) => write!(f, "the guest's rate: {why}"),
             Refusal::HostUse(broken) => write!(f, "the guest's use: its VM process answered {broken}"),
             Refusal::Release(why) => write!(f, "the VM's AppContainers: {why}"),

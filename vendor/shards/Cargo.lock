@@ -1195,6 +1195,7 @@ dependencies = [
  "shards-template",
  "shards-testdir",
  "shards-testguest",
+ "shards-testwait",
  "shards-tuf",
  "shards-tui",
  "shards-user",
@@ -1245,8 +1246,10 @@ dependencies = [
  "shards-apple",
  "shards-dns",
  "shards-ipc",
+ "shards-judge",
  "shards-remote",
  "shards-testdir",
+ "shards-testwait",
  "triomphe",
  "unsize",
  "windows-sys 0.61.2",
@@ -1423,6 +1426,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "shards-judge"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "shards-net"
 version = "0.1.0"
 dependencies = [
@@ -1522,6 +1532,7 @@ dependencies = [
  "shards-abi",
  "shards-ipc",
  "shards-testdir",
+ "shards-testwait",
  "windows-sys 0.61.2",
 ]
 
@@ -1589,6 +1600,16 @@ dependencies = [
  "shards-devcgroup",
  "shards-http2",
  "shards-seccomp",
+]
+
+[[package]]
+name = "shards-testwait"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "shards-judge",
+ "shards-vmm",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

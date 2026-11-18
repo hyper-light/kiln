@@ -3,8 +3,8 @@
 The microVMs kiln's harnesses run in (`docs/shards.md`; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 16), at
 the one Shards revision kiln and Hex build on.
 
-- **Upstream:** https://github.com/hyper-light/shards, commit `85cecd75bb6d7b01520afd2ef9796e05fe770e8b`
-  (2026-11-17), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too (Hex `071934813`, which
+- **Upstream:** https://github.com/hyper-light/shards, commit `1799412f9b18598f548a92124da51a5a534a5114`
+  (2026-11-17), MIT (`LICENSE`): its `main`, the one revision kiln's copy of Hex pins too (Hex `f6192bc99`, which
   makes no change to Shards): its guests' console is `shards_api::CONSOLE` (hvc0) since it deleted the 16550
   (`35e2de91e`), and `host_check` says whether a host runs its microVMs. Since `1389dc0b6` it has a member's run-time arguments (D256), and Hex's image
   class drives its agent-control link's client (`shards-remote`, whose QUIC is kiln's hyper-raft's). Beside
@@ -37,9 +37,12 @@ Each change is recorded in `vendor/patches/shards/`, applied in this order on up
 | File | Change | Why | Recorded as |
 |---|---|---|---|
 | `Cargo.toml`, `Cargo.lock` | aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0 from crates.io, their lock entries holding the SHA-256s upstream's `vendor/README.md` lists, instead of from `vendor/` | upstream's copies are those crates.io packages byte for byte, and kiln vendors aws-lc-rs itself (`vendor/aws-lc-rs`, 1.18.2 with Mantle's change): kiln's tree holds one copy of each project. Shards' own crates name 1.18.1 and aws-lc-sys 0.45.0 (`shards-sigstore` calls it), so its build keeps those versions; as T4 took it on 2026-10-21 | `0001-aws-lc-rs-and-aws-lc-sys-from-crates-io.patch` |
+| `crates/api/src/image.rs`, `crates/api/src/image/{wire,pool,session}.rs`, `crates/ipc/src/lib.rs` | Shards' D286, its API side: an image run given shares another server serves (`ImageSpec::served`, `ServedShare`, `ServedStream`; image channel 52, `wire::Request::served`, `ServedAt`; the streams handed beside the request, on Unix on the run host's links socket, `shards_ipc::kind::SERVED_SHARES` (117), on Windows duplicated into its process; no pool's, no save) | kiln's microVM engine shares each agent's Slates volume into its guest over Slates' own virtio-fs device, a stream handed to Shards with no host mount between (kiln goal 01a1ec34599974448f6b7663ddb07001). Hex's copy carries the same change, byte for byte (`vendor/hex/vendor/patches/shards/`). Upstream on Shards' branch `agents/g265-kiln-shards-microvm-served-image-share` (4ff40fc99 and its fix 5376b406a on its main 4776b2e56; e4e0118c8 and 74d1bc82f the same changes on this revision), which ROOT lands after Shards' v0.8.0 tag; dropped once kiln and Hex take a Shards revision holding it | `0001-shards-api-shards-ipc-an-image-run-takes-shares-another.patch` |
+| `crates/shards/src/{api_run.rs,cli/mod.rs,daemon.rs}`, `crates/shards/tests/{api_image,member_exec,nesting}.rs` | Shards' D286, its run host's side: `api_run::served_streams` takes the streams with the run's request, the microVM's shape counts their slots, `hosted::serve` gives each the slot after the run's own shares' and mounts it as a bind's, the share process passes each to the VM as it is (D228's path; on Windows the run host hands the VM the pipe), and a save of a run holding one is refused (`hosted::served_slots`) | the `shards` kiln carries (`ci/shards/pack.sh`) is the run host kiln's `shards-api` starts, so both sides of the image channel's version 52 are built from here. `Kiln-only:` in form alone: Hex's API-only copy takes no `crates/shards`, so no product holds it; upstream with the change above | `0002-shards-api-run-an-image-run-s-run-host-takes-shares-another.patch` |
 
-The change is kiln's layout alone (`Kiln-only:`), so it isn't offered upstream. Hex's two changes to Shards'
-image API are upstream's own since D246 and D248, so neither kiln's copy nor Hex's carries them.
+The first change is kiln's layout alone (`Kiln-only:`), so it isn't offered upstream. The two D286 changes are
+upstream-bound, carried until ROOT lands them on Shards' main. Hex's two earlier changes to Shards' image API are
+upstream's own since D246 and D248, so neither kiln's copy nor Hex's carries them.
 
 ## Taking a newer upstream
 

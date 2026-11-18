@@ -572,6 +572,7 @@ fn a_deadline_given_through_shards_api_is_met_or_said_passed() {
         upstream_roots: Vec::new(),
         plug_roots: Vec::new(),
         egress_ceiling: Vec::new(),
+        served: Vec::new(),
         gpu_report: None,
     };
     let guest = booted(&ImageShards::new(), &spec(met())).unwrap();
@@ -785,6 +786,7 @@ fn a_nested_workloads_sockets_are_lanes_of_its_orchestrators_controller() {
         upstream_roots: Vec::new(),
         plug_roots: Vec::new(),
         egress_ceiling: Vec::new(),
+        served: Vec::new(),
         gpu_report: None,
     };
     let guest = booted(&ImageShards::new(), &spec).unwrap();
@@ -899,6 +901,7 @@ fn over_lanes(home: &str, case: impl FnOnce(&shards_api::control::Sockets, &[u8]
         upstream_roots: Vec::new(),
         plug_roots: Vec::new(),
         egress_ceiling: Vec::new(),
+        served: Vec::new(),
         gpu_report: None,
     };
     let guest = booted(&ImageShards::new(), &spec).unwrap();
@@ -946,8 +949,12 @@ fn told(sockets: &shards_api::control::Sockets, said: &str) -> Vec<u8> {
 /// (Windows: `warm.rs`'s `pass` too): the workload reads all its controller sends, answers, and
 /// closes its socket while the controller's way is still open. The controller reads
 /// `ConnectionReset`, never `Ok(0)`, after no byte but a prefix of the answer (a cut promises
-/// none before it), and its write after the cut is refused the same. Guards: init's hang-up probe
-/// (`ClientCut`), the muxer's `Cut`, and the endpoint's.
+/// none before it), and its write after the cut is refused the same. On Windows it reads every
+/// byte of the answer, then `Ok(0)`: D251's amendment of 2026-11-15 ends a cut there as an end
+/// in order does (`Conn::linger`), as no WinSock AF_UNIX close keeps the bytes its peer has not
+/// read while telling it apart from one (PM M358), an open limit, and a write after it is not
+/// refused there (its *No black hole*). Guards: init's hang-up probe (`ClientCut`), the muxer's
+/// `Cut`, and the endpoint's.
 #[test]
 fn a_nested_workloads_socket_cut_mid_stream_resets_its_lane_at_the_controller() {
     use std::io::{ErrorKind, Read as _, Write as _};
@@ -960,23 +967,37 @@ fn a_nested_workloads_socket_cut_mid_stream_resets_its_lane_at_the_controller() 
         // All the workload reads, and no half-close: the controller's way stays open.
         lane.write_all(sent).unwrap();
         let mut rest = Vec::new();
-        assert_eq!(
-            lane.read_to_end(&mut rest).map_err(|e| e.kind()),
-            Err(ErrorKind::ConnectionReset),
-            "a socket cut short read as its end in order"
-        );
+        let ended = lane.read_to_end(&mut rest).map_err(|e| e.kind());
         let mut answer = b"cut.sock\n".to_vec();
         answer.extend(sent.iter().rev());
-        assert!(
-            answer.starts_with(&rest),
-            "{} bytes read before the cut are no prefix of the workload's answer",
-            rest.len()
-        );
-        assert_eq!(
-            lane.write_all(b"after").map_err(|e| e.kind()),
-            Err(ErrorKind::ConnectionReset),
-            "a write after the cut"
-        );
+        if cfg!(windows) {
+            assert_eq!(
+                ended,
+                Ok(answer.len()),
+                "a socket cut short on Windows: every byte, then its end"
+            );
+            assert!(
+                rest == answer,
+                "{} bytes read, not the workload's answer whole",
+                rest.len()
+            );
+        } else {
+            assert_eq!(
+                ended,
+                Err(ErrorKind::ConnectionReset),
+                "a socket cut short read as its end in order"
+            );
+            assert!(
+                answer.starts_with(&rest),
+                "{} bytes read before the cut are no prefix of the workload's answer",
+                rest.len()
+            );
+            assert_eq!(
+                lane.write_all(b"after").map_err(|e| e.kind()),
+                Err(ErrorKind::ConnectionReset),
+                "a write after the cut"
+            );
+        }
         let read = told(sockets, "cut.said");
         assert!(
             read == sent,
@@ -1068,6 +1089,7 @@ fn an_orchestrators_run_binds_its_own_agent_control_endpoint() {
             upstream_roots: Vec::new(),
             plug_roots: Vec::new(),
             egress_ceiling: Vec::new(),
+            served: Vec::new(),
             gpu_report: None,
         };
         booted(&ImageShards::new(), &spec).unwrap()

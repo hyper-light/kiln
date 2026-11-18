@@ -27,9 +27,11 @@ use std::time::{Duration, Instant};
 
 use common::{
     Patience, TempDir, Wait, WaitKind, alive, cannot_pool, cannot_run_vms, commands_with, guest_init,
-    home_with, interrupt, interruptible, kernel, kill_now, processes_with, registry_of, rootfs_dir,
+    home_with, interrupt, interruptible, kernel, kill_now, left_of, processes_with, registry_of, rootfs_dir,
     run_shards_env, run_shards_env_in, served, served_variant, shards, test_image, test_image_with,
 };
+#[cfg(windows)]
+use common::{files_under, users};
 
 /// A home with the image pulled, the guest recorded, and, where this host takes snapshots,
 /// the image's template saved by a first run, whose daemon now serves it.
@@ -155,25 +157,30 @@ fn exits(home: &Path, daemon: i32, what: &str) {
 /// home follows what descends from its daemon, and so none of them once it has gone, their
 /// party gone at its first look (CI 43968984258, x86_64 musl: `a_dead_daemons_waiting_vms_end`
 /// refused 3.0 ms and `a_restored_microvm_ends_with_its_home` 1.8 ms in, "its members now:
-/// none followed").
+/// none followed"). Listed again once those listed have ended, until none is, so that a
+/// process the first look missed is waited for too: on Windows a last look once found what
+/// no wait had followed, and the look after it disagreed (CI 44189693085: windows-2025's
+/// `a_dead_daemons_waiting_vms_end` named VM process 9424, and windows-2022's
+/// `a_killed_daemons_joined_microvms_end_with_it` failed naming none, `[]`).
 #[track_caller]
 fn all_end(named: &str, what: &str) {
     let kind = WaitKind::at(std::panic::Location::caller());
-    for (vm, _) in commands_with(named) {
-        let mut ending = Wait::begin(kind, vm, None, "a VM process's end, its daemon gone");
-        while alive(i32::try_from(vm).unwrap()) {
-            if let Err(stall) = ending.look(false) {
-                panic!("{what}: {:?}: {}", commands_with(named), ending.refused(&stall));
-            }
-            std::thread::sleep(ending.next_look());
+    loop {
+        let left = commands_with(named);
+        if left.is_empty() {
+            return;
         }
-        ending.answered();
+        for (vm, _) in left {
+            let mut ending = Wait::begin(kind, vm, None, "a VM process's end, its daemon gone");
+            while alive(i32::try_from(vm).unwrap()) {
+                if let Err(stall) = ending.look(false) {
+                    panic!("{what}: {:?}: {}", commands_with(named), ending.refused(&stall));
+                }
+                std::thread::sleep(ending.next_look());
+            }
+            ending.answered();
+        }
     }
-    assert!(
-        commands_with(named).is_empty(),
-        "{what}: {:?}",
-        commands_with(named)
-    );
 }
 
 fn daemon_pid(home: &Path) -> Option<i32> {
@@ -206,70 +213,6 @@ fn held_under(pid: i32, dir: &Path, named: impl Fn(&str) -> bool) -> Vec<PathBuf
             .map(PathBuf::from)
             .filter(|p| p.starts_with(dir) && named(p))
             .collect()
-    }
-}
-
-/// Every file under `dir`, its subdirectories' among them.
-#[cfg(windows)]
-fn files_under(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let mut dirs = vec![dir.to_path_buf()];
-    while let Some(d) = dirs.pop() {
-        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            match e.file_type() {
-                Ok(t) if t.is_dir() => dirs.push(e.path()),
-                Ok(t) if t.is_file() => files.push(e.path()),
-                _ => {}
-            }
-        }
-    }
-    files
-}
-
-/// The processes that use `file`, open or mapped. The file query works as a standard
-/// user; Restart Manager's RmGetList returned access denied even for that user's own
-/// file on the arm64 Windows test host (PM M414's file-users probe).
-#[cfg(windows)]
-fn users(file: &Path) -> Vec<u32> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Wdk::Storage::FileSystem::{FileProcessIdsUsingFileInformation, NtQueryInformationFile};
-    use windows_sys::Win32::Foundation::{
-        STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH,
-    };
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-    let handle = std::fs::File::open(file).unwrap();
-    // FILE_PROCESS_IDS_USING_FILE_INFORMATION: a ULONG count, padded to a pointer's
-    // alignment, then that many ULONG_PTR process IDs. Both Windows targets are 64-bit.
-    let mut buffer = vec![0usize; 65];
-    loop {
-        let mut io = IO_STATUS_BLOCK::default();
-        let bytes = u32::try_from(buffer.len().checked_mul(size_of::<usize>()).unwrap()).unwrap();
-        // SAFETY: an open synchronous file, its status block, and `bytes` writable,
-        // pointer-aligned bytes for the header and the IDs that follow it.
-        let status = unsafe {
-            NtQueryInformationFile(
-                handle.as_raw_handle(),
-                &mut io,
-                buffer.as_mut_ptr().cast(),
-                bytes,
-                FileProcessIdsUsingFileInformation,
-            )
-        };
-        if matches!(
-            status,
-            STATUS_BUFFER_OVERFLOW | STATUS_BUFFER_TOO_SMALL | STATUS_INFO_LENGTH_MISMATCH
-        ) {
-            buffer.resize(buffer.len().checked_mul(2).unwrap(), 0);
-            continue;
-        }
-        assert_eq!(status, 0, "file users of {}: {status:#x}", file.display());
-        // SAFETY: a successful query wrote the ULONG header into this initialized buffer.
-        let count = unsafe { *buffer.as_ptr().cast::<u32>() } as usize;
-        assert!(count < buffer.len());
-        return buffer[1..=count]
-            .iter()
-            .map(|&pid| u32::try_from(pid).unwrap())
-            .collect();
     }
 }
 
@@ -489,7 +432,13 @@ fn parallel_runs_keep_their_own_stdio() {
         child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
         let mut err = String::new();
         child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
-        assert_eq!(wait(&mut child, &home), Some(0), "run {i}: {err}");
+        let status = wait(&mut child, &home);
+        // A run its VM's host refused to enter, as D261's gate takes it for the host's, skips
+        // the test, said so (CI 44189693085, x86_64 musl: run 4's vCPU 2, 0x7).
+        if status != Some(0) && common::run_host_refused(&err, &home) {
+            return;
+        }
+        assert_eq!(status, Some(0), "run {i}: {err}");
         let whos: Vec<&str> = out.lines().filter(|l| l.starts_with("env WHO=")).collect();
         assert_eq!(
             whos,
@@ -1999,7 +1948,14 @@ fn lists_removed_by_hand_are_made_again_for_the_next_client() {
 /// there each answer's first message is a microVM made with 100 KiB of labels from a file,
 /// more than std's pipes take (64 KiB, its child pipes' quota), and for the one 4,500 names
 /// nothing has follow, their errors one message of 123 KiB, more than a slot's line takes
-/// (the system's default, ipc's `Window::System`, as a Linux FIFO's 64 KiB).
+/// (the system's default, ipc's `Window::System`, as a Linux FIFO's 64 KiB). Before any
+/// take, the daemon holds such a client until it reads or ends (D185's cold start), and
+/// says so: a take is a write that waited on its client, and clients reading their first
+/// messages as fast as the daemon wrote them may have made it wait on none, the FIFO taking
+/// the rest of each as its client read. Asked as it was, the stop held this test, which
+/// read its clients only after it, until the step's limit (CI 44138098584, aarch64 musl,
+/// 54 minutes). It is asked on a thread of its own, and the cut client read once the
+/// daemon says it holds it: then it takes its whole answer, and the stop ends.
 #[test]
 fn a_stopping_daemon_waits_for_no_client_that_reads_nothing() {
     let home = TempDir::new("daemon-unread");
@@ -2065,19 +2021,6 @@ fn a_stopping_daemon_waits_for_no_client_that_reads_nothing() {
         }
         patience.done();
     }
-    let stopped = run_shards_env(&["daemon"], &["stop"], &env);
-    assert_eq!(stopped.status, Some(0), "{stopped}");
-    // The slot whose write waited held the daemon its answer wait, and only it: unless
-    // the stop came before the daemon had the error to write, and cut it off with the rest.
-    // The slots no client opened, and the one whose answer is all written, are no clients
-    // it leaves. Before, it said it left two slots whose client "went no further", 3.1 ms
-    // after its close, its slowest take (an HVF host at dc7f45bc6).
-    let log = std::fs::read_to_string(home.join("daemon.log")).unwrap();
-    let without: Vec<&str> = log.lines().filter(|l| l.contains("exiting without it")).collect();
-    assert!(without.len() <= 1, "{log}");
-    for line in &without {
-        assert!(line.contains("took no more of its answer"), "{line}");
-    }
     // Each read at last: all of what is written is read.
     let read =
         |(mut child, mut out, mut err): (Child, std::process::ChildStdout, std::process::ChildStderr)| {
@@ -2091,6 +2034,34 @@ fn a_stopping_daemon_waits_for_no_client_that_reads_nothing() {
             let status = child.wait().unwrap();
             (status.code(), shown, said.join().unwrap())
         };
+    // The stop, the cut client unread (`Ok`) unless the daemon says it holds that client
+    // until it reads or ends, before any take: then it is read (`Err`, what it showed).
+    let held_until = "held until that client reads or ends";
+    let (stopped, cut) = std::thread::scope(|scope| {
+        let stopping = scope.spawn(|| run_shards_env(&["daemon"], &["stop"], &env));
+        while !stopping.is_finished() {
+            let log = std::fs::read_to_string(home.join("daemon.log")).unwrap();
+            if log.contains(held_until) {
+                let taken = read(cut);
+                return (stopping.join().unwrap(), Err(taken));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (stopping.join().unwrap(), Ok(cut))
+    });
+    assert_eq!(stopped.status, Some(0), "{stopped}");
+    // The slot whose write waited held the daemon its answer wait, and only it: unless
+    // the stop came before the daemon had the error to write, and cut it off with the rest.
+    // The slots no client opened, and the one whose answer is all written, are no clients
+    // it leaves. Before, it said it left two slots whose client "went no further", 3.1 ms
+    // after its close, its slowest take (an HVF host at dc7f45bc6).
+    let log = std::fs::read_to_string(home.join("daemon.log")).unwrap();
+    let without: Vec<&str> = log.lines().filter(|l| l.contains("exiting without it")).collect();
+    assert!(without.len() <= 1, "{log}");
+    for line in &without {
+        assert!(line.contains("took no more of its answer"), "{line}");
+    }
+    let held = log.lines().filter(|l| l.contains(held_until)).count();
     let (status, shown, said) = read(whole);
     assert_eq!(status, Some(0), "{said}");
     assert!(
@@ -2098,16 +2069,24 @@ fn a_stopping_daemon_waits_for_no_client_that_reads_nothing() {
         "{} bytes shown",
         shown.len()
     );
-    // The other's answer ends where its client took nothing.
-    let (status, _, said) = read(cut);
-    assert_eq!(
-        status,
-        Some(125),
-        "{}",
-        said.chars().take(300).collect::<String>()
-    );
-    if without.is_empty() {
-        eprintln!("the stop came before the daemon had the error to write");
+    let head = |said: &str| said.chars().take(300).collect::<String>();
+    match cut {
+        // The other's answer ends where its client took nothing.
+        Ok(cut) => {
+            assert_eq!(held, 0, "{log}");
+            let (status, _, said) = read(cut);
+            assert_eq!(status, Some(125), "{}", head(&said));
+            if without.is_empty() {
+                eprintln!("the stop came before the daemon had the error to write");
+            }
+        }
+        // Held until it read, it took its whole answer: the error of the names nothing has.
+        Err((status, _, said)) => {
+            assert_eq!((held, without.len()), (1, 0), "{log}");
+            assert_eq!(status, Some(1), "{}", head(&said));
+            assert!(said.contains("no such object"), "{}", head(&said));
+            eprintln!("no take was seen before the stop: the daemon held the cut client until it read");
+        }
     }
 }
 
@@ -2986,9 +2965,15 @@ fn pools_keep_what_their_runs_need_while_they_come() {
         );
     };
     let args = [image.as_str(), "exit", "0"];
-    let run = |env: &[(&str, &OsStr)]| {
+    // A run, served; or true where its VM's host refused an entry D261's gate takes for the
+    // host's, which skips the test.
+    let run = |env: &[(&str, &OsStr)]| -> bool {
         let run = run_shards_env(&["run"], &args, env);
+        if run.status != Some(0) && common::run_host_refused(&run.stderr, &home) {
+            return true;
+        }
         assert_eq!(run.status, Some(0), "{}", run.stderr);
+        false
     };
     // A refill, once its daemon has said it: its window then the newest said.
     let refilled = |said: usize| {
@@ -2997,7 +2982,9 @@ fn pools_keep_what_their_runs_need_while_they_come() {
     };
     // Its first run boots its image and saves the template its pool refills from (D25).
     let said = windows().len();
-    run(&env);
+    if run(&env) {
+        return;
+    }
     refilled(said);
     // Runs apart: each begun once the window its daemon said at the refill before it has
     // passed since the run before ended, so its claim comes more than one refill window
@@ -3073,7 +3060,9 @@ fn pools_keep_what_their_runs_need_while_they_come() {
         commands_with(&templates.to_string_lossy()),
         std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default()
     );
-    run(&env);
+    if run(&env) {
+        return;
+    }
     settled(Patience::of(&home), "after the keep-alive", &|n| n >= 1);
     let stopped = run_shards_env(&["daemon"], &["stop"], &env);
     assert_eq!(stopped.status, Some(0), "{stopped}");
@@ -3298,9 +3287,23 @@ fn a_restored_microvm_ends_with_its_home() {
         !processes_with(&named).is_empty()
     });
     let daemon = daemon_pid(&home).expect("a daemon pid");
-    eventually(&home, "the home could not be removed", || {
-        matches!(std::fs::remove_dir_all(&path), Ok(())) || !path.exists()
-    });
+    // Removed as `eventually` would, its failure saying what held the home: its last error,
+    // and each file left with what uses it (jupiter r11 at 7254ebaeb8: windows-x86_64 failed
+    // every time, saying nothing more).
+    let mut patience = Patience::of(&home);
+    loop {
+        let removal = std::fs::remove_dir_all(&path);
+        if removal.is_ok() || !path.exists() {
+            break;
+        }
+        assert!(
+            patience.holds(),
+            "the home could not be removed: {removal:?}\n{}",
+            left_of(&path)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    patience.done();
     // Its log went with its home: its end waited for while it and what it started go on
     // (`common::Wait` on its process, its home gone), and where its threads and its VMs'
     // wait said should it stop going on alive.

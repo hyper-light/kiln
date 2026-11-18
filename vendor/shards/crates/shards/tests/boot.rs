@@ -246,7 +246,17 @@ fn brings_up_every_vcpu() {
         return;
     }
     let k = kernel().to_str().unwrap();
-    for n in [2u32, 7, 16] {
+    // Each count this host runs: no more than its own most (`vm::max_vcpus`), which on a host
+    // whose Hyper-V is nested is its logical processors (D261), the 7 and 16 refused there
+    // (CI 44164945050, both x86_64 Windows images, 4 logical processors).
+    let most = shards_vmm::vm::max_vcpus().unwrap();
+    let mut counts: Vec<u32> = [2u32, 7, 16]
+        .iter()
+        .map(|&n| n.min(most))
+        .filter(|&n| n >= 2)
+        .collect();
+    counts.dedup();
+    for n in counts {
         let cpus = n.to_string();
         let r = vm_run(&[
             "--kernel",
@@ -258,6 +268,10 @@ fn brings_up_every_vcpu() {
             "--cmdline",
             "console=hvc0 panic=-1",
         ]);
+        // A refusal D261's gate takes for its host's skips it.
+        if common::host_refused(&r.stderr) {
+            return;
+        }
         assert!(
             r.stdout.contains(&format!("smp: Brought up 1 node, {n} CPUs")),
             "{n} vCPUs: {r}"
@@ -341,9 +355,8 @@ fn boots_the_hosts_maximum_vcpu_count() {
                 return;
             }
             Brought::Refused(refused) => {
-                limits
-                    .record(max, Outcome::Refused { vcpu: refused.vcpu })
-                    .unwrap();
+                // Kept with its moment, a witness for D261's gate of a machine refused beside it.
+                limits.record_refusal(max, refused.vcpu, refused.refusal).unwrap();
                 refused.to_string()
             }
         },
@@ -366,9 +379,7 @@ fn boots_the_hosts_maximum_vcpu_count() {
                     limits.record(vcpus, Outcome::Ran).unwrap();
                     return;
                 }
-                Brought::Refused(again) => limits
-                    .record(vcpus, Outcome::Refused { vcpu: again.vcpu })
-                    .unwrap(),
+                Brought::Refused(again) => limits.record_refusal(vcpus, again.vcpu, again.refusal).unwrap(),
             }
         }
         vcpus /= 2;
@@ -613,6 +624,10 @@ fn runs_init_as_pid_1_and_powers_off() {
         "--cmdline",
         "console=hvc0 quiet panic=-1",
     ]);
+    // A refusal D261's gate takes for its host's skips it.
+    if common::host_refused(&r.stderr) {
+        return;
+    }
     assert_eq!(r.status, Some(0), "{r}");
     assert!(r.stdout.contains("shards-init: pid 1 running"), "{r}");
     let (init_us, exit_us) = (
@@ -637,6 +652,11 @@ fn runs_init_where_its_kernel_opened_no_console() {
     for console in ["console=hvc1", "console=ttyS0"] {
         let line = format!("{console} quiet panic=-1");
         let r = vm_run(&["--kernel", k, "--init", init, "--cmdline", line.as_str()]);
+        // A refusal D261's gate takes for its host's skips it (CI 44164945050, x86_64 musl on
+        // EC2's Intel 6975P-C: console=ttyS0's vCPU 0 refused, 0x7, beside other tests' refusals).
+        if common::host_refused(&r.stderr) {
+            return;
+        }
         assert_eq!(r.status, Some(0), "{console}: {r}");
         assert!(r.marker_us(1).is_some(), "{console}: {r}");
     }
@@ -677,9 +697,16 @@ fn rejects_invalid_vm_configuration() {
         return;
     }
     let (k, init) = (kernel().to_str().unwrap(), guest_init().to_str().unwrap());
+    // Refused as this host refuses that many, whichever its reason, named typed
+    // (`vm::limits::VcpusRefused`, D261): past its hypervisor's partition, or past its logical
+    // processors where its Hyper-V is nested (CI 44164945050, both x86_64 Windows images).
+    let too_many = shards_vmm::vm::vcpus_refused(100_000)
+        .unwrap()
+        .expect("100000 vCPUs taken by this host")
+        .to_string();
     let cases: &[(&[&str], &str)] = &[
         (&["--kernel", k, "--cpus", "0"], "at least one vCPU"),
-        (&["--kernel", k, "--cpus", "100000"], "vCPUs requested"),
+        (&["--kernel", k, "--cpus", "100000"], too_many.as_str()),
         (&["--kernel", k, "--memory", "63"], "even number of MiB"),
         (&["--kernel", k, "--memory", "65"], "even number of MiB"),
         // Named whole, as the VM process resolved it: Windows gives it a drive.
@@ -1555,6 +1582,10 @@ fn a_snapshot_keeps_memory_to_plug() {
         .into_iter()
         .chain((0..2).map(|_| run_shards(&["restore"], &[snapshot.to_str().unwrap()])))
     {
+        // A refusal D261's gate takes for its host's skips it.
+        if common::host_refused(&run.stderr) {
+            return;
+        }
         assert!(run.stdout.contains("SHARDS-TEST PLUGGED "), "{run}");
         assert!(run.stdout.contains("SHARDS-TEST PASS"), "{run}");
     }
@@ -2440,14 +2471,20 @@ fn shards_api_conforms_on_real_guests() {
         return;
     }
     let spec = |mode: &str| api_spec(&format!("console=hvc0 quiet panic=-1 shards_test={mode}"));
-    conformance::run(&conformance::Subject {
+    let conformed = conformance::run(&conformance::Subject {
         guests: &shards_api::Shards,
         serving: spec("echo"),
         port: 1234,
         unserved: 1236,
         powering_off: spec("kmsg"),
-    })
-    .unwrap();
+    });
+    // A refusal D261's gate takes for its host's skips it.
+    if let Err(failed) = &conformed
+        && common::host_refused(&failed.why)
+    {
+        return;
+    }
+    conformed.unwrap();
 }
 
 /// shards-api's `GuestSpec::shares`: the test guest's `share` mode writes through `shards0`
@@ -2477,7 +2514,14 @@ fn shards_api_shares_a_directory_and_a_read_only_one() {
         ..api_spec("console=hvc0 quiet panic=-1 shards_test=share")
     };
     let guest = shards_api::Shards.boot(&spec).unwrap();
-    assert_eq!(guest.wait_while_runs().unwrap(), shards_api::End::PowerOff);
+    let end = guest.wait_while_runs().unwrap();
+    // A refusal D261's gate takes for its host's skips it.
+    if let shards_api::End::Failed(said) = &end
+        && common::host_refused(said)
+    {
+        return;
+    }
+    assert_eq!(end, shards_api::End::PowerOff);
     assert_eq!(
         std::fs::read_to_string(rw.join("from-guest")).unwrap(),
         "written by a shards guest through --share\n"

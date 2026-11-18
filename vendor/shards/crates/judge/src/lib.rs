@@ -21,9 +21,18 @@
 //! ([`SPREAD`]). What a look finds is its
 //! caller's to say ([`Found`]): shards-api's waits read their guest's VM process
 //! (`progress::Follow`), and so do the daemon's waits on a microVM's own answers (D188).
+//!
+//! A crate of its own, of std alone, which shards-api re-exports: the tests' waits on their
+//! own threads (shards-testwait) judge by the same rule, and shards-remote's tests, beneath
+//! shards-api, take them.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+pub mod threads;
+#[cfg(windows)]
+pub use threads::{ThreadsHeld, threads_held, threads_said};
 
 /// A CPU rate: CPU time had over a wall time, kept as the pair it was measured as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,9 +55,10 @@ impl Rate {
 }
 
 /// What a wait that follows its party found as it refused it
-/// ([`Refusal::Stalled`](crate::Refusal::Stalled)). Kept in nanoseconds, each past u64's (584
-/// years) its most, and its kind's rates boxed apart, so that a refusal is no larger for
-/// them (clippy's `result_large_err` over a pair of refusals, crates/api/tests/sim.rs).
+/// (shards-api's `Refusal::Stalled`). Kept in nanoseconds, each past u64's (584
+/// years) its most, and its kind's rates and its threads' account boxed apart, so that a
+/// refusal is no larger for them (clippy's `result_large_err` over a pair of refusals,
+/// crates/api/tests/sim.rs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stall {
     waited: u64,
@@ -57,6 +67,8 @@ pub struct Stall {
     /// Its kind's R* and C* where an answer of it was rated, and its own rate where it was
     /// refused for running below R* ([`Stall::rate`]).
     rates: Option<Box<Rates>>,
+    /// Its party's threads as its caller read them as it refused it ([`Stall::said`]).
+    threads: Option<Box<str>>,
 }
 
 /// A [`Stall`]'s rates, in nanoseconds: R*'s CPU and wall, C*, and its own rate's CPU and
@@ -92,7 +104,33 @@ impl Stall {
                     rate: None,
                 })
             }),
+            threads: None,
         }
+    }
+
+    /// It, with its party's threads as `threads` says them, read as it was refused: each
+    /// one's state and, where it waits, on what, as its OS keeps them (Windows: its state and
+    /// wait reason, as `threads_said` reads them; Linux: its state and the kernel function it
+    /// sleeps in; macOS: its run state), so that a refusal says what its party was doing, never
+    /// at a look (ROOT, 2026-11-18: CI 44189693085's Windows refusals said "0 of 3 threads
+    /// runnable" and no more). None where its caller read none.
+    #[must_use]
+    pub fn said(mut self, threads: Option<String>) -> Stall {
+        self.threads = threads.map(String::into_boxed_str);
+        self
+    }
+
+    /// Its party's threads as they were read as it was refused ([`Stall::said`]).
+    pub fn threads(&self) -> Option<&str> {
+        self.threads.as_deref()
+    }
+
+    /// Its threads' account as a refusal's sentence ends with it, after its times: "; its
+    /// threads: " and what each was doing ([`Stall::threads`]); nothing where none was read.
+    /// One clause for every refusal that says a stall.
+    pub fn account(&self) -> String {
+        self.threads()
+            .map_or_else(String::new, |threads| format!("; its threads: {threads}"))
     }
 
     /// A wait refused for running below R*: `rate` its work over its unheld time, more work
@@ -143,7 +181,7 @@ impl Stall {
     }
 }
 
-/// What a process has seen of a kind of answer ([`Shards::seen`](crate::Shards::seen),
+/// What a process has seen of a kind of answer (shards-api's `Shards::seen`,
 /// [`Record::seen`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seen {
@@ -185,7 +223,7 @@ const SPREAD: u64 = 2;
 /// ([`Found::Based`], [`Found::Progressed`]), a look that ends a moment past its due time, and
 /// the stillness counted from that end ([`Judge::found_over`]) is less than a window at the
 /// next due look and a whole one at the one after. A derivation of the rule, not a tuning, as
-/// `SPREAD` is: what bounds a test's wait on a still party ([`Judge::refused_within`]).
+/// `SPREAD` is: what a test of a still party counts its due looks against.
 pub const LOOKS_TO_REFUSE: u32 = 3;
 
 /// [`Seen::Learned`]'s, together.
@@ -473,14 +511,6 @@ impl<'a> Judge<'a> {
         slowest.max(self.floor)
     }
 
-    /// How long a wait whose party is still throughout takes at most to be refused over
-    /// `window`, its kind's W*, its judge unheld: its [`LOOKS_TO_REFUSE`] due looks, a window
-    /// apart, and the last one's own span, less than a window, as a window is never less than
-    /// the longest look (its floor).
-    pub fn refused_within(window: Duration) -> Duration {
-        window.saturating_mul(LOOKS_TO_REFUSE.saturating_add(1))
-    }
-
     /// What a look at its party found since the look before, made now: refused where the
     /// party made no progress at all over a whole W* or more since a look last found it
     /// progressed or held, the time its own looks ran late not counted. A look before it is
@@ -623,6 +653,25 @@ impl<'a> Judge<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stall says its party's threads as its caller read them as it refused it, and none
+    /// where its caller read none: the account rides with the stall, apart from its times.
+    #[test]
+    fn a_stall_says_its_partys_threads_as_they_were_read() {
+        let record = Record::new();
+        record.teach(Duration::from_millis(1), Duration::ZERO);
+        let now = Instant::now();
+        let stall = record
+            .stalled(now.checked_sub(Duration::from_millis(5)).unwrap(), now)
+            .unwrap();
+        assert_eq!(stall.threads(), None, "unread until its caller says them");
+        let said = stall
+            .clone()
+            .said(Some("7 waiting (WrUserRequest), 9 ready".into()));
+        assert_eq!(said.threads(), Some("7 waiting (WrUserRequest), 9 ready"));
+        assert_eq!((said.waited(), said.over()), (stall.waited(), stall.over()));
+        assert_eq!(said.said(None).threads(), None);
+    }
 
     /// A rate is less than another's as cross-multiplication says, with no float: equal
     /// rates are neither below the other, none at all is below any, and a duration past

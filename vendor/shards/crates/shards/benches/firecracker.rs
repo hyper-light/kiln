@@ -59,7 +59,13 @@
 //!
 //! - `to_beat`: the host's clock from spawn until the guest's first beat after the restore
 //!   reaches the VMM's stdout: the guest running again, what a user waits for.
-//! - `overhead` and `peak_rss`, as above, while the guest beats.
+//! - The memory rows, `rss_anon`, `rss_file`, `pss` and `pss_file`, read once the guest has
+//!   run past its first beat for the window shards records a restore's working set over
+//!   (`shards_vmm::vm::RECORD_FOR`, D25: 1 s on KVM), both VMMs alike: shards copies ahead
+//!   what its guest wrote over that window, and Firecracker's guest writes its own as it
+//!   runs, so the two are compared after the same guest time (ROOT's ruling of 2026-11-17,
+//!   D36; PM M616), where read as the first beat came they compared a window's copies with
+//!   a beat's writes. Then `overhead`, as above, and `peak_rss`.
 //! - Where shards' restores' time goes, which the envelope does not check: as many restores
 //!   of shards' again, after the paired ones, each with its VM process's log
 //!   (`SHARDS_LOG=info`), whose writes are in no paired sample. `restored`, `vcpus_ready`
@@ -68,11 +74,11 @@
 //!   `logged_to_beat`, those restores' own `to_beat`; `logged_prefetched_pages`, the pages of
 //!   its working set each mapped ahead.
 //! - What each restore's guest touched and what KVM counted of it, which the envelope does
-//!   not check: as its first beat arrives, the pages of its memory file its host maps and
-//!   those it holds a private copy of (`touched_pages`, `written_pages`), and KVM's
-//!   counters of its VM (debugfs, which only root reads: through `sudo -n`, as CI's
-//!   runners allow), read a few beats after it, with each restore's time to its beat and
-//!   its pair, into `firecracker_restore-kvm.tsv` beside the samples (SHARDS_BENCH_SAMPLES).
+//!   not check: KVM's counters of its VM as its first beat arrives (debugfs, which only root
+//!   reads: through `sudo -n`, as CI's runners allow), read a few beats after it, and with
+//!   its memory rows the pages of its memory file its host maps and those it holds a private
+//!   copy of (`touched_pages`, `written_pages`), with each restore's time to its beat and its
+//!   pair, into `firecracker_restore-kvm.tsv` beside the samples (SHARDS_BENCH_SAMPLES).
 //!   `SHARDS_BENCH_KVM=off` reads none of it, for the A/B of the reading itself.
 //! - Where each VMM's restores' time goes in KVM (`--traced N`, none unless asked): once
 //!   the first pair's density (below) is done, N more restores of each VMM of that pair,
@@ -89,7 +95,9 @@
 //! of the same index in the same pair.
 //!
 //! - `fleet_pss`, `fleet_private`: each VM's proportional set size, and its private pages
-//!   (`Private_Clean` and `Private_Dirty` in smaps_rollup), with its fleet running.
+//!   (`Private_Clean` and `Private_Dirty` in smaps_rollup), with its fleet running, read
+//!   once its last VM has run past its first beat for the working set's window
+//!   (`RECORD_FOR`), as the restores' rows are.
 //! - `fleet_pte`: its page tables, `VmPTE` in /proc/PID/status.
 //! - `fleet_host`: the host's `MemAvailable` given up per VM, from before the round's
 //!   first spawn to all of it beating: what process accounting leaves out (KVM's and the
@@ -133,6 +141,8 @@ mod compare {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use shards_vmm::vm::RECORD_FOR;
 
     use super::{common, support};
 
@@ -663,7 +673,7 @@ mod compare {
                 pair,
             );
             for i in 0..WARMUP + runs {
-                let order = if i % 2 == 0 {
+                let order = if i.is_multiple_of(2) {
                     [Vmm::Shards, Vmm::Firecracker]
                 } else {
                     [Vmm::Firecracker, Vmm::Shards]
@@ -901,12 +911,14 @@ mod compare {
         std::fs::write(dir.join("firecracker_restore-kvm.tsv"), tsv).unwrap();
     }
 
-    /// A restored VM held running: its process, and the threads that drain its output.
+    /// A restored VM held running: its process, the threads that drain its output, and when
+    /// its guest first beat.
     struct Held {
         child: std::process::Child,
         pid: libc::pid_t,
         out: thread::JoinHandle<Vec<u8>>,
         err: thread::JoinHandle<String>,
+        beat: Instant,
     }
 
     impl Held {
@@ -926,8 +938,15 @@ mod compare {
                 all
             });
             after_spawn();
-            let held = Held { child, pid, out, err };
-            if beat.recv_timeout(TIMEOUT).is_err() {
+            let beat = beat.recv_timeout(TIMEOUT);
+            let held = Held {
+                child,
+                pid,
+                out,
+                err,
+                beat: beat.unwrap_or_else(|_| Instant::now()),
+            };
+            if beat.is_err() {
                 let (out, err) = held.end();
                 panic!(
                     "a held restore never beat\n--- stdout\n{}\n--- stderr\n{err}",
@@ -980,7 +999,7 @@ mod compare {
         pair: usize,
         fleets: &mut [Fleet; 2],
     ) {
-        let rounds = if pair % 2 == 0 {
+        let rounds = if pair.is_multiple_of(2) {
             [Vmm::Shards, Vmm::Firecracker]
         } else {
             [Vmm::Firecracker, Vmm::Shards]
@@ -1002,6 +1021,12 @@ mod compare {
                     }
                 })
                 .collect();
+            // Read once its last VM's guest has run past its first beat for the window shards
+            // records a working set over (RECORD_FOR, D25), each fleet alike (D36).
+            let settled = held.iter().map(|h| h.beat).max().map(|at| at + RECORD_FOR);
+            if let Some(wait) = settled.and_then(|at| at.checked_duration_since(Instant::now())) {
+                thread::sleep(wait);
+            }
             let after = meminfo_bytes("MemAvailable");
             let of = &mut fleets[matches!(vmm, Vmm::Firecracker) as usize];
             for h in &held {
@@ -1029,7 +1054,13 @@ mod compare {
     fn report_density(fleets: [Fleet; 2], fleet: usize, pairs: usize, cpus: &str, memory: &str) {
         let [shards, fc] = fleets;
         let rounds: Vec<&str> = (0..pairs)
-            .flat_map(|pair| if pair % 2 == 0 { ["S", "F"] } else { ["F", "S"] })
+            .flat_map(|pair| {
+                if pair.is_multiple_of(2) {
+                    ["S", "F"]
+                } else {
+                    ["F", "S"]
+                }
+            })
             .collect();
         support::report(
             "firecracker_density",
@@ -1196,11 +1227,25 @@ mod compare {
         });
         after_spawn();
         let beat = beat.recv_timeout(TIMEOUT);
-        // What the guest touched of its memory file and KVM's counters as it first beat, read
-        // before the readings below: what its restore took, a few beats' more at most.
+        // KVM's counters as its guest first beat, read before the readings below: what its
+        // restore took, a few beats' more at most.
         let read = beat.is_ok() && reads_kvm();
-        let touched = read.then(|| touched(pid, memory_file)).flatten();
         let kvm = read.then(|| common::kvm_counters(pid as u32)).flatten();
+        // Its memory read once its guest has run past its first beat for the window shards
+        // records a restore's working set over (RECORD_FOR, D25), both VMMs alike: the pages
+        // shards copies ahead are what its guest wrote over that window, and Firecracker's
+        // guest writes its own as it runs (ROOT's ruling of 2026-11-17, D36: the restore's and
+        // the fleet's rows compared after the same guest time; `to_beat` as it was). The pages
+        // of its memory file it maps and copies are read then too, where `rss_anon` is.
+        if let Ok(at) = beat
+            && let Some(wait) = (at + RECORD_FOR).checked_duration_since(Instant::now())
+        {
+            thread::sleep(wait);
+        }
+        let touched = read.then(|| touched(pid, memory_file)).flatten();
+        let [anon, file] = ["RssAnon", "RssFile"].map(|field| status_bytes(pid, field));
+        let [pss, pss_file, anon_huge] =
+            ["Pss", "Pss_File", "AnonHugePages"].map(|field| rollup_bytes(pid, field));
         let overhead = beat.is_ok().then(|| {
             (0..READINGS)
                 .map(|_| {
@@ -1210,9 +1255,7 @@ mod compare {
                 .max()
                 .unwrap_or(0)
         });
-        let [peak, anon, file] = ["VmHWM", "RssAnon", "RssFile"].map(|field| status_bytes(pid, field));
-        let [pss, pss_file, anon_huge] =
-            ["Pss", "Pss_File", "AnonHugePages"].map(|field| rollup_bytes(pid, field));
+        let peak = status_bytes(pid, "VmHWM");
         describe_mappings(
             pid,
             &format!("{} restore", command.get_program().to_string_lossy()),
@@ -1279,42 +1322,58 @@ mod compare {
         found.then_some((rss / 4, anon / 4))
     }
 
-    /// The working set a first restore of shards' `snapshot` records over its first second,
-    /// handed to the bench (`--working-set`) and kept beside the snapshot as `shards
-    /// restore`'s writer keeps one (`vm::keep_working_set`, D30): how many pages, 0 where
-    /// none was recorded (a backend that records no restore's).
+    /// The working set a first restore of shards' `snapshot` records until its guest's first
+    /// beat, the comparison's command's answer, as a run's recording ends when its command
+    /// answers (`--record-until`, D25), handed to the bench (`--working-set`) and kept beside
+    /// the snapshot as `shards restore`'s writer keeps one (`vm::keep_working_set`, D30): how
+    /// many pages, 0 where none was recorded (a backend that records no restore's).
     fn record_working_set(snapshot: &Path) -> usize {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
         let (from_vm, to_bench) = std::io::pipe().expect("the working set's pipe");
-        let fd = to_bench.as_raw_fd();
+        let (until, tell) = std::io::pipe().expect("the recording's end's pipe");
+        let (set_fd, until_fd) = (to_bench.as_raw_fd(), until.as_raw_fd());
         let mut command = Command::new(common::shards_vm());
         command
             .arg("restore")
-            .args(["--working-set", "3"])
+            .args(["--working-set", "3", "--record-until", "4"])
             .arg(snapshot)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        // SAFETY: runs in the child between fork and exec, calling only dup2(2) and
-        // fcntl(2), which are async-signal-safe.
+        // SAFETY: runs in the child between fork and exec, calling only fcntl(2) and dup2(2),
+        // which are async-signal-safe. Each end is copied above 4 first (closed on exec), so
+        // that neither is closed as the other is moved into place.
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                let high = |fd| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 5);
+                let (set, until) = (high(set_fd), high(until_fd));
+                if set < 0
+                    || until < 0
+                    || libc::dup2(set, 3) < 0
+                    || libc::dup2(until, 4) < 0
+                    || libc::fcntl(3, libc::F_SETFD, 0) < 0
+                    || libc::fcntl(4, libc::F_SETFD, 0) < 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
         let mut child = command.spawn().expect("spawning the recording restore");
-        drop(to_bench);
-        // Handed once its first second has passed, and its end closes the pipe.
+        drop((to_bench, until));
+        let (beat, _console) = first_beat(child.stdout.take().unwrap());
+        // Handed as its recording ends, and its end closes the pipe.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let (mut from_vm, mut handed) = (from_vm, Vec::new());
             let _ = from_vm.read_to_end(&mut handed);
             let _ = tx.send(handed);
         });
+        beat.recv_timeout(TIMEOUT)
+            .expect("the recording restore's guest never beat");
+        // Its guest has beaten: the end of this pipe ends its recording.
+        drop(tell);
         let handed = rx
             .recv_timeout(TIMEOUT)
             .expect("the recording restore handed nothing in time");
@@ -1921,7 +1980,8 @@ mod compare {
         let ours: Vec<(u64, u64, [u64; 3])> = guest_mappings(&spans, guest_bytes)
             .iter()
             .zip(&maps)
-            .filter_map(|(guest, map)| guest.then_some(*map))
+            .filter(|(guest, _)| **guest)
+            .map(|(_, map)| *map)
             .collect();
         if ours.is_empty() {
             return None;
@@ -1946,7 +2006,7 @@ mod compare {
             pagemap.read_exact_at(&mut entries, start / page * 8).ok()?;
             for (i, entry) in entries.as_chunks::<8>().0.iter().enumerate() {
                 let entry = u64::from_ne_bytes(*entry);
-                if entry & PRESENT == 0 || entry & EXCLUSIVE == 0 {
+                if (entry & PRESENT) == 0 || (entry & EXCLUSIVE) == 0 {
                     continue;
                 }
                 let span = usize::try_from((from + i as u64 * page) / huge).ok()?;

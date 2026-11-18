@@ -527,6 +527,12 @@ pub mod kind {
     /// a range of one protocol's ports, and the way a flow opens. Taken back, every flow it
     /// let open that no other grant admits ends. Answered as `NET_JOIN` is.
     pub const NET_PEER_GRANT: u8 = 116;
+    /// Orchestrator → run host, on its links socket (D286, Unix): the streams of the run's
+    /// shares another server serves (`shards_api::image::wire::Request::served`), in the
+    /// request's order, [`MAX_FDS`](super::MAX_FDS) a message at most and no payload, all of
+    /// them sent before the run's request (`CREATE`), which says how many. Not answered: its
+    /// sender holds its copies until the run has started or been refused (M24).
+    pub const SERVED_SHARES: u8 = 117;
     /// Daemon → a running microVM's VM process: a run joins its network (D119). Its number
     /// (a big-endian u64, which `EXEC_TAKEN` answers), with the VM's end of the joiner's
     /// own connection to the daemon, on which the joiner's run goes as a warm VM's does
@@ -859,6 +865,15 @@ pub const SAVE_DELTA: u8 = 2;
 /// The status of a run its save stopped (D176), as a shell says of a job it stopped, 128
 /// plus SIGTSTP's number on Linux (20): not ended, but stopped where it is, to be resumed.
 pub const SAVED_STATUS: u8 = 148;
+
+/// The status of a warm VM that took no run and ended for its template's sake (D26, ROOT's
+/// ruling of 2026-11-17): its template's files did not read, or its guest reset or powered
+/// off before it asked for its command. Its daemon counts this end alone against the
+/// template; a VM that ended any other way before its run (its host refusing to enter it,
+/// D261; its VMM's error; its stop) failed for no fault of its template's. sysexits(3)'s
+/// EX_DATAERR, "the input data was incorrect in some way": a template is a restore's input.
+/// Read only of a VM that took no run, which has no command whose status it could be.
+pub const TEMPLATE_FAILED_STATUS: u8 = 65;
 
 /// An `ATTACH_RUN` flag: the client's stdin goes to the command's.
 pub const ATTACH_STDIN: u8 = 1;
@@ -2541,13 +2556,17 @@ mod pipe;
 pub use pipe::{
     Arriving, Event, ExitWatch, Listener, Message, Pipe, Poller, RandomFailed, Stream, VSOCK_QUOTA,
     VsockConn, VsockListener, VsockNames, await_any, await_streams, byte_pair, end, fill_random, hung_up,
-    input_pair, output_pair, readable_raw, recv, recv_by, recv_judged, send, send_judged, vsock_instance,
-    vsock_listen, vsock_open, vsock_pair,
+    input_pair, output_pair, readable_raw, recv, recv_by, recv_judged, send, send_judged, vsock_carried,
+    vsock_instance, vsock_listen, vsock_open, vsock_pair,
 };
 
 /// When a judged wait (`send_judged`, `recv_judged`) next asks its judge, and whether it goes
-/// on: asked as the wait begins and each time the time it named passes with its stream not
-/// ready; `Ok(None)` waits on the stream's readiness alone, an error ends the wait with it.
+/// on: asked first once a look finds its stream not ready (each wait looks before it asks: its
+/// write or read itself, then a look with no wait), and each time the time it named passes
+/// with its stream not ready still; `Ok(None)` waits on the stream's readiness alone, an error
+/// ends the wait with it. A wait whose stream is ready at its first look never asks: a judge
+/// that reads its party as it is first asked reads it only where its wait has to wait (D215,
+/// amended 2026-11-17).
 pub type Judge<'a> = dyn FnMut() -> std::io::Result<Option<std::time::Instant>> + 'a;
 #[cfg(windows)]
 mod windows;

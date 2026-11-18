@@ -14,12 +14,12 @@ each at one revision, with kiln's recorded changes, and one copy of each project
 - **Hex** is pinned at its `main`, which builds on kiln's Shards and hyper-raft revisions itself, with kiln's
   records of hyper-raft's changes and kiln's layout as recorded changes (`vendor/hex/UPSTREAM.md`). kiln's copy holds Hex's
   `vendor/MANIFEST.toml` and `vendor/patches`, so `scripts/vendor.py check` holds Hex's pins to kiln's as kiln's
-  copy has them: one Shards revision serves Hex and kiln. Hex is at its `main` (`071934813`: its Shards image class
+  copy has them: one Shards revision serves Hex and kiln. Hex is at its `main` (`f6192bc99`: its Shards image class
   in a process that links Hex, `ImageRuntime::new` and `::leasing`, a member's run-time arguments, the host folders it
   sees, a box's host use at its end, a member's MCP bridge, `Runtime::mcp`, and a member's own signals,
   `Runtime::signal_member`, and since Shards v0.8.0's landing a share's member scope, its own class and its scheduler's
   admission, warm pools, agents' volumes, a member's exec, a run's kept final use and its agent-control link), and Shards
-  at the revision it pins (`85cecd75b`), where Hex makes no change of its own to
+  at the revision it pins (`1799412f9`), where Hex makes no change of its own to
   Shards. The two move together: `scripts/vendor.py shards <commit>` at Hex's new pin, then
   `scripts/vendor.py hex <commit>`; and hyper-raft with them where Hex's pin of it moves (`e0613f52` since Shards'
   agent-control link reads the negotiated idle timeout of hyper-quic's patch Q34 and a handshake's progress, Q35),

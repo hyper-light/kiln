@@ -814,6 +814,55 @@ fn a_patient_wait_goes_on_while_its_party_works() {
     }
 }
 
+/// A home's patience follows the daemon it found as it began after the daemon's record has
+/// gone, and gives it up only once it has gone too, at as many looks in a row that find none
+/// of its party as refuse a still one (`LOOKS_TO_REFUSE`; ROOT, 2026-11-18, #36). A test's
+/// removal of its home takes the daemon's record before the daemon has ended, and on Windows
+/// stops at what the home's microVMs still hold: daemon.rs' `a_restored_microvm_ends_with_its_home`
+/// made its patience before its removal, which first looked after it, and was refused 57 ms
+/// in, "this test's own VM processes, no daemon yet", its restored microVM still ending
+/// (jupiter, bare-metal WHP, at 183fe264e3). Red so (lanes/redgreen/cold-wait.patch): refused
+/// at its first look. Do: a stand-in, idle, named its home's daemon; a cold patience of the
+/// home; the record removed; as many looks as refuse a gone party, and one more, while the
+/// stand-in lives; then its end, and looks until its patience gives up. Expect: held while it
+/// lives; given up after, at no fewer looks than refuse a gone party.
+#[test]
+fn a_homes_patience_follows_its_daemon_past_its_record() {
+    let home = TempDir::new("unrecorded");
+    let mut daemon = stand_in_doing("idle")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    name_daemon(&home, daemon.id());
+    let mut patience = cold_patience(&home);
+    std::fs::remove_file(home.join("daemon.pid")).unwrap();
+    // Each look a due one: its pace waited out before it.
+    for look in 0..=shards_api::LOOKS_TO_REFUSE {
+        std::thread::sleep(patience.next_look());
+        if !patience.holds() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            panic!("given up at look {look} with its daemon alive, its record gone");
+        }
+    }
+    drop(daemon.stdin.take());
+    daemon.wait().unwrap();
+    let mut looks = 0;
+    loop {
+        std::thread::sleep(patience.next_look());
+        if !patience.holds() {
+            break;
+        }
+        looks += 1;
+    }
+    assert!(
+        looks >= shards_api::LOOKS_TO_REFUSE,
+        "given up {looks} looks past its daemon's end, before {} found its party gone",
+        shards_api::LOOKS_TO_REFUSE
+    );
+}
+
 /// A test's wait on a guest (`Heard`: every `Vm` wait, `within`, run.rs' and restore.rs'
 /// waits on their VM process) goes on while its party works, as a command's wait does (the
 /// person's ruling of 2026-11-13, D209): its caller gives it no bound, and past its cold start
@@ -1230,17 +1279,19 @@ fn judged_end(party: &mut std::process::Child) -> Result<std::process::ExitStatu
 /// in as it worked). Do: a stand-in idle throughout, the party's one live process, its calls
 /// begun once it says it rests; from one call site, its kind's kept record removed, a call
 /// that answers at once, then one busy for 200 ms on its own thread, then one idle there
-/// until its wait is refused, the refusal ending it, or for as long as the judge's rule takes
-/// to refuse a still party over its kind's W* (`shards_api::Judge::refused_within`), past
-/// which it answers. Expect: the first two answer; the idle one is refused, and one that
-/// answers fails the test with the due looks that found its party still. It sets itself no
-/// span of its own: a resting process on Windows runs its default
+/// until its wait is refused, the refusal ending it, or until its wait's due looks have found
+/// its party still `shards_api::LOOKS_TO_REFUSE` + 1 times since it last ran, none refusing
+/// it, past which it answers. Expect: the first two answer; the idle one is refused, and one
+/// that answers fails the test with those looks and their times. It counts looks and sets
+/// itself no span of time, which a host holding the looks late would cut short: a resting
+/// process on Windows runs its default
 /// thread pool's workers when its system decides ("the system controls the lifetime of
 /// thread pool threads", Microsoft's Thread Pools; the loader's own use of the pool, Raymond
 /// Chen, "Why does my single-threaded program have multiple threads?", 2019-11-15), and on
 /// CI's arm64 Windows runners one of the stand-in's three ran once, about 840 ms into a call
-/// asleep for 1 s, leaving no window before its end to refuse it in (run 44138098584; trace
-/// run 44151128928, PM M618). Such a run postpones a refusal by a window; none prevents it.
+/// asleep for 1 s, at the due look its refusal had come to (run 44138098584; trace runs
+/// 44151128928 and 44163626733, PM M618). Such a run postpones a refusal by a window; none
+/// prevents it.
 #[test]
 fn a_judged_calls_own_work_is_its_progress() {
     #[track_caller]
@@ -1249,27 +1300,26 @@ fn a_judged_calls_own_work_is_its_progress() {
             let site = std::panic::Location::caller();
             let _ = std::fs::remove_file(common::WaitKind::kept_at(site, "", ""));
         }
-        // Idle, it waits for its refusal, which its wait's stop says, for as long as the judge's
-        // rule takes to refuse a still party over its kind's W*.
-        let (refused, on_refusal) = std::sync::mpsc::channel::<()>();
-        let bound = match common::WaitKind::at(std::panic::Location::caller())
-            .record()
-            .seen()
-        {
-            shards_api::Seen::Learned { slowest, .. } => shards_api::Judge::refused_within(slowest),
-            shards_api::Seen::Cold => Duration::ZERO,
-        };
-        common::judged_accounted(
-            common::Party::client(party, None),
-            "a call's own work",
-            move || {
-                let _ = refused.send(());
-            },
-            move || {
-                if idle {
-                    let _ = on_refusal.recv_timeout(bound);
-                    return;
+        let party = common::Party::client(party, None);
+        if idle {
+            // Idle, it waits for its refusal, whose end of its wait closes the channel of its
+            // judge's looks; told of more than LOOKS_TO_REFUSE due looks that found its party
+            // still since it last ran, none refusing it, it answers. A count of the judge's own
+            // looks, which a host holding them late cannot cut short; it keeps no clock, the CI
+            // step's own limit its last bound.
+            return common::judged_watching(party, "a call's own work", |looks| {
+                while let Ok(still) = looks.recv() {
+                    if still.len() > shards_api::LOOKS_TO_REFUSE as usize {
+                        return;
+                    }
                 }
+            });
+        }
+        common::judged_accounted(
+            party,
+            "a call's own work",
+            || {},
+            move || {
                 let until = Instant::now() + Duration::from_millis(ms);
                 let mut spun = 0u64;
                 while Instant::now() < until {
@@ -1326,12 +1376,12 @@ fn a_judged_calls_own_work_is_its_progress() {
     idle.wait().unwrap();
     assert!(quick.is_ok(), "{quick:?}");
     assert!(busy.is_ok(), "{busy:?}");
-    // Refused, and its account names what its member was doing. Answered, it outlasted the
-    // judge's rule: its account names the due looks that found its party still.
+    // Refused, and its account names what its member was doing. Answered, its judge's looks
+    // outlasted their rule: its account names the due looks that found its party still.
     let Err(said) = idle_call else {
         panic!(
-            "a call idle on its own thread not refused within {} due looks of its kind's W*; its wait as it answered: {idle_account}",
-            shards_api::LOOKS_TO_REFUSE
+            "a call idle on its own thread not refused through {} due looks that found its party still; its wait as it answered: {idle_account}",
+            shards_api::LOOKS_TO_REFUSE + 1
         );
     };
     // Its member listed, none of its threads runnable: Linux says it sleeping (S), macOS live
@@ -1835,11 +1885,12 @@ fn one_state(home: &std::path::Path) -> Patience {
     cold_patience(home)
 }
 
-/// A wait whose first look at its party comes past its kind's W* judges nothing at that
-/// look: it has nothing before it to compare with (#77 waits-02; ROOT's KVM refusals at
-/// c120c8a95, "its last progress its start", 18.4 ms and 31.1 ms into waits of W* 3.527 µs
-/// and 14.0 ms). Red at 9efde7252, refused at that look, as a party found anew was found
-/// still and its wait's start taken for a look. Do: teach a kind its W* by a quick
+/// A wait its caller first looks at past its kind's W* refuses nothing at that look for what
+/// it did not see: its party's work since its own first look, as it began (`Wait::on`), is
+/// progress (#77 waits-02; ROOT's KVM refusals at c120c8a95, "its last progress its start",
+/// 18.4 ms and 31.1 ms into waits of W* 3.527 µs and 14.0 ms). Red at 9efde7252, refused at
+/// that look, as a party found anew was found still and its wait's start taken for a look,
+/// no look made then. Do: teach a kind its W* by a quick
 /// stand-in's end; follow a busy stand-in, then a sleeping one, each first looked at 2 W*
 /// past its wait's start; then follow a sleeping one look after look. Expect: neither first
 /// look refuses; the sleeper looked at on is refused, once its looks have seen a whole W*.
@@ -2376,6 +2427,93 @@ fn an_unreaped_daemon_is_gone() {
     assert!(ended, "an exited daemon held its wait: {}", patience.account());
 }
 
+/// A failed run's VM's refusal is read from its error, or from its daemon's log by its VM's
+/// pid (`common::run_refusal`, what `common::run_host_refused` gates as boot.rs's tests do):
+/// where its client heard only that its guest stopped, the VM its daemon logged as unable to
+/// serve the run in those words, and that VM's refusal, not another VM's the log holds. CI
+/// 44189693085, x86_64 musl, daemon.rs `pools_keep_what_their_runs_need_while_they_come`: a
+/// run ended 125, "the guest stopped before the command ended", read by "VM N ended" alone and
+/// found no refusal. A stand-in log, as the daemon and a warm VM's own log now write it.
+#[test]
+fn a_failed_runs_vm_refusal_is_read_by_its_vms_pid() {
+    let refusal = |pid: u32, when: &str| {
+        format!(
+            "vCPU 2: VM entry failed (hardware reason 0x7): the host's hypervisor (KVM under \
+             KVMKVMKVM) refused to enter it ({when}, at 1794957533.463374 s, VM process {pid})"
+        )
+    };
+    let unserved = "the guest stopped before the command ended: failed to fill whole buffer";
+    let said = format!("shards: {unserved}\n");
+    let log = format!(
+        "shards daemon 7: container a1: its VM 206432 could not serve its run: {unserved}\n\
+         [999 120us WARN] {}\n\
+         [206432 949622us WARN] {}\n\
+         shards daemon 7: VM 206432 ended with Ok(1)\n",
+        refusal(999, "after its guest ran"),
+        refusal(206432, "after its guest ran"),
+    );
+    let read = common::run_refusal(&said, &log);
+    assert!(
+        read.contains("VM process 206432") && !read.contains("VM process 999"),
+        "{read}"
+    );
+    // One its error carries itself: that.
+    let own = format!("shards: {}\n", refusal(206432, "before its guest ran"));
+    assert_eq!(common::run_refusal(&own, ""), own);
+    // A 125 whose VM's refusal its daemon's log holds none of: none, its failure its test's.
+    let other = log.replace("its VM 206432", "its VM 31337");
+    assert_eq!(common::run_refusal(&said, &other), "");
+}
+
+/// A stream no process writes any more is taken whole however late its reader thread runs
+/// (`common::taken_whole`), and one a process still holds is taken as it came, its end not
+/// waited for. CI 44164945050, x86_64 musl: `shards --version` ended with status 0 in 40 ms
+/// and both its streams were said held open, their reader threads yet to hand over what their
+/// pipes held, as its call site's kind, cold, refused its gone party a W* (its own run) past
+/// its end. Red where what came is taken alone: nothing, its reader late. The reader is let go
+/// a tenth of a second after the take begins, far past what the take itself does.
+#[cfg(unix)]
+#[test]
+fn a_stream_whose_writers_are_gone_is_taken_whole_however_late_its_reader() {
+    /// A reader that reads nothing until it is let go.
+    struct Late {
+        pipe: std::io::PipeReader,
+        go: Option<std::sync::mpsc::Receiver<()>>,
+    }
+    impl std::io::Read for Late {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(go) = self.go.take() {
+                let _ = go.recv();
+            }
+            std::io::Read::read(&mut self.pipe, b)
+        }
+    }
+    let said = b"shards version 0.8.0\n";
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let probe = common::probe(&reader);
+    let (go, late) = std::sync::mpsc::channel();
+    let rx = common::collect(Box::new(Late {
+        pipe: reader,
+        go: Some(late),
+    }));
+    writer.write_all(said).unwrap();
+    let mut got = (Vec::new(), false);
+    common::taken_whole(&rx, &probe, &mut got);
+    assert_eq!(
+        got,
+        (Vec::new(), false),
+        "a stream its writer holds was waited for"
+    );
+    drop(writer);
+    let letting = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        go.send(()).unwrap();
+    });
+    common::taken_whole(&rx, &probe, &mut got);
+    letting.join().unwrap();
+    assert_eq!(got, (said.to_vec(), true));
+}
+
 /// A command's streams another process holds open past its end are read for as long as
 /// that holder makes progress, judged from its end by the record its end taught, its kind
 /// cold or not (#77 waits-10: a cold wait kept past its client's end followed a silent
@@ -2706,4 +2844,51 @@ fn spinner() {
             "a waiter spinning alone never refused (W* {slowest:?})"
         );
     }
+}
+
+/// A command its home sends through a context to another home's daemon is served by that
+/// daemon, which joins its party (ROOT's word, 2026-11-18, D215): context.rs's
+/// `a_context_runs_commands_on_its_machine_whole` was refused on CI's x86_64 Windows (run
+/// 44189693085) with its party its client alone, "no daemon yet" in its own home, while the
+/// machine's daemon served it. The context is found as shards chooses it, and its daemon as
+/// the home beside it that listens on its record's address. Do: a context record naming one
+/// home's address, a third home listening elsewhere. Expect: the listening home found by
+/// `--context`, by `SHARDS_CONTEXT` and by the home's current context; none for `default`.
+/// Red where no serving home is found.
+#[test]
+fn a_contexts_command_is_served_by_the_home_that_listens_on_its_address() {
+    let laptop = TempDir::new("ctx-serves");
+    let machine = TempDir::new("ctx-served");
+    let elsewhere = TempDir::new("ctx-elsewhere");
+    // Ports below every OS's ephemeral range: no daemon of a test beside this one binds them.
+    std::fs::write(machine.join("listening"), "127.0.0.1:4711\n").unwrap();
+    std::fs::write(elsewhere.join("listening"), "127.0.0.1:4712\n").unwrap();
+    std::fs::create_dir_all(laptop.join("contexts")).unwrap();
+    std::fs::write(
+        laptop.join("contexts").join("gpu"),
+        format!(
+            "shards context 1\nname gpu\naddress 127.0.0.1:4711\ndaemon {}\ndescription \n",
+            "ab".repeat(32)
+        ),
+    )
+    .unwrap();
+    let home: &std::path::Path = &laptop;
+    let served = |cmd: &std::process::Command| common::serving_home(cmd, Some(home));
+    let machine = machine.to_path_buf();
+    let mut by_flag = std::process::Command::new("shards");
+    by_flag.args(["--context", "gpu", "ps"]);
+    assert_eq!(served(&by_flag), Some(machine.clone()), "by --context");
+    let mut by_env = std::process::Command::new("shards");
+    by_env.arg("images").env("SHARDS_CONTEXT", "gpu");
+    assert_eq!(served(&by_env), Some(machine.clone()), "by SHARDS_CONTEXT");
+    let mut here = std::process::Command::new("shards");
+    here.arg("images").env("SHARDS_CONTEXT", "default");
+    assert_eq!(served(&here), None, "the default context runs here");
+    std::fs::write(laptop.join("context"), "gpu\n").unwrap();
+    let mut current = std::process::Command::new("shards");
+    current
+        .arg("ps")
+        .env_remove("SHARDS_CONTEXT")
+        .env_remove("DOCKER_CONTEXT");
+    assert_eq!(served(&current), Some(machine), "by its home's current context");
 }

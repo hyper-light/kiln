@@ -732,6 +732,18 @@ impl Service {
         matches!(*lock(&self.shared), Slot::Ended { .. })
     }
 
+    /// Its lane is over: its input ended, or was let go by its host (revoked, or no room for
+    /// it, D252). What its subscriber sent before it heard is let go with the lane, never its
+    /// error: a record in flight as its host let the input go is no frame sent amiss (CI
+    /// 44189693085, windows-2022: an MCP connection's stdin, aborted by its host as its
+    /// endpoint read its controller's record, closed the whole connection, `Protocol`).
+    pub(crate) fn over(&self) -> bool {
+        matches!(
+            *lock(&self.shared),
+            Slot::Ended { .. } | Slot::Revoked | Slot::NoRoom
+        )
+    }
+
     /// Its subscriber has been told the input's end, all of it, and its stream finished.
     pub(crate) fn said_its_end(&self) -> bool {
         self.finished
@@ -997,7 +1009,25 @@ impl Service {
         }
         match self.read(io, conn, stream) {
             Ok(()) => self.flush(io),
-            Err(gone) => self.refuse(io, conn, gone.reason()),
+            Err(gone) => match self.closes_with(gone) {
+                Some(reason) => self.refuse(io, conn, reason),
+                // A frame on its way as its host let the input go: nothing more of it is read,
+                // and the revocation closes its owner's connection with its own word.
+                None => io.stop(conn, stream),
+            },
+        }
+    }
+
+    /// The reason its owner's connection is closed with where reading its stream went as
+    /// `gone` ([`Gone::reason`]): none where what was refused came after its host let the
+    /// input go (revoked, or no room for it, D252), a frame on its way as it did and no
+    /// protocol error of its owner's, as a control lane's ([`Service::over`]; CI 44189693085,
+    /// windows-2022: closed `Protocol` before the revocation's own word). Not
+    /// [`refusal`](Service::refusal), the reason a lane to its let-go input is refused.
+    fn closes_with(&self, gone: Gone) -> Option<Reason> {
+        match gone {
+            Gone::Refused(_) if self.revoked() => None,
+            gone => Some(gone.reason()),
         }
     }
 
@@ -1114,13 +1144,13 @@ impl Handler for Service {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    use shards_testwait::{party, receive, waited};
 
     use super::*;
 
     const CONN: ConnKey = 1;
-    /// How long a test waits for what it awaits: a patience of its own.
-    const PATIENCE: Duration = Duration::from_secs(10);
     /// The guest's errnos, Linux's (include/uapi/asm-generic/errno-base.h, errno.h), as its
     /// init reports them whatever the host's own.
     const EIO: i32 = 5;
@@ -1351,7 +1381,7 @@ mod tests {
         };
         // Held by the member: the owner's abort is heard all the same.
         feed(service, &end(0, ECANCELED)).unwrap();
-        closed.recv_timeout(Duration::from_secs(5)).unwrap();
+        receive("its closer never ran", &closed);
         assert!(matches!(relay.next(), Next::Abort(ECANCELED)));
         assert_eq!(
             control.state(),
@@ -1375,6 +1405,37 @@ mod tests {
         assert!(matches!(control.state(), State::Ended { written: 3, .. }));
     }
 
+    /// A record its owner sent before it heard its input let go, by its host's abort or for no
+    /// room (D252), finds the input's lane over, as one sent after its input ended does: its
+    /// reader lets it go with the lane, and no endpoint closes its owner's connection for it
+    /// (CI 44189693085, windows-2022: control.rs's
+    /// `an_inputs_try_says_none_until_its_room_end_or_fault_rings_the_wake`, its MCP stdin
+    /// aborted as its endpoint read the controller's record, was closed `Protocol`, not told
+    /// `Revoked`). Red where only an ended input's lane is over.
+    #[test]
+    fn a_record_in_flight_as_its_input_is_let_go_finds_its_lane_over() {
+        for let_go in [Control::abort as fn(&Control), Control::no_room] {
+            let (mut endpoint, _relay, control) = bound();
+            let service = endpoint.driver.handler_mut();
+            service.state = Subscription::Connecting(CONN);
+            feed(service, &subscribe(scope(), 0)).unwrap();
+            assert!(!service.over(), "an open input's lane is not over");
+            assert_eq!(
+                service.closes_with(Gone::Refused(Reason::Protocol)),
+                Some(Reason::Protocol),
+                "an open input's owner refused for a frame sent amiss"
+            );
+            let_go(&control);
+            assert_eq!(feed(service, &record_frame(0, b"first")), Err(Reason::Protocol));
+            assert!(service.over(), "its lane over: what still comes of it is let go");
+            assert_eq!(
+                service.closes_with(Gone::Refused(Reason::Protocol)),
+                None,
+                "no owner refused for a frame on its way as its input was let go"
+            );
+        }
+    }
+
     #[test]
     fn revocation_tells_the_relay_and_closes_the_members_connection_once_it_has_one() {
         let (_endpoint, relay, control) = bound();
@@ -1385,7 +1446,7 @@ mod tests {
         control.on_close(move || {
             let _ = closes.send(());
         });
-        closed.recv_timeout(Duration::from_secs(5)).unwrap();
+        receive("its closer never ran", &closed);
         assert_eq!(control.state(), State::Revoked);
     }
 
@@ -1497,6 +1558,7 @@ mod tests {
 
     impl Live {
         fn connect(identity: &Identity, server: Fingerprint, to: SocketAddr, offset: u64) -> Live {
+            party::of_test();
             let config = client_config(identity, server, admitted()).unwrap();
             let (hears, heard) = mpsc::channel();
             let (mut driver, asks) = Driver::bind_bounded(
@@ -1520,7 +1582,7 @@ mod tests {
             .unwrap();
             let driver = std::thread::Builder::new()
                 .name("input-owner".into())
-                .spawn(move || driver.run())
+                .spawn(party::carried(move || driver.run()))
                 .unwrap();
             asks.send(Command::Handler(Ask::Connect(to))).unwrap();
             Live {
@@ -1531,7 +1593,7 @@ mod tests {
         }
 
         fn hear(&self) -> Heard {
-            self.heard.recv_timeout(PATIENCE).unwrap()
+            receive("its owner heard nothing", &self.heard)
         }
 
         fn taken(&self) -> u64 {
@@ -1566,18 +1628,36 @@ mod tests {
     }
 
     /// An owner's subscription at `offset`, made again while the endpoint still holds a
-    /// connection it has not let go of, told its first record goes at `at`.
-    fn subscribed(owner: &Identity, server: Fingerprint, address: SocketAddr, offset: u64, at: u64) -> Live {
-        let deadline = std::time::Instant::now() + PATIENCE * 3;
+    /// connection it has not let go of, every RTT sample of which came within `life`, told its
+    /// first record goes at `at`.
+    ///
+    /// Refused while its endpoint holds that connection, which it asks for an answer: unheard
+    /// past its probe timeout since (D180), its place is the next attempt's, made past that time
+    /// as `life` bounds it (`probe_timeout_within`). A refusal after that is the place never let
+    /// go. Before, its party's stillness, which its endpoint's probes of the connection gone
+    /// never let come (CI 44227612442, aarch64 gnu: held to the step's limit).
+    fn subscribed(
+        owner: &Identity,
+        server: Fingerprint,
+        address: SocketAddr,
+        offset: u64,
+        at: u64,
+        life: Duration,
+    ) -> Live {
+        let mut due: Option<Instant> = None;
         loop {
+            if let Some(due) = due {
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            }
             let live = Live::connect(owner, server, address, offset);
             match live.hear() {
                 Heard::Said(Said::Taken { accepted, .. }) => {
                     assert_eq!(accepted, at);
                     return live;
                 }
-                Heard::Lost(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
+                Heard::Lost(_) if due.is_none() => {
+                    drop(live);
+                    due = Some(Instant::now() + crate::net::probe_timeout_within(life));
                 }
                 other => panic!("no subscription: {other:?}"),
             }
@@ -1587,10 +1667,11 @@ mod tests {
     /// The member's side, as the daemon's relay is: each record to `sink`, held until
     /// `gate` lets it go, the owner's end told back as the member's init would tell it.
     fn relay_into(relay: Relay, control: Arc<Control>, gate: mpsc::Receiver<()>) -> mpsc::Receiver<Vec<u8>> {
+        party::of_test();
         let (sink, records) = mpsc::channel();
         std::thread::Builder::new()
             .name("input-relay".into())
-            .spawn(move || {
+            .spawn(party::carried(move || {
                 let mut written = 0u64;
                 loop {
                     match relay.next() {
@@ -1607,7 +1688,7 @@ mod tests {
                         Next::Gone => return,
                     }
                 }
-            })
+            }))
             .unwrap();
         records
     }
@@ -1620,9 +1701,10 @@ mod tests {
             Endpoint::bind(&server, owner.fingerprint(), scope(), admitted()).unwrap();
         let address = endpoint.address;
         let control = Arc::new(control);
+        party::of_test();
         let endpoint_driver = std::thread::Builder::new()
             .name("input-endpoint".into())
-            .spawn(move || endpoint.run())
+            .spawn(party::carried(move || endpoint.run()))
             .unwrap();
         let (gate, gated) = mpsc::channel();
         let records = relay_into(relay, Arc::clone(&control), gated);
@@ -1637,7 +1719,9 @@ mod tests {
 
         // The endpoint takes one connection at a time, and the stranger's, refused at its
         // handshake and closed, holds no place: the owner is taken at its first attempt, as the
-        // coordinator's real-VM run (tests/managed_output/member_stdin.rs) makes it.
+        // coordinator's real-VM run (tests/managed_output/member_stdin.rs) makes it. Every RTT
+        // sample its endpoint takes of it comes within its life.
+        let lived = Instant::now();
         let live = Live::connect(&owner, server.fingerprint(), address, 0);
         assert_eq!(
             live.taken(),
@@ -1646,12 +1730,14 @@ mod tests {
         );
         let first: &[u8] = b"\0\xff\x80{\"jsonrpc\":\"2.0\"}\n";
         live.send(record_frame(0, first));
-        // Held by the member: no taken comes, so no second record may go.
-        if let Ok(heard) = live.heard.recv_timeout(Duration::from_millis(300)) {
+        // Held by the member: no taken comes, so no second record may go. Its party still a
+        // whole W* past every deadline it waits until (D215's stillness): nothing more comes.
+        waited(|| false).unwrap_err();
+        if let Ok(heard) = live.heard.try_recv() {
             panic!("heard while its record was held: {heard:?}");
         }
         gate.send(()).unwrap();
-        assert_eq!(records.recv_timeout(PATIENCE).unwrap(), first);
+        assert_eq!(receive("the member was relayed nothing", &records), first);
         let at = live.taken();
         assert_eq!(at, first.len() as u64);
 
@@ -1660,13 +1746,21 @@ mod tests {
         let second: &[u8] = b"no-newline\xc3\x28";
         live.send(record_frame(at, second));
         gate.send(()).unwrap();
-        assert_eq!(records.recv_timeout(PATIENCE).unwrap(), second);
+        assert_eq!(receive("the member was relayed nothing", &records), second);
         live.vanish();
+        let life = lived.elapsed();
         let at = at + second.len() as u64;
         // The endpoint finds the vanished owner gone as the next contends for its one place,
         // each connection holding one asked for an answer (D180's liveness at use); until then
         // a second connection is refused, as an output's is.
-        let live = subscribed(&owner, server.fingerprint(), address, first.len() as u64, at);
+        let live = subscribed(
+            &owner,
+            server.fingerprint(),
+            address,
+            first.len() as u64,
+            at,
+            life,
+        );
         live.send(end(at, 0).to_vec());
         match live.hear() {
             Heard::Said(Said::Ended { written, end }) => {
@@ -1697,9 +1791,10 @@ mod tests {
             Endpoint::bind(&server, owner.fingerprint(), scope(), admitted()).unwrap();
         let address = endpoint.address;
         let control = Arc::new(control);
+        party::of_test();
         let endpoint_driver = std::thread::Builder::new()
             .name("input-endpoint".into())
-            .spawn(move || endpoint.run())
+            .spawn(party::carried(move || endpoint.run()))
             .unwrap();
         let (gate, gated) = mpsc::channel();
         let records = relay_into(relay, Arc::clone(&control), gated);
@@ -1709,7 +1804,7 @@ mod tests {
         let half: &[u8] = b"{\"id\":1}\n\0\xff\x80";
         first.send(record_frame(0, half));
         gate.send(()).unwrap();
-        assert_eq!(records.recv_timeout(PATIENCE).unwrap(), half);
+        assert_eq!(receive("the member was relayed nothing", &records), half);
         let at = first.taken();
         assert_eq!(at, half.len() as u64);
         drop(first);
@@ -1723,7 +1818,7 @@ mod tests {
         let rest: &[u8] = b"\x1b[2Jno-newline\xc3\x28";
         again.send(record_frame(at, rest));
         gate.send(()).unwrap();
-        assert_eq!(records.recv_timeout(PATIENCE).unwrap(), rest);
+        assert_eq!(receive("the member was relayed nothing", &records), rest);
         let at = again.taken();
         assert_eq!(at, (half.len() + rest.len()) as u64);
         again.send(end(at, 0).to_vec());
