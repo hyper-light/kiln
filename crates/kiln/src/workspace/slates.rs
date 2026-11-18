@@ -1174,7 +1174,11 @@ pub const EXCLUDES: &[&str] = &["/.git"];
 /// and dependencies, which kiln never writes into a person's folder), then [`EXCLUDES`]. A folder git doesn't know
 /// (or a volume with no mount to ask git in) leaves out [`EXCLUDES`] alone.
 pub async fn excludes(m: &Made) -> Vec<String> {
-    let mut out = match git_ignored(m).await {
+    let ignored = match ignores_from(m) {
+        IgnoresFrom::Tree(top) => git_ignored(&top).await,
+        IgnoresFrom::Volume => Ok(Vec::new()),
+    };
+    let mut out = match ignored {
         Ok(ignored) => ignored,
         Err(e) => {
             tracing::debug!(error = %format!("{e:#}"), "what git ignores in a workspace couldn't be read: only .git is left out");
@@ -1183,6 +1187,20 @@ pub async fn excludes(m: &Made) -> Vec<String> {
     };
     out.extend(EXCLUDES.iter().map(|p| (*p).to_owned()));
     out
+}
+
+/// Where what git ignores in a workspace is read ([`excludes`]).
+#[derive(Debug, PartialEq, Eq)]
+enum IgnoresFrom {
+    /// The working tree at its mount's top.
+    Tree(PathBuf),
+    /// The volume itself.
+    Volume,
+}
+
+/// Where what git ignores in workspace `m` is read.
+fn ignores_from(m: &Made) -> IgnoresFrom {
+    IgnoresFrom::Tree(super::place::top(&m.mount))
 }
 
 /// The volume whose drift says what changed on disk under workspace `m` (K5): its base overlay for a captured clone, whose
@@ -1200,9 +1218,9 @@ fn landing(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<LandingR
 }
 
 /// What git ignores in workspace `m` ([`ignored_prefixes`]).
-async fn git_ignored(m: &Made) -> anyhow::Result<Vec<String>> {
+async fn git_ignored(top: &Path) -> anyhow::Result<Vec<String>> {
     let mut c = Command::new("git");
-    c.arg("-C").arg(super::place::top(&m.mount)).args(["status", "--porcelain=v1", "-z", "--ignored=traditional", "--untracked-files=normal"]).env("GIT_TERMINAL_PROMPT", "0");
+    c.arg("-C").arg(top).args(["status", "--porcelain=v1", "-z", "--ignored=traditional", "--untracked-files=normal"]).env("GIT_TERMINAL_PROMPT", "0");
     let o = crate::proc::output(c, GIT_TIMEOUT).await?;
     anyhow::ensure!(o.status.success(), "git status: {}", String::from_utf8_lossy(&o.stderr).trim());
     Ok(ignored_prefixes(&String::from_utf8_lossy(&o.stdout)))
@@ -1585,6 +1603,18 @@ mod tests {
             anyhow::ensure!((none.unmounts.load(Relaxed), none.destroyed.load(Relaxed)) == (0, 1), "nothing mounted: destroyed, nothing asked");
             Ok(())
         })
+    }
+
+    /// W8 (kiln goal 01a1ec34599974448aed2672bafaf9a2): what git ignores in a workspace with no mount (an isolated agent's,
+    /// its volume served to its microVM) is read from its volume, never from the tree at its mount's top: with no mount
+    /// that's `git -C ""`, which git takes for its own process's folder, the runner's, whose ignores are another
+    /// repository's or none (g267, 2026-11-18). A mounted workspace's are read from its working tree.
+    #[test]
+    fn w8_an_unmounted_workspaces_ignores_are_read_from_its_volume_never_the_runners_folder() {
+        let unmounted = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-iso".into(), mount: String::new(), ..Default::default() };
+        assert_eq!(ignores_from(&unmounted), IgnoresFrom::Volume);
+        let mounted = Made { mount: "/state/workspaces/kiln-a".into(), ..unmounted.clone() };
+        assert_eq!(ignores_from(&mounted), IgnoresFrom::Tree(PathBuf::from("/state/workspaces/kiln-a")));
     }
 
     #[test]
