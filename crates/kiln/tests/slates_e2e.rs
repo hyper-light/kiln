@@ -783,7 +783,7 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     }
     eprintln!("DRIVE: {engine:?}, an agent in mode {}, on {}, instance {}", mode.claude(), f.machine, instance.name);
     let id = vm_e2e::open(f, &spec)?;
-    let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?;
+    let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?.reporting(landing_reports(&instance.name));
     let (info, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
     let lines = vm_e2e::said(&events);
     let what = format!("{engine:?} session {id} ({mode:?})");
@@ -894,6 +894,32 @@ pub fn slates_state(instance: &str, volume: &str) -> String {
         Err(e) => format!("daemon status: {e}"),
     };
     format!("--- Slates' own state ---\n{status}\n{shards}")
+}
+
+/// What a landing in the drive's own instance `instance` reports of itself, for a wait's progress (`vm_e2e::Pace::reporting`):
+/// the sequence of the last record of Slates' audit, which a landing moves at each step (presented, granted, validated,
+/// each entry written, finished), asked through its library as an operator would. What kept it from saying, where it
+/// couldn't, which doesn't move.
+fn landing_reports(instance: &str) -> impl FnMut() -> Value + 'static {
+    let name = instance.to_owned();
+    let mut attached: Option<slates_api::Instance> = None;
+    let mut seen = 0u64;
+    move || {
+        if attached.is_none() {
+            attached = slates_api::Instance::attach(&name).ok();
+        }
+        let Some(i) = attached.as_mut() else { return json!({"audit": "not attached"}) };
+        match i.audit(seen) {
+            Ok(records) => {
+                seen = records.iter().map(|r| r.seq).max().unwrap_or(seen).max(seen);
+                json!({"audit": seen})
+            }
+            Err(e) => {
+                attached = None;
+                json!({"audit": format!("{e}")})
+            }
+        }
+    }
 }
 
 /// Waits, a bounded while ([`OP_WITHIN`]), for the Slates mount at `at` to leave the host's table, as an ended session's
@@ -1468,7 +1494,7 @@ mod bare_metal {
         }
         for mode in Mode::ALL {
             let project = Project::new(&dir.path().join(mode.word()))?;
-            drift_kept(&f, &project, mode).map_err(|e| anyhow::anyhow!("{mode:?}: {e:#}"))?;
+            drift_kept(&f, &instance, &project, mode).map_err(|e| anyhow::anyhow!("{mode:?}: {e:#}"))?;
         }
         Ok(())
     }
@@ -1476,10 +1502,10 @@ mod bare_metal {
     /// One agent in `mode` over `project`: its append, the person's change of the same file on disk, its drift, then
     /// its landing (asked by the agent in its next turn where its mode asks nothing; approved by the person where it
     /// asks), which keeps the person's bytes.
-    fn drift_kept(f: &vm_e2e::Fixture, project: &Project, mode: Mode) -> anyhow::Result<()> {
+    fn drift_kept(f: &vm_e2e::Fixture, instance: &Instance, project: &Project, mode: Mode) -> anyhow::Result<()> {
         let spec = json!({"kind": "claude", "mode": mode.claude(), "cwd": project.dir, "prompt": format!("APPEND={} do the task", APPENDED.0), "workspace": {"kind": "volume"}});
         let id = vm_e2e::open(f, &spec)?;
-        let mut pace = vm_e2e::Pace::default();
+        let mut pace = vm_e2e::Pace::default().reporting(landing_reports(&instance.name));
         let (_, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
         anyhow::ensure!(vm_e2e::said(&events).iter().any(|l| *l == format!("APPENDED {}", APPENDED.0)), "{:?}", vm_e2e::said(&events));
         let persons = b"the person's\n".to_vec();
@@ -1491,7 +1517,7 @@ mod bare_metal {
             Mode::Bypass => {
                 let client = format!("land-{}", nonce());
                 vm_e2e::command(f, &id, &json!({"type": "send", "id": client, "text": "LAND do the task", "mode": "queue"}))?;
-                let (_, events) = pace.until(f, &id, vm_e2e::Asked::Message(&client), "its landing's turn", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, &client), vm_e2e::STUB_DONE))?;
+                let (_, events) = pace.until(f, &id, vm_e2e::Asked::Landing(&client), "its landing's turn", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, &client), vm_e2e::STUB_DONE))?;
                 let lines = vm_e2e::said_after(&events, &client);
                 anyhow::ensure!(!lines.iter().any(|l| l.starts_with("LAND_FAIL ")), "its landing reached no answer: {lines:?}");
                 format!("{lines:?}")

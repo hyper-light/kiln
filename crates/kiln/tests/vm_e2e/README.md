@@ -80,9 +80,16 @@ No wait has a time of its own (`vm_e2e::Pace`; docs/research/s35-every-harness/w
 drive is judged by another's: each harness's image, stand-in and build are its own, so another drive's
 answers bound none of its waits (r707: claude's first turn bounded codex's, refused while codex's image was
 still building). Until a harness gives its first answer in a drive, and while it works on a turn the drive
-asked to be long, a wait follows its own parties' liveness and progress alone. After that, the slowest
-answer the harness has given in the drive bounds how long it may go without progress. What progresses is
-kiln's word on the session and its timeline, and, while the session starts (kiln's word on it unmoving as
+asked to be long, a wait follows its own parties' liveness and progress alone. After that, the tail of the
+answers of its own kind the harness has given in the drive bounds how long it may go without progress
+(`vm_e2e::tail`: an upper prediction bound of a log-normal fitted to them, with Student's t for their count,
+at a chance of one in ten thousand that a healthy answer outlasts it; none from fewer than two): a first
+turn, a turn that only answers, a landing's turn (`Asked::Landing`, which writes a workspace to disk), a
+stop and kiln's own work each by their own, never by the slowest single answer, which ordinary load
+outlasts (the coordinator's proofs of 2026-11-18: a landing's turn refused at 373 ms, the slowest earlier
+turn's 372 ms). What progresses is kiln's word on the session and its timeline, what the work under way
+reports of itself where the drive reads that (`Pace::reporting`: a landing's records in Slates' audit), and,
+while the session starts (kiln's word on it unmoving as
 its image builds and its microVM boots), the drive's own processes on the host (`vm_e2e::Own`: those its
 runner's trees gained since the drive began, its build's and its microVM's) and the CPU they use. A wait
 ends at once, typed and saying why, where kiln's own word says no answer can come, or where the fixture's
