@@ -132,10 +132,12 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
         async move { slates::drift(&made).await }
     })?;
     assert_eq!(drifted, Vec::<String>::new(), "nothing changed on disk under it");
-    let plan = kiln::rt::block_on({
+    let (plan, excludes) = kiln::rt::block_on({
         let (made, over) = (made.clone(), folder.text());
         async move { slates::plan_landing(&made, &over).await }
     })?;
+    // No mount to ask git in: what every landing leaves out, alone.
+    assert_eq!(excludes, slates::EXCLUDES, "{excludes:?}");
     let at = |pointer: &str| plan.pointer(pointer).cloned().unwrap_or_default();
     assert_eq!(at("/grant_required"), serde_json::json!(true), "{plan}");
     let manifest = at("/manifest").as_str().unwrap_or_default().to_owned();
@@ -160,7 +162,7 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
             volume,
             snapshot: None,
             target: folder.text(),
-            filter: slates_api::Filter { include: Vec::new(), exclude: slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect() },
+            filter: slates_api::Filter { include: Vec::new(), exclude: excludes },
         };
         let mut approved = [0u8; 32];
         for (i, byte) in approved.iter_mut().enumerate() {

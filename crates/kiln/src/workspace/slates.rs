@@ -446,9 +446,12 @@ pub async fn drift(m: &Made) -> anyhow::Result<Vec<String>> {
     call("status", move |i| i.drift(volume)).await
 }
 
+/// What every landing leaves out: git's own directory.
+pub const EXCLUDES: &[&str] = &["/.git"];
+
 /// What a landing of workspace `m` leaves out, each a prefix of its volume: what git ignores there (its build output
-/// and dependencies, which kiln never writes into a person's folder) and git's own directory. A folder git doesn't
-/// know leaves out `/.git` alone.
+/// and dependencies, which kiln never writes into a person's folder), then [`EXCLUDES`]. A folder git doesn't know
+/// (or a volume with no mount to ask git in) leaves out [`EXCLUDES`] alone.
 pub async fn excludes(m: &Made) -> Vec<String> {
     let mut out = match git_ignored(m).await {
         Ok(ignored) => ignored,
@@ -457,7 +460,7 @@ pub async fn excludes(m: &Made) -> Vec<String> {
             Vec::new()
         }
     };
-    out.push("/.git".to_owned());
+    out.extend(EXCLUDES.iter().map(|p| (*p).to_owned()));
     out
 }
 
