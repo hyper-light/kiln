@@ -109,6 +109,17 @@ pub fn said_marker(lines: &[String], marker: &str) -> bool {
     lines.iter().any(|l| l.contains(marker))
 }
 
+/// What the harness said in its first turn: `lines` up to and including the first that has `marker`. The look that
+/// finds that turn ended can come after a later one, and kiln's word that an agent the harness started ended its
+/// turn starts one that quotes the agent's own `CWD` and `WHERE` (`harness::told`), which r41 read as devin's and
+/// cursor's.
+pub fn first_turn(mut lines: Vec<String>, marker: &str) -> Vec<String> {
+    if let Some(end) = lines.iter().position(|l| l.contains(marker)) {
+        lines.truncate(end + 1);
+    }
+    lines
+}
+
 // ------------------------------------------------------------------------------------------------
 // Check 1: the negotiated suite, from both ends of every link
 // ------------------------------------------------------------------------------------------------
@@ -2093,7 +2104,7 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     ends.started(&id);
     let (first_info, events) = pace.until(f, &id, Asked::Opening, &format!("{kind}'s first turn"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
-    let first = said(&events);
+    let first = first_turn(said(&events), ask.marker);
 
     // Steer: a message into a turn under way (where the harness takes none mid-turn, kiln sends it
     // next), answered.

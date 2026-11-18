@@ -405,6 +405,39 @@ mod checks {
         assert!(said_marker(&lines, STUB_DONE));
     }
 
+    /// r41 (jupiter, kiln 7d760b850): what devin said by the drive's look, its first turn and the turn kiln started
+    /// to tell it the agent it started had ended, whose `HEARD` quotes that agent's `CWD` and `WHERE`. Its folder
+    /// and kernel are its first turn's. Red: `first_turn` keeping every line, failing with r41's own words.
+    #[test]
+    fn s34_the_first_turn_ends_at_its_marker() {
+        let project = r"C:\Users\corph\.cache\xplat\windows\w\t\.tmpidbtmV\project";
+        let read: Vec<String> = [
+            "CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project",
+            "WHERE Linux aa598e29-87e9-4e06-b668-874bbe7986fa",
+            "HEARD WRITE=vm-e2e-2e500e28699c.txt MCP_PING SPAWN=devin do the task",
+            "WROTE vm-e2e-2e500e28699c.txt",
+            "MCP_OK 109 code_run",
+            "MCP_AS 01a1ed46e72273e29f44b28bd7f23623",
+            "SPAWN_OK 01a1ed53df777712af1c3c050921205f",
+            "line 00000",
+            "line 00001",
+            "STUB_DONE",
+            "CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project",
+            "WHERE Linux aa598e29-87e9-4e06-b668-874bbe7986fa",
+            "HEARD Agent \u{201c}Devin\u{201d} (01a1ed53), which you started, ended its turn: CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project WHERE Linux 5607892d-31f9-4e54-b0d2-d34b1d4422d0 HEARD CHILD do the task",
+            "line 00000",
+            "line 00001",
+            "STUB_DONE",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let first = first_turn(read, STUB_DONE);
+        assert_eq!(check_project_path(Some(project), cwd_said(&first).as_deref(), project, "windows"), Ok(()));
+        assert_eq!(where_said(&first), Some(Where { kernel: "Linux".into(), boot: Some("aa598e29-87e9-4e06-b668-874bbe7986fa".into()) }));
+        assert_eq!(first.last().map(String::as_str), Some(STUB_DONE), "the first turn keeps its marker");
+    }
+
     #[test]
     fn s34_kilns_mcp_server_is_reached_from_where_the_harness_runs() {
         let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
