@@ -178,6 +178,8 @@ fn spec(
         plug_roots: Vec::new(),
         // No member's reach past its image's grants (Shards' D278, image channel v39).
         egress_ceiling: Vec::new(),
+        // No share another server serves (Shards' D286, image channel v52).
+        served: Vec::new(),
     }
 }
 

@@ -33,6 +33,7 @@ mod id;
 pub mod lease;
 pub mod patience;
 mod runtime;
+pub mod serve;
 pub mod sim;
 mod spec;
 
@@ -65,8 +66,8 @@ pub use runtime::{
 };
 pub use spec::{
     Ask, BlockCount, BoxOwner, BoxSpec, Class, ClassSpec, End, ExecLimit, Given, ImageMember,
-    ImageVolume, Mount, Network, OciSpec, Program, Rootfs, ShardsImage, Stdio, StringUnit, User,
-    check_pinned, drive_absolute,
+    ImageVolume, Mount, Network, OciSpec, Program, Rootfs, ServedMount, ShardsImage, Stdio,
+    StringUnit, User, check_pinned, drive_absolute,
 };
 
 /// A caller's owned stream: Unix's descriptor becomes a file; Windows keeps the handle's resource kind.

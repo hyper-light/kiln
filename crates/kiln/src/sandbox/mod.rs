@@ -29,6 +29,7 @@ pub mod image;
 pub mod isolated;
 pub mod narrow;
 pub mod pools;
+pub mod served;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -160,7 +161,9 @@ impl std::fmt::Debug for Leasing {
 /// kiln's state ([`shards_home`], `<state>/shards-cache`), its images built there (in `<state>/shards-builds`), each
 /// launch's box named by placement's numbering ([`box_name`]), each run's charge kept in `ledger` ([`of_hex`]), and
 /// its VMs' credentials leased through `leasing` where it is given (plan step 33; else a launch granting one is
-/// refused). They keep `state` as kiln's, which no isolated agent's project is, holds or lies in
+/// refused), and the folders another server serves them asked of this machine's Slates ([`served::SlatesVolumes`]:
+/// an isolated agent's volume, served to its microVM with no mount; kiln goal 01a1ec34…). They keep `state` as kiln's,
+/// which no isolated agent's project is, holds or lies in
 /// ([`Microvms::state`]). Nothing boots until a launch. Blocking.
 pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Option<Arc<dyn kiln_seams::Records>>, leasing: Option<Leasing>) -> anyhow::Result<Microvms> {
     let state = std::path::absolute(state)?;
@@ -172,9 +175,11 @@ pub fn held_in(state: &std::path::Path, shards: std::path::PathBuf, ledger: Opti
         None => hex_node::images::ImageRuntime::new(shards.clone(), paths, &records),
     }
     .map_err(|r| anyhow::anyhow!("Hex's image runtime under {}: {r}", state.display()))?;
+    // The folders Slates serves its microVMs, each an isolated agent's volume (kiln goal 01a1ec34…, Shards' D286).
+    runtime.bind_servers(Arc::new(served::SlatesVolumes)).map_err(|r| anyhow::anyhow!("Hex's image runtime's server of served folders: {r}"))?;
     let images = image::Images::new(shards, shards_home(&state), state.join("shards-builds"));
     let node = Arc::clone(&runtime);
-    let hex = hexvm::HexVms::new(runtime, box_name);
+    let hex = hexvm::HexVms::new(runtime, box_name).serving();
     Ok(Microvms { state: Some(state), node: Some(node), ..of_hex(if leases { hex.leasing() } else { hex }, images, ledger) })
 }
 
@@ -553,7 +558,8 @@ mod tests {
         let vms = super::held_in(state.path(), state.path().join("shards"), None, None)?;
         anyhow::ensure!(vms.hex.is_some(), "its sandbox isn't Hex's");
         anyhow::ensure!(vms.state() == Some(state.path()), "kiln's state isn't kept: {:?}", vms.state());
-        anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == super::hexvm::HOLDS, "its sandbox isn't HexVms");
+        // It holds folders Slates serves its microVMs: its runtime is bound this machine's Slates (`served::SlatesVolumes`).
+        anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == kiln_seams::sandbox::Holds { served: true, ..super::hexvm::HOLDS }, "its sandbox isn't HexVms");
         anyhow::ensure!(state.path().join("hex-records").join("state").exists(), "Hex keeps no records beneath kiln's state");
         let facts = super::facts_of(true, Some(&vms));
         anyhow::ensure!(facts.available && facts.why_not.is_none(), "{facts:?}");
@@ -582,7 +588,7 @@ mod tests {
         let state = tempfile::tempdir()?;
         let leasing = super::Leasing(Arc::new(Refusing));
         let vms = super::held_in(state.path(), state.path().join("shards"), None, Some(leasing))?;
-        anyhow::ensure!(vms.sandbox.holds() == kiln_seams::sandbox::Holds { credentials: true, ..super::hexvm::HOLDS }, "{:?}", vms.sandbox.holds());
+        anyhow::ensure!(vms.sandbox.holds() == kiln_seams::sandbox::Holds { credentials: true, served: true, ..super::hexvm::HOLDS }, "{:?}", vms.sandbox.holds());
         let other = tempfile::tempdir()?;
         let vms = super::held_in(other.path(), other.path().join("shards"), None, None)?;
         anyhow::ensure!(!vms.sandbox.holds().credentials, "a runner with no broker says it holds credentials");

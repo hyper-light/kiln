@@ -16,7 +16,7 @@ use kiln_seams::sandbox::{Boundary, Holds, Launch, Refusal, Run, Sandbox};
 use super::ProcRun;
 
 /// What the host holds a run to: nothing of the seam's but signals, where its processes take them.
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: false, egress_by_host: false, shares: false, signals: cfg!(unix), credentials: false, live: false, swaps: false, components: false, pools: false, volumes: false };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: false, egress_by_host: false, shares: false, signals: cfg!(unix), credentials: false, live: false, swaps: false, components: false, pools: false, volumes: false, served: false };
 
 /// The host's sandbox.
 #[derive(Debug, Clone, Copy, Default)]
@@ -144,6 +144,10 @@ mod tests {
         // The host lays no components: the suite sees this refused.
         fn components(&self, laid: Vec<kiln_seams::sandbox::ComponentAt>) -> Launch {
             Launch { components: laid, ..self.sh("true", &[]) }
+        }
+        // The host is served no folder by another server: the suite sees this refused (kiln goal 01a1ec34…).
+        fn served(&self, _at: &str, served: Vec<kiln_seams::sandbox::Served>) -> Launch {
+            Launch { served, ..self.sh("true", &[]) }
         }
         fn folder(&self) -> String {
             let Some(dir) = &self.folder else { return "/nonexistent-folder".into() };

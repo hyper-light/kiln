@@ -3,7 +3,7 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `955e15c06c512d05444f8a12edeca496f5b9d417`
+- **Upstream:** https://github.com/hyper-light/hex, commit `99eb7f20fe9a6ec502e78559d50a7dc5b9ba151f`
   (2026-11-17), MIT (`LICENSE`): its `main`, fast-forwarded to the v0.8.0 landing (`root/v080-all`). Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
   Shards deleted the 16550 at `35e2de91e`; Hex's D261, D262), its Shards image class in a process that links Hex
   (`hex_node::images::ImageRuntime::new`, and `ImageRuntime::leasing`, made with its orchestrator's lessors), a member's
@@ -17,8 +17,12 @@ The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e8
   `pools`, through Shards' `ImagePools`), an agent's volumes with their bounds (`ShardsImage::volumes`, `Runtime::volumes`,
   `clear_volume`; Shards' D281), a program in a running VM's member (`Runtime::exec_member`), a run that ends on its own
   keeping its final use for its delete, a run's agent-control link (`Runtime::link`), and on Windows a guest's streams
-  on two named pipes (Shards' D272). It pins Shards at `04481e36b`, kiln's own, with no change of Hex's to it, and
-  hyper-raft at `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
+  on two named pipes (Shards' D272); and past it a Shards image VM's shares another server serves (`ShardsImage::served`
+  by source, each one's stream asked of the server its orchestrator bound, `ImageRuntime::bind_servers`,
+  `hex_api::serve::Servers`; Shards' D286, kiln goal 01a1ec34599974448f6b7663ddb07001). It pins Shards at `04481e36b`,
+  kiln's own, with one recorded change of its own to it, Shards' D286's API side
+  (`vendor/patches/shards/0001-shards-api-shards-ipc-an-image-run-takes-shares-another.patch`, which kiln's copy of
+  Shards carries byte for byte, until ROOT lands D286 on Shards' main), and hyper-raft at `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
   of what kiln touches: docs/shards.md).
 - **How kiln uses it:** `hex-node`, and through it Hex's runtime, client, QUIC wire, scheduler simulation, health
   and GPU telemetry, by name; kiln's root `[patch.crates-io]` points the name here, and `seccompiler` (third-party

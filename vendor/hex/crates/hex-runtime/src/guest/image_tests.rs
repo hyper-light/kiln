@@ -5045,6 +5045,98 @@ fn w33_a_credential_no_one_here_can_lease_or_beyond_its_egress_is_refused_before
     assert!(images.asked.lock().unwrap().is_empty());
 }
 
+/// Shards' D286 (kiln goal 01a1ec34…; docs/design/shards-image-class.md §2b): do create a VM given a share another
+/// server serves on a node bound no server of them; bind one serving `project`, then create and start a VM given
+/// `project` writable to its harness, and create and start one given a source the server serves none of. Expect the
+/// first refused `Unconfigured` before any record, nothing booted; the second's boot asked of Shards with one served
+/// share at its place, writable, its files run from, given to its harness as it starts, its stream the server's one
+/// stream, made for that box, writable; the third's start refused `Invalid` naming its source before any effect, its
+/// record still Creating, nothing more booted and no stream made.
+#[test]
+fn d286_a_served_share_is_asked_of_the_nodes_server_as_its_box_boots() {
+    let images = ModelImages::new();
+    let (runtime, owner) = model_runtime(&images, waits());
+    let harness = hex_api::Member {
+        kind: hex_api::MemberKind::Harness,
+        name: "claude".to_owned(),
+    };
+    let served = |name: &str, source: &str| {
+        let mut spec = spec(name, None);
+        if let ClassSpec::ShardsImage(image) = &mut spec.class {
+            image.served = vec![hex_api::ServedMount {
+                source: source.to_owned(),
+                destination: "/srv/project".to_owned(),
+                read_only: false,
+                members: vec![harness.clone()],
+            }];
+        }
+        spec
+    };
+    let unserved = served("image-unserved", "project");
+    let id = unserved.id.clone();
+    assert!(matches!(
+        runtime.create(unserved),
+        Err(Refusal::Unconfigured { what, .. }) if what.contains("served shares")
+    ));
+    assert!(record(&owner, &id).is_none());
+    assert!(images.asked.lock().unwrap().is_empty());
+
+    let servers = hex_api::serve::sim::SimServers::new();
+    servers.serve("project").unwrap();
+    runtime
+        .images
+        .bind_servers(Arc::new(servers.clone()))
+        .unwrap();
+    let id = runtime
+        .create(served("image-served", "project"))
+        .unwrap()
+        .id;
+    runtime.start(&id).unwrap();
+    let asked = images.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    let [share] = asked[0].served.as_slice() else {
+        panic!("{} served shares asked", asked[0].served.len());
+    };
+    assert_eq!(
+        (
+            share.at.as_str(),
+            share.read_only,
+            share.exec,
+            &share.members
+        ),
+        (
+            "/srv/project",
+            false,
+            true,
+            &Some(PlugFor::Members(vec![MemberName::harness("claude")]))
+        )
+    );
+    assert_eq!(servers.made().unwrap(), 1);
+    let probed = servers
+        .probe(&share.stream.as_fd().try_clone_to_owned().unwrap())
+        .unwrap();
+    assert_eq!(
+        (probed.id.as_str(), probed.source.as_str(), probed.read_only),
+        ("image-served", "project", false)
+    );
+
+    let id = runtime
+        .create(served("image-elsewhere", "elsewhere"))
+        .unwrap()
+        .id;
+    assert!(matches!(
+        runtime.start(&id),
+        Err(Refusal::Invalid { why, .. }) if why.contains("elsewhere")
+    ));
+    assert_eq!(record(&owner, &id).unwrap().phase, Phase::Creating);
+    assert_eq!(
+        images.asked.lock().unwrap().len(),
+        1,
+        "a boot asked past a refused stream"
+    );
+    assert_eq!(servers.made().unwrap(), 1);
+}
+
 /// The node VM these tests boot (joint plan step 39): run 1's, Hex's node image, the model's admitted size, one share
 /// where Hex's init finds it, its node's key, and its lanes as its node fitted them (a fixture: six, one place's).
 fn node_vm() -> NodeVm {

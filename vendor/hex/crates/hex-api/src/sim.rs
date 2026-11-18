@@ -19,7 +19,10 @@
 //! may hold: it boots no host ahead of a box, so none is ever warm or starting. Its volumes ([`ShardsImage::volumes`],
 //! kiln plan 01a1dd2e…, P6.2) are the simulator's home's, as the image class holds them: their bounds within the box's
 //! admitted disk, made as its start plugs them, held while its VM runs, and listed and cleared as Shards' store answers
-//! ([`Runtime::volumes`], [`Runtime::clear_volume`]); their files take no bytes, its members writing none.
+//! ([`Runtime::volumes`], [`Runtime::clear_volume`]); their files take no bytes, its members writing none. Its shares
+//! another server serves ([`ShardsImage::served`], Shards' D286) are asked of the server it was given
+//! ([`SimRuntime::with_servers`]) as its start boots it, each stream held while its VM runs, as the class asks them;
+//! given none, it refuses them as the class does a node given none, `Unconfigured`.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -95,6 +98,9 @@ pub struct SimRuntime {
     pools: Mutex<std::collections::BTreeSet<WarmPool>>,
     /// Its home's volumes, by name: each its bound and when it was made. Locked after `boxes` where a call takes both.
     volumes: Mutex<BTreeMap<String, SimVolume>>,
+    /// What serves its image VMs' shares another server serves (Shards' D286; [`SimRuntime::with_servers`]): none, so a
+    /// box naming one is refused as it is created.
+    servers: Option<Arc<dyn crate::serve::Servers>>,
 }
 
 /// A volume of the simulator's home (kiln plan 01a1dd2e…, P6.2): the bound its last first holder set, and when it was
@@ -126,6 +132,9 @@ struct SimVm {
     vcpus: u32,
     booted: Option<Instant>,
     taken: Vec<(Member, Arc<SimProc>)>,
+    /// The streams of its shares another server serves, asked as its start booted it and held while it runs, as its
+    /// run host and VM hold theirs (Shards' D286).
+    served: Vec<crate::serve::Stream>,
 }
 
 #[derive(Default)]
@@ -196,6 +205,15 @@ impl SimRuntime {
         Self {
             term_ends_init: ends,
             ..Self::default()
+        }
+    }
+
+    /// Its image VMs' shares another server serves asked of `servers` as each boots (Shards' D286), as the class asks
+    /// its node's: a box naming one is no longer refused as it is created.
+    pub fn with_servers(self, servers: Arc<dyn crate::serve::Servers>) -> Self {
+        Self {
+            servers: Some(servers),
+            ..self
         }
     }
 
@@ -273,6 +291,28 @@ impl SimRuntime {
 }
 
 impl SimRuntime {
+    /// The streams of `image`'s shares another server serves, for box `id`'s boot, each asked of its server in its spec's
+    /// order (Shards' D286): refused `Unconfigured` where it was given none, as the class refuses them, and as its
+    /// server refuses one.
+    fn served_streams(
+        &self,
+        id: &BoxId,
+        image: &ShardsImage,
+    ) -> Result<Vec<crate::serve::Stream>, Refusal> {
+        if image.served.is_empty() {
+            return Ok(Vec::new());
+        }
+        let servers = self
+            .servers
+            .as_ref()
+            .ok_or_else(crate::serve::unconfigured)?;
+        image
+            .served
+            .iter()
+            .map(|share| servers.stream(id, share))
+            .collect()
+    }
+
     /// `image`'s volumes as its run starts, as the class plugs them (kiln plan 01a1dd2e…, P6.2): refused
     /// `Volume { Bound }` where the running boxes, `held`, serve one with another bound; else each made where it isn't,
     /// its bound the one asked.
@@ -529,6 +569,11 @@ impl Runtime for SimRuntime {
                 if let Some(needs) = crate::unheld(&image.grants) {
                     return Err(Refusal::Awaits { needs });
                 }
+                // Its shares another server serves, where it was given none to serve them, as the class refuses them
+                // (Shards' D286).
+                if !image.served.is_empty() && self.servers.is_none() {
+                    return Err(crate::serve::unconfigured());
+                }
                 // Its volumes' bounds within the disk it was admitted with, as the class holds them (P6.2).
                 let admitted = spec.allocation.map_or(u64::MAX, |a| a.resources.disk_bytes);
                 let bounds = image
@@ -557,6 +602,7 @@ impl Runtime for SimRuntime {
                     .vcpus,
                 booted: None,
                 taken: Vec::new(),
+                served: Vec::new(),
             }),
             _ => None,
         };
@@ -606,6 +652,13 @@ impl Runtime for SimRuntime {
         if init.exit()?.is_some() {
             return Err(Refusal::NotRunning(id.clone(), "start"));
         }
+        // Its shares another server serves, each one's stream asked of its server as it boots, in its spec's order (Shards'
+        // D286): the first refused refuses its start before anything of its run, the box left created, as the class asks
+        // them before its boot's intent.
+        let served = match &b.spec.class {
+            ClassSpec::ShardsImage(image) => self.served_streams(id, image)?,
+            _ => Vec::new(),
+        };
         if let ClassSpec::ShardsImage(image) = &b.spec.class
             && let Err(why) = self.plug_volumes(&held, image)
         {
@@ -616,6 +669,7 @@ impl Runtime for SimRuntime {
         }
         if let Some(vm) = &mut b.vm {
             vm.booted = Some(Instant::now());
+            vm.served = served;
         }
         if let Some(exit) = b.init_ends {
             init.end(exit)?;
@@ -1568,5 +1622,57 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Shards' D286 (kiln goal 01a1ec34…): the simulator asks an image VM's shares another server serves as the class
+    /// does. Do create one given a served share on a simulator given no server; then, on one given a server serving
+    /// `project`, create and start one served `project` and one served a source the server serves none of. Expect the
+    /// first refused `Unconfigured` with no box made; the second started, its stream asked once; the third created, its
+    /// start refused `Invalid` naming the source, that box left created, nothing of its run begun.
+    #[test]
+    fn d286_the_simulator_asks_an_image_vms_served_shares_as_the_class_does() {
+        let served = |name: &str, source: &str| {
+            let mut spec =
+                SimFixture::ShardsImage.spec(BoxId::new(name).unwrap(), Bounds::default());
+            let ClassSpec::ShardsImage(image) = &mut spec.class else {
+                panic!("the image fixture's spec is no image VM's");
+            };
+            image.served = vec![crate::ServedMount {
+                source: source.to_owned(),
+                destination: "/srv/project".to_owned(),
+                read_only: false,
+                members: Vec::new(),
+            }];
+            spec
+        };
+        let alone = SimRuntime::new();
+        assert!(matches!(
+            alone.create(served("unserved", "project")),
+            Err(Refusal::Unconfigured { .. })
+        ));
+        assert!(alone.list().unwrap().is_empty());
+
+        let servers = crate::serve::sim::SimServers::new();
+        servers.serve("project").unwrap();
+        let rt = SimRuntime::new().with_servers(Arc::new(servers.clone()));
+        let first = rt.create(served("first", "project")).unwrap().id;
+        rt.start(&first).unwrap();
+        assert_eq!(
+            servers.made().unwrap(),
+            1,
+            "its stream asked once as it booted"
+        );
+        let other = rt.create(served("other", "elsewhere")).unwrap().id;
+        assert!(matches!(
+            rt.start(&other),
+            Err(Refusal::Invalid { why, .. }) if why.contains("elsewhere")
+        ));
+        let info = rt.inspect(&other).unwrap();
+        assert_eq!((info.state, info.exit), (BoxState::Created, None));
+        assert_eq!(
+            servers.made().unwrap(),
+            1,
+            "no stream made for a source it serves none of"
+        );
     }
 }

@@ -9,14 +9,18 @@
 //! - [`follow`]: what happens to it, back to the agent (C2, C3).
 //! - [`slates`]: a workspace of its own, a Slates volume over its folder (W1–W4).
 //! - [`place`]: where a workspace's volume is mounted on its machine (a folder, or a drive letter on Windows).
+//! - [`ignored`]: what git ignores in one with no mount, from its volume's own `.gitignore` files.
+//! - [`review`]: an agent's work in one with no mount, from its volume's landing entries (A-287).
 //! - [`measure`]: an experiment's variants measured beside it, each in a worktree of its own
 //!   (docs/ci.md W20-R11).
 
 pub mod change;
 pub mod follow;
 pub mod git;
+pub mod ignored;
 pub mod measure;
 pub mod place;
+pub mod review;
 pub mod slates;
 
 #[cfg(test)]
@@ -164,8 +168,9 @@ fn beneath(path: &str, mount: &str) -> String {
 
 /// Makes the workspace `spec` asks for (on the machine its agent `id` works on), before its
 /// harness starts: a volume laid over its folder's repository, mounted, and the agent's folder in
-/// it; or, for one made already (the runner started again), mounted again if its mount went away.
-/// Nothing for an agent that works in its folder itself.
+/// it; for an isolated session, the volume with no mount, which Slates serves its microVM itself
+/// (its folder stays the folder's own path); or, for one made already (the runner started again),
+/// mounted again if its mount went away. Nothing for an agent that works in its folder itself.
 pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyhow::Result<()> {
     let Some(w) = spec.workspace.clone().filter(|w| w.kind == "volume") else { return Ok(()) };
     if let Some(m) = &w.made {
@@ -185,7 +190,11 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     // The whole id: kiln's ids start with the time they were made, so two agents started together
     // share their beginnings (Slates' names are unique on the machine).
     let whole: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
-    let made = slates::make(&format!("kiln-{whole}"), &over).await?;
+    let name = format!("kiln-{whole}");
+    // An isolated session's volume is served to its microVM by Slates itself, never mounted here (kiln goal
+    // 01a1ec34599974448f6b7663ddb07001; `sandbox::isolated::served_project`): its harness works in the folder's own place
+    // in its guest, and nothing of the volume is in this machine's mount table.
+    let made = if spec.isolation.is_some() { slates::make_unmounted(&name, &over).await? } else { slates::make(&name, &over).await? };
     // Its landings follow the mode its agent starts in (the person's rule, 2026-11-18; W6), as kiln, the launcher, sets
     // the volume's write policy; no agent can raise it. Where kiln can't set one (an instance it started under a systemd
     // unit), Slates' unset policy holds: its landings ask, and kiln's own `agents.land` judges each by the agent's mode.
@@ -193,9 +202,11 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     if let Err(e) = slates::set_policy(&made, slates_api::WritePolicy { merge: mode, land: mode, require_signed_merges: false }).await {
         tracing::info!(volume = %made.volume, error = %format!("{e:#}"), "a workspace's write policy wasn't set: its landings ask, as Slates' unset policy does");
     }
-    let top = place::top(&made.mount);
-    let here = if sub.is_empty() { top } else { top.join(&sub) };
-    spec.cwd = Some(here.to_string_lossy().into_owned());
+    if !made.mount.is_empty() {
+        let top = place::top(&made.mount);
+        let here = if sub.is_empty() { top } else { top.join(&sub) };
+        spec.cwd = Some(here.to_string_lossy().into_owned());
+    }
     spec.workspace = Some(Workspace { kind: w.kind, over: Some(over.to_string_lossy().into_owned()), sub, made: Some(made), ..Workspace::default() });
     Ok(())
 }
@@ -398,6 +409,14 @@ fn own(ws: Option<&Workspace>) -> anyhow::Result<(&slates::Made, &str)> {
     }
 }
 
+/// The workspace of its own an ask is about where it has no mount (an isolated session's Slates volume, served to its
+/// microVM: `sandbox::isolated::served_project`), and the folder it lies over; none for any other.
+fn unmounted(ws: Option<&Workspace>) -> Option<(&slates::Made, &str)> {
+    let w = ws?;
+    let m = w.made.as_ref().filter(|m| m.mount.is_empty())?;
+    Some((m, w.over.as_deref()?))
+}
+
 async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>) -> anyhow::Result<Value> {
     match ask {
         Ask::Look => {
@@ -411,7 +430,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
             // the landing would write what git ignores.
             let why_not = match slates::can_take_grants() {
                 Err(e) => Some(format!("{e:#}")),
-                Ok(()) => slates::writable(m, &plan).await.err(),
+                Ok(()) => slates::writable(m, over, &plan).await.err(),
             };
             Ok(json!({"plan": plan, "excludes": excludes, "can_write": why_not.is_none(), "why_not": why_not}))
         }
@@ -420,7 +439,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
             Ok(match slates::land(m, over, &manifest).await? {
                 slates::Landed::Written(outcome) => json!({"landed": outcome}),
                 slates::Landed::Changed(plan, excludes) => {
-                    let why_not = slates::writable(m, &plan).await.err();
+                    let why_not = slates::writable(m, over, &plan).await.err();
                     json!({"changed": true, "plan": plan, "excludes": excludes, "can_write": why_not.is_none(), "why_not": why_not})
                 }
             })
@@ -441,7 +460,18 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
             let facts = git::facts(cwd).await?;
             let top = Path::new(&facts.top);
             let who = git::identity(top, &c.fallback).await;
-            let Some(made) = git::commit(top, facts.head.as_deref(), c.paths.as_deref(), &c.message, &who, sign).await? else {
+            let made = match unmounted(ws) {
+                // No working tree here (an isolated session's volume, served to its microVM): its changes come from the
+                // volume itself (kiln goal 01a1ec34599974448f6b7663ddb07001; Slates' A-287), every one, as a workspace of
+                // its own's change takes them.
+                Some((m, over)) => {
+                    anyhow::ensure!(c.paths.is_none(), "a workspace with no mount commits every change it holds, never chosen files");
+                    let changes = review::changes(m, over).await?;
+                    git::commit_changes(top, facts.head.as_deref(), &changes, &c.message, &who, sign).await?
+                }
+                None => git::commit(top, facts.head.as_deref(), c.paths.as_deref(), &c.message, &who, sign).await?,
+            };
+            let Some(made) = made else {
                 anyhow::bail!("there's nothing to commit: the agent's files are as the folder's last commit has them");
             };
             let said = git::push(top, &c.to, &format!("+{}:{}", made.sha, c.to_ref), c.bearer.as_deref()).await?;
