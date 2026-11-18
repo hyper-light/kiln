@@ -253,20 +253,21 @@ pub fn check_all_links(links: &[LinkSuites]) -> Result<(), String> {
     links.iter().try_for_each(check_link)
 }
 
-/// Why a drive's links can't pass the checks above where kiln's own word on its session says why: a gap of the built
-/// system's, named, so a run's red reads as that gap rather than as a check's words (gaps.json's `link_report`).
+/// Why a drive's links can't pass the checks above where kiln's own word on its session says why, named, so a run's
+/// red reads as that cause rather than as a check's words. kiln reports a microVM's link (gaps.json's `link_report`,
+/// which holds for every harness): this names a run it reported none of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkGap {
-    /// kiln says the session runs in a microVM and reports no agent-control link of it (`/runs/control` absent).
-    /// kiln's runner holds its microVMs through Hex's image runtime (`sandbox::held_in`), whose `Runtime` signals the
-    /// member and takes kiln's MCP lane over that link but has no call that reports it, so `HexRun::link` answers none.
+    /// kiln says the session runs in a microVM and has no `/runs/control` for it. `HexRun::link` asks Hex's
+    /// `Runtime::link`, which waits for its run's agent-control endpoint to report (`sandbox::hexvm`), and answers none
+    /// only where that run ended before its endpoint reported, or where Hex refused the call.
     HexReportsNoLink,
 }
 
 impl std::fmt::Display for LinkGap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HexReportsNoLink => f.write_str("Hex reports no agent-control link: Hex has no Runtime call for it yet"),
+            Self::HexReportsNoLink => f.write_str("kiln has no /runs/control for this microVM's run: Hex reported no agent-control link of it"),
         }
     }
 }
@@ -289,7 +290,7 @@ pub struct LinksFailed {
 impl std::fmt::Display for LinksFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.gap {
-            Some(gap) => write!(f, "{gap} (kiln says the session runs in a microVM and reports no /runs/control: gaps.json's link_report gap); its links' checks said: {}", self.said),
+            Some(gap) => write!(f, "{gap}; its links' checks said: {}", self.said),
             None => f.write_str(&self.said),
         }
     }
