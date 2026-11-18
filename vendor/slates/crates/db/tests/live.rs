@@ -1750,6 +1750,53 @@ fn expect_a_whole_state_admitted_one_past_the_credit(shipper: &mut Shipper, whol
   admitted
 }
 
+/// A-371 (AC-8.9; A-200 amended): a whole state in flight rides one past the credit and never counts against the
+/// deltas behind it. Do: bound a shipper by a whole state of 64 KiB, append that whole state as the daemon does
+/// (`append_checkpoint`, then `mark_checkpoint` and the bounds set again from it), and with nothing acknowledged append
+/// 4 KiB deltas. Expect every delta whose bytes keep the deltas in flight within the credit admitted, as with no whole
+/// state in flight, the next refused `NoCredit`, no second whole state admitted while the first and the deltas are
+/// in flight, and the acknowledgement settling all of them. Before, the whole state's own bytes filled the credit, so
+/// every delta after a whole entry was refused until the whole was durable, and the daemon, owing a whole state for each
+/// refusal, shipped the volume whole again (the measurer's 32 writers on a 128 MiB volume: 1 whole record became 3).
+#[test]
+fn deltas_behind_a_whole_state_in_flight_are_admitted_within_the_credit() {
+  const WHOLE: usize = 64 << 10;
+  const DELTA: usize = 4 << 10;
+  let mut shipper = shipper_bounded_by_whole(WHOLE);
+  let whole = shipper.append_checkpoint(vec![7; WHOLE]).unwrap();
+  shipper.mark_checkpoint(whole.head());
+  shipper.set_bounds(Bounds::of_whole(whole.wire_bytes()));
+  let delta_bytes = Entry {
+    payload: vec![0; DELTA],
+    ..whole.clone()
+  }
+  .wire_bytes();
+  let admitted = whole.wire_bytes() / delta_bytes;
+  let mut appended = vec![whole];
+  for value in 0..admitted {
+    let payload = vec![u8::try_from(value % 256).unwrap(); DELTA];
+    appended.push(shipper.append(payload).unwrap_or_else(|refusal| {
+      panic!("delta {value} of {admitted} behind the whole state: {refusal:?}")
+    }));
+  }
+  assert_eq!(
+    shipper.append(vec![0; DELTA]),
+    Err(LiveError::NoCredit { durable: None }),
+    "the delta that would pass the credit waits"
+  );
+  assert!(
+    !shipper.admits_checkpoint(),
+    "no second whole state while the first and the deltas are in flight"
+  );
+  let held = held_after(HostId(1), &appended);
+  assert_eq!(shipper.on_reply(HostId(2), Ok(held)), Next::Nothing);
+  assert_eq!(
+    (shipper.in_flight(), shipper.in_flight_bytes()),
+    (0, 0),
+    "the acknowledgement settles the whole state and every delta"
+  );
+}
+
 /// AC-8.9: the credit counts what each entry costs. Do bound a shipper at three small entries' bytes and put one small
 /// entry in flight. Expect a second small entry admitted, an entry larger than what is left refused though only one
 /// is in flight, and, once nothing is in flight, that same large entry admitted whatever its size (the log never
@@ -2648,6 +2695,29 @@ fn hostile_replies_are_refused() {
   }
 }
 
+/// §4.2 (a candidate's admission of a live log, g229): a holder that cannot admit the volume's claim answers `NoRoom`
+/// with what it could admit, so the owner can refuse typed. Do: encode a `NoRoom` reply at zero, a middle value and
+/// `u64::MAX`, then decode it whole, cut short at every length and with a byte too many. Expect: the same refusal back,
+/// whole; `Malformed` for every cut and for the extra byte; never a panic.
+#[test]
+fn a_holders_no_room_crosses_the_wire_with_what_it_could_admit() {
+  for available in [0, 1 << 20, u64::MAX] {
+    let refusal = Err(LiveError::NoRoom { available });
+    let bytes = encode_reply(&refusal);
+    assert_eq!(decode_reply(&bytes), refusal, "{available} back whole");
+    for length in 0..bytes.len() {
+      assert_eq!(
+        decode_reply(&bytes[..length]),
+        Err(LiveError::Malformed),
+        "{available} cut at {length}"
+      );
+    }
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert_eq!(decode_reply(&longer), Err(LiveError::Malformed));
+  }
+}
+
 /// Hostile input on the header readers a holder uses before it decodes a message it will not serve: an entry's and an
 /// install's epoch are read back as encoded, every truncation short of the epoch reads none, and a fetch is not read as
 /// an install. Never a panic.
@@ -2779,28 +2849,70 @@ fn hostile_report_answers_are_refused() {
   }
 }
 
-/// Hostile input on a fetched reply: it round-trips; a payload over the cap is refused, and no cut of it decodes whole.
+/// Hostile input on a fetched reply (g251: its payloads read in place, one at a time): it round-trips, its payloads in
+/// order; a payload over the cap is refused when it is reached, and the log is spent after it; a length of `u32::MAX`
+/// is refused before anything is read for it; and no cut of the reply reads whole.
 #[test]
 fn hostile_fetched_replies_are_refused() {
-  use slates_db::live::{decode_fetched, encode_fetched};
+  use slates_db::live::{FetchedLog, fetched_reply, push_fetched};
   let head = Head {
     epoch: HostEpoch(2),
     position: 7,
     identity: [4; 32],
   };
-  let payloads = vec![vec![1, 2, 3], vec![9; 40]];
-  let reply = encode_fetched(&Ok(Some(head)), &payloads);
+  let payloads = vec![vec![1, 2, 3], vec![9; 100]];
+  let mut reply = fetched_reply(&Ok(Some(head)), 0);
+  for payload in &payloads {
+    push_fetched(&mut reply, payload);
+  }
+  let read_all = |log: &mut FetchedLog| -> Vec<Result<Vec<u8>, LiveError>> {
+    std::iter::from_fn(|| {
+      log
+        .next_payload()
+        .map(|payload| payload.map(<[u8]>::to_vec))
+    })
+    .collect()
+  };
+  let (decoded, mut log) = FetchedLog::decode(reply.clone(), CAP).unwrap();
+  assert_eq!(decoded, Some(head));
   assert_eq!(
-    decode_fetched(&reply, CAP),
-    Ok((Some(head), payloads.clone()))
+    log.first(),
+    Some(&payloads[0][..]),
+    "the first is read in place"
   );
-  assert_eq!(decode_fetched(&reply, 8), Err(LiveError::Malformed));
+  assert_eq!(
+    read_all(&mut log),
+    payloads.iter().cloned().map(Ok).collect::<Vec<_>>()
+  );
+  assert!(log.is_spent() && log.taken() == payloads.len());
+  // The cap admits the reply's head (a tag and 48 bytes) and the first payload, never the second.
+  let (_, mut capped) = FetchedLog::decode(reply.clone(), 64).unwrap();
+  assert_eq!(
+    read_all(&mut capped),
+    vec![Ok(payloads[0].clone()), Err(LiveError::Malformed)],
+    "the payload over the cap is refused when reached, and nothing follows it"
+  );
+  let mut huge = fetched_reply(&Ok(Some(head)), 0);
+  huge.extend_from_slice(&u32::MAX.to_le_bytes());
+  huge.extend_from_slice(&[0; 16]);
+  let (_, mut huge) = FetchedLog::decode(huge, CAP).unwrap();
+  assert_eq!(read_all(&mut huge), vec![Err(LiveError::Malformed)]);
+  assert_no_cut_reads_whole(&reply, payloads.len());
+}
+
+/// Every cut of a fetched `reply` short of its end: none that decodes reads all of its `payloads` whole.
+fn assert_no_cut_reads_whole(reply: &[u8], payloads: usize) {
+  use slates_db::live::FetchedLog;
   for length in 0..reply.len() {
-    if let Ok((_, decoded)) = decode_fetched(&reply[..length], CAP) {
-      assert!(
-        decoded.len() < payloads.len(),
-        "a cut reply never decodes whole"
-      );
+    if let Ok((_, mut cut)) = FetchedLog::decode(reply[..length].to_vec(), CAP) {
+      let whole = std::iter::from_fn(|| {
+        cut
+          .next_payload()
+          .map(|payload| payload.map(<[u8]>::to_vec))
+      })
+      .filter(Result::is_ok)
+      .count();
+      assert!(whole < payloads, "a cut reply never reads whole");
     }
   }
 }

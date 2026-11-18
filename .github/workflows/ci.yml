@@ -1,7 +1,9 @@
 # CI: the UI is built once and embedded into every Rust build (rust-embed reads ui/dist).
-# Linux runs clippy and the tests; macOS and Windows check that kiln builds (clippy covers the
-# tests' code too) on their native toolchains, and Windows runs the priority checks only Windows
-# itself can answer (goal 3 step 1, goal 8 step 4).
+# Linux on x86-64 runs clippy and the tests; macOS (Apple silicon), Windows (x86-64 and arm64) and
+# Linux on arm64 check that kiln builds (clippy covers the tests' code too) on their native
+# toolchains, with everything it vendors and links built with it (Slates, Hex, Mantle and Shards'
+# crates: vendor/MANIFEST.toml), and Windows runs the priority checks only Windows itself can
+# answer (goal 3 step 1, goal 8 step 4).
 name: ci
 
 on:
@@ -112,7 +114,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        # Every platform kiln builds and runs on (README, Platforms) but the linux job's: Apple silicon,
+        # Windows on x86-64 and arm64, Linux on arm64, each on GitHub's own runner of that platform
+        # (kiln goal 01a1ec34599974448569750ac79093b6: the Slates kiln vendors built on every one).
+        os: [macos-latest, windows-latest, windows-11-arm, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -127,6 +132,21 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
+      # aws-lc-sys (the TLS Slates, Mantle and kiln link) builds its C and its arm64 assembly with
+      # clang-cl on arm64 Windows and refuses MSVC's cl.exe there; the image carries LLVM with
+      # clang-cl, found as Slates' own windows-11-arm lane finds it. Named as the target's C
+      # compiler for every later step.
+      - name: clang-cl for the C kiln links (arm64 Windows)
+        if: ${{ matrix.os == 'windows-11-arm' }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Clippy
         shell: bash

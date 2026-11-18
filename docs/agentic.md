@@ -244,7 +244,8 @@ run on kiln's blocking pool (`crate::workspace::slates`). kiln carries no Slates
 machine installs one: kiln's own executable is Slates' anchor and daemon (`kiln slates-role
 --instance <name> anchor`, and the daemon its anchor starts the same way), handed to Slates' own
 main before kiln's runtime starts, so the daemon a runner talks to is the same code as the client it
-links, built with every kiln on every platform kiln builds. A role's process ends at any panic, as
+links, built with every kiln on every platform kiln builds (CI builds it natively on each:
+`.github/workflows/ci.yml`, Linux on x86-64 and arm64, Apple silicon, Windows on x86-64 and arm64). A role's process ends at any panic, as
 Slates' own builds do, so its anchor starts a daemon again rather than leave one serving with a
 thread gone. A runner keeps one instance, `kiln`, for all the machine's runner processes. The
 instance's anchor starts apart from the runner: on Linux, where the runner runs under the user's
@@ -292,7 +293,12 @@ asked for. What the agent hasn't touched is read from the folder as it is now; w
 (edits, build output, git's own writes) is held in the volume alone, so the folder and other
 agents never see it. Ended for good, the agent's volume goes with it, once no other agent works in it: the last
 of the agents working in one ends it (on its machine's runner process), and an agent that couldn't start after all
-takes only a volume made for it alone with it.
+takes only a volume made for it alone with it. Its mount goes first, asked again while what the agent left behind
+still holds it for as long as the agent's own end took, then let go: detached on Linux, forced off on macOS (Slates'
+`mount::unmount_busy`, contract 36), kiln saying what held it. A mount is its own attachment in Slates (its file-system
+bridge's), lasting until it's unmounted, as a microVM's stream lasts until it closes (W8): none of kiln's attachments
+has the term Slates gives its command line's, which lapses once nothing renews it (Slates' A-384), so nothing kiln
+keeps between an agent's turns needs renewing.
 
 *Why not one base per folder, pinned and cloned, as first planned:* Slates (c8d6adb4) refuses a
 clone of an overlay's snapshot (`ContentUnavailable`, pinned or not), and pinned files count as
