@@ -368,10 +368,17 @@ Built, each where it is:
   a stream handed to Shards (`sandbox::isolated::served_project`: the volume by its id, where the microVM sees the
   folder it lies over, writable, given to the harness, the harness's folder at the same place beneath it; the
   seam's `Launch::served`, `hexvm::served_of`). Hex asks the server its runtime was bound for the stream as the box
-  boots; microVMs bound none refuse such a launch, typed (`hexvm::NO_SERVER`). Its review is built from the volume's
-  changes (`workspace::git::commit_changes`, git's ignore rules over the volume's own `.gitignore` files:
-  `workspace::ignored`). Owed: kiln's Slates server bound to Hex's runtime, the workspace made with no mount for an
-  isolated session, and the review's read of Slates' landing entries, on kiln's library swap to slates-api (g263).
+  boots: kiln's runtime is bound this machine's Slates as that server (`sandbox::served::SlatesVolumes`, the
+  volume's stream from `Instance::serve_shards`, the Shards route); microVMs bound none refuse such a launch, typed
+  (`hexvm::NO_SERVER`). An isolated session's workspace is made with no mount (`workspace::slates::make_unmounted`;
+  its `made.mount` is empty, nothing of it is in the machine's mount table). Its review (`agents.change`) is built
+  from the volume's own changes: the entries of its landing presented never writing, each file read at the volume's
+  head and checked against its BLAKE3 (`workspace::review`, Slates' A-287), committed beside the folder
+  (`workspace::git::commit_changes`), git's ignore rules over the volume's own `.gitignore` files
+  (`workspace::ignored`); a landing's check of what git ignores reads the same entries. Owed: the real-VM run (the
+  stand-in agent in a Shards microVM of its own, `tests/slates_e2e.rs`'s `microvm::` drive, on HVF, KVM and WHP);
+  Shards' D286 on Shards' main (carried as vendor/shards' recorded changes until ROOT lands it); on Windows, the
+  VM process as a known holder of its stream for DAX (Slates' A-180), which the run host makes and kiln never sees.
 - **A member's signals** (Shards' D238, Hex's `Runtime::signal_member`): interrupt and stop reach the member
   alone on its own lane of its run's agent-control endpoint; its kill is its box's delete.
 - **kiln's MCP from inside** (Shards' D254, Hex's `ImageMember::mcp` and `Runtime::mcp`): above.

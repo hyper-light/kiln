@@ -93,6 +93,9 @@ pem = "4"
 # Git's ignore rules over a workspace with no mount, its volume's own `.gitignore` files read through Slates
 # (`workspace::ignored`; kiln goal 01a1ec34599974448f6b7663ddb07001): ripgrep's matcher, the version vendored vorpal links.
 ignore = "0.4.33"
+# The BLAKE3 a Slates landing entry names a file's bytes by, which a review made with no mount checks each file it
+# reads against (`workspace::review`; Slates' A-287): the version Slates' own crates and vorpal link.
+blake3 = "1.8.7"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 bytes = "1.12.1"

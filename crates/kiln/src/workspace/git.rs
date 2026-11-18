@@ -351,6 +351,35 @@ fn staged_entries<'a>(listed: &'a str, under: &str) -> Vec<(&'a str, &'a str, &'
         .collect()
 }
 
+/// The paths repository `top` tracks (its index), each as git names it within the repository: what git's ignore rules
+/// never apply to (gitignore(5)), for a review made with no working tree (`super::review`).
+pub async fn tracked(top: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut c = git(top);
+    c.args(["ls-files", "-z"]);
+    Ok(run(c, GIT_TIMEOUT).await?.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect())
+}
+
+/// What repository `top`'s ignore rules beneath its folders' own `.gitignore` files are (gitignore(5)): its
+/// `info/exclude`, the user's excludes file (`core.excludesFile`, else git's own default,
+/// `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`), each one's bytes where it has one, and whether names match
+/// whatever their case (`core.ignoreCase`), for a review made with no working tree (`super::review`).
+pub async fn excludes(top: &Path) -> anyhow::Result<(Option<Vec<u8>>, Option<Vec<u8>>, bool)> {
+    let mut c = git(top);
+    c.args(["rev-parse", "--git-path", "info/exclude"]);
+    let info = top.join(run(c, GIT_TIMEOUT).await?);
+    let mut c = git(top);
+    c.args(["config", "--path", "--get", "core.excludesFile"]);
+    let user = match ask(c).await {
+        Some(file) => Some(std::path::PathBuf::from(file)),
+        None => Some(std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty()).map_or_else(|| crate::os::home_dir().join(".config"), std::path::PathBuf::from).join("git").join("ignore")),
+    };
+    let mut c = git(top);
+    c.args(["config", "--bool", "--get", "core.ignoreCase"]);
+    let case_insensitive = ask(c).await.is_some_and(|v| v == "true");
+    let read = |file: &Path| std::fs::read(file).ok();
+    Ok((read(&info), user.as_deref().and_then(read), case_insensitive))
+}
+
 /// Writes the commit of `tree` on `parent`, saying `message`, by `author` (at the time given, else
 /// now), committed by `who`: an agent's work, so signed as the agent with the key this runner holds
 /// in slot `sign` (its session's at its epoch, W27-R03), and never with a key the person's git
