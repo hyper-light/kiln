@@ -1,0 +1,54 @@
+[package]
+name = "slates-bridge-virtiofs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The virtio-fs guest device (§4.6 A-9, D-2, RQ-20; Phase 4): a sans-io split-virtqueue machine over a bounded guest-memory seam, the FUSE-over-virtio request cycle over the shared Bridge through the FUSE codec, device admission that authenticates the consumer before any queue exists and charges every request against the attachment's credits, and the device loop as a perpetual task on the owning shard over the runtime. The VMM seam is in-process or an inherited descriptor; DAX is not advertised."
+
+[dependencies]
+slates-bridge-core = { workspace = true }
+slates-bridge-fuse = { workspace = true }
+slates-vfs = { workspace = true }
+slates-machine = { workspace = true }
+slates-wire = { workspace = true }
+slates-db = { workspace = true }
+slates-rt = { workspace = true }
+# The inherited-descriptor binding maps the guest's memory objects through `SharedObject` (Linux).
+slates-mem = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Descriptor and memory-object syscalls, never a host path (R1): the DAX cache region's `MAP_FIXED` overlays
+# (`src/dax.rs`, every Unix host — exercised on macOS over an `shm` object), and on Linux the vhost-user back end's
+# socket peer credentials, `SCM_RIGHTS` descriptors, the kick/call eventfds and the epoll doorbell.
+rustix = { workspace = true }
+# The DAX cache region's reservation is an `MmapMut` (Send, provenance-correct, safe slice reads) the device overlays
+# with `MAP_FIXED`; holding the mapping as `MmapMut` keeps `AdmittedDevice` `Send` without an `unsafe impl` (§4.6).
+memmap2 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# One ioctl: `UDMABUF_CREATE`, which confines a guest's DAX window to its own descriptor (`src/udmabuf.rs`).
+# rustix has no wrapper for it, and its typed `ioctl` cannot express one that *returns* a descriptor without an
+# `unsafe impl Ioctl` of our own — which would be two unsafe sites where libc is one.
+libc = { workspace = true }
+# The vhost-user front end's credentials (`SO_PEERCRED`), read soundly: rustix 1.1's `UCred` cannot hold the pid 0 the
+# kernel reports for a front end whose process this one cannot see (`slates_ipc::peer`).
+slates-ipc = { workspace = true }
+
+[dev-dependencies]
+
+[target.'cfg(unix)'.dev-dependencies]
+# The runtime test's doorbell: a pipe pair the simulated VMM owns, drained and kicked through
+# `rustix` (descriptor I/O on a memory object, never a host path). The crate's own source holds no
+# descriptor — the seam owns and drains the doorbell; the loop only awaits its number.
+rustix = { workspace = true }
+# The DAX window's chaos schedule (`tests/device.rs`): random interleavings of map, unmap, write and
+# truncate against one guest-visible cache region. Seeds go through `slates-test-seeds`, so a failing
+# case is recorded without writing a file (R1).
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
+
+[lints]
+workspace = true

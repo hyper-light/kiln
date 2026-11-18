@@ -1,7 +1,7 @@
 //! The bare-metal engine's workspaces end to end (kiln goal 01a1ec34599974448aed2672bafaf9a2; docs/agentic.md W2–W6):
-//! agents started through kiln on a hub of its own, with a real Slates (`KILN_TEST_SLATES`: its binary), on any
-//! machine that can mount a volume (FUSE on Linux, NFS on loopback on macOS, WinFsp at a drive letter on Windows);
-//! skipped, saying so, elsewhere. No harness ever runs (each agent's program doesn't exist), so each session stays as
+//! agents started through kiln on a hub of its own, with a Slates instance of the test's own run by a kiln executable
+//! in Slates' roles (`KILN_TEST_BIN`: no Slates binary anywhere), on any machine that can mount a volume (FUSE on
+//! Linux, NFS on loopback on macOS, WinFsp at a drive letter on Windows); skipped, saying so, elsewhere. No harness ever runs (each agent's program doesn't exist), so each session stays as
 //! kiln made it, its folder its workspace.
 //!
 //! - Every harness kiln runs, started naming no workspace, works in a volume of its own, mounted, its folder there.
@@ -102,16 +102,18 @@ fn project(bare: &Path, work: &Path) -> anyhow::Result<String> {
 /// each volume going with the last agent working in it.
 #[test]
 fn w2_every_harness_and_agent_works_on_a_volume_reviews_drifts_and_lands_under_a_grant() -> anyhow::Result<()> {
-    let Some(bin) = std::env::var_os("KILN_TEST_SLATES") else {
-        eprintln!("skipped: KILN_TEST_SLATES names no Slates binary");
+    // The kiln executable whose `slates-role` runs the test's instance: a unit test's own executable isn't kiln's.
+    let Some(program) = std::env::var_os("KILN_TEST_BIN") else {
+        eprintln!("skipped: KILN_TEST_BIN names no kiln executable (cargo build -p kiln, then KILN_TEST_BIN=<target>/debug/kiln)");
         return Ok(());
     };
-    if place::kind().is_none() {
-        eprintln!("skipped: {}", place::why_not());
+    if let Err(fault) = slates_api::mount::available() {
+        eprintln!("skipped: {fault}");
         return Ok(());
     }
     let instance = format!("kilntest{}", std::process::id());
-    anyhow::ensure!(super::slates::set_override(super::slates::Override { binary: bin.into(), instance }), "another test pointed workspaces elsewhere");
+    let o = super::slates::Override { instance, program: Some(program.into()), quick: true };
+    anyhow::ensure!(super::slates::set_override(o), "another test pointed workspaces elsewhere");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(crate::rt::block_on(run()));

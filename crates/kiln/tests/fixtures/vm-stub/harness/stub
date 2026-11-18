@@ -17,6 +17,10 @@ prompt asks with words:
 
     WRITE=<name>    the file <name> written in its folder, its name as its words, as a harness at work
                     in its project writes one: `WROTE <name>`, or `WRITE_FAIL <why>`
+    APPEND=<name>   the line `APPENDED <name>` added to the end of the file <name> already in its
+                    folder, as a harness changes a file of its project: `APPENDED <name>`, or
+                    `APPEND_FAIL <why>` (none is made where it isn't there)
+    REMOVE=<name>   the file <name> in its folder removed: `REMOVED <name>`, or `REMOVE_FAIL <why>`
     MCP_PING        a round trip to kiln's MCP server, the one its dialect was given (stdio or HTTP):
                     initialize, then tools/list: `MCP_OK <tools> <first tool>`, then `MCP_AS <agent>`
                     where kiln's answer to initialize names whom it serves (its instructions' "You are
@@ -24,6 +28,21 @@ prompt asks with words:
     SPAWN=<kind>    an agent of that harness started through kiln's MCP server (`agents_start`), from
                     where this one runs: `SPAWN_OK <its id>`, or `SPAWN_FAIL <why>`
     SLOW=<ms>       that long between its lines, so a turn lasts long enough to steer into
+    RAISE           its own permission mode raised to one that asks nothing, asked of kiln's MCP server
+                    as the agent itself (`agents_broadcast` to itself, the console's `set_mode` to
+                    `bypassPermissions`), before any `LAND`: `RAISE_REFUSED <why>` where kiln refused
+                    it, `RAISE_ASKED <answer>` where kiln took the ask, or `RAISE_FAIL <why>` where it
+                    reached no kiln
+    LAND            its own workspace written to its folder on disk, asked of kiln's MCP server as an
+                    agent would ask it (`agents_land`, the agent named as kiln's answer to initialize
+                    names it), kiln answering by the landing permission its person gave it, its mode
+                    (docs/agentic.md W6): `LAND_WRITTEN <kiln's answer>` where kiln wrote it at once;
+                    `LAND_APPROVAL <its manifest>` where kiln holds it for a person's approval, then its
+                    own approval of that manifest asked as well, which an agent that asks is never
+                    given: `LAND_SELF_REFUSED <why>` where kiln refused it, `LAND_SELF_WRITTEN <answer>`
+                    where kiln wrote, `LAND_SELF_FAIL <answer>` where it answered neither;
+                    `LAND_REFUSED <why>` where kiln refused the landing; or `LAND_FAIL <why>` where it
+                    reached no kiln or its answer was no landing's outcome
     HOLD            no line more once it said what it heard, until it's stopped: a turn only a stop
                     ends, so a line of it after a stop says the stop wasn't taken
     CONNECT=<host>:<port>
@@ -38,7 +57,8 @@ prompt asks with words:
 
 A message steered into a running turn is said as `STEERED <its words>`. A stopped turn ends where it
 was, as its harness ends one (Claude Code's interrupt, Codex's turn/interrupt, ACP's session/cancel,
-Pi's abort; Antigravity's process is ended by kiln).
+Pi's abort; Antigravity's process is ended by kiln). As Claude Code, it says the permission mode it
+was started in (`--permission-mode`, else `default`) and the one a `set_permission_mode` set.
 """
 import json
 import os
@@ -106,6 +126,31 @@ def write(name):
         return "WROTE " + name
     except OSError as e:
         return "WRITE_FAIL %s" % e
+
+
+def append(name):
+    """The line `APPENDED <name>` added to the end of `name`, a file already in its folder (a bare file name):
+    opened for reading and writing, so a file that isn't there is refused, never made."""
+    if name in (".", "..") or os.sep in name:
+        return "APPEND_FAIL %r is no bare file name" % name
+    try:
+        with open(name, "r+") as f:
+            f.seek(0, os.SEEK_END)
+            f.write("APPENDED %s\n" % name)
+        return "APPENDED " + name
+    except OSError as e:
+        return "APPEND_FAIL %s" % e
+
+
+def remove(name):
+    """`name`, a file in its folder (a bare file name), removed."""
+    if name in (".", "..") or os.sep in name:
+        return "REMOVE_FAIL %r is no bare file name" % name
+    try:
+        os.remove(name)
+        return "REMOVED " + name
+    except OSError as e:
+        return "REMOVE_FAIL %s" % e
 
 
 # --- a destination, as the network where it runs grants it ------------------------------------------
@@ -404,6 +449,95 @@ def spawn(servers, kind):
             c.close()
 
 
+def _tool_text(res):
+    return "".join(b.get("text", "") for b in res.get("content") or [] if isinstance(b, dict))
+
+
+def _words(text):
+    """`text` on one line, as long as a line it says may be."""
+    return " ".join(str(text).split())[:300] or "-"
+
+
+def _ask_land(c, arguments):
+    """`agents_land` asked with `arguments`: (kiln's answer as an object, or None where its words are no JSON object;
+    its words; why kiln refused it, or None). kiln's refusal comes as the tool's error (`isError`) or as a JSON-RPC
+    error (`Mcp.call`'s `<method> refused: <message>`); any other failure is no answer (`OSError`)."""
+    try:
+        res = c.call("tools/call", {"name": "agents_land", "arguments": arguments})
+    except OSError as e:
+        if " refused: " in str(e):
+            return None, _words(e), _words(e)
+        raise
+    text = _tool_text(res)
+    if res.get("isError"):
+        return None, _words(text), _words(text or "agents_land was refused")
+    try:
+        answer = json.loads(text) if text.strip().startswith("{") else None
+    except ValueError:
+        answer = None
+    return (answer if isinstance(answer, dict) else None), _words(text), None
+
+
+def raise_mode(servers):
+    """`RAISE_REFUSED <why>`, `RAISE_ASKED <answer>` or `RAISE_FAIL <why>`: its own permission mode raised to one that
+    asks nothing, asked of kiln as the agent itself, as a console's command to itself (`agents_broadcast`). Whatever
+    kiln answers, the landing permission its person gave it must stay what it was (Ada 2026-11-18: an agent can never
+    raise its own)."""
+    try:
+        c = _connect(servers)
+    except (OSError, ValueError) as e:
+        return "RAISE_FAIL %s" % _words(e)
+    try:
+        if not c.named:
+            return "RAISE_FAIL kiln's MCP server named no agent this harness is"
+        arguments = {"to": {"ids": [c.named]}, "command": {"type": "set_mode", "mode": "bypassPermissions"}}
+        try:
+            res = c.call("tools/call", {"name": "agents_broadcast", "arguments": arguments})
+        except OSError as e:
+            return ("RAISE_REFUSED %s" if " refused: " in str(e) else "RAISE_FAIL %s") % _words(e)
+        return ("RAISE_REFUSED %s" if res.get("isError") else "RAISE_ASKED %s") % _words(_tool_text(res))
+    finally:
+        c.close()
+
+
+def land(servers):
+    """Its lines, kiln answering by its mode (Slates' typed landing outcome, `outcome` naming it): `LAND_WRITTEN
+    <answer>`; or `LAND_APPROVAL <manifest>` then its own approval's `LAND_SELF_REFUSED <why>`, `LAND_SELF_WRITTEN
+    <answer>` or `LAND_SELF_FAIL <answer>`; or `LAND_REFUSED <why>`; or `LAND_FAIL <why>`. The agent it asks for is
+    itself, as kiln's answer to initialize names it: a harness asking to write its own work to disk."""
+    try:
+        c = _connect(servers)
+    except (OSError, ValueError) as e:
+        return ["LAND_FAIL %s" % _words(e)]
+    try:
+        if not c.named:
+            return ["LAND_FAIL kiln's MCP server named no agent this harness is"]
+        answer, said, refused = _ask_land(c, {"agent": c.named})
+        outcome = (answer or {}).get("outcome")
+        if refused is not None or outcome == "refused":
+            return ["LAND_REFUSED %s" % (refused or said)]
+        if outcome == "written":
+            return ["LAND_WRITTEN %s" % said]
+        manifest = ((answer or {}).get("approval") or {}).get("manifest") if outcome == "approval_required" else None
+        if not isinstance(manifest, str) or not manifest:
+            return ["LAND_FAIL kiln's answer is no landing's outcome naming what it holds: %s" % said]
+        lines = ["LAND_APPROVAL %s" % manifest]
+        # Its own approval of what it was told waits on a person: an agent that asks never gives it.
+        answer, said, refused = _ask_land(c, {"agent": c.named, "manifest": manifest})
+        outcome = (answer or {}).get("outcome")
+        if refused is not None or outcome == "refused":
+            lines.append("LAND_SELF_REFUSED %s" % (refused or said))
+        elif outcome == "written":
+            lines.append("LAND_SELF_WRITTEN %s" % said)
+        else:
+            lines.append("LAND_SELF_FAIL %s" % said)
+        return lines
+    except (OSError, ValueError) as e:
+        return ["LAND_FAIL %s" % _words(e)]
+    finally:
+        c.close()
+
+
 # --- a turn -----------------------------------------------------------------------------------------
 
 
@@ -441,12 +575,23 @@ class Turn:
         name = re.search(r"\bWRITE=([A-Za-z0-9._-]+)", self.prompt)
         if name:
             self.say(write(name.group(1)))
+        name = re.search(r"\bAPPEND=([A-Za-z0-9._-]+)", self.prompt)
+        if name:
+            self.say(append(name.group(1)))
+        name = re.search(r"\bREMOVE=([A-Za-z0-9._-]+)", self.prompt)
+        if name:
+            self.say(remove(name.group(1)))
         if "MCP_PING" in self.prompt:
             for line in mcp_ping(self.servers):
                 self.say(line)
         kind = re.search(r"\bSPAWN=([a-z]+)\b", self.prompt)
         if kind:
             self.say(spawn(self.servers, kind.group(1)))
+        if re.search(r"\bRAISE\b", self.prompt):
+            self.say(raise_mode(self.servers))
+        if re.search(r"\bLAND\b", self.prompt):
+            for line in land(self.servers):
+                self.say(line)
         for host, port in re.findall(r"\bCONNECT=([A-Za-z0-9.-]+):(\d+)\b", self.prompt):
             self.say(connect(host, int(port)))
         if re.search(r"\bHOLD\b", self.prompt):
@@ -500,6 +645,8 @@ def run_claude():
     servers = _claude_servers()
     work = queue.Queue()
     current = [None]
+    # The permission mode it runs in, as Claude Code says it: the one it was started in, until one is set.
+    mode = [flag("--permission-mode") or "default"]
 
     def read():
         for line in sys.stdin:
@@ -511,7 +658,9 @@ def run_claude():
                 req = m.get("request") or {}
                 resp = {}
                 if req.get("subtype") == "initialize":
-                    resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": "default", "claude_code_version": VERSION}
+                    resp = {"commands": [], "models": [], "agents": [], "current_permission_mode": mode[0], "claude_code_version": VERSION}
+                elif req.get("subtype") == "set_permission_mode" and isinstance(req.get("mode"), str):
+                    mode[0] = req["mode"]
                 elif req.get("subtype") == "interrupt" and current[0]:
                     current[0].stop()
                 emit({"type": "control_response", "response": {"subtype": "success", "request_id": m.get("request_id"), "response": resp}})
@@ -554,7 +703,7 @@ def run_claude():
         # `--replay-user-messages`: the prompt it took, said back under its last message's id.
         if replay and commands:
             emit({"type": "user", "message": {"role": "user", "content": prompt}, "session_id": session, "parent_tool_use_id": None, "uuid": commands[-1], "isReplay": True})
-        emit({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "stub", "permissionMode": "default", "claude_code_version": VERSION})
+        emit({"type": "system", "subtype": "init", "cwd": os.getcwd(), "session_id": session, "tools": [], "mcp_servers": [], "model": "stub", "permissionMode": mode[0], "claude_code_version": VERSION})
         said = [0]
 
         def say(text, turn=turn):

@@ -1,0 +1,323 @@
+//! External Data Representation (XDR, RFC 4506): the wire encoding ONC RPC and NFSv3 are built on.
+//! Everything is big-endian and padded so every field starts on a four-byte boundary; a variable
+//! opaque or string is a four-byte length then the bytes then the padding. This module is a
+//! bounds-checked sequential writer and reader over byte buffers — no allocation on a declared
+//! length before it is checked against a caller-supplied cap and the bytes that remain, so a hostile
+//! length is a typed refusal, never an allocation or a panic (§4.9's discipline, reused here).
+
+/// A refusal from the XDR reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XdrError {
+  /// The buffer ends before a field the caller asked for.
+  Truncated,
+  /// A declared length is larger than the caller's cap or the bytes that remain, or a string is not
+  /// valid UTF-8.
+  BadLength,
+}
+
+/// Format: XDR aligns every field to a four-byte boundary (RFC 4506).
+const XDR_ALIGN: usize = 4;
+
+/// The alignment padding for a field of `len` bytes.
+fn padding(len: usize) -> usize {
+  len.next_multiple_of(XDR_ALIGN).saturating_sub(len)
+}
+
+/// A sequential XDR writer building a big-endian, four-byte-aligned byte buffer.
+#[derive(Debug, Default)]
+pub struct XdrWriter {
+  out: Vec<u8>,
+}
+
+impl XdrWriter {
+  /// An empty writer.
+  pub fn new() -> XdrWriter {
+    XdrWriter::default()
+  }
+
+  /// Writes a 32-bit unsigned integer.
+  pub fn u32(&mut self, value: u32) {
+    self.out.extend_from_slice(&value.to_be_bytes());
+  }
+
+  /// Writes a 32-bit signed integer.
+  pub fn i32(&mut self, value: i32) {
+    self.out.extend_from_slice(&value.to_be_bytes());
+  }
+
+  /// Writes a 64-bit unsigned integer.
+  pub fn u64(&mut self, value: u64) {
+    self.out.extend_from_slice(&value.to_be_bytes());
+  }
+
+  /// Writes a 64-bit signed integer (XDR `hyper`, RFC 4506 §4.5).
+  pub fn i64(&mut self, value: i64) {
+    self.out.extend_from_slice(&value.to_be_bytes());
+  }
+
+  /// Writes a boolean as a 32-bit `1` or `0`.
+  pub fn bool(&mut self, value: bool) {
+    self.u32(u32::from(value));
+  }
+
+  /// Writes a variable-length opaque: a four-byte length, the bytes, then padding.
+  pub fn opaque(&mut self, bytes: &[u8]) {
+    self.u32(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+    self.fixed(bytes);
+  }
+
+  /// An empty writer with room for `bytes` before it grows (a reply whose budget the caller knows).
+  pub fn with_capacity(bytes: usize) -> XdrWriter {
+    XdrWriter {
+      out: Vec::with_capacity(bytes),
+    }
+  }
+
+  /// A writer appending to `out`, whose bytes are kept: a reply encoded after room its caller reserved in front of it
+  /// (the record marker and RPC header [`crate::rpc::finish_success_record`] fills in), so it is never copied to be
+  /// framed.
+  pub fn continuing(out: Vec<u8>) -> XdrWriter {
+    XdrWriter { out }
+  }
+
+  /// Forgets everything written, keeping the buffer for reuse.
+  pub fn clear(&mut self) {
+    self.out.clear();
+  }
+
+  /// Writes a variable-length opaque whose bytes `build` writes in place: the length is written first as a
+  /// placeholder and filled in afterwards, then the padding, so the value is never built in a buffer of its own
+  /// and copied.
+  pub fn opaque_built(&mut self, build: impl FnOnce(&mut XdrWriter)) {
+    let at = self.out.len();
+    self.u32(0);
+    build(self);
+    let len = self
+      .out
+      .len()
+      .saturating_sub(at.saturating_add(size_of::<u32>()));
+    self.out.extend(std::iter::repeat_n(0u8, padding(len)));
+    if let Some(slot) = self.out.get_mut(at..at.saturating_add(size_of::<u32>())) {
+      slot.copy_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes());
+    }
+  }
+
+  /// Writes a variable-length opaque whose bytes `append` adds to the end of the buffer itself (a read into the reply's
+  /// own buffer, so the payload is never in a buffer of its own): the length word is a placeholder filled in
+  /// afterwards, then the padding. When `append` fails the buffer is cut back to where the opaque began, so the caller
+  /// writes another reply in its place. The length appended.
+  pub fn opaque_appended<E>(
+    &mut self,
+    append: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+  ) -> Result<usize, E> {
+    let at = self.out.len();
+    self.u32(0);
+    if let Err(error) = append(&mut self.out) {
+      self.out.truncate(at);
+      return Err(error);
+    }
+    let len = self
+      .out
+      .len()
+      .saturating_sub(at.saturating_add(size_of::<u32>()));
+    self.out.extend(std::iter::repeat_n(0u8, padding(len)));
+    if let Some(slot) = self.out.get_mut(at..at.saturating_add(size_of::<u32>())) {
+      slot.copy_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes());
+    }
+    Ok(len)
+  }
+
+  /// Writes fixed-length bytes (the length is fixed by the type, not sent) followed by padding.
+  pub fn fixed(&mut self, bytes: &[u8]) {
+    self.out.extend_from_slice(bytes);
+    self
+      .out
+      .extend(std::iter::repeat_n(0u8, padding(bytes.len())));
+  }
+
+  /// Overwrites the 32-bit word at byte `at` with `value` (a header word filled in once what it counts is known);
+  /// nothing changes when no whole word was written there.
+  pub fn set_u32_at(&mut self, at: usize, value: u32) {
+    if let Some(slot) = self.out.get_mut(at..at.saturating_add(size_of::<u32>())) {
+      slot.copy_from_slice(&value.to_be_bytes());
+    }
+  }
+
+  /// The bytes written so far.
+  pub fn as_slice(&self) -> &[u8] {
+    &self.out
+  }
+
+  /// Drops everything written past the first `len` bytes (a result that would not fit its reply).
+  pub fn truncate(&mut self, len: usize) {
+    self.out.truncate(len);
+  }
+
+  /// The number of bytes written so far.
+  pub fn len(&self) -> usize {
+    self.out.len()
+  }
+
+  /// Whether nothing has been written.
+  pub fn is_empty(&self) -> bool {
+    self.out.is_empty()
+  }
+
+  /// The finished buffer.
+  pub fn into_bytes(self) -> Vec<u8> {
+    self.out
+  }
+}
+
+/// A sequential XDR reader over a byte buffer, bounds-checked.
+#[derive(Debug)]
+pub struct XdrReader<'a> {
+  bytes: &'a [u8],
+  pos: usize,
+}
+
+impl<'a> XdrReader<'a> {
+  /// A reader over `bytes`.
+  pub fn new(bytes: &'a [u8]) -> XdrReader<'a> {
+    XdrReader { bytes, pos: 0 }
+  }
+
+  /// The bytes not yet read.
+  pub fn remaining(&self) -> usize {
+    self.bytes.len().saturating_sub(self.pos)
+  }
+
+  /// The reader's position.
+  pub fn position(&self) -> usize {
+    self.pos
+  }
+
+  /// The bytes not yet read, so a caller can peek a leading field through a fresh reader without
+  /// consuming this one (the multi-volume router reads the leading file handle to route, then hands
+  /// the untouched reader to the chosen volume's export).
+  pub fn rest(&self) -> &'a [u8] {
+    self.bytes.get(self.pos..).unwrap_or(&[])
+  }
+
+  /// Takes `count` bytes, or refuses when the buffer is too short.
+  fn take(&mut self, count: usize) -> Result<&'a [u8], XdrError> {
+    let end = self.pos.checked_add(count).ok_or(XdrError::BadLength)?;
+    let slice = self.bytes.get(self.pos..end).ok_or(XdrError::Truncated)?;
+    self.pos = end;
+    Ok(slice)
+  }
+
+  /// Reads a 32-bit unsigned integer.
+  pub fn u32(&mut self) -> Result<u32, XdrError> {
+    let word = self.take(size_of::<u32>())?;
+    Ok(u32::from_be_bytes(
+      word.try_into().map_err(|_| XdrError::Truncated)?,
+    ))
+  }
+
+  /// Reads a 32-bit signed integer.
+  pub fn i32(&mut self) -> Result<i32, XdrError> {
+    let word = self.take(size_of::<i32>())?;
+    Ok(i32::from_be_bytes(
+      word.try_into().map_err(|_| XdrError::Truncated)?,
+    ))
+  }
+
+  /// Reads a 64-bit unsigned integer.
+  pub fn u64(&mut self) -> Result<u64, XdrError> {
+    let word = self.take(size_of::<u64>())?;
+    Ok(u64::from_be_bytes(
+      word.try_into().map_err(|_| XdrError::Truncated)?,
+    ))
+  }
+
+  /// Reads a 64-bit signed integer (XDR `hyper`, RFC 4506 §4.5).
+  pub fn i64(&mut self) -> Result<i64, XdrError> {
+    let word = self.take(size_of::<i64>())?;
+    Ok(i64::from_be_bytes(
+      word.try_into().map_err(|_| XdrError::Truncated)?,
+    ))
+  }
+
+  /// Reads a boolean (any nonzero 32-bit value is true).
+  pub fn bool(&mut self) -> Result<bool, XdrError> {
+    Ok(self.u32()? != 0)
+  }
+
+  /// Reads fixed-length bytes and skips the padding.
+  pub fn fixed(&mut self, count: usize) -> Result<&'a [u8], XdrError> {
+    let slice = self.take(count)?;
+    let pad = padding(count);
+    self.pos = self.pos.saturating_add(pad).min(self.bytes.len());
+    Ok(slice)
+  }
+
+  /// Reads a variable-length opaque, refusing a length past `max` or the bytes that remain before
+  /// allocating for it.
+  pub fn opaque(&mut self, max: usize) -> Result<&'a [u8], XdrError> {
+    let len = usize::try_from(self.u32()?).map_err(|_| XdrError::BadLength)?;
+    if len > max || len > self.remaining() {
+      return Err(XdrError::BadLength);
+    }
+    self.fixed(len)
+  }
+
+  /// Reads a variable-length string (a variable opaque validated as UTF-8), capped at `max`.
+  pub fn string(&mut self, max: usize) -> Result<&'a str, XdrError> {
+    let bytes = self.opaque(max)?;
+    std::str::from_utf8(bytes).map_err(|_| XdrError::BadLength)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  use super::*;
+
+  /// An XDR variable-opaque body: a 4-byte big-endian length (the *claimed* count, which may lie) then `bytes`.
+  fn framed(claimed: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut v = claimed.to_be_bytes().to_vec();
+    v.extend_from_slice(bytes);
+    v
+  }
+
+  /// The foundational-parser guard (CWE-789/CWE-125: never allocate or read from an untrusted length). A declared
+  /// opaque length past the caller's cap or the bytes that remain is refused `BadLength` before any bytes are
+  /// taken — the reader returns a borrowed slice, so nothing is ever allocated sized by the length — and a
+  /// truncated length word is `Truncated`.
+  #[test]
+  fn a_hostile_opaque_length_is_refused_before_reading() {
+    assert!(matches!(
+      XdrReader::new(&framed(u32::MAX, &[])).opaque(1 << 20),
+      Err(XdrError::BadLength)
+    ));
+    assert!(matches!(
+      XdrReader::new(&framed(100, &[7u8; 100])).opaque(16),
+      Err(XdrError::BadLength)
+    ));
+    assert!(matches!(
+      XdrReader::new(&framed(100, &[7u8; 4])).opaque(1 << 20),
+      Err(XdrError::BadLength)
+    ));
+    assert!(matches!(
+      XdrReader::new(&[0u8; 2]).opaque(16),
+      Err(XdrError::Truncated)
+    ));
+  }
+
+  /// A well-formed opaque reads its bytes (3 bytes + one XDR pad), and a string that is not UTF-8 is `BadLength`,
+  /// never a panic.
+  #[test]
+  fn a_well_formed_opaque_reads_and_bad_utf8_is_refused() {
+    assert_eq!(
+      XdrReader::new(&framed(3, &[1, 2, 3, 0]))
+        .opaque(16)
+        .unwrap(),
+      &[1u8, 2, 3]
+    );
+    assert!(matches!(
+      XdrReader::new(&framed(2, &[0xFF, 0xFE, 0, 0])).string(16),
+      Err(XdrError::BadLength)
+    ));
+  }
+}

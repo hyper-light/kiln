@@ -1,0 +1,539 @@
+//! ONC RPC (RFC 1057/5531): the remote-procedure-call layer NFSv3, MOUNT and portmap ride on. Over
+//! TCP a message is framed by *record marking* — a four-byte header per fragment whose top bit is
+//! the last-fragment flag and whose low 31 bits are the fragment length — so a reader can tell a
+//! complete message from a partial one on the stream. A call names a program, version and procedure
+//! and carries two credentials; the loopback server accepts and sends `AUTH_NONE` (it trusts the
+//! peer of a socket only it created and the kernel connects, checked out of band). A reply is
+//! accepted or denied, and an accepted reply carries a status then the procedure's results.
+//!
+//! This module is the pure codec: it parses a call header and builds a reply message, and frames and
+//! deframes records, all bounds-checked over [`crate::xdr`] with no socket. A hostile length is a
+//! typed refusal, and a partial stream is distinguished from a malformed one so the reader can wait
+//! for more bytes rather than fail.
+
+use crate::xdr::{XdrError, XdrReader, XdrWriter};
+
+/// Format: the ONC RPC message type for a call.
+const MSG_CALL: u32 = 0;
+/// Format: the ONC RPC message type for a reply.
+const MSG_REPLY: u32 = 1;
+/// Format: the ONC RPC version this codec speaks (RFC 5531).
+const RPC_VERSION: u32 = 2;
+/// Format: the reply status for an accepted message (`MSG_ACCEPTED`).
+const REPLY_ACCEPTED: u32 = 0;
+/// Format: the `AUTH_NONE` authentication flavor (RFC 5531).
+const AUTH_NONE: u32 = 0;
+/// Format: the largest credential or verifier body ONC RPC allows (RFC 5531, 400 bytes).
+const MAX_AUTH_BODY: usize = 400;
+/// Derived: the largest ONC RPC message the server accepts or sends, bounding a record-marking
+/// fragment so a hostile length is refused before any accumulation: the transfer ceiling every
+/// FSINFO and v4 session advertises ([`crate::procedures::MAX_TRANSFER`]) plus the most a request of
+/// that ceiling adds to it, RPC headers included ([`crate::v4::compound::COMPOUND_HEADER_BYTES`], which
+/// a v3 WRITE call's header never exceeds — [`V3_WRITE_CALL_OVERHEAD`], checked when this is built).
+/// Every reply is no larger: a READ's or READDIR's results are capped at the transfer ceiling, and a
+/// v4 reply at the session's response size, the same sum (A-113). It is also the largest record a
+/// held connection must queue whole, so it sizes that connection's socket buffers
+/// (`slates_server::nfs`). Until 2026-10-06 it was a placeholder 2 MiB.
+pub const MAX_MESSAGE: usize = derived_max_message();
+
+/// Derived: what a v3 WRITE call adds to its data ([`derived_v3_write_call_overhead`]).
+const V3_WRITE_CALL_OVERHEAD: usize = derived_v3_write_call_overhead();
+
+/// The sum stated on [`V3_WRITE_CALL_OVERHEAD`]: the RPC call header at its largest (six words, then a credential and
+/// a verifier, each a flavor, a length and at most [`MAX_AUTH_BODY`] bytes) and WRITE3args' fixed fields (a handle's
+/// length and its largest bytes, the offset, the count, the stability and the data's length; RFC 1813 §3.3.7).
+// Evaluated only in a `const` item: an overflow fails the build, it cannot wrap at run time.
+#[allow(clippy::arithmetic_side_effects)]
+const fn derived_v3_write_call_overhead() -> usize {
+  /// Format: an XDR word.
+  const WORD: usize = 4;
+  /// Format: the RPC call header's fixed words: xid, message type, RPC version, program, version, procedure.
+  const CALL_WORDS: usize = 6;
+  /// Format: the largest NFSv3 file handle (`NFS3_FHSIZE`, RFC 1813 §2.4).
+  const FHSIZE3: usize = 64;
+  /// Format: an `offset3` (a `uint64`).
+  const OFFSET: usize = 8;
+  let rpc = CALL_WORDS * WORD + 2 * (2 * WORD + MAX_AUTH_BODY);
+  let args = (WORD + FHSIZE3) + OFFSET + WORD + WORD + WORD;
+  rpc + args
+}
+
+/// The sum stated on [`MAX_MESSAGE`].
+// Evaluated only in a `const` item: an overflow or a failed check fails the build, it cannot happen at run time.
+#[allow(clippy::arithmetic_side_effects)]
+const fn derived_max_message() -> usize {
+  let header = crate::v4::compound::COMPOUND_HEADER_BYTES as usize;
+  assert!(
+    V3_WRITE_CALL_OVERHEAD <= header,
+    "a v3 WRITE call's header fits the compound header bound"
+  );
+  crate::procedures::MAX_TRANSFER as usize + header
+}
+/// Format: the record-marking last-fragment flag — the top bit of the four-byte marker (RFC 5531).
+const LAST_FRAGMENT: u32 = 0x8000_0000;
+/// Format: the record-marking fragment-length mask — the low 31 bits of the marker.
+const FRAGMENT_LEN_MASK: u32 = 0x7fff_ffff;
+/// Format: `accept_stat` SUCCESS (RFC 5531 §9).
+const ACCEPT_SUCCESS: u32 = 0;
+/// Format: `accept_stat` PROG_UNAVAIL.
+const ACCEPT_PROG_UNAVAIL: u32 = 1;
+/// Format: `accept_stat` PROG_MISMATCH.
+const ACCEPT_PROG_MISMATCH: u32 = 2;
+/// Format: `accept_stat` PROC_UNAVAIL.
+const ACCEPT_PROC_UNAVAIL: u32 = 3;
+/// Format: `accept_stat` GARBAGE_ARGS.
+const ACCEPT_GARBAGE_ARGS: u32 = 4;
+/// Format: `accept_stat` SYSTEM_ERR.
+const ACCEPT_SYSTEM_ERR: u32 = 5;
+
+/// A refusal from the RPC codec, or a signal that the stream does not yet hold a whole record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpcError {
+  /// The stream does not yet contain a complete record; read more bytes and retry.
+  Incomplete,
+  /// A record's declared length exceeds the message cap (a hostile or corrupt marker).
+  RecordTooLarge,
+  /// The message is not a call, or its RPC version is not 2.
+  NotACall,
+  /// A field is malformed (a bad length or a short body).
+  Malformed,
+}
+
+impl From<XdrError> for RpcError {
+  fn from(_: XdrError) -> RpcError {
+    RpcError::Malformed
+  }
+}
+
+/// A parsed RPC call header: the transaction id and the program, version and procedure it targets.
+/// The credentials are validated for shape and skipped (the loopback server uses `AUTH_NONE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpcCall {
+  /// The transaction id, echoed in the reply.
+  pub xid: u32,
+  /// The RPC program number (NFS, MOUNT or portmap).
+  pub program: u32,
+  /// The program version.
+  pub version: u32,
+  /// The procedure number.
+  pub procedure: u32,
+}
+
+/// The status of an accepted reply (RFC 5531 `accept_stat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptStatus {
+  /// The procedure ran; its results follow.
+  Success,
+  /// The program is not served here.
+  ProgUnavail,
+  /// The program version is out of range; the supported `[low, high]` follows.
+  ProgMismatch {
+    /// The lowest supported version.
+    low: u32,
+    /// The highest supported version.
+    high: u32,
+  },
+  /// The procedure number is not served.
+  ProcUnavail,
+  /// The arguments would not decode.
+  GarbageArgs,
+  /// The server hit an internal error.
+  SystemErr,
+}
+
+impl AcceptStatus {
+  /// The RFC 5531 wire value.
+  fn wire(self) -> u32 {
+    match self {
+      AcceptStatus::Success => ACCEPT_SUCCESS,
+      AcceptStatus::ProgUnavail => ACCEPT_PROG_UNAVAIL,
+      AcceptStatus::ProgMismatch { .. } => ACCEPT_PROG_MISMATCH,
+      AcceptStatus::ProcUnavail => ACCEPT_PROC_UNAVAIL,
+      AcceptStatus::GarbageArgs => ACCEPT_GARBAGE_ARGS,
+      AcceptStatus::SystemErr => ACCEPT_SYSTEM_ERR,
+    }
+  }
+}
+
+/// Skips one `opaque_auth` (flavor then a bounded opaque body), validating its shape.
+fn skip_auth(reader: &mut XdrReader<'_>) -> Result<(), RpcError> {
+  let _flavor = reader.u32()?;
+  let _body = reader.opaque(MAX_AUTH_BODY)?;
+  Ok(())
+}
+
+/// Deframes one record-marked message from the front of `bytes`, returning the assembled message and
+/// the number of stream bytes it consumed. `Incomplete` means the stream does not yet hold the whole
+/// record (wait for more bytes); a fragment claiming more than the message cap is refused.
+pub fn read_record(bytes: &[u8]) -> Result<(Vec<u8>, usize), RpcError> {
+  let (message, consumed) = RecordReader::default().read(bytes)?;
+  message
+    .map(|message| (message, consumed))
+    .ok_or(RpcError::Incomplete)
+}
+
+/// Derived: one fragment per allowed payload byte plus a possibly empty terminal fragment. This
+/// admits maximal byte fragmentation while bounding empty fragments independently of payload (AUD-03).
+const MAX_FRAGMENTS: usize = MAX_MESSAGE + 1;
+
+/// Incremental record marking (§4.6): each framing byte is examined once, including across TCP reads.
+/// Payload and fragment count have independent bounds; consumed bytes may be discarded immediately.
+#[derive(Default)]
+pub struct RecordReader {
+  marker: [u8; size_of::<u32>()],
+  marker_bytes: usize,
+  remaining: usize,
+  last: bool,
+  fragments: usize,
+  message: Vec<u8>,
+}
+
+impl RecordReader {
+  /// Consumes up to one complete message and returns the consumed prefix length. `None` asks for
+  /// more bytes without retaining the consumed stream prefix. Bytes after a completed record belong
+  /// to the next call. Refusal terminates the stream; no further input may be fed to that reader.
+  pub fn read(&mut self, bytes: &[u8]) -> Result<(Option<Vec<u8>>, usize), RpcError> {
+    let mut consumed = 0;
+    while let Some(unread) = bytes.get(consumed..).filter(|unread| !unread.is_empty()) {
+      if let Some(marker_rest) = self
+        .marker
+        .get_mut(self.marker_bytes..)
+        .filter(|rest| !rest.is_empty())
+      {
+        let count = marker_rest.len().min(unread.len());
+        if let (Some(into), Some(from)) = (marker_rest.get_mut(..count), unread.get(..count)) {
+          into.copy_from_slice(from);
+        }
+        self.marker_bytes = self.marker_bytes.saturating_add(count);
+        consumed = consumed.saturating_add(count);
+        if self.marker_bytes < self.marker.len() {
+          break;
+        }
+        let marker = u32::from_be_bytes(self.marker);
+        self.remaining =
+          usize::try_from(marker & FRAGMENT_LEN_MASK).map_err(|_| RpcError::RecordTooLarge)?;
+        self.last = marker & LAST_FRAGMENT != 0;
+        if self.fragments == MAX_FRAGMENTS
+          || self.remaining > MAX_MESSAGE.saturating_sub(self.message.len())
+        {
+          return Err(RpcError::RecordTooLarge);
+        }
+        self.fragments = self.fragments.saturating_add(1);
+      }
+      let unread = bytes.get(consumed..).unwrap_or_default();
+      let count = self.remaining.min(unread.len());
+      self
+        .message
+        .extend_from_slice(unread.get(..count).unwrap_or_default());
+      consumed = consumed.saturating_add(count);
+      self.remaining = self.remaining.saturating_sub(count);
+      if self.remaining == 0 {
+        self.marker_bytes = 0;
+        if self.last {
+          self.fragments = 0;
+          return Ok((Some(std::mem::take(&mut self.message)), consumed));
+        }
+      }
+    }
+    Ok((None, consumed))
+  }
+
+  /// The bytes the reader needs before its current fragment is complete: the rest of a fragment's marker, else the
+  /// rest of its body. A record of several fragments may need more after this, once its next marker is read; a reader
+  /// that waits for this many is woken no earlier than it can make progress (A-113's receive low-water mark).
+  pub fn wanted(&self) -> usize {
+    let marker_rest = self.marker.len().saturating_sub(self.marker_bytes);
+    if marker_rest > 0 {
+      marker_rest
+    } else {
+      self.remaining.max(1)
+    }
+  }
+}
+
+/// Frames `body` as one last-fragment record (prepends the four-byte record marker).
+pub fn write_record(body: &[u8]) -> Vec<u8> {
+  let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+  let marker = len | LAST_FRAGMENT;
+  let mut out = Vec::with_capacity(body.len().saturating_add(size_of::<u32>()));
+  out.extend_from_slice(&marker.to_be_bytes());
+  out.extend_from_slice(body);
+  out
+}
+
+/// Format: an accepted reply's header with an empty `AUTH_NONE` verifier — xid, message type, reply status, verifier
+/// flavor, verifier length and accept status, one XDR word each (RFC 5531 §9).
+const REPLY_HEADER_BYTES: usize = 6 * size_of::<u32>();
+
+/// Format: a `PROG_MISMATCH` reply's extra words, the lowest and highest versions supported (RFC 5531 §9).
+const MISMATCH_BYTES: usize = 2 * size_of::<u32>();
+
+/// [`reply_bytes`] framed as one last-fragment record ([`write_record`]), built in one buffer: the marker reserved, the
+/// header and the results written once, the marker filled in last. Built through `reply_bytes` and then `write_record`,
+/// a READ's 256 KiB of results was copied twice more (8.8% of the daemon's samples on a Linux NFSv4.2 read,
+/// 2026-10-09). Byte for byte `write_record(&reply_bytes(..))`, which a wire test holds it to.
+pub fn reply_record(xid: u32, status: AcceptStatus, results: &[u8]) -> Vec<u8> {
+  let carried = if matches!(status, AcceptStatus::Success) {
+    results
+  } else {
+    &[]
+  };
+  let extra = if matches!(status, AcceptStatus::ProgMismatch { .. }) {
+    MISMATCH_BYTES
+  } else {
+    0
+  };
+  let capacity = size_of::<u32>()
+    .saturating_add(REPLY_HEADER_BYTES)
+    .saturating_add(extra)
+    .saturating_add(carried.len());
+  let mut writer = XdrWriter::with_capacity(capacity);
+  writer.u32(0); // the record marker, filled in below
+  writer.u32(xid);
+  writer.u32(MSG_REPLY);
+  writer.u32(REPLY_ACCEPTED);
+  writer.u32(AUTH_NONE); // verifier flavor
+  writer.opaque(&[]); // empty verifier body
+  writer.u32(status.wire());
+  if let AcceptStatus::ProgMismatch { low, high } = status {
+    writer.u32(low);
+    writer.u32(high);
+  }
+  let mut out = writer.into_bytes();
+  out.extend_from_slice(carried);
+  let message = out.len().saturating_sub(size_of::<u32>());
+  let marker = u32::try_from(message).unwrap_or(u32::MAX) | LAST_FRAGMENT;
+  if let Some(slot) = out.get_mut(..size_of::<u32>()) {
+    slot.copy_from_slice(&marker.to_be_bytes());
+  }
+  out
+}
+
+/// Format: the bytes in front of a successful reply's results once framed: the record marker and the accepted reply's
+/// header ([`REPLY_HEADER_BYTES`]).
+pub const SUCCESS_RECORD_HEAD: usize = size_of::<u32>() + REPLY_HEADER_BYTES;
+
+/// A buffer holding [`SUCCESS_RECORD_HEAD`] reserved bytes, for a successful reply's results to be encoded after
+/// ([`crate::xdr::XdrWriter::continuing`]) and framed in place by [`finish_success_record`].
+pub fn success_record_head() -> Vec<u8> {
+  vec![0u8; SUCCESS_RECORD_HEAD]
+}
+
+/// Frames `record` in place: its first [`SUCCESS_RECORD_HEAD`] bytes, reserved by [`success_record_head`], become the
+/// record marker and a successful reply's header for `xid`, and the results already after them are not moved. Byte
+/// for byte `reply_record(xid, AcceptStatus::Success, results)`, which a wire test holds it to. Encoding an NFSv4
+/// reply into a separate buffer and framing it copied a READ's whole transfer once more (5.6% of the daemon's samples
+/// on a Linux NFSv4.2 read, 2026-10-09).
+pub fn finish_success_record(xid: u32, mut record: Vec<u8>) -> Vec<u8> {
+  let message = record.len().saturating_sub(size_of::<u32>());
+  let marker = u32::try_from(message).unwrap_or(u32::MAX) | LAST_FRAGMENT;
+  let mut head = XdrWriter::with_capacity(SUCCESS_RECORD_HEAD);
+  head.u32(marker);
+  head.u32(xid);
+  head.u32(MSG_REPLY);
+  head.u32(REPLY_ACCEPTED);
+  head.u32(AUTH_NONE); // verifier flavor
+  head.opaque(&[]); // empty verifier body
+  head.u32(AcceptStatus::Success.wire());
+  if let Some(slot) = record.get_mut(..SUCCESS_RECORD_HEAD) {
+    slot.copy_from_slice(head.as_slice());
+  }
+  record
+}
+
+/// Parses an RPC call from a message body, returning the header and a reader positioned at the
+/// procedure arguments. Refuses a message that is not a version-2 call.
+pub fn parse_call(body: &[u8]) -> Result<(RpcCall, XdrReader<'_>), RpcError> {
+  let mut reader = XdrReader::new(body);
+  let xid = reader.u32()?;
+  if reader.u32()? != MSG_CALL || reader.u32()? != RPC_VERSION {
+    return Err(RpcError::NotACall);
+  }
+  let program = reader.u32()?;
+  let version = reader.u32()?;
+  let procedure = reader.u32()?;
+  skip_auth(&mut reader)?; // credential
+  skip_auth(&mut reader)?; // verifier
+  Ok((
+    RpcCall {
+      xid,
+      program,
+      version,
+      procedure,
+    },
+    reader,
+  ))
+}
+
+use crate::access::{UnixGroups, UnixIdentity};
+
+/// Format: the `AUTH_SYS` authentication flavor (RFC 5531): a credential carrying the caller's uid/gid.
+const AUTH_SYS: u32 = 1;
+
+/// Format: the most supplementary groups an `AUTH_SYS` credential carries — `authsys_parms.gids` is
+/// declared `unsigned int gids<16>` (RFC 5531 Appendix A). A credential claiming more is malformed and
+/// refused before any group is read (a hostile length never sizes an allocation).
+pub const AUTH_SYS_MAX_GIDS: usize = 16;
+
+/// The Unix identity an `AUTH_SYS` credential on a call names — the uid the client mounted as and its
+/// primary and supplementary groups — or `None` for `AUTH_NONE` or a credential this cannot read. On a
+/// loopback mount the kernel fills all of it from the mounting process (§4.13), so a served request
+/// runs as that user, its permission checks see the user's groups, and a created object takes the
+/// user's own group, exactly as a native NFS server does, rather than owning everything root:wheel.
+/// Re-reads the call header (cheap) to reach the credential `parse_call` skips.
+pub fn auth_sys_identity(body: &[u8]) -> Option<UnixIdentity> {
+  let mut reader = XdrReader::new(body);
+  // The call header before the credential: xid, mtype, rpcvers, program, version, procedure.
+  let _xid = reader.u32().ok()?;
+  let _mtype = reader.u32().ok()?;
+  let _rpcvers = reader.u32().ok()?;
+  let _program = reader.u32().ok()?;
+  let _version = reader.u32().ok()?;
+  let _procedure = reader.u32().ok()?;
+  let flavor = reader.u32().ok()?;
+  let credential = reader.opaque(MAX_AUTH_BODY).ok()?;
+  if flavor != AUTH_SYS {
+    return None;
+  }
+  parse_authsys_parms(credential)
+}
+
+/// Decodes an `authsys_parms` (RFC 5531 Appendix A: stamp, machinename, uid, gid, `gids<16>`) into the
+/// identity it names; `None` for a truncated body or one claiming more groups than the bound.
+fn parse_authsys_parms(body: &[u8]) -> Option<UnixIdentity> {
+  let mut credential = XdrReader::new(body);
+  let _stamp = credential.u32().ok()?;
+  let _machinename = credential.opaque(MAX_AUTH_BODY).ok()?;
+  let uid = credential.u32().ok()?;
+  let gid = credential.u32().ok()?;
+  let count = usize::try_from(credential.u32().ok()?).ok()?;
+  if count > AUTH_SYS_MAX_GIDS {
+    return None;
+  }
+  let mut supplementary = Vec::with_capacity(count);
+  for _ in 0..count {
+    supplementary.push(credential.u32().ok()?);
+  }
+  Some(UnixIdentity {
+    uid,
+    groups: UnixGroups { gid, supplementary },
+  })
+}
+
+/// The Unix `(uid, gid)` an `AUTH_SYS` credential names — the uid and primary group of
+/// [`auth_sys_identity`] — or `None` for `AUTH_NONE` or a credential this cannot read.
+pub fn auth_sys_creds(body: &[u8]) -> Option<(u32, u32)> {
+  auth_sys_identity(body).map(|identity| (identity.uid, identity.groups.gid))
+}
+
+/// The Unix user id an `AUTH_SYS` credential names (the mounting user), or `None`. A thin projection of
+/// [`auth_sys_creds`]; the request runs as this user (§4.13).
+pub fn auth_sys_uid(body: &[u8]) -> Option<u32> {
+  auth_sys_creds(body).map(|(uid, _)| uid)
+}
+
+/// The Unix group id an `AUTH_SYS` credential names (the mounting user's primary group), or `None`. A
+/// thin projection of [`auth_sys_creds`]; an object the request creates takes this group.
+pub fn auth_sys_gid(body: &[u8]) -> Option<u32> {
+  auth_sys_creds(body).map(|(_, gid)| gid)
+}
+
+/// Builds an accepted RPC reply message body (not record-marked): the xid, the accepted status, an
+/// `AUTH_NONE` verifier, the accept status, and — for success — the already-XDR-encoded `results`.
+pub fn reply_bytes(xid: u32, status: AcceptStatus, results: &[u8]) -> Vec<u8> {
+  let mut writer = XdrWriter::new();
+  writer.u32(xid);
+  writer.u32(MSG_REPLY);
+  writer.u32(REPLY_ACCEPTED);
+  writer.u32(AUTH_NONE); // verifier flavor
+  writer.opaque(&[]); // empty verifier body
+  writer.u32(status.wire());
+  if let AcceptStatus::ProgMismatch { low, high } = status {
+    writer.u32(low);
+    writer.u32(high);
+  }
+  let mut out = writer.into_bytes();
+  if matches!(status, AcceptStatus::Success) {
+    out.extend_from_slice(results);
+  }
+  out
+}
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  use proptest::prelude::*;
+
+  use super::*;
+  use crate::xdr::XdrWriter;
+
+  /// Builds an `authsys_parms` body (RFC 5531): stamp, machinename, uid, gid, the *claimed* gid count, then the
+  /// gids actually present (which may be fewer than the claim — a hostile credential).
+  fn authsys_parms(uid: u32, gid: u32, claimed: u32, gids: &[u32]) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    w.u32(0); // stamp
+    w.opaque(b"host"); // machinename
+    w.u32(uid);
+    w.u32(gid);
+    w.u32(claimed); // the count the credential claims — a hostile one lies
+    for gid in gids {
+      w.u32(*gid);
+    }
+    w.into_bytes()
+  }
+
+  /// §4.13 hostile input (RFC 5531: `AUTH_SYS` supplementary groups are bounded at sixteen). A credential
+  /// claiming a colossal group count is refused before any allocation — never a four-billion-entry `Vec`, an OOM
+  /// or a panic — and the bound is exact (17 is refused, 16 accepted); a well-formed credential decodes.
+  #[test]
+  fn a_colossal_auth_sys_gid_count_is_refused_before_allocating() {
+    // Claims u32::MAX groups but carries none: the count check refuses it before `Vec::with_capacity`.
+    assert!(
+      parse_authsys_parms(&authsys_parms(1000, 100, u32::MAX, &[])).is_none(),
+      "a colossal claimed gid count is refused, not allocated"
+    );
+    // The bound is exact.
+    assert!(
+      parse_authsys_parms(&authsys_parms(1000, 100, 17, &[7; 17])).is_none(),
+      "17 groups (past the 16 bound) is refused"
+    );
+    let at_bound = parse_authsys_parms(&authsys_parms(1000, 100, 16, &[7; 16]))
+      .expect("16 groups (at the bound) decodes");
+    assert_eq!(at_bound.groups.supplementary.len(), 16);
+    // A well-formed small credential decodes to its identity.
+    let id = parse_authsys_parms(&authsys_parms(1000, 100, 3, &[10, 20, 30]))
+      .expect("a valid credential decodes");
+    assert_eq!(
+      (id.uid, id.groups.gid, id.groups.supplementary.len()),
+      (1000, 100, 3)
+    );
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+    /// Hostile-input fuzz of the AUTH_SYS credential parser (every NFS request carries one, §4.13): any byte
+    /// string parses to `None` or a bounded identity, never a panic (proptest fails on one) and never more than
+    /// the sixteen supplementary groups RFC 5531 allows — so a hostile credential can neither OOM (the count is
+    /// checked before the `Vec`) nor crash. The second arm frames a well-formed header with a random claimed
+    /// count and random gids, reaching the count bound and the per-gid decode with arbitrary values.
+    #[test]
+    fn any_auth_sys_credential_parses_to_a_bounded_identity_or_none(
+      body in proptest::collection::vec(any::<u8>(), 0..256),
+      uid in any::<u32>(),
+      gid in any::<u32>(),
+      claimed in 0u32..64,
+      gids in proptest::collection::vec(any::<u32>(), 0..40),
+    ) {
+      if let Some(id) = parse_authsys_parms(&body) {
+        prop_assert!(id.groups.supplementary.len() <= AUTH_SYS_MAX_GIDS);
+      }
+      if let Some(id) = parse_authsys_parms(&authsys_parms(uid, gid, claimed, &gids)) {
+        prop_assert!(
+          id.groups.supplementary.len() <= AUTH_SYS_MAX_GIDS,
+          "the sixteen-group bound holds for any framed credential"
+        );
+      }
+    }
+  }
+}

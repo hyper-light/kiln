@@ -1286,17 +1286,19 @@ agent's folder on that agent's machine works in that agent's volume:
   a plan is refused. Slates takes a person's go-ahead from kiln on macOS and Windows; not on Linux
   yet (Slates can't take a grant from outside its anchor's own session there), and the plan says so.
   kiln leaves out what git ignores in the workspace (the agent's build output and dependencies) and
-  `.git`, and writes only what git sees changed; on a machine whose Slates leaves out one path per
-  landing (an older one), the plan says to put the work up for review instead.
+  `.git`, and writes only what git sees changed: when more would be written (a build still running
+  made it since), the plan says to put the work up for review instead.
 - **How long it lasts.** As long as the agent: ended for good, its volume goes with it. It outlives
   the runner's restarts and upgrades (Slates' anchor runs apart from the runner: its own systemd
   user unit on Linux), but not the machine's (Slates keeps volumes in memory). An agent in one
   doesn't move to another machine yet.
-- **Where it can.** A machine with Slates installed (`slates` on `PATH`, or kiln's own under the
-  runner's state directory) and a mount it can make: FUSE through `fusermount3` on Linux, NFS on
-  loopback on macOS, WinFsp on Windows (each workspace at a drive letter of its own, the highest
-  free: Slates mounts a WinFsp volume at a drive letter alone). `GET /api/harness/workspaces` says
-  which machines can, and why each other can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
+- **Where it can.** Any machine with a mount it can make: FUSE through `fusermount3` on Linux, NFS
+  on loopback on macOS, WinFsp on Windows (each workspace at a drive letter of its own, the highest
+  free: Slates mounts a WinFsp volume at a drive letter alone). Nothing needs installing but WinFsp:
+  Slates is built into kiln (vendored, and driven through its library, never a `slates` command),
+  and kiln's own executable runs its anchor and daemon (`kiln slates-role`). `GET
+  /api/harness/workspaces` says which machines can, and why each other can't. kiln keeps one Slates
+  instance, `kiln`, per machine (two shards).
 
 ## From an Agentfile, in a microVM of its own
 

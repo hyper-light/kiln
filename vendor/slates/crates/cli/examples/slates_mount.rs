@@ -1,0 +1,197 @@
+//! Watch `slates mount` for real: a live kernel NFS mount of a RAM-only slates volume, with a file
+//! written through it and read back — no privilege, no kernel extension, no Apple entitlement (§4.6,
+//! R10). It starts an in-process daemon (the same `Daemon` the `slates` binary supervises), provisions
+//! a volume through the real client, and then does exactly what `slates mount ID DIR` does: runs
+//! `mount_nfs` against the daemon's loopback NFS port with the options `crates/api/src/mount.rs`
+//! builds. Where `crates/bridge-nfs/examples/nfs_loopback.rs` prints a port for a human to mount by
+//! hand, this drives the whole lifecycle to a real kernel mount and back, automatically.
+//!
+//! It drives the `mount_nfs` program form of the mount (the BSDs'), where `slates mount` on macOS calls
+//! `mount(2)` through the library (`slates_api::Instance::mount`, A-34) so that no capability shows in
+//! `ps`; it names the source it mirrors. The integration test `crates/cli/tests/cli.rs` drives the actual
+//! binary end to end.
+//!
+//! Run (macOS/BSD): `cargo run -p slates-cli --example slates_mount`
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use slates_client::{Client, CreateSpec, Deadlines};
+use slates_db::replay::RECOVERY_BUDGET_NS;
+use slates_ipc::protocol::{NamePolicy, SizeClass};
+use slates_machine::{MachineProfile, ProfileOptions};
+use slates_server::daemon::LIVENESS_BUDGET_NS;
+use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+/// Shape: the machine-probe budget (milliseconds) of the quick profile — an input to derivations for
+/// this demo daemon, not a gate.
+const PROBE_MS: u64 = 5;
+/// Shape: how long to wait for the just-started daemon's rendezvous to answer (seconds) before giving
+/// up — `Daemon::start` returns as the shards come up, a beat before the rendezvous is connectable.
+const CONNECT_WAIT_SECS: u64 = 5;
+
+/// A live kernel mount, torn down (`umount` then `rmdir`) when dropped, so even a panic mid-demo leaves
+/// no mount or temp directory behind. Both steps are best-effort — a leftover mount is worse than a
+/// swallowed teardown error.
+struct Mounted {
+  path: String,
+}
+
+impl Drop for Mounted {
+  fn drop(&mut self) {
+    let _ = Command::new("umount").arg(&self.path).output();
+    let _ = Command::new("rmdir").arg(&self.path).output();
+  }
+}
+
+/// Whether `mount_nfs` — the mechanism `slates mount` drives — is on this host (macOS and the BSDs).
+fn mount_nfs_present() -> bool {
+  Command::new("sh")
+    .args(["-c", "command -v mount_nfs"])
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+/// The quick machine profile the demo daemon derives its constants from.
+fn quick_profile() -> MachineProfile {
+  MachineProfile::measure_patiently(&ProfileOptions {
+    budget_per_probe: Duration::from_millis(PROBE_MS),
+    codecs: false,
+    core_matrix: false,
+  })
+  .expect("the machine profile measures")
+}
+
+/// A single-shard in-process daemon (R8, the laptop-degenerate case) named for this process.
+fn start_daemon(instance: &str) -> Daemon {
+  let profile = quick_profile();
+  let config = DaemonConfig::derive(&profile, instance, Some(1));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-example-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("explicit initial group for this example");
+  daemon
+}
+
+/// Connects a client to the daemon's rendezvous, retrying until it answers within the wait budget.
+fn connect(instance: &str) -> Client {
+  let started = Instant::now();
+  loop {
+    let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
+    match Client::connect(instance, deadlines) {
+      Ok(client) => return client,
+      Err(e) => {
+        assert!(
+          started.elapsed() < Duration::from_secs(CONNECT_WAIT_SECS),
+          "connect to the demo daemon: {e}"
+        );
+        std::hint::spin_loop();
+      }
+    }
+  }
+}
+
+/// The exact `mount_nfs` options `slates mount` builds (`crates/api/src/mount.rs::mount_args`): NFSv3
+/// over TCP, the daemon's port for both NFS and MOUNT (one server), `noresvport` for the unprivileged
+/// mount (R10), `hard,intr` so a call waits as long as the daemon asks and a signal still ends the wait, `locallocks,nosuid,nodev,rdirplus`, and
+/// `actimeo=1` (the derived attribute-cache timeout).
+fn mount_options(port: u16) -> String {
+  format!(
+    "vers=3,tcp,port={port},mountport={port},noresvport,hard,intr,locallocks,nosuid,nodev,rdirplus,\
+     actimeo=1"
+  )
+}
+
+/// A fresh, user-owned mount-point directory in the build output — beside this example's binary under
+/// `target/`, named with the process id — made by `mkdir`, not `std::fs::create_dir` (R1; A-50: never `/tmp`).
+fn fresh_mount_point() -> String {
+  let exe = std::env::current_exe().unwrap();
+  let beside = exe.parent().unwrap();
+  let path = format!("{}/slates-mount-{}", beside.display(), std::process::id());
+  let made = Command::new("mkdir").args(["-p", &path]).output().unwrap();
+  assert!(made.status.success(), "mkdir -p {path}");
+  path
+}
+
+/// Writes a file through the mount and reads it back (shell, not `std::fs` — R1), showing the bytes
+/// round-trip host → NFS → the slates volume → NFS → host.
+fn roundtrip_through(path: &str) {
+  let message = "hello from a live slates kernel mount";
+  let file = format!("{path}/hello.txt");
+  let wrote = Command::new("sh")
+    .arg("-c")
+    .arg(format!("printf '%s' '{message}' > '{file}'"))
+    .output()
+    .unwrap();
+  assert!(
+    wrote.status.success(),
+    "write through the mount: {}",
+    String::from_utf8_lossy(&wrote.stderr)
+  );
+  let readback = Command::new("cat").arg(&file).output().unwrap();
+  let got = String::from_utf8_lossy(&readback.stdout).into_owned();
+  println!("  wrote {message:?} through the mount, read back {got:?}");
+  assert_eq!(got, message, "the bytes read back byte for byte");
+}
+
+fn main() {
+  if !mount_nfs_present() {
+    println!("mount_nfs is not on this host; this live-mount example is macOS/BSD only.");
+    return;
+  }
+
+  let instance = format!("slates-example-{}", std::process::id());
+  let daemon = start_daemon(&instance);
+  let mut client = connect(&instance);
+
+  let name = "demo";
+  client
+    .create(&CreateSpec {
+      name: name.to_owned(),
+      // A small bounded RAM volume for the demo.
+      size: SizeClass::Bounded { limit: 8 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+  let port = daemon
+    .nfs_port()
+    .expect("the daemon is serving NFS on loopback");
+  println!("provisioned volume {name:?}; the daemon serves NFS on loopback port {port}");
+  println!("the command this mirrors:  slates mount <volume-id> <dir>");
+
+  let path = fresh_mount_point();
+  let options = mount_options(port);
+  let status = Command::new("mount_nfs")
+    .args(["-o", &options, &format!("localhost:/{name}"), &path])
+    .status()
+    .unwrap();
+  assert!(status.success(), "mount_nfs failed ({status})");
+  let mounted = Mounted { path: path.clone() };
+  println!("mounted a real kernel NFS mount at {path}");
+  println!("  (unprivileged: noresvport — no root, no kernel extension, no Apple entitlement)");
+
+  roundtrip_through(&path);
+
+  let listing = Command::new("ls").args(["-la", &path]).output().unwrap();
+  print!(
+    "  ls of the mount:\n{}",
+    String::from_utf8_lossy(&listing.stdout)
+  );
+
+  drop(mounted); // umount + rmdir
+  println!("unmounted and cleaned up — the mount table is clean again.");
+  drop(client);
+  drop(daemon);
+}

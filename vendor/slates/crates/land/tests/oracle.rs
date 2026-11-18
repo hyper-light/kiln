@@ -1,0 +1,1844 @@
+//! The landing oracle (Phase 1 task 12; §4.15, D-26) over the simulated host: the worked
+//! example of §4.15 with both of its failures, T-1.12's plan, T-1.14's outsider edits injected
+//! between validation and write, T-1.15's crash at every write instruction with the sibling
+//! sweep and the idempotent re-run, T-1.16's exchange fallback, AC-1.13's atomicity, AC-1.14's
+//! proportionality, and the stage-and-exchange path for an empty target.
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::collections::BTreeMap;
+
+use slates_land::engine::{
+  AuditKind, Degradation, LandingRefusal, LandingReport, LandingRequest, LandingState,
+  LandingTarget, Observer, Outcome, Presented, Unobserved,
+};
+use slates_land::grant::{GrantRefusal, GrantScope, GrantState, Surface};
+use slates_land::manifest::{Action, Filter, LandingEntry};
+use slates_land::verdict::{ConflictClass, Verdict};
+use slates_vfs::base::BaseConfig;
+use slates_vfs::host::sim::SimHost;
+use slates_vfs::host::{HostFs, HostKind};
+use slates_vfs::volume::{Store, Volume};
+
+mod common;
+use common::{
+  LARGE, Session, Setup, TERM_NS, config, mkdir, read_through, rename, request, rm_r, scratch,
+  split, store, symlink, unlink, write_file,
+};
+
+fn overlay(host: &mut SimHost, store: &mut Store) -> Volume {
+  // The base tree predates the mount (`common::SETTLED_NS`).
+  host.advance_ns(common::SETTLED_NS);
+  let root = host.root();
+  let facts = host.facts(root).unwrap();
+  Volume::create_overlay(
+    store,
+    config(),
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: LARGE,
+    },
+  )
+  .unwrap()
+}
+
+fn root_target(host: &mut SimHost) -> LandingTarget {
+  LandingTarget {
+    dir: host.root(),
+    key: "/".into(),
+  }
+}
+
+// ---------------------------------------------------------------- the disk
+
+type Disk = BTreeMap<String, (HostKind, Vec<u8>)>;
+
+fn is_hidden(path: &str) -> bool {
+  path.split('/').any(|c| c.starts_with(".slates-"))
+}
+
+/// The disk as (path → kind and bytes), hidden siblings excluded.
+fn disk(host: &SimHost) -> Disk {
+  host
+    .paths()
+    .into_iter()
+    .filter(|(p, _)| !is_hidden(p))
+    .map(|(p, k)| {
+      let bytes = host.bytes(&p).unwrap_or_default();
+      (p, (k, bytes))
+    })
+    .collect()
+}
+
+/// T-1.12 / A-26: planning a landing with IPC names refuses before any host write.
+#[test]
+fn ipc_names_refuse_landing_before_an_ordinary_file_can_be_written() {
+  for kind in [
+    slates_vfs::inode::Kind::Fifo,
+    slates_vfs::inode::Kind::Socket,
+  ] {
+    let mut store = store();
+    let mut volume = scratch(&mut store);
+    let root = volume.root_inode(&store).unwrap();
+    let file = volume
+      .create_file_no(&mut store, root, "ordinary", 0o600)
+      .unwrap();
+    volume
+      .write(&mut store, file, 0, b"must not escape")
+      .unwrap();
+    volume
+      .mknod_no(&mut store, root, "ipc", 0o600, kind)
+      .unwrap();
+    let mut host = SimHost::new();
+    let before = disk(&host);
+    assert!(matches!(
+      slates_land::manifest::plan(
+        &mut volume,
+        &mut store,
+        &mut host,
+        &Filter::default(),
+        slates_land::source::Source::Head
+      ),
+      Err(slates_vfs::VfsError::SpecialFileOperation)
+    ));
+    assert_eq!(disk(&host), before);
+  }
+}
+
+fn hidden_names(host: &SimHost) -> Vec<String> {
+  host
+    .paths()
+    .into_iter()
+    .filter(|(p, _)| is_hidden(p))
+    .map(|(p, _)| p)
+    .collect()
+}
+
+fn outcome_of<'r>(report: &'r LandingReport, path: &str) -> &'r Outcome {
+  report
+    .entries
+    .iter()
+    .find(|e| e.path.as_ref() == path)
+    .unwrap_or_else(|| panic!("no entry for {path}"))
+    .outcome
+    .as_ref()
+    .unwrap()
+}
+
+// ---------------------------------------------------------------- the worked example
+
+/// The base of §4.15's worked example, scaled: `files` under `src/` and `tests/`.
+fn example_base(host: &mut SimHost, files: usize) {
+  host.mkdir("/src");
+  host.mkdir("/tests");
+  for f in 0..files {
+    let dir = if f % 2 == 0 { "src" } else { "tests" };
+    host.replace_file(&format!("/{dir}/f{f}.rs"), format!("base {f}").as_bytes());
+  }
+  host.replace_file("/src/lib.rs", b"base lib");
+  host.replace_file("/tests/a.rs", b"base a");
+}
+
+/// The edits: twelve replacements, one delete, three creates, and 190 files under `target/`.
+fn example_edits(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  for f in 0..10 {
+    let dir = if f % 2 == 0 { "src" } else { "tests" };
+    write_file(
+      vol,
+      host,
+      store,
+      &format!("/{dir}/f{f}.rs"),
+      format!("edited {f}").as_bytes(),
+    );
+  }
+  write_file(vol, host, store, "/src/lib.rs", b"edited lib");
+  write_file(vol, host, store, "/tests/a.rs", b"edited a");
+  unlink(vol, host, store, "/src/f10.rs");
+  write_file(vol, host, store, "/src/new1.rs", b"new 1");
+  write_file(vol, host, store, "/src/new2.rs", b"new 2");
+  write_file(vol, host, store, "/tests/new3.rs", b"new 3");
+  mkdir(vol, host, store, "/target");
+  for f in 0..190 {
+    write_file(vol, host, store, &format!("/target/o{f}"), b"obj");
+  }
+}
+
+fn example_request(id: u64) -> LandingRequest {
+  LandingRequest {
+    filter: Filter {
+      include: Vec::new(),
+      exclude: vec!["/target".into()],
+    },
+    ..request(id)
+  }
+}
+
+/// The presented manifest of the worked example: 16 entries, 191 filtered out, all `Apply`.
+fn assert_presented(presented: &Presented) {
+  assert_eq!(presented.manifest.entries.len(), 16);
+  assert_eq!(
+    presented.manifest.summary.filtered_out, 191,
+    "190 objects and target/ itself"
+  );
+  let by_action = &presented.manifest.summary.by_action;
+  assert_eq!(by_action.get("replace").copied(), Some(12));
+  assert_eq!(by_action.get("delete").copied(), Some(1));
+  assert_eq!(by_action.get("create").copied(), Some(3));
+  assert!(
+    presented
+      .preliminary
+      .iter()
+      .all(|e| e.verdict == Some(Verdict::Apply))
+  );
+}
+
+/// The disk and the overlay after the worked example landed.
+fn assert_example_landed(report: &LandingReport, host: &SimHost, vol: &Volume, store: &Store) {
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(report.written, 16);
+  assert!(report.durability.data_synced && report.durability.dirs_synced);
+  assert_eq!(host.bytes("/src/lib.rs").unwrap(), b"edited lib");
+  assert_eq!(host.bytes("/src/new1.rs").unwrap(), b"new 1");
+  assert!(host.bytes("/src/f10.rs").is_none());
+  assert!(host.bytes("/target/o0").is_none(), "excluded by the filter");
+  assert!(hidden_names(host).is_empty());
+  assert_only_excluded_remain(vol, store);
+}
+
+/// Advance: the landed entries left the overlay; the excluded ones stayed.
+fn assert_only_excluded_remain(vol: &Volume, store: &Store) {
+  let diverged = vol.diverged(store);
+  assert!(
+    diverged.iter().all(|d| d.path.starts_with("/target")),
+    "{diverged:?}"
+  );
+  assert_eq!(diverged.len(), 191);
+}
+
+/// One run of the worked example over a base of `base_files`; returns the host calls it took.
+fn worked_example(base_files: usize) -> u64 {
+  let mut host = SimHost::new();
+  example_base(&mut host, base_files);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  example_edits(&mut vol, &mut host, &mut store);
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let calls_before = host.calls();
+  let writes_before = host.write_steps();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let presented = setup.present(&example_request(1));
+  assert_presented(&presented);
+  assert_eq!(
+    setup.host.write_steps(),
+    writes_before,
+    "presenting writes nothing"
+  );
+  let report = setup.land(example_request(1)).unwrap();
+  assert_example_landed(&report, &host, &vol, &store);
+  host.calls() - calls_before
+}
+
+/// §4.15's worked example: 16 entries planned, 190 excluded, 0 conflicts; granted once; 16
+/// `Written`; the disk holds the overlay's bytes; the overlay is empty after; the host work
+/// is proportional to the 16 entries, not the base (AC-1.14 at 10^3 and 10^5 base entries).
+#[test]
+fn the_worked_example_lands_sixteen_entries_and_the_work_does_not_grow_with_the_base() {
+  let small = worked_example(1_000);
+  let large = worked_example(100_000);
+  assert_eq!(small, large, "host calls at 10^3 and 10^5 base entries");
+}
+
+/// Failure one of the worked example: the user edited `src/lib.rs` before the grant; the
+/// preliminary verdict shows `ModifyModify`; a landing refuses with nothing written; the agent
+/// reads the disk version, rewrites, rewitnesses and lands with a new manifest.
+#[test]
+fn failure_one_a_conflict_refuses_before_any_write_and_rewitness_clears_it() {
+  let mut host = SimHost::new();
+  example_base(&mut host, 20);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  example_edits(&mut vol, &mut host, &mut store);
+  host.replace_file("/src/lib.rs", b"user's lib");
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let writes_before = host.write_steps();
+  let refused = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(example_request(2));
+  let Err(LandingRefusal::Conflict(entries)) = refused else {
+    panic!("{refused:?}");
+  };
+  let lib = entries
+    .iter()
+    .find(|e| e.path.as_ref() == "/src/lib.rs")
+    .unwrap();
+  assert_eq!(
+    lib.verdict,
+    Some(Verdict::Conflict(ConflictClass::ModifyModify))
+  );
+  assert_eq!(
+    host.write_steps(),
+    writes_before,
+    "AC-1.12: nothing written while any verdict is a conflict"
+  );
+  assert_eq!(host.bytes("/src/lib.rs").unwrap(), b"user's lib");
+  // Resolve: read the disk version, merge, rewitness, land again.
+  let disk_version = vol.with_host(&mut host).read_base("/src/lib.rs").unwrap();
+  assert_eq!(disk_version, b"user's lib");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/src/lib.rs",
+    b"user's lib + edited lib",
+  );
+  vol
+    .with_host(&mut host)
+    .rewitness(&mut store, Some(&["/src/lib.rs".to_owned()]))
+    .unwrap();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(example_request(3))
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(
+    host.bytes("/src/lib.rs").unwrap(),
+    b"user's lib + edited lib"
+  );
+}
+
+/// An observer that replaces named files on the disk right before their write (an editor or
+/// `git checkout` racing the landing).
+struct Outsider {
+  victims: Vec<&'static str>,
+}
+
+/// Advance the clock between validation and writing without changing the target bytes.
+struct ExchangeTick;
+
+impl Observer<SimHost> for ExchangeTick {
+  fn before_write(&mut self, host: &mut SimHost, _entry: &LandingEntry) {
+    host.advance_ns(1);
+  }
+}
+
+/// T-1.14/T-1.15: the landing's own exchange changes ctime without creating a conflict.
+#[test]
+fn an_exchange_after_the_witness_tick_lands_and_replans_empty() {
+  let mut host = SimHost::new();
+  host.replace_file("/file", b"original");
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/file", b"replacement");
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land_with(request(1), &mut ExchangeTick).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(setup.host.bytes("/file").unwrap(), b"replacement");
+  assert!(hidden_names(setup.host).is_empty());
+  assert!(setup.present(&request(2)).manifest.entries.is_empty());
+}
+
+/// An outsider changes equal-length bytes within one timestamp tick; exchange then changes ctime.
+struct SameTimestampOutsider;
+
+impl Observer<SimHost> for SameTimestampOutsider {
+  fn before_write(&mut self, host: &mut SimHost, entry: &LandingEntry) {
+    host.write_in_place(&entry.path, b"outsider", 0);
+    host.advance_ns(1);
+  }
+}
+
+/// An outsider changes metadata before the landing; restoring the mode cannot restore ctime.
+struct MetadataOutsider;
+
+impl Observer<SimHost> for MetadataOutsider {
+  fn before_write(&mut self, host: &mut SimHost, entry: &LandingEntry) {
+    let mode = host.fingerprint(&entry.path).unwrap().mode;
+    host.advance_ns(1);
+    host.chmod(&entry.path, mode);
+  }
+}
+
+/// T-1.14: a ctime change preceding our exchange remains a real witness conflict.
+#[test]
+fn an_exchange_does_not_hide_an_earlier_metadata_change() {
+  let mut host = SimHost::new();
+  host.replace_file("/file", b"original");
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/file", b"replacement");
+  let mut session = Session::new();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land_with(request(1), &mut MetadataOutsider)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert_eq!(
+    *outcome_of(&report, "/file"),
+    Outcome::Undone(ConflictClass::TargetInUse)
+  );
+  assert_eq!(host.bytes("/file").unwrap(), b"original");
+}
+
+/// T-1.14: accepting the exchange's ctime change still requires the witnessed content.
+#[test]
+fn an_exchange_preserves_a_same_timestamp_outsider_write() {
+  let mut host = SimHost::new();
+  host.replace_file("/file", b"original");
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/file", b"replacement");
+  let mut session = Session::new();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land_with(request(1), &mut SameTimestampOutsider)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert_eq!(
+    *outcome_of(&report, "/file"),
+    Outcome::Undone(ConflictClass::TargetInUse)
+  );
+  assert_eq!(host.bytes("/file").unwrap(), b"outsider");
+  assert!(hidden_names(&host).is_empty());
+}
+
+impl Observer<SimHost> for Outsider {
+  fn before_write(&mut self, host: &mut SimHost, entry: &LandingEntry) {
+    if self.victims.contains(&entry.path.as_ref()) {
+      host.replace_file(&entry.path, format!("outsider {}", entry.path).as_bytes());
+    }
+  }
+}
+
+/// Failure two of the worked example: `git checkout` replaced `tests/a.rs` between validation
+/// and the exchange; the displaced file is not the witness; the landing exchanges back and
+/// records `Undone(TargetInUse)`; the report is `Partial` with 15 `Written`; the outsider's
+/// bytes stay; the entry stays in the overlay.
+#[test]
+fn failure_two_a_lost_compare_and_swap_is_undone_and_reported() {
+  let mut host = SimHost::new();
+  example_base(&mut host, 20);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  example_edits(&mut vol, &mut host, &mut store);
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let mut outsider = Outsider {
+    victims: vec!["/tests/a.rs"],
+  };
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land_with(example_request(4), &mut outsider)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert_eq!(report.written, 15);
+  assert_eq!(report.conflicts, 1);
+  assert_eq!(
+    *outcome_of(&report, "/tests/a.rs"),
+    Outcome::Undone(ConflictClass::TargetInUse)
+  );
+  assert_eq!(
+    host.bytes("/tests/a.rs").unwrap(),
+    b"outsider /tests/a.rs",
+    "no outsider write lost"
+  );
+  assert!(hidden_names(&host).is_empty(), "the temporary went away");
+  let diverged = vol.diverged(&store);
+  assert!(
+    diverged.iter().any(|d| d.path == "/tests/a.rs"),
+    "the entry stays in the overlay"
+  );
+}
+
+/// An observer that rewrites a pseudo-random subset of the replacements, alternating a new
+/// inode (save-by-rename) and an in-place write.
+struct RandomOutsider {
+  seed: u64,
+  hit: BTreeMap<String, Vec<u8>>,
+}
+
+impl Observer<SimHost> for RandomOutsider {
+  fn before_write(&mut self, host: &mut SimHost, entry: &LandingEntry) {
+    /// Shape: a linear congruential step (Knuth's MMIX constants).
+    const MUL: u64 = 6_364_136_223_846_793_005;
+    const INC: u64 = 1_442_695_040_888_963_407;
+    self.seed = self.seed.wrapping_mul(MUL).wrapping_add(INC);
+    if !matches!(entry.action, Action::Replace) || self.seed >> 62 == 0 {
+      return;
+    }
+    let bytes = format!("outsider {}", entry.path).into_bytes();
+    if (self.seed >> 61) & 1 == 0 {
+      host.replace_file(&entry.path, &bytes);
+    } else {
+      host.write_in_place(&entry.path, &bytes, 1_000);
+    }
+    self.hit.insert(entry.path.to_string(), bytes);
+  }
+}
+
+/// Every entry the outsider hit is `Undone(TargetInUse)` with the outsider's bytes on the
+/// disk; every other one is `Written` with the agent's.
+fn assert_losses_detected(report: &LandingReport, host: &SimHost, hit: &BTreeMap<String, Vec<u8>>) {
+  for entry in &report.entries {
+    let path = entry.path.to_string();
+    match hit.get(&path) {
+      Some(bytes) => {
+        assert_eq!(
+          entry.outcome,
+          Some(Outcome::Undone(ConflictClass::TargetInUse)),
+          "{path}"
+        );
+        assert_eq!(
+          host.bytes(&path).unwrap(),
+          *bytes,
+          "{path}: the outsider's write stays"
+        );
+      }
+      None => {
+        assert_eq!(entry.outcome, Some(Outcome::Written), "{path}");
+        assert!(host.bytes(&path).unwrap().starts_with(b"agent"), "{path}");
+      }
+    }
+  }
+}
+
+/// T-1.14: an outsider rewriting target files at random while a landing runs; every loss is
+/// detected at the swap, undone and reported; no outsider write is lost; no agent write is
+/// applied over one. Both outsider forms: a new inode (save-by-rename) and an in-place write.
+#[test]
+fn t_1_14_random_outsider_rewrites_are_all_detected() {
+  for seed in 1..=8u64 {
+    let mut host = SimHost::new();
+    example_base(&mut host, 40);
+    let mut store = store();
+    let mut vol = overlay(&mut host, &mut store);
+    for f in 0..40 {
+      let dir = if f % 2 == 0 { "src" } else { "tests" };
+      write_file(
+        &mut vol,
+        &mut host,
+        &mut store,
+        &format!("/{dir}/f{f}.rs"),
+        format!("agent {f}").as_bytes(),
+      );
+    }
+    let target = root_target(&mut host);
+    let mut session = Session::new();
+    let mut outsider = RandomOutsider {
+      seed,
+      hit: BTreeMap::new(),
+    };
+    let report = Setup {
+      host: &mut host,
+      target: &target,
+      vol: &mut vol,
+      store: &mut store,
+      session: &mut session,
+    }
+    .land_with(request(seed), &mut outsider)
+    .unwrap();
+    assert_losses_detected(&report, &host, &outsider.hit);
+    let expected = if outsider.hit.is_empty() {
+      LandingState::Done
+    } else {
+      LandingState::Partial
+    };
+    assert_eq!(report.state, expected);
+    assert_eq!(report.conflicts, outsider.hit.len());
+    assert!(hidden_names(&host).is_empty());
+  }
+}
+
+// ---------------------------------------------------------------- crashes
+
+/// The crash scenario's base: every action class at once.
+fn crash_base(host: &mut SimHost) {
+  host.replace_file("/keep.txt", b"keep");
+  for n in 1..=3 {
+    host.replace_file(&format!("/old{n}.txt"), format!("old {n}").as_bytes());
+  }
+  host.replace_file("/gone.txt", b"gone");
+  host.mkdir("/tree");
+  host.replace_file("/tree/x.txt", b"x");
+  host.mkdir("/tree/y");
+  host.replace_file("/tree/y/z.txt", b"z");
+  host.mkdir("/moved");
+  host.replace_file("/moved/m.txt", b"m");
+  host.mkdir("/cleared");
+  host.replace_file("/cleared/a.txt", b"a");
+  host.replace_file("/cleared/b.txt", b"b");
+}
+
+fn crash_edits(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  write_file(vol, host, store, "/new1.txt", b"new 1");
+  write_file(vol, host, store, "/new2.txt", b"new 2");
+  mkdir(vol, host, store, "/dir");
+  write_file(vol, host, store, "/dir/inner.txt", b"inner");
+  for n in 1..=3 {
+    write_file(
+      vol,
+      host,
+      store,
+      &format!("/old{n}.txt"),
+      format!("replaced {n}").as_bytes(),
+    );
+  }
+  unlink(vol, host, store, "/gone.txt");
+  rm_r(vol, host, store, "/tree");
+  rename(vol, host, store, "/moved", "/moved2");
+  symlink(vol, host, store, "/link", "keep.txt");
+  rm_r(vol, host, store, "/cleared");
+  mkdir(vol, host, store, "/cleared");
+  write_file(vol, host, store, "/cleared/c.txt", b"c");
+  // A file past three content windows, so a landing copies it a window per unit (AUD-29-25): its bytes vary
+  // by position, so a window copied to the wrong offset shows on the disk.
+  let window = store.content.chunk_bytes();
+  let large: Vec<u8> = (0..LARGE_WINDOWS * window + 1)
+    .map(|at| u8::try_from(at % usize::from(u8::MAX)).unwrap())
+    .collect();
+  write_file(vol, host, store, "/large.bin", &large);
+}
+
+/// Shape: the content windows the crash scenario's large file spans (and one byte more).
+const LARGE_WINDOWS: usize = 3;
+
+/// The crash scenario, ready to land: the host, the volume and its store; `exchange: false` takes the
+/// atomic exchange away (the fallback of T-1.16).
+/// The simulated filesystem a crash scenario runs on: whether it has the atomic exchange, and whether it
+/// has unnamed temporaries (`O_TMPFILE`: Linux's tmpfs and ext4 do; APFS does not, so a macOS temporary is
+/// named from its creation).
+#[derive(Clone, Copy)]
+struct Filesystem {
+  exchange: bool,
+  unnamed_temporaries: bool,
+}
+
+fn crash_scenario(fs: Filesystem) -> (SimHost, Store, Volume) {
+  let mut host = SimHost::new();
+  host.set_exchange_supported(fs.exchange);
+  host.set_unnamed_temporaries(fs.unnamed_temporaries);
+  crash_base(&mut host);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  crash_edits(&mut vol, &mut host, &mut store);
+  (host, store, vol)
+}
+
+/// The reference: the disk before, the disk after a clean landing, and the write count.
+fn crash_reference(fs: Filesystem) -> (Disk, Disk, u64) {
+  let (before, after, writes, _) = crash_reference_in(fs, Session::new());
+  (before, after, writes)
+}
+
+/// [`crash_reference`] under `session` (one call, or sliced): also the report and the overlay after.
+fn crash_reference_in(fs: Filesystem, mut session: Session) -> (Disk, Disk, u64, Landed) {
+  let (mut host, mut store, mut vol) = crash_scenario(fs);
+  let before = {
+    let mut fresh = SimHost::new();
+    crash_base(&mut fresh);
+    disk(&fresh)
+  };
+  let target = root_target(&mut host);
+  let writes = host.write_steps();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(request(1))
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(hidden_names(&host).is_empty());
+  let landed = Landed {
+    outcomes: report
+      .entries
+      .iter()
+      .map(|e| (e.path.to_string(), format!("{:?}", e.outcome)))
+      .collect(),
+    counts: (
+      report.written,
+      report.skipped,
+      report.conflicts,
+      report.failed,
+      report.held,
+    ),
+    diverged: format!("{:?}", vol.diverged(&store)),
+    slices: session.slices,
+    barriers_away: session.barriers_away,
+    visible_before_durable: host.visible_before_durable().to_vec(),
+  };
+  (before, disk(&host), host.write_steps() - writes, landed)
+}
+
+/// What a landing reported and left in the overlay, for comparing a sliced run with the one call.
+#[derive(Debug, PartialEq, Eq)]
+struct Landed {
+  outcomes: Vec<(String, String)>,
+  counts: (usize, usize, usize, usize, usize),
+  diverged: String,
+  slices: u64,
+  /// The barriers a sliced run gave out to run away from it (A-132).
+  barriers_away: u64,
+  /// Every name a temporary was visible under before it was durable.
+  visible_before_durable: Vec<String>,
+}
+
+/// Every path on `now` is as on `before` or as on `after`: old or new, never torn.
+fn assert_old_or_new(crash_at: u64, now: &Disk, before: &Disk, after: &Disk) {
+  for path in before.keys().chain(after.keys()) {
+    let old_or_new = now.get(path) == before.get(path) || now.get(path) == after.get(path);
+    assert!(
+      old_or_new,
+      "crash {crash_at}: {path} is torn: {:?}",
+      now.get(path)
+    );
+  }
+}
+
+/// Without the exchange (§4.15 "Exchange fallback", AUD-29-04): every path on `now` is old or new, or
+/// absent while its old entry sits aside at one of the landing's own hidden names beside it (a crash inside a
+/// window between moving the old entry aside and placing the new one), byte for byte. How many paths were
+/// set aside.
+fn assert_old_new_or_aside(crash_at: u64, host: &SimHost, before: &Disk, after: &Disk) -> usize {
+  let mut set_aside = 0usize;
+  let now = disk(host);
+  let hidden: Disk = host
+    .paths()
+    .into_iter()
+    .filter(|(p, _)| is_hidden(p))
+    .map(|(p, k)| {
+      let bytes = host.bytes(&p).unwrap_or_default();
+      (p, (k, bytes))
+    })
+    .collect();
+  for path in before.keys().chain(after.keys()) {
+    if now.get(path) == before.get(path) || now.get(path) == after.get(path) {
+      continue;
+    }
+    let old = before.get(path);
+    let aside = !now.contains_key(path)
+      && old.is_some()
+      && ancestors_or_self(path).any(|entry| {
+        let rest = path.strip_prefix(entry).unwrap_or_default();
+        !now.contains_key(entry)
+          && hidden
+            .keys()
+            .any(|h| split(h).0 == split(entry).0 && hidden.get(&format!("{h}{rest}")) == old)
+      });
+    assert!(
+      aside,
+      "crash {crash_at}: {path} is neither old, new nor set aside: {:?}",
+      now.get(path)
+    );
+    set_aside += 1;
+  }
+  set_aside
+}
+
+/// `path` and each directory above it, nearest first (the root excluded).
+fn ancestors_or_self(path: &str) -> impl Iterator<Item = &str> {
+  std::iter::successors(Some(path), |p| {
+    let (parent, _) = split(p);
+    (parent != "/").then_some(parent)
+  })
+}
+
+/// One crash at write instruction `crash_at`: every path old or new (or, without the exchange, set aside),
+/// then the resume reaches the reference, sweeps the siblings, and a further run plans nothing. How many
+/// paths the crash left set aside.
+fn crash_then_resume(fs: Filesystem, crash_at: u64, before: &Disk, after: &Disk) -> usize {
+  crash_then_resume_in(fs, crash_at, before, after, Session::new())
+}
+
+/// [`crash_then_resume`] under `session` (one call, or sliced).
+fn crash_then_resume_in(
+  fs: Filesystem,
+  crash_at: u64,
+  before: &Disk,
+  after: &Disk,
+  mut session: Session,
+) -> usize {
+  let exchange = fs.exchange;
+  let (mut host, mut store, mut vol) = crash_scenario(fs);
+  let target = root_target(&mut host);
+  host.crash_at_write(host.write_steps() + crash_at);
+  let result = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(request(1));
+  assert!(host.crashed(), "crash {crash_at}");
+  if let Ok(report) = &result {
+    assert_eq!(
+      report.state,
+      LandingState::Aborted,
+      "crash {crash_at}: {report:?}"
+    );
+    assert!(
+      report
+        .degraded
+        .iter()
+        .any(|d| matches!(d, Degradation::Crashed { .. }))
+    );
+  }
+  let set_aside = if exchange {
+    assert_old_or_new(crash_at, &disk(&host), before, after);
+    0
+  } else {
+    assert_old_new_or_aside(crash_at, &host, before, after)
+  };
+  host.recover();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(
+    report.state,
+    LandingState::Done,
+    "crash {crash_at}: resume {report:?}"
+  );
+  let presented = setup.present(&request(1));
+  assert!(
+    presented.manifest.entries.is_empty(),
+    "crash {crash_at}: idempotent: {:?}",
+    presented.manifest.entries
+  );
+  assert_eq!(
+    &disk(&host),
+    after,
+    "crash {crash_at}: the resumed landing reaches the reference"
+  );
+  assert!(
+    hidden_names(&host).is_empty(),
+    "crash {crash_at}: siblings swept: {:?}",
+    hidden_names(&host)
+  );
+  set_aside
+}
+
+/// T-1.15 and AC-1.13: crash at every write instruction; every entry is old or new; the
+/// resume sweeps the hidden siblings and lands the rest; a further run plans nothing.
+#[test]
+fn t_1_15_crash_at_every_write_instruction_then_resume() {
+  crash_at_every_instruction(LINUX);
+}
+
+/// T-1.15 on a filesystem whose temporaries are named from creation (APFS: no `O_TMPFILE`). Do: crash at
+/// every write instruction, then resume. Expect: as on Linux — every path old or new, the resume reaching
+/// the reference, and every sibling swept, none kept: a temporary the crashed attempt created is the
+/// landing's own however little of it was written (§4.15 step 11). Red before 2026-09-30: a temporary
+/// crashed mid-write sat at its aside name, matched neither the witness nor the overlay, and was kept
+/// (the macOS CI runner's `kill -9` found an empty `.slates-kept-*`; job 109759894864).
+#[test]
+fn t_1_15_named_temporaries_crash_at_every_write_instruction_then_resume() {
+  crash_at_every_instruction(MACOS);
+}
+
+/// The same on a filesystem with named temporaries and no exchange.
+#[test]
+fn t_1_15_named_temporaries_without_exchange_crash_at_every_write_instruction_then_resume() {
+  let set_aside = crash_at_every_instruction(Filesystem {
+    exchange: false,
+    unnamed_temporaries: false,
+  });
+  assert!(set_aside > 0, "no crash fell inside a window");
+}
+
+/// Format: Linux's tmpfs and ext4: the exchange and unnamed temporaries.
+const LINUX: Filesystem = Filesystem {
+  exchange: true,
+  unnamed_temporaries: true,
+};
+/// Format: APFS: the exchange (`RENAME_SWAP`), temporaries named from creation.
+const MACOS: Filesystem = Filesystem {
+  exchange: true,
+  unnamed_temporaries: false,
+};
+
+/// Crashes a landing on `fs` at every write instruction and resumes each; the crashes that fell inside a
+/// fallback window.
+fn crash_at_every_instruction(fs: Filesystem) -> usize {
+  let (before, after, steps) = crash_reference(fs);
+  assert!(steps > 20, "the scenario writes in many steps: {steps}");
+  (0..steps)
+    .map(|crash_at| crash_then_resume(fs, crash_at, &before, &after))
+    .sum()
+}
+
+/// §4.15 step 8, by use: a file the landing writes is durable before it is visible. Do: land the crash scenario (new
+/// files, replacements, removals and renames) on each simulated filesystem, in one call and stepped one unit per
+/// slice, on a host that records any landing temporary made visible under a real name while its bytes, mode or
+/// modification time were unsynced. Expect: none; every placement comes after its file's sync. Before 2026-10-10 no
+/// test read that order: the simulated host recorded syncs nobody checked.
+#[test]
+fn a_landed_file_is_durable_before_it_is_visible() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: false,
+    },
+  ] {
+    for mut session in [Session::new(), Session::sliced()] {
+      let (mut host, mut store, mut vol) = crash_scenario(fs);
+      let target = root_target(&mut host);
+      let report = Setup {
+        host: &mut host,
+        target: &target,
+        vol: &mut vol,
+        store: &mut store,
+        session: &mut session,
+      }
+      .land(request(1))
+      .unwrap();
+      assert_eq!(report.state, LandingState::Done, "{report:?}");
+      assert!(report.written > 0, "the scenario wrote files: {report:?}");
+      assert!(
+        host.visible_before_durable().is_empty(),
+        "exchange {} unnamed {}: visible before durable: {:?}",
+        fs.exchange,
+        fs.unnamed_temporaries,
+        host.visible_before_durable()
+      );
+    }
+  }
+}
+
+/// §4.15 step 9, by use: an entry advances out of the overlay only once its directory is synced, and a rename's source
+/// directory too. Do: land the crash scenario on each simulated filesystem, in one call and stepped one unit per slice,
+/// on a host that tracks each directory changed since its last sync. Expect: the landing `Done` (every entry advanced),
+/// and every entry's directory that still exists, and a rename's source directory, synced after its last change.
+/// Before 2026-10-10 the simulated host recorded directory syncs nobody read.
+#[test]
+fn every_landed_entry_has_its_directory_synced_before_it_advances() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: false,
+    },
+  ] {
+    for mut session in [Session::new(), Session::sliced()] {
+      let (mut host, mut store, mut vol) = crash_scenario(fs);
+      let target = root_target(&mut host);
+      let report = Setup {
+        host: &mut host,
+        target: &target,
+        vol: &mut vol,
+        store: &mut store,
+        session: &mut session,
+      }
+      .land(request(1))
+      .unwrap();
+      assert_eq!(report.state, LandingState::Done, "{report:?}");
+      let unsynced: Vec<String> = report
+        .entries
+        .iter()
+        .flat_map(|entry| {
+          let from = match &entry.action {
+            Action::Rename { from } => Some(split(from).0.to_owned()),
+            _ => None,
+          };
+          std::iter::once(split(&entry.path).0.to_owned()).chain(from)
+        })
+        .filter(|dir| {
+          let exists = dir == "/"
+            || host
+              .paths()
+              .iter()
+              .any(|(path, kind)| path == dir && *kind == HostKind::Dir);
+          exists && host.unsynced_dir(dir)
+        })
+        .collect();
+      assert!(
+        unsynced.is_empty(),
+        "exchange {} unnamed {}: advanced with their directory unsynced: {unsynced:?}",
+        fs.exchange,
+        fs.unnamed_temporaries
+      );
+    }
+  }
+}
+
+/// The check behind [`a_landed_file_is_durable_before_it_is_visible`] can fail, in each way a placement can come too
+/// A-133 (the sliced finish's advance is read-consistent between its slices, and leaves the base clean). Do: over an
+/// overlay, modify a base file and add a new one, write the landed bytes onto the base disk as the landing's write
+/// phase would, then advance the overlay one entry at a time — reading every landed path after each slice. Expect:
+/// every read returns the landed content at every point (a not-yet-advanced path reads the overlay's private copy = the
+/// landed bytes; an advanced one reads the base, also the landed bytes), the advance takes more than one slice
+/// (non-vacuity), and once the advance is done no drift remains — the advance clears each entry's witness as it goes.
+///
+/// It also pins the corrected finding: a *modified* base file is copied up yet keeps its base witness, so from the
+/// write-phase placement until its own advance a `status` query sees it as transient self-drift (pre-existing: the
+/// write phase is already sliced). The advance clears it (`base_forget` removes the witness and the recorded drift), so
+/// the drift set only shrinks during the advance and is empty after.
+#[test]
+fn a_sliced_advance_reads_consistently_and_leaves_the_base_clean() {
+  use slates_vfs::base::Landed;
+  let mut host = SimHost::new();
+  example_base(&mut host, 6);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  // The overlay's changes a landing would advance: a modified base file (copied up) and a fresh file.
+  write_file(&mut vol, &mut host, &mut store, "/src/f0.rs", b"landed 0");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/src/new.rs",
+    b"landed new",
+  );
+  // The landing's write phase already put the landed bytes on the disk; the advance only moves the overlay to match.
+  host.replace_file("/src/f0.rs", b"landed 0");
+  host.replace_file("/src/new.rs", b"landed new");
+  let landed = [
+    Landed {
+      path: "/src/f0.rs".to_owned(),
+      written: None,
+    },
+    Landed {
+      path: "/src/new.rs".to_owned(),
+      written: None,
+    },
+  ];
+  // Every landed path reads its landed content, whether or not it has been advanced yet.
+  let reads_landed = |vol: &mut Volume, host: &mut SimHost, store: &mut Store| {
+    assert_eq!(read_through(vol, host, store, "/src/f0.rs"), b"landed 0");
+    assert_eq!(read_through(vol, host, store, "/src/new.rs"), b"landed new");
+  };
+  let drift_set = |vol: &mut Volume, host: &mut SimHost, store: &mut Store| {
+    vol.with_host(host).status(store).unwrap().drift.len()
+  };
+  vol
+    .with_host(&mut host)
+    .land_advance_begin(&mut store, None)
+    .unwrap();
+  let mut slices = 0;
+  let mut prev_drift = drift_set(&mut vol, &mut host, &mut store);
+  for entry in &landed {
+    reads_landed(&mut vol, &mut host, &mut store);
+    let during = drift_set(&mut vol, &mut host, &mut store);
+    assert!(
+      during <= prev_drift,
+      "the advance never adds drift: {during} after {prev_drift}"
+    );
+    prev_drift = during;
+    vol
+      .with_host(&mut host)
+      .land_advance_one(&mut store, entry, None)
+      .unwrap();
+    slices += 1;
+  }
+  vol.with_host(&mut host).land_advance_end();
+  reads_landed(&mut vol, &mut host, &mut store);
+  // The advance cleared every landed entry's witness, so the base reports no drift once it is done.
+  assert_eq!(
+    drift_set(&mut vol, &mut host, &mut store),
+    0,
+    "the advance left the base clean"
+  );
+  assert!(
+    slices > 1,
+    "the advance ran in more than one slice: {slices}"
+  );
+}
+
+/// early. Do: on the simulated host, place temporaries at real names after: nothing; a write-out alone; a barrier
+/// alone; a write-out, a later write, then a barrier; a write-out, a barrier taken, a write while it runs (A-132) and
+/// another write-out before its outcome came back; a write-out then a barrier. Expect: every name but the last
+/// recorded — a file is durable only once a barrier taken after a write-out made after its last change has returned
+/// (A-130), however it changed while the barrier ran.
+#[test]
+fn a_temporary_placed_before_its_barrier_is_recorded() {
+  use slates_vfs::host::{HostFile, LandFs};
+  let mut host = SimHost::new();
+  let root = host.root();
+  let temp = |host: &mut SimHost, n: u32| {
+    let file = host
+      .create_temp(root, &format!(".slates-0000000000000001-{n}"))
+      .unwrap();
+    host.write_at(file, 0, b"bytes").unwrap();
+    file
+  };
+  let barrier = |host: &mut SimHost, files: &[HostFile]| {
+    let ran = host.begin_barrier(files).unwrap().run();
+    host.end_barrier(files, ran).unwrap();
+  };
+  let unsynced = temp(&mut host, 0);
+  host.place(unsynced, root, "unsynced").unwrap();
+  let written_out = temp(&mut host, 1);
+  host.write_out(written_out).unwrap();
+  host.place(written_out, root, "written_out").unwrap();
+  let barrier_only = temp(&mut host, 2);
+  barrier(&mut host, &[barrier_only]);
+  host.place(barrier_only, root, "barrier_only").unwrap();
+  let changed = temp(&mut host, 3);
+  host.write_out(changed).unwrap();
+  host.write_at(changed, 5, b" more").unwrap();
+  barrier(&mut host, &[changed]);
+  host.place(changed, root, "changed").unwrap();
+  let changed_while_running = temp(&mut host, 4);
+  host.write_out(changed_while_running).unwrap();
+  let running = host.begin_barrier(&[changed_while_running]).unwrap();
+  host.write_at(changed_while_running, 5, b" more").unwrap();
+  host.write_out(changed_while_running).unwrap();
+  let ran = running.run();
+  host.end_barrier(&[changed_while_running], ran).unwrap();
+  host
+    .place(changed_while_running, root, "changed_while_running")
+    .unwrap();
+  let durable = temp(&mut host, 5);
+  host.write_out(durable).unwrap();
+  barrier(&mut host, &[durable]);
+  host.place(durable, root, "durable").unwrap();
+  assert_eq!(
+    host.visible_before_durable(),
+    [
+      "/unsynced",
+      "/written_out",
+      "/barrier_only",
+      "/changed",
+      "/changed_while_running"
+    ]
+    .map(str::to_owned)
+  );
+}
+
+/// AUD-29-25. Do: land the crash scenario on each simulated filesystem in one call, then again stepped one
+/// unit per slice. Expect: the sliced run leaves the same disk, the same report (every entry's outcome and the
+/// counts) and the same overlay, and it took more slices than the manifest has entries — the slicing is
+/// real, and where a slice ends changes nothing.
+#[test]
+fn a_landing_stepped_one_unit_per_slice_lands_exactly_as_the_one_call() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: false,
+    },
+  ] {
+    let (before, after, writes, whole) = crash_reference_in(fs, Session::new());
+    let (sliced_before, sliced_after, sliced_writes, sliced) =
+      crash_reference_in(fs, Session::sliced());
+    assert_eq!((sliced_before, sliced_after), (before, after));
+    assert_eq!(sliced_writes, writes, "the same host writes");
+    assert_eq!(sliced.outcomes, whole.outcomes);
+    assert_eq!(sliced.counts, whole.counts);
+    assert_eq!(sliced.diverged, whole.diverged);
+    assert_eq!(whole.slices, 0, "the one call takes no slices");
+    assert!(
+      usize::try_from(sliced.slices).unwrap() > sliced.outcomes.len(),
+      "{} slices for {} entries",
+      sliced.slices,
+      sliced.outcomes.len()
+    );
+  }
+}
+
+/// A-132. Do: land the crash scenario on each simulated filesystem in one call, then sliced with each barrier held away
+/// from the run for three slices before it runs — a busy disk holding the barrier while the shard steps on. Expect: the
+/// held run leaves the same disk, the same host writes, the same report and the same overlay as the one call; no name
+/// was visible before its temporary was durable; and barriers were held (the non-vacuity), the run stepping nothing
+/// and giving no barrier out twice while each was away (asserted by the driver).
+#[test]
+fn a_landing_waits_on_each_barrier_away_and_lands_exactly_as_the_one_call() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+  ] {
+    let (before, after, writes, whole) = crash_reference_in(fs, Session::new());
+    let (held_before, held_after, held_writes, held) =
+      crash_reference_in(fs, Session::sliced_holding_barriers(3));
+    assert_eq!((held_before, held_after), (before, after));
+    assert_eq!(held_writes, writes, "the same host writes");
+    assert_eq!(held.outcomes, whole.outcomes);
+    assert_eq!(held.counts, whole.counts);
+    assert_eq!(held.diverged, whole.diverged);
+    assert!(held.visible_before_durable.is_empty(), "{held:?}");
+    assert!(held.barriers_away > 0, "no barrier was held away");
+  }
+}
+
+/// AUD-29-25 with T-1.15. Do: crash the sliced landing at every write instruction, then resume it sliced.
+/// Expect: as for the one call — every path old or new (or aside, without the exchange), the resume reaching
+/// the reference, and every sibling swept.
+#[test]
+fn a_sliced_landing_crashed_at_every_write_instruction_resumes_to_the_reference() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+  ] {
+    let (before, after, steps) = crash_reference(fs);
+    for crash_at in 0..steps {
+      crash_then_resume_in(fs, crash_at, &before, &after, Session::sliced());
+    }
+  }
+}
+
+/// T-1.15 and T-1.16 with AUD-29-04: the same crash at every write instruction on a filesystem without the
+/// exchange. Every path is old or new, or absent while its old entry sits aside at one of the landing's own
+/// names (a crash inside the fallback's window); the resume puts such an entry back before its verdicts are
+/// taken, then reaches the reference, sweeps the siblings, and a further run plans nothing.
+#[test]
+fn t_1_15_without_exchange_crash_at_every_write_instruction_then_resume() {
+  let set_aside = crash_at_every_instruction(Filesystem {
+    exchange: false,
+    unnamed_temporaries: true,
+  });
+  // Not vacuous: some crash fell inside a window and left an entry aside for the resume to put back.
+  assert!(set_aside > 0, "no crash fell inside a window");
+}
+
+// ---------------------------------------------------------------- exchange fallback
+
+/// T-1.16: a filesystem without exchange; a replacement moves the old file aside and the new one in, never
+/// over anything (AUD-29-04); the window the name is absent is measured into the outcome; the Degraded cell
+/// is reported; an outsider edit before the write is still refused (at the verify).
+#[test]
+fn t_1_16_without_exchange_the_fallback_reports_its_window() {
+  let mut host = SimHost::new();
+  host.set_exchange_supported(false);
+  example_base(&mut host, 20);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  example_edits(&mut vol, &mut host, &mut store);
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let mut outsider = Outsider {
+    victims: vec!["/tests/a.rs"],
+  };
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land_with(example_request(5), &mut outsider)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert!(
+    report
+      .degraded
+      .iter()
+      .any(|d| matches!(d, Degradation::NoExchange { .. })),
+    "{:?}",
+    report.degraded
+  );
+  let lib = report
+    .entries
+    .iter()
+    .find(|e| e.path.as_ref() == "/src/lib.rs")
+    .unwrap();
+  assert_eq!(lib.outcome, Some(Outcome::Written));
+  assert!(
+    lib.window_ns.is_some(),
+    "the window is written into the outcome"
+  );
+  assert_eq!(
+    *outcome_of(&report, "/tests/a.rs"),
+    Outcome::Conflict(ConflictClass::TargetInUse)
+  );
+  assert_eq!(host.bytes("/tests/a.rs").unwrap(), b"outsider /tests/a.rs");
+  assert_eq!(host.bytes("/src/lib.rs").unwrap(), b"edited lib");
+  assert!(hidden_names(&host).is_empty());
+}
+
+/// Named temporaries (no `O_TMPFILE`): the same landing, the hidden names gone after.
+#[test]
+fn named_temporaries_leave_nothing_behind() {
+  let mut host = SimHost::new();
+  host.set_unnamed_temporaries(false);
+  example_base(&mut host, 20);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  example_edits(&mut vol, &mut host, &mut store);
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(example_request(6))
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(hidden_names(&host).is_empty());
+  assert_eq!(host.bytes("/src/new1.rs").unwrap(), b"new 1");
+}
+
+// ---------------------------------------------------------------- T-1.12
+
+/// T-1.12: `rm -r` of a 40k-entry base directory, then two files recreated inside; the plan
+/// is one recursive removal (a clear) and two creates; the landing leaves exactly two entries.
+#[test]
+fn t_1_12_a_removed_and_recreated_directory_plans_one_clear_and_two_creates() {
+  let mut host = SimHost::new();
+  host.mkdir("/big");
+  for f in 0..40_000 {
+    host.replace_file(&format!("/big/f{f}"), b"x");
+  }
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  rm_r(&mut vol, &mut host, &mut store, "/big");
+  mkdir(&mut vol, &mut host, &mut store, "/big");
+  write_file(&mut vol, &mut host, &mut store, "/big/one", b"1");
+  write_file(&mut vol, &mut host, &mut store, "/big/two", b"2");
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let presented = setup.present(&request(7));
+  let actions: Vec<&Action> = presented
+    .manifest
+    .entries
+    .iter()
+    .map(|e| &e.action)
+    .collect();
+  assert_eq!(
+    actions,
+    vec![&Action::Clear, &Action::Create, &Action::Create],
+    "{actions:?}"
+  );
+  let report = setup.land(request(7)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  let inside: Vec<String> = host
+    .paths()
+    .into_iter()
+    .filter(|(p, _)| p.starts_with("/big/"))
+    .map(|(p, _)| p)
+    .collect();
+  assert_eq!(inside, vec!["/big/one".to_owned(), "/big/two".to_owned()]);
+  assert!(
+    vol.diverged(&store).is_empty(),
+    "{:?}",
+    vol.diverged(&store)
+  );
+}
+
+// ---------------------------------------------------------------- scratch landings
+
+/// Checks the public host namespace while each entry is written, not just after cleanup has
+/// hidden an out-of-target stage. This observer permits exactly the granted `/out` subtree.
+struct ContainedWrites {
+  checked: usize,
+}
+
+impl Observer<SimHost> for ContainedWrites {
+  fn before_write(&mut self, host: &mut SimHost, _entry: &LandingEntry) {
+    self.checked += 1;
+    for (path, _) in host.paths() {
+      assert!(
+        path == "/" || path == "/out" || path.starts_with("/out/"),
+        "the target grant did not authorize {path}"
+      );
+    }
+  }
+}
+
+/// AC-9.4 / T-9.1, R1: grant a landing into an empty child directory. Its parent is available
+/// for resolving the target, but no stage may appear beside that target while writing.
+#[test]
+fn a_target_grant_keeps_the_landing_inside_its_directory() {
+  let mut host = SimHost::new();
+  host.mkdir("/out");
+  let root = host.root();
+  let target = LandingTarget {
+    dir: host.open_dir(root, "out").unwrap(),
+    key: "/out".into(),
+  };
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  write_file(&mut vol, &mut host, &mut store, "/file", b"granted");
+  let mut session = Session::new();
+  let mut observed = ContainedWrites { checked: 0 };
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land_with(request(1), &mut observed)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(observed.checked, 1, "the actual write was observed");
+  assert_eq!(host.bytes("/out/file").unwrap(), b"granted");
+}
+
+/// AC-1.10 / T-9.1: create a nested scratch tree through the inode-based operations used by
+/// native mounts, then grant its landing. Every directory and the file must reach the target;
+/// the overlay-aware fixture helpers must not hide a missing scratch-directory declaration.
+#[test]
+fn a_scratch_tree_created_by_inode_lands_its_parent_directories_and_file() {
+  let mut host = SimHost::new();
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let outer = vol.mkdir_no(&mut store, root, "outer", 0o755).unwrap();
+  let inner = vol.mkdir_no(&mut store, outer, "inner", 0o755).unwrap();
+  let file = vol
+    .create_file_no(&mut store, inner, "file", 0o644)
+    .unwrap();
+  vol.write(&mut store, file, 0, b"landed").unwrap();
+  let snapshot = vol.snapshot(&mut store).unwrap();
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(report.written, 3, "both parents and their file: {report:?}");
+  assert_eq!(setup.host.bytes("/outer/inner/file").unwrap(), b"landed");
+  assert!(setup.present(&request(2)).manifest.entries.is_empty());
+  let mut preserved = Volume::clone_of(setup.store, setup.vol, snapshot, config()).unwrap();
+  assert_eq!(
+    read_through(&mut preserved, setup.host, setup.store, "/outer/inner/file"),
+    b"landed"
+  );
+}
+
+/// Ten directories of a hundred files each in a scratch volume.
+fn scratch_tree(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  for d in 0..10 {
+    mkdir(vol, host, store, &format!("/d{d}"));
+    for f in 0..100 {
+      write_file(
+        vol,
+        host,
+        store,
+        &format!("/d{d}/f{f}"),
+        format!("{d}/{f}").as_bytes(),
+      );
+    }
+  }
+}
+
+/// AC-1.10 / R1: land a scratch tree inside an empty target without replacing its identity;
+/// the volume becomes an overlay, a second landing plans nothing, and reads follow the disk.
+#[test]
+fn a_scratch_volume_into_an_empty_target_preserves_the_target() {
+  let mut host = SimHost::new();
+  host.mkdir("/out");
+  let root = host.root();
+  let dir = host.open_dir(root, "out").unwrap();
+  let target = LandingTarget {
+    dir,
+    key: "/out".into(),
+  };
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  scratch_tree(&mut vol, &mut host, &mut store);
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(8)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  let reopened = setup.host.open_dir(root, "out").unwrap();
+  assert_eq!(
+    setup.host.fingerprint_dir(target.dir).unwrap().ino,
+    setup.host.fingerprint_dir(reopened).unwrap().ino
+  );
+  setup.host.close_dir(reopened);
+  assert_eq!(report.written, 1_010);
+  let presented = setup.present(&request(8));
+  assert!(presented.manifest.entries.is_empty());
+  assert_eq!(host.bytes("/out/d3/f7").unwrap(), b"3/7");
+  assert!(hidden_names(&host).is_empty());
+  assert!(
+    vol.is_overlay(),
+    "a scratch volume gains a base on the target"
+  );
+  assert!(vol.diverged(&store).is_empty());
+  assert_reads_follow_the_disk(&mut vol, &mut host, &mut store);
+}
+
+/// After the landing the volume reads the file from the disk and follows an outsider's edit.
+fn assert_reads_follow_the_disk(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  assert_eq!(read_through(vol, host, store, "/d3/f7"), b"3/7");
+  host.advance_ns(1_000_000);
+  host.replace_file("/out/d3/f7", b"disk");
+  assert_eq!(
+    read_through(vol, host, store, "/d3/f7"),
+    b"disk",
+    "untouched entries follow the live disk"
+  );
+}
+
+/// A scratch volume into a populated target lands in place, creates only, with `CreateCreate`
+/// when a name already holds different bytes.
+#[test]
+fn a_scratch_volume_into_a_populated_target_lands_in_place() {
+  let mut host = SimHost::new();
+  host.replace_file("/existing", b"theirs");
+  host.replace_file("/same", b"same");
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  write_file(&mut vol, &mut host, &mut store, "/fresh", b"fresh");
+  write_file(&mut vol, &mut host, &mut store, "/same", b"same");
+  write_file(&mut vol, &mut host, &mut store, "/existing", b"mine");
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let refused = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(request(9));
+  let Err(LandingRefusal::Conflict(entries)) = refused else {
+    panic!("{refused:?}");
+  };
+  let existing = entries
+    .iter()
+    .find(|e| e.path.as_ref() == "/existing")
+    .unwrap();
+  assert_eq!(
+    existing.verdict,
+    Some(Verdict::Conflict(ConflictClass::CreateCreate))
+  );
+  let same = entries.iter().find(|e| e.path.as_ref() == "/same").unwrap();
+  assert_eq!(
+    same.verdict,
+    Some(Verdict::Skip),
+    "same bytes: nothing to do"
+  );
+  assert_eq!(host.bytes("/existing").unwrap(), b"theirs");
+  unlink(&mut vol, &mut host, &mut store, "/existing");
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(request(10))
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(host.bytes("/fresh").unwrap(), b"fresh");
+}
+
+// ---------------------------------------------------------------- grants and leases
+
+/// The failure matrix: a single-use grant bound to another manifest refuses with nothing
+/// written; a held lease refuses before anything else.
+#[test]
+fn a_mismatched_grant_and_a_held_lease_refuse() {
+  let mut host = SimHost::new();
+  example_base(&mut host, 4);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/src/lib.rs", b"v1");
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let presented = setup.present(&request(11));
+  let once = setup
+    .session
+    .grants
+    .issue(
+      Surface::Cli,
+      presented.manifest.hash,
+      presented.binding.clone(),
+      GrantScope::Once,
+      1,
+      TERM_NS,
+    )
+    .expect("a grant id");
+  // The plan changed after the human saw it.
+  write_file(setup.vol, setup.host, setup.store, "/src/lib.rs", b"v2");
+  let mut req = request(11);
+  req.grant = Some(once);
+  let refused = setup.try_land(&req, &mut Unobserved);
+  assert!(
+    matches!(
+      refused,
+      Err(LandingRefusal::Grant(GrantRefusal::GrantMismatch { .. }))
+    ),
+    "{refused:?}"
+  );
+  assert_eq!(setup.host.bytes("/src/lib.rs").unwrap(), b"base lib");
+  assert!(
+    setup
+      .session
+      .grants
+      .get(once)
+      .is_some_and(|g| g.state == GrantState::Issued),
+    "the mismatched grant was never used"
+  );
+}
+
+/// A held lease refuses before anything else; released, the landing runs and consumes its
+/// single-use grant.
+#[test]
+fn a_held_lease_refuses_and_a_single_use_grant_is_consumed() {
+  let mut host = SimHost::new();
+  example_base(&mut host, 4);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/src/lib.rs", b"v2");
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let mut req = request(11);
+  let presented = setup.present(&request(11));
+  let fresh = setup
+    .session
+    .grants
+    .issue(
+      Surface::Cli,
+      presented.manifest.hash,
+      presented.binding.clone(),
+      GrantScope::Once,
+      1,
+      TERM_NS,
+    )
+    .expect("a grant id");
+  req.grant = Some(fresh);
+  let key = common::target_lease_key(setup.host, setup.target);
+  let held = setup.session.leases.take(&key, 99, 1, TERM_NS).unwrap();
+  let refused = setup.try_land(&req, &mut Unobserved);
+  assert!(
+    matches!(refused, Err(LandingRefusal::LeaseHeld(_))),
+    "{refused:?}"
+  );
+  assert_eq!(setup.host.bytes("/src/lib.rs").unwrap(), b"base lib");
+  setup.session.leases.release(&held);
+  let report = setup.try_land(&req, &mut Unobserved).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(setup.host.bytes("/src/lib.rs").unwrap(), b"v2");
+  assert!(
+    setup
+      .session
+      .grants
+      .get(fresh)
+      .is_some_and(|g| g.state == GrantState::Consumed),
+    "a single-use grant is consumed by its landing"
+  );
+}
+
+/// A session grant covers later landings of the same volume into the same target; each still
+/// presents and still lands; the grant is not consumed; the audit log has every finish.
+#[test]
+fn a_session_grant_covers_the_next_landing() {
+  let mut host = SimHost::new();
+  example_base(&mut host, 4);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/src/lib.rs", b"v1");
+  let target = root_target(&mut host);
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let presented = setup.present(&request(12));
+  let grant = setup
+    .session
+    .grants
+    .issue(
+      Surface::Confirmation,
+      presented.manifest.hash,
+      presented.binding.clone(),
+      GrantScope::Session,
+      1,
+      TERM_NS,
+    )
+    .expect("a grant id");
+  let mut req = request(12);
+  req.grant = Some(grant);
+  let report = setup.try_land(&req, &mut Unobserved).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(setup.host.bytes("/src/lib.rs").unwrap(), b"v1");
+  write_file(setup.vol, setup.host, setup.store, "/src/lib.rs", b"v3");
+  let report = setup.try_land(&req, &mut Unobserved).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(setup.host.bytes("/src/lib.rs").unwrap(), b"v3");
+  assert!(
+    setup
+      .session
+      .grants
+      .get(grant)
+      .is_some_and(|g| g.state == GrantState::Issued),
+    "a session grant is not consumed"
+  );
+  let finished = setup
+    .session
+    .audit
+    .records()
+    .iter()
+    .filter(|r| r.kind == AuditKind::LandingFinished)
+    .count();
+  assert_eq!(finished, 2);
+}
+
+/// Sets the Windows attribute bits `bits` (a Win32 word) on the file at `path` through the overlay, as the WinFsp
+/// drive's `SetFileAttributes` does (A-262).
+fn set_windows_bits(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  path: &str,
+  bits: u32,
+) {
+  let (dir, name) = split(path);
+  let d = common::dir_of(vol, host, store, dir);
+  let mut o = vol.with_host(host);
+  let no = o.lookup(store, d, name).unwrap().inode;
+  o.set_windows_attributes(
+    store,
+    no,
+    slates_vfs::inode::WindowsAttributes::kept(bits, slates_vfs::inode::Kind::File),
+  )
+  .unwrap();
+}
+
+/// A-262, stage 1 (no landing applies the bits yet). Do: run §4.15's worked example twice over the same base, the second
+/// time with Windows attribute bits set (`HIDDEN | SYSTEM`) on an edited file, on a created one, and on a base file the
+/// work never otherwise touched. Expect: both landings are `Done` with nothing refused, and they leave the same disk,
+/// byte for byte and kind for kind: a landing carries the bits nowhere and fails on none of them.
+#[test]
+fn a_landing_ignores_windows_attribute_bits_without_error() {
+  let land = |with_bits: bool| {
+    let mut host = SimHost::new();
+    example_base(&mut host, 16);
+    let mut store = store();
+    let mut vol = overlay(&mut host, &mut store);
+    example_edits(&mut vol, &mut host, &mut store);
+    if with_bits {
+      for path in ["/src/lib.rs", "/src/new1.rs", "/src/f12.rs"] {
+        set_windows_bits(&mut vol, &mut host, &mut store, path, 0x2 | 0x4);
+      }
+    }
+    let target = root_target(&mut host);
+    let mut session = Session::new();
+    let mut setup = Setup {
+      host: &mut host,
+      target: &target,
+      vol: &mut vol,
+      store: &mut store,
+      session: &mut session,
+    };
+    let report = setup.land(example_request(1)).unwrap();
+    assert_eq!(report.state, LandingState::Done, "{report:?}");
+    (disk(&host), report.written)
+  };
+  let (with_bits, written_with_bits) = land(true);
+  let (without, written_without) = land(false);
+  assert_eq!(
+    with_bits, without,
+    "the bits change nothing a landing writes, and refuse nothing"
+  );
+  assert_eq!(
+    written_with_bits, written_without,
+    "nor how many entries it writes ({written_without})"
+  );
+}

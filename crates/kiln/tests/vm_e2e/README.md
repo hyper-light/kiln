@@ -15,7 +15,10 @@ at one.
 | `crates/kiln/tests/fixtures/vm-stub/harness/`, `vm_e2e::stub_agentfile` | the stand-in as a microVM image: its harness directory, and its Agentfile, its text alone, which the drive writes for each harness and keeps in kiln for the run |
 
 Step 35's own (`vm_e2e/step35.rs`, `vm_e2e/gaps.json`, `vm_e2e/mcp.rs`, `ui/e2e/vm-harnesses.spec.ts`)
-are its agent's and say how they run.
+are its agent's and say how they run. `crates/kiln/tests/slates_e2e.rs` (kiln goal
+28e73c34ff3d898696d8210ef3b9fa94) builds on this drive and on the stand-in's `APPEND`, `REMOVE`, `RAISE`
+and `LAND` words: agents on Slates volumes on the host and in microVMs, each one's landing as its mode
+gives it; its module doc says how it runs.
 
 ## The drive, and what each step checks
 

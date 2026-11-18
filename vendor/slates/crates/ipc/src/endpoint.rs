@@ -1,0 +1,1072 @@
+//! The two ends of one client's rings (§4.7 "Protocol", "Wake strategy"): the client end
+//! writes requests and waits for replies, spinning for its wake estimate before parking on the
+//! wake word; the daemon end drains requests and writes replies, waking a parked client. The
+//! estimate starts at the window the daemon published (its boot probe's mean wake) and learns
+//! from each park a reply ended: the daemon stamps the host clock just before it wakes a parked
+//! client, and the client times the stamp to its own return (§4.3's online estimate, the same
+//! rule as the shard's). Each end owns its sequence cursors; the slots' sequence words carry the
+//! protocol, so neither end touches a shared counter on the hot path.
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::RawSocket;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+use slates_machine::wake::WakeEstimate;
+
+use crate::error::IpcError;
+use crate::region::{
+  ClientRegion, PARKED_STAMP_SLOT_ONE, PARKED_STAMP_SLOT_ZERO, REPLY_STAMP_CONFIRMED,
+  REPLY_STAMP_SLOTS,
+};
+use crate::slot::{Slot, SlotKind};
+// The word-based wake serves Linux/macOS; Windows waits on and signals the region's named Event
+// instead (`ClientRegion::wake_wait`/`wake_signal`), so this import is dead there.
+#[cfg(not(windows))]
+use crate::wake;
+
+/// Format: the eight bytes a completion signal writes (an eventfd counter increment on Linux; a byte
+/// stream elsewhere reads them as one nudge). The value is not read — the fd's readability is the
+/// signal — so any nonzero eight bytes serve; `1` matches the eventfd add-one convention.
+#[cfg(unix)]
+const COMPLETION_NUDGE: [u8; 8] = 1u64.to_ne_bytes();
+
+/// A request as the daemon end hands it to the server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Request {
+  /// The request id word.
+  pub request: u64,
+  /// The kind.
+  pub kind: SlotKind,
+  /// The payload.
+  pub payload: Vec<u8>,
+}
+
+/// A reply as the client end returns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reply {
+  /// The request id word it answers.
+  pub request: u64,
+  /// The kind.
+  pub kind: SlotKind,
+  /// The payload.
+  pub payload: Vec<u8>,
+}
+
+/// The client's end.
+pub struct ClientEnd {
+  region: ClientRegion,
+  doorbell: Option<crate::rendezvous::Doorbell>,
+  liveness: Option<crate::rendezvous::Liveness>,
+  /// A spin window the caller chose over the daemon's published one (a caller that wants
+  /// the reply without a wake spins for its own latency floor).
+  spin_override_ns: Option<u64>,
+  next_request: u64,
+  next_reply: u64,
+  /// Wakes the client had to park for (the spin-to-park ratio's numerator).
+  parks: u64,
+  /// Replies taken.
+  replies: u64,
+  /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
+  /// reply's wake that landed after its reply was taken and found this park — so the client parked
+  /// again. Every park ends in a reply, one of these, or the deadline.
+  unanswered_wakes: u64,
+  /// The client's online wake estimate, its spin window: seeded with the window the daemon published
+  /// and fed the wake of each park a reply ended, from the daemon's reply stamp to the client running
+  /// again ([`Self::wait`]).
+  wake: WakeEstimate,
+  /// Parks whose wake fed the estimate (a non-vacuity count).
+  wake_samples: u64,
+  /// Parks a reply ended, as `(waiting_ns, returned_ns)` by the reply stamp slot each named, whose stamp
+  /// the daemon had not yet confirmed when the client read it: settled at a later park's arming, and given
+  /// up when the slot is armed again (`region::REPLY_STAMP_SLOTS`).
+  unsettled: [Option<(u64, u64)>; REPLY_STAMP_SLOTS],
+  /// The reply stamp slot the next park names: the slots alternate, so a confirmation that lands after
+  /// the next park armed finds its own slot intact.
+  next_stamp_slot: usize,
+  /// The completion fd an async SDK event loop polls for reply-readiness (§4.7, D-19): the daemon
+  /// makes it readable when it writes a reply to a parked client, so an `asyncio`/`uv_poll` loop wakes
+  /// without spinning. `None` for the sync client (it parks on the wake word) and where the platform
+  /// has no completion channel yet. The fd is read-drained and the reply taken with [`Self::try_take`].
+  #[cfg(unix)]
+  completion: Option<OwnedFd>,
+  /// The completion bridge (a self-pipe fed by a thread), started on demand for an SDK that adopts the
+  /// completion fd into a stream; `None` for a sync client and until the first such async use. On
+  /// macOS the thread parks on the wake word (macOS passes no shared completion fd, D-10) and both the
+  /// plain and dup async paths use it. On Linux it polls the rendezvous eventfd (`self.completion`):
+  /// Python's asyncio polls that eventfd directly and needs no bridge, so only the dup path (Node,
+  /// whose `net.Socket` refuses an eventfd) starts one, to convert the eventfd to a pollable pipe.
+  #[cfg(any(target_os = "macos", target_os = "linux"))]
+  bridge: Option<crate::completion::CompletionBridge>,
+  /// The Windows completion bridge (a loopback socket fed by a thread parking on the region's named
+  /// Event), started on demand by [`Self::enable_async_completion`]; `None` for a sync client and
+  /// until the first async use. Windows passes no shared completion fd (Mach and named sockets are
+  /// refused, D-10), so the async SDK polls this bridge's socket, exactly as macOS polls its pipe.
+  #[cfg(windows)]
+  bridge: Option<crate::completion::CompletionBridge>,
+}
+
+impl std::fmt::Debug for ClientEnd {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ClientEnd")
+      .field("region", &self.region)
+      .field("parks", &self.parks)
+      .finish()
+  }
+}
+
+impl ClientEnd {
+  /// The client's end over an opened region.
+  pub fn new(region: ClientRegion) -> ClientEnd {
+    let wake = WakeEstimate::new(u64::from(region.spin_ns()), region.spin_shift());
+    ClientEnd {
+      wake,
+      wake_samples: 0,
+      unsettled: [None; REPLY_STAMP_SLOTS],
+      next_stamp_slot: 0,
+      region,
+      doorbell: None,
+      liveness: None,
+      spin_override_ns: None,
+      next_request: 0,
+      next_reply: 0,
+      parks: 0,
+      replies: 0,
+      unanswered_wakes: 0,
+      #[cfg(unix)]
+      completion: None,
+      #[cfg(any(target_os = "macos", target_os = "linux"))]
+      bridge: None,
+      #[cfg(windows)]
+      bridge: None,
+    }
+  }
+
+  /// The client's end over everything the rendezvous handed over: the region, the doorbell,
+  /// the liveness check, and (where the platform has one) the completion fd an async SDK polls.
+  /// These resources must move together: on Linux the liveness handle owns the control socket;
+  /// dropping it while retaining the ring tells the daemon to reap a client that is still in use.
+  // `connected` is mutated only to take the completion fd, which is a Unix concern; on Windows it is
+  // read-only, so the `mut` is dead there.
+  #[cfg_attr(windows, allow(unused_mut))]
+  pub fn connected(mut connected: crate::rendezvous::Connected) -> ClientEnd {
+    #[cfg(unix)]
+    let completion = connected.take_completion();
+    let mut end = ClientEnd::new(connected.region);
+    end.doorbell = Some(connected.doorbell);
+    end.liveness = Some(connected.liveness);
+    #[cfg(unix)]
+    {
+      end.completion = completion;
+    }
+    end
+  }
+
+  /// Sets the completion fd (the rendezvous's, or a paired fd a test injects). The daemon's end makes
+  /// it readable on a reply to a parked client; an async SDK polls it.
+  #[cfg(unix)]
+  pub fn set_completion(&mut self, completion: OwnedFd) {
+    self.completion = Some(completion);
+  }
+
+  /// The completion fd for an async SDK event loop to poll (`asyncio.add_reader` / `uv_poll`, D-19),
+  /// or `None` for a sync client or a platform without one. The loop waits for it to become readable,
+  /// drains it ([`Self::drain_completion`]), then takes the reply with [`Self::try_take`].
+  #[cfg(unix)]
+  pub fn completion_fd(&self) -> Option<RawFd> {
+    // Where a bridge was started (macOS always, Linux only for the fd-adopting dup path), it is the
+    // descriptor the loop polls; otherwise it is the raw completion fd (Linux's rendezvous eventfd).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(bridge) = &self.bridge {
+      return Some(bridge.completion_fd());
+    }
+    self.completion.as_ref().map(AsRawFd::as_raw_fd)
+  }
+
+  /// Clears the completion fd's readiness bytes after the event loop reports it readable, so the next
+  /// wait blocks again rather than seeing a stale nudge. Best-effort — a non-blocking read that takes
+  /// the buffered bytes (an eventfd resets its counter; a socket drains its nudges); an empty fd is a
+  /// no-op.
+  #[cfg(unix)]
+  pub fn drain_completion(&self) {
+    // A started bridge owns the descriptor the loop polls, so drain its pipe; otherwise drain the raw
+    // completion fd (Linux's eventfd, whose read resets its counter).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(bridge) = &self.bridge {
+      bridge.drain();
+      return;
+    }
+    if let Some(fd) = &self.completion {
+      let mut scratch = [0u8; 64];
+      let _ = rustix::io::read(fd, &mut scratch);
+    }
+  }
+
+  /// Enables the async completion channel and returns the descriptor an event loop polls
+  /// (`add_reader` / `uv_poll`, D-19). Idempotent — the same descriptor each call. On Linux this is
+  /// the eventfd the rendezvous passed (the daemon writes it directly); on macOS it starts the
+  /// completion bridge (a self-pipe fed by a thread parking on the wake word) on first use. The SDK
+  /// registers the descriptor once, arms the parked flag with [`Self::arm_async`] before it yields,
+  /// re-checks [`Self::try_take`] to close the race, and drains the fd with [`Self::drain_completion`]
+  /// when the loop reports it readable.
+  #[cfg(unix)]
+  pub fn enable_async_completion(&mut self) -> Result<RawFd, IpcError> {
+    #[cfg(target_os = "macos")]
+    {
+      if let Some(bridge) = &self.bridge {
+        return Ok(bridge.completion_fd());
+      }
+      let bridge = crate::completion::CompletionBridge::start(&self.region)?;
+      let fd = bridge.completion_fd();
+      self.bridge = Some(bridge);
+      Ok(fd)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      self.completion_fd().ok_or(IpcError::Unsupported {
+        feature: "async completion fd (the rendezvous passed no completion descriptor)",
+      })
+    }
+  }
+
+  /// Like [`Self::enable_async_completion`] but returns a **dup** the caller owns and must close — for
+  /// an SDK whose event loop adopts and closes the descriptor it polls (Node's `net.Socket`; `asyncio`
+  /// only polls it, so it uses `enable_async_completion`). The dup and the client's own descriptor
+  /// refer to the same pipe, so closing the dup leaves the client's intact — no double close.
+  ///
+  /// On Linux this is also where the fd-adopting SDK diverges from the direct one: the rendezvous
+  /// eventfd is not adoptable as a Node stream (`net.Socket` refuses an eventfd, `ERR_INVALID_FD_TYPE`),
+  /// so this starts a [`crate::completion::CompletionBridge`] that converts the eventfd's readiness to
+  /// a pollable self-pipe and returns a dup of the pipe. The plain [`Self::enable_async_completion`]
+  /// still hands Python the raw eventfd, which its `asyncio` selector polls directly with no bridge.
+  #[cfg(unix)]
+  pub fn enable_async_completion_dup(&mut self) -> Result<RawFd, IpcError> {
+    // Ensure the channel exists (starts the macOS bridge; Linux already holds the eventfd).
+    self.enable_async_completion()?;
+    #[cfg(target_os = "linux")]
+    {
+      // Start the pipe bridge over a dup of the eventfd (the client keeps its own copy), then hand the
+      // caller a dup of the bridge's pipe read end — the descriptor Node's `net.Socket` can adopt.
+      if self.bridge.is_none() {
+        let eventfd = self.completion.as_ref().ok_or(IpcError::Unsupported {
+          feature: "async completion fd (the rendezvous passed no completion descriptor)",
+        })?;
+        let eventfd_dup = rustix::io::dup(eventfd).map_err(|error| IpcError::OsRefused {
+          call: "dup",
+          code: Some(error.raw_os_error()),
+        })?;
+        self.bridge = Some(crate::completion::CompletionBridge::start_from_eventfd(
+          eventfd_dup,
+        )?);
+      }
+      match &self.bridge {
+        Some(bridge) => Ok(bridge.dup_fd()?.into_raw_fd()),
+        None => Err(IpcError::Unsupported {
+          feature: "async completion fd (the completion bridge did not start)",
+        }),
+      }
+    }
+    #[cfg(target_os = "macos")]
+    {
+      // The plain path already started the bridge; a dup of its pipe is the caller-owned descriptor.
+      match &self.bridge {
+        Some(bridge) => Ok(bridge.dup_fd()?.into_raw_fd()),
+        None => Err(IpcError::Unsupported {
+          feature: "async completion fd (the completion bridge did not start)",
+        }),
+      }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    match &self.completion {
+      Some(fd) => Ok(
+        rustix::io::dup(fd)
+          .map_err(|error| IpcError::OsRefused {
+            call: "dup",
+            code: Some(error.raw_os_error()),
+          })?
+          .into_raw_fd(),
+      ),
+      None => Err(IpcError::Unsupported {
+        feature: "async completion fd (the rendezvous passed no completion descriptor)",
+      }),
+    }
+  }
+
+  /// The completion socket for an async SDK event loop to poll (`uv_poll` / a Python selector, D-19),
+  /// or `None` for a sync client or until [`Self::enable_async_completion`] starts the bridge. The
+  /// loop waits for it to become readable, drains it ([`Self::drain_completion`]), then takes the
+  /// reply with [`Self::try_take`]. The Windows analogue of `Self::completion_fd`, which is the Unix arm and so never exists where this one does.
+  #[cfg(windows)]
+  pub fn completion_socket(&self) -> Option<RawSocket> {
+    self
+      .bridge
+      .as_ref()
+      .map(crate::completion::CompletionBridge::completion_socket)
+  }
+
+  /// Clears the completion socket's readiness after the event loop reports it readable, so the next
+  /// wait blocks again rather than seeing a stale nudge. Best-effort — a non-blocking read of the
+  /// buffered nudges; a no-op before the bridge starts or when the socket is already drained.
+  #[cfg(windows)]
+  pub fn drain_completion(&self) {
+    if let Some(bridge) = &self.bridge {
+      bridge.drain();
+    }
+  }
+
+  /// Enables the async completion channel and returns the socket an event loop polls (`uv_poll` / a
+  /// selector, D-19). Idempotent — the same socket each call. Windows passes no shared completion fd
+  /// (Mach and named sockets are refused, D-10), so this starts the completion bridge (a loopback
+  /// socket fed by a thread parking on the region's named Event) on first use, exactly as macOS
+  /// starts its self-pipe bridge. The SDK registers the socket once, arms the parked flag with
+  /// [`Self::arm_async`] before it yields, re-checks [`Self::try_take`] to close the race, and drains
+  /// the socket with [`Self::drain_completion`] when the loop reports it readable.
+  #[cfg(windows)]
+  pub fn enable_async_completion(&mut self) -> Result<RawSocket, IpcError> {
+    if let Some(bridge) = &self.bridge {
+      return Ok(bridge.completion_socket());
+    }
+    let bridge = crate::completion::CompletionBridge::start(&self.region)?;
+    let socket = bridge.completion_socket();
+    self.bridge = Some(bridge);
+    Ok(socket)
+  }
+
+  /// Like [`Self::enable_async_completion`] but returns a **dup** the caller owns and must close — for
+  /// an SDK whose event loop closes the socket it polls (Node's `net.Socket` adopts and closes it;
+  /// asyncio only polls it, so it uses `enable_async_completion`). The dup and the client's own socket
+  /// refer to the same loopback endpoint, so closing the dup leaves the client's intact.
+  #[cfg(windows)]
+  pub fn enable_async_completion_dup(&mut self) -> Result<RawSocket, IpcError> {
+    self.enable_async_completion()?;
+    match &self.bridge {
+      Some(bridge) => bridge.dup_socket(),
+      None => Err(IpcError::Unsupported {
+        feature: "async completion socket (the bridge did not start)",
+      }),
+    }
+  }
+
+  /// Arms the completion signal before the SDK yields to its event loop: the daemon wakes a parked
+  /// client on a reply, making the completion fd readable, and the bridges nudge their pipe or socket
+  /// only while armed. This is the same `parked` flag the sync [`Self::wait`] sets; the async path manages
+  /// it explicitly because it never calls `wait`. A caller re-checks [`Self::try_take`] right after
+  /// arming to close the race with a reply that landed during the spin; the park protocol's fence
+  /// ([`crate::park::after_arming`]) orders that re-check after the flag, so a reply it misses is one the
+  /// daemon sees the flag for and wakes on (before 2026-09-29 there was no fence, and both could miss).
+  pub fn arm_async(&self) -> Result<(), IpcError> {
+    // The async path times no wake, so its stamp slot is never read: slot 0's flag only marks it armed.
+    self
+      .region
+      .client_parked()?
+      .store(PARKED_STAMP_SLOT_ZERO, Ordering::Release);
+    crate::park::after_arming();
+    Ok(())
+  }
+
+  /// Clears the arm ([`Self::arm_async`]) once a reply is taken, so a later fast-path reply costs the
+  /// daemon no wake and the bridge no pipe write.
+  pub fn disarm_async(&self) -> Result<(), IpcError> {
+    self.region.client_parked()?.store(0, Ordering::Release);
+    Ok(())
+  }
+
+  /// Whether the daemon this end was connected to is gone (dead or restarted); true for an
+  /// end that has no liveness check, so a caller reconnects rather than waits forever.
+  pub fn daemon_gone(&self) -> bool {
+    self.liveness.as_ref().is_none_or(|l| l.daemon_gone())
+  }
+
+  /// A descriptor that reports the daemon's departure when polled for `POLLRDHUP` (`Liveness::watch`, Linux), or `None`
+  /// for an end with no liveness check.
+  #[cfg(target_os = "linux")]
+  #[must_use]
+  pub fn daemon_watch(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    self
+      .liveness
+      .as_ref()
+      .map(crate::rendezvous::Liveness::watch)
+  }
+
+  /// Receives a descriptor the daemon sent over the control socket (§4.6: a content map, A-135; a stream end,
+  /// A-161), or `None` if none is waiting (or this end has no control socket). Non-blocking; the descriptor arrives
+  /// by `SCM_RIGHTS` with what it is for and the request it answers.
+  #[cfg(unix)]
+  pub fn recv_delivery(
+    &self,
+  ) -> Result<Option<crate::rendezvous::ControlDelivery>, crate::error::IpcError> {
+    match self.liveness.as_ref() {
+      Some(liveness) => liveness.recv_delivery(),
+      None => Ok(None),
+    }
+  }
+
+  /// The region.
+  pub fn region(&self) -> &ClientRegion {
+    &self.region
+  }
+
+  /// The region, mutably (the bulk area).
+  pub fn region_mut(&mut self) -> &mut ClientRegion {
+    &mut self.region
+  }
+
+  /// Chooses the spin window (`None`: the client's wake estimate, seeded with the daemon's published
+  /// window and refined from the client's own parks).
+  pub fn set_spin_ns(&mut self, spin_ns: Option<u64>) {
+    self.spin_override_ns = spin_ns;
+  }
+
+  /// The client's online wake estimate now, nanoseconds: its spin window unless one was chosen.
+  pub fn wake_estimate_ns(&self) -> u64 {
+    self.wake.mean_ns()
+  }
+
+  /// Parks whose measured wake fed the estimate.
+  pub fn wake_samples(&self) -> u64 {
+    self.wake_samples
+  }
+
+  /// Parks so far and replies so far (the measured spin-to-park ratio).
+  pub fn park_ratio(&self) -> (u64, u64) {
+    (self.parks, self.replies)
+  }
+
+  /// Parks a wake ended with no reply waiting, so the client parked again (see the field).
+  pub fn unanswered_wakes(&self) -> u64 {
+    self.unanswered_wakes
+  }
+
+  /// The ring index the next request takes (its bulk chunk is chosen by it).
+  pub fn next_request_index(&self) -> u64 {
+    self.next_request
+  }
+
+  /// Sends `message` as request `request`: packed for the next ring position (a body past a slot's inline payload goes
+  /// to that position's bulk chunk) and pushed; `RingFull` when the daemon has not taken the slot the ring wraps onto.
+  /// Room is checked before anything is packed: the position's bulk chunk is the oldest unread request's until the
+  /// daemon takes it, and a body packed there before a push refused `RingFull` was written over that request's
+  /// (`a_request_refused_ring_full_never_writes_over_an_unread_body`). The only way a request is packed.
+  pub fn send_message<M: slates_wire::Wire>(
+    &mut self,
+    request: u64,
+    message: &M,
+  ) -> Result<(), IpcError> {
+    let index = self.next_request;
+    if !self.region.cmd().can_push(self.region.object(), index)? {
+      return Err(IpcError::RingFull);
+    }
+    let slot = crate::protocol::pack(
+      &mut self.region,
+      crate::protocol::Direction::Request,
+      index,
+      request,
+      message,
+    )?;
+    self.send(&slot)
+  }
+
+  /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps
+  /// onto (the caller blocks on credit and retries; nothing is dropped). Rings the doorbell
+  /// when the daemon's shard has announced it is going idle — read after the doorbell protocol's
+  /// fence ([`crate::doorbell`]), so a shard that missed this request on its re-check is always rung.
+  pub fn send(&mut self, slot: &Slot) -> Result<(), IpcError> {
+    let cmd = self.region.cmd();
+    cmd.push(self.region.object_mut(), self.next_request, slot)?;
+    self.next_request = self.next_request.wrapping_add(1);
+    let announced = self.region.daemon_parked()?;
+    let parked =
+      crate::doorbell::after_publishing_idle_announced(|| announced.load(Ordering::Relaxed) != 0);
+    if parked {
+      self.region.doorbell()?.fetch_add(1, Ordering::AcqRel);
+      if let Some(bell) = &self.doorbell {
+        bell.ring()?;
+      }
+    }
+    Ok(())
+  }
+
+  /// Takes the next reply if one is there, its body owned: a bulk body is copied out before the slot is released, so
+  /// a daemon replying on into the freed slot's chunk never changes it ([`crate::protocol::owned`]).
+  pub fn try_take(&mut self) -> Result<Option<Reply>, IpcError> {
+    let cpl = self.region.cpl();
+    let Some(peeked) = cpl.peek(self.region.object(), self.next_reply)? else {
+      return Ok(None);
+    };
+    let owned = peeked.and_then(|slot| crate::protocol::owned(&self.region, slot));
+    cpl.release(self.region.object(), self.next_reply)?;
+    let slot = owned?;
+    self.next_reply = self.next_reply.wrapping_add(1);
+    self.replies = self.replies.saturating_add(1);
+    Ok(Some(Reply {
+      request: slot.request,
+      kind: slot.kind,
+      payload: slot.payload,
+    }))
+  }
+
+  /// Waits for the next reply: spins for the wake estimate, then parks on the wake word
+  /// (setting the parked flag and re-checking the slot to close the race), until the reply
+  /// arrives or `deadline_ns` (from the call) passes. A park a reply ended teaches the estimate
+  /// its wake.
+  pub fn wait(&mut self, deadline_ns: Option<u64>) -> Result<Reply, IpcError> {
+    let started = Instant::now();
+    let spin_ns = self.spin_override_ns.unwrap_or_else(|| self.wake.mean_ns());
+    loop {
+      if let Some(reply) = self.try_take()? {
+        return Ok(reply);
+      }
+      if elapsed_ns(started) < spin_ns {
+        std::hint::spin_loop();
+        continue;
+      }
+      if deadline_ns.is_some_and(|d| elapsed_ns(started) >= d) {
+        return Err(IpcError::DeadlineExceeded);
+      }
+      // Park: the flag first, the word's value (Linux/macOS), then the re-check that closes the race
+      // with a reply written between the last poll and the wait. On Linux/macOS the wait returns at
+      // once if the wake word moved past the value read here; on Windows the named auto-reset Event
+      // carries a signal made before the wait, so no separate value is needed. The park's reply stamp
+      // slot is cleared before the flag names it (the flag's release orders it), so the stamp read after
+      // the wake is the first one the daemon took for this park. Earlier parks' unconfirmed stamps are
+      // settled first; the one in this slot is given up, as one daemon serves the ring in order and its
+      // reply call returned before the reply this client took since.
+      let slot = self.next_stamp_slot;
+      self.next_stamp_slot = usize::from(slot == 0);
+      self.settle_wakes()?;
+      if let Some(given_up) = self.unsettled.get_mut(slot) {
+        *given_up = None;
+      }
+      self.region.reply_stamp(slot)?.store(0, Ordering::Relaxed);
+      self
+        .region
+        .client_parked()?
+        .store(parked_flag(slot), Ordering::Release);
+      // The park protocol's client half: the word's value and the re-check below are ordered after the
+      // flag, so a reply the re-check misses is one the daemon sees the flag for (§4.7; `crate::park`).
+      crate::park::after_arming();
+      #[cfg(not(windows))]
+      let expected = self.region.wake_word()?.load(Ordering::Acquire);
+      if let Some(reply) = self.try_take()? {
+        self.region.client_parked()?.store(0, Ordering::Release);
+        return Ok(reply);
+      }
+      self.parks = self.parks.saturating_add(1);
+      let remaining = deadline_ns.map(|d| d.saturating_sub(elapsed_ns(started)));
+      let waiting_ns = slates_machine::clock::monotonic_ns();
+      #[cfg(windows)]
+      let woken = self.region.wake_wait(remaining)?;
+      #[cfg(not(windows))]
+      let woken = wake::wait(self.region.wake_word()?, expected, remaining)?;
+      let returned_ns = slates_machine::clock::monotonic_ns();
+      self.region.client_parked()?.store(0, Ordering::Release);
+      if woken {
+        if let Some(unsettled) = self.unsettled.get_mut(slot) {
+          *unsettled = Some((waiting_ns, returned_ns));
+        }
+        self.settle_wakes()?;
+        if let Some(reply) = self.try_take()? {
+          return Ok(reply);
+        }
+        self.unanswered_wakes = self.unanswered_wakes.saturating_add(1);
+      }
+      if !woken && deadline_ns.is_some() {
+        if let Some(reply) = self.try_take()? {
+          return Ok(reply);
+        }
+        return Err(IpcError::DeadlineExceeded);
+      }
+    }
+  }
+}
+
+/// Format: whether the daemon's wake reports finding the client asleep, so a stamp is learned only once
+/// confirmed. Windows' auto-reset Event cannot tell a signal that met a sleeper from one that will be
+/// consumed later, so there a stamp inside the wait is learned unconfirmed — the stand-in the boot probe
+/// uses there too (`WakeLatency::asleep_confirmed`).
+const WAKER_CONFIRMS: bool = !cfg!(windows);
+
+/// The client's parked flag for a park that names `slot`.
+fn parked_flag(slot: usize) -> u32 {
+  if slot == 0 {
+    PARKED_STAMP_SLOT_ZERO
+  } else {
+    PARKED_STAMP_SLOT_ONE
+  }
+}
+
+/// The reply stamp slot a parked flag's value names (any armed value other than slot one's names slot 0).
+fn stamp_slot(parked: u32) -> usize {
+  usize::from(parked == PARKED_STAMP_SLOT_ONE)
+}
+
+impl ClientEnd {
+  /// Folds each unsettled park's wake into the estimate once its stamp can be judged: the daemon's reply
+  /// stamp to the client's return, when the daemon confirmed its wake found the client asleep and the
+  /// stamp falls inside the wait — a sleeper woken, the event the boot probe times. A reply that landed
+  /// while the park was being set up met a waiter not yet asleep: its wake finds no sleeper and is never
+  /// confirmed, and timing it would teach a wake that never happened (measured: the bench's daemon,
+  /// replying the instant the flag rose, taught 611–974 ns against the boot probe's 2.0–3.3 µs, macOS,
+  /// 2026-09-25). A stamp not yet confirmed stays unsettled: the daemon confirms after its wake call
+  /// returns, which the woken client can outrun by a whole further park under load (measured: 26 to 29 of
+  /// 32 parks on two busy CPUs, 2026-11-04), so it stays in its slot until that slot is armed again.
+  fn settle_wakes(&mut self) -> Result<(), IpcError> {
+    for slot in 0..REPLY_STAMP_SLOTS {
+      let Some(Some((waiting_ns, returned_ns))) = self.unsettled.get(slot).copied() else {
+        continue;
+      };
+      let stamp = self.region.reply_stamp(slot)?.load(Ordering::Acquire);
+      let confirmed = stamp & REPLY_STAMP_CONFIRMED != 0;
+      if WAKER_CONFIRMS && !confirmed {
+        continue;
+      }
+      if let Some(settled) = self.unsettled.get_mut(slot) {
+        *settled = None;
+      }
+      let sent_ns = stamp & !REPLY_STAMP_CONFIRMED;
+      if waiting_ns <= sent_ns && sent_ns <= returned_ns {
+        self.wake.record(returned_ns.saturating_sub(sent_ns));
+        self.wake_samples = self.wake_samples.saturating_add(1);
+      }
+    }
+    Ok(())
+  }
+}
+
+/// The daemon's end.
+pub struct DaemonEnd {
+  region: ClientRegion,
+  next_request: u64,
+  next_reply: u64,
+  /// Wakes issued.
+  wakes: u64,
+  /// The completion fd to make readable when a reply reaches a parked client, so an async SDK event
+  /// loop polling it wakes (§4.7, D-19). `None` where the platform has no completion channel. Signaled
+  /// only under the same parked check as the wake-word wake, so a spinning client costs no extra syscall.
+  #[cfg(unix)]
+  completion: Option<OwnedFd>,
+}
+
+impl std::fmt::Debug for DaemonEnd {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("DaemonEnd")
+      .field("region", &self.region)
+      .field("wakes", &self.wakes)
+      .finish()
+  }
+}
+
+impl DaemonEnd {
+  /// The daemon's end over the region it created.
+  pub fn new(region: ClientRegion) -> DaemonEnd {
+    DaemonEnd {
+      region,
+      next_request: 0,
+      next_reply: 0,
+      wakes: 0,
+      #[cfg(unix)]
+      completion: None,
+    }
+  }
+
+  /// Sets the completion fd the rendezvous handed the daemon for this client — the write end the daemon
+  /// nudges on a reply to a parked client. `None` clears it.
+  #[cfg(unix)]
+  pub fn set_completion(&mut self, completion: Option<OwnedFd>) {
+    self.completion = completion;
+  }
+
+  /// The region.
+  pub fn region(&self) -> &ClientRegion {
+    &self.region
+  }
+
+  /// The region, mutably (the bulk area).
+  pub fn region_mut(&mut self) -> &mut ClientRegion {
+    &mut self.region
+  }
+
+  /// Wakes issued so far.
+  pub fn wakes(&self) -> u64 {
+    self.wakes
+  }
+
+  /// The ring index the next reply takes (its bulk chunk is chosen by it).
+  pub fn next_reply_index(&self) -> u64 {
+    self.next_reply
+  }
+
+  /// Takes the next request if one is there, its body owned: a bulk body is copied out before the slot is released,
+  /// so a client sending on into the freed slot's chunk never changes it ([`crate::protocol::owned`]). A hostile slot
+  /// is released and reported.
+  pub fn try_take(&mut self) -> Result<Option<Request>, IpcError> {
+    let cmd = self.region.cmd();
+    let peeked = match cmd.peek(self.region.object(), self.next_request) {
+      Ok(None) => return Ok(None),
+      Ok(Some(peeked)) => Some(peeked.and_then(|slot| crate::protocol::owned(&self.region, slot))),
+      Err(e) => {
+        self.next_request = self.next_request.wrapping_add(1);
+        return Err(e);
+      }
+    };
+    let released = cmd.release(self.region.object(), self.next_request);
+    self.next_request = self.next_request.wrapping_add(1);
+    released?;
+    let Some(slot) = peeked.transpose()? else {
+      return Ok(None);
+    };
+    Ok(Some(Request {
+      request: slot.request,
+      kind: slot.kind,
+      payload: slot.payload,
+    }))
+  }
+
+  /// Replies `message` to request `request`: packed for the next completion-ring position and written, waking the client
+  /// if it parked; `RingFull` when the client has not taken the slot the ring wraps onto. Room is checked before
+  /// anything is packed, as [`ClientEnd::send_message`] checks it: the position's bulk chunk holds the oldest reply the
+  /// client has not taken until it does. The only way a reply is packed.
+  pub fn reply_message<M: slates_wire::Wire>(
+    &mut self,
+    request: u64,
+    message: &M,
+  ) -> Result<(), IpcError> {
+    let index = self.next_reply;
+    if !self.region.cpl().can_push(self.region.object(), index)? {
+      return Err(IpcError::RingFull);
+    }
+    let slot = crate::protocol::pack(
+      &mut self.region,
+      crate::protocol::Direction::Reply,
+      index,
+      request,
+      message,
+    )?;
+    self.reply(&slot)
+  }
+
+  /// Writes a reply and wakes the client if it parked.
+  pub fn reply(&mut self, slot: &Slot) -> Result<(), IpcError> {
+    let cpl = self.region.cpl();
+    cpl.push(self.region.object_mut(), self.next_reply, slot)?;
+    self.next_reply = self.next_reply.wrapping_add(1);
+    let word = self.region.wake_word()?;
+    word.fetch_add(1, Ordering::AcqRel);
+    let parked = self.region.client_parked()?;
+    let mut armed = 0;
+    // The park protocol's daemon half (`crate::park`): the flag is read after the reply's publication in
+    // the order the client's fence takes part in, so a parked client whose re-check missed this reply is
+    // seen here and woken. Before 2026-09-29 this read had no fence, and a client's re-check and this read
+    // could both miss. The value read names the park's reply stamp slot.
+    if crate::park::after_publishing_armed(|| {
+      armed = parked.load(Ordering::Relaxed);
+      armed != 0
+    }) {
+      // A second advance for the wake: a bridge between two waits has already taken the first advance
+      // into the value its next wait compares against, and this one makes that wait return.
+      word.fetch_add(1, Ordering::AcqRel);
+      // The first wake of this park stamps the host clock, so the client can time its own wake (§4.7);
+      // a later reply to the same park keeps the first stamp.
+      let stamp = self.region.reply_stamp(stamp_slot(armed))?;
+      let sent_ns = slates_machine::clock::monotonic_ns() & !REPLY_STAMP_CONFIRMED;
+      let stamped = stamp
+        .compare_exchange(0, sent_ns, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+      // Wake the parked client: the wake word on Linux/macOS (a spinning client never parked, so it
+      // pays no wake), the named auto-reset Event on Windows. Where the wake reports a sleeper found,
+      // the stamp it timed is confirmed for the client — that stamp only, in its own slot. The woken client
+      // can arm its next park before this confirmation lands; that park names the other slot, so this one
+      // is intact (the bug record of 2026-11-04: with one slot the next park cleared it, and the
+      // confirmation then left a bare confirmed bit that refused the following park's stamp).
+      #[cfg(windows)]
+      self.region.wake_signal()?;
+      #[cfg(not(windows))]
+      if wake::wake_one(word)? && stamped {
+        // A failed exchange is this slot armed again before the confirmation, which the ring's order
+        // rules out but for a client that gave the reply up past its deadline: nothing left to confirm.
+        let _ = stamp.compare_exchange(
+          sent_ns,
+          sent_ns | REPLY_STAMP_CONFIRMED,
+          Ordering::Release,
+          Ordering::Relaxed,
+        );
+      }
+      #[cfg(windows)]
+      let _ = stamped;
+      self.wakes = self.wakes.saturating_add(1);
+      // Nudge the completion fd too, so an async SDK event loop polling it (D-19) wakes alongside a
+      // futex-parked sync client. Both are under the same parked check, so a spinning client pays for
+      // neither.
+      #[cfg(unix)]
+      self.nudge_completion();
+    }
+    Ok(())
+  }
+
+  /// Makes the completion fd readable (a write of `COMPLETION_NUDGE`), best-effort. A short write, a
+  /// full pipe, or an absent fd is ignored: the fd's readability is the signal and the wake word has
+  /// already advanced, so a missed nudge only means the SDK falls back to its next poll of the ring,
+  /// never a lost reply.
+  #[cfg(unix)]
+  fn nudge_completion(&self) {
+    if let Some(fd) = &self.completion {
+      let _ = rustix::io::write(fd, &COMPLETION_NUDGE);
+    }
+  }
+
+  /// Marks the daemon's shard going idle (true) or polling (false), so the client knows whether
+  /// to ring the doorbell. Announcing idle is half of the doorbell protocol: the shard must re-check its
+  /// rings through [`crate::doorbell::after_announcing_idle_pending`] before it idles.
+  pub fn set_parked(&self, parked: bool) -> Result<(), IpcError> {
+    self
+      .region
+      .daemon_parked()?
+      .store(u32::from(parked), Ordering::Release);
+    Ok(())
+  }
+
+  /// The doorbell's value (the client bumps it per request while the daemon is parked).
+  pub fn doorbell(&self) -> Result<u32, IpcError> {
+    Ok(self.region.doorbell()?.load(Ordering::Acquire))
+  }
+}
+
+fn elapsed_ns(since: Instant) -> u64 {
+  u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use std::os::fd::{BorrowedFd, RawFd};
+  use std::sync::atomic::Ordering;
+
+  use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+  use super::{ClientEnd, DaemonEnd};
+  use crate::region::{ClientRegion, RegionGeometry};
+  use crate::slot::Slot;
+
+  /// A region name unique to this process: a fixed name collides when two runs of these tests overlap
+  /// on a platform that names its shared objects (macOS), and the second run's create removes the
+  /// first's name or is refused `EEXIST`.
+  fn unique_name(test: &str) -> String {
+    format!("{test}-{}", std::process::id())
+  }
+
+  fn geometry() -> RegionGeometry {
+    RegionGeometry {
+      slots: 8,
+      spin_ns: 200_000,
+      spin_shift: 4,
+      bulk_bytes: 4096,
+      page: 4096,
+    }
+  }
+
+  /// Reads whatever the non-blocking fd has right now (`0` when empty), so a test checks readability
+  /// without blocking or a poll dependency.
+  fn read_available(fd: RawFd) -> usize {
+    let mut buf = [0u8; 8];
+    // SAFETY: `fd` is the client end's live, non-blocking completion fd for the test's duration.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    rustix::io::read(borrowed, &mut buf).unwrap_or(0)
+  }
+
+  /// A parked client's completion fd becomes readable when the daemon replies (§4.7, D-19): the
+  /// fd-readiness an async SDK event loop polls instead of spinning. A socketpair stands in for the
+  /// platform completion channel (an eventfd on Linux), the same shape, testable on every unix. Do:
+  /// pair the ends, mark the client parked, send a request, reply. Expect: the completion fd is quiet
+  /// before, carries the nudge after, and the reply is waiting for `try_take`.
+  #[test]
+  fn a_reply_to_a_parked_client_nudges_the_completion_fd() {
+    let region =
+      ClientRegion::create(&unique_name("slates-endpoint-completion"), 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let client_region = ClientRegion::open(&handoff, len).unwrap();
+    let mut daemon = DaemonEnd::new(region);
+    let mut client = ClientEnd::new(client_region);
+
+    // macOS's socketpair takes no CLOEXEC/NONBLOCK creation flags (Linux-only), so pass none and set
+    // the client end non-blocking with an ioctl — the real completion fds are created non-blocking too,
+    // so the readability check never blocks.
+    let (daemon_fd, client_fd) = rustix::net::socketpair(
+      AddressFamily::UNIX,
+      SocketType::STREAM,
+      SocketFlags::empty(),
+      None,
+    )
+    .unwrap();
+    rustix::io::ioctl_fionbio(&client_fd, true).unwrap();
+    daemon.set_completion(Some(daemon_fd));
+    client.set_completion(client_fd);
+    let poll_fd = client.completion_fd().unwrap();
+
+    assert_eq!(
+      read_available(poll_fd),
+      0,
+      "the completion fd is quiet before any reply"
+    );
+
+    // Mark the client parked (the idle condition the daemon signals for), then run one round trip.
+    client
+      .region()
+      .client_parked()
+      .unwrap()
+      .store(1, Ordering::Release);
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"ok").unwrap())
+      .unwrap();
+
+    // The daemon nudged the completion fd: an async event loop polling it would wake here.
+    assert!(
+      read_available(poll_fd) > 0,
+      "a reply to a parked client makes the completion fd readable"
+    );
+    // And the reply is in the ring for the SDK to take once its loop wakes.
+    let reply = client.try_take().unwrap().unwrap();
+    assert_eq!(reply.request, 1);
+    assert_eq!(reply.payload, b"ok");
+  }
+
+  /// Waits up to `timeout_ns` for `fd` to become readable without consuming it (a poll, not a read),
+  /// so a test asserts readiness and drains separately. `true` if readable within the budget.
+  #[cfg(any(target_os = "macos", target_os = "linux"))]
+  fn poll_readable(fd: RawFd, timeout_ns: u64) -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    // SAFETY: `fd` is the client's live completion fd, borrowed for one poll within the test.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut fds = [PollFd::new(&borrowed, PollFlags::IN)];
+    let ts = Timespec {
+      tv_sec: i64::try_from(timeout_ns / 1_000_000_000).unwrap_or(0),
+      tv_nsec: i64::try_from(timeout_ns % 1_000_000_000).unwrap_or(0),
+    };
+    rustix::event::poll(&mut fds, Some(&ts)).is_ok_and(|n| n > 0)
+  }
+
+  /// The macOS completion bridge signals only an *armed* reply, so the async fast path stays free of
+  /// any event-loop wakeup, and it stops clean on drop (§4.7, D-19). Do: enable the bridge; reply to a
+  /// disarmed client (the fast path) and then to an armed one (the slow path). Expect: the fd stays
+  /// quiet for the disarmed reply, becomes readable for the armed one, both replies wait in the ring,
+  /// and dropping the client joins the bridge thread (the test returns rather than hanging).
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn the_completion_bridge_signals_only_an_armed_reply_and_stops_clean() {
+    let region =
+      ClientRegion::create(&unique_name("slates-endpoint-bridge"), 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let client_region = ClientRegion::open(&handoff, len).unwrap();
+    let mut daemon = DaemonEnd::new(region);
+    let mut client = ClientEnd::new(client_region);
+    let fd = client.enable_async_completion().unwrap();
+
+    // Fast path: the client is not armed (parked == 0), so the daemon issues no wake and the bridge
+    // writes nothing — no event-loop wakeup for a reply the client would take during its spin.
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"one").unwrap())
+      .unwrap();
+    assert!(
+      !poll_readable(fd, 100_000_000),
+      "a disarmed (fast-path) reply does not wake the event loop"
+    );
+    let reply = client.try_take().unwrap().unwrap();
+    assert_eq!(reply.payload, b"one");
+
+    // Slow path: the client arms before it would yield, so the daemon wakes the word and the bridge
+    // makes the pipe readable for the loop.
+    client.arm_async().unwrap();
+    client.send(&Slot::inline(2, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"two").unwrap())
+      .unwrap();
+    assert!(
+      poll_readable(fd, 2_000_000_000),
+      "an armed (slow-path) reply makes the completion fd readable"
+    );
+    client.drain_completion();
+    client.disarm_async().unwrap();
+    let reply = client.try_take().unwrap().unwrap();
+    assert_eq!(reply.payload, b"two");
+
+    // Clean shutdown: dropping the client joins the bridge thread; returning proves no hang.
+    drop(client);
+  }
+
+  /// On Linux the descriptor an fd-adopting SDK receives (`enable_async_completion_dup`) is a **pipe**
+  /// fed by a bridge over the completion eventfd, not the eventfd itself — Node's `net.Socket` refuses
+  /// an eventfd (`ERR_INVALID_FD_TYPE`, the bug of 2026-09-16), but adopts a pipe. Python's plain path
+  /// keeps the raw eventfd. Do: give the client a real completion eventfd, take the dup; reply to a
+  /// disarmed client (fast path) then an armed one (slow path). Expect: the dup is a FIFO (a pipe),
+  /// stays quiet for the fast-path reply, becomes readable for the armed one, both replies wait in the
+  /// ring, and dropping the client joins the bridge thread (the test returns rather than hanging).
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn the_linux_completion_dup_is_a_pollable_pipe_fed_by_the_eventfd() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use rustix::event::{EventfdFlags, eventfd};
+    use rustix::fs::{FileType, fstat};
+
+    let region = ClientRegion::create("slates-endpoint-linux-bridge", 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let client_region = ClientRegion::open(&handoff, len).unwrap();
+    let mut daemon = DaemonEnd::new(region);
+    let mut client = ClientEnd::new(client_region);
+
+    // A real completion eventfd, the Linux primitive the rendezvous hands over: the daemon nudges a
+    // dup, the client holds the original. The daemon writes it only for a parked client.
+    let eventfd = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
+    let daemon_fd = rustix::io::dup(&eventfd).unwrap();
+    daemon.set_completion(Some(daemon_fd));
+    client.set_completion(eventfd);
+
+    // The descriptor an fd-adopting SDK is handed: own it so the test closes it (net.Socket would).
+    // SAFETY: `enable_async_completion_dup` just returned this live dup fd; own it for the test.
+    let dup = unsafe { OwnedFd::from_raw_fd(client.enable_async_completion_dup().unwrap()) };
+    let poll_fd = dup.as_raw_fd();
+    assert_eq!(
+      FileType::from_raw_mode(fstat(&dup).unwrap().st_mode),
+      FileType::Fifo,
+      "the dup is a pipe (adoptable by Node's net.Socket), not the eventfd it refuses"
+    );
+
+    // Fast path: the client is not armed, so the daemon nudges nothing and the bridge stays quiet —
+    // the async fast path never wakes the event loop (§4.7).
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"one").unwrap())
+      .unwrap();
+    assert!(
+      !poll_readable(poll_fd, 100_000_000),
+      "a disarmed (fast-path) reply does not wake the event loop"
+    );
+    assert_eq!(client.try_take().unwrap().unwrap().payload, b"one");
+
+    // Slow path: the client arms before it would yield, so the daemon nudges the eventfd and the
+    // bridge makes the pipe readable for the loop.
+    client.arm_async().unwrap();
+    client.send(&Slot::inline(2, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"two").unwrap())
+      .unwrap();
+    assert!(
+      poll_readable(poll_fd, 2_000_000_000),
+      "an armed (slow-path) reply makes the completion pipe readable"
+    );
+    client.drain_completion();
+    client.disarm_async().unwrap();
+    assert_eq!(client.try_take().unwrap().unwrap().payload, b"two");
+
+    // Clean shutdown: dropping the client joins the bridge thread; returning proves no hang.
+    drop(dup);
+    drop(client);
+  }
+}

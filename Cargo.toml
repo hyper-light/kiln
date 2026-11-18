@@ -2,9 +2,9 @@
 resolver = "3"
 members = ["crates/*"]
 # Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md;
-# so are Quiver, Focal's bus, hyper-raft, vorpal, aws-lc-rs, Mantle, Shards and Hex (vendor/MANIFEST.toml),
+# so are Quiver, Focal's bus, hyper-raft, vorpal, aws-lc-rs, Mantle, Shards, Hex and Slates (vendor/MANIFEST.toml),
 # each a workspace of its own.
-exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/vorpal", "vendor/aws-lc-rs", "vendor/mantle", "vendor/shards", "vendor/hex", "bench/kilndb", "bench/http"]
+exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/vorpal", "vendor/aws-lc-rs", "vendor/mantle", "vendor/shards", "vendor/hex", "vendor/slates", "bench/kilndb", "bench/http"]
 
 [workspace.package]
 version = "0.2.0"
@@ -96,6 +96,9 @@ seccompiler = { path = "vendor/hex/vendor/seccompiler" }
 shards-agentfile = { path = "vendor/shards/crates/agentfile" }
 shards-api = { path = "vendor/shards/crates/api" }
 shards-image = { path = "vendor/shards/crates/image" }
+# Slates, agents' workspaces of their own (vendor/slates; docs/agentic.md, W): its library, the crate kiln names.
+# Its own crates take one another by path, as Slates' root manifest points them.
+slates-api = { path = "vendor/slates/crates/api" }
 quiver = { path = "vendor/quiver/crates/quiver" }
 quiver-api = { path = "vendor/quiver/crates/quiver-api" }
 # vorpal, the search across a change (docs/ci.md W26-R07): its crates, the tree-sitter runtime it

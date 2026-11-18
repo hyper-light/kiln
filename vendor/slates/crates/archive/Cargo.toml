@@ -1,0 +1,35 @@
+[package]
+name = "slates-archive"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The archive format (D-17, §4.16 archive, research/compression-archive-dedup.md §2.6): a single-pass, streamable, content-addressed, self-verifying byte stream of a snapshot — header, chunk records, manifest, seek table and trailer, each chunk BLAKE3-verified before use (Phase 7). Never written to disk by slates."
+
+[dependencies]
+blake3 = { workspace = true }
+lz4_flex = { workspace = true }
+# zstd is the C-backed ratio codec (D-17), optional and on by default so native builds use it.
+# `--no-default-features` turns it off **for this crate only**: `slates-vfs`, `slates-server` and
+# `slates-cluster` each declare `slates-archive = { workspace = true }` without `default-features = false`
+# and forward no feature, so their edge requests the default and zstd is on however the gate is invoked —
+# measured 2026-10-19, `cargo tree --target x86_64-pc-windows-msvc --workspace --no-default-features`
+# still resolves zstd-sys. A cross-lint of those crates therefore does need a C toolchain for the target
+# today; making the gate reach them is `default-features = false` plus a default-on forwarding feature
+# through each dependent (the shape `slates-client`'s `pure-hash` already uses for blake3). A `ruzstd`
+# decode-only fallback for those builds is owed (GAPS §8g).
+zstd = { workspace = true, optional = true }
+
+[features]
+default = ["zstd"]
+# The zstd codec (encode and decode); off on targets without a C toolchain.
+zstd = ["dep:zstd"]
+
+[dev-dependencies]
+slates-test-seeds = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true
