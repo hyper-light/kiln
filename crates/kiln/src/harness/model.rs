@@ -1552,6 +1552,14 @@ pub struct State {
     pub model: String,
     #[serde(default)]
     pub mode: String,
+    /// How much its launcher, or a person since, let it do unasked, on kiln's one scale of modes (`lineage::Level`):
+    /// kiln's own record, set as it starts (`Spec::launched`) and by each mode set by a command it takes (a person's,
+    /// any; an agent's, no higher than its own grant: `lineage::may_command`), never by what its harness reports. Its
+    /// permissions are judged by the lower of this and `mode` (`lineage::granted`; the person's rule, 2026-11-18: an
+    /// agent never raises its own permission). None: a session an older kiln runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "\"plan\" | \"ask\" | \"accept_edits\" | \"auto\" | \"bypass\""))]
+    pub launched: Option<super::lineage::Level>,
     #[serde(default)]
     pub title: String,
     /// The session's name as a person last gave it (empty: the one it started with).

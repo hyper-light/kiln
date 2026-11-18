@@ -1284,9 +1284,10 @@ agent's folder on that agent's machine works in that agent's volume:
   out), and any file changed in the folder since the agent changed it, in which
   case nothing is written until they agree. A person writes it; an agent writes it as its mode
   lets it (the lower of its own and that of the agent whose work it is, each as far as it was
-  granted: the lower of its mode now and the one its launcher started it in, which kiln alone
-  records, so an agent or a harness that raises its own mode gains nothing; and no agent can raise
-  its own mode or set a permission control, its own or a child's past its own grant, by any way in):
+  granted: the lower of its mode now and the one its launcher started it in or a person set since,
+  which kiln alone records, so an agent or a harness that raises its own mode gains nothing; and no
+  agent can raise its own mode or set a permission control, its own or a child's past its own grant,
+  by any way in):
   at once in a mode that edits
   unasked (accept edits, auto, bypass); after its person's click in one that asks (asked in their
   chat turn: 428 until they confirm, then the same call again; refused outside one); never in one that

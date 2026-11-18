@@ -127,6 +127,21 @@ pub fn granted_mode(info: &crate::harness::session::Info) -> slates_api::WriteMo
     write_mode(Some(crate::harness::lineage::granted(info)))
 }
 
+/// Has workspace `w`'s write policy follow its agent's grant `level` (`write_mode`; the person's rule, 2026-11-18; W6),
+/// set by kiln as the launcher, where its agent works in a volume of its own: a person's later change of its mode
+/// reaches Slates' own policy, as its start did (`prepare`). A volume another agent owns (`Workspace::owner`) keeps its
+/// owner's; a folder has none. Slates' answer is logged, not waited on: kiln's own `agents.land` judges each landing by
+/// the agents' grants whatever the volume's policy says.
+pub fn follow_grant(w: Option<&Workspace>, level: crate::harness::lineage::Level) {
+    let Some(made) = w.filter(|w| w.owner.is_none()).and_then(|w| w.made.clone()) else { return };
+    let mode = write_mode(Some(level));
+    drop(crate::rt::spawn(async move {
+        if let Err(e) = slates::set_policy(&made, slates_api::WritePolicy { merge: mode, land: mode, require_signed_merges: false }).await {
+            tracing::info!(volume = %made.volume, error = %format!("{e:#}"), "a workspace's write policy didn't follow its agent's grant: kiln's own landing judges by the grant");
+        }
+    }));
+}
+
 /// The write mode of agent `asker`'s landing of agent `target`'s workspace (`target` itself, or an agent below the one
 /// asking): the stricter of their two granted modes ([`granted_mode`]), so a landing never writes past the grant of the
 /// agent asking or of the agent whose work it is.

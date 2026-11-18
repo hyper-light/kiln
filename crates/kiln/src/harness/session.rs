@@ -944,6 +944,10 @@ impl Info {
         self.title.clone_from(&s.title);
         self.model.clone_from(&s.model);
         self.mode.clone_from(&s.mode);
+        // Kiln's own record of its grant, which a mode set by command moves (a runner from before it says none).
+        if s.launched.is_some() {
+            self.launched = s.launched;
+        }
         if !s.cwd.is_empty() {
             self.cwd.clone_from(&s.cwd);
         }
@@ -2143,6 +2147,36 @@ fn read_state(core: &mut Core, client: String, read: super::state_view::Read) {
     core.reply(client, value);
 }
 
+/// The grant a command it takes gives it, when it gives one (the person's rule, 2026-11-18; docs/agentic.md W6): a mode
+/// set by command is how much it may do unasked from now, as kiln records it (`Spec::launched`, `State::launched`). Kiln
+/// sends it one only as a person asks (any mode) or as an agent may (no higher than its own grant, its own mode or a
+/// child's: `lineage::may_command` refuses the rest before it's sent), so a person's raise is a grant, and one lowered
+/// by anyone is the grant from then. What its harness reports of its mode never is. A mode kiln can't place asks.
+fn grant_of(kind: &Kind, c: &Command) -> Option<super::lineage::Level> {
+    let Command::SetMode { mode } = c else { return None };
+    Some(super::lineage::level(kind.id, mode).unwrap_or(super::lineage::Level::Ask))
+}
+
+/// Records the grant command `c` gives session `s` ([`grant_of`]) in its spec (carried as it's restarted, moved or taken
+/// up) and its state (which carries it to the server's copy: `Info::apply`), and has its workspace's write policy follow
+/// it (`workspace::follow_grant`).
+fn granted_by(s: &Session, kind: &Kind, c: &Command) {
+    let Some(level) = grant_of(kind, c) else { return };
+    let workspace = {
+        let mut spec = s.spec.lock();
+        spec.launched = Some(level);
+        spec.workspace.clone()
+    };
+    {
+        let mut core = s.core.lock();
+        if core.state.launched != Some(level) {
+            core.state.launched = Some(level);
+            core.touch_state();
+        }
+    }
+    crate::workspace::follow_grant(workspace.as_ref(), level);
+}
+
 fn at_state(core: &mut Core, client: String, revision: &str, command: Command, apply: impl FnOnce(&mut Core, Command)) -> bool {
     use super::state_view::Error;
     let id = match &command {
@@ -2509,6 +2543,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
     let now = crate::util::now_ms();
     core.session_id.clone_from(&id);
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
+    // Its grant, as kiln records it (`State::launched`): its spec's, which every mode set by command since has moved.
+    core.state.launched = Some(spec.launched_level());
     // It goes to work only with room on its machine (`super::limit`).
     core.room = Some(Arc::clone(&files.room));
     let cwd = core.state.cwd.clone();
@@ -5560,6 +5596,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 on_change();
                             }
                             c => {
+                                granted_by(&s, kind, &c);
                                 // A model of its own harness: no switch after all.
                                 if matches!(c, Command::SetModel { .. }) && switching.take().is_some() {
                                     let mut core = s.core.lock();
@@ -6181,7 +6218,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         let _ = take_override(&s, change, None, None, kind, &files).await;
                         on_change();
                     }
-                    c => adapter.command(&mut s.core.lock(), c),
+                    c => {
+                        granted_by(&s, kind, &c);
+                        adapter.command(&mut s.core.lock(), c);
+                    }
                 },
                 }
                 },
@@ -6794,6 +6834,39 @@ mod tests {
             anyhow::ensure!(matches!(rx.try_recv(), Err(async_channel::TryRecvError::Closed)), "its end, once the session went");
             Ok(())
         })
+    }
+
+    /// The person's rule of 2026-11-18 (docs/agentic.md W6; kiln goal 01a1ec34599974448aed2672bafaf9a2): a mode set by
+    /// command is the session's grant from then, in its spec (which its restarts and moves carry) and its state (which
+    /// carries it to the server's copy), since kiln sends one only as a person asks or as an agent may; a mode kiln can't
+    /// place asks; nothing else a command says moves it. The server's copy follows the state's record, and a runner from
+    /// before it, saying none, leaves the copy's own. Without it a person's raise of an agent's mode would never be a
+    /// grant, and its landings would ask whatever the person chose.
+    #[test]
+    fn w6_a_mode_set_by_command_is_its_grant_and_the_servers_copy_follows() -> anyhow::Result<()> {
+        use super::super::lineage::Level;
+        let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
+        let set = |m: &str| Command::SetMode { mode: m.into() };
+        assert_eq!(grant_of(claude, &set("bypassPermissions")), Some(Level::Bypass));
+        assert_eq!(grant_of(claude, &set("plan")), Some(Level::Plan));
+        assert_eq!(grant_of(claude, &set("turbo")), Some(Level::Ask), "a mode kiln can't place asks");
+        assert_eq!(grant_of(claude, &Command::Interrupt), None);
+        assert_eq!(grant_of(claude, &Command::Control { id: "acp:mode".into(), value: None }), None, "a control is no grant");
+        let (s, _rx) = idle("granted");
+        s.spec.lock().launched = Some(Level::Ask);
+        s.core.lock().state.launched = Some(Level::Ask);
+        granted_by(&s, claude, &set("bypassPermissions"));
+        anyhow::ensure!(s.spec.lock().launched == Some(Level::Bypass) && s.core.lock().state.launched == Some(Level::Bypass), "a person's raise is its grant");
+        granted_by(&s, claude, &set("plan"));
+        anyhow::ensure!(s.spec.lock().launched == Some(Level::Plan) && s.core.lock().state.launched == Some(Level::Plan), "lowered by anyone, the grant from then");
+        granted_by(&s, claude, &Command::Interrupt);
+        anyhow::ensure!(s.spec.lock().launched == Some(Level::Plan), "nothing else moves it");
+        let mut info = Info { kind: "claude".into(), launched: Some(Level::Ask), ..Info::default() };
+        info.apply(&State { mode: "bypassPermissions".into(), launched: Some(Level::Bypass), ..State::default() });
+        anyhow::ensure!(info.launched == Some(Level::Bypass) && super::super::lineage::granted(&info) == Level::Bypass, "{info:?}");
+        info.apply(&State { mode: "bypassPermissions".into(), launched: None, ..State::default() });
+        anyhow::ensure!(info.launched == Some(Level::Bypass), "a runner from before it says none: the copy keeps its own");
+        Ok(())
     }
 
     /// Goal 4, plan 01a1a59c2a9c step 5: whether two infos differ in what lists show, compared field by

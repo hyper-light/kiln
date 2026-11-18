@@ -324,9 +324,14 @@ its children and its goals' and plan steps' subagents. Nor can an agent move its
 command reaches an agent (the REST command, the console's socket, `agents.broadcast`,
 `agents.control`) refuses an agent's `set_mode` above its own grant, its own or a child's, and an
 agent's change of any permission control (Codex's approvals and sandbox, an ACP agent's mode options:
-`lineage::may_command`); a person sets those. A session an older kiln began has no launch level
-recorded and is held to its harness's own default. A person's later raise of an agent's mode is not
-yet a grant: its landings still ask until kiln records the person's change as one (owed).
+`lineage::may_command`); a person sets those. A mode set by command is the agent's grant from then
+(`State::launched`, which the session moves only on a `set_mode` it takes, and which carries it to the
+server's copy; its spec carries it through restarts and moves): kiln sends one only as a person asks,
+any mode, or as an agent may, so a person's raise of an agent's mode is a grant and its landings follow
+it, and a mode lowered by anyone is the grant from then. Its volume's write policy follows the grant
+too (`workspace::follow_grant`, under kiln's launcher secret; a volume another agent owns keeps its
+owner's). A session an older kiln began has no launch level recorded and is held to its harness's own
+default.
 `agents.land` follows the same rule: an agent in a mode that edits
 unasked lands at once, its plan as it stands or the manifest it names; one in a mode that asks reads
 its plan, and its writing waits on its person's click (`crate::confirms`: asked in their chat turn, 428

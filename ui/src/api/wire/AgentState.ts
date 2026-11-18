@@ -80,7 +80,15 @@ tree?: string,
  * (the Changes tab's Commits). None for a session from before kiln kept it, or one begun
  * outside a repository: its own are told by when they were made.
  */
-started_head?: string, model: string, mode: string, title: string, 
+started_head?: string, model: string, mode: string, 
+/**
+ * How much its launcher, or a person since, let it do unasked, on kiln's one scale of modes (`lineage::Level`):
+ * kiln's own record, set as it starts (`Spec::launched`) and by each mode set by a command it takes (a person's,
+ * any; an agent's, no higher than its own grant: `lineage::may_command`), never by what its harness reports. Its
+ * permissions are judged by the lower of this and `mode` (`lineage::granted`; the person's rule, 2026-11-18: an
+ * agent never raises its own permission). None: a session an older kiln runs.
+ */
+launched?: "plan" | "ask" | "accept_edits" | "auto" | "bypass", title: string, 
 /**
  * The session's name as a person last gave it (empty: the one it started with).
  */

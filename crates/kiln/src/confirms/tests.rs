@@ -549,3 +549,24 @@ fn w6_a_broadcast_raises_no_agent_past_its_senders_grant() -> anyhow::Result<()>
         Ok(())
     })
 }
+
+/// The person's rule of 2026-11-18 (docs/agentic.md W6), by use: a person's raise of an agent's mode is its grant. An
+/// agent launched in a mode that asks, whose runner reports the grant a person's `set_mode` gave it (its state's record,
+/// `State::launched`, which a session moves only on a mode set by command), lands at once: its landing reaches its
+/// machine. One whose harness alone reports the raise still waits on its person
+/// (`w6_an_agent_that_raised_its_own_mode_still_lands_as_its_launcher_let_it`).
+#[test]
+fn w6_a_persons_raise_of_an_agents_mode_is_its_grant() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+        hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+        launched_in(&hub, "raised", None, "default", "default", None).await?;
+        let state = crate::harness::model::State { mode: "bypassPermissions".into(), launched: Some(crate::harness::lineage::Level::Bypass), ..Default::default() };
+        hub.harness.ingest(&Location::Machine("box".into()), "raised", crate::harness::core::Update::State { state: Box::new(state) }).await;
+        let info = hub.harness.info("raised").ok_or_else(|| anyhow::anyhow!("no session"))?;
+        anyhow::ensure!(info.launched == Some(crate::harness::lineage::Level::Bypass), "the server's copy follows its state: {:?}", info.launched);
+        let landed = call(agent(&hub, "raised").await?, "agents.land", json!({"agent": "raised", "manifest": "ab12"})).await;
+        anyhow::ensure!(reached_the_machine(&landed), "a person's grant writes at once: {landed:?}");
+        Ok(())
+    })
+}
