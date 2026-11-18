@@ -71,7 +71,7 @@ pub enum MoveRefused {
 impl MoveRefused {
     /// Slates' typed answer to a move, by kind.
     pub fn of(e: &slates_api::Error) -> MoveRefused {
-        use slates_api::{Busy, Error, Invalid, MoveTarget, RetryCause, Stale, Unmovable, Unusable};
+        use slates_api::{Busy, Error, Invalid, MoveTarget, RetryCause, Unmovable, Unusable};
         match e {
             Error::Busy(Busy::Attached) => MoveRefused::Attached,
             Error::Busy(Busy::Moving) => MoveRefused::AlreadyMoving,
@@ -80,7 +80,7 @@ impl MoveRefused {
             Error::Unusable(Unusable::Unmovable(Unmovable::Snapshots)) => MoveRefused::Snapshots,
             Error::Invalid(Invalid::MoveTarget(MoveTarget::NotMember)) => MoveRefused::NotAMember,
             Error::Invalid(Invalid::MoveTarget(MoveTarget::OutsideNeighbourhood)) => MoveRefused::OutsideNeighbourhood,
-            Error::Retry { cause: RetryCause::MoveUnplaced, .. } | Error::Stale(Stale::MoveUnplaced) => MoveRefused::Unplaced,
+            Error::Retry { cause: RetryCause::MoveUnplaced, .. } => MoveRefused::Unplaced,
             other => MoveRefused::Slates { said: other.to_string() },
         }
     }
@@ -235,7 +235,7 @@ mod tests {
     /// K4: Slates' typed answers to a move, each by kind, and anything else in Slates' words.
     #[test]
     fn k4_slates_refusals_of_a_move_are_reported_by_kind() {
-        use slates_api::{Busy, Error, Invalid, MoveTarget, RetryCause, Stale, Unmovable, Unusable};
+        use slates_api::{Busy, Error, Invalid, MoveTarget, RetryCause, Unmovable, Unusable};
         let cases = [
             (Error::Busy(Busy::Attached), MoveRefused::Attached),
             (Error::Busy(Busy::Moving), MoveRefused::AlreadyMoving),
@@ -245,7 +245,6 @@ mod tests {
             (Error::Invalid(Invalid::MoveTarget(MoveTarget::NotMember)), MoveRefused::NotAMember),
             (Error::Invalid(Invalid::MoveTarget(MoveTarget::OutsideNeighbourhood)), MoveRefused::OutsideNeighbourhood),
             (Error::Retry { cause: RetryCause::MoveUnplaced, pause_ns: 5 }, MoveRefused::Unplaced),
-            (Error::Stale(Stale::MoveUnplaced), MoveRefused::Unplaced),
         ];
         for (error, kind) in cases {
             assert_eq!(MoveRefused::of(&error), kind, "{error:?}");

@@ -7691,7 +7691,7 @@ sys.exit(1)
         use super::super::handing::NotHanded;
         use super::super::host::Decided;
         let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
-        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false };
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false, slates: None };
         let kept: CarriedIds = Arc::new(|_| Box::pin(async { Ok(vec![("m1".to_owned(), "d1".to_owned()), ("m2".to_owned(), "d2".to_owned())]) }));
         let unreadable: CarriedIds = Arc::new(|_| Box::pin(async { Err("its records are gone".to_owned()) }));
         let unknown = || -> Result<(), NotHanded> { Err(NotHanded::Unknown("the link dropped".into())) };
@@ -7775,7 +7775,7 @@ sys.exit(1)
         crate::rt::block_on(async move {
             for (kid, native) in [("gemini", true), ("gemini", false), ("antigravity", true), ("antigravity", false), ("claude", true), ("claude", false)] {
                 let kind = Kind::get(kid).ok_or_else(|| anyhow::anyhow!("no {kid}"))?;
-                let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native };
+                let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native, slates: None };
                 let (s, _rx) = idle("h1");
                 {
                     let mut core = s.core.lock();
@@ -7816,7 +7816,7 @@ sys.exit(1)
     #[test]
     fn a_hand_over_fences_its_inbox_then_reads_its_ids_then_copies_what_it_holds() -> anyhow::Result<()> {
         let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
-        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false };
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false, slates: None };
         crate::rt::block_on(async move {
             let (s, _rx) = idle("h1");
             let s = Arc::new(s);
