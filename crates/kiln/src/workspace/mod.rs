@@ -619,7 +619,7 @@ mod tests {
             ("CARGO_TARGET_DIR", format!("{l}/target")),
             ("HOME", o.clone()),
             ("XDG_CONFIG_HOME", format!("{o}/.config")),
-            ("DISPLAY", ":0"),
+            ("DISPLAY", ":0".to_owned()),
             ("ON_IT", format!("{top}/src")),
             ("LOOKALIKE", format!("{o}-other/x")),
             ("WORDS", "src".to_owned()),
