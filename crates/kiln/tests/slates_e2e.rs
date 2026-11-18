@@ -851,10 +851,19 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
         && cfg!(unix)
         && let Some(mount) = &made.mount
     {
-        // A mount that stays says what kiln's runner and Slates said of it.
-        mount_gone(&canonical(Path::new(mount))).map_err(|e| fail(format!("{e:#}")))?;
+        // A mount that stays says what kiln's runner and Slates said of it, the runner's every word on taking its
+        // workspaces down among them.
+        mount_gone(&canonical(Path::new(mount))).map_err(|e| fail(format!("{e:#}\n--- kiln's runner on taking workspaces down ---\n{}", removals_said(f))))?;
     }
     Ok(())
+}
+
+/// Every line kiln's runner logged of taking agents' workspaces down (an ended agent's workspace, the mount table, a
+/// workspace that stayed), whole, where its log's tail is crowded with its periodic lines: which branch a removal took.
+fn removals_said(f: &vm_e2e::Fixture) -> String {
+    let text = f.log.as_ref().and_then(|log| std::fs::read_to_string(log).ok()).unwrap_or_default();
+    let said: Vec<&str> = text.lines().filter(|line| ["an ended agent's", "mount table", "workspace stayed"].iter().any(|word| line.contains(word))).collect();
+    if said.is_empty() { "kiln's runner said nothing of taking its workspace down".to_owned() } else { said.join("\n") }
 }
 
 /// How many of the end lines of each Slates log a failed drive says.
