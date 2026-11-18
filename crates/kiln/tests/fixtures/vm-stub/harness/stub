@@ -37,6 +37,7 @@ prompt asks with words:
                     agent would ask it (`agents_land`, the agent named as kiln's answer to initialize
                     names it), kiln answering by the landing permission its person gave it, its mode
                     (docs/agentic.md W6): `LAND_WRITTEN <kiln's answer>` where kiln wrote it at once;
+                    `LAND_CONFLICTED <kiln's answer>` where its presentation met conflicts;
                     `LAND_APPROVAL <its manifest>` where kiln holds it for a person's approval, then its
                     own approval of that manifest asked as well, which an agent that asks is never
                     given: `LAND_SELF_REFUSED <why>` where kiln refused it, `LAND_SELF_WRITTEN <answer>`
@@ -502,9 +503,11 @@ def raise_mode(servers):
 
 def land(servers):
     """Its lines, kiln answering by its mode (Slates' typed landing outcome, `outcome` naming it): `LAND_WRITTEN
-    <answer>`; or `LAND_APPROVAL <manifest>` then its own approval's `LAND_SELF_REFUSED <why>`, `LAND_SELF_WRITTEN
-    <answer>` or `LAND_SELF_FAIL <answer>`; or `LAND_REFUSED <why>`; or `LAND_FAIL <why>`. The agent it asks for is
-    itself, as kiln's answer to initialize names it: a harness asking to write its own work to disk."""
+    <answer>`; or `LAND_CONFLICTED <answer>`; or `LAND_APPROVAL <manifest>` then its own approval's
+    `LAND_SELF_REFUSED <why>`, `LAND_SELF_WRITTEN <answer>` or `LAND_SELF_FAIL <answer>`; or `LAND_REFUSED <why>`; or
+    `LAND_FAIL <why>`. The agent it asks for is itself, as kiln's answer to initialize names it: a harness asking to
+    write its own work to disk. kiln refuses an ask agent's own approval as an error (403, or 428 while it waits on its
+    person's click): either is `LAND_SELF_REFUSED`."""
     try:
         c = _connect(servers)
     except (OSError, ValueError) as e:
@@ -518,6 +521,8 @@ def land(servers):
             return ["LAND_REFUSED %s" % (refused or said)]
         if outcome == "written":
             return ["LAND_WRITTEN %s" % said]
+        if outcome == "conflicted":
+            return ["LAND_CONFLICTED %s" % said]
         manifest = ((answer or {}).get("approval") or {}).get("manifest") if outcome == "approval_required" else None
         if not isinstance(manifest, str) or not manifest:
             return ["LAND_FAIL kiln's answer is no landing's outcome naming what it holds: %s" % said]

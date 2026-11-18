@@ -1294,13 +1294,13 @@ agent's folder on that agent's machine works in that agent's volume:
   `approval_required` (`approval`: the manifest to approve, its summary and conflicts). An agent
   working in another's volume lands nothing of its own while that one works: the volume lands whole,
   from its owner. kiln approves it with a secret of its own that it hands Slates at every start,
-  on every system; not yet where Slates runs under a systemd unit (Linux), which can't take it, and
-  there the plan says so. kiln leaves out what git ignores in the workspace (the agent's build output
+  on every system. kiln leaves out what git ignores in the workspace (the agent's build output
   and dependencies) and `.git`, and writes only what git sees changed: when more would be written (a
   build still running made it since), the plan says to put the work up for review instead.
 - **How long it lasts.** As long as the agent: ended for good, its volume goes with it. It outlives
-  the runner's restarts and upgrades (Slates' anchor runs apart from the runner: its own systemd
-  user unit on Linux), but not the machine's (Slates keeps volumes in memory). An agent in one
+  the runner's restarts and upgrades (Slates' anchor runs apart from the runner: a systemd user
+  scope of its own on Linux, its own process group elsewhere), but not the machine's (Slates keeps
+  volumes in memory). An agent in one
   doesn't move to another machine yet.
 - **Where it can.** Any machine with a mount it can make: FUSE through `fusermount3` on Linux, NFS
   on loopback on macOS, WinFsp on Windows (each workspace at a drive letter of its own, the highest

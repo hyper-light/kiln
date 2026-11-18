@@ -17,9 +17,9 @@
 //! landing, which wait while the daemon lives.
 //!
 //! The machine keeps one Slates instance (`kiln`) for all its runner processes. Its anchor is
-//! started apart from the runner (its own systemd user unit on Linux, its own process group
-//! elsewhere), so restarting or upgrading the runner never ends it: a volume lives in the
-//! anchor's memory, and goes when it does.
+//! started apart from the runner (a systemd user scope of its own on Linux where the runner runs
+//! under the user's service manager, its own process group elsewhere), so restarting or upgrading
+//! the runner never ends it: a volume lives in the anchor's memory, and goes when it does.
 //!
 //! kiln speaks Slates' typed consumer contract (slates-api's A-299, pinned at [`CONTRACT`]): every
 //! answer is a typed outcome and every failure a typed error, never text to parse. Writing a volume
@@ -38,6 +38,7 @@
 //! now. Files it has touched are witnessed when it first writes them, and a later change on disk
 //! to one of them is reported as drift.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -52,7 +53,15 @@ pub const INSTANCE: &str = "kiln";
 /// The version of Slates' consumer contract this module is written against (slates-api's `CONTRACT`,
 /// A-299, raised with every change to a type or a verb of it): a re-vendor that moves it fails
 /// `w1_kiln_speaks_the_contract_it_was_written_against` beside the matches it must extend.
-pub const CONTRACT: u32 = 8;
+///
+/// 16 since kiln took Slates at 15f6b5b8e (from 8). Of what 9 to 16 added, kiln uses the
+/// anchor's command under a wrapper (14: `start_anchor`'s systemd scope keeps the launcher
+/// secret on the anchor's standard input) and the mounts an unmount names unreported (16,
+/// Windows: `unmount`). It needs none of the rest: the `Volumes` seam and its simulator (9),
+/// a volume's loss window (10), a daemon's recovered verdict (11), a Shards stream's resync
+/// channel (12), signed merges (13), the volume core's typed refusals (15, which kiln shows in
+/// Slates' words as it did).
+pub const CONTRACT: u32 = 16;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -233,37 +242,58 @@ fn start_spec(launcher: Option<LauncherSecret>) -> anyhow::Result<StartSpec> {
     })
 }
 
-/// Whether the anchor starts under a systemd user unit of its own (Linux, where there is one),
-/// rather than here: tests and labs start theirs here (`KILN_SLATES_DIRECT`), so no unit outlives
-/// them.
-fn under_systemd() -> bool {
-    let direct = OVERRIDE.get().is_some() || std::env::var_os("KILN_SLATES_DIRECT").is_some();
-    !direct && cfg!(target_os = "linux") && std::env::var_os("XDG_RUNTIME_DIR").is_some() && crate::os::which("systemd-run").is_some()
+/// Whether the anchor starts in a systemd user scope of its own (`scope_wrapper`): on Linux,
+/// where this process runs under the user's service manager (as a runner's user unit does), unless
+/// `KILN_SLATES_DIRECT` asks for its own process group in this process's cgroup (labs, and the
+/// servers end-to-end tests start, which stop their instance's processes themselves). A scope ends
+/// with its processes, so a test that stops the anchor it started leaves no unit behind.
+pub fn starts_in_a_scope() -> bool {
+    std::env::var_os("KILN_SLATES_DIRECT").is_none()
+        && cfg!(target_os = "linux")
+        && std::env::var_os("XDG_RUNTIME_DIR").is_some()
+        && crate::os::which("systemd-run").is_some()
+        && std::fs::read_to_string("/proc/self/cgroup").is_ok_and(|cgroup| in_user_manager(&cgroup))
 }
 
-/// Starts the instance's anchor apart from this process: a systemd user unit of its own on Linux
-/// where there is one (stopping or restarting the runner's unit never takes it along), its own
-/// process group elsewhere, with what it says appended to `log`. The anchor started here, which
-/// [`ensure_up`] watches while it waits for its daemon to answer; none for a unit's.
-async fn start_anchor(log: &Path) -> anyhow::Result<Option<std::process::Child>> {
-    if under_systemd() {
-        // A unit's anchor takes no standard input, so it carries no launcher secret yet (Slates' `StartSpec`
-        // hands the secret on the command's own standard input, which a host can't give its wrapper); kiln
-        // can't approve on it ([`can_take_grants`]).
-        let anchor = start_spec(None)?.anchor_command().map_err(|e| anyhow::anyhow!("Slates: {e}"))?;
-        let unit = format!("{}-slates", instance());
-        let mut reset = Command::new("systemctl");
-        reset.args(["--user", "reset-failed", &format!("{unit}.service")]);
-        let _ = crate::proc::output(reset, Duration::from_secs(10)).await;
-        let mut c = Command::new("systemd-run");
-        c.args(["--user", "--quiet", "--collect", &format!("--unit={unit}"), "--"]).arg(anchor.get_program()).args(anchor.get_args());
-        match crate::proc::output(c, Duration::from_secs(20)).await {
-            Ok(o) if o.status.success() => return Ok(None),
-            Ok(o) => tracing::info!(said = %String::from_utf8_lossy(&o.stderr).trim(), "Slates' anchor didn't start as a unit of its own; starting it here"),
-            Err(e) => tracing::info!(error = %format!("{e:#}"), "Slates' anchor didn't start as a unit of its own; starting it here"),
-        }
-    }
-    let mut anchor = start_spec(Some(launcher_secret()?))?.anchor_command().map_err(|e| anyhow::anyhow!("Slates: {e}"))?;
+/// Whether the cgroup `/proc/self/cgroup` names (`cgroup`, its v2 `0::` line) lies in the user's own
+/// service manager's tree (`user@<uid>.service`): only from there can that manager move a process
+/// of this one's into a scope of its own. A login session's cgroup (`session-<n>.scope`) and a
+/// system service's belong to the system's manager, and the user's can't move a process out of them.
+fn in_user_manager(cgroup: &str) -> bool {
+    cgroup.lines().filter_map(|l| l.strip_prefix("0::")).any(|path| path.split('/').any(|part| part.starts_with("user@") && part.ends_with(".service")))
+}
+
+/// The command that runs the anchor in a systemd user scope of its own named `unit`
+/// (`systemd-run --user --scope`): systemd-run moves its own process into the scope and then execs
+/// the anchor, which keeps the standard input, the environment and the process group Slates gave
+/// it (`StartSpec::anchor_command_under`, contract 14). The launcher's secret reaches the anchor
+/// on that standard input, and stopping or restarting the runner's unit never takes the instance
+/// along. A transient service (`systemd-run` with no `--scope`) is started by the user manager,
+/// which hands it no standard input of ours.
+fn scope_wrapper(unit: &str) -> Vec<OsString> {
+    ["systemd-run", "--user", "--scope", "--quiet", "--collect", &format!("--unit={unit}"), "--"].into_iter().map(OsString::from).collect()
+}
+
+/// The anchor's command, handed `launcher`'s secret: run under [`scope_wrapper`] where it starts
+/// under systemd (`scoped`), as itself elsewhere.
+fn anchor_command(launcher: LauncherSecret, scoped: bool) -> anyhow::Result<Command> {
+    let spec = start_spec(Some(launcher))?;
+    let command = if scoped {
+        let wrapper = scope_wrapper(&format!("{}-slates", instance()));
+        spec.anchor_command_under(&wrapper.iter().map(OsString::as_os_str).collect::<Vec<&OsStr>>())
+    } else {
+        spec.anchor_command()
+    };
+    command.map_err(|e| anyhow::anyhow!("Slates: {e}"))
+}
+
+/// Starts the instance's anchor apart from this process, handed kiln's launcher secret: in a
+/// systemd user scope of its own on Linux where this process runs under the user's service manager
+/// ([`starts_in_a_scope`], [`scope_wrapper`]), in its own process group elsewhere, with what it says
+/// (systemd-run's own refusal included) appended to `log`. The process started is the anchor
+/// itself, which [`ensure_up`] watches while it waits for its daemon to answer.
+fn start_anchor(log: &Path) -> anyhow::Result<std::process::Child> {
+    let mut anchor = anchor_command(launcher_secret()?, starts_in_a_scope())?;
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -273,7 +303,7 @@ async fn start_anchor(log: &Path) -> anyhow::Result<Option<std::process::Child>>
     anchor.stdout(out).stderr(err);
     let child = crate::os::supervise::spawn_detached(&mut anchor)?;
     let _ = STARTED.set(child.id());
-    Ok(Some(child))
+    Ok(child)
 }
 
 /// One start of the anchor at a time: agents starting together find it started by the first.
@@ -292,14 +322,14 @@ pub async fn ensure_up() -> anyhow::Result<()> {
         return Ok(());
     }
     let h = here()?;
-    let anchor = start_anchor(&h.log).await?;
+    let anchor = start_anchor(&h.log)?;
     let name = instance();
     let until = Instant::now() + UP_WAIT;
-    // The anchor started here is watched while it's waited for (its exit ends the wait), and never
-    // after: it outlives this process.
+    // The anchor started here is watched while it's waited for (its exit ends the wait, a scope
+    // systemd refused included), and never after: it outlives this process.
     let answered = crate::rt::blocking(move || {
         let mut anchor = anchor;
-        Instance::wait_for(&name, anchor.as_mut(), Some(until)).map(|_| ())
+        Instance::wait_for(&name, Some(&mut anchor), Some(until)).map(|_| ())
     })
     .await?;
     // Another of the machine's kiln processes may have started it meanwhile, its anchor this one's
@@ -427,7 +457,9 @@ async fn mount_at(m: &Made) -> anyhow::Result<()> {
 }
 
 /// Takes the mount at `path` away: with the OS's own unmount, which needs no daemon (Unix); or by
-/// ending its attachment (Windows, where the drive is the daemon's own).
+/// ending its attachment (Windows, where the drive is the daemon's own). On Windows Slates finds
+/// the drive among its volumes' mounts, and names each volume it couldn't ask (one its recovery
+/// couldn't rebuild): those are logged, since their mounts are unknown.
 async fn unmount(path: String) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -435,7 +467,12 @@ async fn unmount(path: String) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        call("unmount", move |i| i.unmount(&path)).await
+        let unmounted = call("unmount", move |i| i.unmount(&path)).await?;
+        if !unmounted.unreported.is_empty() {
+            let unreported: Vec<String> = unmounted.unreported.iter().map(ToString::to_string).collect();
+            tracing::info!(unreported = %unreported.join("; "), "Slates unmounted a workspace's drive but couldn't ask every volume for its mounts");
+        }
+        Ok(())
     }
 }
 
@@ -799,21 +836,10 @@ fn read_secret(path: &Path) -> anyhow::Result<Option<LauncherSecret>> {
 }
 
 /// kiln's authority as its instance's launcher (`launcher_secret`): what sets a workspace's write
-/// policy and approves a landing its mode asks about. Refused where the instance runs under a
-/// systemd unit, which took no secret at its start ([`can_take_grants`]).
+/// policy and approves a landing its mode asks about. Every anchor kiln starts is handed the
+/// secret, a scoped one under systemd included ([`start_anchor`]).
 fn launcher() -> anyhow::Result<Issuer> {
-    can_take_grants()?;
     Ok(Issuer::from_launcher_secret(&launcher_secret()?))
-}
-
-/// Whether this machine's Slates takes kiln's approvals and policies, and why not: an instance
-/// kiln starts under a systemd unit (Linux) is handed no launcher secret yet.
-pub fn can_take_grants() -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !under_systemd(),
-        "Slates on this machine runs under a systemd unit of its own, which kiln can't hand its launcher secret to yet: put the work up for review instead"
-    );
-    Ok(())
 }
 
 /// What came of writing a workspace back: written (Slates' outcome), or not, because the plan is no
@@ -829,7 +855,6 @@ pub enum Landed {
 /// under kiln's authority ([`approve`]). When anything changed, nothing is written and the new plan
 /// comes back.
 pub async fn land(m: &Made, over: &str, manifest: &str) -> anyhow::Result<Landed> {
-    can_take_grants()?;
     let (shown, excludes) = plan_landing(m, over).await?;
     if shown.get("manifest").and_then(Value::as_str).map(str::to_ascii_lowercase) != Some(manifest.to_ascii_lowercase()) {
         return Ok(match shown.get("grant_required").and_then(Value::as_bool) {
@@ -1045,5 +1070,43 @@ mod tests {
         assert_eq!(request.filter.exclude, ["/target", "/.git"]);
         assert!(request.filter.include.is_empty() && request.snapshot.is_none() && request.target == "/src/kiln");
         Ok(())
+    }
+
+    /// W1 (Slates' contract 14): under systemd the anchor's command is systemd-run making a scope of
+    /// its own, named for the instance, that execs exactly the anchor's own command; and the
+    /// launcher's secret still rides its standard input (the anchor is told so), never an argument.
+    #[test]
+    fn w1_under_systemd_the_anchor_runs_in_a_scope_of_its_own_handed_the_secret() -> anyhow::Result<()> {
+        let text = |os: &OsStr| os.to_string_lossy().into_owned();
+        let secret = LauncherSecret::generate()?;
+        let scoped = anchor_command(secret.clone(), true)?;
+        assert_eq!(scoped.get_program(), "systemd-run");
+        let args: Vec<String> = scoped.get_args().map(text).collect();
+        let unit = format!("--unit={}-slates", instance());
+        let wrapper = ["--user", "--scope", "--quiet", "--collect", unit.as_str(), "--"];
+        assert_eq!(args.get(..wrapper.len()), Some(&wrapper.map(str::to_owned)[..]), "{args:?}");
+        let own = anchor_command(secret.clone(), false)?;
+        let mut execed = vec![text(own.get_program())];
+        execed.extend(own.get_args().map(text));
+        assert_eq!(args.get(wrapper.len()..), Some(&execed[..]), "what the scope execs is the anchor's own command");
+        let marked = scoped.get_envs().any(|(k, v)| k == "SLATES_LAUNCHER" && v.is_some_and(|v| v == "stdin"));
+        assert!(marked, "{:?}", scoped.get_envs().collect::<Vec<_>>());
+        let hex: String = secret.bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert!(args.iter().all(|a| !a.contains(&hex)), "the secret rides no argument");
+        Ok(())
+    }
+
+    /// W1: only a process under the user's own service manager (a runner's user unit) starts its
+    /// anchor in a scope: the user's manager can't move a process out of a login session's cgroup
+    /// or a system service's. cgroup v2's line alone decides.
+    #[test]
+    fn w1_only_a_process_under_the_users_service_manager_starts_its_anchor_in_a_scope() {
+        let runner = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/kiln-agent.service/kiln\n";
+        assert!(in_user_manager(runner));
+        let hybrid = "12:pids:/user.slice/user-1000.slice/session-2.scope\n0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n";
+        assert!(in_user_manager(hybrid), "the v2 line, beside v1's");
+        for outside in ["0::/user.slice/user-1000.slice/session-3.scope\n", "0::/system.slice/kiln-agent.service\n", "1:name=systemd:/user.slice/user-1000.slice/user@1000.service\n", "0::/\n", ""] {
+            assert!(!in_user_manager(outside), "{outside:?}");
+        }
     }
 }

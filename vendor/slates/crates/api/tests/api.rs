@@ -1,8 +1,9 @@
 //! The library and its consumer contract by use (§4.12 "Embedding", A-278; "The consumer contract", A-299): an
 //! embedding host's whole flow over a daemon in this process — attach, the consensus group, volumes provisioned from
 //! each source, snapshotted, cloned and destroyed, an overlay written, its drift read typed, a landing presented for
-//! approval and approved exactly as shown, a conflict typed per path, a merge accepted and a merge conflicted, signed
-//! work refused until the daemon verifies it, a Shards stream that serves the volume, and the daemon observed — each
+//! approval and approved exactly as shown, a conflict typed per path, a merge accepted and a merge conflicted, a signed
+//! merge judged and its record read back (a signed landing refused until the daemon verifies a landing's signature), a
+//! Shards stream that serves the volume, and the daemon observed — each
 //! outcome and each refusal asserted as its typed variant. Every test drives the crate's own verbs and judges only what
 //! a host could observe: the daemon's answers and the bytes on the disk.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
@@ -14,26 +15,41 @@
   clippy::disallowed_methods
 )]
 
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind, Error, Existing, Filter,
-  GrantState, Instance, Intent, Invalid, IssuerFault, LandOutcome, LandingApproval,
-  LandingConflict, LandingStage, LandingState, MergeApproval, MergeOutcome, Missing, PathFault,
-  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SnapshotId, Unsupported,
-  Unusable, Verification, VolumeId, VolumeSpec, Work, WorkSignature, WriteAct, WriteMode,
-  WritePolicy,
+  AttachTransport, Denied, Error, Exhausted, Existing, Instance, Intent, Invalid, IssuerFault,
+  KindMismatch, MergeApproval, MergeOutcome, MergeRecord, Missing, MountOptions, PathFault,
+  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId,
+  Source, TrustedSigner, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
+  WorkSignature, WriteAct, WriteMode, WritePolicy,
+};
+// What only the Unix-gated tests (the overlay and landing tests) name.
+#[cfg(unix)]
+use slates_api::{
+  AuditKind, BaseState, ConflictClass, Drift, DriftKind, Filter, GrantState, LandOutcome,
+  LandingApproval, LandingConflict, LandingStage, LandingState, Unsupported,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+/// A software SSH signer (A-321), shared with the daemon's own signed-work tests; not every helper is used here.
+#[path = "../../server/tests/common/signer.rs"]
+#[allow(dead_code)]
+mod signer;
 
 /// Shape: each probe's wall budget for the tests' machine profile (milliseconds); measured once per process.
 const PROBE_MS: u64 = 5;
 /// Shape: one shard per test daemon: the library's verbs are the subject, not placement.
 const TEST_SHARDS: u16 = 1;
+/// Shape: the shards of the daemon kiln starts (`crates/kiln/src/workspace/slates.rs`, `SHARDS`): two on every
+/// machine, so each shard's reserve is a sixth of the machine's memory (three memory classes) while kiln's volume asks
+/// a quarter.
+const KILN_SHARDS: u16 = 2;
 /// Shape: how long a test waits for its daemon's rendezvous to answer after the start.
 const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: a scratch volume's quota and an overlay's growth bound: room for the few small files a test writes.
@@ -58,7 +74,7 @@ fn profile() -> MachineProfile {
     .expect("the machine profile measures");
   static RESERVED: OnceLock<bool> = OnceLock::new();
   let _ = RESERVED.get_or_init(|| {
-    let largest = DaemonConfig::derive(&profile, "api-reserve", Some(TEST_SHARDS));
+    let largest = DaemonConfig::derive(&profile, "api-reserve", Some(TEST_SHARDS.max(KILN_SHARDS)));
     slates_server::seal_keys::reserve(largest.seal_key_slots)
   });
   profile
@@ -67,11 +83,16 @@ fn profile() -> MachineProfile {
 /// A daemon of this process named after `tag` (its consensus group not made: [`Instance::ensure_group`] makes it), and
 /// an instance attached to it, retried while the rendezvous comes up.
 fn daemon(tag: &str) -> (Daemon, Instance) {
+  daemon_on(tag, TEST_SHARDS)
+}
+
+/// [`daemon`] on `shards` shards.
+fn daemon_on(tag: &str, shards: u16) -> (Daemon, Instance) {
   static NEXT: AtomicU64 = AtomicU64::new(0);
   let profile = profile();
   let serial = NEXT.fetch_add(1, Ordering::Relaxed);
   let instance = format!("api-{tag}-{}-{serial}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let config = DaemonConfig::derive(&profile, &instance, Some(shards));
   let daemon = Daemon::start(
     &profile,
     config,
@@ -100,12 +121,22 @@ fn grouped(tag: &str) -> (Daemon, Instance) {
   (daemon, instance)
 }
 
+/// [`grouped`] on the shards of the daemon kiln starts ([`KILN_SHARDS`]).
+#[cfg(unix)]
+fn kiln_grouped(tag: &str) -> (Daemon, Instance) {
+  let (daemon, mut instance) = daemon_on(tag, KILN_SHARDS);
+  instance.ensure_group().unwrap();
+  (daemon, instance)
+}
+
 /// A real directory for an overlay's base and a landing's target (A-50: never `/tmp`, never a RAM directory): in the
 /// build output, named with the process id and a counter, canonical, removed on drop.
+#[cfg(unix)]
 struct Folder {
   path: String,
 }
 
+#[cfg(unix)]
 impl Folder {
   fn new() -> Folder {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -136,6 +167,7 @@ impl Folder {
   }
 }
 
+#[cfg(unix)]
 impl Drop for Folder {
   fn drop(&mut self) {
     let _removed = std::fs::remove_dir_all(&self.path);
@@ -166,6 +198,7 @@ fn provision(instance: &mut Instance, spec: &VolumeSpec) -> VolumeId {
 }
 
 /// The landing of `volume`'s head into `folder`, `.git` left out as kiln's landings leave it.
+#[cfg(unix)]
 fn landing_into(volume: VolumeId, folder: &Folder) -> slates_api::LandingRequest {
   slates_api::LandingRequest {
     volume,
@@ -185,6 +218,7 @@ fn issuer_of(daemon: &Daemon) -> slates_api::Issuer {
 }
 
 /// A signature in `ssh-keygen -Y sign`'s armour, for the refusals that come before any verifier reads it.
+#[cfg(unix)]
 fn a_signature() -> WorkSignature {
   WorkSignature::from_armoured(
     "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----",
@@ -348,15 +382,43 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   );
   assert_eq!(folder.read("n.txt"), None);
 
-  let request = landing_into(volume, &folder);
+  let approval = expect_an_approval_asked(&mut instance, &landing_into(volume, &folder));
+  expect_the_entries_listed_as_they_read(&mut instance, volume, &approval);
+
+  let issuer = issuer_of(&daemon);
+  let stale = LandingApproval {
+    manifest: [0u8; 32],
+    ..approval.clone()
+  };
+  let changed = instance.approve_landing(&stale, &issuer).unwrap();
+  assert!(
+    matches!(&changed, LandOutcome::ApprovalRequired(fresh) if fresh.manifest == approval.manifest),
+    "an approval of another manifest is no approval of this one: {changed:?}"
+  );
+  assert_eq!(folder.read("a.txt").unwrap(), b"a\n", "nothing was written");
+
+  expect_the_approved_manifest_written(&mut instance, &approval, &issuer, &folder);
+  expect_the_landing_audited_and_its_grant_consumed(&mut instance, &approval);
+  daemon.stop();
+}
+
+/// The ask of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: land `request` signed, then unsigned.
+/// Expect the signed landing refused `Unsupported(SignedWork)` before anything is sent, and the unsigned one answered
+/// `ApprovalRequired`, unsigned, for `request`, with a typed summary of one create and one replace, `.git` filtered out.
+/// Returns the approval.
+#[cfg(unix)]
+fn expect_an_approval_asked(
+  instance: &mut Instance,
+  request: &slates_api::LandingRequest,
+) -> LandingApproval {
   assert_eq!(
-    instance.land(&request, Some(&a_signature())),
+    instance.land(request, Some(&a_signature())),
     Err(Error::Unsupported(Unsupported::SignedWork))
   );
-  let LandOutcome::ApprovalRequired(approval) = instance.land(&request, None).unwrap() else {
+  let LandOutcome::ApprovalRequired(approval) = instance.land(request, None).unwrap() else {
     panic!("a landing with changes asks under today's mode");
   };
-  assert_eq!(approval.request, request);
+  assert_eq!(approval.request, *request);
   assert_eq!(approval.verification, Verification::Unsigned);
   assert_eq!(
     (
@@ -370,8 +432,18 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   assert_eq!(approval.summary.actions.total(), 2);
   assert!(approval.summary.filtered_out >= 1, "{:?}", approval.summary);
   assert_eq!(approval.manifest_text().len(), 64);
-  // A-287: the approval's entry list is what it writes, path by path, `/.git` left out, each file as it reads.
-  let entries = instance.approval_entries(&approval).unwrap();
+  approval
+}
+
+/// The entry list of `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (A-287). Expect `approval`'s list to
+/// be what it writes, path by path, `/.git` left out, each file as it reads in `volume`.
+#[cfg(unix)]
+fn expect_the_entries_listed_as_they_read(
+  instance: &mut Instance,
+  volume: VolumeId,
+  approval: &LandingApproval,
+) {
+  let entries = instance.approval_entries(approval).unwrap();
   let listed: Vec<_> = entries
     .iter()
     .map(|entry| {
@@ -390,7 +462,7 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
     ]
   );
   for entry in &entries {
-    let bytes = read_file(&mut instance, volume, &entry.path);
+    let bytes = read_file(instance, volume, &entry.path);
     assert_eq!(
       entry.content.map(|content| content.hash),
       Some(*blake3::hash(&bytes).as_bytes()),
@@ -398,20 +470,19 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
       entry.path
     );
   }
+}
 
-  let issuer = issuer_of(&daemon);
-  let stale = LandingApproval {
-    manifest: [0u8; 32],
-    ..approval.clone()
-  };
-  let changed = instance.approve_landing(&stale, &issuer).unwrap();
-  assert!(
-    matches!(&changed, LandOutcome::ApprovalRequired(fresh) if fresh.manifest == approval.manifest),
-    "an approval of another manifest is no approval of this one: {changed:?}"
-  );
-  assert_eq!(folder.read("a.txt").unwrap(), b"a\n", "nothing was written");
-
-  let landed = instance.approve_landing(&approval, &issuer).unwrap();
+/// The approved landing of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: approve `approval` with
+/// `issuer`. Expect it `Written` and `Done`, unsigned, two entries written, and `folder` holding exactly the volume's
+/// two files with `.git/HEAD` as it was.
+#[cfg(unix)]
+fn expect_the_approved_manifest_written(
+  instance: &mut Instance,
+  approval: &LandingApproval,
+  issuer: &slates_api::Issuer,
+  folder: &Folder,
+) {
+  let landed = instance.approve_landing(approval, issuer).unwrap();
   let LandOutcome::Written(report) = landed else {
     panic!("the approved manifest lands: {landed:?}");
   };
@@ -425,8 +496,16 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
     b"ref: refs/heads/main\n",
     "git's own files were left out"
   );
-  // The approval and the landing are audited and listed, typed (A-299): the presentation, the grant the launcher
-  // issued, the landing finished `Done`, and the single-use grant consumed by it.
+}
+
+/// The record of `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (A-299). Expect the approval and the
+/// landing audited and listed, typed: the presentation, the grant the launcher issued, the landing finished `Done`, and
+/// the single-use grant of `approval` consumed by it.
+#[cfg(unix)]
+fn expect_the_landing_audited_and_its_grant_consumed(
+  instance: &mut Instance,
+  approval: &LandingApproval,
+) {
   let audit = instance.audit(0).unwrap();
   let kinds: Vec<AuditKind> = audit.iter().map(|record| record.kind).collect();
   assert!(
@@ -447,7 +526,6 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
       .any(|grant| grant.manifest == approval.manifest && grant.state == GrantState::Consumed),
     "{grants:?}"
   );
-  daemon.stop();
 }
 
 /// AC-5.12 / T-5.14 (A-278, A-299; §4.15 "Drift", step 4): do change a file in an overlay, then change the same file on
@@ -550,20 +628,33 @@ fn a_landing_follows_its_volumes_write_mode() {
   };
   assert_eq!(report.state, LandingState::Done, "{report:?}");
   assert_eq!(bypassed.read("w.txt").unwrap(), b"written at once\n");
+  expect_a_forbidding_volume_never_lands(&mut instance, shut, &forbidden, &launcher);
+  daemon.stop();
+}
 
+/// The forbidding half of `a_landing_follows_its_volumes_write_mode`. Do: forbid `shut`'s merges and landings with the
+/// `launcher`'s authority, write a file into it and land it over `forbidden`; then set a policy that also requires
+/// signed merges on it, and one on a consumer. Expect the landing answered `Refused` by the volume's own policy, nothing
+/// written; the volume's requirement set and read back (A-321); and the consumer's refused
+/// `Invalid::SignedMergesNotAVolume` before anything is sent, since the requirement is a volume's rule.
+#[cfg(unix)]
+fn expect_a_forbidding_volume_never_lands(
+  instance: &mut Instance,
+  shut: VolumeId,
+  forbidden: &Folder,
+  launcher: &slates_api::Issuer,
+) {
   let forbid = WritePolicy {
     merge: WriteMode::Forbid,
     land: WriteMode::Forbid,
     require_signed_merges: false,
   };
   instance
-    .set_write_policy(PolicySubject::Volume(shut), &forbid, &launcher)
+    .set_write_policy(PolicySubject::Volume(shut), &forbid, launcher)
     .unwrap();
-  write_file(&mut instance, shut, "/f.txt", b"never landed\n");
+  write_file(instance, shut, "/f.txt", b"never landed\n");
   assert_eq!(
-    instance
-      .land(&landing_into(shut, &forbidden), None)
-      .unwrap(),
+    instance.land(&landing_into(shut, forbidden), None).unwrap(),
     LandOutcome::Refused(PolicyRefusal {
       act: WriteAct::Land,
       by: PolicySubject::Volume(shut),
@@ -571,26 +662,28 @@ fn a_landing_follows_its_volumes_write_mode() {
     })
   );
   assert_eq!(forbidden.read("f.txt"), None, "nothing was written");
+  let requiring = WritePolicy {
+    require_signed_merges: true,
+    ..forbid
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(shut), &requiring, launcher)
+    .unwrap();
   assert_eq!(
-    instance.set_write_policy(
-      PolicySubject::Volume(shut),
-      &WritePolicy {
-        require_signed_merges: true,
-        ..forbid
-      },
-      &launcher
-    ),
-    Err(Error::Unsupported(Unsupported::SignedWork))
+    instance.write_policy(PolicySubject::Volume(shut)).unwrap(),
+    Some(requiring)
   );
-  daemon.stop();
+  assert_eq!(
+    instance.set_write_policy(PolicySubject::Consumer(1), &requiring, launcher),
+    Err(Error::Invalid(Invalid::SignedMergesNotAVolume))
+  );
 }
 
 /// AC-5.12 / T-5.14 (A-299; §4.16, D-27): do provision a green and work volumes over it; merge a seed, then two works
 /// based on the same version that rewrite the same bytes, one after the other; rebase and merge a third that changed
 /// another file. Expect a green's and a work's status read with no base; the seed and the first `Merged` at versions 1
 /// and 2, unsigned; the second `Conflicted` with a
-/// window on the rewritten bytes and the green's head 2, nothing merged; the third rebased onto 2 and merged at 3; and a
-/// signed merge refused `Unsupported(SignedWork)` before anything is sent.
+/// window on the rewritten bytes and the green's head 2, nothing merged; and the third rebased onto 2 and merged at 3.
 #[test]
 fn a_merge_is_accepted_or_conflicted_typed() {
   let (daemon, mut instance) = grouped("merge");
@@ -622,10 +715,6 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     .edit(seed.volume, "f", 0, 0, b"aaaaaaaa")
     .unwrap();
   assert_eq!(
-    instance.merge(&seed, &[], Some(&a_signature())),
-    Err(Error::Unsupported(Unsupported::SignedWork))
-  );
-  assert_eq!(
     instance.merge(&seed, &[], None).unwrap(),
     MergeOutcome::Merged {
       version: 1,
@@ -643,11 +732,20 @@ fn a_merge_is_accepted_or_conflicted_typed() {
     instance.merge(&first, &[], None).unwrap(),
     MergeOutcome::Merged { version: 2, .. }
   ));
+  expect_the_same_bytes_rewritten_conflict(&mut instance, &second);
+  expect_a_rebased_work_merged(&mut instance, &third);
+  daemon.stop();
+}
+
+/// The conflict of `a_merge_is_accepted_or_conflicted_typed`. Do: in `second`, based on the version before the first
+/// work's merge, rewrite the bytes that merge rewrote, and merge it. Expect it `Conflicted` with a window on the
+/// rewritten bytes and the green's head 2, nothing merged.
+fn expect_the_same_bytes_rewritten_conflict(instance: &mut Instance, second: &Work) {
   instance
     .client()
     .edit(second.volume, "f", 0, 4, b"YYYY")
     .unwrap();
-  let MergeOutcome::Conflicted(conflicts) = instance.merge(&second, &[], None).unwrap() else {
+  let MergeOutcome::Conflicted(conflicts) = instance.merge(second, &[], None).unwrap() else {
     panic!("a rewrite of bytes the green changed since the base conflicts");
   };
   assert_eq!(conflicts.head, 2);
@@ -658,18 +756,115 @@ fn a_merge_is_accepted_or_conflicted_typed() {
       .any(|conflict| conflict.path == "f" && conflict.at < 4),
     "the conflict names the rewritten range: {conflicts:?}"
   );
+}
+
+/// The rebase of `a_merge_is_accepted_or_conflicted_typed`. Do: change another file in `third`, rebase it and merge it.
+/// Expect it rebased onto version 2 and merged at 3.
+fn expect_a_rebased_work_merged(instance: &mut Instance, third: &Work) {
   instance
     .client()
     .edit(third.volume, "g", 0, 0, b"other")
     .unwrap();
   assert_eq!(
-    instance.rebase(&third).unwrap(),
+    instance.rebase(third).unwrap(),
     RebaseOutcome::Rebased { version: 2 }
   );
   assert!(matches!(
-    instance.merge(&third, &[], None).unwrap(),
+    instance.merge(third, &[], None).unwrap(),
     MergeOutcome::Merged { version: 3, .. }
   ));
+}
+
+/// AC-5.12 (A-321; §4.16, §4.12 "The consumer contract"): do trust a key on a green and require signed merges there,
+/// with the launcher's authority; merge a work unsigned; ask for its statement, sign it with the trusted key and merge
+/// it; read the version's merge record back, and a version never committed. Expect the signers read back as set; the
+/// unsigned merge `Refused` by the green's requirement, unsigned, nothing merged; the statement naming the work, a
+/// person's text; the signed merge `Merged` at 1, verified naming the trusted key; its record verified, read back after
+/// the checkpoint the merge let fold its chain entry (the work moved to 1, so nothing below it is live); the origin's
+/// record unsigned; and the uncommitted version `NotFound` naming it.
+#[test]
+fn a_signed_merge_is_judged_and_read_back_through_the_contract() {
+  let (daemon, mut instance) = grouped("signed-merge");
+  let launcher = issuer_of(&daemon);
+  let green = provision(
+    &mut instance,
+    &VolumeSpec {
+      name: "signed-green".to_owned(),
+      source: slates_api::Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  let key = signer::TestSigner::fresh();
+  let trusted = TrustedSigner::from_wire(key.public()).unwrap();
+  instance
+    .set_signers(green, std::slice::from_ref(&trusted), &launcher)
+    .unwrap();
+  assert_eq!(instance.signers(green).unwrap(), vec![trusted.clone()]);
+  let requiring = WritePolicy {
+    merge: WriteMode::Bypass,
+    land: WriteMode::Ask,
+    require_signed_merges: true,
+  };
+  instance
+    .set_write_policy(PolicySubject::Volume(green), &requiring, &launcher)
+    .unwrap();
+  let Provisioned::Work { work, .. } = instance
+    .provision(&VolumeSpec::work("signed", green))
+    .unwrap()
+  else {
+    panic!("a work volume provisions as one");
+  };
+  instance
+    .client()
+    .edit(work.volume, "f", 0, 0, b"signed work")
+    .unwrap();
+  assert_eq!(
+    instance.merge(&work, &[], None).unwrap(),
+    MergeOutcome::Refused(PolicyRefusal {
+      act: WriteAct::Merge,
+      by: PolicySubject::Volume(green),
+      reason: PolicyReason::SignatureRequired {
+        verification: Verification::Unsigned
+      },
+    })
+  );
+  assert_eq!(instance.client().versions(green).unwrap(), 0);
+  let statement = instance.merge_statement(&work, &[]).unwrap();
+  assert_eq!(statement.work, work);
+  assert!(
+    String::from_utf8(statement.statement.clone())
+      .unwrap()
+      .starts_with("slates merge v1\n")
+  );
+  let signature = WorkSignature::from_blob(key.sign(&statement.statement));
+  let verified = Verification::Verified {
+    signer: trusted.signer(),
+  };
+  assert_eq!(
+    instance.merge(&work, &[], Some(&signature)).unwrap(),
+    MergeOutcome::Merged {
+      version: 1,
+      verification: verified
+    }
+  );
+  assert_eq!(
+    instance.merge_record(green, 1).unwrap(),
+    MergeRecord {
+      version: 1,
+      verification: verified,
+    }
+  );
+  assert_eq!(
+    instance.merge_record(green, 0).unwrap().verification,
+    Verification::Unsigned,
+    "the origin, which no merge made"
+  );
+  assert_eq!(
+    instance.merge_record(green, 9),
+    Err(Error::NotFound(Missing::Version { green, version: 9 }))
+  );
   daemon.stop();
 }
 
@@ -763,6 +958,118 @@ fn a_merge_follows_its_greens_write_mode() {
   daemon.stop();
 }
 
+/// kiln's volume bound (`crates/kiln/src/workspace/slates.rs`, `volume_max`): a quarter of the machine's memory in
+/// whole GiB, at least one and at most 64.
+#[cfg(unix)]
+fn kiln_volume_max() -> u64 {
+  /// Format: kiln's `MAX_VOLUME_GIB`.
+  const MAX_VOLUME_GIB: u64 = 64;
+  ((profile().facts.memory.total / 4) >> 30).clamp(1, MAX_VOLUME_GIB) << 30
+}
+
+/// The daemon's own count of each shard's inode-version slab (§4.2 inode dimension), printed beside a test's verdict
+/// as its evidence: the slots, those committed to volumes' allowances, and those snapshots retain.
+#[cfg(unix)]
+fn print_version_slabs(instance: &mut Instance, when: &str) {
+  for shard in instance.daemon_status().unwrap().shards {
+    eprintln!(
+      "{when}: shard {} version_slots {} committed_versions {} retained_versions {} volumes {}",
+      shard.partition,
+      shard.version_slots,
+      shard.committed_versions,
+      shard.retained_versions,
+      shard.volumes
+    );
+  }
+}
+
+/// P1 (2026-11-18, kiln's review over a microVM's volume, which failed `agents.change` with "reading .gitignore: a
+/// bound is reached: Quota"; A-342, `docs/bugs/2026-11-18-a-dynamic-volume-reserved-the-whole-version-slab.md`). Do:
+/// what kiln does, on the daemon kiln starts ([`KILN_SHARDS`]) with kiln's own volume spec (a quarter of the machine's
+/// memory):
+/// the agent's three edits and its lookup of the project's `.gitignore` (git reads it); then review: snapshot, present
+/// that snapshot's landing without writing and list its entries, read `.gitignore` at the head as kiln's ignore rules
+/// do, and a base file nothing looked up before the snapshot. Expect: each file's bytes as the disk holds them — a read
+/// of a file nobody changed is never refused for space.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot() {
+  let (daemon, mut instance) = kiln_grouped("review-read");
+  let folder = Folder::new();
+  let ignores = b"target/\n*.log\n";
+  let readme = b"the project\n";
+  folder.write(".gitignore", ignores);
+  folder.write("README.md", readme);
+  folder.write("src/lib.rs", b"pub fn a() {}\n");
+  folder.write(".git/HEAD", b"ref: refs/heads/main\n");
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("kiln-review", &folder.path, kiln_volume_max()),
+  );
+  write_file(
+    &mut instance,
+    volume,
+    "/src/lib.rs",
+    b"pub fn a() { b() }\n",
+  );
+  write_file(&mut instance, volume, "/src/new.rs", b"pub fn b() {}\n");
+  write_file(&mut instance, volume, "/notes.txt", b"done\n");
+  assert_eq!(read_file(&mut instance, volume, "/.gitignore"), ignores);
+  let snapshot = instance.snapshot(volume).unwrap();
+  let request = slates_api::LandingRequest {
+    snapshot: Some(snapshot),
+    ..landing_into(volume, &folder)
+  };
+  let LandOutcome::ApprovalRequired(approval) = instance.plan_landing(&request).unwrap() else {
+    panic!("the agent's edits are presented");
+  };
+  assert_eq!(instance.approval_entries(&approval).unwrap().len(), 3);
+  print_version_slabs(&mut instance, "review");
+  assert_eq!(
+    instance.read(volume, "/.gitignore", slates_api::ReadAt::Head),
+    Ok(ignores.to_vec()),
+    "an unchanged base file looked up before the snapshot reads at the head"
+  );
+  assert_eq!(
+    instance.read(volume, "/README.md", slates_api::ReadAt::Head),
+    Ok(readme.to_vec()),
+    "an unchanged base file first looked up after the snapshot reads at the head"
+  );
+  instance.destroy_snapshot(volume, snapshot).unwrap();
+  daemon.stop();
+}
+
+/// P1's sibling (2026-11-18, the same bound, A-342): do provision one more of kiln's workspaces (kiln's own volume
+/// spec, a quarter of the machine's memory each) than the daemon kiln starts has shards, through one instance, as kiln
+/// does for its agents' sessions. Expect every one made: a workspace that may grow to a quarter of the machine holds
+/// none of its shard's room before it grows (§4.2: dynamic growth consumes only unpromised capacity).
+#[cfg(unix)]
+#[test]
+fn kilns_workspaces_are_provisioned_side_by_side() {
+  let (daemon, mut instance) = kiln_grouped("side-by-side");
+  let folders: Vec<Folder> = (0..=KILN_SHARDS)
+    .map(|_| {
+      let folder = Folder::new();
+      folder.write("README.md", b"the project\n");
+      folder
+    })
+    .collect();
+  let mut made = Vec::new();
+  for (serial, folder) in folders.iter().enumerate() {
+    let spec = VolumeSpec::overlay(&format!("kiln-{serial}"), &folder.path, kiln_volume_max());
+    let provisioned = instance.provision(&spec);
+    print_version_slabs(&mut instance, &format!("after workspace {serial}"));
+    made.push(provisioned.map(|made| made.volume()));
+  }
+  for (serial, volume) in made.iter().enumerate() {
+    assert!(volume.is_ok(), "workspace {serial}: {volume:?}");
+  }
+  for volume in made.into_iter().flatten() {
+    instance.destroy(volume).unwrap();
+  }
+  daemon.stop();
+}
+
 /// AC-5.12 / T-5.14 (A-278; §4.14): do read the daemon's status and a shard's telemetry through the library; expect the
 /// daemon's shards reported and the drain answered for the shard it has.
 #[test]
@@ -853,4 +1160,226 @@ mod shards {
     drop(device);
     daemon.stop();
   }
+}
+
+/// A volume id no instance issued (A-310's conformance cases).
+const NOWHERE: VolumeId = VolumeId { bytes: [0xAB; 16] };
+/// Shape: the simulator's bound in the conformance suite: room for every volume and attachment the suite makes.
+const SIM_MOST: usize = 16;
+
+/// The volume `seam` provisions from `spec`.
+fn made<V: Volumes>(seam: &mut V, spec: &VolumeSpec) -> VolumeId {
+  seam.provision(spec).unwrap().volume()
+}
+
+/// The names `seam` lists, sorted.
+fn names_of<V: Volumes>(seam: &mut V) -> Vec<String> {
+  let mut names: Vec<String> = seam.list().unwrap().into_iter().map(|v| v.name).collect();
+  names.sort();
+  names
+}
+
+/// A stream end made ready for [`reads_its_end`] while its attachment still lives: on Unix a socket whose read waits at
+/// most the suite's wait. The wait is set before the detach, since macOS refuses `SO_RCVTIMEO` (`EINVAL`) on a socket
+/// whose peer has gone.
+#[cfg(unix)]
+fn awaiting(end: slates_api::StreamEnd) -> std::os::unix::net::UnixStream {
+  let socket = std::os::unix::net::UnixStream::from(end);
+  socket.set_read_timeout(Some(START_WAIT)).unwrap();
+  socket
+}
+
+/// Whether the peer of a stream end reads its end within the suite's wait: the attachment it reached has ended.
+#[cfg(unix)]
+fn reads_its_end(socket: &std::os::unix::net::UnixStream) -> bool {
+  let mut byte = [0u8; 1];
+  matches!(std::io::Read::read(&mut &*socket, &mut byte), Ok(0))
+}
+
+/// A stream end as it is where it is a pipe handle (Windows): [`reads_its_end`] does not judge it.
+#[cfg(not(unix))]
+fn awaiting(end: slates_api::StreamEnd) -> slates_api::StreamEnd {
+  end
+}
+
+/// Whether the peer of a stream end reads its end: not judged where the end is a pipe handle (Windows).
+#[cfg(not(unix))]
+fn reads_its_end(_end: &slates_api::StreamEnd) -> bool {
+  true
+}
+
+/// A-310's conformance suite: one flow of the seam's verbs, each outcome and each refusal asserted as its typed value,
+/// run over an instance and over the simulator. Do: provision an empty volume and again by its name; snapshot it and
+/// clone the snapshot; list; snapshot, clone from, destroy and serve a volume no one made; detach an attachment no one
+/// made; provision an overlay of a relative folder; make a green, a work over it, a work over a volume that is no green
+/// and one over no volume; serve a volume to a Shards VMM and detach it; destroy a snapshot a clone pins, then an
+/// unpinned one; destroy the clone and wait for it to leave the list; snapshot it. Expect: the volume made once and
+/// refused `AlreadyExists` naming it; both volumes listed; the strangers refused `NotFound` naming the volume, the
+/// snapshot or the attachment; the relative folder refused `NotAbsolute`; the work at the green's first version, the
+/// others refused `NotGreen` and `NotFound`; a stream of the Shards transport whose peer reads its end once detached;
+/// the pinned snapshot's destroy refused `Busy` by the volume core's `Pinned` (a holder to end first, typed since
+/// A-299) and the unpinned one's done; the clone gone from the list, and refused `NotFound` after.
+fn the_seam_conforms<V: Volumes>(seam: &mut V) {
+  let origin = made(seam, &VolumeSpec::empty("seam-origin", ROOM));
+  assert_eq!(
+    seam.provision(&VolumeSpec::empty("seam-origin", ROOM)),
+    Err(Error::AlreadyExists(Existing::Volume { existing: origin }))
+  );
+  let snapshot = seam.snapshot(origin).unwrap();
+  let clone = made(seam, &VolumeSpec::clone_of("seam-clone", origin, snapshot));
+  assert_eq!(names_of(seam), ["seam-clone", "seam-origin"]);
+  expect_strangers_refused_typed(seam, snapshot);
+  expect_a_work_over_a_green_alone(seam, origin);
+  expect_a_served_streams_peer_reads_its_end_at_the_detach(seam, origin);
+  assert!(
+    matches!(
+      seam.destroy_snapshot(origin, snapshot),
+      Err(Error::Busy(slates_api::Busy::Volume(
+        slates_api::VolumeRefusal::Pinned
+      )))
+    ),
+    "a snapshot a clone pins is not destroyed"
+  );
+  let unpinned = seam.snapshot(origin).unwrap();
+  assert_eq!(seam.destroy_snapshot(origin, unpinned), Ok(()));
+  seam.destroy(clone).unwrap();
+  let started = Instant::now();
+  while names_of(seam).contains(&"seam-clone".to_owned()) {
+    assert!(started.elapsed() < START_WAIT, "the clone leaves the list");
+    std::thread::yield_now();
+  }
+  assert_eq!(
+    seam.snapshot(clone),
+    Err(Error::NotFound(Missing::Volume(clone)))
+  );
+}
+
+/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy and serve a volume no one
+/// made; detach an attachment no one made; provision an overlay of a relative folder. Expect each refused typed:
+/// `NotFound` naming the volume, the snapshot or the attachment, and the folder `NotAbsolute`.
+fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId) {
+  assert_eq!(
+    seam.snapshot(NOWHERE),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  assert_eq!(
+    seam.provision(&VolumeSpec::clone_of("seam-stranger", NOWHERE, snapshot)),
+    Err(Error::NotFound(Missing::Snapshot {
+      volume: NOWHERE,
+      snapshot
+    }))
+  );
+  assert_eq!(
+    seam.destroy(NOWHERE),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  assert_eq!(
+    seam
+      .serve_shards(NOWHERE, Intent::Read, None)
+      .map(|served| served.attachment.attachment),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  assert_eq!(
+    seam.detach(u64::MAX),
+    Err(Error::NotFound(Missing::Attachment {
+      attachment: u64::MAX
+    }))
+  );
+  assert_eq!(
+    seam.provision(&VolumeSpec::overlay("seam-overlay", "relative/dir", ROOM)),
+    Err(Error::Invalid(Invalid::Path {
+      path: "relative/dir".to_owned(),
+      fault: PathFault::NotAbsolute
+    }))
+  );
+}
+
+/// The works of `the_seam_conforms`. Do: make a green, a work over it, a work over `origin` (no green) and one over no
+/// volume. Expect the work at the green's first version, and the others refused `NotGreen` and `NotFound`.
+fn expect_a_work_over_a_green_alone<V: Volumes>(seam: &mut V, origin: VolumeId) {
+  let green = made(
+    seam,
+    &VolumeSpec {
+      name: "seam-green".to_owned(),
+      source: Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  match seam.provision(&VolumeSpec::work("seam-work", green)) {
+    Ok(Provisioned::Work { work, base }) => assert_eq!((work.green, base), (green, 0)),
+    other => panic!("a work over a green: {other:?}"),
+  }
+  assert_eq!(
+    seam.provision(&VolumeSpec::work("seam-not-over-a-green", origin)),
+    Err(Error::Invalid(Invalid::Kind(KindMismatch::NotGreen)))
+  );
+  assert_eq!(
+    seam.provision(&VolumeSpec::work("seam-over-nothing", NOWHERE)),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+}
+
+/// The Shards stream of `the_seam_conforms`. Do: serve `origin` to a Shards VMM, then detach it. Expect a stream of the
+/// Shards transport whose peer reads its end once detached.
+fn expect_a_served_streams_peer_reads_its_end_at_the_detach<V: Volumes>(
+  seam: &mut V,
+  origin: VolumeId,
+) {
+  let served = seam.serve_shards(origin, Intent::Write, None).unwrap();
+  assert_eq!(
+    served.attachment.capability.transport,
+    AttachTransport::ShardsFs
+  );
+  let peer = awaiting(served.stream);
+  seam.detach(served.attachment.attachment).unwrap();
+  assert!(
+    reads_its_end(&peer),
+    "a detached stream's peer reads its end"
+  );
+}
+
+/// A-310: the conformance suite over a real instance, in this process.
+#[test]
+fn an_instance_answers_the_seams_conformance_suite() {
+  let (daemon, mut instance) = grouped("seam");
+  the_seam_conforms(&mut instance);
+  daemon.stop();
+}
+
+/// A-310: the conformance suite over the simulator, with no daemon anywhere.
+#[test]
+fn the_simulator_answers_the_seams_conformance_suite() {
+  the_seam_conforms(&mut SimVolumes::new(SIM_MOST));
+}
+
+/// A-310: the simulator's own bound and what a mount is to it. Do: give it room for one volume and one attachment;
+/// provision a second volume; mount the first, then mount it again, then a volume no one made; detach the mount. Expect
+/// the second volume refused `Exhausted::Table`, the first mount answered with the path as given, the second refused
+/// at the bound, the stranger `NotFound`, and the detach done.
+#[test]
+fn the_simulator_holds_what_it_was_given_room_for() {
+  let mut sim = SimVolumes::new(1);
+  let only = made(&mut sim, &VolumeSpec::empty("only", ROOM));
+  assert!(matches!(
+    sim.provision(&VolumeSpec::empty("second", ROOM)),
+    Err(Error::Exhausted(Exhausted::Table { .. }))
+  ));
+  let options = MountOptions {
+    read_only: false,
+    subtree: None,
+    shared: false,
+  };
+  let mounted = sim.mount(only, "/simulated/mount", &options).unwrap();
+  assert_eq!(mounted.path, "/simulated/mount");
+  assert!(matches!(
+    sim.mount(only, "/simulated/another", &options),
+    Err(Error::Exhausted(Exhausted::Table { .. }))
+  ));
+  assert_eq!(
+    sim.mount(NOWHERE, "/simulated/stranger", &options),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  assert_eq!(sim.detach(mounted.attachment), Ok(()));
 }
