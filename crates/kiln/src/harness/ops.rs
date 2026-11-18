@@ -1547,8 +1547,8 @@ pub mod input {
         /// The terminal session it belongs to, where a person starts it from one.
         pub shell: Option<String>,
         /// One of your environments it starts with (docs/agents.md, "Environments"), by id: its variables over the
-        /// machine's user's environment, or a clean one; left out, the machine's user's. A person's choice: an agent's
-        /// start with one is refused.
+        /// machine's user's environment, or a clean one. Left out: an agent's agents run with its own, a person's
+        /// with the machine's user's.
         pub agentenv: Option<String>,
         /// Its task apart from the words of the agent definition it runs (as agentdefs_run starts one): what
         /// a split's variant that's another agent is told after that agent's words. Which definition it runs is

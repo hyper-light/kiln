@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use super::{Agentenv, Brief, R, Refusal};
+use super::{Agentenv, R, Refusal};
 use crate::harness::agentenv::{From as VarFrom, Resolved, Set};
 use crate::harness::registry::Location;
 use crate::hub::Hub;
@@ -42,7 +42,7 @@ pub async fn open(hub: &Hub, env: &Agentenv, microvm: bool, by: &str, for_what: 
             VarFrom::Secret => {
                 let name = v.secret.as_deref().and_then(|s| kiln_ci::secrets::check_name(s).ok()).unwrap_or_default();
                 let value = opened.get(&name).ok_or_else(|| Refusal::SecretMissing(vec![name.clone()]))?;
-                Set::Value(value.clone())
+                Set::Secret(value.clone())
             }
             VarFrom::Unset => Set::Unset,
         };
@@ -102,15 +102,24 @@ pub fn given(hub: &Hub, session: &str, target: &str) {
     }
 }
 
-/// A runner process announced session `session` (`Update::Open`) running with `reported` (its
-/// `Info::agentenv`): where kiln keeps that it runs with another, and that process speaks `agentenv` and
-/// wasn't given it yet (a move, a hand-over, its runner started again), it's given it, opened again, its
-/// harness started again on it. Once for each process: a process that was given it and still says
-/// otherwise (an announcement that came before it took it) isn't sent it twice.
-pub fn opened(hub: &Arc<Hub>, from: &Location, session: &str, reported: Option<&Brief>) {
+/// A runner process announced session `session` (`Update::Open`, its info `info`), running with `info.agentenv`.
+/// Where kiln keeps that it runs with another, and that process speaks `agentenv` and wasn't given it yet (a
+/// move, a hand-over to a newer process, its runner started again or upgraded in place: a runner keeps an
+/// environment in memory alone), it's given it, opened again (`Command::Agentenv`, `restart` false). Once for
+/// each process: one that was given it and still says otherwise (an announcement that came before it took it)
+/// isn't sent it twice. A session new to the server (`new`) that a person branched from another
+/// (`Info::variant_of`) runs with that one's environment, kept for it too, unless it says one of its own.
+pub fn opened(hub: &Arc<Hub>, from: &Location, session: &str, info: &crate::harness::session::Info, new: bool) {
     let Location::Machine(machine) = from else { return };
-    let Some(want) = super::linked(hub, session) else { return };
-    if reported.is_some_and(|b| b.id == want) {
+    let branched = info.variant_of.as_deref().map(|v| v.split_once('/').map_or(v, |(s, _)| s));
+    let want = match super::linked(hub, session) {
+        Some(w) => w,
+        None => match branched.filter(|_| new && info.agentenv.is_none()).and_then(|b| super::linked(hub, b)) {
+            Some(w) => w,
+            None => return,
+        },
+    };
+    if info.agentenv.as_ref().is_some_and(|b| b.id == want) {
         return;
     }
     if !speaks(hub, machine) {
@@ -121,12 +130,20 @@ pub fn opened(hub: &Arc<Hub>, from: &Location, session: &str, reported: Option<&
         return;
     }
     hub.agentenvs.given_in(session, process);
-    let (hub, session) = (Arc::clone(hub), session.to_owned());
+    let (hub, session, microvm, branched) = (Arc::clone(hub), session.to_owned(), info.isolation.is_some(), branched.map(str::to_owned));
     drop(crate::rt::spawn(async move {
-        let microvm = hub.harness.info(&session).is_some_and(|i| i.isolation.is_some());
+        // A branch kept as running with its source's, as a start's is.
+        if super::linked(&hub, &session).is_none() {
+            let Ok(Some(env)) = super::any(&hub, &want).await else { return };
+            let by = format!("kiln (branched from {})", branched.as_deref().unwrap_or_default());
+            if let Err(e) = super::link(&hub, &session, Some(&env), &by).await {
+                tracing::warn!(target: "kiln.agentenvs", %session, error = %e, "a branch's environment couldn't be kept");
+                return;
+            }
+        }
         match again(&hub, &session, microvm, "its runner process holding it without it").await {
             Ok(Some(r)) => {
-                let sent = hub.harness.send_agentenv(&hub, &session, Some(r), true).await;
+                let sent = hub.harness.send_agentenv(&hub, &session, Some(r), false).await;
                 if let Some((_, why)) = sent.failure() {
                     tracing::warn!(target: "kiln.agentenvs", %session, %why, "a session's environment couldn't be given to the runner process that holds it");
                 }

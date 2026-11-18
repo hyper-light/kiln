@@ -176,7 +176,7 @@ fn opened_for_a_session_its_secrets_are_read_marked_and_audited_by_name() -> any
         let env = create(&hub, "user:u-ada", Draft { name: "work".into(), vars: serde_json::from_value(vars())?, ..Draft::default() }).await?;
         let r = resolve::open(&hub, &env, false, "user:u-ada", "a test").await?;
         anyhow::ensure!(
-            r.vars == [("PATH_EXTRA".into(), Set::Machine("HOME".into())), ("MODE".into(), Set::Value("fast".into())), ("ANTHROPIC_API_KEY".into(), Set::Value(FAKE.into())), ("NO_PROXY".into(), Set::Unset)],
+            r.vars == [("PATH_EXTRA".into(), Set::Machine("HOME".into())), ("MODE".into(), Set::Value("fast".into())), ("ANTHROPIC_API_KEY".into(), Set::Secret(FAKE.into())), ("NO_PROXY".into(), Set::Unset)],
             "{:?}",
             r.vars
         );
@@ -196,8 +196,8 @@ fn opened_for_a_session_its_secrets_are_read_marked_and_audited_by_name() -> any
 }
 
 /// A start with an environment: opened into its spec and kept as the one it runs with, so it can't be deleted while it
-/// runs; another's, an agent's choice, a microVM given a secret, and a runner that runs none are refused with nothing
-/// started.
+/// runs, and an agent it starts runs with it too; another's, a microVM given a secret, and a runner that runs none are
+/// refused with nothing started.
 #[test]
 fn a_start_runs_with_its_persons_environment_or_is_refused() -> anyhow::Result<()> {
     use crate::harness::lineage::{Ask, Starter, start};
@@ -215,11 +215,6 @@ fn a_start_runs_with_its_persons_environment_or_is_refused() -> anyhow::Result<(
         let bos = create(&hub, "user:u-bo", Draft { name: "bo".into(), ..Draft::default() }).await?;
         let why = start(&hub, &by, ask(&bos.id)).await.err().map(|(_, w)| w).unwrap_or_default();
         anyhow::ensure!(why.starts_with("agentenv_unknown: "), "{why}");
-        // An agent's start names none.
-        let parent = crate::harness::session::Info { id: "p1".into(), kind: "claude".into(), ..Default::default() };
-        let child = Starter { parent: Some(parent), actor: "agent:p1".into(), ..Starter::default() };
-        let (code, _) = start(&hub, &child, ask(&env.id)).await.err().unwrap_or((StatusCode::OK, String::new()));
-        anyhow::ensure!(code == StatusCode::FORBIDDEN, "{code}");
         // In a microVM its secret is refused, naming the variable (a start's check of each target it's placed on).
         let why = resolve::runs_there(&hub, &env, "local", true).map_err(|r| r.said()).err().unwrap_or_default();
         anyhow::ensure!(why.starts_with("agentenv_secret_in_microvm: ") && why.contains("ANTHROPIC_API_KEY") && !why.contains(FAKE), "{why}");
@@ -233,10 +228,17 @@ fn a_start_runs_with_its_persons_environment_or_is_refused() -> anyhow::Result<(
         let started = start(&hub, &by, ask(&env.id)).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let id = started.first().map(|i| i.id.clone()).unwrap_or_default();
         anyhow::ensure!(linked(&hub, &id).as_deref() == Some(env.id.as_str()), "kept");
-        anyhow::ensure!(sessions_of(&hub, &env.id) == [id.clone()]);
+        anyhow::ensure!(sessions_of(&hub, &env.id) == std::slice::from_ref(&id));
         let refused = delete(&hub, "user:u-ada", &env.id).await;
-        anyhow::ensure!(matches!(&refused, Err(Refusal::InUse(s)) if s == &[id.clone()]), "{refused:?}");
+        anyhow::ensure!(matches!(&refused, Err(Refusal::InUse(s)) if s.contains(&id)), "{refused:?}");
         anyhow::ensure!(refused.map(|_| ()).err().is_some_and(|r| r.said().contains(&id)), "the refusal names it");
+        // An agent it starts names none: it runs with its parent's, kept for it too.
+        let parent = started.first().cloned().ok_or_else(|| anyhow::anyhow!("no session"))?;
+        let child = Starter { parent: Some(parent), actor: format!("agent:{id}"), opener: Some("user:u-ada".into()), ..Starter::default() };
+        let kids = start(&hub, &child, Ask { agentenv: None, ..ask("") }).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let kid = kids.first().map(|i| i.id.clone()).unwrap_or_default();
+        anyhow::ensure!(linked(&hub, &kid).as_deref() == Some(env.id.as_str()), "a child runs with its parent's");
+        anyhow::ensure!(sessions_of(&hub, &env.id).len() == 2);
         // Kept across a restart of the server: read again as it starts.
         let again = Held::default();
         again.load(&hub.store).await?;

@@ -471,8 +471,8 @@ refused and kept out of the image as a `kiln.secret.` one is.
 Environments for agent sessions (docs/agents.md, "Environments"; `crate::agentenvs`; decided by the user,
 2026-11-18): a person's named sets of variables an agent session runs with, apart from CI's and CD's
 environments (`agentenv` in every route, operation and type). Each is its owner's alone, an admin
-included, as their secrets are; another's answers 404. A person keeps, applies and chooses their own: an
-agent's call is refused (403), and so is an agent's `agents.start` naming one. Each route is an operation
+included, as their secrets are; another's answers 404. A person keeps and applies their own: an agent's
+call is refused (403). Each route is an operation
 too (`agentenvs.*`: `POST /api/ops/<name>`, kiln's MCP tools `agentenvs_*`, code mode's
 `kiln.agentenvs.*`), and each change is audited; each secret a session is given is audited by name
 (`secret.use`), never its value. The routes need `agents.run`.
@@ -487,7 +487,9 @@ too (`agentenvs.*`: `POST /api/ops/<name>`, kiln's MCP tools `agentenvs_*`, code
 | DELETE | `/api/agentenvs/<id>` | 204 (`agentenvs.delete`) |
 | PUT | `/api/harness/sessions/<agent>/agentenv` | `{ agentenv: id \| null, restart?: true }` → `{ agent, agentenv: { id, name, version } \| null, restarted }` (`agentenvs.apply`): an agent you may steer runs with it from now on (null: its machine's user's environment), its harness started again on its conversation unless `restart` is false. 409 while its machine is away, its environment as it was |
 
-`POST /api/harness/agents` (`agents.start`) takes `agentenv?: id`, the environment the agents it starts run with;
+`POST /api/harness/agents` (`agents.start`) takes `agentenv?: id`, the environment the agents it starts run with
+(one of the person's an agent acts for, for an agent's start); left out, an agent's agents run with its own, as a
+session a person branches from another runs with that one's, kept for it as for a start;
 `POST /api/harness/sessions` carries none (a `spec.agentenv` asked for is dropped: kiln opens one from one its
 person chose). `AgentInfo` says `agentenv?: { id, name, version }`, the environment a session's harness started
 with, as its machine says it. Each change of one, and of the sessions running with it, is an
@@ -512,7 +514,8 @@ The server keeps which environment each session runs with and opens it again (it
 read again) whenever it starts the session's harness: a restart (`agents.restart`, `sessions.restart`, a
 command's `restart`; refused with its code where it can't be opened, a stop by force never), a resume from kiln's
 copy, a move from the server, and a runner process that holds the session without it (one it moved or was
-handed over to, or a runner started again: given it, its harness started again on it).
+handed over to, or a runner started again or upgraded in place: given it with `restart` false). A `secret`
+variable reaches its runner as `Set::Secret`, never as a value of its own kind.
 
 ## WebSockets
 

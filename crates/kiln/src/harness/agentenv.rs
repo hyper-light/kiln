@@ -66,9 +66,12 @@ pub struct Var {
 pub enum Set {
     /// The machine's user's variable of this name.
     Machine(String),
-    /// This value (a `value` variable's, or a secret's).
+    /// This value: a `value` variable's.
     Value(String),
     Unset,
+    /// One of its owner's secrets, its value opened (a `secret` variable's): never in a microVM, where a secret is
+    /// granted by name alone. Appended last.
+    Secret(String),
 }
 
 impl std::fmt::Debug for Set {
@@ -78,6 +81,7 @@ impl std::fmt::Debug for Set {
             // A secret's value may be one: never written out.
             Self::Value(_) => f.write_str("Value(..)"),
             Self::Unset => f.write_str("Unset"),
+            Self::Secret(_) => f.write_str("Secret(..)"),
         }
     }
 }
@@ -168,9 +172,9 @@ mod tests {
 
     #[test]
     fn a_resolved_values_debug_never_shows_it() {
-        let r = Resolved { id: "e".into(), name: "n".into(), version: 1, base: Base::User, vars: vec![("K".into(), Set::Value("sk-ant-secret".into())), ("M".into(), Set::Machine("HOME".into()))] };
+        let r = Resolved { id: "e".into(), name: "n".into(), version: 1, base: Base::User, vars: vec![("K".into(), Set::Value("sk-ant-secret".into())), ("S".into(), Set::Secret("sk-ant-other".into())), ("M".into(), Set::Machine("HOME".into()))] };
         let shown = format!("{r:?}");
-        assert!(!shown.contains("sk-ant-secret"), "{shown}");
+        assert!(!shown.contains("sk-ant-secret") && !shown.contains("sk-ant-other") && shown.contains("Secret(..)"), "{shown}");
         assert!(shown.contains("HOME"), "{shown}");
     }
 }

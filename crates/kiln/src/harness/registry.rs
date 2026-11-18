@@ -3150,9 +3150,10 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool, over: &dyn Fn(u64) -> bool) -> Option<Ingest> {
         // A runner process announcing a session without the environment kiln keeps it runs with is given it
-        // (`crate::agentenvs::resolve::opened`): one that took it over, or started again, holds none.
+        // (`crate::agentenvs::resolve::opened`): one that took it over, or started again, holds none; a branch new
+        // here runs with its source's.
         if let Update::Open { info, .. } = &u {
-            crate::agentenvs::resolve::opened(hub, from, id, info.agentenv.as_ref());
+            crate::agentenvs::resolve::opened(hub, from, id, info, s.get(id).is_none());
         }
         let ingest = self.prepare(hub, from, id, u, shipped)?;
         self.apply(s, hub, ingest, over)

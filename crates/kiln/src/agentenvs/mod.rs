@@ -6,8 +6,8 @@
 //!
 //! - **Theirs alone.** Each is its owner's (`owner`: the server's `owner`, or `user:<id>`), named once
 //!   among theirs. A person reaches only their own, an admin included, as with their secrets: a `value`
-//!   variable may hold one (the person's choice, never looked into). An agent changes none, applies none
-//!   and starts none with one: a person chooses the sessions their secrets go to.
+//!   variable may hold one (the person's choice, never looked into). An agent keeps, changes and applies
+//!   none; the agents it starts run with its own, or one of its person's its start names.
 //! - **Kept as written.** kiln.db keeps its variables as the person wrote them, a secret by its name
 //!   ([`crate::harness::agentenv::Var`]); its version goes up with each change.
 //! - **Opened as a harness starts** ([`resolve`]): each `secret` read from its owner's own, marked used and
@@ -177,11 +177,11 @@ pub fn typed(said: &str) -> Option<(&'static str, &str)> {
     CODES.iter().find(|c| **c == code).map(|c| (*c, words))
 }
 
-/// Whose environments the caller's are: the person it is. An agent's are none to change, apply or start
-/// with: a person chooses the sessions their secrets go to (`crate::secrets::mine`: an agent sets none).
+/// Whose environments the caller's are: the person it is. An agent keeps, changes and applies none: a person
+/// chooses the sessions their secrets go to (`crate::secrets::mine`: an agent sets none).
 pub fn person(caller: &crate::authz::Caller) -> R<String> {
     if caller.agent.is_some() || caller.kind == crate::authz::gate::Kind::Agent {
-        return Err(Refusal::Forbidden("a person keeps, applies and chooses their own environments: an agent doesn't".into()));
+        return Err(Refusal::Forbidden("a person keeps and applies their own environments: an agent doesn't".into()));
     }
     crate::harness::lineage::person_of(caller).ok_or_else(|| Refusal::Forbidden(format!("{} acts for no person here, and an environment is a person's", caller.name)))
 }
@@ -370,6 +370,14 @@ pub async fn get(hub: &Hub, person: &str, id: &str) -> R<Agentenv> {
     match found.filter(|r| r.owner == person) {
         Some(r) => Ok(r.read(sessions_of(hub, id))?),
         None => Err(unknown(id)),
+    }
+}
+
+/// The environment session `session` runs with, whoever's: none, its machine's user's.
+pub async fn of_session(hub: &Hub, session: &str) -> R<Option<Agentenv>> {
+    match linked(hub, session) {
+        Some(id) => any(hub, &id).await,
+        None => Ok(None),
     }
 }
 
