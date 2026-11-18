@@ -22,6 +22,9 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 const GONE_WITHIN: Duration = Duration::from_secs(30);
 /// How often the process table is looked at while waited on.
 const LOOK_EVERY: Duration = Duration::from_millis(100);
+/// How long a destroyed volume may take to leave its instance's list: the daemon answers a destroy and tears the
+/// volume down in cooperative slices after (Slates' `Instance::destroy`), so it is listed until the last slice.
+const TORN_DOWN_WITHIN: Duration = Duration::from_secs(30);
 /// A file's mode as the test writes it in the volume: a plain file, and one the agent made executable.
 const MODE: u32 = 0o644;
 const EXECUTABLE: u32 = 0o755;
@@ -168,8 +171,8 @@ fn g265_a_volume_with_no_mount_is_served_on_a_stream_and_reviewed_from_its_own_c
     })?;
     let refused = kiln::rt::block_on({
         let (made, over, plan) = (made.clone(), over.clone(), plan.clone());
-        async move { slates::writable(&made, &over, &plan).await }
-    });
+        async move { anyhow::Ok(slates::writable(&made, &over, &plan).await) }
+    })?;
     assert!(refused.as_ref().is_err_and(|why| why.contains("2 files git ignores")), "{refused:?}");
 
     // Slates' stream of the volume, as Hex asks it of kiln's server for a box's boot: a socket, its microVM's device's
@@ -192,7 +195,11 @@ fn g265_a_volume_with_no_mount_is_served_on_a_stream_and_reviewed_from_its_own_c
         let made = made.clone();
         async move { slates::remove(&made).await }
     })?;
-    assert!(library.list()?.iter().all(|v| v.id != volume), "the volume outlived its removal");
+    let until = Instant::now() + TORN_DOWN_WITHIN;
+    while library.list()?.iter().any(|v| v.id == volume) {
+        anyhow::ensure!(Instant::now() < until, "the volume outlived its removal by {}s", TORN_DOWN_WITHIN.as_secs());
+        std::thread::sleep(LOOK_EVERY);
+    }
     drop(library);
 
     drop(stop);

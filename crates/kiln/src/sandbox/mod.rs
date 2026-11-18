@@ -558,7 +558,8 @@ mod tests {
         let vms = super::held_in(state.path(), state.path().join("shards"), None, None)?;
         anyhow::ensure!(vms.hex.is_some(), "its sandbox isn't Hex's");
         anyhow::ensure!(vms.state() == Some(state.path()), "kiln's state isn't kept: {:?}", vms.state());
-        anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == super::hexvm::HOLDS, "its sandbox isn't HexVms");
+        // It holds folders Slates serves its microVMs: its runtime is bound this machine's Slates (`served::SlatesVolumes`).
+        anyhow::ensure!(vms.sandbox.boundaries() == vec!["microvm"] && vms.sandbox.holds() == kiln_seams::sandbox::Holds { served: true, ..super::hexvm::HOLDS }, "its sandbox isn't HexVms");
         anyhow::ensure!(state.path().join("hex-records").join("state").exists(), "Hex keeps no records beneath kiln's state");
         let facts = super::facts_of(true, Some(&vms));
         anyhow::ensure!(facts.available && facts.why_not.is_none(), "{facts:?}");
