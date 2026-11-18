@@ -3091,7 +3091,8 @@ for line in sys.stdin:
     /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2): what an agent works in when its start names no
     /// workspace is the server's `[agents] workspace`: on a server that says `folder` (a test's, a lab's) its folder
     /// itself, nothing made for it; and a person's `folder` is kept as asked on a server whose default is a volume, its
-    /// machine asked nothing about one. Neither needs Slates, so this holds on every machine.
+    /// machine asked nothing about one, as is the folder of one started in a person's shell. None needs Slates, so this
+    /// holds on every machine.
     #[test]
     fn w2_a_start_naming_no_workspace_follows_the_servers_setting_and_a_folder_asked_for_is_kept() -> anyhow::Result<()> {
         run(async {
@@ -3115,6 +3116,10 @@ for line in sys.stdin:
             let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
             anyhow::ensure!(ws.pointer("/workspace/kind") == Some(&json!("folder")) && ws.get("drift") == Some(&json!([])), "{ws}");
             anyhow::ensure!(ws.pointer("/workspace/volume") == Some(&Value::Null), "{ws}");
+            // One started in a person's shell works beside them in the shell's folder, its machine asked nothing.
+            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: Some("t1".into()), ..Default::default() };
+            let shelled = hub.harness.open(&hub, "local", spec, 1).await?;
+            anyhow::ensure!(shelled.first().is_some_and(|i| i.workspace.is_none()), "{shelled:?}");
             Ok(())
         })
     }

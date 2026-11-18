@@ -1062,7 +1062,8 @@ kiln's MCP server tells each agent its id. `workspace` is `volume` (a Slates vol
 what it gets when it names none, where its machine can make one) or `folder` (the folder itself);
 in a result it is `{kind, over, sub, volume, mount, owner, why_not}`: `owner` when it works in
 another agent's volume, `why_not` when it works in its folder because its machine can't make one,
-and `null` for one isolated in a microVM, a conversation taken up (`resume`), or one started before
+and `null` for one isolated in a microVM, a conversation taken up (`resume`), one started in a person's shell
+(`shell`), or one started before
 volumes were the default; `branch` and
 `change_request` are `null` until it has a change request.
 
