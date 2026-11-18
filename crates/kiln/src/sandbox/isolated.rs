@@ -416,7 +416,9 @@ pub fn guest_path(host: &str) -> Result<String, String> {
 /// folder (Codex's and ACP's requests) or names something after one for it (Claude Code's folder of a
 /// project's conversations) says the folder as [`Seen::said`] has it; and what it says of the folder it
 /// works in (Claude Code's `init` and worktrees, Codex's thread) is the machine's folder again
-/// ([`Seen::host_of`]), the session's own, where kiln reads its files on the machine.
+/// ([`Seen::host_of`]), the session's own, where kiln reads its files on the machine. A file it names that
+/// kiln reads (a change's baseline and its file now, an approval's preview) is the machine's too
+/// ([`host_file`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Seen {
     host: String,
@@ -447,14 +449,16 @@ impl Seen {
     }
 
     /// `path`, a folder or file as the harness says it, as this machine names it: its project and what's
-    /// beneath it at the machine's own place, with Windows' `\` between its parts ([`Seen::said`] the other
-    /// way); anything else as it is. A drive's root keeps its `\`: `C:` alone names the drive's current
-    /// folder (Microsoft's "Naming Files, Paths, and Namespaces").
+    /// beneath it at the machine's own place, its parts joined as its folder is written (Windows' `\`, or
+    /// `/` for a folder written with it alone) ([`Seen::said`] the other way); anything else as it is. A
+    /// drive's root keeps its separator: `C:` alone names the drive's current folder (Microsoft's "Naming
+    /// Files, Paths, and Namespaces").
     pub fn host_of(&self, path: &str) -> String {
         match path.strip_prefix(self.at.as_str()) {
             Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-                let rest = rest.trim_end_matches('/').replace('/', "\\");
-                let root = if rest.is_empty() && self.host.ends_with(':') { "\\" } else { "" };
+                let sep = if self.host.contains('/') && !self.host.contains('\\') { "/" } else { "\\" };
+                let rest = rest.trim_end_matches('/').replace('/', sep);
+                let root = if rest.is_empty() && self.host.ends_with(':') { sep } else { "" };
                 format!("{}{root}{rest}", self.host)
             }
             _ => path.to_owned(),
@@ -472,6 +476,15 @@ pub fn said(seen: Option<&Seen>, path: &str) -> String {
 /// harness that sees the machine's own paths.
 pub fn host_of(seen: Option<&Seen>, path: &str) -> String {
     seen.map_or_else(|| path.to_owned(), |s| s.host_of(path))
+}
+
+/// The machine's file a harness names, `path`, where kiln reads it (a change's baseline and its file now,
+/// an approval's preview): rooted in its view as it is (`Path::has_root`: a microVM's `/…` on every
+/// machine, where Windows' `Path::is_absolute` wants a drive and would put `/mnt/c/x` beneath `cwd`), else
+/// beneath `cwd`, its folder as it sees it ([`said`]); then as this machine names it ([`host_of`]).
+pub fn host_file(seen: Option<&Seen>, cwd: &str, path: &str) -> String {
+    let path = if std::path::Path::new(path).has_root() || cwd.is_empty() { path.to_owned() } else { format!("{}/{path}", cwd.trim_end_matches('/')) };
+    host_of(seen, &path)
 }
 
 /// The folder `spec`'s harness is told it works in: its project as its microVM sees it, isolated
@@ -1154,6 +1167,26 @@ mod tests {
             assert_eq!(harness_cwd(&spec(cwd, isolated)), cwd);
             assert_eq!(host_of(Seen::of(&spec(cwd, isolated)).as_ref(), "/mnt/c/x"), "/mnt/c/x", "{cwd}");
         }
+    }
+
+    /// Step 17 part 7: a file an isolated harness names is read where the machine has it (`host_file`): a
+    /// microVM's rooted `/mnt/c/…` as it is (rooted on every machine, though Windows' `Path::is_absolute`
+    /// wants a drive), a relative one beneath its folder as it sees it, each then the machine's; a harness
+    /// on its machine, its own paths; a folder written with `/` keeps it.
+    #[test]
+    fn s17_a_file_an_isolated_harness_names_is_read_where_the_machine_has_it() {
+        let spec = |cwd: &str| Spec { kind: "claude".into(), cwd: Some(cwd.into()), isolation: Some(microvm(None)), ..Spec::default() };
+        let windows = spec(r"C:\src\app");
+        let (seen, cwd) = (Seen::of(&windows), harness_cwd(&windows));
+        assert_eq!(cwd, "/mnt/c/src/app");
+        for (named, file) in [("/mnt/c/src/app/notes.txt", r"C:\src\app\notes.txt"), ("notes.txt", r"C:\src\app\notes.txt"), ("crates/kiln/a.rs", r"C:\src\app\crates\kiln\a.rs"), ("/mnt/c/src/app/.claude/worktrees/x/b.rs", r"C:\src\app\.claude\worktrees\x\b.rs"), ("/home/claude/.claude/settings.json", "/home/claude/.claude/settings.json")] {
+            assert_eq!(host_file(seen.as_ref(), &cwd, named), file, "{named}");
+        }
+        for (named, file) in [("/Users/ada/app/a.rs", "/Users/ada/app/a.rs"), ("src/a.rs", "/Users/ada/app/src/a.rs")] {
+            assert_eq!(host_file(None, "/Users/ada/app", named), file, "{named}");
+        }
+        let slashed = Seen::of(&spec("D:/src/kiln"));
+        assert_eq!(host_file(slashed.as_ref(), "/mnt/d/src/kiln", "a/b.rs"), "D:/src/kiln/a/b.rs");
     }
 
     /// Step 17: an isolated launch is its image's harness member, in the session's folder as its microVM

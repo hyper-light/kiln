@@ -101,7 +101,13 @@ the machine's network) is replaced by an Agentfile image's members.
   `/mnt/c/src/app`, its path as WSL names it, Shards' D235), which is the machine's own path for a Unix
   project and for every session on its host. What a harness says of the folder it works in (Claude Code's
   `init` and worktrees, Codex's thread) is the machine's folder again (`Seen::host_of`), the session's own,
-  where kiln reads its files; what it says of its files is read against its folder as it sees it.
+  where kiln reads its files. What every adapter shows of the files a harness names (Claude Code's, Codex's,
+  ACP's, Antigravity's and Pi's calls and diffs) is read against its folder as it sees it; a file kiln reads
+  for it (a change's baseline and its file now, an approval's preview) is the machine's
+  (`isolated::host_file`): rooted in the harness's view as it is (`/mnt/c/x`, which Windows'
+  `Path::is_absolute` takes for no absolute path), else beneath its folder, then as the machine names it.
+  Isolated sessions a Windows machine started before kiln `d081df523` saw their project at `/work/<name>`;
+  they are left as they are, not moved to the new path: only test runs ever had them.
 - **It's no process of the machine's**: its session has no pid (`Duplex::host_pid` is none), nothing
   of it is in the session's group of processes, and it is never handed across an in-place upgrade
   (it stops, and starts again in the next image, its conversation going on).

@@ -169,6 +169,10 @@ pub struct Agy {
     /// message's id): done once it goes on past that call.
     #[serde(default)]
     sent: Vec<(String, String)>,
+    /// Where it sees its project, in a microVM that sees it elsewhere than this machine
+    /// (`sandbox::isolated::Seen`): what it says of its files is shown against its folder as it sees it.
+    #[serde(default)]
+    seen: Option<crate::sandbox::isolated::Seen>,
 }
 
 impl Agy {
@@ -193,7 +197,13 @@ impl Agy {
             held: Vec::new(),
             asks: HashMap::new(),
             sent: Vec::new(),
+            seen: crate::sandbox::isolated::Seen::of(spec),
         }
+    }
+
+    /// The folder it works in, as it sees it ([`Self::seen`]): what it says of its files is shown against it.
+    fn cwd(&self, core: &Core) -> String {
+        crate::sandbox::isolated::said(self.seen.as_ref(), &core.state.cwd)
     }
 
     fn notice(&mut self, core: &mut Core, level: Level, text: impl Into<String>) {
@@ -681,7 +691,7 @@ impl Agy {
     fn ask_hook(&mut self, core: &mut Core, task: Option<&str>, name: &str, args: &Value, tool: ToolKind, why: String, reply: Sender<Value>) {
         self.seq += 1;
         let id = format!("kiln-ask-{}-{}", Core::now(), self.seq);
-        let call = tool_call(&id, name, args, &core.state.cwd);
+        let call = tool_call(&id, name, args, &self.cwd(core));
         let command = (tool == ToolKind::Shell).then(|| call.title.clone());
         let approval = Approval {
             id: id.clone(),
@@ -692,7 +702,7 @@ impl Agy {
             detail: call.detail.clone(),
             input: clip_json(args, 64 * 1024),
             command,
-            cwd: args.get("Cwd").and_then(Value::as_str).unwrap_or(core.state.cwd.as_str()).to_owned(),
+            cwd: args.get("Cwd").and_then(Value::as_str).map_or_else(|| self.cwd(core), str::to_owned),
             diffs: Vec::new(),
             reason: Some(why),
             always: Vec::new(),
@@ -915,7 +925,7 @@ impl Agy {
                 let id = self.tools.entry(index).or_insert_with(|| format!("agy-{}-{index}", self.tag)).clone();
                 let mut call = match core.get(&id).map(|e| &e.body) {
                     Some(Body::Tool(t)) => t.as_ref().clone(),
-                    _ => tool_call(&id, &name, info.get("parameters").unwrap_or(&Value::Null), &core.state.cwd),
+                    _ => tool_call(&id, &name, info.get("parameters").unwrap_or(&Value::Null), &self.cwd(core)),
                 };
                 if let Some(out) = info.get("output").and_then(Value::as_str).filter(|o| !o.is_empty()) {
                     // kiln's own tools' answers as the conversation shows them (`crate::reach::shown`):
@@ -1300,6 +1310,27 @@ mod tests {
         assert!(!args(&Spec { mode: Some(BYPASS.into()), allow_bypass: false, ..Spec::default() }).iter().any(|x| x.contains("dangerously")));
         assert!(args(&Spec::default()).windows(2).any(|w| w == ["--mode", "accept-edits"]));
         assert!(!args(&Spec { mode: Some(ASK.into()), effort: Some("ultra".into()), ..Spec::default() }).iter().any(|x| x == "--mode" || x == "--effort"));
+    }
+
+    /// Step 17 part 7: an isolated Antigravity on a Windows machine names its files at its microVM's
+    /// `/mnt/c/…`: its calls show them by their place in its project; the session's folder stays the
+    /// machine's.
+    #[test]
+    fn s17_an_isolated_agys_calls_show_its_files_in_its_folder() {
+        let spec = Spec { kind: "antigravity".into(), cwd: Some(r"C:\src\app".into()), isolation: Some(crate::harness::session::Isolation::microvm()), ..Spec::default() };
+        let mut core = Core::new();
+        core.state.cwd = r"C:\src\app".into();
+        let mut a = Agy::new(&spec);
+        a.start(&mut core);
+        feed(&mut a, &mut core, &[json!({"event": "init", "conversation_id": CID, "init": {"model": "gemini-3.8-flash-low", "cwd": "/mnt/c/src/app", "tools": ["view_file"], "permission_mode": "always-proceed"}})]);
+        send(&mut a, &mut core, "m1", "Read it", SendMode::Queue);
+        feed(&mut a, &mut core, &[step(0, "DONE", "user_input", json!({})), step(1, "DONE", "tool", json!({"tool_name": "view_file", "tool_info": {"name": "view_file", "parameters": {"AbsolutePath": "/mnt/c/src/app/src/a.rs"}}}))]);
+        let titles: Vec<String> = core.events().filter_map(|e| match &e.body {
+            Body::Tool(t) if t.tool == ToolKind::Read => Some(t.title.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(titles, ["src/a.rs"]);
+        assert_eq!(core.state.cwd, r"C:\src\app");
     }
 
     #[test]

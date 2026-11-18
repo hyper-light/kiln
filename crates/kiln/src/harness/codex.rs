@@ -4196,7 +4196,7 @@ impl Codex {
                     let by = parent.clone().or_else(|| thread.map(str::to_owned)).unwrap_or_else(|| super::model::BY_AGENT.to_owned());
                     for c in &changes {
                         let Some(path) = c.get("path").and_then(Value::as_str) else { continue };
-                        let abs = if std::path::Path::new(path).is_absolute() { path.to_owned() } else { format!("{}/{path}", cwd.trim_end_matches('/')) };
+                        let abs = crate::sandbox::isolated::host_file(self.seen.as_ref(), &cwd, path);
                         let kind = c.get("kind").and_then(|k| k.get("type")).and_then(Value::as_str).unwrap_or("update");
                         let diff = c.get("diff").and_then(Value::as_str).unwrap_or("");
                         let baseline = match kind {
@@ -5203,6 +5203,31 @@ mod tests {
             assert_eq!(core.state.cwd, host, "{host}: the session's folder");
             assert_eq!(c.cwd(&core), told, "{host}: its folder as it sees it");
         }
+    }
+
+    /// Step 17 part 7: an isolated Codex's file change on a Windows machine, of a file at its microVM's
+    /// `/mnt/c/…`, joins the changeset as the machine's file, where kiln reads it, shown by its place in its
+    /// project.
+    #[test]
+    fn s17_an_isolated_codexs_edits_are_the_machines_files() {
+        use super::super::session::{Isolation, Spec};
+        let spec = Spec { kind: "codex".into(), cwd: Some(r"C:\src\app".into()), isolation: Some(Isolation::microvm()), ..Spec::default() };
+        let mut core = Core::new();
+        core.state.cwd = r"C:\src\app".into();
+        let mut c = Codex::from_spec(&spec);
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "codex_cli_rs/0.162.1"}));
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "thread/start", json!({"thread": {"id": "th1", "turns": []}, "cwd": "/mnt/c/src/app"}));
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress", "items": []}}}),
+            json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "fileChange", "id": "f1", "status": "completed", "changes": [{"path": "/mnt/c/src/app/src/a.rs", "kind": {"type": "update"}, "diff": "@@ -1,1 +1,1 @@\n-old\n+new\n"}]}}}),
+        ]);
+        let jobs: Vec<(String, String)> = core.take_change_jobs().into_iter().map(|j| (j.abs, j.rel)).collect();
+        assert_eq!(jobs, [(r"C:\src\app\src\a.rs".to_owned(), "src/a.rs".to_owned())]);
+        assert!(core.events().any(|e| matches!(&e.body, Body::Tool(t) if t.diffs.first().is_some_and(|d| d.path == "src/a.rs"))));
+        assert_eq!(core.state.cwd, r"C:\src\app");
     }
 
     /// CP-T3.2: a steer received before turn/start answers still reaches that turn. A second
