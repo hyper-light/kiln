@@ -1058,10 +1058,13 @@ they run, and refused and noted the same way.
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
 lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
 as are the goal stack's operations (`goals.*`); what ends, stops or steers an agent always names it.
-kiln's MCP server tells each agent its id. `workspace` is `folder` (the folder itself, the
-default) or `volume` (a Slates volume of its own, where its machine can make one); in a result it
-is `null` for an agent in its folder, and `branch` and `change_request` are `null` until it has a
-change request.
+kiln's MCP server tells each agent its id. `workspace` is `volume` (a Slates volume of its own:
+what it gets when it names none, where its machine can make one) or `folder` (the folder itself);
+in a result it is `{kind, over, sub, volume, mount, owner, why_not}`: `owner` when it works in
+another agent's volume, `why_not` when it works in its folder because its machine can't make one,
+and `null` for one isolated in a microVM, a conversation taken up (`resume`), or one started before
+volumes were the default; `branch` and
+`change_request` are `null` until it has a change request.
 
 An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,
 files_changed, lines_added, lines_removed, cost_usd, doing?, parent?, plan_run?, last_turn?,
@@ -1263,8 +1266,10 @@ permissions low and how to merge their work.
 
 ## Workspaces of their own
 
-An agent can work in **its own Slates volume** instead of the folder itself (Mission control's
-composer → More options → Workspace → Own volume; `agents.start` with `workspace: "volume"`) (docs/agentic.md, W):
+Every agent works in **its own Slates volume** wherever its machine can make one, unless a person
+chooses its folder itself (Mission control's composer → More options → Workspace → This folder;
+`agents.start` with `workspace: "folder"`) or the server's `[agents] workspace` is `folder` (docs/agentic.md, W2). An agent started in another
+agent's folder on that agent's machine works in that agent's volume:
 
 - **What it is.** On the agent's machine, before its harness starts, kiln lays an overlay volume
   over the folder's repository and mounts it under the runner's state directory
@@ -1279,17 +1284,18 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   case nothing is written until they agree. Only a person writes it: an agent's `agents.land` with
   a plan is refused. Slates takes a person's go-ahead from kiln on macOS and Windows; not on Linux
   yet (Slates can't take a grant from outside its anchor's own session there), and the plan says so.
-  Slates' command line leaves out one path per landing, so kiln leaves out `.git` and writes only
-  what git sees changed: when the agent's build output or dependencies would be written too, the
-  plan says to put the work up for review instead.
+  kiln leaves out what git ignores in the workspace (the agent's build output and dependencies) and
+  `.git`, and writes only what git sees changed; on a machine whose Slates leaves out one path per
+  landing (an older one), the plan says to put the work up for review instead.
 - **How long it lasts.** As long as the agent: ended for good, its volume goes with it. It outlives
   the runner's restarts and upgrades (Slates' anchor runs apart from the runner: its own systemd
   user unit on Linux), but not the machine's (Slates keeps volumes in memory). An agent in one
   doesn't move to another machine yet.
 - **Where it can.** A machine with Slates installed (`slates` on `PATH`, or kiln's own under the
   runner's state directory) and a mount it can make: FUSE through `fusermount3` on Linux, NFS on
-  loopback on macOS. `GET /api/harness/workspaces` says which machines can, and why each other
-  can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
+  loopback on macOS, WinFsp on Windows (each workspace at a drive letter of its own, the highest
+  free: Slates mounts a WinFsp volume at a drive letter alone). `GET /api/harness/workspaces` says
+  which machines can, and why each other can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
 
 ## From an Agentfile, in a microVM of its own
 

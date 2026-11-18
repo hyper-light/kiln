@@ -6865,10 +6865,12 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     let caller = caller_of(hub, req.headers()).await;
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     as_asked(&mut body.spec, caller.as_ref());
-    // A workspace of its own is asked for by its kind alone (its machine makes it), and only of a
-    // machine that can make one: one that can't would let it work in the folder itself, unasked.
+    // A workspace is asked for by its kind alone (its machine makes a volume), a volume only of a machine that can make
+    // one: one that can't would let it work in the folder itself, unasked. Asked nothing, it gets a volume where its
+    // machine can make one (`Registry::open_as`); the folder itself is a choice kept as made.
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
-        None | Some("folder") => body.spec.workspace = None,
+        None => {}
+        Some("folder") => body.spec.workspace = Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }),
         Some("volume") => {
             crate::harness::lineage::workspaces_on(hub, &body.target).await.map_err(|why| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
             body.spec.workspace = Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });

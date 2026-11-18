@@ -202,7 +202,10 @@ export interface Choices {
   name: string;
   prompt: string;
   reach: string;
+  /** A Slates volume of its own over the folder (the person's choice, where the machine can make one). */
   volume: boolean;
+  /** Its folder itself, as the person chose; neither: what the server gives (a volume where the machine can make one, else its folder, saying why). */
+  folder?: boolean;
   /** The Agentfile its microVM is made from (`Spec.isolation.image`); none: a process on its machine. */
   agentfile?: string;
 }
@@ -221,7 +224,7 @@ export function specOf(c: Choices): Spec {
     prompt: c.prompt.trim() || undefined,
     shell: c.shell || undefined,
     reach: c.reach || undefined,
-    workspace: c.volume && !c.shell ? { kind: "volume" } : undefined,
+    workspace: c.shell ? undefined : c.volume ? { kind: "volume" } : c.folder ? { kind: "folder" } : undefined,
     // A microVM of its own, made from its Agentfile (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
     ...(c.agentfile ? { isolation: { kind: "microvm", image: c.agentfile } } : {}),
   };

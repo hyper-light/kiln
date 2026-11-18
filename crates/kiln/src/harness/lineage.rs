@@ -1627,11 +1627,14 @@ fn with_person(isolation: Option<Isolation>, person: Option<&str>) -> Option<Iso
 /// [`start`], the spec made for the ask then tuned by `tune` before anything starts.
 async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec) + Send) -> Result<Vec<Info>, Refused> {
     let kind = harness(&ask.kind)?;
-    let volume = match ask.workspace.as_deref().map(str::trim) {
-        None | Some("" | "folder") => false,
-        Some("volume") => true,
-        Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder), not {w:?}"))),
+    // What it asked to work in: nothing (a volume where its machine can make one: `Registry::open_as`), its folder
+    // itself, or a volume, which its machine must be able to make.
+    let workspace = match ask.workspace.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(asked @ ("folder" | "volume")) => Some(crate::workspace::Workspace { kind: asked.to_owned(), ..Default::default() }),
+        Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder, what it gets where it says nothing and its machine can make one), not {w:?}"))),
     };
+    let volume = workspace.as_ref().is_some_and(|w| w.kind == "volume");
     let count = ask.count.unwrap_or(1).clamp(1, 16);
     let resume = ask.resume.as_deref().map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned);
     if resume.is_some() && count > 1 {
@@ -1770,7 +1773,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         parent: by.parent.as_ref().map(|p| p.id.clone()),
         plan_run: by.plan_run.clone(),
         helper: ask.helper.clone(),
-        workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
+        workspace,
         isolation: with_person(isolation.clone(), person.as_deref()),
         resume: resume.clone(),
         agentfile: kept.text,

@@ -4203,7 +4203,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     crate::rt::spawn(async move {
                                         let opened = match crate::workspace::prepare(&mut spec, &session).await {
                                             Ok(()) => {
-                                                let made = spec.workspace.as_ref().and_then(|w| w.made.clone());
+                                                let made = crate::workspace::made_alone(&spec);
                                                 let opened = h.open(Some(session.clone()), spec).map(|_| ());
                                                 // What was made for it goes with it: asked again under its id, it's made anew.
                                                 if opened.is_err()

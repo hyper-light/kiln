@@ -591,12 +591,28 @@ pub struct Agents {
     /// default): none is granted live (default deny).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub egress_ceiling: Vec<String>,
+    /// Where an agent on its machine's host works when its start names no workspace (docs/agentic.md W2): `volume`, a
+    /// Slates volume of its own where its machine can make one (the person's decision, 2026-11-18, kiln goal
+    /// 01a1ec34599974448aed2672bafaf9a2), or `folder`, the folder itself, as before it (test servers and labs, whose
+    /// agents must leave no volume or mount behind on the machine that runs them).
+    pub workspace: DefaultWorkspace,
 }
 
 impl Default for Agents {
     fn default() -> Self {
-        Self { max_depth: 3, max_children: None, egress_ceiling: Vec::new() }
+        Self { max_depth: 3, max_children: None, egress_ceiling: Vec::new(), workspace: DefaultWorkspace::Volume }
     }
+}
+
+/// `[agents] workspace`: what an agent works in when its start names no workspace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultWorkspace {
+    /// A Slates volume of its own laid over its folder where its machine can make one, else its folder, saying why.
+    #[default]
+    Volume,
+    /// Its folder itself.
+    Folder,
 }
 
 impl Conversations {

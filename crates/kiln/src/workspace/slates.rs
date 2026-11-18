@@ -100,15 +100,9 @@ pub fn binary() -> Option<PathBuf> {
 }
 
 /// How a volume is mounted here, when it can be: `fuse` (Linux, through `fusermount3`, no
-/// privilege) or `nfs` (macOS, on loopback).
+/// privilege), `nfs` (macOS, on loopback) or `winfsp` (Windows, at a drive letter: `super::place`).
 pub fn mount_kind() -> Option<&'static str> {
-    if cfg!(target_os = "linux") {
-        crate::os::which("fusermount3").map(|_| "fuse")
-    } else if cfg!(target_os = "macos") {
-        Some("nfs")
-    } else {
-        None
-    }
+    super::place::kind()
 }
 
 /// What a machine says of its workspaces, in its facts.
@@ -121,8 +115,7 @@ pub async fn facts() -> Facts {
     };
     let slates = Some(bin.to_string_lossy().into_owned());
     let Some(mount) = mount_kind() else {
-        let why = if cfg!(target_os = "linux") { "fusermount3 isn't installed (the fuse3 package)" } else { "Slates can't mount a volume on this system yet" };
-        return Facts { slates, why_not: Some(why.to_owned()), ..Facts::default() };
+        return Facts { slates, why_not: Some(super::place::why_not().to_owned()), ..Facts::default() };
     };
     if HERE.get().is_none() {
         return Facts { slates, mount: Some(mount.to_owned()), why_not: Some("this kiln keeps no workspaces".to_owned()), ..Facts::default() };
@@ -187,9 +180,19 @@ async fn start_anchor(bin: &Path, log: &Path) -> anyhow::Result<()> {
         c.process_group(0);
     }
     let child = c.spawn()?;
-    // Never waited on: it outlives this process.
+    // Never waited on: it outlives this process. Its pid is kept, so a test stops the one anchor it started alone.
+    let _ = STARTED.set(child.id());
     drop(child);
     Ok(())
+}
+
+/// The pid of the anchor this process started apart (its own process group: [`start_anchor`]), the first one.
+static STARTED: OnceLock<u32> = OnceLock::new();
+
+/// The pid of the anchor this process started itself, when it started one apart: what a test that started its own
+/// instance stops at its end, and nothing else.
+pub fn started_anchor() -> Option<u32> {
+    STARTED.get().copied()
 }
 
 /// One start of the anchor at a time: agents starting together find it started by the first.
@@ -243,38 +246,37 @@ pub struct Made {
     pub mount: String,
 }
 
-/// Where workspace `name` is mounted.
-pub fn mount_of(name: &str) -> anyhow::Result<PathBuf> {
-    Ok(here()?.root.join(name))
-}
-
-/// A new workspace `name` laid over `over`, mounted.
+/// A new workspace `name` laid over `over`, mounted where its machine mounts workspaces (`super::place`): its folder
+/// under the workspaces folder, or on Windows the highest drive letter free, the next one free when another start took
+/// that one meanwhile.
 pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
     let over_s = over.to_string_lossy().into_owned();
     let max = volume_max();
     let made = verb(&["volume", "create", name, "--dynamic", &max, "--base", &over_s]).await?;
     let volume = made.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("Slates made no volume: {made}"))?.to_owned();
-    let mount = mount_of(name)?;
-    let m = Made { volume, name: name.to_owned(), mount: mount.to_string_lossy().into_owned() };
-    if let Err(e) = mounted(&m).await {
-        let _ = verb(&["volume", "destroy", &m.volume]).await;
-        return Err(e);
+    let mut failed = anyhow::anyhow!(super::place::NO_POINT);
+    for point in super::place::points(&here()?.root, name) {
+        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned() };
+        // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
+        // volume, not this one, and Slates refuses a second mount at it.
+        match mount_at(&m).await {
+            Ok(()) => return Ok(m),
+            // Taken meanwhile (a drive letter another start mounted first): the next one.
+            Err(e) if super::place::taken(&point) => failed = e,
+            Err(e) => {
+                failed = e;
+                break;
+            }
+        }
     }
-    Ok(m)
+    let _ = verb(&["volume", "destroy", &volume]).await;
+    Err(failed)
 }
 
-/// Whether something is mounted at `dir` (its device differs from its parent's).
-#[cfg(unix)]
+/// Whether a volume is mounted at `dir` (`super::place::is_mount`).
 fn is_mount(dir: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    let (Ok(d), Some(Ok(p))) = (std::fs::metadata(dir), dir.parent().map(std::fs::metadata)) else { return false };
-    d.dev() != p.dev()
-}
-
-#[cfg(not(unix))]
-fn is_mount(_dir: &Path) -> bool {
-    false
+    super::place::is_mount(dir)
 }
 
 /// Workspace `m` is mounted where it says (again, after the machine's mount went away while its
@@ -284,7 +286,13 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     if is_mount(&dir) {
         return Ok(());
     }
-    std::fs::create_dir_all(&dir)?;
+    mount_at(m).await
+}
+
+/// Mounts workspace `m` at its point, which holds nothing of it now.
+async fn mount_at(m: &Made) -> anyhow::Result<()> {
+    let dir = PathBuf::from(&m.mount);
+    super::place::ready(&dir)?;
     let mount = m.mount.clone();
     verb_plain(&["mount", &m.volume, &mount]).await?;
     anyhow::ensure!(is_mount(&dir), "Slates said it mounted {} at {mount}, but nothing is mounted there", m.name);
@@ -318,7 +326,7 @@ pub async fn remove(m: &Made) -> anyhow::Result<()> {
         }
     }
     verb(&["volume", "destroy", &m.volume]).await?;
-    let _ = std::fs::remove_dir(&dir);
+    super::place::clear(&dir);
     Ok(())
 }
 
@@ -329,19 +337,71 @@ pub async fn drift(m: &Made) -> anyhow::Result<Vec<String>> {
     Ok(st.get("drifted").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect())
 }
 
-/// What a landing leaves out: git's own directory. Slates' command line takes one `--exclude`
-/// (each flag keeps its last value, though its wire format takes several).
-pub const EXCLUDES: &[&str] = &["/.git"];
+/// What a landing of workspace `m` leaves out, each a prefix of its volume: what git ignores there (its build output
+/// and dependencies, which kiln never writes into a person's folder), then git's own directory. `/.git` goes last: a
+/// Slates whose command line keeps one `--exclude` (before 2026-11-18) still leaves git's own directory out, and
+/// [`writable`] refuses the rest. A folder git doesn't know leaves out `/.git` alone.
+pub async fn excludes(m: &Made) -> Vec<String> {
+    let mut out = match git_ignored(m).await {
+        Ok(ignored) => ignored,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "what git ignores in a workspace couldn't be read: only .git is left out");
+            Vec::new()
+        }
+    };
+    out.push("/.git".to_owned());
+    out
+}
 
-fn land_args<'a>(m: &'a Made, over: &'a str) -> Vec<&'a str> {
-    vec!["land", m.volume.as_str(), over, "--exclude", "/.git"]
+fn land_args(m: &Made, over: &str, excludes: &[String]) -> Vec<String> {
+    let mut args = vec!["land".to_owned(), m.volume.clone(), over.to_owned()];
+    for prefix in excludes {
+        args.push("--exclude".to_owned());
+        args.push(prefix.clone());
+    }
+    args
+}
+
+/// What git ignores in workspace `m` ([`ignored_prefixes`]).
+async fn git_ignored(m: &Made) -> anyhow::Result<Vec<String>> {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(super::place::top(&m.mount)).args(["status", "--porcelain=v1", "-z", "--ignored=traditional", "--untracked-files=normal"]).env("GIT_TERMINAL_PROMPT", "0");
+    let o = crate::proc::output(c, VERB_TIMEOUT).await?;
+    anyhow::ensure!(o.status.success(), "git status: {}", String::from_utf8_lossy(&o.stderr).trim());
+    Ok(ignored_prefixes(&String::from_utf8_lossy(&o.stdout)))
+}
+
+/// The paths `git status --porcelain=v1 -z --ignored=traditional` says it ignores (`!! target/`: a directory git
+/// ignores whole is named once), each a prefix of the volume (`/target`); a rename's or a copy's source, a field of its
+/// own, is no path of its own.
+fn ignored_prefixes(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fields = text.split('\0').filter(|f| !f.is_empty());
+    while let Some(record) = fields.next() {
+        if let Some(path) = record.strip_prefix("!! ") {
+            let path = path.trim_end_matches('/');
+            if !path.is_empty() {
+                out.push(format!("/{path}"));
+            }
+        } else if names_a_source(record) {
+            let _ = fields.next();
+        }
+    }
+    out
+}
+
+/// Whether a `git status --porcelain=v1 -z` record is a rename's or a copy's, whose source follows as a field of its
+/// own: its status says so in either column, the index's (`R  new`) or the worktree's (` R new`, a file added with
+/// `git add -N` in place of one removed).
+fn names_a_source(record: &str) -> bool {
+    record.chars().take(2).any(|status| matches!(status, 'R' | 'C'))
 }
 
 /// How many paths git sees changed in workspace `m`: tracked files changed or deleted, and new
 /// files git doesn't ignore, each one (`--untracked-files=all`).
 async fn git_changed(m: &Made) -> anyhow::Result<usize> {
     let mut c = Command::new("git");
-    c.arg("-C").arg(&m.mount).args(["status", "--porcelain=v1", "-z", "--untracked-files=all"]).env("GIT_TERMINAL_PROMPT", "0");
+    c.arg("-C").arg(super::place::top(&m.mount)).args(["status", "--porcelain=v1", "-z", "--untracked-files=all"]).env("GIT_TERMINAL_PROMPT", "0");
     let o = crate::proc::output(c, VERB_TIMEOUT).await?;
     anyhow::ensure!(o.status.success(), "git status: {}", String::from_utf8_lossy(&o.stderr).trim());
     Ok(count_changed(&String::from_utf8_lossy(&o.stdout)))
@@ -354,7 +414,7 @@ fn count_changed(text: &str) -> usize {
     let mut fields = text.split('\0').filter(|f| !f.is_empty());
     while let Some(record) = fields.next() {
         n = n.saturating_add(1);
-        if record.starts_with('R') || record.starts_with('C') {
+        if names_a_source(record) {
             let _ = fields.next();
         }
     }
@@ -373,9 +433,9 @@ fn planned_files(plan: &Value) -> usize {
         .fold(0usize, usize::saturating_add)
 }
 
-/// Whether `plan` writes only what git sees changed in workspace `m`: with `.git` the one path
-/// left out, anything more is something git ignores (build output, dependencies), which kiln
-/// won't write into a person's folder.
+/// Whether `plan` writes only what git sees changed in workspace `m`: with what git ignores and `.git` left out
+/// ([`excludes`]), anything more is something git ignores that this machine's Slates wrote anyway (one whose command
+/// line keeps one `--exclude`), which kiln won't write into a person's folder.
 pub async fn writable(m: &Made, plan: &Value) -> Result<(), String> {
     let planned = planned_files(plan);
     let changed = git_changed(m).await.map_err(|e| format!("{e:#}"))?;
@@ -383,16 +443,20 @@ pub async fn writable(m: &Made, plan: &Value) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "it would also write {} file{} git ignores (build output, dependencies) into the folder: Slates' command line leaves out only .git, so put the work up for review instead",
+        "it would also write {} file{} git ignores (build output, dependencies) into the folder: this machine's Slates leaves out only .git (an older one: update it), so put the work up for review instead",
         planned.saturating_sub(changed),
         if planned.saturating_sub(changed) == 1 { "" } else { "s" }
     ))
 }
 
 /// What writing workspace `m` back to `over` would do: Slates' presentation (`landing`,
-/// `manifest`, `summary`, `conflicts`, `grant_required`), or how it went if nothing needed a grant.
-pub async fn plan_landing(m: &Made, over: &str) -> anyhow::Result<Value> {
-    verb(&land_args(m, over)).await
+/// `manifest`, `summary`, `conflicts`, `grant_required`), or how it went if nothing needed a grant;
+/// and what it leaves out ([`excludes`]).
+pub async fn plan_landing(m: &Made, over: &str) -> anyhow::Result<(Value, Vec<String>)> {
+    let excludes = excludes(m).await;
+    let args = land_args(m, over, &excludes);
+    let plan = verb(&args.iter().map(String::as_str).collect::<Vec<_>>()).await?;
+    Ok((plan, excludes))
 }
 
 /// How a person's grant reaches this machine's Slates: the variables its anchor said to export
@@ -413,11 +477,11 @@ pub fn can_take_grants() -> anyhow::Result<()> {
 }
 
 /// What came of writing a workspace back: written (Slates' outcome), or not, because the plan is no
-/// longer the one the person saw (the new plan, to show them).
+/// longer the one the person saw (the new plan, to show them, and what it leaves out).
 #[derive(Debug)]
 pub enum Landed {
     Written(Value),
-    Changed(Value),
+    Changed(Value, Vec<String>),
 }
 
 /// Writes workspace `m` back to `over` exactly as the plan whose manifest is `manifest` (the one
@@ -427,7 +491,7 @@ pub enum Landed {
 /// comes back. Either way the grant binds exactly what the person said yes to.
 pub async fn land(m: &Made, over: &str, manifest: &str) -> anyhow::Result<Landed> {
     let env = issuer_env()?;
-    let plan = plan_landing(m, over).await?;
+    let (plan, excludes) = plan_landing(m, over).await?;
     if plan.get("grant_required").and_then(Value::as_bool) != Some(true) {
         // Nothing waits on a grant (nothing to write, or it landed as it was).
         return Ok(Landed::Written(plan));
@@ -436,7 +500,7 @@ pub async fn land(m: &Made, over: &str, manifest: &str) -> anyhow::Result<Landed
         anyhow::bail!("Slates' plan named no landing: {plan}");
     };
     if now != manifest {
-        return Ok(Landed::Changed(plan));
+        return Ok(Landed::Changed(plan, excludes));
     }
     writable(m, &plan).await.map_err(anyhow::Error::msg)?;
     let bin = binary().ok_or_else(|| anyhow::anyhow!("Slates isn't installed on this machine"))?;
@@ -459,11 +523,11 @@ pub async fn land(m: &Made, over: &str, manifest: &str) -> anyhow::Result<Landed
         .find_map(|l| serde_json::from_str::<Value>(l).ok())
         .and_then(|v| v.get("grant").or_else(|| v.get("id")).and_then(Value::as_u64))
         .ok_or_else(|| anyhow::anyhow!("Slates gave no grant: {said}"))?;
-    let grant = grant.to_string();
-    let mut args = land_args(m, over);
-    args.push("--grant");
-    args.push(&grant);
-    Ok(Landed::Written(verb(&args).await?))
+    // Landed under its grant exactly as planned: the same prefixes left out, so the same manifest.
+    let mut args = land_args(m, over, &excludes);
+    args.push("--grant".to_owned());
+    args.push(grant.to_string());
+    Ok(Landed::Written(verb(&args.iter().map(String::as_str).collect::<Vec<_>>()).await?))
 }
 
 #[cfg(test)]
@@ -481,137 +545,24 @@ mod tests {
     fn a_landing_is_weighed_against_what_git_sees_changed() {
         // ` M a`, `?? n`, a rename (its source a field of its own), a deletion.
         assert_eq!(count_changed(" M src/a.rs\0?? src/n.rs\0R  new.rs\0old.rs\0 D gone.rs\0"), 4);
+        assert_eq!(count_changed(" R new.txt\0old.txt\0"), 1, "a rename git sees in the worktree (git add -N), its source no path of its own");
         assert_eq!(count_changed(""), 0);
         let plan = serde_json::json!({"summary": {"by_action": [{"action": "replace", "count": 2}, {"action": "create", "count": 3}, {"action": "mkdir", "count": 4}]}});
         assert_eq!(planned_files(&plan), 5, "directories don't count");
         assert_eq!(planned_files(&serde_json::json!({})), 0);
     }
-}
 
-/// Workspaces end to end with a real Slates (`KILN_TEST_SLATES`: its binary; skipped, saying so,
-/// without it), on a hub of its own, under a timeout: an agent kiln runs on the server, in a
-/// volume of its own over a git folder. No harness ever runs (its program doesn't exist).
-#[cfg(all(test, target_os = "linux"))]
-mod end_to_end {
-    use std::path::Path;
-    use std::process::Command;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use serde_json::{Value, json};
-
-    use crate::harness::session::Spec;
-    use crate::ops::{Cx, call};
-
-    fn sh(dir: &Path, script: &str) -> anyhow::Result<String> {
-        let out = Command::new("sh").arg("-c").arg(script).current_dir(dir).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").output()?;
-        anyhow::ensure!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-    }
-
-    fn get<'a>(v: &'a Value, pointer: &str) -> &'a Value {
-        v.pointer(pointer).unwrap_or(&Value::Null)
-    }
-
-    /// Stops the test's own Slates instance, whatever happened.
-    struct Instance(String);
-
-    impl Drop for Instance {
-        fn drop(&mut self) {
-            let pattern = format!("[s]lates --instance {} ", self.0);
-            let _ = Command::new("pkill").arg("-f").arg(&pattern).status();
-        }
-    }
-
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (W6): a landing leaves out each path git ignores, once per directory
+    /// git ignores whole, a rename's source no path of its own; and `.git` last, which an older Slates keeps alone.
     #[test]
-    fn an_agent_works_in_a_volume_of_its_own_and_its_folder_stays_as_it_was() -> anyhow::Result<()> {
-        let Some(bin) = std::env::var_os("KILN_TEST_SLATES") else {
-            eprintln!("skipped: KILN_TEST_SLATES names no Slates binary");
-            return Ok(());
-        };
-        if crate::os::which("fusermount3").is_none() {
-            eprintln!("skipped: no fusermount3 to mount a volume with");
-            return Ok(());
-        }
-        let instance = format!("kilntest{}", std::process::id());
-        let _stop = Instance(instance.clone());
-        anyhow::ensure!(super::set_override(super::Override { binary: bin.into(), instance }), "another test pointed workspaces elsewhere");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(crate::rt::block_on(run()));
-        });
-        match rx.recv_timeout(Duration::from_secs(120)) {
-            Ok(r) => r,
-            Err(_) => anyhow::bail!("the workspace hung"),
-        }
-    }
-
-    async fn run() -> anyhow::Result<()> {
-        let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
-        let h = Arc::clone(&hub);
-        crate::rt::spawn(async move {
-            let _ = crate::harness::registry::Registry::run_local(h).await;
-        });
-        let bare = tempfile::tempdir()?;
-        sh(bare.path(), "git init -q --bare -b main")?;
-        let work = tempfile::tempdir()?;
-        let remote = bare.path().to_string_lossy().into_owned();
-        sh(work.path(), &format!("git init -q -b main && git config user.name Ada && git config user.email ada@example.com && git config commit.gpgsign false && git config tag.gpgsign false && printf 'target/\\n' > .gitignore && mkdir -p src target && echo a > src/a.rs && git add . && git commit -qm init && git remote add origin {remote} && git push -q origin main && echo built > target/out"))?;
-        let cwd = work.path().join("src").to_string_lossy().into_owned();
-        let spec = Spec {
-            kind: "claude".into(),
-            cwd: Some(cwd.clone()),
-            name: Some("Change a".into()),
-            program: Some(work.path().join("no-claude").to_string_lossy().into_owned()),
-            workspace: Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() }),
-            ..Spec::default()
-        };
-        let infos = hub.harness.open(&hub, "local", spec, 1).await?;
-        let info = infos.first().cloned().ok_or_else(|| anyhow::anyhow!("no agent"))?;
-        let made = info.workspace.as_ref().and_then(|w| w.made.clone()).ok_or_else(|| anyhow::anyhow!("no workspace made: {:?}", info.workspace))?;
-        // It works in its volume, in the folder it was asked to: what it hasn't touched is the folder's.
-        assert!(info.cwd.starts_with(&made.mount) && info.cwd.ends_with("/src"), "{} in {}", info.cwd, made.mount);
-        assert_eq!(std::fs::read_to_string(Path::new(&made.mount).join("src/a.rs"))?, "a\n");
-        assert_eq!(std::fs::read_to_string(Path::new(&made.mount).join("target/out"))?, "built\n", "build output comes from the folder");
-        // What it changes stays in its volume.
-        std::fs::write(Path::new(&made.mount).join("src/a.rs"), "a2\n")?;
-        std::fs::write(Path::new(&made.mount).join("src/new.rs"), "n\n")?;
-        assert_eq!(std::fs::read_to_string(work.path().join("src/a.rs"))?, "a\n", "the folder is as it was");
-        assert!(!work.path().join("src/new.rs").exists());
-        let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
-        let fail = |(c, m): crate::ops::Fail| anyhow::anyhow!("{c}: {m}");
-        // Its change request comes from its volume: everything that changed there.
-        let out = call(cx.clone(), "agents.change", json!({"agent": info.id, "title": "Change a"})).await.map_err(fail)?;
-        let branch = get(&out, "/change_request/branch").as_str().unwrap_or_default().to_owned();
-        assert_eq!(sh(bare.path(), &format!("git show {branch}:src/a.rs"))?, "a2");
-        assert_eq!(sh(bare.path(), &format!("git show {branch}:src/new.rs"))?, "n");
-        // A file it changed, changed on disk too: drift.
-        std::fs::write(work.path().join("src/a.rs"), "the person's\n")?;
-        let ws = call(cx.clone(), "agents.workspace", json!({"agent": info.id})).await.map_err(fail)?;
-        assert!(get(&ws, "/drift").as_array().is_some_and(|d| d.iter().any(|x| x.as_str().is_some_and(|s| s.contains("a.rs")))), "{ws}");
-        // Writing it back: the plan, with the person's change to a.rs as a conflict, and git's own files left out.
-        let plan = call(cx.clone(), "agents.land", json!({"agent": info.id})).await.map_err(fail)?;
-        assert_eq!(get(&plan, "/plan/grant_required"), &json!(true), "{plan}");
-        assert_eq!(get(&plan, "/excludes"), &json!(["/.git"]), "{plan}");
-        // A person's go-ahead can't reach Slates from kiln on Linux yet, and the plan and the write say so.
-        assert_eq!(get(&plan, "/can_write"), &json!(false), "{plan}");
-        assert!(get(&plan, "/why_not").as_str().is_some_and(|w| w.contains("Linux")), "{plan}");
-        let manifest = get(&plan, "/plan/manifest").as_str().unwrap_or_default().to_owned();
-        let refused = call(cx.clone(), "agents.land", json!({"agent": info.id, "manifest": manifest})).await.err().map(|(_, m)| m).unwrap_or_default();
-        assert!(refused.contains("Linux"), "{refused}");
-        // An agent can't write it, whatever it asks.
-        let as_agent = Cx { hub: Arc::clone(&hub), caller: crate::mcp::session_caller(&hub, &info.id, None).await.map_err(anyhow::Error::msg)? };
-        let refused = call(as_agent, "agents.land", json!({"agent": info.id, "manifest": "00"})).await.err().map(|(c, m)| format!("{c} {m}")).unwrap_or_default();
-        assert!(refused.contains("403") && refused.contains("a person's to say"), "{refused}");
-        // Ended for good: its volume goes with it.
-        assert!(hub.harness.close(&hub, &info.id).await);
-        for _ in 0..100 {
-            if !super::is_mount(Path::new(&made.mount)) {
-                break;
-            }
-            crate::rt::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(!super::is_mount(Path::new(&made.mount)), "unmounted");
-        Ok(())
+    fn a_landing_leaves_out_what_git_ignores_and_git_itself_last() {
+        let said = "!! target/\0 M src/a.rs\0R  new.rs\0old.rs\0!! src/gen.o\0?? src/n.rs\0 R moved.rs\0!! was.rs\0!! node_modules/\0";
+        assert_eq!(ignored_prefixes(said), ["/target", "/src/gen.o", "/node_modules"]);
+        assert!(ignored_prefixes("").is_empty());
+        let m = Made { volume: "v".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into() };
+        let args = land_args(&m, "/src/kiln", &["/target".to_owned(), "/.git".to_owned()]);
+        assert_eq!(args, ["land", "v", "/src/kiln", "--exclude", "/target", "--exclude", "/.git"]);
     }
 }
+
+// The bare-metal engine's workspaces end to end, with a real Slates: `super::bare_metal_tests`.

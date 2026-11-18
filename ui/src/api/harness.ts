@@ -373,8 +373,8 @@ export interface Spec {
   speed?: string;
   /** Commands on other runners (kiln reach): unset, it may use any; "off", only its own machine; else where it prefers them (a runner, or `linux/x86_64`). */
   reach?: string;
-  /** Where it works: its folder itself (none), or a Slates volume of its own laid over the folder (`volume`). */
-  workspace?: { kind: "volume" };
+  /** Where it works: a Slates volume of its own laid over the folder (`volume`), or its folder itself (`folder`); none: a volume where its machine can make one, else its folder, saying why. */
+  workspace?: { kind: "folder" | "volume" };
   /** How it's held when not as a process on its machine: a microVM of its own (`microvm`), made from the Agentfile `image` names (api/agentfiles.ts; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31). */
   isolation?: Isolation;
 }

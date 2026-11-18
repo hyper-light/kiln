@@ -8,6 +8,7 @@
 //! - [`change`]: an agent's change request, from its work to review (C1, C6).
 //! - [`follow`]: what happens to it, back to the agent (C2, C3).
 //! - [`slates`]: a workspace of its own, a Slates volume over its folder (W1–W4).
+//! - [`place`]: where a workspace's volume is mounted on its machine (a folder, or a drive letter on Windows).
 //! - [`measure`]: an experiment's variants measured beside it, each in a worktree of its own
 //!   (docs/ci.md W20-R11).
 
@@ -15,7 +16,11 @@ pub mod change;
 pub mod follow;
 pub mod git;
 pub mod measure;
+pub mod place;
 pub mod slates;
+
+#[cfg(test)]
+mod bare_metal_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,11 +28,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Where an agent works when not in its folder itself (`Spec::workspace`).
+/// Where an agent works (`Spec::workspace`): a Slates volume laid over its folder, or the folder itself.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Workspace {
-    /// `volume`: a Slates volume of its own, laid over its folder.
+    /// `volume`: a Slates volume laid over its folder (its own, or another agent's it works in: `owner`); `folder`:
+    /// the folder itself, as a person asked, or because its machine can't make a volume (`why_not`).
     pub kind: String,
     /// The folder it's laid over: its repository's top (else the folder itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,10 +46,98 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub made: Option<slates::Made>,
+    /// The agent whose volume it works in, when it isn't its own: it was started in another agent's workspace on its
+    /// machine (a child in its parent's folder), so it works there, as two agents in one folder do ([`sharing`]). The
+    /// volume goes when the last agent working in it ends, and only its owner's change request takes everything in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub owner: Option<String>,
+    /// Why it works in its folder though its start named no workspace: its machine can't make a volume, as it said
+    /// ([`by_default`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub why_not: Option<String>,
 }
 
 /// The kinds of workspace an agent may ask for: its folder itself, or a volume of its own.
 pub const KINDS: &[&str] = &["folder", "volume"];
+
+/// What an agent works in when its start named no workspace (the person's decision, 2026-11-18, kiln goal
+/// 01a1ec34599974448aed2672bafaf9a2: kiln's bare-metal engine runs every harness and agent on a Slates volume;
+/// docs/agentic.md W2): a volume of its own where its machine can make one (`can`), else its folder, saying why.
+pub fn by_default(can: Result<(), String>) -> Workspace {
+    match can {
+        Ok(()) => Workspace { kind: "volume".to_owned(), ..Workspace::default() },
+        Err(why) => Workspace { kind: "folder".to_owned(), why_not: Some(why), ..Workspace::default() },
+    }
+}
+
+/// The workspace an agent works in when its folder `cwd` lies in one that an agent of its machine works in now
+/// (`live`: each such agent's id and workspace): that one, the agent's folder its own place in it. A volume is never
+/// laid over a volume (Slates refuses a base on one of its own mounts, its A-227), so an agent started in another's
+/// folder, a child in its parent's above all, works in that agent's volume, as two agents in one folder do. The
+/// volume's owner stays the agent that made it, whoever works there in turn.
+pub fn sharing(cwd: &str, live: &[(String, Workspace)]) -> Option<Workspace> {
+    live.iter().find_map(|(id, w)| {
+        let made = w.made.as_ref()?;
+        within(cwd, &made.mount).then(|| Workspace {
+            kind: "volume".to_owned(),
+            over: w.over.clone(),
+            sub: beneath(cwd, &made.mount),
+            made: Some(made.clone()),
+            owner: Some(w.owner.clone().unwrap_or_else(|| id.clone())),
+            why_not: None,
+        })
+    })
+}
+
+/// Whether `a` and `b` are workspaces in one volume.
+pub fn same_volume(a: Option<&Workspace>, b: Option<&Workspace>) -> bool {
+    match (a.and_then(|w| w.made.as_ref()), b.and_then(|w| w.made.as_ref())) {
+        (Some(x), Some(y)) => x.volume == y.volume,
+        _ => false,
+    }
+}
+
+/// A drive letter's path (`K:`), the mount of a Windows workspace.
+fn drive(path: &str) -> Option<char> {
+    let mut chars = path.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(letter), Some(':'), None) if letter.is_ascii_alphabetic() => Some(letter.to_ascii_uppercase()),
+        _ => None,
+    }
+}
+
+/// How long `path`'s leading text that is `mount` is, when it is: exactly, or a drive letter whatever its case
+/// (Windows names `k:` and `K:` alike).
+fn mount_prefix(path: &str, mount: &str) -> Option<usize> {
+    if path.starts_with(mount) {
+        return Some(mount.len());
+    }
+    let letter = drive(mount)?;
+    let head = path.get(..mount.len())?;
+    (drive(head) == Some(letter)).then_some(mount.len())
+}
+
+/// Whether `path` is `mount` or lies beneath it, as either platform writes its paths: the server judges its runners'
+/// paths whatever it runs on itself (a Windows runner's `K:\src` lies on its drive `K:`), so this compares their text,
+/// never by the server's own `Path`.
+pub fn within(path: &str, mount: &str) -> bool {
+    let mount = mount.trim_end_matches(['/', '\\']);
+    if mount.is_empty() {
+        return false;
+    }
+    match mount_prefix(path, mount).and_then(|n| path.get(n..)) {
+        Some(rest) => rest.is_empty() || rest.starts_with(['/', '\\']),
+        None => false,
+    }
+}
+
+/// `path`'s place beneath `mount` (it lies [`within`] it): a workspace's `sub`, empty for the mount itself.
+fn beneath(path: &str, mount: &str) -> String {
+    let mount = mount.trim_end_matches(['/', '\\']);
+    mount_prefix(path, mount).and_then(|n| path.get(n..)).unwrap_or_default().trim_start_matches(['/', '\\']).trim_end_matches(['/', '\\']).to_owned()
+}
 
 /// Makes the workspace `spec` asks for (on the machine its agent `id` works on), before its
 /// harness starts: a volume laid over its folder's repository, mounted, and the agent's folder in
@@ -69,10 +163,17 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     // share their beginnings (Slates' names are unique on the machine).
     let whole: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
     let made = slates::make(&format!("kiln-{whole}"), &over).await?;
-    let here = if sub.is_empty() { PathBuf::from(&made.mount) } else { PathBuf::from(&made.mount).join(&sub) };
+    let top = place::top(&made.mount);
+    let here = if sub.is_empty() { top } else { top.join(&sub) };
     spec.cwd = Some(here.to_string_lossy().into_owned());
-    spec.workspace = Some(Workspace { kind: w.kind, over: Some(over.to_string_lossy().into_owned()), sub, made: Some(made) });
+    spec.workspace = Some(Workspace { kind: w.kind, over: Some(over.to_string_lossy().into_owned()), sub, made: Some(made), ..Workspace::default() });
     Ok(())
+}
+
+/// The volume a start made for its agent alone, which goes with it when it can't start after all: none when its
+/// workspace is another agent's (`owner`), which goes on.
+pub fn made_alone(spec: &crate::harness::session::Spec) -> Option<slates::Made> {
+    spec.workspace.as_ref().filter(|w| w.owner.is_none()).and_then(|w| w.made.clone())
 }
 
 /// Whether `spec` needs its workspace made (or mounted again) before its harness starts.
@@ -80,8 +181,8 @@ pub fn needs_preparing(spec: &crate::harness::session::Spec) -> bool {
     spec.workspace.as_ref().is_some_and(|w| w.kind == "volume")
 }
 
-/// Ends agent session `spec`'s workspace for good, when it has one of its own: its volume and what
-/// it held go with the session.
+/// Ends agent session `spec`'s workspace for good, when it has a volume: the volume and what it held go
+/// with the session. Its caller asks this of the last agent working in it alone ([`same_volume`]).
 pub fn release(spec: &crate::harness::session::Spec) {
     let Some(m) = spec.workspace.as_ref().and_then(|w| w.made.clone()) else { return };
     crate::rt::spawn(async move {
@@ -260,7 +361,7 @@ pub async fn serve(cwd: &Path, work: &Path, ws: Option<&Workspace>, ask: Ask, ve
 
 /// The workspace of its own an ask about one needs: its volume and the folder it's laid over.
 fn own(ws: Option<&Workspace>) -> anyhow::Result<(&slates::Made, &str)> {
-    let w = ws.ok_or_else(|| anyhow::anyhow!("it works in its folder itself, not a workspace of its own"))?;
+    let w = ws.filter(|w| w.kind == "volume").ok_or_else(|| anyhow::anyhow!("it works in its folder itself, not a workspace of its own"))?;
     match (&w.made, &w.over) {
         (Some(m), Some(over)) => Ok((m, over.as_str())),
         _ => anyhow::bail!("its workspace isn't made yet"),
@@ -275,22 +376,22 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
         }
         Ask::Plan => {
             let (m, over) = own(ws)?;
-            let plan = slates::plan_landing(m, over).await?;
+            let (plan, excludes) = slates::plan_landing(m, over).await?;
             // Why it can't be written from kiln: this machine's Slates takes no go-ahead from it, or
             // the landing would write what git ignores.
             let why_not = match slates::can_take_grants() {
                 Err(e) => Some(format!("{e:#}")),
                 Ok(()) => slates::writable(m, &plan).await.err(),
             };
-            Ok(json!({"plan": plan, "excludes": slates::EXCLUDES, "can_write": why_not.is_none(), "why_not": why_not}))
+            Ok(json!({"plan": plan, "excludes": excludes, "can_write": why_not.is_none(), "why_not": why_not}))
         }
         Ask::Land { manifest } => {
             let (m, over) = own(ws)?;
             Ok(match slates::land(m, over, &manifest).await? {
                 slates::Landed::Written(outcome) => json!({"landed": outcome}),
-                slates::Landed::Changed(plan) => {
+                slates::Landed::Changed(plan, excludes) => {
                     let why_not = slates::writable(m, &plan).await.err();
-                    json!({"changed": true, "plan": plan, "excludes": slates::EXCLUDES, "can_write": why_not.is_none(), "why_not": why_not})
+                    json!({"changed": true, "plan": plan, "excludes": excludes, "can_write": why_not.is_none(), "why_not": why_not})
                 }
             })
         }
@@ -349,4 +450,101 @@ async fn push_all(top: &Path, to: Option<&str>, pushes: &[Push]) -> (usize, Stri
         }
     }
     (pushes.len(), said, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn made(volume: &str, mount: &str) -> slates::Made {
+        slates::Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: mount.into() }
+    }
+
+    fn volume_at(volume: &str, mount: &str, over: &str) -> Workspace {
+        Workspace { kind: "volume".into(), over: Some(over.into()), made: Some(made(volume, mount)), ..Workspace::default() }
+    }
+
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (W2): a start that names no workspace gets a volume where its machine
+    /// can make one, and its folder where it can't, with the machine's word for why.
+    #[test]
+    fn w2_a_start_that_names_nothing_gets_a_volume_where_its_machine_can_make_one() {
+        assert_eq!(by_default(Ok(())), Workspace { kind: "volume".into(), ..Workspace::default() });
+        let folder = by_default(Err("fusermount3 isn't installed (the fuse3 package)".into()));
+        assert_eq!(folder.kind, "folder");
+        assert_eq!(folder.why_not.as_deref(), Some("fusermount3 isn't installed (the fuse3 package)"));
+        assert!(folder.made.is_none() && folder.owner.is_none());
+    }
+
+    /// W2: an agent whose folder lies in another agent's volume works in that volume, at its place there, the volume's
+    /// owner the agent that made it (also for an agent started in turn in a sharer's folder); a folder outside every
+    /// mount, or beside one (`kiln-a2` is not beneath `kiln-a`), shares nothing.
+    #[test]
+    fn w2_an_agent_started_in_another_agents_folder_works_in_its_volume() {
+        let parent = volume_at("v1", "/state/workspaces/kiln-a", "/home/ada/src/kiln");
+        let live = vec![("a".to_owned(), parent.clone())];
+        let child = sharing("/state/workspaces/kiln-a/crates/kiln", &live).unwrap_or_default();
+        assert_eq!(child.kind, "volume");
+        assert_eq!(child.made, parent.made, "its parent's volume, not one of its own");
+        assert_eq!(child.over, parent.over, "laid over the same folder");
+        assert_eq!(child.sub, "crates/kiln");
+        assert_eq!(child.owner.as_deref(), Some("a"));
+        assert_eq!(sharing("/state/workspaces/kiln-a", &live).map(|w| w.sub), Some(String::new()), "at the top");
+        assert_eq!(sharing("/state/workspaces/kiln-a/", &live).map(|w| w.sub), Some(String::new()));
+        assert_eq!(sharing("/state/workspaces/kiln-a2/src", &live), None, "beside it, not in it");
+        assert_eq!(sharing("/home/ada/src/kiln", &live), None, "the folder itself: a volume of its own");
+        // A grandchild in the child's folder: still the parent's.
+        let both = vec![("b".to_owned(), child.clone())];
+        assert_eq!(sharing("/state/workspaces/kiln-a/crates", &both).and_then(|w| w.owner), Some("a".to_owned()));
+        // One not yet made shares nothing.
+        let unmade = vec![("c".to_owned(), Workspace { kind: "volume".into(), ..Workspace::default() })];
+        assert_eq!(sharing("/state/workspaces/kiln-c", &unmade), None);
+    }
+
+    /// W2 on Windows (judged on any server): a volume is mounted at a drive letter, and a folder on that drive, written
+    /// either way and with the letter in either case, lies in it.
+    #[test]
+    fn w2_a_folder_on_a_windows_workspaces_drive_lies_in_it() {
+        assert!(within(r"K:\src\kiln", "K:"));
+        assert!(within(r"k:\src", "K:"));
+        assert!(within("K:/src", "K:"));
+        assert!(within("K:", "K:"));
+        assert!(within(r"K:\", "K:"));
+        assert!(!within(r"L:\src", "K:"));
+        assert!(!within(r"C:\K:\src", "K:"));
+        let live = vec![("w".to_owned(), volume_at("v9", "K:", r"C:\Users\ada\src\kiln"))];
+        assert_eq!(sharing(r"k:\crates\kiln", &live).map(|w| w.sub), Some(r"crates\kiln".to_owned()));
+        assert!(!within("/anything", ""), "no mount holds everything");
+    }
+
+    /// W3: a volume goes with the last agent working in it, and a start that fails takes only a volume made for it
+    /// alone with it.
+    #[test]
+    fn w3_a_shared_volume_is_one_volume_and_only_its_owners_start_takes_it() {
+        let parent = volume_at("v1", "/w/kiln-a", "/src");
+        let child = sharing("/w/kiln-a/sub", &[("a".to_owned(), parent.clone())]);
+        assert!(same_volume(Some(&parent), child.as_ref()));
+        assert!(!same_volume(Some(&parent), Some(&volume_at("v2", "/w/kiln-b", "/src"))));
+        assert!(!same_volume(Some(&parent), None));
+        assert!(!same_volume(Some(&by_default(Ok(()))), Some(&by_default(Ok(())))), "volumes not made yet are no volume");
+        let spec = |w: Option<Workspace>| crate::harness::session::Spec { workspace: w, ..Default::default() };
+        assert_eq!(made_alone(&spec(Some(parent.clone()))), parent.made);
+        assert_eq!(made_alone(&spec(child)), None, "its parent's volume goes on");
+        assert_eq!(made_alone(&spec(None)), None);
+    }
+
+    /// W2: an agent in its folder, whatever the reason, has no workspace of its own to ask about.
+    #[test]
+    fn w2_an_agent_in_its_folder_has_no_volume_to_ask_about() {
+        let folder = by_default(Err("no Slates here".into()));
+        let refused = own_of(Some(&folder));
+        assert!(refused.contains("its folder itself"), "{refused}");
+        assert!(own_of(None).contains("its folder itself"));
+        let unmade = Workspace { kind: "volume".into(), ..Workspace::default() };
+        assert!(own_of(Some(&unmade)).contains("isn't made yet"));
+        assert!(super::own(Some(&volume_at("v1", "/w/kiln-a", "/src"))).is_ok());
+    }
+
+    fn own_of(w: Option<&Workspace>) -> String {
+        super::own(w).err().map(|e| format!("{e:#}")).unwrap_or_default()
+    }
 }

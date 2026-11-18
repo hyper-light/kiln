@@ -620,8 +620,8 @@ async fn result(cx: Cx, v: Value) -> Out {
         "tree": info.tree,
         "machine": wait::machine(&info.target),
         "cost_usd": info.cost_usd,
-        // Its workspace of its own (docs/agentic.md, W): the folder it's laid over, and its volume.
-        "workspace": info.workspace.as_ref().map(|w| json!({"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount)})),
+        // Its workspace (docs/agentic.md, W): the folder it's laid over, and its volume.
+        "workspace": info.workspace.as_ref().map(workspace_shown),
         "branch": record.as_ref().map(|r| json!(r.branch)),
         "change_request": record.as_ref().map(crate::workspace::change::shown),
     }))
@@ -635,13 +635,24 @@ async fn change(cx: Cx, v: Value) -> Out {
     Ok(json!({"change_request": crate::workspace::change::shown(&r)}))
 }
 
+/// An agent's workspace as its views show it: its kind, the folder it's laid over and its place there, its volume and
+/// where it's mounted; whose volume it is when another agent's (`owner`), and why it works in its folder when its start
+/// named nothing and its machine can't make a volume (`why_not`).
+fn workspace_shown(w: &crate::workspace::Workspace) -> Value {
+    json!({"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount), "owner": w.owner, "why_not": w.why_not})
+}
+
 async fn workspace(cx: Cx, v: Value) -> Out {
     let info = seen(&cx, &agent_of(&v)?).await?;
     let Some(w) = info.workspace.clone() else {
         return Ok(json!({"workspace": Value::Null, "drift": []}));
     };
+    // Its folder itself has nothing of its own to drift from.
+    if w.made.is_none() {
+        return Ok(json!({"workspace": workspace_shown(&w), "drift": []}));
+    }
     let look = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Look).await?;
-    Ok(json!({"workspace": {"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount)}, "drift": look.get("drift").cloned().unwrap_or(json!([]))}))
+    Ok(json!({"workspace": workspace_shown(&w), "drift": look.get("drift").cloned().unwrap_or(json!([]))}))
 }
 
 /// Its repository's branches, tags and latest commits (docs/agents.md, "Compare").
@@ -1413,10 +1424,11 @@ pub mod input {
         pub name: Option<String>,
         #[schemars(range(min = 1, max = 16))]
         pub count: Option<i64>,
-        /// Where it works: `folder`, its folder itself (the default), or `volume`, a Slates volume
-        /// of its own laid over the folder's repository, where what it changes stays its own until
-        /// it goes up for review (agents.change) or a person writes it to disk. Where the machine
-        /// has Slates.
+        /// Where it works: `volume`, a Slates volume of its own laid over the folder's repository,
+        /// where what it changes stays its own until it goes up for review (agents.change) or a
+        /// person writes it to disk (the default where its machine can make one; else its folder,
+        /// saying why), or `folder`, its folder itself. Started in another agent's folder on that
+        /// agent's machine, it works in that agent's volume.
         pub workspace: Option<AgentsStartWorkspace>,
         /// How it's held: `none`, a process on its machine (the default), or `microvm`, a microVM of
         /// its own, on a machine that starts them. An isolated agent's agents are isolated too. An
@@ -2987,6 +2999,37 @@ for line in sys.stdin:
             let deep = as_agent(&hub, &kid).await?;
             let Err((_, why)) = call(deep, "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE})).await else { anyhow::bail!("too deep") };
             anyhow::ensure!(why.contains("max_depth"), "{why}");
+            Ok(())
+        })
+    }
+
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2): what an agent works in when its start names no
+    /// workspace is the server's `[agents] workspace`: on a server that says `folder` (a test's, a lab's) its folder
+    /// itself, nothing made for it; and a person's `folder` is kept as asked on a server whose default is a volume, its
+    /// machine asked nothing about one. Neither needs Slates, so this holds on every machine.
+    #[test]
+    fn w2_a_start_naming_no_workspace_follows_the_servers_setting_and_a_folder_asked_for_is_kept() -> anyhow::Result<()> {
+        run(async {
+            let fail = |(s, m): crate::ops::Fail| anyhow::anyhow!("{s} {m}");
+            let started = |out: &Value| out.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            // A server whose agents work in their folders (every test server's): nothing named, nothing made.
+            let hub = hub_with(|_| {}).await?;
+            let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let id = started(&call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local"})).await.map_err(fail)?);
+            let info = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("no agent {id}"))?;
+            anyhow::ensure!(info.workspace.is_none(), "{:?}", info.workspace);
+            let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
+            anyhow::ensure!(ws == json!({"workspace": null, "drift": []}), "{ws}");
+            // kiln's default, a volume where its machine can make one: a person's `folder` is kept as asked.
+            let hub = hub_with(|c| c.agents.workspace = crate::config::DefaultWorkspace::Volume).await?;
+            let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let id = started(&call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local", "workspace": "folder"})).await.map_err(fail)?);
+            let info = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("no agent {id}"))?;
+            anyhow::ensure!(info.workspace == Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }), "{:?}", info.workspace);
+            // Its folder has nothing of its own to drift from, and no machine is asked.
+            let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
+            anyhow::ensure!(ws.pointer("/workspace/kind") == Some(&json!("folder")) && ws.get("drift") == Some(&json!([])), "{ws}");
+            anyhow::ensure!(ws.pointer("/workspace/volume") == Some(&Value::Null), "{ws}");
             Ok(())
         })
     }

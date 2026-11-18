@@ -414,8 +414,9 @@ pub struct Spec {
     /// environment and program into it as it opens ([`super::host::Host::open`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent: bool,
-    /// Where it works when not in its folder itself: a Slates volume of its own laid over the
-    /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
+    /// Where it works (`crate::workspace`): a Slates volume laid over its folder, made on its machine before it
+    /// starts and kept with it (its own, or another agent's it works in), or its folder itself (`kind: folder`); none:
+    /// its folder, as it was before volumes were the default (docs/agentic.md W2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::workspace::Workspace>,
     /// How it's held when not as a process on its machine: in a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -866,7 +867,7 @@ pub struct Info {
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_bypass: bool,
-    /// Its workspace of its own, when it has one (as `Spec::workspace`).
+    /// Where it works, when its start decided (as `Spec::workspace`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub workspace: Option<crate::workspace::Workspace>,

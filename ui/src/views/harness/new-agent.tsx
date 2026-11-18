@@ -123,8 +123,8 @@ function useChoices() {
   };
   const [modelByKind, setModelByKind] = useLocalStorage<Record<string, string>>("kiln.agents.models", {});
   const [speedByKind, setSpeedByKind] = useLocalStorage<Record<string, string>>("kiln.agents.speeds", {});
-  /** `volume`: a Slates volume of its own over the folder, where the machine can make one. */
-  const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "folder");
+  /** `volume`: a Slates volume of its own over the folder, where the machine can make one (what an agent gets unless a person chooses its folder: kiln goal 01a1ec34…, the person's decision of 2026-11-18). */
+  const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "volume");
   /** The Agentfile each harness's microVM is made from, per project (views/agentfiles/choose.ts); none kept: a process on its machine. */
   const [agentfiles, setAgentfiles] = useLocalStorage<Record<string, string>>("kiln.agents.agentfiles", {});
   const [dirs, setDirs] = useLocalStorage<Record<string, string[]>>("kiln.agents.recentDirs", {});
@@ -256,6 +256,7 @@ function resolve(c: Choices, m: Machines) {
     speed,
     canVolume,
     volume: c.workspace === "volume" && canVolume && !c.shell,
+    folder: c.workspace === "folder" && !c.shell,
     others,
     shells: m.shells.filter((s) => s.target === target && !s.exited),
     kindName: info?.name ?? kind,
@@ -846,6 +847,7 @@ export function NewAgent({
       prompt: sending ? "" : body,
       reach: c.reach,
       volume: s.volume,
+      folder: s.folder,
       agentfile: agentfile?.image,
     });
     const ids = Array.from({ length: c.count }, () => clientId());

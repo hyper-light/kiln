@@ -334,7 +334,7 @@ host_seconds = {host_seconds}
             data = toml_path(&data),
             cd = tables.cd,
             host_seconds = tables.host_seconds,
-            extra = extra(root.path())
+            extra = agents_in_folders(&extra(root.path()))
         );
         std::fs::write(root.path().join("kiln.toml"), cfg)?;
         let server_env = env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
@@ -1267,6 +1267,19 @@ fn server_command(dir: &Path, log: std::fs::File) -> anyhow::Result<Command> {
     Ok(cmd)
 }
 
+/// `extra` with the server's agents working in their folders (docs/agentic.md W2, `[agents] workspace`), so none leaves a
+/// Slates volume or mount behind on the machine running the tests; a test that says otherwise names `workspace` in an
+/// `[agents]` of its own.
+pub fn agents_in_folders(extra: &str) -> String {
+    if !extra.contains("[agents]") {
+        format!("{extra}\n[agents]\nworkspace = \"folder\"\n")
+    } else if extra.contains("workspace =") {
+        extra.to_owned()
+    } else {
+        extra.replacen("[agents]", "[agents]\nworkspace = \"folder\"", 1)
+    }
+}
+
 fn start_once(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, &str)]) -> anyhow::Result<Result<Server, String>> {
     let (port, quic) = (free_port()?, free_udp_port()?);
     let data = dir.join("data");
@@ -1281,6 +1294,7 @@ fn start_once(dir: &Path, o: &Options<'_>, https: bool, cd: bool, env: &[(&str, 
     } else {
         format!("{}\n[ci.scheduler]\nheadroom = false\n", o.extra)
     };
+    let extra = agents_in_folders(&extra);
     let config = format!(
         r#"[server]
 http_addr = "127.0.0.1:{port}"

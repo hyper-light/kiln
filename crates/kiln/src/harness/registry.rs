@@ -4411,6 +4411,21 @@ impl Registry {
             crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
         }
         let loc = Location::of_target(target);
+        // Where it works, on its machine's host (the person's decision, 2026-11-18, kiln goal
+        // 01a1ec34599974448aed2672bafaf9a2; docs/agentic.md W2): one whose folder lies in a workspace an agent there
+        // works in now works in that one; one whose start named none gets a volume of its own where its machine can make
+        // one, else its folder, saying why (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
+        // its boundary's sharing decides, and a conversation taken up stays in the folder its harness keeps it by
+        // (`resume`).
+        if spec.isolation.is_none() && spec.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
+            let here = loc.target();
+            let live: Vec<(String, crate::workspace::Workspace)> = self.list().into_iter().filter(|i| Location::of_target(&i.target).target() == here).filter_map(|i| i.workspace.filter(|w| w.made.is_some()).map(|w| (i.id, w))).collect();
+            if let Some(shared) = spec.cwd.as_deref().and_then(|cwd| crate::workspace::sharing(cwd, &live)) {
+                spec.workspace = Some(shared);
+            } else if spec.workspace.is_none() && spec.resume.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
+                spec.workspace = Some(crate::workspace::by_default(crate::harness::lineage::workspaces_on(hub, target).await));
+            }
+        }
         // A machine whose kiln is to be upgraded takes no new agent (`crate::skew`).
         if let Location::Machine(m) = &loc
             && let Some(why) = hub.skew_holds(m)
@@ -4454,7 +4469,7 @@ impl Registry {
                     // A workspace of its own first: a volume over its folder, mounted, its folder in it.
                     let id = ids.get(i).cloned().unwrap_or_else(crate::util::new_id);
                     crate::workspace::prepare(&mut spec, &id).await.map_err(|e| e.context("its workspace"))?;
-                    let made = spec.workspace.as_ref().and_then(|w| w.made.clone());
+                    let made = crate::workspace::made_alone(&spec);
                     let s = match self.local.open(Some(id), spec) {
                         Ok(s) => s,
                         Err(e) => {
