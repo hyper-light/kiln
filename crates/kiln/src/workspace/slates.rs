@@ -608,13 +608,13 @@ pub(super) async fn pause_for_move(pause: Duration) {
     crate::rt::sleep(pause).await;
 }
 
-/// Whether workspace `m`'s own volume is mounted where it says: its folder holds a mount (Unix: no other workspace
-/// mounts at a workspace's folder); on Windows its drive letter holds a Slates drive that its volume reports
-/// ([`holds_own_drive`]), since a letter is any workspace's to take.
+/// Whether workspace `m`'s own volume is mounted where it says: the kernel's mount table holds a mount at its folder
+/// ([`mounted_now`]; Unix: no other workspace mounts at a workspace's folder); on Windows its drive letter holds a
+/// Slates drive that its volume reports ([`holds_own_drive`]), since a letter is any workspace's to take.
 async fn mounted_as_made(m: &Made) -> anyhow::Result<bool> {
     let point = PathBuf::from(&m.mount);
     if !cfg!(windows) {
-        return Ok(is_mount(&point));
+        return Ok(mounted_now(&point).await);
     }
     let volume = volume_id(&m.volume)?;
     let own = call("status", move |i| i.status(volume)).await?.mounts;
@@ -704,6 +704,42 @@ async fn let_go(path: String) -> anyhow::Result<slates_api::LetGo> {
     }
 }
 
+/// Whether workspace mount `dir` is still there as its removal asks: the kernel's mount table's word, read without
+/// touching the mount (`super::place::listed`), never a stat of a hard NFS mount, which waits on its server for as long
+/// as that can't answer and reads any refusal as no mount; on Windows, the drive's file system. A table that can't be
+/// read counts it mounted, so its removal asks to take it down rather than leave it unasked.
+async fn mounted_now(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let point = dir.to_path_buf();
+        match crate::rt::blocking(move || super::place::listed(&point)).await.and_then(|listed| listed) {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::info!(mount = %dir.display(), error = %format!("{e:#}"), "the mount table couldn't be read: a workspace's mount is taken as there");
+                true
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        is_mount(dir)
+    }
+}
+
+/// Lets go of workspace `m`'s mount at `dir`, which something still held past `patience` (`refused`: the last refusal),
+/// then says what came of it: let go, or still mounted, with what holds it, looked up only then, so a slow look never
+/// stands between the let-go and the agent's end.
+async fn let_go_of(m: &Made, dir: &Path, refused: &str, patience: Duration) {
+    let how = let_go(m.mount.clone()).await;
+    if !mounted_now(dir).await {
+        tracing::info!(mount = %m.mount, %refused, ?patience, let_go = ?how.ok(), "an ended agent's workspace was still in use past its agent's end: let go");
+        return;
+    }
+    let holders = holders(&m.mount).await;
+    let error = how.err().map(|e| format!("{e:#}")).unwrap_or_default();
+    tracing::warn!(mount = %m.mount, %refused, %holders, ?patience, %error, "an ended agent's workspace stays mounted: what holds it holds it past its agent's end");
+}
+
 /// What came of taking a workspace's mount down ([`unmount_patiently`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Unmounted {
@@ -718,10 +754,12 @@ enum Unmounted {
 /// way out, the kernel's last reference to a file it had open) goes in about the time its agent's own end took, which is
 /// what its caller gives as `patience`; a refusal then isn't the agent's leftovers. The last refusal, where it's still
 /// held after that.
-async fn unmount_patiently<A, F>(mut ask: A, held: impl Fn() -> bool, patience: Duration) -> Unmounted
+async fn unmount_patiently<A, F, H, G>(mut ask: A, mut held: H, patience: Duration) -> Unmounted
 where
     A: FnMut() -> F,
     F: std::future::Future<Output = anyhow::Result<()>>,
+    H: FnMut() -> G,
+    G: std::future::Future<Output = bool>,
 {
     let began = Instant::now();
     let mut pause: Option<Duration> = None;
@@ -731,7 +769,7 @@ where
             Ok(()) => return Unmounted::Gone,
             Err(e) => format!("{e:#}"),
         };
-        if !held() {
+        if !held().await {
             return Unmounted::Gone;
         }
         let took = asked.elapsed();
@@ -782,14 +820,14 @@ async fn holders(_mount: &str) -> String {
 /// that has ended.
 pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
     let dir = PathBuf::from(&m.mount);
-    if !m.mount.is_empty() && mounted_as_made(m).await? {
-        let held = || is_mount(&dir);
-        if let Unmounted::StillHeld(refused) = unmount_patiently(|| unmount(m), held, patience).await {
-            let holders = holders(&m.mount).await;
-            match let_go(m.mount.clone()).await {
-                Ok(how) => tracing::info!(mount = %m.mount, %refused, %holders, ?patience, let_go = ?how, "an ended agent's workspace was still in use past its agent's end: let go"),
-                Err(e) => tracing::warn!(mount = %m.mount, %refused, %holders, ?patience, error = %format!("{e:#}"), "an ended agent's workspace stays mounted: what holds it holds it past its agent's end"),
+    if !m.mount.is_empty() {
+        if mounted_as_made(m).await? {
+            match unmount_patiently(|| unmount(m), || mounted_now(&dir), patience).await {
+                Unmounted::Gone => tracing::info!(mount = %m.mount, "an ended agent's workspace is unmounted"),
+                Unmounted::StillHeld(refused) => let_go_of(m, &dir, &refused, patience).await,
             }
+        } else {
+            tracing::info!(mount = %m.mount, "an ended agent's workspace had nothing of its own mounted at its point");
         }
     }
     let volume = volume_id(&m.volume)?;
@@ -1245,16 +1283,16 @@ mod tests {
                 let n = asks.fetch_add(1, Ordering::Relaxed);
                 async move { if n < free_at { anyhow::bail!("Resource busy") } else { Ok(()) } }
             };
-            let gone = unmount_patiently(|| busy_until(2), || true, Duration::from_secs(60)).await;
+            let gone = unmount_patiently(|| busy_until(2), || async { true }, Duration::from_secs(60)).await;
             anyhow::ensure!(gone == Unmounted::Gone && asks.load(Ordering::Relaxed) == 3, "taken down at its third ask: {gone:?} after {asks:?}");
             asks.store(0, Ordering::Relaxed);
-            let once = unmount_patiently(|| busy_until(u32::MAX), || true, Duration::ZERO).await;
+            let once = unmount_patiently(|| busy_until(u32::MAX), || async { true }, Duration::ZERO).await;
             anyhow::ensure!(once == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) == 1, "no patience: asked once: {once:?} after {asks:?}");
             asks.store(0, Ordering::Relaxed);
-            let went = unmount_patiently(|| busy_until(u32::MAX), || false, Duration::from_secs(60)).await;
+            let went = unmount_patiently(|| busy_until(u32::MAX), || async { false }, Duration::from_secs(60)).await;
             anyhow::ensure!(went == Unmounted::Gone && asks.load(Ordering::Relaxed) == 1, "no longer mounted: gone, asked no more: {went:?} after {asks:?}");
             asks.store(0, Ordering::Relaxed);
-            let held = unmount_patiently(|| busy_until(u32::MAX), || true, Duration::from_millis(50)).await;
+            let held = unmount_patiently(|| busy_until(u32::MAX), || async { true }, Duration::from_millis(50)).await;
             anyhow::ensure!(held == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) > 1, "asked again, then held: {held:?} after {asks:?}");
             Ok(())
         })

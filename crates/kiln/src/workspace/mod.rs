@@ -177,6 +177,51 @@ fn beneath(path: &str, mount: &str) -> String {
     mount_prefix(path, mount).and_then(|n| path.get(n..)).unwrap_or_default().trim_start_matches(['/', '\\']).trim_end_matches(['/', '\\']).to_owned()
 }
 
+/// The variables of an agent's environment naming its harness's own homes, where kiln reads what the harness keeps for
+/// a session (its transcript, its memories: `harness::homes`) after any volume has gone: never moved onto a mount, even
+/// where a person's home lies in the folder a volume is laid over (`XDG_*` stay too).
+const HOMES: &[&str] = &["HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME"];
+
+/// The separator of a list of paths in one variable (`PATH`, `PYTHONPATH`) on this system, as `std::env::split_paths`
+/// reads them: `;` on Windows, `:` elsewhere.
+const PATH_LIST: char = if cfg!(windows) { ';' } else { ':' };
+
+/// `env` with every path in it that lies in folder `over` named at the same place under `top`, where a workspace's
+/// volume shows `over`: a variable's whole value, or each path of a list of them ([`PATH_LIST`]); the rest as it was,
+/// byte for byte. An agent started in a person's shell is handed the shell's environment, which names the person's
+/// folder (`OLDPWD`, an activated virtual environment's `VIRTUAL_ENV` and its `PATH` entry, a `CARGO_TARGET_DIR`);
+/// moved onto the mount, a command that trusts its environment works in the volume, never past it (I11; `PWD` is the
+/// folder the harness starts in, `harness::kinds`). A path spelled through a link is judged by its real path, as git
+/// names `over`. The harness's own homes stay ([`HOMES`], `XDG_*`), and so does a path on the mount already.
+pub fn rehomed(env: &[(String, String)], over: &str, top: &str) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(key, value)| {
+            let home = HOMES.contains(&key.as_str()) || key.starts_with("XDG_");
+            (key.clone(), if home { value.clone() } else { value.split(PATH_LIST).map(|path| rehomed_path(path, over, top).unwrap_or_else(|| path.to_owned())).collect::<Vec<_>>().join(&PATH_LIST.to_string()) })
+        })
+        .collect()
+}
+
+/// `path` at its place under `top` where it lies in `over`, by its spelling or by its real path (`place::real`: through
+/// its nearest folder there is, where it isn't made yet); None for anything else (a relative path or no path at all, one
+/// outside `over`, one under `top` already).
+fn rehomed_path(path: &str, over: &str, top: &str) -> Option<String> {
+    if !Path::new(path).is_absolute() || within(path, top) {
+        return None;
+    }
+    let place = if within(path, over) {
+        beneath(path, over)
+    } else {
+        let real = place::real(Path::new(path)).to_string_lossy().into_owned();
+        if !within(&real, over) || within(&real, top) {
+            return None;
+        }
+        beneath(&real, over)
+    };
+    let top = Path::new(top);
+    Some(if place.is_empty() { top.to_string_lossy().into_owned() } else { top.join(place).to_string_lossy().into_owned() })
+}
+
 /// Makes the workspace `spec` asks for (on the machine its agent `id` works on), before its
 /// harness starts: a volume laid over its folder's repository, mounted, and the agent's folder in
 /// it; for an isolated session, the volume with no mount, which Slates serves its microVM itself
@@ -185,7 +230,13 @@ fn beneath(path: &str, mount: &str) -> String {
 pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyhow::Result<()> {
     let Some(w) = spec.workspace.clone().filter(|w| w.kind == "volume") else { return Ok(()) };
     if let Some(m) = &w.made {
-        return slates::mounted(m).await;
+        slates::mounted(m).await?;
+        // Its environment on that mount too, as its folder is (one started in a person's shell inside another agent's
+        // volume, or one started again): nothing of it left naming the folder the volume is laid over.
+        if let Some(over) = w.over.as_deref().filter(|_| !m.mount.is_empty()) {
+            spec.env = rehomed(&spec.env, over, &place::top(&m.mount).to_string_lossy());
+        }
+        return Ok(());
     }
     let cwd = PathBuf::from(crate::harness::session::resolve_cwd(spec.cwd.as_deref()));
     anyhow::ensure!(cwd.is_dir(), "{} isn't a folder on this machine", cwd.display());
@@ -208,6 +259,9 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     }
     if !made.mount.is_empty() {
         let top = place::top(&made.mount);
+        // Its environment moved onto the mount with its folder (an agent started in a person's shell is handed the
+        // shell's, which names the person's folder: I11).
+        spec.env = rehomed(&spec.env, &over.to_string_lossy(), &top.to_string_lossy());
         let here = if sub.is_empty() { top } else { top.join(&sub) };
         spec.cwd = Some(here.to_string_lossy().into_owned());
     }
@@ -576,6 +630,51 @@ mod tests {
 
     fn volume_at(volume: &str, mount: &str, over: &str) -> Workspace {
         Workspace { kind: "volume".into(), over: Some(over.into()), made: Some(made(volume, mount)), ..Workspace::default() }
+    }
+
+    /// I11 (kiln goal 01a1ec34599974448aed2672bafaf9a2, docs/agentic.md W2): an agent started in a person's shell works
+    /// on its volume with no second path: every path of the shell's environment in the folder its volume is laid over,
+    /// whole or in a list, spelled through a link or not, is moved to its place on the mount; its harness's homes, paths
+    /// elsewhere, a path on the mount already, a look-alike folder and what isn't a path stay byte for byte.
+    #[test]
+    #[cfg(unix)]
+    fn i11_a_shells_environment_is_moved_onto_its_agents_mount() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let over = std::fs::canonicalize(dir.path())?.join("project");
+        std::fs::create_dir_all(over.join(".venv").join("bin"))?;
+        std::fs::create_dir_all(over.join("src"))?;
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&over, &linked)?;
+        let (o, l, top) = (over.to_string_lossy().into_owned(), linked.to_string_lossy().into_owned(), "/state/workspaces/kiln-a");
+        let shells: Vec<(String, String)> = [
+            ("PWD", format!("{o}/src")),
+            ("OLDPWD", "/Users/person".to_owned()),
+            ("VIRTUAL_ENV", format!("{o}/.venv")),
+            ("PATH", format!("{o}/.venv/bin:/usr/bin:{l}/src")),
+            ("CARGO_TARGET_DIR", format!("{l}/target")),
+            ("HOME", o.clone()),
+            ("XDG_CONFIG_HOME", format!("{o}/.config")),
+            ("DISPLAY", ":0".to_owned()),
+            ("ON_IT", format!("{top}/src")),
+            ("LOOKALIKE", format!("{o}-other/x")),
+            ("WORDS", "src".to_owned()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        let moved: std::collections::HashMap<String, String> = rehomed(&shells, &o, top).into_iter().collect();
+        let at = |key: &str| moved.get(key).map(String::as_str);
+        assert_eq!(at("PWD"), Some("/state/workspaces/kiln-a/src"));
+        assert_eq!(at("VIRTUAL_ENV"), Some("/state/workspaces/kiln-a/.venv"));
+        assert_eq!(at("PATH"), Some("/state/workspaces/kiln-a/.venv/bin:/usr/bin:/state/workspaces/kiln-a/src"), "each path of a list, one spelled through a link");
+        assert_eq!(at("CARGO_TARGET_DIR"), Some("/state/workspaces/kiln-a/target"), "through a link, though it isn't made yet");
+        for (key, value) in &shells {
+            if ["OLDPWD", "HOME", "XDG_CONFIG_HOME", "DISPLAY", "ON_IT", "LOOKALIKE", "WORDS"].contains(&key.as_str()) {
+                assert_eq!(at(key), Some(value.as_str()), "{key} stays");
+            }
+        }
+        assert_eq!(moved.len(), shells.len());
+        Ok(())
     }
 
     /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2; Windows): an agent's folder keeps its place in its repository on its

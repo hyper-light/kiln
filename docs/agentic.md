@@ -281,9 +281,15 @@ choice made) and `agents.start`. Several agents on one folder each get their own
 agent's folder on that agent's machine (a child placed in its parent's folder, above all) works in that agent's
 volume, as two agents in one folder did (`workspace.owner` names whose it is): a volume is never laid over a volume,
 which Slates refuses (its A-227). An isolated agent's workspace is its microVM's boundary's to share (W8), and a
-conversation taken up (`resume`) stays in the folder its harness keeps it by, and an agent started in a person's shell
-(`shell`) works beside them in the shell's folder, as the composer shows it (it takes the shell's environment, whose
-`PWD` names that folder). A server sets the default with
+conversation taken up (`resume`) stays in the folder its harness keeps it by. An agent started in a person's shell
+(`shell`) works on a volume like any other, laid over the shell's folder as its machine reads it at the start, and it
+is handed the shell's environment moved onto the mount with it: every path in it that lies in that folder, a whole
+value or each path of a list (`OLDPWD`, an activated virtual environment's `VIRTUAL_ENV` and `PATH` entry, a
+`CARGO_TARGET_DIR`), names its place on the mount instead (spelled through a link or not), and its harness's `PWD` is
+the folder it starts in; the harness's own homes (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`,
+`XDG_*`) stay where kiln reads its records, and nothing of its environment names the person's folder, so a command
+that trusts it works in the volume, never past it (no second path; the composer offers Own volume for a shell's agent
+as for any). A server sets the default with
 `[agents] workspace`: `volume` (kiln's own) or `folder`, the folder itself as before; kiln's test servers and
 scratch hubs say `folder`, so no test leaves a volume or a mount behind on the machine that runs it, and a test of
 workspaces asks for its volumes.
@@ -299,11 +305,14 @@ agents never see it. Ended for good, the agent's volume goes with it, once no ot
 of the agents working in one ends it (on its machine's runner process), and an agent that couldn't start after all
 takes only a volume made for it alone with it. Its mount goes first, asked again while what the agent left behind
 still holds it for as long as the agent's own end took, then let go: detached on Linux, forced off on macOS (Slates'
-`mount::unmount_busy`, contract 36), kiln saying what held it. A mount is its own attachment in Slates (its file-system
-bridge's), lasting until it's unmounted, as a microVM's stream lasts until it closes (W8). On Windows a drive letter is
-any workspace's to take, so a workspace's drive is its own only while its volume reports a mount there: a Slates drive
-at its letter that it doesn't report is neither used as its mount at a restart nor taken down at its end, which detaches
-its volume's own attachment at the letter. None of kiln's attachments
+`mount::unmount_busy`, contract 36), kiln saying what held it where it stays. kiln names a mount by its real path, as
+the kernel's mount table names it (macOS reaches `/var`, where temporary folders lie, through a link to
+`/private/var`), and judges whether it's still there by that table, never by looking into the mount, which on a hard
+NFS mount waits on its server and takes any refusal for no mount. A mount is its own attachment in Slates (its
+file-system bridge's), lasting until it's unmounted, as a microVM's stream lasts until it closes (W8). On Windows a
+drive letter is any workspace's to take, so a workspace's drive is its own only while its volume reports a mount
+there: a Slates drive at its letter that it doesn't report is neither used as its mount at a restart nor taken down at
+its end, which detaches its volume's own attachment at the letter. None of kiln's attachments
 has the term Slates gives its command line's, which lapses once nothing renews it (Slates' A-384), so nothing kiln
 keeps between an agent's turns needs renewing.
 
