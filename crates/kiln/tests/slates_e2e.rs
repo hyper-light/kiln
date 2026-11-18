@@ -5,10 +5,11 @@
 //!
 //! Each drive starts two agents through kiln's REST API, the stand-in harness behind each (`tests/fixtures/vm-stub/
 //! harness/stub`: no model), each in a workspace of its own (`"workspace": {"kind": "volume"}`) over a git project of its
-//! own with a bare remote: one in Claude Code's mode that asks nothing (`bypassPermissions`), one in its mode that asks
-//! (`default`) ([`Mode`]). Each one's first turn writes a new file, appends a line to a tracked one and removes another,
-//! then asks kiln itself, as the agent, to write its work to disk (the stand-in's `LAND`). What each drive reads, all of
-//! it what a person or an agent could observe:
+//! own with a bare remote: one in Claude Code's mode that asks (`default`), then one in its mode that asks nothing
+//! (`bypassPermissions`) ([`Mode`]). Each one's first turn writes a new file, appends a line to a tracked one and removes
+//! another, then asks kiln itself, as the agent, to write its work to disk (the stand-in's `LAND`). What each drive
+//! reads, all of it what a person or an agent could observe, each step said (`PROVEN: ...`) as it holds, so a drive that
+//! fails shows how far the rest went:
 //!
 //! 1. **Slates through its library alone, at kiln's pin.** The runner finds no `slates` executable (its PATH holds none
 //!    and `KILN_SLATES` is empty), so a workspace made at all was made without Slates' command line; no `slates` process
@@ -438,8 +439,9 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Both, in the order a drive starts them.
-    pub const ALL: [Mode; 2] = [Mode::Bypass, Mode::Ask];
+    /// Both, in the order a drive starts them: the agent that asks first, since its review needs no landing, so a drive
+    /// on a kiln whose landing falls short still shows how far the rest goes.
+    pub const ALL: [Mode; 2] = [Mode::Ask, Mode::Bypass];
 
     /// The mode as Claude Code names it (`--permission-mode`), as a session's spec gives it to kiln.
     pub fn claude(self) -> &'static str {
@@ -478,17 +480,23 @@ pub fn approval_said(lines: &[String]) -> Option<String> {
     lines.iter().find_map(|l| l.strip_prefix("LAND_APPROVAL ")).map(str::trim).filter(|m| is_manifest(m)).map(str::to_owned)
 }
 
-/// What the stand-in's turn said it did, as [`prompt`] asked: its three changes made, then its own landing, as kiln
-/// answered it by its `mode` (docs/agentic.md W6): written at once where it asks nothing; where it asks, its ask to
-/// raise its own mode answered by kiln (refused, or taken without effect on its landing), then its landing held as an
-/// approval request naming its manifest, and its own approval of that refused. Never failed for want of a kiln to
-/// ask, never refused outright (neither mode forbids writing).
-pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), String> {
+/// The stand-in's turn made the three changes [`prompt`] asked for, as it said: `probe` written, [`APPENDED`] appended
+/// to, [`REMOVED`] removed.
+pub fn check_edits(lines: &[String], probe: &str) -> Result<(), String> {
     for want in [format!("WROTE {probe}"), format!("APPENDED {}", APPENDED.0), format!("REMOVED {}", REMOVED.0)] {
         if !lines.contains(&want) {
             return Err(format!("the harness never said {want:?}: {lines:?}"));
         }
     }
+    Ok(())
+}
+
+/// What the stand-in's turn said of its own landing, as kiln answered it by its `mode` (docs/agentic.md W6): written
+/// at once where it asks nothing; where it asks, its ask to raise its own mode answered by kiln (refused, or taken
+/// without effect on its landing), then its landing held as an approval request naming its manifest, and its own
+/// approval of that refused. Never failed for want of a kiln to ask, never refused outright (neither mode forbids
+/// writing).
+pub fn check_landing(lines: &[String], mode: Mode) -> Result<(), String> {
     let said = |tag: &str| lines.iter().find(|l| l.starts_with(tag));
     for (tag, what) in [("LAND_FAIL ", "its own landing reached no answer"), ("LAND_REFUSED ", "its own landing was refused"), ("LAND_CONFLICTED ", "its own landing met conflicts")] {
         if let Some(l) = said(tag) {
@@ -518,6 +526,12 @@ pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), Strin
             said("LAND_SELF_REFUSED ").map(|_| ()).ok_or_else(|| format!("its own approval of its landing wasn't refused: {lines:?}"))
         }
     }
+}
+
+/// The whole turn: its changes ([`check_edits`]), then its own landing ([`check_landing`]).
+pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), String> {
+    check_edits(lines, probe)?;
+    check_landing(lines, mode)
 }
 
 // =================================================================================================
@@ -774,7 +788,7 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     let lines = vm_e2e::said(&events);
     let what = format!("{engine:?} session {id} ({mode:?})");
     let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}", f.runner_log());
-    check_turn(&lines, &probe, mode).map_err(fail)?;
+    check_edits(&lines, &probe).map_err(fail)?;
     let made = workspace_of(&info).map_err(fail)?;
     anyhow::ensure!(canonical(Path::new(&made.over)) == project.path(), "{what}: its volume lies over {}, not its project {}", made.over, project.dir);
     let said_cwd = vm_e2e::cwd_said(&lines).ok_or_else(|| fail(format!("its harness never said its folder: {lines:?}")))?;
@@ -798,26 +812,36 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
         }
     };
     looks.look(instance, mounts_of)?;
+    looks.check().map_err(fail)?;
+    eprintln!("PROVEN: {what}: its three edits made in volume {} over {} ({}), its harness at {said_cwd}", made.volume, made.over, made.mount.as_deref().map_or_else(|| "no host mount".to_owned(), |m| format!("mounted at {m}")));
     if mode == Mode::Ask {
         // Its work, and its own landing held for a person's approval, left the project's folder as it was.
         anyhow::ensure!(tree(&project.path())? == before, "{what}: the project's folder changed before any approval: {:?}", changes(&before, &tree(&project.path())?));
-        // Review: its change request holds exactly its changes.
+        // Review, which needs no landing: its change request holds exactly its changes.
         let changed = op(f, "agents.change", &json!({"agent": id, "title": "g266 end to end"}))?;
         let branch = changed.pointer("/change_request/branch").and_then(Value::as_str).ok_or_else(|| fail(format!("its change request names no branch: {changed}")))?.to_owned();
         let proposed = changes(&project.tree_at("main")?, &project.tree_at(&branch)?);
         anyhow::ensure!(proposed == expected(&probe), "{what}: its change request {branch} holds {proposed:?}, not its harness's changes {:?}", expected(&probe));
         looks.look(instance, mounts_of)?;
+        looks.check().map_err(fail)?;
+        eprintln!("PROVEN: {what}: its folder untouched; its change request {branch} holds exactly its changes");
+    }
+    check_landing(&lines, mode).map_err(fail)?;
+    eprintln!("PROVEN: {what}: its own landing answered as its mode says: {:?}", lines.iter().filter(|l| l.starts_with("LAND") || l.starts_with("RAISE")).collect::<Vec<_>>());
+    if mode == Mode::Ask {
         // The person is shown the request its agent was answered, which writes nothing, and approves it.
         let asked = approval_said(&lines).ok_or_else(|| fail(format!("its harness never said the manifest it was held for: {lines:?}")))?;
         let shown = approval_manifest(&op(f, "agents.land", &json!({"agent": id}))?).map_err(fail)?;
         anyhow::ensure!(shown == asked, "{what}: the person was shown request {shown}, not the one its agent was answered, {asked}");
         anyhow::ensure!(tree(&project.path())? == before, "{what}: showing a person the approval request wrote to the project's folder");
+        eprintln!("PROVEN: {what}: the person was shown request {shown}, the one its agent was answered");
         written(&op(f, "agents.land", &json!({"agent": id, "manifest": shown}))?).map_err(fail)?;
     }
     // Its landing written: at once where its mode asks nothing, as its turn said; on the person's approval where it asks.
     let after = tree(&project.path())?;
     anyhow::ensure!(changes(&before, &after) == expected(&probe), "{what}: its landing changed {:?}, not its harness's changes {:?}", changes(&before, &after), expected(&probe));
     anyhow::ensure!(project.git_state()? == git_before, "{what}: its landing changed the project's git HEAD or index");
+    eprintln!("PROVEN: {what}: its folder holds exactly its changes, git's HEAD and index as they were");
     looks.look(instance, mounts_of)?;
     pace.stop(f, &id)?;
     if engine == Engine::BareMetal
@@ -1039,8 +1063,8 @@ mod checks {
 
     #[test]
     fn g266_claudes_modes_name_the_drives_two_agents() {
-        assert_eq!(Mode::ALL.map(Mode::claude), ["bypassPermissions", "default"]);
-        assert_eq!(Mode::ALL.map(Mode::word), ["bypass", "ask"]);
+        assert_eq!(Mode::ALL.map(Mode::claude), ["default", "bypassPermissions"]);
+        assert_eq!(Mode::ALL.map(Mode::word), ["ask", "bypass"]);
         assert!(is_manifest(MANIFEST) && is_manifest(&"AB".repeat(32)));
         assert!(!is_manifest(&"ab".repeat(31)) && !is_manifest(&"ab".repeat(33)) && !is_manifest(&MANIFEST.replace('a', "g")) && !is_manifest(""));
     }
