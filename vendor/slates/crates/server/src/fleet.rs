@@ -1006,20 +1006,25 @@ const ROUND_ANCHORS: RoundAnchors = RoundAnchors {
 ///   gathers no new reply for as long as a peer may go unheard before it is suspected — or for one round-trip
 ///   tail, whichever is longer — is judged stalled, not merely slow, and is left to time out at its current
 ///   deadline.
-fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
+pub(crate) fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
-/// The budget a live-shipped entry's exchange runs under (A-200): a hard deadline of the daemon's liveness budget, past
-/// which a holder that has not answered is not a live one to wait for (its link is dropped and dialed afresh,
-/// `live_ship::lose_links`), with the record plane's poll between wake-ups (a reply wakes the collector at once).
-/// Derived: `LIVENESS_BUDGET_NS`, `HEARTBEAT_NS / POLL_PER_PERIOD`. Not the consensus round's budget: that is derived
-/// from the slowest path's tail, which a paused holder inflates, so one exchange to it held the holder's only session
-/// past a 40 s wait and the resumed holder never caught up (2026-11-05, `live_fleet`, 1 of 2 runs). A holder is not a
-/// voter; each answers on its own.
+/// The budget a live-shipped exchange runs under where no holder's session is at hand (A-200, A-444): a hard deadline of
+/// the floor of the session plane's own judgment of a gone path, the persistent-congestion duration (RFC 9002 §7.6.1:
+/// three probe timeouts, each `smoothed_rtt + max(4·rttvar, kGranularity) + max_ack_delay`, §6.2.1) of a path with
+/// nothing measured, where each probe timeout is the initial one (§6.2.2): no holder's session is taken for gone sooner,
+/// so no live exchange gives a holder up sooner. Past it a holder that has not answered is not a live one to wait for (its
+/// link is dropped and dialed afresh, `live_ship::lose_links`), with the record plane's poll between wake-ups (a reply
+/// wakes the collector at once). An exchange that holds its holder's session takes that session's own duration
+/// (`live_ship`'s `exchange_budget`). Until A-444 the deadline was one liveness window, under that floor, so the live lane
+/// dropped links its sessions still counted live. Not the consensus round's budget: that is derived from the slowest
+/// path's tail, which a paused holder inflates, so one exchange to it held the holder's only session past a 40 s wait and
+/// the resumed holder never caught up (2026-11-05, `live_fleet`, 1 of 2 runs). A holder is not a voter; each answers on
+/// its own.
 pub(crate) fn live_budget() -> CommitBudget {
   CommitBudget::hard(
-    crate::daemon::LIVENESS_BUDGET_NS,
+    slates_transport::rtt::RttEstimator::new().persistent_congestion_duration_floored(0),
     (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
   )
 }
@@ -1516,6 +1521,46 @@ impl Drop for DialedIn {
   }
 }
 
+/// The stable anchor of the peer that presented `certificate`: the roster's for that certificate, or the one the
+/// certificate itself derives when the roster names it not (task #22's two-id model).
+fn rostered_anchor(roster: &[Rostered], certificate: &CertificateDer<'static>) -> HostId {
+  roster
+    .iter()
+    .find(|peer| peer.certificate == *certificate)
+    .map_or_else(
+      || crate::deploy::host_id_of_certificate(certificate),
+      |peer| peer.anchor,
+    )
+}
+
+/// Whether this node's discovery recognizes the peer that presented `certificate` (its enrollment).
+fn discovery_recognizes(certificate: &CertificateDer<'static>) -> bool {
+  state::with_state(|state| {
+    state
+      .discovery
+      .as_ref()
+      .and_then(|discovery| discovery.recognizes(certificate))
+  })
+  .flatten()
+  .is_some()
+}
+
+/// The peer's next request, or a forward this node finished for it; none once the session ends (a peer's reset
+/// counted).
+async fn next_or_end(
+  endpoint: &mut Endpoint,
+  forwards: &mut crate::forward_lane::ServedForwards,
+) -> Option<crate::forward_lane::Next> {
+  match crate::forward_lane::next_request_or_forwarded(endpoint, forwards).await {
+    Ok(next) => Some(next),
+    Err(EndpointError::PeerReset) => {
+      count_refusal(SERVE_PEER_RESET);
+      None
+    }
+    Err(_) => None,
+  }
+}
+
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
 /// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
 /// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
@@ -1549,13 +1594,7 @@ async fn serve_peer_records(
     count_refusal(ACCEPT_REFUSED);
     return;
   };
-  let peer_anchor = roster
-    .iter()
-    .find(|peer| peer.certificate == certificate)
-    .map_or_else(
-      || crate::deploy::host_id_of_certificate(&certificate),
-      |peer| peer.anchor,
-    );
+  let peer_anchor = rostered_anchor(&roster, &certificate);
   let seed = crate::deploy::member_id(peer_anchor, 0);
   // The peer dialed this session and keeps it only while it keeps direct contact with this node (A-337).
   let _dialed_in = DialedIn::counted(peer_anchor);
@@ -1575,26 +1614,12 @@ async fn serve_peer_records(
   let mut forwards = crate::forward_lane::ServedForwards::new();
   loop {
     // Enrolled once the discovery recognizes the peer's certificate, and asked again only until then.
-    enrolled = enrolled
-      || state::with_state(|state| {
-        state
-          .discovery
-          .as_ref()
-          .and_then(|discovery| discovery.recognizes(&certificate))
-      })
-      .flatten()
-      .is_some();
+    enrolled = enrolled || discovery_recognizes(&certificate);
     // A forwarded verb runs on its own task (`crate::forward_lane::ServedForwards`), so one waiting on its owner shard
     // holds no other request of this peer; every other request is served here, one at a time, as before.
-    let next =
-      match crate::forward_lane::next_request_or_forwarded(&mut endpoint, &mut forwards).await {
-        Ok(next) => next,
-        Err(EndpointError::PeerReset) => {
-          count_refusal(SERVE_PEER_RESET);
-          return;
-        }
-        Err(_) => return,
-      };
+    let Some(next) = next_or_end(&mut endpoint, &mut forwards).await else {
+      return;
+    };
     let (stream_id, stream, request) = match next {
       crate::forward_lane::Next::Forwarded { stream_id, reply } => {
         if endpoint.reply(stream_id, reply).is_err() {
@@ -1759,6 +1784,10 @@ async fn serve_peer_records(
                 .map_or(seed, |learned| learned.host)
             })
             .unwrap_or(seed);
+            // An owner's ask that this candidate make a volume's admission before it turns live shipping on (§4.2, A-401).
+            if slates_db::live::is_admit(&request) {
+              return crate::live_ship::serve_admit(control, local, peer_host, &request).await;
+            }
             // An install puts a whole state in a copy; a report or a fetch takes nothing in.
             let installs =
               !slates_db::live::is_report(&request) && !slates_db::live::is_fetch(&request);
@@ -5326,6 +5355,54 @@ async fn fetch_green_inputs(
   }
 }
 
+/// Counter (A-412): fetches a holder began of the inputs of versions its own ledger holds without them, its replica behind
+/// that ledger ([`fetch_ledger_inputs`]). Format: a refusal name in the daemon's status report.
+const CATCH_UP_BEGUN: &str = "merge.catch_up.begun";
+/// Counter (A-412): inputs such a fetch brought in whole, one a version. Format: a refusal name in the daemon's status
+/// report.
+const CATCH_UP_FETCHED: &str = "merge.catch_up.fetched";
+/// Counter (A-412): such a fetch whose task the shard's arena refused; the record's next shipment begins it again. Format:
+/// a refusal name in the daemon's status report.
+const CATCH_UP_UNSPAWNED: &str = "merge.catch_up.unspawned";
+
+/// Fetches by identity from `sender`, a merge record's owner, the inputs of the versions of the green `object` this holder's
+/// ledger holds without them (`unheld`, each version and manifest, lowest first), its replica behind that ledger (A-412,
+/// `merge_service::catch_up`): a takeover committed those versions again here through the register path, which carries no
+/// inputs. Each is staged as placed for its version, so the retention rule keeps it by that version's ledger position
+/// ([`fetch_manifest_into_hold`]); the record's next shipment finds them held and advances the replica. One fetch a green
+/// at a time (`MergeShardState::catching_up`), in a detached task of this shard, each manifest within one live exchange's
+/// budget; it ends at the first manifest not fetched, and the next shipment begins another.
+pub(crate) fn fetch_ledger_inputs(
+  state: &mut ShardState,
+  object: ObjectId,
+  sender: HostId,
+  unheld: Vec<(u64, [u8; 32])>,
+) {
+  if !state.merge.catching_up.insert(object) {
+    return;
+  }
+  state.count(CATCH_UP_BEGUN, 1);
+  let fetching = async move {
+    let budget = live_budget();
+    for (version, manifest) in unheld {
+      if !fetch_manifest_into_hold(object, &[sender], move |_| version, manifest, budget).await {
+        break;
+      }
+      count_refusal(CATCH_UP_FETCHED);
+    }
+    let _ = state::with_state_counted(|s| s.merge.catching_up.remove(&object));
+  };
+  match futures::spawn(fetching) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => {
+      state.merge.catching_up.remove(&object);
+      state.count(CATCH_UP_UNSPAWNED, 1);
+    }
+  }
+}
+
 /// Which kind of taken-over object a give-up ends ([`give_up_taken_over`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TakenOver {
@@ -5789,7 +5866,7 @@ async fn held_archive_in_turns(object: ObjectId, identity: [u8; 32]) -> Option<A
       let slice_bytes = s.config.copy_slice_bytes();
       let mut copied_bytes = 0u64;
       s.count(MATERIALIZE_ARCHIVE_SLICES, 1);
-      while let Some(chunk) = next.next() {
+      for chunk in next.by_ref() {
         let held = s
           .held_content
           .held_chunk(s.store.content.arena(), object, &identity, &chunk)?;
@@ -5978,6 +6055,8 @@ async fn begin_materializing(
       }
     });
   }
+  // A wall bound, by its reason (A-397, A-440): the period's, since the making runs on as a task of the owner shard and
+  // the next attempt joins it ([`making_of`], in that shard's own time).
   let ended = crate::xshard::task_within(
     origin,
     target,
@@ -6085,6 +6164,45 @@ async fn injected_turn_pause() {
   }
 }
 
+/// A placed seal's archive (none for a contentless volume), the successor's lineage key to adopt and the head's
+/// naming key ([`Source::Archive`]).
+type ArchiveSource = (
+  Option<Archive>,
+  Option<([u8; 16], Vec<u8>)>,
+  Option<crate::head::HeadNaming>,
+);
+
+/// A taken-over volume's placed archive, opened in a turn of its owner shard: a copy this node froze for a move it made
+/// (A-291) let go before the volume's keys are adopted ([`let_frozen_go`]; an envelope's open let it go in its first
+/// turn); the volume's lineage key adopted, so this node seals under the key the dead owner did (A-92 pieces 3b and 4c;
+/// an envelope's was adopted before its open, [`open_in_turns`]; a head that carried no entry for this node, having
+/// acknowledged before its pair arrived, leaves a plain archive's volume to a new key); and the archive itself. A
+/// sealed archive is opened before this task begins, so what arrives here is a plain one, or none for a contentless
+/// volume.
+async fn archive_opened(
+  object: ObjectId,
+  id: DbVolumeId,
+  catalog: &crate::catalog::CatalogValue,
+  (archive, lineage, naming): ArchiveSource,
+) -> Result<Option<Archive>, &'static str> {
+  futures::yield_now().await;
+  making_turn(object, |s| {
+    let_frozen_go(s, id)?;
+    if let Some(lineage) = lineage
+      && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
+    {
+      s.count(LINEAGE_UNADOPTED, 1);
+    }
+    match archive {
+      Some(archive) => opened_archive(archive).map(Some).ok_or_else(|| {
+        s.count(ENVELOPE_UNOPENED, 1);
+        ENVELOPE_UNOPENED
+      }),
+      None => Ok(None),
+    }
+  })?
+}
+
 /// The turns of a taken-over volume's materialization on its owner shard, each a turn of its own:
 /// - from a live log, its payloads opened and applied a slice a turn ([`crate::live_ship::Rebuilding`], counted
 ///   [`LIVE_REBUILD_SLICES`]), then laid out as an archive; from a placed seal, the successor's lineage key adopted and
@@ -6120,33 +6238,10 @@ async fn make_in_turns(making: MakeTaken, source: Source) -> Result<(), &'static
       archive,
       lineage,
       naming,
-    } => {
-      futures::yield_now().await;
-      let opened = making_turn(object, |s| {
-        // A copy this node froze for a move it made (A-291) goes before the volume's keys are adopted
-        // ([`let_frozen_go`]); an envelope's open let it go in its first turn.
-        let_frozen_go(s, id)?;
-        // The volume's lineage key, so this node seals under the same key the dead owner did (A-92 pieces 3b and 4c);
-        // an envelope's was adopted before its open ([`open_in_turns`]). A head that carried no entry for this node
-        // (it acknowledged before its pair arrived) leaves a plain archive's volume to a new key.
-        if let Some(lineage) = lineage
-          && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref())
-            .is_err()
-        {
-          s.count(LINEAGE_UNADOPTED, 1);
-        }
-        // A sealed archive is opened before this task begins ([`open_in_turns`]); what arrives here is a plain one, or
-        // none for a contentless volume.
-        match archive {
-          Some(archive) => opened_archive(archive).map(Some).ok_or_else(|| {
-            s.count(ENVELOPE_UNOPENED, 1);
-            ENVELOPE_UNOPENED
-          }),
-          None => Ok(None),
-        }
-      })??;
-      (opened, None)
-    }
+    } => (
+      archive_opened(object, id, &catalog, (archive, lineage, naming)).await?,
+      None,
+    ),
   };
   let from_live_log = adopted.is_some();
   futures::yield_now().await;
@@ -7151,7 +7246,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     .holds_for(peer, state.fleet.host())
   {
     DirectContact::Holder
-  } else if state.council.known_voter(peer) || state.root.is_voter(peer) {
+  } else if state.council.known_voter(peer) || state.root.known_voter(peer) {
     DirectContact::Voter
   } else if state.council.is_staged(peer) || state.root.is_staged(peer) {
     DirectContact::Staged
@@ -8867,6 +8962,9 @@ fn reconcile_root_membership(s: &mut ShardState) {
   s.root.reconcile_regions(&alive, &s.region_mirrors);
   let representatives = alive_representatives(s);
   s.root.reconcile_voters(&representatives);
+  // Once no change is in flight, the voters in force go into the root configuration, so a root learner learns them by
+  // its version (A-406): a seat change alone moves none.
+  s.root.record_voters();
 }
 
 /// One period as the **root** leader — the cross-region parallel of [`lead_council_period`]: reconcile the
@@ -9116,11 +9214,21 @@ fn alive_regions(state: &ShardState) -> Vec<RegionId> {
 /// sets over [`alive_regions`] and the root configuration's regions; equal in steady state, so a converged
 /// learner fetches nothing. (This rests on the all-to-all mesh, where a node's SWIM sees every region's
 /// hosts; a region-scoped mesh would need a version-carrying signal instead — owed with region-scoped SWIM.)
+/// A root voter it knows that its membership no longer holds alive is the same signal for the voters (A-406): the
+/// group has replaced it or will, and the configuration records who votes once it has, while a region whose
+/// representative died stays in the regions and moves nothing the first comparison sees.
 fn root_diverges(state: &ShardState) -> bool {
   let alive: std::collections::BTreeSet<RegionId> = alive_regions(state).into_iter().collect();
   let known: std::collections::BTreeSet<RegionId> =
     state.root.configuration().regions.iter().copied().collect();
   alive != known
+    || state.root.known_voters().iter().any(|voter| {
+      state
+        .fleet
+        .membership()
+        .state(*voter)
+        .is_none_or(|held| held.liveness != Liveness::Alive)
+    })
 }
 
 /// Drives this node's **root group** one period from the record-plane coordinator (§4.8, D-14 — the root
@@ -9174,9 +9282,9 @@ async fn drive_root_group(
   if !is_voter && !is_leader {
     // A root learner (a region member that is not its region's representative): it does not drive the Raft.
     // It fetches the committed root configuration from a root voter and adopts the newest (§4.8, D-14) —
-    // reactively, only when its own alive view of the regions diverges from the root configuration it holds
-    // ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel of the config
-    // learner's reactive fetch.
+    // reactively, only when its own alive view of the regions, or of the root voters it knows, diverges from the
+    // root configuration it holds ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel
+    // of the config learner's reactive fetch. It asks the voters its configuration records (A-406).
     // As the council learner: an uninitialized root paces its fetches; recovery fetches at once.
     let now = futures::now_ns();
     let wanted = state::with_state(|s| {
@@ -9197,7 +9305,8 @@ async fn drive_root_group(
     .unwrap_or(false);
 
     if wanted {
-      let targets = root_learner_targets(&voters, local);
+      let known = state::with_state(|s| s.root.known_voters()).unwrap_or_else(|| voters.clone());
+      let targets = root_learner_targets(&known, local);
       drive_root_learner_fetch(&targets, budget, in_flight).await;
       let _ = state::with_state_counted(|s| {
         let still = !s.root.initialized();
@@ -11017,7 +11126,8 @@ const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
 ///
 /// A session whose peer is gone without a word is dropped here too, and its entry with it: the transport's one
 /// judgement of a dead session (`Endpoint::peer_silent_past`, fleet-transport.md §5), an ack-eliciting packet
-/// unanswered for a liveness budget or the session's persistent-congestion duration, whichever is longer. It covers a
+/// unanswered for the session's persistent-congestion duration (A-444: its floor is the session's own probe timeout,
+/// where a liveness window stood, which the duration, three initial probe timeouts at least, always passed). It covers a
 /// reset lost and a peer that is silent. Judged at the one place every borrower hands the session back, and every
 /// borrower's hold is bounded by a derived budget, so a silent session is judged within its window plus one hold: with
 /// a deaf session under a 256-client burst the council's replication held it 120 times in 10 s while the forward lane's
@@ -11037,10 +11147,12 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
           let dropped = crate::state::WallAndPeriods::now(s);
           s.dead_session_dropped_at.insert(host, dropped);
         }
+        // Silent past the session's own persistent-congestion duration (RFC 9002 §7.6.1), floored at its own probe
+        // timeout (§6.2.1): the session plane's estimator decides, never a fixed window (A-444).
         Some(link)
           if link.endpoint.is_none()
             && link.borrowed == returned
-            && endpoint.peer_silent_past(crate::daemon::LIVENESS_BUDGET_NS) =>
+            && endpoint.peer_silent_past(endpoint.pto()) =>
         {
           s.record_sessions.remove(&host);
           s.count(LINK_SESSION_JUDGED_DEAD, 1);
@@ -11050,7 +11162,7 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
             endpoint.peer_silence_ns().unwrap_or(0) / NS_PER_MS,
             endpoint
               .persistent_congestion_duration()
-              .max(crate::daemon::LIVENESS_BUDGET_NS)
+              .max(endpoint.pto())
               / NS_PER_MS
           );
           let dropped = crate::state::WallAndPeriods::now(s);

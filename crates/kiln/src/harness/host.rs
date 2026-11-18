@@ -1696,8 +1696,9 @@ impl Host {
         }
         let mut pkg = pkg;
         // A workspace volume that moved here with it (K4): its mount re-placed under this machine's own place for
-        // workspaces and its folder there, mounted as the session starts (`workspace::mounted_for`).
-        let volume_here = crate::workspace::arrived_here(&mut pkg.spec);
+        // workspaces and its folder there, mounted as the session starts (`workspace::mounted_for`); moved, unless an
+        // older runner process of this machine handed it over (K5: no landing of a moved clone before Slates' stage 2).
+        let volume_here = crate::workspace::arrived_here(&mut pkg.spec, !pkg.handover);
         let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
         // Its folder isn't here (it wasn't a repository kiln keeps in step): it works in home. A
         // worktree it brings is made once its repository's files are here.
@@ -4027,7 +4028,7 @@ mod tests {
     fn w3_an_archived_agents_volume_outlives_the_last_live_agent_working_in_it() -> anyhow::Result<()> {
         use crate::workspace::{Workspace, slates::Made};
         let dir = tempfile::tempdir()?;
-        let ws = |volume: &str| Workspace { kind: "volume".into(), over: Some("/src".into()), made: Some(Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: format!("/w/kiln-{volume}") }), ..Workspace::default() };
+        let ws = |volume: &str| Workspace { kind: "volume".into(), over: Some("/src".into()), made: Some(Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: format!("/w/kiln-{volume}"), ..Default::default() }), ..Workspace::default() };
         let record = |w: Option<Workspace>| serde_json::json!({"saved": {"id": "a", "spec": {"kind": "claude", "workspace": w}}, "state": {}, "events": [{"long": "history"}], "phase": "archived"});
         std::fs::write(dir.path().join("a.json"), serde_json::to_vec(&record(Some(ws("v1"))))?)?;
         std::fs::write(dir.path().join("b.json"), serde_json::to_vec(&record(None))?)?;

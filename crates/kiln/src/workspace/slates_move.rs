@@ -218,7 +218,7 @@ mod tests {
     use crate::workspace::slates_fleet::Member;
 
     fn made() -> Made {
-        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/state/workspaces/kiln-a".into() }
+        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/state/workspaces/kiln-a".into(), ..Default::default() }
     }
 
     fn fleet() -> crate::config::SlatesFleet {

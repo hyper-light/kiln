@@ -38,8 +38,9 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  AttachTransport, DatabaseRefusal, HostPathReason, MoveRefusal, OwnMountUse, Principal,
-  RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VolumeId, VolumeRefusal,
+  ArchiveFault, AttachTransport, DatabaseRefusal, HostPathReason, MoveRefusal, OwnMountUse,
+  Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VolumeId,
+  VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -524,6 +525,9 @@ pub enum Invalid {
   Volume(VolumeRefusal),
   /// A move's target cannot take the volume (A-291): name another member.
   MoveTarget(MoveTarget),
+  /// The bytes an archive import read make no volume, by their kind (A-453): another format's file, a newer format, a
+  /// copy cut off or altered, or an archive a faulty writer made. Nothing was made.
+  Archive(ArchiveFault),
 }
 
 /// Why a move's target cannot take the volume ([`Invalid::MoveTarget`], A-291).
@@ -892,6 +896,7 @@ impl Error {
       Refusal::DigestNotClean => Error::Invalid(Invalid::NoCleanDigest),
       Refusal::ChosenPathUnavailable { reason } => Error::Invalid(Invalid::ChosenPath(reason)),
       Refusal::ImageRefused { reason } => Error::Invalid(Invalid::Image(Note::new(reason))),
+      Refusal::ArchiveRefused { fault } => Error::Invalid(Invalid::Archive(fault)),
       Refusal::OwnMount { path, used_as } => Error::Invalid(Invalid::OwnMount { path, used_as }),
       Refusal::Destroying => Error::Unusable(Unusable::Destroying),
       Refusal::Archived => Error::Unusable(Unusable::Archived),
@@ -1270,6 +1275,9 @@ pub enum MountMissing {
   SharedMount,
   /// A subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive.
   WindowsSubtreeOrShared,
+  /// The machine does not let WinFsp's driver make a mount's drive (Windows, A-369): an Administrator sets
+  /// `MountUseMountmgrFromFSD` to 1 once, which the driver reads at every mount (A-417).
+  MountManager,
 }
 
 impl fmt::Display for MountMissing {
@@ -1297,6 +1305,10 @@ impl fmt::Display for MountMissing {
       }
       Self::WindowsSubtreeOrShared => {
         "a subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive letter"
+      }
+      Self::MountManager => {
+        "this machine does not let WinFsp's driver make a mount's drive: an Administrator allows it once with \
+         `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f`"
       }
     })
   }
