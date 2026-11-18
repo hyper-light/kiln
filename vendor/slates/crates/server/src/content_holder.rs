@@ -503,6 +503,66 @@ fn changes_cover(
   published_count.saturating_add(added).checked_sub(gone) == Some(acceptor.position_count())
 }
 
+/// The content hold's pieces changed since the last committed publication (A-376): each held now put, each gone
+/// removed.
+fn content_hold_changes(
+  state: &ShardState,
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) {
+  for piece in state.held_content.changed_pieces() {
+    match state.held_content.piece_bytes(piece) {
+      Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
+        key: hold_piece_key(piece),
+        bytes,
+      }),
+      None => removed.push(hold_piece_key(piece)),
+    }
+  }
+}
+
+/// A live copy's changes since the last committed publication: its head and the entries in slots past the published
+/// ones put, and the published slots it dropped removed; a copy let go removes its head and every published slot.
+fn live_copy_changes(
+  state: &ShardState,
+  object: ObjectId,
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) {
+  let published = state.published_held.live.get(&object).copied();
+  let Some(held) = state.live.held.get(&object) else {
+    removed.push(piece_key(KIND_LIVE_HEAD, object.0, 0));
+    if let Some((published_first, published_end)) = published {
+      removed.extend(
+        (published_first..published_end).map(|slot| piece_key(KIND_LIVE_ENTRY, object.0, slot)),
+      );
+    }
+    return;
+  };
+  let (first, end) = held.slots();
+  // A copy's slots only move forward, and a copy made again starts at or above the shard's slot floor, so every slot
+  // below the published end that it still holds is the published entry.
+  let (published_first, published_end) = published.unwrap_or((first, first));
+  put.extend(live_pieces(object, held, published_end));
+  removed.extend(
+    (published_first..published_end.min(first))
+      .chain(end.max(published_first)..published_end)
+      .map(|slot| piece_key(KIND_LIVE_ENTRY, object.0, slot)),
+  );
+}
+
+/// The replica checkpoints changed since the last committed publication (A-404): each kept now put, each dropped
+/// removed.
+fn checkpoint_changes(
+  state: &ShardState,
+  (put, removed): (&mut Vec<slates_vfs::recover::HeldPiece>, &mut Vec<PieceKey>),
+) {
+  for object in &state.merge.checkpoints_changed {
+    match state.merge.checkpoints.get(object) {
+      Some(held) => put.push(checkpoint_piece(*object, held)),
+      None => removed.push(piece_key(KIND_REPLICA_CHECKPOINT, object.0, 0)),
+    }
+  }
+}
+
 /// What a delta carries of the held pieces since the last committed publication (A-270): a whole piece whose bytes
 /// differ; of every register its tracked map marked, its head and the positions its acceptor accepted or dropped since
 /// (A-367), or, dropped whole, the head and every position published; and of a live copy, its head, the entries in slots
@@ -533,48 +593,13 @@ pub(crate) fn held_changes(state: &ShardState) -> HeldChanges {
   // The content hold's pieces it changed since the last committed publication (A-376): each held now put, each gone
   // removed. The hold's whole image was re-encoded at every publication and re-put whenever it changed, which at f > 0
   // is every version of a green its holder takes.
-  for piece in state.held_content.changed_pieces() {
-    match state.held_content.piece_bytes(piece) {
-      Some(bytes) => put.push(slates_vfs::recover::HeldPiece {
-        key: hold_piece_key(piece),
-        bytes,
-      }),
-      None => removed.push(hold_piece_key(piece)),
-    }
-  }
+  content_hold_changes(state, (&mut put, &mut removed));
   for object in state.live.held.changed() {
-    let published = state.published_held.live.get(object).copied();
-    match state.live.held.get(object) {
-      Some(held) => {
-        let (first, end) = held.slots();
-        // A copy's slots only move forward, and a copy made again starts at or above the shard's slot floor, so every
-        // slot below the published end that it still holds is the published entry.
-        let (published_first, published_end) = published.unwrap_or((first, first));
-        put.extend(live_pieces(*object, held, published_end));
-        removed.extend(
-          (published_first..published_end.min(first))
-            .chain(end.max(published_first)..published_end)
-            .map(|slot| piece_key(KIND_LIVE_ENTRY, object.0, slot)),
-        );
-      }
-      None => {
-        removed.push(piece_key(KIND_LIVE_HEAD, object.0, 0));
-        if let Some((published_first, published_end)) = published {
-          removed.extend(
-            (published_first..published_end).map(|slot| piece_key(KIND_LIVE_ENTRY, object.0, slot)),
-          );
-        }
-      }
-    }
+    live_copy_changes(state, *object, (&mut put, &mut removed));
   }
   // The replica checkpoints this holder changed since the last committed publication (A-404): each kept now put, each
   // dropped removed.
-  for object in &state.merge.checkpoints_changed {
-    match state.merge.checkpoints.get(object) {
-      Some(held) => put.push(checkpoint_piece(*object, held)),
-      None => removed.push(piece_key(KIND_REPLICA_CHECKPOINT, object.0, 0)),
-    }
-  }
+  checkpoint_changes(state, (&mut put, &mut removed));
   // The live logs this shard ships whose kept piece this publication changes (A-344): each captured one at the position
   // its coming entry takes, and each marked; a log let go has its piece removed.
   let owned = crate::live_ship::owned_changes(state);
@@ -813,6 +838,9 @@ impl From<slates_wire::WireError> for HeldRefused {
   }
 }
 
+/// A content hold's pieces by kind (A-376): its chunks', its manifests' and its stages' bytes.
+type PiecesByKind = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// Splits a recovered image's held pieces (A-270), each live copy joined from its head and its entries in slot order.
 /// No pieces hold nothing; pieces that do not decode, or that leave a copy's entries short, are refused.
 pub(crate) fn split_held(
@@ -831,7 +859,7 @@ pub(crate) fn split_held(
   let mut positions: BTreeMap<[u8; 16], Vec<slates_db::register::PersistedPosition>> =
     BTreeMap::new();
   // The content hold's chunk, manifest and stage pieces (A-376), put back into its image once all are read.
-  let mut content: (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) = Default::default();
+  let mut content: PiecesByKind = Default::default();
   for piece in pieces {
     let (kind, object, slot) = split_key(&piece.key);
     match kind {

@@ -29,6 +29,8 @@ pub mod slates_move;
 
 #[cfg(test)]
 mod bare_metal_tests;
+#[cfg(test)]
+mod captured_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -283,24 +285,26 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
 
 /// A session that arrived with a workspace volume (it moved here with its agent, K4, `harness::host`'s take-over): its
 /// mount re-placed under this machine's own place for workspaces where it named another machine's, and its folder there
-/// (the mount's top, with the agent's place beneath it). Whether it has a workspace volume to mount here as it starts
-/// ([`mounted_for`]), so its folder is never taken for one this machine lacks.
-pub fn arrived_here(spec: &mut crate::harness::session::Spec) -> bool {
+/// (the mount's top, with the agent's place beneath it); marked moved where it came from another machine
+/// (`from_elsewhere`: the server's package, never a hand-over between two runner processes of this one), which kiln
+/// writes back to no folder until Slates' move carries its capture (`slates::arrived`, K5). Whether it has a workspace
+/// volume to mount here as it starts ([`mounted_for`]), so its folder is never taken for one this machine lacks.
+pub fn arrived_here(spec: &mut crate::harness::session::Spec, from_elsewhere: bool) -> bool {
     let Some(w) = spec.workspace.as_mut().filter(|w| w.kind == "volume") else { return false };
     let Some(m) = w.made.as_ref().filter(|m| !m.mount.is_empty()) else { return false };
-    let placed = match slates::placed_here(m) {
-        Ok(placed) => placed,
+    let arrived = match slates::arrived(m, from_elsewhere) {
+        Ok(arrived) => arrived,
         Err(e) => {
             tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "a workspace that arrived couldn't be placed here");
             return false;
         }
     };
-    if placed.mount != m.mount {
-        let top = place::top(&placed.mount);
+    if arrived.mount != m.mount {
+        let top = place::top(&arrived.mount);
         let here = if w.sub.is_empty() { top } else { top.join(&w.sub) };
         spec.cwd = Some(here.to_string_lossy().into_owned());
-        w.made = Some(placed);
     }
+    w.made = Some(arrived);
     true
 }
 
@@ -665,7 +669,7 @@ mod tests {
     use super::*;
 
     fn made(volume: &str, mount: &str) -> slates::Made {
-        slates::Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: mount.into() }
+        slates::Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: mount.into(), ..Default::default() }
     }
 
     fn volume_at(volume: &str, mount: &str, over: &str) -> Workspace {

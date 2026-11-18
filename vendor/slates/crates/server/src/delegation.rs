@@ -54,7 +54,7 @@ pub(crate) fn drain(s: &mut ShardState) {
   }
   let requested = s.store.recall_gate.take_requested();
   let now = futures::now_ns();
-  let lease = s.config.failover_slo_ns;
+  let lease = crate::nfs::v4_lease_ns(s);
   let Some(files) = s.nfs_v4_files.as_mut() else {
     return;
   };
@@ -150,7 +150,11 @@ async fn send_recalls(sessionid: SessionId) {
     let Some(recall) = next else {
       return;
     };
-    let _ = state::with_state_counted(|s| s.count(RECALL_SENT, 1));
+    let bound = state::with_state_counted(|s| {
+      s.count(RECALL_SENT, 1);
+      crate::callback::bound_ns(s, &sessionid)
+    })
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
     let answered = crate::callback::call_on_slot(
       sessionid,
       |next| {
@@ -161,7 +165,7 @@ async fn send_recalls(sessionid: SessionId) {
           &recall.fh.0,
         )
       },
-      crate::daemon::LIVENESS_BUDGET_NS,
+      bound,
     )
     .await;
     // A callback the transport lost (no reply, no carrier, a refused RPC) marks the back channel down, so the client is
