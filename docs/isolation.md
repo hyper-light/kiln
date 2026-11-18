@@ -362,6 +362,16 @@ Built, each where it is:
   made (Hex's `ShardsImage::shares`), and its working directory there. Each start share is given to its harness
   member as it starts (Shards' D277, Hex's `Mount::members`, `hexvm::mount_of`), so its harness works in its
   project from its first instruction; one given to a member a launch doesn't drive is refused, typed.
+- **A workspace of its own served, never mounted** (kiln goal 01a1ec34599974448f6b7663ddb07001; Shards' D286, Hex's
+  `ShardsImage::served`): where a session's workspace is a Slates volume made with no mount, its project is no folder
+  of the machine's but that volume, served to its microVM by Slates over Slates' own virtio-fs device and DAX window,
+  a stream handed to Shards (`sandbox::isolated::served_project`: the volume by its id, where the microVM sees the
+  folder it lies over, writable, given to the harness, the harness's folder at the same place beneath it; the
+  seam's `Launch::served`, `hexvm::served_of`). Hex asks the server its runtime was bound for the stream as the box
+  boots; microVMs bound none refuse such a launch, typed (`hexvm::NO_SERVER`). Its review is built from the volume's
+  changes (`workspace::git::commit_changes`, git's ignore rules over the volume's own `.gitignore` files:
+  `workspace::ignored`). Owed: kiln's Slates server bound to Hex's runtime, the workspace made with no mount for an
+  isolated session, and the review's read of Slates' landing entries, on kiln's library swap to slates-api (g263).
 - **A member's signals** (Shards' D238, Hex's `Runtime::signal_member`): interrupt and stop reach the member
   alone on its own lane of its run's agent-control endpoint; its kill is its box's delete.
 - **kiln's MCP from inside** (Shards' D254, Hex's `ImageMember::mcp` and `Runtime::mcp`): above.

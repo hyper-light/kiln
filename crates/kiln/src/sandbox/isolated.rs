@@ -111,16 +111,27 @@ pub fn launch_of(kind: &Kind, spec: &Spec, image: String, kiln: &[&Path]) -> any
         anyhow::bail!("an isolated agent can't work in {}: {why}", given.display());
     }
     let run = kind.elsewhere(spec)?;
-    let project = project_share(&cwd).map_err(anyhow::Error::msg)?;
+    let harness = kiln_seams::sandbox::Member(run.member.to_owned());
+    // Its project: the folder itself, shared; or, where its workspace of its own is a Slates volume made for it with no
+    // mount (`crate::workspace::prepare`), that volume, served to its microVM by Slates over Slates' own virtio-fs device
+    // and given to its harness, which works in it from its first instruction ([`served_project`]).
+    let (folder, shares, served) = match served_project(spec, &cwd, &harness).map_err(anyhow::Error::msg)? {
+        Some((served, folder)) => (folder, Vec::new(), vec![served]),
+        None => {
+            let project = project_share(&cwd).map_err(anyhow::Error::msg)?;
+            (project.at.clone(), vec![project], Vec::new())
+        }
+    };
     // Its project's top-level directory, where a folder is plugged in live ([`launch`] adds its person's volumes' and its
     // session's root).
-    let roots = plug_root_of(&project.at).into_iter().collect();
-    let volumes = volumes_of(&spec.volumes, &kiln_seams::sandbox::Member(run.member.to_owned()))?;
+    let roots = plug_root_of(&folder).into_iter().collect();
+    let volumes = volumes_of(&spec.volumes, &harness)?;
     Ok(Launch {
         program: run.member.to_owned(),
         args: run.args,
-        folder: Some(project.at.clone()),
-        shares: vec![project],
+        folder: Some(folder),
+        shares,
+        served,
         env: run.env,
         limits: Limits::NONE,
         egress: Egress::Any,
@@ -184,7 +195,13 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
         Source::Kept { .. } => Reach::Whole { why: Whole::PersonsOwn },
         Source::Builtin(b) => {
             let person = spec.isolation.as_ref().and_then(|i| i.person.clone());
-            let (model, homes, project, env) = (spec.model.clone(), homes.map(std::path::Path::to_path_buf), launch.shares.first().cloned(), launch.env.clone());
+            // Its project's own configuration is read where the machine has it: its folder, or the folder a project Slates
+            // serves lies over, which its volume reads through until its agent writes there.
+            let project = match (served_over(spec), launch.served.first()) {
+                (Some((_, over)), Some(served)) => Some(Share { host: over.to_owned(), at: served.at.clone(), writable: true, members: Vec::new() }),
+                _ => launch.shares.first().cloned(),
+            };
+            let (model, homes, env) = (spec.model.clone(), homes.map(std::path::Path::to_path_buf), launch.env.clone());
             crate::rt::blocking(move || reach_of(b, person.as_deref(), model.as_deref(), homes.as_deref(), project.as_ref(), &env)).await?
         }
     };
@@ -214,7 +231,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     // top-level directories of its project and its person's volumes, and its session's own root, where kiln puts such a
     // folder by default (`harness::overrides`), each once.
     let mut roots: Vec<String> = Vec::new();
-    for root in launch.shares.iter().filter(|s| s.writable).filter_map(|s| plug_root_of(&s.at)).chain([VOLUMES.to_owned()]) {
+    for root in launch.shares.iter().filter(|s| s.writable).map(|s| s.at.as_str()).chain(launch.served.iter().filter(|s| s.writable).map(|s| s.at.as_str())).filter_map(plug_root_of).chain([VOLUMES.to_owned()]) {
         if !roots.contains(&root) {
             roots.push(root);
         }
@@ -418,9 +435,10 @@ impl Seen {
     /// before its harness is told anything.
     pub fn of(spec: &Spec) -> Option<Self> {
         spec.isolation.as_ref()?;
-        let cwd = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
-        let at = guest_path(&cwd, PROJECTS).ok()?;
-        (at != cwd).then(|| Self { host: cwd.trim_end_matches(['\\', '/']).to_owned(), at })
+        // A project Slates serves is seen where the folder its volume lies over is ([`served_project`]).
+        let host = served_over(spec).map_or_else(|| crate::harness::session::resolve_cwd(spec.cwd.as_deref()), |(_, over)| over.to_owned());
+        let at = guest_path(&host, PROJECTS).ok()?;
+        (at != host).then(|| Self { host: host.trim_end_matches(['\\', '/']).to_owned(), at })
     }
 
     /// `path`, a folder or file of this machine's, as the harness sees it: its project and what's beneath
@@ -452,6 +470,39 @@ pub fn harness_cwd(spec: &Spec) -> String {
 /// microVM, which is its member's working folder too.
 pub fn project_share(cwd: &str) -> Result<Share, String> {
     Ok(Share { host: cwd.to_owned(), at: guest_path(cwd, PROJECTS)?, writable: true, members: Vec::new() })
+}
+
+/// `spec`'s workspace of its own where it is a Slates volume made with no mount, which Slates serves its microVM
+/// ([`served_project`]), and the folder that volume lies over; none for any other.
+fn served_over(spec: &Spec) -> Option<(&crate::workspace::slates::Made, &str)> {
+    let w = spec.workspace.as_ref().filter(|w| w.kind == "volume")?;
+    let made = w.made.as_ref().filter(|m| m.mount.is_empty() && !m.volume.is_empty())?;
+    Some((made, w.over.as_deref()?))
+}
+
+/// An isolated `spec`'s project as Slates serves it to its microVM (kiln goal 01a1ec34599974448f6b7663ddb07001), where
+/// its workspace of its own is a Slates volume made with no mount (`crate::workspace::prepare`): the volume, by its id,
+/// writable and given to its `harness` as it starts, where its microVM sees the folder the volume lies over
+/// ([`guest_path`]); and its harness's folder, `cwd` at the same place in it. None for a session working in its folder
+/// itself, or in a mounted workspace, whose folder is shared ([`project_share`]). Why not, where `cwd` lies outside the
+/// folder the volume lies over.
+pub fn served_project(spec: &Spec, cwd: &str, harness: &kiln_seams::sandbox::Member) -> Result<Option<(kiln_seams::sandbox::Served, String)>, String> {
+    let Some((made, over)) = served_over(spec) else { return Ok(None) };
+    let at = guest_path(over, PROJECTS)?;
+    let within = Path::new(cwd).strip_prefix(over).map_err(|_| format!("{cwd} lies outside {over}, the folder its workspace's volume lies over"))?;
+    let mut folder = at.clone();
+    for part in within.components() {
+        match part {
+            std::path::Component::Normal(name) => {
+                folder.push('/');
+                folder.push_str(&name.to_string_lossy());
+            }
+            std::path::Component::CurDir => {}
+            other => return Err(format!("{cwd}: {other:?} in its folder beneath {over}")),
+        }
+    }
+    let served = kiln_seams::sandbox::Served { source: made.volume.clone(), at, writable: true, members: vec![harness.clone()] };
+    Ok(Some((served, folder)))
 }
 
 /// Why folder `cwd` can't be an isolated agent's project, shared writable with its microVM, where it can't
@@ -1231,6 +1282,45 @@ mod tests {
         assert!(launched(&in_workspace(mine.as_path(), project.as_path())).is_ok(), "its own workspace over a project");
         assert!(refusal(&in_workspace(mine.as_path(), crate::os::home_dir().as_path())).contains("home folder"), "its own workspace over the home");
         assert!(refusal(&in_workspace(theirs.as_path(), project.as_path())).contains("lies in"), "another agent's workspace");
+        Ok(())
+    }
+
+    /// Kiln goal 01a1ec34599974448f6b7663ddb07001: an isolated session whose workspace of its own is a Slates volume made
+    /// with no mount is given that volume as a folder Slates serves its microVM, never a folder of the machine's. Do
+    /// launch one working in a folder beneath its project's top, the volume laid over that top. Expect no share of the
+    /// machine's, one served folder: the volume by its id, where its microVM sees the top, writable, given to its harness;
+    /// its working folder the same place beneath it; its harness told it works there; the top's top-level directory a plug
+    /// root. Do launch one whose workspace is mounted. Expect its folder shared from the machine, and nothing served.
+    #[test]
+    fn g265_a_workspace_volume_with_no_mount_is_served_to_its_microvm_and_no_folder_is_shared() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let top = dir.path().join("proj");
+        let sub = top.join("crates").join("kiln");
+        std::fs::create_dir_all(&sub)?;
+        let (top_s, sub_s) = (top.to_string_lossy().into_owned(), sub.to_string_lossy().into_owned());
+        let workspace = |mount: &str| crate::workspace::Workspace {
+            kind: "volume".into(),
+            over: Some(top_s.clone()),
+            sub: "crates/kiln".into(),
+            made: Some(crate::workspace::slates::Made { volume: "0123456789abcdef0123456789abcdef".into(), name: "kiln-x".into(), mount: mount.into() }),
+        };
+        let spec = Spec { kind: "codex".into(), cwd: Some(sub_s.clone()), isolation: Some(microvm(None)), workspace: Some(workspace("")), ..Spec::default() };
+        let launched = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into(), &[])?;
+        let at = guest_path(&top_s, PROJECTS).map_err(anyhow::Error::msg)?;
+        let folder = format!("{at}/crates/kiln");
+        assert!(launched.shares.is_empty(), "no folder of the machine's: {:?}", launched.shares);
+        assert_eq!(
+            launched.served,
+            [kiln_seams::sandbox::Served { source: "0123456789abcdef0123456789abcdef".into(), at: at.clone(), writable: true, members: vec![kiln_seams::sandbox::Member("codex".into())] }],
+            "its volume, served where its microVM sees the folder it lies over"
+        );
+        assert_eq!(launched.folder.as_deref(), Some(folder.as_str()), "its working folder, at the same place in it");
+        assert_eq!(harness_cwd(&spec), folder, "its harness told it works there");
+        assert_eq!(launched.plug_roots, plug_root_of(&at).into_iter().collect::<Vec<_>>());
+        let mounted = Spec { workspace: Some(workspace(&top_s)), ..spec.clone() };
+        let shared = launch_of(kind("codex")?, &mounted, "harness-codex@sha256:00".into(), &[])?;
+        assert!(shared.served.is_empty(), "a mounted workspace is served nothing");
+        assert_eq!(shared.shares.len(), 1, "its folder, shared from the machine");
         Ok(())
     }
 

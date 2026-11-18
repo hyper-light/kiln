@@ -247,6 +247,110 @@ pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, 
     Ok(Some(Made { sha, parent: parent.map(str::to_owned), files }))
 }
 
+/// One change an agent made to its folder as a workspace of its own with no mount says it (kiln goal
+/// 01a1ec34599974448f6b7663ddb07001: its microVM is served its Slates volume, and nothing of it is on this machine's
+/// disk): the volume's names and bytes, from Slates' landing entries (A-287), each path relative to the repository's
+/// top, `/`-separated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// The file holds `bytes`, executable or not (git's two file modes).
+    File { path: String, bytes: Vec<u8>, executable: bool },
+    /// A symbolic link to `target`.
+    Link { path: String, target: String },
+    /// The file is gone.
+    Gone { path: String },
+    /// Every file beneath the directory is gone (it was removed, or cleared before its new files were written).
+    GoneUnder { path: String },
+    /// The directory moved whole: every file beneath `from` is beneath `to` now, as it was, but those changed as it
+    /// moved, which come as their own changes at their new paths.
+    Moved { from: String, to: String },
+}
+
+/// Commits `changes` on `parent` (`None`: a first commit), by `who`, saying `message`, signed as [`commit_tree`] signs,
+/// made beside the folder (a scratch index), so the person's branch, index and working tree are never touched, as
+/// [`commit`] makes one; `Ok(None)` when they change nothing. Its directories first, in their order (each lists what the
+/// index holds beneath it then), then each file: a moved directory's changed files land over its moved ones, as Slates
+/// lands them (renames before the files written into them). The changes are the volume's, which leave out what git
+/// ignores before they come here.
+pub async fn commit_changes(top: &Path, parent: Option<&str>, changes: &[Change], message: &str, who: &Ident, sign: Option<&str>) -> anyhow::Result<Option<Made>> {
+    let scratch = Scratch(std::env::temp_dir().join(format!("kiln-change-{}.index", crate::util::new_id())));
+    let indexed = |args: &[&str]| {
+        let mut c = git(top);
+        c.env("GIT_INDEX_FILE", &scratch.0).args(args);
+        c
+    };
+    match parent {
+        Some(p) => run(indexed(&["read-tree", p]), GIT_TIMEOUT).await?,
+        None => run(indexed(&["read-tree", "--empty"]), GIT_TIMEOUT).await?,
+    };
+    for change in changes {
+        let (under, to) = match change {
+            Change::GoneUnder { path } => (path, None),
+            Change::Moved { from, to } => (from, Some(to)),
+            _ => continue,
+        };
+        let listed = run(indexed(&["ls-files", "-s", "-z", "--", &format!(":(literal){under}")]), GIT_TIMEOUT).await?;
+        let staged = staged_entries(&listed, under);
+        let gone: Vec<u8> = staged.iter().flat_map(|(_, _, path)| [path.as_bytes(), b"\0".as_slice()].concat()).collect();
+        with_stdin(indexed(&["update-index", "-z", "--force-remove", "--stdin"]), &gone).await?;
+        if let Some(to) = to {
+            let moved: Vec<u8> = staged.iter().flat_map(|(mode, sha, path)| format!("{mode} {sha}\t{to}{}\0", path.get(under.len()..).unwrap_or_default()).into_bytes()).collect();
+            with_stdin(indexed(&["update-index", "-z", "--index-info"]), &moved).await?;
+        }
+    }
+    let (mut written, mut gone) = (Vec::new(), Vec::new());
+    for change in changes {
+        match change {
+            Change::File { path, bytes, executable } => {
+                let blob = with_stdin(indexed(&["hash-object", "-w", "--stdin"]), bytes).await?;
+                written.extend(format!("{} {blob}\t{path}\0", if *executable { "100755" } else { "100644" }).into_bytes());
+            }
+            Change::Link { path, target } => {
+                let blob = with_stdin(indexed(&["hash-object", "-w", "--stdin"]), target.as_bytes()).await?;
+                written.extend(format!("120000 {blob}\t{path}\0").into_bytes());
+            }
+            Change::Gone { path } => gone.extend([path.as_bytes(), b"\0".as_slice()].concat()),
+            Change::GoneUnder { .. } | Change::Moved { .. } => {}
+        }
+    }
+    if !written.is_empty() {
+        with_stdin(indexed(&["update-index", "-z", "--index-info"]), &written).await?;
+    }
+    if !gone.is_empty() {
+        with_stdin(indexed(&["update-index", "-z", "--force-remove", "--stdin"]), &gone).await?;
+    }
+    let tree = run(indexed(&["write-tree"]), GIT_TIMEOUT).await?;
+    let before = match parent {
+        Some(p) => {
+            let mut c = git(top);
+            c.args(["rev-parse", &format!("{p}^{{tree}}")]);
+            Some(run(c, GIT_TIMEOUT).await?)
+        }
+        None => None,
+    };
+    if before.as_deref() == Some(tree.as_str()) {
+        return Ok(None);
+    }
+    let sha = commit_tree(top, &tree, parent, message, (who, None), who, sign).await?;
+    let files = changed(top, parent, &sha).await?;
+    Ok(Some(Made { sha, parent: parent.map(str::to_owned), files }))
+}
+
+/// The entries `git ls-files -s -z` lists beneath directory `under` (`<mode> <object> <stage>\t<path>`, each ended by a
+/// NUL): each one's mode, object and path, the directory's own name never one of them, nor a path that only begins
+/// as it does (`under` `a` and `ab/c`).
+fn staged_entries<'a>(listed: &'a str, under: &str) -> Vec<(&'a str, &'a str, &'a str)> {
+    listed
+        .split('\0')
+        .filter_map(|record| {
+            let (meta, path) = record.split_once('\t')?;
+            let mut parts = meta.split(' ');
+            let (mode, sha) = (parts.next()?, parts.next()?);
+            path.strip_prefix(under).filter(|rest| rest.starts_with('/')).map(|_| (mode, sha, path))
+        })
+        .collect()
+}
+
 /// Writes the commit of `tree` on `parent`, saying `message`, by `author` (at the time given, else
 /// now), committed by `who`: an agent's work, so signed as the agent with the key this runner holds
 /// in slot `sign` (its session's at its epoch, W27-R03), and never with a key the person's git
@@ -1153,6 +1257,56 @@ mod tests {
         })?;
         assert_eq!(status_before, out(&top, &["status", "--porcelain"])?, "the folder's index and working tree are as they were");
         assert_eq!(out(&top, &["log", "--format=%s", "-1"])?, "init", "the branch didn't move");
+        Ok(())
+    }
+
+    /// Kiln goal 01a1ec34599974448f6b7663ddb07001 (an agent's work from a workspace with no mount, Slates' A-287): a
+    /// commit made of the volume's changes, with no working tree to read. Do commit, on the folder's last commit, a
+    /// changed file, a new executable one, a symbolic link, a removal, a directory moved whole with one of its files
+    /// changed as it moved, and a directory cleared then given a new file. Expect each path as the changes say (the moved
+    /// directory's other files with their bytes as they were, the changed one with its new bytes, the cleared one's old
+    /// files gone), the commit on that last commit, the folder's branch, index and working tree as they were; and the
+    /// same changes again on that commit changing nothing.
+    #[test]
+    fn g265_a_commit_of_a_volumes_changes_is_made_with_no_working_tree() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "mkdir -p lib/old gen && echo one > lib/old/one.rs && echo two > lib/old/two.rs && echo g > gen/g.rs && git add . && git commit -qm more")?;
+        let status_before = out(&top, &["status", "--porcelain"])?;
+        let head = out(&top, &["rev-parse", "HEAD"])?;
+        let changes = vec![
+            Change::GoneUnder { path: "gen".into() },
+            Change::Moved { from: "lib/old".into(), to: "lib/new".into() },
+            Change::File { path: "a".into(), bytes: b"a, the agent's\n".to_vec(), executable: false },
+            Change::File { path: "tools/run.sh".into(), bytes: b"#!/bin/sh\necho run\n".to_vec(), executable: true },
+            Change::File { path: "lib/new/two.rs".into(), bytes: b"two, changed\n".to_vec(), executable: false },
+            Change::File { path: "gen/fresh.rs".into(), bytes: b"fresh\n".to_vec(), executable: false },
+            Change::Link { path: "latest".into(), target: "tools/run.sh".into() },
+            Change::Gone { path: "src/s.rs".into() },
+        ];
+        let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
+        let (here, parent) = (top.clone(), head.clone());
+        let made = crate::rt::block_on(async move { commit_changes(&here, Some(&parent), &changes, "The agent's work", &who, None).await })?.ok_or_else(|| anyhow::anyhow!("no commit"))?;
+        assert_eq!(made.parent.as_deref(), Some(head.as_str()));
+        let listed = out(&top, &["ls-tree", "-r", "--format=%(objectmode) %(path)", made.sha.as_str()])?;
+        let mut tree: Vec<&str> = listed.lines().collect();
+        tree.sort_unstable();
+        assert_eq!(tree, [".gitignore", "a", "b", "gen/fresh.rs", "latest", "lib/new/one.rs", "lib/new/two.rs", "tools/run.sh"].map(|p| match p {
+            "latest" => "120000 latest".to_owned(),
+            "tools/run.sh" => "100755 tools/run.sh".to_owned(),
+            p => format!("100644 {p}"),
+        }));
+        let show = |path: &str| out(&top, &["show", format!("{}:{path}", made.sha).as_str()]);
+        assert_eq!(show("a")?, "a, the agent's");
+        assert_eq!(show("lib/new/one.rs")?, "one", "a moved directory's unchanged file keeps its bytes");
+        assert_eq!(show("lib/new/two.rs")?, "two, changed", "its changed file lands over the moved one");
+        assert_eq!(show("latest")?, "tools/run.sh", "a link's blob is its target");
+        assert_eq!(status_before, out(&top, &["status", "--porcelain"])?, "the folder's index and working tree are as they were");
+        assert_eq!(out(&top, &["rev-parse", "HEAD"])?, head, "the branch didn't move");
+        let again = vec![Change::File { path: "a".into(), bytes: b"a, the agent's\n".to_vec(), executable: false }];
+        let (here, sha) = (top.clone(), made.sha.clone());
+        let who = Ident { name: "Ada".into(), email: "ada@example.com".into() };
+        assert!(crate::rt::block_on(async move { commit_changes(&here, Some(&sha), &again, "again", &who, None).await })?.is_none(), "nothing more to commit");
         Ok(())
     }
 

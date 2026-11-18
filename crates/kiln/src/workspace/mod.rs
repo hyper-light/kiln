@@ -8,12 +8,14 @@
 //! - [`change`]: an agent's change request, from its work to review (C1, C6).
 //! - [`follow`]: what happens to it, back to the agent (C2, C3).
 //! - [`slates`]: a workspace of its own, a Slates volume over its folder (W1–W4).
+//! - [`ignored`]: what git ignores in one with no mount, from its volume's own `.gitignore` files.
 //! - [`measure`]: an experiment's variants measured beside it, each in a worktree of its own
 //!   (docs/ci.md W20-R11).
 
 pub mod change;
 pub mod follow;
 pub mod git;
+pub mod ignored;
 pub mod measure;
 pub mod slates;
 

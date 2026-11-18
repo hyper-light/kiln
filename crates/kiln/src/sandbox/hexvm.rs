@@ -75,7 +75,7 @@ use std::time::Duration;
 
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, ImageVolume, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ShardsImage};
+use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, ImageVolume, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ServedMount, ShardsImage};
 use kiln_ci::place::holder::BoxName;
 use kiln_seams::Records;
 use kiln_seams::records::{Tx, Write};
@@ -89,7 +89,7 @@ use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, KeptVolume, Launch, Lin
 /// guest: its `usage_of`), or weights. Credentials it holds where its runtime leases them ([`HexVms::leasing`], its
 /// [`Sandbox::holds`]); these say none. Volumes of its node's Shards home given to a launch, listed and cleared (kiln
 /// plan 01a1dd2e…, P6.2: module docs).
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false, volumes: true };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false, volumes: true, served: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
 pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (its server's broker didn't open, or this runner has no link to its server to ask it over), and a run granted one is never run without it (Shards' D242)";
@@ -112,6 +112,8 @@ pub struct HexVms {
     vms: parking_lot::Mutex<HashMap<String, Weak<Vm>>>,
     /// Whether its runtime leases its VMs' credentials, given lessors over a run-lease broker ([`HexVms::leasing`]).
     leases: bool,
+    /// Whether its runtime was bound a server of its VMs' served folders ([`HexVms::serving`]).
+    serves: bool,
 }
 
 /// The family of kiln's records each microVM's charge is kept in as its run ends: keyed by its box's name, a
@@ -305,7 +307,13 @@ impl HexVms {
     /// Over Hex's runtime `runtime`, naming each launch's box with `names`, which answers none where nothing numbers
     /// one (a launch then refused).
     pub fn new(runtime: Arc<dyn Runtime>, names: impl Fn() -> Option<BoxName> + Send + Sync + 'static) -> Self {
-        Self { runtime, names: Box::new(names), ledger: None, vms: parking_lot::Mutex::new(HashMap::new()), leases: false }
+        Self { runtime, names: Box::new(names), ledger: None, vms: parking_lot::Mutex::new(HashMap::new()), leases: false, serves: false }
+    }
+
+    /// Its runtime was bound a server of its VMs' served folders (`hex_node::images::ImageRuntime::bind_servers`, Hex's
+    /// `hex_api::serve::Servers`; Shards' D286), so it holds launches given folders another server serves (module docs).
+    pub fn serving(self) -> Self {
+        Self { serves: true, ..self }
     }
 
     /// Its runtime was given lessors over the node's run-lease broker (`hex_node::images::ImageRuntime::leasing`), so
@@ -345,9 +353,12 @@ impl HexVms {
     /// behind.
     pub async fn launch_as(&self, name: BoxName, launch: Launch, size: Option<(u32, u64)>, sign_ins: &[crate::secrets::signin::SignIn]) -> Result<Box<dyn Run>, Refusal> {
         // Its grants checked as any sandbox's would be first (`Invalid`), then refused where no broker leases them.
-        Holds { credentials: true, ..HOLDS }.check(&launch)?;
+        Holds { credentials: true, served: true, ..HOLDS }.check(&launch)?;
         if (!launch.credentials.is_empty() || !sign_ins.is_empty()) && !self.leases {
             return Err(Refusal::Unsupported(NO_BROKER.into()));
+        }
+        if !launch.served.is_empty() && !self.serves {
+            return Err(Refusal::Unsupported(NO_SERVER.into()));
         }
         let Boundary::MicroVm { image } = &launch.boundary else { return Err(Refusal::Unsupported("a run outside a microVM".into())) };
         let member = Member { kind: MemberKind::Harness, name: launch.program.clone() };
@@ -355,10 +366,14 @@ impl HexVms {
         let credentials = credentials_of(&member, &launch.credentials);
         let sign_ins = sign_ins_of(&member, sign_ins);
         let mut shares = launch.shares.iter().map(|s| mount_of(s, &member)).collect::<Result<Vec<Mount>, Refusal>>()?;
+        // Its folders another server serves (Shards' D286), each asked of the server its runtime was bound as its box boots.
+        let served = launch.served.iter().map(|s| served_of(s, &member)).collect::<Result<Vec<ServedMount>, Refusal>>()?;
         // Its harness works in it from its first instruction: given to no member, it would reach its run's root alone,
-        // and its harness's start would fail entering it (Shards' D277).
+        // and its harness's start would fail entering it (Shards' D277). A folder within one of its served folders is
+        // that server's, never the machine's.
         if let Some(folder) = &launch.folder
             && !shares.iter().any(|s| &s.destination == folder)
+            && !launch.served.iter().any(|s| within(folder, &s.at))
         {
             shares.push(Mount { source: PathBuf::from(folder), destination: folder.clone(), read_only: false, members: vec![member.clone()] });
         }
@@ -367,7 +382,7 @@ impl HexVms {
         // Its volumes (P6.2), plugged by Hex as its run starts, each bound drawn from the disk its box is admitted with.
         let disk = disk_of(&launch.volumes)?;
         let volumes = volumes_of(&member, &launch.volumes)?;
-        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, volumes, ..ShardsImage::new(image) };
+        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, volumes, served, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size, disk)?), route: None, band: 0 };
         let name = id.to_string();
@@ -410,7 +425,7 @@ impl Sandbox for HexVms {
     }
 
     fn holds(&self) -> Holds {
-        Holds { credentials: self.leases, ..HOLDS }
+        Holds { credentials: self.leases, served: self.serves, ..HOLDS }
     }
 
     // None yet (`HOLDS.pools`): the Hex kiln vendors boots each box on Shards' `ImageShards`, not its `ImagePools`
@@ -461,6 +476,32 @@ fn mount_of(share: &Share, driven: &Member) -> Result<Mount, Refusal> {
         })
         .collect::<Result<Vec<Member>, Refusal>>()?;
     Ok(Mount { source: PathBuf::from(&share.host), destination: share.at.clone(), read_only: !share.writable, members })
+}
+
+/// Why a launch given a folder another server serves is refused where its runtime was bound no server of them.
+pub const NO_SERVER: &str = "a folder another server serves (a Slates volume served to its microVM with no mount of the machine's): this machine's microVMs were bound no server of them, so a run given one is never started without it (Shards' D286)";
+
+/// `served` as Hex asks its server for it as its box boots (`ShardsImage::served`, Shards' D286): by its source, at its
+/// place, read-only where it isn't writable, given as they start to the members it names, which Hex names by kind and
+/// name, so one given to a member the launch doesn't drive is refused, as a share's is ([`mount_of`]).
+fn served_of(served: &kiln_seams::sandbox::Served, driven: &Member) -> Result<ServedMount, Refusal> {
+    let members = served
+        .members
+        .iter()
+        .map(|named| {
+            if driven.name == named.0 {
+                Ok(driven.clone())
+            } else {
+                Err(Refusal::Unsupported(format!("a folder served at {:?} given to {:?} as it starts, a member of its image it doesn't drive: Hex names each member by its kind, and a launch types the harness it drives alone", served.at, named.0)))
+            }
+        })
+        .collect::<Result<Vec<Member>, Refusal>>()?;
+    Ok(ServedMount { source: served.source.clone(), destination: served.at.clone(), read_only: !served.writable, members })
+}
+
+/// Whether `path` is `place` or lies beneath it, step by step.
+fn within(path: &str, place: &str) -> bool {
+    std::path::Path::new(path).starts_with(place)
 }
 
 /// `granted`'s credentials as Hex grants them to `member`: by reference alone, toward each host lowercased as its
@@ -1824,6 +1865,47 @@ pub(crate) mod tests {
             let elsewhere = vec![share("/Users/ada/data", "/data", true, &["claude", "helper"])];
             let refused = vms.launch(Launch { shares: elsewhere, ..launch(Egress::Only(Vec::new())) }).await.err();
             assert!(matches!(&refused, Some(Refusal::Unsupported(why)) if why.contains("\"helper\"")), "{refused:?}");
+            assert_eq!(rt.specs.lock().len(), 1, "a refused launch asks Hex for no box");
+            run.kill();
+            let (_, ends) = drain(run.as_ref()).await;
+            assert_eq!(ends, [Exit::Killed]);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Kiln goal 01a1ec34599974448f6b7663ddb07001 (Shards' D286, Hex's `ShardsImage::served`): a launch's folder another
+    /// server serves reaches Hex by its source, Hex asking the server its runtime was bound for its stream as the box
+    /// boots. Do launch a run whose folder lies in a folder served writable to its harness, on microVMs bound a server of
+    /// that source. Expect its box's image to serve it by its source at its place, writable, given to its harness, no
+    /// folder of the machine's shared at its folder, and the server asked for one stream. Do launch it on microVMs bound
+    /// no server, and give the folder to a member the launch doesn't drive. Expect each refused Unsupported, the first
+    /// saying why ([`NO_SERVER`]), the second naming the member, and no box asked for either.
+    #[test]
+    fn g265_a_launchs_served_folder_reaches_hex_by_its_source_and_is_no_share_of_the_machine() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{Member as Who, Served};
+        crate::rt::block_on(async {
+            let servers = hex_api::serve::sim::SimServers::new();
+            servers.serve("0123456789abcdef0123456789abcdef").map_err(|e| anyhow::anyhow!("{e}"))?;
+            let rt = Arc::new(Metered { sim: SimRuntime::new().with_servers(Arc::new(servers.clone())), ..Metered::default() });
+            let n = AtomicU64::new(0);
+            let vms = HexVms::new(Arc::<Metered>::clone(&rt), move || Some(BoxName::Unreserved { epoch: 7, n: n.fetch_add(1, Ordering::Relaxed) })).serving();
+            assert!(vms.holds().served, "microVMs bound a server hold served folders");
+            let served = |members: &[&str]| Served { source: "0123456789abcdef0123456789abcdef".into(), at: "/work".into(), writable: true, members: members.iter().map(|m| Who((*m).to_owned())).collect() };
+            let run = vms.launch(Launch { served: vec![served(&["claude"])], ..launch(Egress::Only(Vec::new())) }).await?;
+            let specs = rt.specs.lock().clone();
+            let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
+            let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
+            let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
+            assert_eq!(image.served, [ServedMount { source: "0123456789abcdef0123456789abcdef".into(), destination: "/work".into(), read_only: false, members: vec![harness] }]);
+            assert!(image.shares.is_empty(), "its folder, in a served folder, is no share of the machine's: {:?}", image.shares);
+            assert_eq!(servers.made().map_err(|e| anyhow::anyhow!("{e}"))?, 1, "its stream asked of the server once, as its box booted");
+            let other = vms.launch(Launch { served: vec![served(&["helper"])], ..launch(Egress::Only(Vec::new())) }).await.err();
+            assert!(matches!(&other, Some(Refusal::Unsupported(why)) if why.contains("\"helper\"")), "{other:?}");
+            let (unbound, _, plain) = metered();
+            assert!(!plain.holds().served, "microVMs bound no server hold no served folder");
+            let refused = plain.launch(Launch { served: vec![served(&["claude"])], ..launch(Egress::Only(Vec::new())) }).await.err();
+            assert!(matches!(&refused, Some(Refusal::Unsupported(why)) if why == NO_SERVER), "{refused:?}");
+            assert!(unbound.specs.lock().is_empty(), "a refused launch asks Hex for no box");
             assert_eq!(rt.specs.lock().len(), 1, "a refused launch asks Hex for no box");
             run.kill();
             let (_, ends) = drain(run.as_ref()).await;

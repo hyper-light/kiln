@@ -86,6 +86,9 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 # A capacity keeper's chain.pem and roots.pem, encoded as Hex's `hex_quic::enroll::store::finish` writes them
 # (`capacity::issue_keeper`); the copy hex-quic takes.
 pem = "4"
+# Git's ignore rules over a workspace with no mount, its volume's own `.gitignore` files read through Slates
+# (`workspace::ignored`; kiln goal 01a1ec34599974448f6b7663ddb07001): ripgrep's matcher, the version vendored vorpal links.
+ignore = "0.4.33"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 bytes = "1.12.1"
