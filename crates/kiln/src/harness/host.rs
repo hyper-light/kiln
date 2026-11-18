@@ -2815,19 +2815,30 @@ impl Host {
             // agent's workspace for its restore, [`Host::archive`]): the last of them ends it.
             let spec = s.spec.lock().clone();
             let others: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
-            if !others.iter().any(|o| crate::workspace::same_volume(o.spec.lock().workspace.as_ref(), spec.workspace.as_ref())) {
+            let last = !others.iter().any(|o| crate::workspace::same_volume(o.spec.lock().workspace.as_ref(), spec.workspace.as_ref()));
+            let on_a_mount = spec.workspace.as_ref().and_then(|w| w.made.as_ref()).is_some_and(|m| !m.mount.is_empty());
+            if last || on_a_mount {
                 let archives = self.archive_dir();
                 let ending = Arc::clone(&s);
                 crate::rt::spawn(async move {
-                    let probe = spec.clone();
-                    // Unread, it's kept: an archived agent's work is never lost to a failed look.
-                    let kept = crate::rt::blocking(move || archived_keep(archives.as_deref(), probe.workspace.as_ref())).await.unwrap_or(true);
-                    if !kept {
-                        // Its processes gone first: its harness works in the mount, which can't come down under it
-                        // (macOS refused it busy, and there's no lazy unmount there). How long their end took, from its
-                        // close, is how long what they left behind may still hold it (`workspace::release`).
-                        ending.close_wait().await;
-                        crate::workspace::release(&spec, closed.elapsed()).await;
+                    // Its processes gone first: its harness works in the mount, which can't come down under it
+                    // (macOS refused it busy, and there's no lazy unmount there). How long their end took, from its
+                    // close, is how long what they left behind may still hold it (`workspace::release`).
+                    ending.close_wait().await;
+                    // Its conversation back to its person's folder's project before its mount goes, whoever else still
+                    // works in the volume: the project its harness kept for the mount's folder goes with the volume
+                    // (docs/agentic.md W2).
+                    if on_a_mount {
+                        let conversation = ending.core.lock().state.harness_session.clone();
+                        crate::workspace::send_conversation_home(&spec, conversation).await;
+                    }
+                    if last {
+                        let probe = spec.clone();
+                        // Unread, it's kept: an archived agent's work is never lost to a failed look.
+                        let kept = crate::rt::blocking(move || archived_keep(archives.as_deref(), probe.workspace.as_ref())).await.unwrap_or(true);
+                        if !kept {
+                            crate::workspace::release(&spec, closed.elapsed()).await;
+                        }
                     }
                 });
             }

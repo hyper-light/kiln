@@ -869,17 +869,64 @@ fn some_of(v: &[String]) -> String {
     format!("{}{}", shown.join(", "), if v.len() > 6 { format!(" and {} more", v.len() - 6) } else { String::new() })
 }
 
+/// Why a conversation's record wasn't moved ([`rehome`], [`rehome_branch`], [`return_home`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotMoved {
+    /// A record of it is already where it was to go: neither is written over, and both stay.
+    InBoth { session: String, from: PathBuf, to: PathBuf },
+    /// A step of the move was refused (a folder made, a file moved), in the system's words.
+    Refused { session: String, step: String },
+    /// The project the harness keeps for the folder it was to go to couldn't be named (Gemini CLI's).
+    Unnamed { session: String, folder: String },
+}
+
+impl std::fmt::Display for NotMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InBoth { session, from, to } => write!(f, "a record of conversation {session} is in {} and in {}: neither is written over", from.display(), to.display()),
+            Self::Refused { session, step } => write!(f, "conversation {session}'s record: {step}"),
+            Self::Unnamed { session, folder } => write!(f, "conversation {session}: the harness's project for {folder} couldn't be named"),
+        }
+    }
+}
+
+/// Harness `kind`'s record of conversation `session` moved from the project the harness keeps for folder `from` (an
+/// ended agent's mount) to the one it keeps for folder `to` (its person's folder), where they resume it: the reverse of
+/// [`rehome`]. Whether anything moved.
+pub fn return_home(kind: &str, dirs: &Dirs, session: &str, from: &str, to: &str) -> Result<bool, NotMoved> {
+    match kind {
+        "claude" => {
+            let config = dirs.claude();
+            move_claude(session, &super::handoff::claude_project_dir(&config, from), &super::handoff::claude_project_dir(&config, to), false)
+        }
+        "gemini" => {
+            let gemini = dirs.gemini();
+            let Some(id) = gemini_known(&gemini, &gemini_key(from)) else { return Ok(false) };
+            move_gemini(&gemini, session, &gemini.join("tmp").join(id).join("chats"), to)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Harness `kind`'s own record of conversation `session` moved to where the harness looks for it from folder `cwd`, a
 /// conversation taken up there (on its agent's volume, at the mount: kiln goal 01a1ec34599974448aed2672bafaf9a2, I12):
 /// Claude Code's transcript to the project folder it keeps for `cwd` (`--resume` looks there alone), Gemini CLI's chat
-/// to the project it keeps for `cwd` (`session/load` looks among that project's chats). One record of it, not two, as a
-/// move to another machine keeps it (`super::moving::install`). Codex goes on by its thread's id, given the folder
-/// (`thread/resume`'s `cwd`), and an ACP agent is given the folder in `session/load`: nothing of theirs moves. Whether
-/// anything moved; why not, where a record of it is in both places already or a move was refused.
-pub fn rehome(kind: &str, dirs: &Dirs, session: &str, cwd: &str) -> Result<bool, String> {
+/// to the project it keeps for `cwd` (`session/load` looks among that project's chats), from wherever it is. One record
+/// of it, not two, as a move to another machine keeps it (`super::moving::install`). Codex goes on by its thread's id,
+/// given the folder (`thread/resume`'s `cwd`), and an ACP agent is given the folder in `session/load`: nothing of theirs
+/// moves. Whether anything moved.
+pub fn rehome(kind: &str, dirs: &Dirs, session: &str, cwd: &str) -> Result<bool, NotMoved> {
     match kind {
-        "claude" => rehome_claude(&dirs.claude(), session, cwd, false),
-        "gemini" => rehome_gemini(&dirs.gemini(), session, cwd),
+        "claude" => {
+            let config = dirs.claude();
+            let Some(from) = super::transcript::find(&config, session).and_then(|t| t.parent().map(Path::to_path_buf)) else { return Ok(false) };
+            move_claude(session, &from, &super::handoff::claude_project_dir(&config, cwd), false)
+        }
+        "gemini" => {
+            let gemini = dirs.gemini();
+            let Some((_, chats)) = gemini_chat(&gemini, session) else { return Ok(false) };
+            move_gemini(&gemini, session, &chats, cwd)
+        }
         _ => Ok(false),
     }
 }
@@ -887,71 +934,91 @@ pub fn rehome(kind: &str, dirs: &Dirs, session: &str, cwd: &str) -> Result<bool,
 /// [`rehome`] for a branch of the conversation (Claude Code's `--fork-session`, the only harness kiln branches from a
 /// record it moves): a copy of its transcript where the harness looks from `cwd`, the conversation itself left where it
 /// was, as the person may go on with it there.
-pub fn rehome_branch(kind: &str, dirs: &Dirs, session: &str, cwd: &str) -> Result<bool, String> {
+pub fn rehome_branch(kind: &str, dirs: &Dirs, session: &str, cwd: &str) -> Result<bool, NotMoved> {
     match kind {
-        "claude" => rehome_claude(&dirs.claude(), session, cwd, true),
+        "claude" => {
+            let config = dirs.claude();
+            let Some(from) = super::transcript::find(&config, session).and_then(|t| t.parent().map(Path::to_path_buf)) else { return Ok(false) };
+            move_claude(session, &from, &super::handoff::claude_project_dir(&config, cwd), true)
+        }
         _ => Ok(false),
     }
 }
 
-/// Claude Code's transcript of `session` (and, moved, the folder of its session's own files beside it, `<session>/`:
-/// its subagents' transcripts and tool results) put in the project folder Claude Code keeps for `cwd` under `config`,
-/// from the one it's in; `copy`: a copy of the transcript alone, the original left. A record already in both is
-/// written over in neither.
-fn rehome_claude(config: &Path, session: &str, cwd: &str, copy: bool) -> Result<bool, String> {
-    let Some(transcript) = super::transcript::find(config, session) else { return Ok(false) };
-    let to = super::handoff::claude_project_dir(config, cwd);
-    let Some(from) = transcript.parent().map(Path::to_path_buf) else { return Ok(false) };
+/// Whether `session` is a conversation's id as the harnesses write them (letters, digits, `-` and `_`): nothing else
+/// names a file kiln moves.
+fn conversation_id(session: &str) -> bool {
+    !session.is_empty() && session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Claude Code's transcript of `session` in project folder `from` (and, moved, the folder of its session's own files
+/// beside it, `<session>/`: its subagents' transcripts and tool results) put in project folder `to`; `copy`: a copy of
+/// the transcript alone, the original left. Nothing in `from`: nothing moves. A record already in `to` is written over
+/// in neither place.
+fn move_claude(session: &str, from: &Path, to: &Path, copy: bool) -> Result<bool, NotMoved> {
+    let name = format!("{session}.jsonl");
+    let transcript = from.join(&name);
+    if !conversation_id(session) || from == to || !transcript.is_file() {
+        return Ok(false);
+    }
+    if to.join(&name).exists() {
+        return Err(NotMoved::InBoth { session: session.to_owned(), from: from.to_path_buf(), to: to.to_path_buf() });
+    }
+    let refused = |step: String| NotMoved::Refused { session: session.to_owned(), step };
+    std::fs::create_dir_all(to).map_err(|e| refused(format!("create {}: {e}", to.display())))?;
+    if copy {
+        std::fs::copy(&transcript, to.join(&name)).map_err(|e| refused(format!("copy {} to {}: {e}", transcript.display(), to.display())))?;
+        return Ok(true);
+    }
+    std::fs::rename(&transcript, to.join(&name)).map_err(|e| refused(format!("move {} to {}: {e}", transcript.display(), to.display())))?;
+    let own = from.join(session);
+    if own.is_dir() && !to.join(session).exists() {
+        std::fs::rename(&own, to.join(session)).map_err(|e| refused(format!("move {} to {}: {e}", own.display(), to.display())))?;
+    }
+    Ok(true)
+}
+
+/// Gemini CLI's chat of `session` in the chats folder `from` ([`gemini_chat_in`]) and its subagents' folder
+/// (`<session>/` there) moved to the chats of the project Gemini CLI keeps for `cwd` under `gemini` (named and marked as
+/// Gemini CLI names it, [`gemini_claim`]). Nothing in `from`: nothing moves. A chat already there is written over in
+/// neither place.
+fn move_gemini(gemini: &Path, session: &str, from: &Path, cwd: &str) -> Result<bool, NotMoved> {
+    if !conversation_id(session) {
+        return Ok(false);
+    }
+    let Some(chat) = gemini_chat_in(from, session) else { return Ok(false) };
+    let id = gemini_claim(gemini, &gemini_key(cwd)).ok_or_else(|| NotMoved::Unnamed { session: session.to_owned(), folder: cwd.to_owned() })?;
+    let to = gemini.join("tmp").join(id).join("chats");
+    let Some(name) = chat.file_name().map(std::ffi::OsStr::to_os_string) else { return Ok(false) };
     if from == to {
         return Ok(false);
     }
-    let name = format!("{session}.jsonl");
     if to.join(&name).exists() {
-        return Err(format!("Claude Code keeps session {session} in {} and in {}: neither is written over", from.display(), to.display()));
+        return Err(NotMoved::InBoth { session: session.to_owned(), from: from.to_path_buf(), to });
     }
-    std::fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
-    if copy {
-        std::fs::copy(&transcript, to.join(&name)).map_err(|e| format!("copy {} to {}: {e}", transcript.display(), to.display()))?;
-        return Ok(true);
-    }
-    std::fs::rename(&transcript, to.join(&name)).map_err(|e| format!("move {} to {}: {e}", transcript.display(), to.display()))?;
+    let refused = |step: String| NotMoved::Refused { session: session.to_owned(), step };
+    std::fs::create_dir_all(&to).map_err(|e| refused(format!("create {}: {e}", to.display())))?;
+    std::fs::rename(&chat, to.join(&name)).map_err(|e| refused(format!("move {} to {}: {e}", chat.display(), to.display())))?;
     let own = from.join(session);
     if own.is_dir() && !to.join(session).exists() {
-        std::fs::rename(&own, to.join(session)).map_err(|e| format!("move {} to {}: {e}", own.display(), to.display()))?;
+        std::fs::rename(&own, to.join(session)).map_err(|e| refused(format!("move {} to {}: {e}", own.display(), to.display())))?;
     }
     Ok(true)
 }
 
-/// Gemini CLI's chat of `session` ([`gemini_chat`]) and its subagents' folder (`chats/<session>/`) moved to the chats of
-/// the project Gemini CLI keeps for `cwd` under `gemini` (named and marked as Gemini CLI names it, [`gemini_claim`]),
-/// from the project they're in. A chat already there is written over in neither.
-fn rehome_gemini(gemini: &Path, session: &str, cwd: &str) -> Result<bool, String> {
-    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Ok(false);
-    }
-    let Some((chat, chats)) = gemini_chat(gemini, session) else { return Ok(false) };
-    let id = gemini_claim(gemini, &gemini_key(cwd)).ok_or_else(|| format!("Gemini CLI's project for {cwd} couldn't be named under {}", gemini.display()))?;
-    let to = gemini.join("tmp").join(id).join("chats");
-    if chats == to {
-        return Ok(false);
-    }
-    let Some(name) = chat.file_name() else { return Ok(false) };
-    if to.join(name).exists() {
-        return Err(format!("Gemini CLI keeps session {session} in {} and in {}: neither is written over", chats.display(), to.display()));
-    }
-    std::fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
-    std::fs::rename(&chat, to.join(name)).map_err(|e| format!("move {} to {}: {e}", chat.display(), to.display()))?;
-    let own = chats.join(session);
-    if own.is_dir() && !to.join(session).exists() {
-        std::fs::rename(&own, to.join(session)).map_err(|e| format!("move {} to {}: {e}", own.display(), to.display()))?;
-    }
-    Ok(true)
-}
-
-/// Gemini CLI's chat of `session` under `gemini`, and the chats folder it's in: in a project's chats, a file named for the
-/// session (`session-<time>-<its id's first 8>.jsonl`, or `.json` before Gemini CLI wrote lines) whose record names it
-/// (`sessionId`: the first line's, or the whole file's for a `.json`, read up to [`MAX_FILE`]).
+/// Gemini CLI's chat of `session` under `gemini`, and the chats folder it's in, in whichever project holds it
+/// ([`gemini_chat_in`]).
 fn gemini_chat(gemini: &Path, session: &str) -> Option<(PathBuf, PathBuf)> {
+    std::fs::read_dir(gemini.join("tmp")).ok()?.flatten().find_map(|project| {
+        let chats = project.path().join("chats");
+        gemini_chat_in(&chats, session).map(|chat| (chat, chats))
+    })
+}
+
+/// Gemini CLI's chat of `session` in a project's chats folder `chats`: a file named for the session
+/// (`session-<time>-<its id's first 8>.jsonl`, or `.json` before Gemini CLI wrote lines) whose record names it
+/// (`sessionId`: the first line's, or the whole file's for a `.json`, read up to [`MAX_FILE`]).
+fn gemini_chat_in(chats: &Path, session: &str) -> Option<PathBuf> {
     let short = session.get(..8).unwrap_or(session);
     let names_it = |path: &Path, lines: bool| -> bool {
         let text = if lines {
@@ -969,22 +1036,15 @@ fn gemini_chat(gemini: &Path, session: &str) -> Option<(PathBuf, PathBuf)> {
         };
         serde_json::from_str::<Value>(text.trim()).ok().and_then(|v| v.get("sessionId").and_then(Value::as_str).map(str::to_owned)).as_deref() == Some(session)
     };
-    for project in std::fs::read_dir(gemini.join("tmp")).ok()?.flatten() {
-        let chats = project.path().join("chats");
-        let Ok(files) = std::fs::read_dir(&chats) else { continue };
-        for file in files.flatten() {
-            let name = file.file_name().to_string_lossy().into_owned();
-            let (stem, lines) = match (name.strip_suffix(".jsonl"), name.strip_suffix(".json")) {
-                (Some(stem), _) => (stem, true),
-                (None, Some(stem)) => (stem, false),
-                (None, None) => continue,
-            };
-            if stem.starts_with("session-") && stem.ends_with(short) && names_it(&file.path(), lines) {
-                return Some((file.path(), chats));
-            }
-        }
-    }
-    None
+    std::fs::read_dir(chats).ok()?.flatten().map(|file| file.path()).find(|path| {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let (stem, lines) = match (name.strip_suffix(".jsonl"), name.strip_suffix(".json")) {
+            (Some(stem), _) => (stem.to_owned(), true),
+            (None, Some(stem)) => (stem.to_owned(), false),
+            (None, None) => return false,
+        };
+        stem.starts_with("session-") && stem.ends_with(short) && names_it(path, lines)
+    })
 }
 
 /// Put `home` (from machine `from`) where harness `kind` looks for it on this machine, for session
@@ -1188,6 +1248,67 @@ mod tests {
         let ours = super::super::handoff::claude_project_dir(&config, "/state/workspaces/kiln-b");
         assert!(ours.join(format!("{session}.jsonl")).is_file() && theirs.join(format!("{session}.jsonl")).is_file(), "a copy in the mount's project, the conversation where it was");
         assert_eq!(rehome_branch("codex", &dirs, session, "/state/workspaces/kiln-b"), Ok(false), "Codex branches its thread by id");
+        Ok(())
+    }
+
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2): an ended agent's Claude Code conversation goes
+    /// back from the project folder Claude Code kept for its mount's folder to its person's folder's, where they resume
+    /// it: its transcript and its session's own files; a branch's copy of another conversation stays where it is.
+    #[test]
+    fn w2_an_ended_agents_claude_conversation_goes_back_to_its_persons_project() -> anyhow::Result<()> {
+        let t = tempfile::tempdir()?;
+        let config = t.path().join(".claude");
+        let dirs = Dirs::at(t.path(), &[("CLAUDE_CONFIG_DIR".to_owned(), config.to_string_lossy().into_owned())]);
+        let (mount, person) = ("/state/workspaces/kiln-a/src", "/Users/person/project/src");
+        let (session, copied) = ("2e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b", "3e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b");
+        let ours = super::super::handoff::claude_project_dir(&config, mount);
+        put(&ours.join(format!("{session}.jsonl")), "{\"cwd\":\"/state/workspaces/kiln-a/src\"}\n")?;
+        put(&ours.join(session).join("subagents").join("agent-a.jsonl"), "{}\n")?;
+        put(&ours.join(format!("{copied}.jsonl")), "{}\n")?;
+        assert_eq!(return_home("claude", &dirs, session, mount, person), Ok(true));
+        let theirs = super::super::handoff::claude_project_dir(&config, person);
+        assert!(theirs.join(format!("{session}.jsonl")).is_file() && theirs.join(session).join("subagents").join("agent-a.jsonl").is_file(), "back in the person's project");
+        assert!(!ours.join(format!("{session}.jsonl")).exists() && !ours.join(session).exists(), "none left in the mount's");
+        assert!(ours.join(format!("{copied}.jsonl")).is_file(), "a branch's copy stays where it is");
+        assert_eq!(return_home("claude", &dirs, session, mount, person), Ok(false), "back already");
+        Ok(())
+    }
+
+    /// W2: a conversation the person's folder's project already holds a record of isn't moved back over it: both stay as
+    /// they are, and the refusal names both places.
+    #[test]
+    fn w2_a_conversation_that_cant_go_back_leaves_both_records_and_says_so() -> anyhow::Result<()> {
+        let t = tempfile::tempdir()?;
+        let config = t.path().join(".claude");
+        let dirs = Dirs::at(t.path(), &[("CLAUDE_CONFIG_DIR".to_owned(), config.to_string_lossy().into_owned())]);
+        let (mount, person, session) = ("/state/workspaces/kiln-a", "/Users/person/project", "4e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b");
+        let (ours, theirs) = (super::super::handoff::claude_project_dir(&config, mount), super::super::handoff::claude_project_dir(&config, person));
+        put(&ours.join(format!("{session}.jsonl")), "ours\n")?;
+        put(&theirs.join(format!("{session}.jsonl")), "theirs\n")?;
+        let refused = return_home("claude", &dirs, session, mount, person);
+        assert_eq!(refused, Err(NotMoved::InBoth { session: session.to_owned(), from: ours.clone(), to: theirs.clone() }));
+        assert_eq!((std::fs::read_to_string(ours.join(format!("{session}.jsonl")))?, std::fs::read_to_string(theirs.join(format!("{session}.jsonl")))?), ("ours\n".to_owned(), "theirs\n".to_owned()), "both stay as they were");
+        Ok(())
+    }
+
+    /// W2: an ended agent's Gemini CLI conversation goes back from the project Gemini CLI kept for its mount's folder to
+    /// the one it keeps for its person's folder: its chat and its subagents' folder.
+    #[test]
+    fn w2_an_ended_agents_gemini_conversation_goes_back_to_its_persons_project() -> anyhow::Result<()> {
+        let t = tempfile::tempdir()?;
+        let g = t.path().join(".gemini");
+        let dirs = Dirs::at(t.path(), &[]);
+        let (mount, person, session) = ("/state/workspaces/kiln-a", "/Users/person/project", "8f3e2d1c-0b9a-4876-a5b4-c3d2e1f0a9b8");
+        let id = gemini_claim(&g, &gemini_key(mount)).ok_or_else(|| anyhow::anyhow!("no project for the mount"))?;
+        let ours = g.join("tmp").join(&id).join("chats");
+        let file = format!("session-2026-11-18T11-00-{}.jsonl", session.get(..8).unwrap_or(session));
+        put(&ours.join(&file), &format!("{{\"sessionId\":\"{session}\"}}\n"))?;
+        put(&ours.join(session).join("sub.jsonl"), "{}\n")?;
+        assert_eq!(return_home("gemini", &dirs, session, mount, person), Ok(true));
+        let home = gemini_known(&g, &gemini_key(person)).ok_or_else(|| anyhow::anyhow!("no project for the person's folder"))?;
+        let theirs = g.join("tmp").join(&home).join("chats");
+        assert!(theirs.join(&file).is_file() && theirs.join(session).join("sub.jsonl").is_file(), "{home}: back in the person's project");
+        assert!(!ours.join(&file).exists() && !ours.join(session).exists(), "none left in the mount's");
         Ok(())
     }
 
