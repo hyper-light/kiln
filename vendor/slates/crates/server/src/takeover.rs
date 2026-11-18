@@ -50,12 +50,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::{ClusterError, CommitBudget, broadcast, commit_record};
 use slates_db::register::{
-  Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, Lineage, ObjectId,
-  Placement, Record, RegionalConfiguration, RegisterError, encode_refusal,
+  Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, LedgerPrepare,
+  LedgerPromise, Lineage, ObjectId, Placement, Record, RegionalConfiguration, RegisterError,
+  encode_refusal,
 };
 use slates_db::takeover::{
-  CountingRule, Heard, Readiness, answer_by_name, copy_falls_to, falls_to as falls_by_authority,
-  promise_object, readiness,
+  CountingRule, Heard, LedgerAnswered, Readiness, answer_by_name, answer_ledger, copy_falls_to,
+  falls_to as falls_by_authority, ledger_positions, promise_object, readiness,
 };
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
@@ -67,6 +68,29 @@ use crate::state::{self, ShardState};
 /// Format: the stream id a successor's takeover page rides on a record session — distinct from every other
 /// stream the session multiplexes (1–15), so `serve_peer_records` dispatches it by its stream.
 pub(crate) const TAKEOVER_STREAM: u64 = 16;
+
+/// The record-session stream a successor asks a ledger's positions over (A-364; [`LedgerPrepare`],
+/// [`serve_ledger_prepare`]): a green's merge-record log adopted position by position.
+/// Format: a record-session stream id, the next free one when A-364 took it; ids are never reused or renumbered.
+pub(crate) const TAKEOVER_LEDGER_STREAM: u64 = 28;
+
+/// Counter: positions of a ledger a successor adopted and committed again under its own epoch (A-364,
+/// [`adopt_ledger_positions`]): each one a version's record it lacked below the version its round adopted.
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_LEDGER_POSITIONS_ADOPTED: &str = "fleet.takeover.ledger_positions_adopted";
+/// Counter: a ledger question a holder refused (another successor, another round, or a promise refused for any reason
+/// but a higher fence; [`serve_ledger_prepare`]). Format: a counter name in the daemon's status report.
+const TAKEOVER_LEDGER_REFUSED: &str = "fleet.takeover.ledger_refused";
+/// Counter: a successor's ledger question found no round of the retired host here to ask under (its share confirmed
+/// and the retirement gone, or a new configuration it has not started over under). Format: a counter name in the
+/// daemon's status report.
+const TAKEOVER_LEDGER_NO_ROUND: &str = "fleet.takeover.ledger_no_round";
+/// Counter: a ledger question answered with a fence above the round's epoch: the round starts over above it.
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_LEDGER_FENCED: &str = "fleet.takeover.ledger_fenced";
+/// Counter: a ledger's positions not adopted whole this period: a position's cohorts had not all promised it, or none
+/// that did reported a value there. Format: a counter name in the daemon's status report.
+const TAKEOVER_LEDGER_WAITING: &str = "fleet.takeover.ledger_waiting";
 
 /// The status refusal count under which a holder records a takeover page it refused: bytes that are no
 /// request, a request whose asker is not the session's peer, or one naming a host this holder has no kept
@@ -153,8 +177,17 @@ const TAKEOVER_RECLAIMED: &str = "fleet.takeover.reclaimed";
 
 /// The status count under which a holder records a copy it kept though its line ended at a completed takeover, or its
 /// successor confirmed with this holder outside its placement: the takeover never asked this holder (it was no survivor
-/// of it), so nothing shows its copy adopted (A-309). Format: a refusal name in the daemon's status report.
+/// of it), and nothing shows the object recovered within tolerance (past it, or judged by a completion record, which
+/// keeps no neighbourhood), so its copy may be the only one of a record no round learned (A-309, A-341). Format: a
+/// refusal name in the daemon's status report.
 const TAKEOVER_KEPT_UNASKED: &str = "fleet.takeover.kept_unasked";
+
+/// The status count under which a holder records a copy the takeover never asked it for, let go as a stale one is
+/// ([`let_go_stale`]) because its successor confirmed with this holder outside its placement and the kept retirement
+/// shows the object's settled cohorts within tolerance (`RegionalConfiguration::within_tolerance`): the round heard a
+/// recovery quorum of each, and every record committed for the object is on `f + 1` of each, so it learned one at least
+/// as new as this copy (A-341). Format: a refusal name in the daemon's status report.
+const TAKEOVER_UNASKED_COVERED: &str = "fleet.takeover.unasked_covered";
 
 /// The status count under which a holder records a stale copy it kept because it still holds the copy's content
 /// (A-335): content its records name it for, or content placed for a sequence ahead of them, which its retention rule
@@ -237,6 +270,11 @@ pub struct HostTakeover {
   /// held alive at a newer one, it has been heard since, and a round that gave objects up starts over
   /// ([`HostTakeover::heard_since`], A-351).
   judged_incarnation: u64,
+  /// When this node began the round, on the shard's clock, kept across a restart: the takeover's recovery is timed from
+  /// here to its share done, into the failover estimate (A-363).
+  began_ns: u64,
+  /// Whether that recovery has been timed: a share stays done while its retirement completes, and is timed once.
+  timed: bool,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -279,8 +317,9 @@ struct Page {
 }
 
 impl HostTakeover {
-  /// A round under `generation` at `epoch`, having asked nothing yet, its retired host held at `incarnation`.
-  fn new(generation: u64, epoch: HostEpoch, incarnation: u64) -> HostTakeover {
+  /// A round under `generation` at `epoch`, having asked nothing yet, its retired host held at `incarnation`, begun at
+  /// `began_ns` on the shard's clock.
+  fn new(generation: u64, epoch: HostEpoch, incarnation: u64, began_ns: u64) -> HostTakeover {
     HostTakeover {
       generation,
       epoch,
@@ -294,7 +333,19 @@ impl HostTakeover {
       given_up: BTreeSet::new(),
       past_tolerance: BTreeMap::new(),
       judged_incarnation: incarnation,
+      began_ns,
+      timed: false,
     }
+  }
+
+  /// Times this round's recovery into `failover` the first time its share is done, at `now_ns`: from its beginning,
+  /// however many times a new configuration started it over (A-363). Later calls fold nothing.
+  fn time_done(&mut self, now_ns: u64, failover: &mut slates_cluster::failover::Failover) {
+    if self.timed {
+      return;
+    }
+    self.timed = true;
+    failover.takeover_done(now_ns.saturating_sub(self.began_ns));
   }
 
   /// Starts the round over at `generation` and `epoch`, its retired host held at `incarnation`: every promise was for
@@ -412,8 +463,10 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
   }
 }
 
-/// Brings every object this holder holds to the owner the committed configuration names for it (§4.8), run on
-/// the control shard at each install, before the held acceptors' authority is reconciled to their owners:
+/// Brings every object this holder holds to the owner the committed configuration names for it (§4.8), before the held
+/// acceptors' authority is reconciled to their owners; an install's walk does it a copy a turn
+/// ([`resolve_held_object`], `fleet::install_on_copy`, A-398), and this whole pass is that walk's oracle in the daemon's
+/// unit tests:
 ///
 /// - an object whose owner a kept retirement names is moved to the successor its lineage ranks, and remembers
 ///   the retired host whose takeover it is recovered in (`departed_owners`, the lease gate's record);
@@ -421,54 +474,73 @@ pub(crate) fn track_owner_on_every_shard(state: &mut ShardState, object: ObjectI
 ///   took part in that takeover (`RegionalConfiguration::settled_for`), as is one whose successor has confirmed its
 ///   share while this holder, asked in that round, is outside the successor's placement (the successor's adoption never
 ///   reaches it); a stale copy is dropped unless this holder still holds its content, which the successor may still
-///   fetch from it ([`let_go_stale`], A-335); a holder the round never asked keeps its copy, counted (A-309);
+///   fetch from it ([`let_go_stale`], A-335); a holder the round never asked keeps its copy, counted (A-309), unless the
+///   kept retirement shows the object's settled cohorts within tolerance, when it goes the same way (A-341);
 /// - an object no survivor can recover is left as it is, counted by the successor that learns it.
+#[cfg(test)]
 pub(crate) fn resolve_held_objects(state: &mut ShardState, local: HostId) {
   let regional = state.council.configuration().clone();
   let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
   for object in held {
-    let Some(owner) = state.fleet.object_owner(object) else {
-      continue;
-    };
-    if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
-      match stale_after_confirmation(state, &regional, object, owner, local) {
-        Confirmation::Stale => let_go_stale(state, object),
-        Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
-        Confirmation::None => {}
+    resolve_held_object(state, local, &regional, object);
+  }
+}
+
+/// [`resolve_held_objects`] for one held copy, `object`'s, under `regional`: the walk of an install takes the copies a
+/// slice a turn (`fleet::install_on_copy`, A-398), and this whole pass is its oracle in the daemon's unit tests.
+pub(crate) fn resolve_held_object(
+  state: &mut ShardState,
+  local: HostId,
+  regional: &RegionalConfiguration,
+  object: ObjectId,
+) {
+  let Some(owner) = state.fleet.object_owner(object) else {
+    return;
+  };
+  if regional.members.contains(&owner) && !regional.retired.contains_key(&owner) {
+    match stale_after_confirmation(state, regional, object, owner, local) {
+      Confirmation::Stale => let_go_stale(state, object),
+      Confirmation::Covered => {
+        state.count(TAKEOVER_UNASKED_COVERED, 1);
+        let_go_stale(state, object);
       }
-      continue;
+      Confirmation::Unasked => state.count(TAKEOVER_KEPT_UNASKED, 1),
+      Confirmation::None => {}
     }
-    match regional.lineage(owner, object) {
-      Lineage::Successor {
-        departed,
-        successor,
-      } => {
-        track_owner_on_every_shard(state, object, successor);
-        let since_version = regional
-          .retired
-          .get(&departed)
-          .map_or(regional.version, |retirement| retirement.version);
-        state.departed_owners.insert(
-          object,
-          crate::lease::DepartedOwner {
-            owner: departed,
-            since_version,
-          },
-        );
-      }
-      // Lost or unresolved: nothing shows the object adopted anywhere, so this holder keeps its copy (A-272), counted so
-      // it shows what it keeps that no takeover will recover (A-340).
-      Lineage::Lost => state.count(TAKEOVER_KEPT_LOST, 1),
-      Lineage::Unresolved => state.count(TAKEOVER_KEPT_UNRESOLVED, 1),
-      Lineage::Settled { takeover } => {
-        if regional.settled_for(takeover, local) {
-          let_go_stale(state, object);
-        } else {
-          state.count(TAKEOVER_KEPT_UNASKED, 1);
-        }
+    return;
+  }
+  match regional.lineage(owner, object) {
+    Lineage::Successor {
+      departed,
+      successor,
+    } => {
+      track_owner_on_every_shard(state, object, successor);
+      let since_version = regional
+        .retired
+        .get(&departed)
+        .map_or(regional.version, |retirement| retirement.version);
+      state.departed_owners.insert(
+        object,
+        crate::lease::DepartedOwner {
+          owner: departed,
+          since_version,
+        },
+      );
+    }
+    // Lost or unresolved: nothing shows the object adopted anywhere, so this holder keeps its copy (A-272), counted so
+    // it shows what it keeps that no takeover will recover (A-340).
+    Lineage::Lost => state.count(TAKEOVER_KEPT_LOST, 1),
+    Lineage::Unresolved => state.count(TAKEOVER_KEPT_UNRESOLVED, 1),
+    Lineage::Settled { takeover } => {
+      if regional.settled_for(takeover, local) {
+        let_go_stale(state, object);
+      } else {
+        state.count(TAKEOVER_KEPT_UNASKED, 1);
       }
     }
   }
+  // A copy the configuration moved to another member (A-291) follows its move.
+  crate::moves::follow_moved_objects(state);
 }
 
 /// Lets a stale copy of `object` go ([`reclaim`]) unless this holder still holds content for it once its retention
@@ -493,7 +565,10 @@ fn let_go_stale(state: &mut ShardState, object: ObjectId) {
 /// was asked in that round (one of its survivors, A-309), so `owner` learned this copy and adopted the object, and this
 /// holder is outside `owner`'s placement of it, so the adoption never reaches this copy. A holder the round never asked
 /// (one an earlier neighbourhood of the retired host reached) keeps its copy: `owner` may have confirmed without ever
-/// learning the object (`crates/db/tests/lineage_model.rs` found it). The confirmation is read from the kept retirement
+/// learning the object (`crates/db/tests/lineage_model.rs` found it), unless the kept retirement shows the object's
+/// settled cohorts within tolerance, so the round learned a record at least as new (A-341; past tolerance, or judged by
+/// a completion record alone, the model found a history that let go the last copy of a record placed at `f + 1` after
+/// one failure). The confirmation is read from the kept retirement
 /// or, once the takeover completed, from its completion record (A-309): the last confirmation drops the retirement in
 /// the very version that records it, and judged by the kept retirement alone a holder outside the placement never saw
 /// that confirmation and kept its stale copy for good.
@@ -532,6 +607,7 @@ fn stale_after_confirmation(
       .is_some_and(|placement| !placement.place(object).candidates.contains(&local));
   match (outside, asked) {
     (true, true) => Confirmation::Stale,
+    (true, false) if regional.within_tolerance(departed.owner, object) => Confirmation::Covered,
     (true, false) => Confirmation::Unasked,
     (false, _) => Confirmation::None,
   }
@@ -541,8 +617,12 @@ fn stale_after_confirmation(
 enum Confirmation {
   /// The successor confirmed its share and this holder, outside its placement, was asked in that round: stale.
   Stale,
-  /// The successor confirmed and this holder is outside its placement, but the round never asked it: kept, counted
-  /// [`TAKEOVER_KEPT_UNASKED`] (A-309).
+  /// The successor confirmed and this holder is outside its placement, and the round never asked it, but the kept
+  /// retirement shows the object's settled cohorts within tolerance: stale too, counted [`TAKEOVER_UNASKED_COVERED`]
+  /// (A-341).
+  Covered,
+  /// The successor confirmed and this holder is outside its placement, but the round never asked it and nothing shows
+  /// the object recovered within tolerance: kept, counted [`TAKEOVER_KEPT_UNASKED`] (A-309).
   Unasked,
   /// No confirmation that judges the copy: none yet, or this holder is within the successor's placement.
   None,
@@ -566,12 +646,20 @@ pub(crate) fn forget_owner_on_every_shard(state: &mut ShardState, object: Object
   }
 }
 
+/// Drops this holder's stale copy of `object` after a takeover ([`drop_copy`]). Reached only through [`let_go_stale`],
+/// once the retention rule left no whole content for the object here (A-335). Counted [`TAKEOVER_RECLAIMED`].
+fn reclaim(state: &mut ShardState, object: ObjectId) {
+  drop_copy(state, object);
+  let count = state.refusals.entry(TAKEOVER_RECLAIMED).or_insert(0);
+  *count = count.saturating_add(1);
+}
+
 /// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
 /// replica, and whatever content it held for the object, a partial stage included (AUD-29-43: a stale copy's bytes are
-/// reclaimed with its records, never kept for a head this holder no longer backs). Reached only through
-/// [`let_go_stale`], once the retention rule left no whole content for the object here (A-335). Counted
-/// [`TAKEOVER_RECLAIMED`].
-fn reclaim(state: &mut ShardState, object: ObjectId) {
+/// reclaimed with its records, never kept for a head this holder no longer backs). A takeover's reclaim ([`reclaim`])
+/// and a planned move's (A-291, `crate::moves::follow_moved_objects`, once the move's new owner has sealed the volume
+/// under its own placement, which leaves this holder out) both end a copy so.
+pub(crate) fn drop_copy(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
   state.held_content.forget_object(
     &mut crate::content_holder::hold_space(&mut state.store),
@@ -580,8 +668,8 @@ fn reclaim(state: &mut ShardState, object: ObjectId) {
   state.fleet.forget_object(object);
   state.departed_owners.remove(&object);
   state.merge.replicas.remove(&object);
-  let count = state.refusals.entry(TAKEOVER_RECLAIMED).or_insert(0);
-  *count = count.saturating_add(1);
+  // Its durable checkpoint goes with it (A-404).
+  crate::merge_service::forget_checkpoint(state, object);
 }
 
 /// Answers one page of a successor's takeover round on [`TAKEOVER_STREAM`] (§4.8): after checking the asker is
@@ -602,34 +690,12 @@ pub(crate) fn serve_host_prepare(
   let Ok(prepare) = HostPrepare::decode(request) else {
     return refuse(state);
   };
-  if prepare.owner != peer_host {
-    return refuse(state);
-  }
-  if state.injected_takeover_silence.contains(&peer_host) {
-    state.count(TAKEOVER_SILENCED_BY_FAULT, 1);
-    return Vec::new();
-  }
-  let installed = state.fleet.configuration().version;
-  if prepare.generation != installed || state.council.configuration().version != installed {
-    state.count(TAKEOVER_PAGE_UNMATCHED, 1);
-    if prepare.generation > installed {
-      state.config_refresh_wanted = true;
-      return Vec::new();
-    }
-    return encode_refusal(&RegisterError::ConfigurationStale { version: installed });
-  }
-  if !state
-    .council
-    .configuration()
-    .retired
-    .contains_key(&prepare.departed)
-  {
-    return refuse(state);
-  }
-  if !gate_open(state, prepare.departed) {
-    let count = state.refusals.entry(PROMOTION_DEFERRED).or_insert(0);
-    *count = count.saturating_add(1);
-    return Vec::new();
+  if let Some(refused) = question_refused(
+    state,
+    peer_host,
+    (prepare.owner, prepare.departed, prepare.generation),
+  ) {
+    return refused;
   }
   let page = if prepare.named.is_empty() {
     list_page(state, local, &prepare)
@@ -645,6 +711,91 @@ pub(crate) fn serve_host_prepare(
     return Vec::new();
   }
   page.encode()
+}
+
+/// Whether a holder answers a takeover question from `peer_host` naming `owner` as the asker, `departed` the retired host
+/// and `generation` the round's configuration: `None` when it does, else the reply it gives instead. Every takeover
+/// question goes through it ([`serve_host_prepare`], [`serve_ledger_prepare`]): the asker is the authenticated peer; a
+/// question a test's fault silences gets nothing; a generation other than this holder's is refused
+/// `ConfigurationStale` (or, a newer one, nothing while this holder fetches it); the retired host must be retired here;
+/// and the lease gate must be open ([`gate_open`]), else nothing, counted deferred.
+fn question_refused(
+  state: &mut ShardState,
+  peer_host: HostId,
+  (owner, departed, generation): (HostId, HostId, u64),
+) -> Option<Vec<u8>> {
+  if owner != peer_host {
+    return Some(refuse(state));
+  }
+  if state.injected_takeover_silence.contains(&peer_host) {
+    state.count(TAKEOVER_SILENCED_BY_FAULT, 1);
+    return Some(Vec::new());
+  }
+  let installed = state.fleet.configuration().version;
+  if generation != installed || state.council.configuration().version != installed {
+    state.count(TAKEOVER_PAGE_UNMATCHED, 1);
+    if generation > installed {
+      state.config_refresh_wanted = true;
+      return Some(Vec::new());
+    }
+    return Some(encode_refusal(&RegisterError::ConfigurationStale {
+      version: installed,
+    }));
+  }
+  if !state
+    .council
+    .configuration()
+    .retired
+    .contains_key(&departed)
+  {
+    return Some(refuse(state));
+  }
+  if !gate_open(state, departed) {
+    let count = state.refusals.entry(PROMOTION_DEFERRED).or_insert(0);
+    *count = count.saturating_add(1);
+    return Some(Vec::new());
+  }
+  None
+}
+
+/// A holder's answer to a successor's ledger question (A-364; §4.8 "For each ledger position"): admitted as a page is
+/// ([`question_refused`]), answered from this holder's own records ([`answer_ledger`]: the asker the ledger's successor,
+/// the copy in this round, the object promised at the round's epoch, then every position it accepted in the asked range,
+/// paged by the frame), and given only once the shard's publish keeps the raised fence (§4.8 persistence before reply).
+/// A refused answer is nothing, counted.
+pub(crate) fn serve_ledger_prepare(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  let Ok(prepare) = LedgerPrepare::decode(request) else {
+    return refuse(state);
+  };
+  if let Some(refused) = question_refused(
+    state,
+    peer_host,
+    (prepare.owner, prepare.departed, prepare.generation),
+  ) {
+    return refused;
+  }
+  let regional = state.council.configuration().clone();
+  let Some(promise) = answer_ledger(
+    local,
+    &prepare,
+    &regional,
+    &mut state.holder_records,
+    page_budget(),
+  ) else {
+    state.count(TAKEOVER_LEDGER_REFUSED, 1);
+    return Vec::new();
+  };
+  if crate::verbs::publish_shard(state).is_err() {
+    let count = state.refusals.entry(PROMISE_UNPUBLISHED).or_insert(0);
+    *count = count.saturating_add(1);
+    return Vec::new();
+  }
+  promise.encode()
 }
 
 /// Counter: copies a page listed, or a successor learned of its own, by the owner an install moved their authority from
@@ -858,6 +1009,15 @@ async fn drive_host_takeover(
   let past = state::with_state(|s| unpromised_past_the_bound(s, departed)).unwrap_or_default();
   give_up_unpromised(departed, past, local).await;
   let done = state::with_state(|s| round_done(s, departed, local)).unwrap_or(false);
+  if done {
+    // The share is done: its takeover's recovery is a sample of the failover estimate, folded once (A-363), whether or
+    // not its confirmation is withheld below.
+    let _ = state::with_state_counted(|s| {
+      if let Some(take) = s.host_takeovers.get_mut(&departed) {
+        take.time_done(slates_rt::futures::now_ns(), &mut s.failover);
+      }
+    });
+  }
   // Test support: a confirmation withheld, as one late to commit leaves the share owed (A-353).
   let withheld = done
     && state::with_state(|s| {
@@ -904,10 +1064,14 @@ pub(crate) fn begin_round(
   };
   let held = state.fleet.membership().state(departed);
   let incarnation = held.map_or(0, |held| held.incarnation);
-  let take = state
-    .host_takeovers
-    .entry(departed)
-    .or_insert_with(|| HostTakeover::new(regional.version, first_epoch, incarnation));
+  let take = state.host_takeovers.entry(departed).or_insert_with(|| {
+    HostTakeover::new(
+      regional.version,
+      first_epoch,
+      incarnation,
+      slates_rt::futures::now_ns(),
+    )
+  });
   let mut restarted = false;
   if take.generation != regional.version {
     let epoch = take.epoch.max(first_epoch);
@@ -1233,7 +1397,7 @@ pub(crate) fn ready_objects(
   if local_promises {
     answer_own_copies_by_name(state, departed, local, &regional);
   }
-  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  let bound = crate::fleet::takeover_attempts(state.failover_ns);
   let Some(take) = state.host_takeovers.get_mut(&departed) else {
     return Vec::new();
   };
@@ -1355,7 +1519,7 @@ pub(crate) fn unpromised_past_the_bound(
   state: &ShardState,
   departed: HostId,
 ) -> Vec<(ObjectId, u32)> {
-  let bound = crate::fleet::takeover_attempts(state.config.failover_slo_ns);
+  let bound = crate::fleet::takeover_attempts(state.failover_ns);
   state
     .host_takeovers
     .get(&departed)
@@ -1674,7 +1838,73 @@ async fn adopt(
   local: HostId,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
-  let (mut acceptor, shape, quorum, record) = state::with_state(|s| {
+  let (dispatch, record, placement) =
+    commit_adopted(departed, object, adopted, local, budget).await?;
+  state::with_state(|s| match placement {
+    Ok(placement) => record_adoption(s, departed, object, &record, placement, local),
+    Err(unplaced_cause) => {
+      s.count(TAKEOVER_ADOPT_UNPLACED, 1);
+      s.count(unplaced_cause, 1);
+    }
+  });
+  Some(dispatch)
+}
+
+/// Adopts `object` as [`adopt`] does, at `epoch`: a moved volume's adoption (A-291, `crate::moves`), whose round over
+/// the move's cohort is no takeover's, names its own epoch, and names this node as `departed` (no takeover round is kept
+/// for it). Returns the dispatch to settle and whether the record was placed.
+pub(crate) async fn adopt_at(
+  departed: HostId,
+  object: ObjectId,
+  adopted: Accepted,
+  epoch: HostEpoch,
+  local: HostId,
+  budget: CommitBudget,
+) -> (Option<Dispatch>, bool) {
+  let Some((dispatch, record, placement)) =
+    commit_adopted_at(object, adopted, epoch, local, budget).await
+  else {
+    return (None, false);
+  };
+  let placed = placement.is_ok();
+  state::with_state(|s| match placement {
+    Ok(placement) => record_adoption(s, departed, object, &record, placement, local),
+    Err(unplaced_cause) => {
+      s.count(TAKEOVER_ADOPT_UNPLACED, 1);
+      s.count(unplaced_cause, 1);
+    }
+  });
+  (Some(dispatch), placed)
+}
+
+/// Re-commits `adopted`, a record of `object` the round of `departed`'s takeover learned, under this node (`local`) at
+/// the round's epoch and the configuration's generation, on the object's placement (phase two of the takeover: the
+/// record accepted again under the new epoch, BUG-12), and keeps the acceptor that holds it. The dispatch whose
+/// stragglers the caller recovers, the record committed, and its placement when it placed at the quorum, else the
+/// counter naming why not. `None` when the round is gone. Shared by [`adopt`] (the newest record, then its adoption
+/// recorded) and [`adopt_ledger_positions`] (the positions of a ledger below it, A-364).
+async fn commit_adopted(
+  departed: HostId,
+  object: ObjectId,
+  adopted: Accepted,
+  local: HostId,
+  budget: CommitBudget,
+) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
+  let epoch =
+    state::with_state(|s| s.host_takeovers.get(&departed).map(|take| take.epoch)).flatten()?;
+  commit_adopted_at(object, adopted, epoch, local, budget).await
+}
+
+/// [`commit_adopted`] at `epoch`, the round's: a takeover's round names its own, and a moved volume's adoption (A-291,
+/// `crate::moves`) the epoch of its round over the move's cohort, which no takeover round is kept for.
+async fn commit_adopted_at(
+  object: ObjectId,
+  adopted: Accepted,
+  epoch: HostEpoch,
+  local: HostId,
+  budget: CommitBudget,
+) -> Option<(Dispatch, Record, Result<Placement, &'static str>)> {
+  let (mut acceptor, shape, quorum, record, replaces) = state::with_state(|s| {
     let config = s.fleet.configuration();
     let generation = config.version;
     let quorum = config.quorum;
@@ -1682,7 +1912,6 @@ async fn adopt(
       acked: Vec::new(),
       ..config.place(object)
     };
-    let epoch = s.host_takeovers.get(&departed)?.epoch;
     let mut acceptor = s.holder_records.remove(&object).unwrap_or_else(|| {
       Acceptor::new(
         local,
@@ -1696,6 +1925,10 @@ async fn adopt(
       generation,
       owner: local,
     });
+    // This node holds another value at the adopted position, a lower epoch's that never committed (A-373).
+    let replaces = acceptor
+      .value_at(object, adopted.sequence)
+      .is_some_and(|held| held != adopted.value.as_slice());
     let record = Record {
       owner: local,
       object,
@@ -1704,7 +1937,7 @@ async fn adopt(
       generation,
       value: adopted.value,
     };
-    Some((acceptor, shape, quorum, record))
+    Some((acceptor, shape, quorum, record, replaces))
   })
   .flatten()?;
   let holders = take_sessions("fleet.lent_to.adopt", |host| {
@@ -1757,20 +1990,257 @@ async fn adopt(
     TAKEOVER_ADOPT_UNACKED
   };
   let placement = match committed.outcome {
-    Ok(placement) if placement.placed(quorum) => Some(placement),
-    Ok(_) | Err(ClusterError::Uncertain { .. } | ClusterError::NotPlaced { .. }) => None,
-    Err(_) => None,
+    Ok(placement) if placement.placed(quorum) => Ok(placement),
+    Ok(_) | Err(ClusterError::Uncertain { .. } | ClusterError::NotPlaced { .. }) => {
+      Err(unplaced_cause)
+    }
+    Err(_) => Err(unplaced_cause),
   };
+  // The local acceptance replaced that value: a replica of the green built over it follows (A-373), so the adoption's
+  // engine is advanced from the version before, never served from a value the ledger no longer holds.
+  let replaced =
+    replaces && acceptor.value_at(object, record.sequence) == Some(record.value.as_slice());
   state::with_state(|s| {
     s.holder_records.insert(object, acceptor);
-    if let Some(placement) = placement {
-      record_adoption(s, departed, object, &record, placement, local);
-    } else {
-      s.count(TAKEOVER_ADOPT_UNPLACED, 1);
-      s.count(unplaced_cause, 1);
+    if replaced {
+      crate::merge_origin::rewind_past_replaced(s, &record);
     }
   });
-  Some(dispatch)
+  Some((dispatch, record, placement))
+}
+
+/// What a ledger question of a takeover round asks and what its answers are counted by (A-364, [`ledger_question`]).
+struct LedgerQuestion {
+  /// The question, under the round's epoch and generation.
+  prepare: LedgerPrepare,
+  /// The members of the ledger's recovery cohorts, settled and current, this node aside: each is asked.
+  asked: Vec<HostId>,
+  /// The answers so far: this node's own, when it may promise.
+  answers: BTreeMap<HostId, LedgerAnswered>,
+  /// The ledger's recovery cohorts.
+  cohorts: Vec<Vec<HostId>>,
+  /// Its current cohorts (A-309).
+  current: Vec<Vec<HostId>>,
+  /// The configuration's members.
+  members: Vec<HostId>,
+  /// The configuration's quorum.
+  quorum: slates_db::register::Quorum,
+}
+
+/// The ledger question for positions `from..to` of `object` in this node's (`local`'s) round of `departed`'s takeover
+/// (A-364): under the round's epoch and generation, asked of every member of the ledger's recovery cohorts, settled and
+/// current, with this node's own positions in the range already its answer while its lease gate is open, as its own
+/// copies are promised in a round ([`promise_local_copies`]). `None` when there is no round here under the installed
+/// configuration.
+fn ledger_question(
+  state: &mut ShardState,
+  departed: HostId,
+  object: ObjectId,
+  (from, to): (u64, u64),
+  local: HostId,
+) -> Option<LedgerQuestion> {
+  let regional = state.council.configuration().clone();
+  if state.fleet.configuration().version != regional.version {
+    return None;
+  }
+  let take = state.host_takeovers.get(&departed)?;
+  if take.generation != regional.version {
+    return None;
+  }
+  let prepare = LedgerPrepare {
+    departed,
+    owner: local,
+    epoch: take.epoch,
+    generation: take.generation,
+    object,
+    from,
+    to,
+  };
+  let cohorts = regional.recovery_cohorts(departed, object);
+  let current = regional.current_cohorts(departed, object);
+  let asked: BTreeSet<HostId> = cohorts
+    .iter()
+    .chain(current.iter())
+    .flatten()
+    .copied()
+    .filter(|host| *host != local && regional.members.contains(host))
+    .collect();
+  let mut answers = BTreeMap::new();
+  if gate_open(state, departed) {
+    let own = state
+      .holder_records
+      .get(&object)
+      .map(|acceptor| acceptor.positions_between(object, from, to))
+      .unwrap_or_default();
+    answers.insert(
+      local,
+      LedgerAnswered {
+        positions: own
+          .into_iter()
+          .map(|accepted| (accepted.sequence, accepted))
+          .collect(),
+        covered_to: to,
+      },
+    );
+  }
+  Some(LedgerQuestion {
+    prepare,
+    asked: asked.into_iter().collect(),
+    answers,
+    cohorts,
+    current,
+    members: regional.members.clone(),
+    quorum: regional.quorum,
+  })
+}
+
+/// Adopts positions `from..to` of the ledger `object` (a green's merge-record log) in this node's (`local`'s) round of
+/// `departed`'s takeover (A-364; §4.8 "For each ledger position, ... phase one consults an authorized quorum of
+/// distinct holders and adopts the highest accepted proposal consistent with the committed prefix"): the round adopted
+/// the ledger's newest record at `to`, and this node lacks records below it, which phase one's pages never report
+/// (each holder's highest record alone). Every member of the ledger's recovery cohorts is asked for its positions in the
+/// range under the round's epoch ([`TAKEOVER_LEDGER_STREAM`], [`serve_ledger_prepare`]); at each position, in order, once
+/// its cohorts promised it, the value accepted under the highest epoch is adopted
+/// ([`slates_db::takeover::ledger_positions`], the rule `docs/wip/models/FencedLedger.tla` checks) and committed again
+/// under this node at the round's epoch ([`commit_adopted`]: phase-two acceptance at a new epoch records it, BUG-12). The
+/// positions adopted, or the counter naming why the range was not adopted whole this period (no round, a fence above the
+/// epoch, which starts the round over above it, or a position not yet ready or not placed); with the dispatches whose
+/// stragglers the caller recovers.
+pub(crate) async fn adopt_ledger_positions(
+  departed: HostId,
+  object: ObjectId,
+  (from, to): (u64, u64),
+  local: HostId,
+  budget: CommitBudget,
+) -> (Result<u64, &'static str>, Vec<Dispatch>) {
+  let mut dispatches = Vec::new();
+  let Some(LedgerQuestion {
+    prepare,
+    asked,
+    mut answers,
+    cohorts,
+    current,
+    members,
+    quorum,
+  }) = state::with_state(|s| ledger_question(s, departed, object, (from, to), local)).flatten()
+  else {
+    let _ = state::with_state(|s| s.count(TAKEOVER_LEDGER_NO_ROUND, 1));
+    return (Err(TAKEOVER_LEDGER_NO_ROUND), dispatches);
+  };
+  let sessions = take_sessions("fleet.lent_to.ledger_positions", |host| {
+    asked.contains(&host)
+  });
+  let sent: Vec<HostId> = sessions.iter().map(|(host, _)| *host).collect();
+  let request = prepare.encode();
+  let outgoing: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.clone(), endpoint))
+    .collect();
+  let (replied, stragglers) =
+    broadcast(outgoing, TAKEOVER_LEDGER_STREAM, Priority::Control, budget).await;
+  let mut recovered = Vec::with_capacity(replied.len());
+  let mut fence: Option<HostEpoch> = None;
+  for (host, reply, endpoint) in replied {
+    if let Ok(promise) = LedgerPromise::decode(&reply.bytes)
+      && promise.holder == host
+      && promise.binds(&prepare)
+    {
+      match promise.fenced {
+        Some(fenced) => fence = fence.max(Some(fenced)),
+        None => {
+          answers.insert(
+            host,
+            LedgerAnswered {
+              covered_to: promise.next.unwrap_or(to),
+              positions: promise
+                .positions
+                .into_iter()
+                .map(|accepted| (accepted.sequence, accepted))
+                .collect(),
+            },
+          );
+        }
+      }
+    }
+    recovered.push((host, endpoint));
+  }
+  dispatches.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::Discard,
+  ));
+  return_sessions(recovered);
+  if let Some(fence) = fence {
+    let _ = state::with_state(|s| {
+      if let Some(take) = s.host_takeovers.get_mut(&departed) {
+        take.fenced = take.fenced.max(Some(fence));
+      }
+      s.count(TAKEOVER_LEDGER_FENCED, 1);
+    });
+    return (Err(TAKEOVER_LEDGER_FENCED), dispatches);
+  }
+  let adoption = ledger_positions(
+    (&cohorts, &current),
+    |host| members.contains(&host),
+    quorum,
+    (from, to),
+    &answers,
+  );
+  let adopted = commit_ledger_positions(
+    departed,
+    object,
+    adoption.adopted,
+    local,
+    budget,
+    &mut dispatches,
+  )
+  .await;
+  let whole = adoption.stopped_at.is_none() && adopted == to.saturating_sub(from);
+  let _ = state::with_state(|s| {
+    if adopted > 0 {
+      s.count(TAKEOVER_LEDGER_POSITIONS_ADOPTED, adopted);
+    }
+    if !whole {
+      s.count(TAKEOVER_LEDGER_WAITING, 1);
+    }
+  });
+  let outcome = if whole {
+    Ok(adopted)
+  } else {
+    Err(TAKEOVER_LEDGER_WAITING)
+  };
+  (outcome, dispatches)
+}
+
+/// Commits each of a ledger's `adopted` positions again under this node, in order ([`commit_adopted`]), stopping at the
+/// first that does not place (counted by why); each dispatch kept for the caller. How many placed.
+async fn commit_ledger_positions(
+  departed: HostId,
+  object: ObjectId,
+  adopted: Vec<Accepted>,
+  local: HostId,
+  budget: CommitBudget,
+  dispatches: &mut Vec<Dispatch>,
+) -> u64 {
+  let mut placed: u64 = 0;
+  for accepted in adopted {
+    let Some((dispatch, _, placement)) =
+      commit_adopted(departed, object, accepted, local, budget).await
+    else {
+      break;
+    };
+    dispatches.push(dispatch);
+    if let Err(cause) = placement {
+      let _ = state::with_state(|s| {
+        s.count(TAKEOVER_ADOPT_UNPLACED, 1);
+        s.count(cause, 1);
+      });
+      break;
+    }
+    placed = placed.saturating_add(1);
+  }
+  placed
 }
 
 /// Records `object` adopted by this node: tracked as its own, its placement kept at the adoption's sequence
@@ -1981,7 +2451,7 @@ mod tests {
   #[test]
   fn a_round_advances_only_when_a_member_moves_on_and_a_restart_keeps_the_count() {
     let member = HostId(2);
-    let mut take = HostTakeover::new(5, HostEpoch(3), 0);
+    let mut take = HostTakeover::new(5, HostEpoch(3), 0, 0);
     let page = |after: u64, complete: bool| Page {
       after: (!complete).then_some(ObjectId::new(HostId(1), after)),
       complete,
@@ -2025,7 +2495,7 @@ mod tests {
       })
     };
     let given_up = ObjectId::new(HostId(1), 7);
-    let mut take = HostTakeover::new(5, HostEpoch(3), 4);
+    let mut take = HostTakeover::new(5, HostEpoch(3), 4, 0);
     assert!(
       !take.heard_since(held(Liveness::Alive, 5)),
       "nothing given up: nothing to judge afresh"
@@ -2269,6 +2739,9 @@ mod tests {
           uid: 0,
         },
         completion: None,
+        signature: None,
+        folded_below: 0,
+        checkpoint_floor: 0,
       };
       state.pending_green_materializations.insert(
         green,
@@ -2385,7 +2858,7 @@ mod tests {
 
   /// A round of the audit node's for `departed`'s takeover that has learned `object` and adopted nothing.
   fn round_that_learned(state: &mut ShardState, departed: HostId, object: ObjectId) {
-    let mut take = HostTakeover::new(state.council.configuration().version, HostEpoch(2), 0);
+    let mut take = HostTakeover::new(state.council.configuration().version, HostEpoch(2), 0, 0);
     take.learned.insert(object, BTreeMap::new());
     state.host_takeovers.insert(departed, take);
   }

@@ -1413,6 +1413,84 @@ fn a_holders_publication_carries_the_record_it_acknowledges_not_everything_it_ho
   );
 }
 
+/// Shape: the positions of one ledger the per-position test holds, one publication each: enough that a delta carrying
+/// the whole ledger would carry tens of times what one position is.
+const LEDGER_POSITIONS: u64 = 64;
+
+/// §4.8 "persistence before reply", A-367: a holder of a green keeps every version's merge record, a ledger that is
+/// never compacted, and publishes before it acknowledges each; what that publication carries must be the record it
+/// acknowledges, never the ledger it already carries. Do: hold [`LEDGER_POSITIONS`] records of one ledger register (a
+/// merge record's class byte, so no position is compacted) at its next sequence each, through the holder's production
+/// path, reading after each the held bytes its publication's delta carried; then restart the daemon warm over the same
+/// anchor. Expect every delta after the first to carry the same bytes (the register's head and the one position; a hold
+/// a checkpoint published carries none in a delta), and every position held after the restart at its sequence. Before:
+/// the register was one piece, so each delta carried every position held, and a green's commit at `f > 0` grew by a
+/// position's bytes a version (about 10 µs a version in a debug build, `a_submit_late_in_a_greens_history_...`).
+#[test]
+fn a_holders_publication_carries_the_position_it_acknowledges_not_the_whole_ledger() {
+  use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-held-ledger-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("held-ledger", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let owner = first.member_identity().unwrap();
+  let ledger = ObjectId::new(HostId(owner.0), 1);
+  let carried = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("publish.delta_held_bytes")
+      .copied()
+      .unwrap_or(0)
+  };
+  let mut per_hold = Vec::new();
+  for sequence in 1..=LEDGER_POSITIONS {
+    let before = carried(&first);
+    let mut value = vec![slates_server::catalog::MERGE_CLASS];
+    value.resize(HELD_VALUE_BYTES, u8::try_from(sequence % 251).unwrap());
+    let record = Record {
+      owner,
+      object: ledger,
+      sequence,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value,
+    };
+    let reply = first.hold_record_as_authorized(owner, record).unwrap();
+    assert!(!reply.is_empty(), "position {sequence} acknowledged");
+    per_hold.push(carried(&first).saturating_sub(before));
+  }
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let held_after = second.fleet_held_positions(ledger);
+  second.stop();
+  let deltas: std::collections::BTreeSet<u64> = per_hold
+    .iter()
+    .skip(1)
+    .copied()
+    .filter(|bytes| *bytes > 0)
+    .collect();
+  assert_eq!(
+    deltas.len(),
+    1,
+    "every delta after the first carries the register's head and one position, whatever the ledger holds: {per_hold:?}"
+  );
+  assert_eq!(
+    held_after.map(|positions| positions
+      .into_iter()
+      .map(|(sequence, _)| sequence)
+      .collect::<Vec<_>>()),
+    Ok((1..=LEDGER_POSITIONS).collect::<Vec<_>>()),
+    "every acknowledged position is held after a warm restart"
+  );
+}
+
 // -------------------------------------------- crash injection at every durable step (AC-2.3, AC-2.12)
 //
 // A scenario of single-transaction steps, so each crash point is a real state a kill can leave. Two
@@ -1840,15 +1918,41 @@ fn approve(
     .expect("the approval issues a grant")
 }
 
+/// Presents single-use grant `once` for `volume` at its snapshot again: refused `GrantInvalid`, as spent.
+fn assert_spent(
+  client: &mut slates_client::Client,
+  (volume, snapshot): (slates_client::VolumeId, slates_client::SnapshotId),
+  target: &str,
+  once: u64,
+) {
+  let again = client.land(
+    volume,
+    Some(snapshot),
+    target,
+    Filter::default(),
+    Some(once),
+  );
+  assert!(
+    matches!(
+      again,
+      Err(slates_client::ClientError::Refused(
+        slates_client::Refusal::GrantInvalid
+      ))
+    ),
+    "the single-use grant stays spent across the restart: {again:?}"
+  );
+}
+
 /// AUD-29-06 (§4.15 step 3: a session grant covers later landings for its session; §4.8 recovery): a session
 /// grant covers its binding across a daemon restart, a single-use grant stays spent across one, and a grant
 /// issued after a restart takes an id no earlier grant had. Before 2026-09-29 a restarted shard rebuilt no
 /// runtime grant (every grant was lost at a restart, and the first grant after it re-minted a recorded id,
 /// refused `AlreadyExists`), and every landing recorded its grant consumed, a session grant included. Do:
 /// land under a single-use grant; approve a session grant for another volume; restart the daemon over the
-/// same segment; land twice under the session grant; list the grants; approve a new landing. Expect: both
-/// session landings land; the single-use grant is listed consumed and the session grant issued; the new
-/// grant's id is neither earlier one.
+/// same segment; land twice under the session grant; list the grants; present the single-use grant again;
+/// approve a new landing. Expect: both session landings land; the session grant is listed issued, and the
+/// single-use grant, used up, is not listed (A-266: the table holds live grants) and is refused `GrantInvalid`;
+/// the new grant's id is neither earlier one.
 #[test]
 fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
   use slates_ipc::protocol::GrantScope;
@@ -1917,11 +2021,9 @@ fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
     .into_iter()
     .map(|grant| (grant.id, grant.state))
     .collect();
-  assert_eq!(
-    states.get(&once).map(String::as_str),
-    Some("consumed"),
-    "{states:?}"
-  );
+  // A used-up grant leaves the table (A-266): it is not listed, and presented again it is still refused as spent.
+  assert_eq!(states.get(&once), None, "{states:?}");
+  assert_spent(&mut client, (spent, spent_snapshot), &target.path, once);
   assert_eq!(
     states.get(&session).map(String::as_str),
     Some("issued"),
@@ -4910,6 +5012,84 @@ fn a_created_and_pinned_overlay_survives_a_restart() {
   drop(stream);
   drop(client);
   second.stop();
+}
+
+/// §4.2 accounting through recovery, §4.8 (A-395; `docs/bugs/2026-11-05-a-volume-promised-the-whole-version-slab-is-refused-at-recovery.md`).
+/// A snapshot shares with the head every directory the head has not changed since, as it shares the files; recovery
+/// rebuilt each of a snapshot's directories privately, an inode version on its deadlist the live daemon never held,
+/// charged to the version slab, so a restart took a slot a directory more than the live daemon had, and a volume
+/// promised the whole slab was refused (the whole kernel's base volume: 6,348 slots short, its 6,348 directories). Do:
+/// create an overlay over a directory holding `f` and `d1/d2/g`, pin its whole base, snapshot it, read every shard's
+/// committed and snapshot-retained version slots, and restart the daemon over the same segment. Expect the overlay
+/// served after the restart with both files read back over the mount, and every shard's committed and retained version
+/// slots what they were before the restart.
+#[test]
+fn a_snapshots_unchanged_directories_take_no_version_slot_after_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-helddirs-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("helddirs", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  // The base's nested directories: the test's own temporary directory, which it removes.
+  #[allow(clippy::disallowed_methods)]
+  std::fs::create_dir_all(format!("{}/d1/d2", target.path)).unwrap();
+  target.seed("f", BEFORE);
+  target.seed("d1/d2/g", BEFORE);
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch("held-dirs")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    2,
+    "both base files pinned"
+  );
+  client.snapshot(overlay).unwrap();
+  let versions = |client: &mut Client| -> Vec<(u64, u64)> {
+    client
+      .daemon_status()
+      .unwrap()
+      .shards
+      .iter()
+      .map(|shard| (shard.committed_versions, shard.retained_versions))
+      .collect()
+  };
+  let before = versions(&mut client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let served = client.status(overlay).is_ok();
+  let after = versions(&mut client);
+  let read_back = served.then(|| {
+    let (mut stream, root) = mounted_on(&second, "held-dirs");
+    let f = lookup(&mut stream, &root, "f", 2);
+    let d1 = lookup(&mut stream, &root, "d1", 3);
+    let d2 = lookup(&mut stream, &d1, "d2", 4);
+    let g = lookup(&mut stream, &d2, "g", 5);
+    (read(&mut stream, &f, 6), read(&mut stream, &g, 7))
+  });
+  drop(client);
+  second.stop();
+  eprintln!(
+    "version slots (committed, retained) by shard: before the restart {before:?}, after {after:?}"
+  );
+  assert!(served, "the overlay is served after the restart");
+  assert_eq!(
+    read_back,
+    Some((BEFORE.to_vec(), BEFORE.to_vec())),
+    "both pinned files read back"
+  );
+  assert_eq!(
+    after, before,
+    "recovery takes the version slots the live daemon held, no slot for a directory the snapshot shares"
+  );
 }
 
 /// A clone name for an origin named `origin_name` that hashes to a partition other than the origin's (A-236's alias

@@ -16,6 +16,13 @@
 //! pool on a client of its own (`call`): microseconds for most verbs, longer for a mount or a
 //! landing, which wait while the daemon lives.
 //!
+//! What kiln keeps across an agent's turns needs nothing to keep it alive. Slates gives a term only
+//! to an attachment of its command line's form, which lapses once nothing renews it (about a second
+//! idle on one machine; Slates' A-384, whose `slates_client::Hold` renews one), and kiln makes none:
+//! a workspace's mount is its file-system bridge's attachment, which lasts until it is unmounted
+//! ([`remove`]); a microVM's stream is its guest's, which lasts until its last copy closes
+//! (`crate::sandbox::served`); and every other call's client ends with the call.
+//!
 //! The machine keeps one Slates instance (`kiln`) for all its runner processes. Its anchor is
 //! started apart from the runner (a systemd user scope of its own on Linux where the runner runs
 //! under the user's service manager, its own process group elsewhere), so restarting or upgrading
@@ -76,7 +83,22 @@ pub const INSTANCE: &str = "kiln";
 /// `LandingApproval` carries the statement a signer signs and the signature it carried, which kiln
 /// sends none of), a takeover past its volume's tolerance (21) and a reply held for durability as a
 /// typed retry (22, `RetryCause::DurabilityPending`, which kiln shows in Slates' words as before).
-pub const CONTRACT: u32 = 23;
+///
+/// 36 since kiln took Slates at e418f5cd2 (from 23). kiln uses 36: an ended agent's mount that
+/// something still holds once its patience is spent is let go on every Unix host
+/// (`mount::unmount_busy`: detached on Linux, forced on macOS), where 23's `unmount_lazy` was
+/// Linux's alone and a Mac kept the mount ([`remove`]). It shows two counts the contract added: the
+/// drifted entries too long for any reply to name (26, `DriftReport::elided`, [`drift_lines`]) and
+/// a written landing's degraded cells past what one reply holds (27,
+/// `LandingReport::degraded_elided`, `report_json`). It needs none of the rest: the failover
+/// estimate in the daemon's status (24), the chosen-path launcher (25), paged lists (26, 29:
+/// `Instance::drift` reads every page itself, in path order), a rewitness's and a stale disk's
+/// counts (27), a merge's replaced verdict (28), a granted landing's audit trail (30, 32, 35), the
+/// async form (31: kiln's calls run on its blocking pool, `call`), a volume's move to another
+/// fleet member (33) and a captured base (34); their refusals kiln shows in Slates' words. The
+/// revision brings Slates' A-384 too, a term for a command line's attachment, which kiln makes
+/// none of (module docs).
+pub const CONTRACT: u32 = 36;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -225,7 +247,7 @@ fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
             slates_api::MountMissing::FuseDevice => WorkspaceMissing::FuseDevice,
             slates_api::MountMissing::WinFsp => WorkspaceMissing::WinFsp,
             slates_api::MountMissing::MountNfs => WorkspaceMissing::MountNfs,
-            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared | slates_api::MountMissing::LazyUnmount => WorkspaceMissing::Mount,
+            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared => WorkspaceMissing::Mount,
         },
         _ => WorkspaceMissing::Mount,
     }
@@ -520,17 +542,19 @@ async fn unmount(path: String) -> anyhow::Result<()> {
     }
 }
 
-/// Lets go of the mount at `path` though something still uses it: the kernel takes it out of the
-/// namespace now and finishes once its last user closes (Linux's lazy unmount); refused elsewhere,
-/// saying why.
-async fn let_go(path: String) -> anyhow::Result<()> {
+/// Lets go of the mount at `path` though something still uses it (Slates' `mount::unmount_busy`, contract 36), saying
+/// how: on Linux the kernel takes it out of the namespace now and finishes once its last user closes
+/// ([`slates_api::LetGo::Detached`]); on macOS, which has no detaching unmount and whose loopback mount is `hard`, it is
+/// unmounted now and its users' next calls on it fail ([`slates_api::LetGo::Forced`]). Refused on Windows, saying why:
+/// a workspace's drive is its daemon's own, which [`unmount`] detaches.
+async fn let_go(path: String) -> anyhow::Result<slates_api::LetGo> {
     #[cfg(unix)]
     {
-        crate::rt::blocking(move || slates_api::mount::unmount_lazy(&path)).await?.map_err(|e| anyhow::anyhow!("Slates' unmount: {e}"))
+        crate::rt::blocking(move || slates_api::mount::unmount_busy(&path)).await?.map_err(|e| anyhow::anyhow!("Slates' unmount: {e}"))
     }
     #[cfg(not(unix))]
     {
-        anyhow::bail!("a lazy unmount of {path} is Linux's alone")
+        anyhow::bail!("letting go of a mount still in use is the Unix hosts': {path} is a drive its daemon detaches")
     }
 }
 
@@ -606,8 +630,9 @@ async fn holders(_mount: &str) -> String {
 
 /// Workspace `m` gone: unmounted, its volume destroyed and its mount point removed. What it held is lost. A mount still in
 /// use is asked again for as long as `patience` (its agent's own end took that long: [`unmount_patiently`]); still in
-/// use then, it's let go lazily on Linux, and elsewhere stays mounted, kiln saying what holds it. Its volume is destroyed
-/// all the same: nothing is kept for an agent that has ended.
+/// use then, it's let go on a Unix host, detached on Linux and forced on macOS ([`let_go`]), kiln saying what held it,
+/// and a Windows drive stays mounted, kiln saying so. Its volume is destroyed all the same: nothing is kept for an agent
+/// that has ended.
 pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
     let dir = PathBuf::from(&m.mount);
     if !m.mount.is_empty() && is_mount(&dir) {
@@ -615,7 +640,7 @@ pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
         if let Unmounted::StillHeld(refused) = unmount_patiently(|| unmount(m.mount.clone()), held, patience).await {
             let holders = holders(&m.mount).await;
             match let_go(m.mount.clone()).await {
-                Ok(()) => tracing::info!(mount = %m.mount, %refused, %holders, ?patience, "an ended agent's workspace was still in use past its agent's end: let go lazily"),
+                Ok(how) => tracing::info!(mount = %m.mount, %refused, %holders, ?patience, let_go = ?how, "an ended agent's workspace was still in use past its agent's end: let go"),
                 Err(e) => tracing::warn!(mount = %m.mount, %refused, %holders, ?patience, error = %format!("{e:#}"), "an ended agent's workspace stays mounted: what holds it holds it past its agent's end"),
             }
         }
@@ -637,10 +662,14 @@ pub async fn drift(m: &Made) -> anyhow::Result<Vec<String>> {
 }
 
 /// A drift report as kiln shows it: each drifted entry and what the disk did to it, then each entry
-/// whose re-check the host refused, as not known to match.
+/// whose re-check the host refused, as not known to match, then how many more Slates counted but
+/// could name in no reply (`DriftReport::elided`, contract 26: a path near the system's longest),
+/// so a person never reads a short list as the whole of it.
 fn drift_lines(report: &DriftReport) -> Vec<String> {
     let drifted = report.drifted.iter().map(|d| format!("{} ({:?})", d.path, d.kind));
-    drifted.chain(report.unverified.iter().map(|path| format!("{path} (Unverified)"))).collect()
+    let unverified = report.unverified.iter().map(|path| format!("{path} (Unverified)"));
+    let unnamed = (report.elided > 0).then(|| format!("{} more, each path too long for Slates to name (Unnamed)", report.elided));
+    drifted.chain(unverified).chain(unnamed).collect()
 }
 
 /// Sets workspace `m`'s write policy: what its landings do, as the launcher (kiln) gives it from its
@@ -795,7 +824,8 @@ fn summary_json(s: &Summary) -> Value {
 }
 
 /// What reached the disk, as kiln shows it: the landing's counts, how it finished, the durability
-/// it reached and each degraded cell it met.
+/// it reached, each degraded cell it met as far as one reply holds them, and how many more it met
+/// (`degraded_elided`, contract 27).
 fn report_json(r: &LandingReport) -> Value {
     json!({
         "landing": r.landing,
@@ -814,6 +844,7 @@ fn report_json(r: &LandingReport) -> Value {
             "dirs": r.durability.dirs,
         },
         "degraded": r.degraded.iter().map(|d| format!("{d:?}")).collect::<Vec<_>>(),
+        "degraded_elided": r.degraded_elided,
         "barriers": r.barriers,
     })
 }
@@ -1162,9 +1193,49 @@ mod tests {
     /// couldn't re-check as not known to match.
     #[test]
     fn w4_drift_reads_as_kiln_showed_it() {
-        let report = DriftReport { drifted: vec![slates_api::Drift { path: "/README.md".into(), kind: slates_api::DriftKind::Modified }], unverified: vec!["/b.rs".into()], watcher: slates_api::Watcher::Unavailable };
+        let report = DriftReport { drifted: vec![slates_api::Drift { path: "/README.md".into(), kind: slates_api::DriftKind::Modified }], unverified: vec!["/b.rs".into()], watcher: slates_api::Watcher::Unavailable, elided: 0 };
         assert_eq!(drift_lines(&report), ["/README.md (Modified)", "/b.rs (Unverified)"]);
-        assert!(drift_lines(&DriftReport { drifted: Vec::new(), unverified: Vec::new(), watcher: slates_api::Watcher::Live }).is_empty());
+        assert!(drift_lines(&DriftReport { drifted: Vec::new(), unverified: Vec::new(), watcher: slates_api::Watcher::Live, elided: 0 }).is_empty());
+    }
+
+    /// W4 (Slates' contract 26): drifted entries Slates counted but could name in no reply (a path near the system's
+    /// longest) show as one line counting them after the named ones, so a short list never passes for the whole; a
+    /// report with none counted shows no such line.
+    #[test]
+    fn w4_drift_counts_the_entries_slates_could_not_name() {
+        let report = DriftReport { drifted: vec![slates_api::Drift { path: "/a.rs".into(), kind: slates_api::DriftKind::Deleted }], unverified: Vec::new(), watcher: slates_api::Watcher::Live, elided: 2 };
+        assert_eq!(drift_lines(&report), ["/a.rs (Deleted)", "2 more, each path too long for Slates to name (Unnamed)"]);
+        let only = DriftReport { drifted: Vec::new(), unverified: Vec::new(), watcher: slates_api::Watcher::Live, elided: 1 };
+        assert_eq!(drift_lines(&only), ["1 more, each path too long for Slates to name (Unnamed)"], "drift even when none could be named");
+    }
+
+    /// W6 (Slates' contract 27): a written landing shows each degraded cell Slates named, and counts those past what one
+    /// reply holds, so a landing that met more than its report lists never reads as having met only those.
+    #[test]
+    fn w6_a_written_landing_shows_its_degraded_cells_and_counts_the_rest() {
+        let durability = slates_api::LandingDurability { data_synced: true, dirs_synced: false, media: false, media_requested: false, dirs: 3 };
+        let report = LandingReport {
+            landing: 9,
+            state: slates_api::LandingState::Done,
+            written: 4,
+            skipped: 1,
+            conflicts: 0,
+            failed: 0,
+            bytes_written: 53,
+            held: 2,
+            durability,
+            degraded: vec![slates_api::LandingDegradation::BarriersOnly],
+            degraded_elided: 5,
+            barriers: 1,
+            verification: slates_api::Verification::Unsigned,
+        };
+        let shown = outcome_json(&LandOutcome::Written(report));
+        assert_eq!(shown.get("outcome"), Some(&json!("written")));
+        assert_eq!(shown.pointer("/written/degraded"), Some(&json!(["BarriersOnly"])));
+        assert_eq!(shown.pointer("/written/degraded_elided"), Some(&json!(5)));
+        assert_eq!(shown.pointer("/written/written"), Some(&json!(4)));
+        assert_eq!(shown.pointer("/written/held"), Some(&json!(2)));
+        assert_eq!(shown.pointer("/written/durability/dirs"), Some(&json!(3)));
     }
 
     /// W6: kiln's launcher secret is made once and kept, private, and read back the same at every
