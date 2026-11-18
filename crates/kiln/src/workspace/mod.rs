@@ -9,6 +9,7 @@
 //! - [`follow`]: what happens to it, back to the agent (C2, C3).
 //! - [`slates`]: a workspace of its own, a Slates volume over its folder (W1–W4).
 //! - [`slates_fleet`]: a runner's identity as a node of kiln's Slates fleet, its key and kiln's certificate for it.
+//! - [`slates_move`]: an agent moved to another runner with its workspace volume, by Slates' own move (K4).
 //! - [`place`]: where a workspace's volume is mounted on its machine (a folder, or a drive letter on Windows).
 //! - [`ignored`]: what git ignores in one with no mount, from its volume's own `.gitignore` files.
 //! - [`review`]: an agent's work in one with no mount, from its volume's landing entries (A-287).
@@ -24,6 +25,7 @@ pub mod place;
 pub mod review;
 pub mod slates;
 pub mod slates_fleet;
+pub mod slates_move;
 
 #[cfg(test)]
 mod bare_metal_tests;
@@ -277,6 +279,39 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     }
     spec.workspace = Some(Workspace { kind: w.kind, over: Some(over.to_string_lossy().into_owned()), sub, made: Some(made), ..Workspace::default() });
     Ok(())
+}
+
+/// A session that arrived with a workspace volume (it moved here with its agent, K4, `harness::host`'s take-over): its
+/// mount re-placed under this machine's own place for workspaces where it named another machine's, and its folder there
+/// (the mount's top, with the agent's place beneath it). Whether it has a workspace volume to mount here as it starts
+/// ([`mounted_for`]), so its folder is never taken for one this machine lacks.
+pub fn arrived_here(spec: &mut crate::harness::session::Spec) -> bool {
+    let Some(w) = spec.workspace.as_mut().filter(|w| w.kind == "volume") else { return false };
+    let Some(m) = w.made.as_ref().filter(|m| !m.mount.is_empty()) else { return false };
+    let placed = match slates::placed_here(m) {
+        Ok(placed) => placed,
+        Err(e) => {
+            tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "a workspace that arrived couldn't be placed here");
+            return false;
+        }
+    };
+    if placed.mount != m.mount {
+        let top = place::top(&placed.mount);
+        let here = if w.sub.is_empty() { top } else { top.join(&w.sub) };
+        spec.cwd = Some(here.to_string_lossy().into_owned());
+        w.made = Some(placed);
+    }
+    true
+}
+
+/// A session's workspace volume mounted where it says before its harness starts in it (`harness::session`): one that
+/// arrived with a move (its new owner may answer a moment after the move, so Slates' pauses are waited out), or one a
+/// refused move let go of and took back. Nothing for any other workspace.
+pub async fn mounted_for(spec: &crate::harness::session::Spec) -> anyhow::Result<()> {
+    match spec.workspace.as_ref().filter(|w| w.kind == "volume").and_then(|w| w.made.as_ref()) {
+        Some(m) => slates::mounted_patiently(m).await,
+        None => Ok(()),
+    }
 }
 
 /// The folder a workspace for `cwd` is laid over, and `cwd`'s place beneath it (a workspace's `sub`): its repository's

@@ -253,7 +253,7 @@ impl Hub {
             // Native where the newest process reads a native package: an ACP agent or Antigravity
             // goes on in its own conversation there; else (an older build, a rollback) in words.
             let native = native_to(&self.instances.load(), &name);
-            let c = Command::MoveTo { to: name.clone(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native };
+            let c = Command::MoveTo { to: name.clone(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native, slates: None };
             let Some(json) = self.worded(&name, peer, &id, &c).await else { continue };
             tracing::info!(agent = %name, peer, session = %id, "an older runner process of this machine hands this agent session to the newest once its turn is over");
             self.command_peers(&name, vec![peer], &ServerMsg::HarnessCmd { session: id, json }).await.log_when_answered(LOG_WITHIN);

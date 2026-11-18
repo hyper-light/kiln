@@ -138,10 +138,13 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     if info.isolation.is_some() {
         return Err(crate::sandbox::isolated::NO_MOVE.to_owned());
     }
-    // Its workspace is a volume in its machine's memory: it doesn't follow yet (docs/agentic.md W7).
-    if info.workspace.as_ref().is_some_and(|w| w.made.is_some()) {
-        return Err(format!("it works in a workspace of its own on {}, which can't move with it yet: open a change request from its work (or write it to disk), then start an agent on {}", hub.shown(&from), hub.shown(&to)));
-    }
+    // Its workspace volume goes with it by Slates' own move, inside kiln's Slates fleet (docs/agentic.md W7; kiln goal
+    // 95101ef3, K4): planned here, moved by its runner once its turn is over, before the session is handed over.
+    // Refused by kind, it stays where it is, running.
+    let volume_move = match info.workspace.as_ref().and_then(|w| w.made.as_ref()) {
+        Some(made) => Some(plan_volume_move(hub, &info.id, &from, &to, made).map_err(|refused| refused.reported())?),
+        None => None,
+    };
     let connected = hub.agents.load().get(&to).is_some_and(|a| a.connected && !a.ephemeral);
     if !connected {
         return Err(format!("{} is not connected", hub.shown(&to)));
@@ -169,8 +172,12 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
         return Ok(serde_json::json!({ "moving": to, "from_server": true }));
     }
     // Its machine is away: it can't hand the session over, so it goes on from the server's copy of
-    // its conversation (`docs/conversations.md`, "Resuming on another machine").
+    // its conversation (`docs/conversations.md`, "Resuming on another machine"). Not one whose workspace volume moves:
+    // only the runner that holds it moves it.
     if !hub.agents.load().get(&from).is_some_and(|a| a.connected) {
+        if volume_move.is_some() {
+            return Err(crate::workspace::slates_move::MoveRefused::SourceAway { machine: hub.shown(&from) }.reported());
+        }
         if kind.is_some() {
             return Err(format!("{} is away, so it can only go on in {} (from the server's copy of its conversation)", hub.shown(&from), info.kind_name));
         }
@@ -182,11 +189,14 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
         if hub.instances.load().newest_with(m, crate::proto::CAP_REACH).is_none() {
             return Err(format!("{}'s runner can't hand sessions over (an older runner: upgrade it)", hub.shown(m)));
         }
+        if volume_move.is_some() && !moves_volumes(hub, m) {
+            return Err(crate::workspace::slates_move::MoveRefused::OlderRunner { machine: hub.shown(m) }.reported());
+        }
     }
     let (hub, id) = (Arc::clone(hub), id.to_owned());
     let to2 = to.clone();
     crate::rt::spawn(async move {
-        if let Err(e) = prepare_and_go(&hub, &id, &from, &to2, &info.cwd, now, kind, model).await {
+        if let Err(e) = prepare_and_go(&hub, &id, &from, &to2, &info.cwd, now, kind, model, volume_move).await {
             say(&hub, &id, &format!("Couldn't move to {}: {e}", hub.shown(&to2))).await;
         }
     });
@@ -254,10 +264,36 @@ async fn say(hub: &Arc<Hub>, id: &str, text: &str) {
     let _ = hub.harness.command(hub, id, Command::Moving { text: text.to_owned() }).await;
 }
 
+/// The plan for moving agent `id`'s workspace volume `made` with it from `from` to `to` (K4,
+/// `workspace::slates_move::plan`): the fleet the server's `[slates_fleet]` declares, the target's node as its runner
+/// last said it, and no other live agent working in the volume.
+fn plan_volume_move(hub: &Hub, id: &str, from: &str, to: &str, made: &crate::workspace::slates::Made) -> Result<crate::workspace::slates_move::VolumeMove, crate::workspace::slates_move::MoveRefused> {
+    let sharers: Vec<String> = hub
+        .harness
+        .list()
+        .into_iter()
+        .filter(|i| i.id != id && i.status != super::model::Status::Exited && i.workspace.as_ref().and_then(|w| w.made.as_ref()).is_some_and(|m| m.volume == made.volume))
+        .map(|i| i.name)
+        .collect();
+    crate::workspace::slates_move::plan(&hub.cfg.slates_fleet, &hub.slates_fleet.members(|_| true), from, to, made, &sharers)
+}
+
+/// Whether machine `m`'s newest runner process names [`crate::proto::feature::SLATES_MOVE`]: it moves a workspace
+/// volume with its agent, and mounts one that arrived.
+fn moves_volumes(hub: &Hub, m: &str) -> bool {
+    let inst = hub.instances.load();
+    inst.newest(m).and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::SLATES_MOVE))
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, now: bool, kind: Option<String>, model: Option<String>) -> Result<(), String> {
-    let (there, note) = folder(hub, id, from, to, cwd, false).await?;
-    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model, local: false, native: false }).await {
+async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, now: bool, kind: Option<String>, model: Option<String>, volume_move: Option<crate::workspace::slates_move::VolumeMove>) -> Result<(), String> {
+    // A workspace volume goes by Slates' own move, and the runner it goes to places it under its own place for
+    // workspaces: no repository of its folder is copied over.
+    let (there, note) = match &volume_move {
+        Some(_) => (cwd.to_owned(), Some("Its workspace volume moves with it, by Slates' own move.".to_owned())),
+        None => folder(hub, id, from, to, cwd, false).await?,
+    };
+    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now, kind, model, local: false, native: false, slates: volume_move }).await {
         Sent::Ok | Sent::Taken => Ok(()),
         Sent::Unreachable => Err(format!("{} is not connected", hub.shown(from))),
         s => Err(s.failure().map_or_else(|| format!("{} didn't take it", hub.shown(from)), |(_, why)| why)),
@@ -369,6 +405,27 @@ mod tests {
             }
         }
         assert!(resumed_how("no-such-harness").contains("can't be resumed"));
+    }
+
+    /// Kiln goal 95101ef3, K4: an agent whose workspace is a Slates volume moves with it only inside kiln's Slates fleet:
+    /// with no `[slates_fleet]` declared, its move is refused by kind (`not_in_fleet`, naming its machine) before anything
+    /// of it stops. Before K4 any such move was refused whole, saying the workspace couldn't move yet.
+    #[test]
+    fn k4_a_volume_agent_moves_only_inside_kilns_slates_fleet() -> anyhow::Result<()> {
+        use super::super::core::Update;
+        use super::super::model::Status;
+        use super::super::session::Info;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.put_agent(crate::hub::tests::live_runner("elsewhere", "linux", "x86_64"));
+            let made = crate::workspace::slates::Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-ws".into(), mount: "/state/workspaces/kiln-ws".into() };
+            let workspace = crate::workspace::Workspace { kind: "volume".into(), made: Some(made), ..crate::workspace::Workspace::default() };
+            let held = Info { id: "ws".into(), kind: "codex".into(), status: Status::Idle, workspace: Some(workspace), ..Info::default() };
+            hub.harness.ingest(&Location::Machine("box".into()), "ws", Update::Open { info: Box::new(held), since: None }).await;
+            let moved = start(&hub, "ws", "elsewhere", false, None, None).await;
+            anyhow::ensure!(moved.as_ref().is_err_and(|e| e.contains("[kind: not_in_fleet]") && e.contains("box")), "{moved:?}");
+            Ok(())
+        })
     }
 
     /// Kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5: an isolated agent goes on on its own machine

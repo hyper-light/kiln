@@ -1695,11 +1695,14 @@ impl Host {
             return Err(Refused::NotTaken(format!("{} is not installed on this machine", kind.name)));
         }
         let mut pkg = pkg;
+        // A workspace volume that moved here with it (K4): its mount re-placed under this machine's own place for
+        // workspaces and its folder there, mounted as the session starts (`workspace::mounted_for`).
+        let volume_here = crate::workspace::arrived_here(&mut pkg.spec);
         let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
         // Its folder isn't here (it wasn't a repository kiln keeps in step): it works in home. A
         // worktree it brings is made once its repository's files are here.
         let mut note = None;
-        if !std::path::Path::new(&cwd).is_dir() && pkg.worktree.is_none() {
+        if !volume_here && !std::path::Path::new(&cwd).is_dir() && pkg.worktree.is_none() {
             note = Some(format!("{cwd} isn't on this machine, so it works in the home folder"));
             cwd = session::resolve_cwd(None);
             pkg.spec.cwd = Some(cwd.clone());
@@ -5411,7 +5414,7 @@ while True:
             until_it("m1's turn, over", 60, || idle() && s.core.lock().state.harness_session.is_some()).await?;
             assert!(host.command("held", message("m2", "one it had already")));
             until_it("m2 said back, and the session at rest", 60, || idle() && s.core.lock().state.delivery.get("m2") == Some(&super::super::model::Delivery::Completed)).await?;
-            assert!(host.command("held", Command::MoveTo { to: "elsewhere".into(), cwd, note: None, now: true, kind: None, model: None, local: false, native: false }));
+            assert!(host.command("held", Command::MoveTo { to: "elsewhere".into(), cwd, note: None, now: true, kind: None, model: None, local: false, native: false, slates: None }));
             until_it("its move, tried", 60, || said("Couldn't move to elsewhere")).await?;
             assert!(!s.core.lock().hold, "it goes on here: nothing waits on the move");
             assert!(host.close("held"));
@@ -5442,7 +5445,7 @@ while True:
             until_it("m1's turn, over", 60, || s.core.lock().state.status == Status::Idle && s.core.lock().state.harness_session.is_some()).await?;
             assert!(host.command("wedged", message("m2", "one it says nothing of")));
             until_it("m2 written, and the session held as working", 60, || s.core.lock().state.delivery.get("m2") == Some(&super::super::model::Delivery::Sent) && s.core.lock().state.status == Status::Running).await?;
-            assert!(host.command("wedged", Command::MoveTo { to: "elsewhere".into(), cwd, note: None, now: true, kind: None, model: None, local: false, native: false }));
+            assert!(host.command("wedged", Command::MoveTo { to: "elsewhere".into(), cwd, note: None, now: true, kind: None, model: None, local: false, native: false, slates: None }));
             until_it("its move, tried", 60, || said("Couldn't move to elsewhere")).await?;
             assert!(host.close("wedged"));
             Ok(())
@@ -5584,7 +5587,7 @@ while True:
             let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
             assert!(host.command("isolated", Command::SetModel { model: "gpt-5.5".into(), kind: Some("codex".into()) }));
             until_it("its switch refused", 60, || said(crate::sandbox::isolated::NO_SWITCH)).await?;
-            assert!(host.command("isolated", Command::MoveTo { to: "elsewhere".into(), cwd: cwd.clone(), note: None, now: true, kind: None, model: None, local: false, native: false }));
+            assert!(host.command("isolated", Command::MoveTo { to: "elsewhere".into(), cwd: cwd.clone(), note: None, now: true, kind: None, model: None, local: false, native: false, slates: None }));
             until_it("its move refused", 60, || said(crate::sandbox::isolated::NO_MOVE)).await?;
             assert!(host.command("isolated", message("m3", "still here")));
             until_it("m3's turn, over", 60, || idle() && answers() >= 3).await?;
@@ -6855,7 +6858,7 @@ while True:
             until_it("m2 waiting behind m1's turn", 30, || s.core.lock().state.queue.iter().any(|q| q.id == "m2")).await?;
             // The server asks the older process to hand it to the newest (`crate::handovers`): it
             // goes once m1's turn is over.
-            assert!(older.command("h", Command::MoveTo { to: String::new(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false }));
+            assert!(older.command("h", Command::MoveTo { to: String::new(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false, slates: None }));
             // Its package, in pieces, as the server gets them, passed on to the newer process.
             let mut bytes = Vec::new();
             let got = crate::rt::timeout(Duration::from_secs(60), async {

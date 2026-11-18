@@ -4221,6 +4221,8 @@ struct Move {
     local: bool,
     /// With `local`: that process reads a native package (`Command::MoveTo::native`).
     native: bool,
+    /// Its workspace volume goes with it, by Slates' own move (`Command::MoveTo::slates`, K4).
+    slates: Option<crate::workspace::slates_move::VolumeMove>,
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
@@ -4228,7 +4230,7 @@ struct Move {
 /// doesn't go to another machine (its microVM and what its harness keeps there are this one's, kiln
 /// plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), refused before anything of it stops, saying so.
 #[allow(clippy::too_many_arguments)]
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool) -> Option<Move> {
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool, slates: Option<crate::workspace::slates_move::VolumeMove>) -> Option<Move> {
     // Its spec before its core: never the one lock inside the other.
     let isolated = s.spec.lock().isolation.is_some();
     let mut core = s.core.lock();
@@ -4253,7 +4255,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Some(Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local })
+    Some(Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local, slates: slates.filter(|_| !local) })
 }
 
 /// A person pauses it, or resumes it (`Command::Pause` without a task), or why it can't be, said in its conversation.
@@ -4801,6 +4803,15 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     let reach = crate::reach::node::global().ok_or_else(|| "this runner can't reach other runners (an older one?)".to_owned())?;
     let me = reach.name().to_owned();
     let mut spec = s.resume_spec();
+    // Its workspace volume goes first, by Slates' own move to the node of the runner it goes to (K4,
+    // `workspace::slates_move`): its harness is down, so nothing of it holds the volume. Refused, it stays here, its
+    // workspace mounted again, the refusal said by kind.
+    if let Some(vm) = &mv.slates {
+        let made = spec.workspace.as_ref().and_then(|w| w.made.clone()).ok_or_else(|| "it has no workspace volume to move".to_owned())?;
+        moving_note(s, &format!("Moving to {}: its workspace volume moves there first, by Slates' own move", mv.to));
+        crate::workspace::slates_move::move_out(&made, vm).await.map_err(|refused| refused.reported())?;
+        moving_note(s, &format!("Moving to {}: its workspace volume is there; handing over the conversation", mv.to));
+    }
     // Going on there in another harness: its timeline says so (there too, as it travels with it).
     if let Some(to) = mv.kind {
         if !(kind.switchable() && to.switchable()) {
@@ -5256,6 +5267,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 if blocked.is_none() && !isolated {
                     kind.prepare(&spec).await;
                 }
+                // Its workspace volume mounted where it says before its harness starts in it: one that moved here with it
+                // (K4: its new owner may answer a moment after the move), or one a refused move let go of and took back.
+                let blocked = match blocked {
+                    None if !isolated => crate::workspace::mounted_for(&spec).await.err().map(|e| format!("its workspace: {e:#}")),
+                    other => other,
+                };
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // Isolated: its harness is a member of its image in a microVM of its own, through
@@ -5505,8 +5522,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                     switching = Some(sw);
                                 }
                             }
-                            Command::MoveTo { to, cwd, note, now, kind: into, model, local, native } => {
-                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native) {
+                            Command::MoveTo { to, cwd, note, now, kind: into, model, local, native, slates } => {
+                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
                                     // Not waiting for the turn: it stops here, and goes on there.
                                     if mv.picks_up {
                                         adapter.command(&mut s.core.lock(), Command::Interrupt);
@@ -6152,8 +6169,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         }
                     }
                     // Another runner: it goes there, now.
-                    Command::MoveTo { to, cwd, note, now, kind: into, model, local, native } => {
-                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native) {
+                    Command::MoveTo { to, cwd, note, now, kind: into, model, local, native, slates } => {
+                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
                             moving = Some(mv);
                             break;
                         }
@@ -7674,7 +7691,7 @@ sys.exit(1)
         use super::super::handing::NotHanded;
         use super::super::host::Decided;
         let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
-        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false };
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false, slates: None };
         let kept: CarriedIds = Arc::new(|_| Box::pin(async { Ok(vec![("m1".to_owned(), "d1".to_owned()), ("m2".to_owned(), "d2".to_owned())]) }));
         let unreadable: CarriedIds = Arc::new(|_| Box::pin(async { Err("its records are gone".to_owned()) }));
         let unknown = || -> Result<(), NotHanded> { Err(NotHanded::Unknown("the link dropped".into())) };
@@ -7758,7 +7775,7 @@ sys.exit(1)
         crate::rt::block_on(async move {
             for (kid, native) in [("gemini", true), ("gemini", false), ("antigravity", true), ("antigravity", false), ("claude", true), ("claude", false)] {
                 let kind = Kind::get(kid).ok_or_else(|| anyhow::anyhow!("no {kid}"))?;
-                let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native };
+                let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native, slates: None };
                 let (s, _rx) = idle("h1");
                 {
                     let mut core = s.core.lock();
@@ -7799,7 +7816,7 @@ sys.exit(1)
     #[test]
     fn a_hand_over_fences_its_inbox_then_reads_its_ids_then_copies_what_it_holds() -> anyhow::Result<()> {
         let kind = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
-        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false };
+        let mv = Move { to: "newer".into(), cwd: String::new(), note: None, picks_up: false, kind: None, model: None, local: true, native: false, slates: None };
         crate::rt::block_on(async move {
             let (s, _rx) = idle("h1");
             let s = Arc::new(s);

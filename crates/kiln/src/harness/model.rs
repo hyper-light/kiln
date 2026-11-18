@@ -2250,6 +2250,12 @@ pub enum Command {
         /// in its own conversation; else (an older build, a rollback) its conversation goes in words.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         native: bool,
+        /// Its workspace volume goes with it, by Slates' own move to the target's node (K4,
+        /// `workspace::slates_move`): moved once its harness is down, before the session is handed over.
+        /// The server's alone to set; no person's view shows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(skip))]
+        slates: Option<crate::workspace::slates_move::VolumeMove>,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {

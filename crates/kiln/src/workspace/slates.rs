@@ -383,11 +383,11 @@ pub async fn ensure_up() -> anyhow::Result<()> {
     // node's identity, word and manifest made, and the manifest read by Slates' own reader before the instance starts on
     // it. Any other process's instance runs alone. A chosen runner that can't join starts nothing: the next start asks
     // again, rather than starting an instance outside the fleet it was chosen for.
-    let fleet = match super::slates_fleet::source() {
+    let joined = match super::slates_fleet::source() {
         Some(source) => super::slates_fleet::join(source).await?,
         None => None,
     };
-    let anchor = start_anchor(&h.log, fleet)?;
+    let anchor = start_anchor(&h.log, joined.as_ref().map(|j| j.selection.clone()))?;
     let name = instance();
     // The anchor started here is watched while it's waited for, and never after: it outlives this process. The wait
     // lasts while the anchor lives, with no deadline of kiln's: the anchor judges its starting daemon by the daemon's
@@ -406,8 +406,32 @@ pub async fn ensure_up() -> anyhow::Result<()> {
     {
         anyhow::bail!("{} (its log: {})", start_refused(&e), h.log.display());
     }
-    // A new instance holds no volumes until its group exists; an existing one is left as it is.
+    // A fleet node imports its groups (Slates: never make one there), and says its member id, which a move of a volume to
+    // it names (K4): its runner's word again, now with the member its daemon serves as since this start.
+    if let (Some(joined), Some(source)) = (&joined, super::slates_fleet::source()) {
+        match call("member", |i| i.member()).await {
+            Ok(member) => {
+                if let Err(e) = super::slates_fleet::report_member(source, &joined.node, member).await {
+                    tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't say its member id: no volume moves to it until it does");
+                }
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't read its member id: no volume moves to it until it does"),
+        }
+        return Ok(());
+    }
+    // A new instance run alone holds no volumes until its group exists; an existing one is left as it is.
     call("bootstrap", |i| i.ensure_group()).await
+}
+
+/// The machine's instance started as kiln's Slates fleet's node now, where the server's `[slates_fleet]` lists this
+/// runner (K4): a fleet node holds other runners' copies and takes moved volumes only while its daemon runs, so it isn't
+/// left to start with this machine's first workspace. Nothing for a runner not listed.
+pub async fn start_if_chosen() -> anyhow::Result<()> {
+    let Some(source) = super::slates_fleet::source() else { return Ok(()) };
+    if super::slates_fleet::ask_place(source).await?.is_none() {
+        return Ok(());
+    }
+    ensure_up().await
 }
 
 /// What kiln says of a start of the machine's instance that ended before it answered (`e`, Slates' refusal of its wait).
@@ -527,6 +551,62 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
         return Ok(());
     }
     mount_at(m).await
+}
+
+/// Workspace `m` as this machine places it: where its mount names another machine's place for workspaces (it moved here
+/// with its agent, K4), its own place under this machine's ([`super::place::points`]); as it was otherwise.
+pub fn placed_here(m: &Made) -> anyhow::Result<Made> {
+    placed_under(m, &here()?.root)
+}
+
+/// [`placed_here`] with this machine's place for workspaces `root`.
+fn placed_under(m: &Made, root: &Path) -> anyhow::Result<Made> {
+    let mount = Path::new(&m.mount);
+    if m.mount.is_empty() || mount.starts_with(root) || mount.starts_with(super::place::real(root)) {
+        return Ok(m.clone());
+    }
+    let point = super::place::points(root, &m.name).into_iter().next().ok_or_else(|| anyhow::anyhow!(super::place::NO_POINT))?;
+    Ok(Made { mount: point.to_string_lossy().into_owned(), ..m.clone() })
+}
+
+/// [`mounted`], waiting while Slates asks for a pause (a volume that just moved here is served once its new owner has
+/// adopted it: until then its verbs are refused for now, `Error::Retry`), each pause the one Slates derived: Slates
+/// bounds the adoption itself, so no clock of kiln's ends the wait.
+pub async fn mounted_patiently(m: &Made) -> anyhow::Result<()> {
+    if m.mount.is_empty() || mounted_as_made(m).await? {
+        return Ok(());
+    }
+    loop {
+        match mount_typed(m).await? {
+            Ok(()) => return Ok(()),
+            Err(slates_api::Error::Retry { pause_ns, .. }) => pause_for_move(Duration::from_nanos(pause_ns)).await,
+            Err(refused) => anyhow::bail!("Slates' mount: {refused}"),
+        }
+    }
+}
+
+/// Workspace `m`'s mount let go before its volume moves (K4): its agent's harness is down, so nothing of it holds the
+/// mount; one still held is refused, and the volume stays.
+pub(super) async fn unmount_for_move(m: &Made) -> anyhow::Result<()> {
+    if m.mount.is_empty() || !mounted_as_made(m).await? {
+        return Ok(());
+    }
+    unmount(m).await?;
+    anyhow::ensure!(!mounted_as_made(m).await?, "its mount at {} is still held", m.mount);
+    Ok(())
+}
+
+/// One ask of volume `volume`'s move to fleet member `member` (Slates' `Instance::move_volume`, contract 33): its typed
+/// answer, apart from a failure to reach Slates at all.
+pub(super) async fn ask_move(volume: &str, member: u64) -> anyhow::Result<Result<slates_api::MoveProgress, slates_api::Error>> {
+    let id = volume_id(volume)?;
+    call("move", move |i| Ok(i.move_volume(id, member))).await
+}
+
+/// A pause between two asks of a move, or of a mount of a volume that just moved here.
+#[allow(clippy::disallowed_methods)] // (e) a move's measured pause
+pub(super) async fn pause_for_move(pause: Duration) {
+    crate::rt::sleep(pause).await;
 }
 
 /// Whether workspace `m`'s own volume is mounted where it says: the kernel's mount table holds a mount at its folder
@@ -1454,6 +1534,24 @@ mod tests {
         assert!(marked, "{:?}", handed.get_envs().collect::<Vec<_>>());
         let hex: String = secret.bytes().iter().map(|b| format!("{b:02x}")).collect();
         assert!(handed.get_args().all(|a| !a.to_string_lossy().contains(&hex)), "the secret rides no argument");
+        Ok(())
+    }
+
+    /// K4 (kiln goal 95101ef32ffb8b099942fe076619c310): a workspace that moved here with its agent names the other
+    /// machine's place for workspaces; it's placed under this machine's own, by its name, its volume the same; one placed
+    /// here already, and one with no mount (an isolated session's), stay as they are.
+    #[cfg(unix)]
+    #[test]
+    fn k4_a_workspace_that_moved_here_is_placed_under_this_machines_own_place() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let root = scratch.path().join("workspaces");
+        let moved = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into() };
+        let placed = placed_under(&moved, &root)?;
+        let here = super::super::place::real(&root).join("kiln-a");
+        assert_eq!(placed, Made { mount: here.to_string_lossy().into_owned(), ..moved.clone() });
+        assert_eq!(placed_under(&placed, &root)?, placed, "placed here already");
+        let unmounted = Made { mount: String::new(), ..moved };
+        assert_eq!(placed_under(&unmounted, &root)?, unmounted);
         Ok(())
     }
 
