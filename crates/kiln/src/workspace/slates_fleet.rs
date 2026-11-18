@@ -31,8 +31,15 @@
 //!   node with its key, and kiln's CA as the fleet's enrollment root; the path a `slates_api::role::FleetSelection`
 //!   names with this machine's name.
 //!
-//! Who joins the fleet, its fault tolerance, and when its Slates starts with it are the operator's to say (K3, opt-in,
-//! kiln's AGENTS.md); this module makes each runner's identity, finds the others and writes what Slates reads.
+//! - **The operator's choice** (K3; [`place_of`], `[slates_fleet]` in the server's configuration,
+//!   `POST /api/agents/slates-fleet/place`): which runners join, each by its machine's name with where its node is
+//!   reached, and the fleet's `f`; off while none is listed (kiln's AGENTS.md: opt-in automation). Only a listed
+//!   runner's word is taken, at the address the operator gave it ([`admit_chosen`]).
+//! - **A chosen runner's start** ([`join`], called by `workspace::slates::ensure_up` before it starts the machine's
+//!   instance): its place asked of the server, its identity made or renewed, its word said and the fleet's nodes
+//!   heard, the manifest written, and the manifest read by Slates' own reader (`slates_api::role::check_fleet`) as the
+//!   instance's start will read it; the instance then starts with `StartSpec.fleet` naming the manifest and the
+//!   machine. A runner the operator didn't list starts its instance alone, as before.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -417,6 +424,116 @@ pub fn write_manifest(dir: &Path, identity: &NodeIdentity, machine: &str, member
     Ok(path)
 }
 
+// -------------------------------------------------------------------------- the operator's choice (K3)
+
+/// Where the operator placed a runner in the fleet (`[slates_fleet]`): the fleet's name, its fault tolerance, and where
+/// the runner's node is reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Place {
+    pub fleet: String,
+    pub f: u32,
+    pub address: String,
+}
+
+/// The place `[slates_fleet]` gives the machine named `machine`: none when it lists no runner (off) or not that one;
+/// refused, naming what's wrong, when the setting can't make a fleet: a name kiln doesn't give a machine, an address
+/// Slates can't dial, or fewer runners than `2f + 1` (a write commits at `f + 1` of `2f + 1` copies).
+pub fn place_of(setting: &crate::config::SlatesFleet, machine: &str) -> Result<Option<Place>, String> {
+    if setting.nodes.is_empty() {
+        return Ok(None);
+    }
+    for (name, address) in &setting.nodes {
+        if crate::pki::sanitize_name(name) != *name {
+            return Err(format!("[slates_fleet.nodes] {name:?} isn't a machine's name as kiln writes it (lowercase letters, digits, '-' and '.')"));
+        }
+        check_address(address).map_err(|e| format!("[slates_fleet.nodes] {name}: {e:#}"))?;
+    }
+    let candidates = u64::from(setting.f).saturating_mul(2).saturating_add(1);
+    if u64::try_from(setting.nodes.len()).unwrap_or(u64::MAX) < candidates {
+        return Err(format!("[slates_fleet] f = {} needs at least {candidates} runners (a write commits at f + 1 of 2f + 1 copies), and {} are listed", setting.f, setting.nodes.len()));
+    }
+    Ok(setting.nodes.get(machine).map(|address| Place { fleet: FLEET.to_owned(), f: setting.f, address: address.clone() }))
+}
+
+/// [`admit`] under the operator's choice: the word of a runner `setting` lists, for its node at the address listed for
+/// it, and no other.
+pub fn admit_chosen(pki: &Pki, ask: &Announce, setting: &crate::config::SlatesFleet) -> anyhow::Result<Member> {
+    let member = admit(pki, ask)?;
+    let place = place_of(setting, &member.machine).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let place = place.ok_or_else(|| anyhow::anyhow!("{} isn't in kiln's Slates fleet: [slates_fleet.nodes] doesn't list it", member.machine))?;
+    anyhow::ensure!(place.address == member.address, "{}'s node is listed at {}, not {}", member.machine, place.address, member.address);
+    Ok(member)
+}
+
+/// What a runner's start needs to join (module docs): its node's folder (`<state>/slates-fleet`), the server, kiln's
+/// root (PEM), and its machine's own name and certificate, whose proof every ask carries.
+#[derive(Debug, Clone)]
+pub struct Source {
+    pub dir: PathBuf,
+    pub server_url: String,
+    pub ca_pem: String,
+    pub machine_name: String,
+    pub machine: Leaf,
+}
+
+/// The runner's source, set once as its process starts ([`set_source`]); none in a process that is no runner's.
+static SOURCE: std::sync::OnceLock<Source> = std::sync::OnceLock::new();
+
+/// Sets the runner's source (the runner's start, once): from then on its machine's instance asks to join as it starts.
+pub fn set_source(source: Source) {
+    let _ = SOURCE.set(source);
+}
+
+/// The runner's source, when this process is a runner's.
+pub fn source() -> Option<&'static Source> {
+    SOURCE.get()
+}
+
+/// What a runner sends `POST /api/agents/slates-fleet/place`: its machine's proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskPlace {
+    pub cert_pem: String,
+    pub proof_csr: String,
+}
+
+/// The place the server's `[slates_fleet]` gives the runner `source` is (none when it lists it not).
+pub async fn ask_place(source: &Source) -> anyhow::Result<Option<Place>> {
+    use crate::http::client::{Client, Roots};
+    let ask = AskPlace { cert_pem: source.machine.cert_pem.clone(), proof_csr: crate::pki::make_csr_with_key(&source.machine_name, &source.machine.key_pem)? };
+    let http = Client::new(Roots::WebPkiPlusDer(crate::join::pem_der(&source.ca_pem)?), None)?;
+    let url = format!("{}/api/agents/slates-fleet/place", source.server_url.trim_end_matches('/'));
+    let resp = http.post(&url).json(&ask).send().await.with_context(|| format!("reach {url}"))?;
+    if !resp.is_success() {
+        let status = resp.status();
+        let body = resp.bytes(REFUSAL_BYTES).await.unwrap_or_default();
+        anyhow::bail!("the server refused this runner's place in kiln's Slates fleet ({status}): {}", String::from_utf8_lossy(&body).trim());
+    }
+    resp.json(ANSWER_BYTES).await.context("this runner's place in kiln's Slates fleet")
+}
+
+/// The fleet selection the manifest written in `dir` makes for `machine`, read by Slates' own reader exactly as the
+/// instance's start reads it: refused in Slates' words, so an instance is never started on a manifest it would refuse.
+pub fn checked(manifest: &Path, machine: &str) -> anyhow::Result<slates_api::role::FleetSelection> {
+    let selection = slates_api::role::FleetSelection { manifest: manifest.to_string_lossy().into_owned(), node: machine.to_owned() };
+    slates_api::role::check_fleet(&selection).map_err(|e| anyhow::anyhow!("Slates refuses the fleet manifest {}: {e}", manifest.display()))?;
+    Ok(selection)
+}
+
+/// A runner's start (module docs): the fleet selection its machine's instance starts with, when the operator chose it;
+/// none when not.
+pub async fn join(source: &Source) -> anyhow::Result<Option<slates_api::role::FleetSelection>> {
+    let Some(place) = ask_place(source).await? else {
+        return Ok(None);
+    };
+    let identity = identity(&source.dir, &source.server_url, &source.ca_pem, &source.machine_name, &source.machine).await?;
+    let node = announcement(&identity, &place.address)?;
+    let members = discover(&source.server_url, &source.ca_pem, &source.machine_name, &source.machine, &node).await?;
+    let manifest = write_manifest(&source.dir, &identity, &source.machine_name, &members, place.f)?;
+    let selection = checked(&manifest, &source.machine_name)?;
+    tracing::info!(manifest = %manifest.display(), nodes = members.members.len(), f = place.f, "this runner's Slates joins kiln's Slates fleet");
+    Ok(Some(selection))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +775,74 @@ mod tests {
         let mut other = members.clone();
         other.fleet = "another.fleet".to_owned();
         assert!(write_manifest(&dir, &a, "bench-a", &other, 1).is_err(), "another fleet");
+        Ok(())
+    }
+
+    /// The setting that lists bench-a, bench-b and bench-c at the addresses the K2 tests give them, `f` 1.
+    fn chosen(f: u32) -> crate::config::SlatesFleet {
+        crate::config::SlatesFleet {
+            f,
+            nodes: [("bench-a", "10.0.0.1:17300"), ("bench-b", "10.0.0.2:17300"), ("bench-c", "runner-c.lan:17302")].into_iter().map(|(m, a)| (m.to_owned(), a.to_owned())).collect(),
+        }
+    }
+
+    /// K3: off while `[slates_fleet]` lists no runner; a listed runner's place is its listed address and the fleet's
+    /// `f`; an unlisted one has none; a setting that can't make a fleet (too few runners for its `f`, an address Slates
+    /// can't dial, a name kiln gives no machine) is refused, naming what's wrong.
+    #[test]
+    fn k3_the_operators_setting_places_the_runners_it_lists_and_no_other() -> anyhow::Result<()> {
+        assert_eq!(place_of(&crate::config::SlatesFleet::default(), "bench-a"), Ok(None), "off until declared");
+        assert_eq!(place_of(&chosen(1), "bench-a"), Ok(Some(Place { fleet: FLEET.to_owned(), f: 1, address: "10.0.0.1:17300".to_owned() })));
+        assert_eq!(place_of(&chosen(1), "bench-d"), Ok(None));
+        assert!(place_of(&chosen(2), "bench-a").is_err_and(|e| e.contains("at least 5")), "f = 2 over three runners");
+        let mut ipv6 = chosen(1);
+        ipv6.nodes.insert("bench-d".to_owned(), "[::1]:17300".to_owned());
+        assert!(place_of(&ipv6, "bench-a").is_err_and(|e| e.contains("bench-d")));
+        let mut named = chosen(1);
+        named.nodes.insert("Bench D".to_owned(), "10.0.0.4:17300".to_owned());
+        assert!(place_of(&named, "bench-a").is_err());
+        Ok(())
+    }
+
+    /// K3: the server takes a runner's word only when the operator listed it, and only at the address it was listed at.
+    #[test]
+    fn k3_only_a_listed_runners_word_is_taken_at_its_listed_address() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
+        let (leaf_a, identity_a) = node(&pki, scratch.path(), "bench-a")?;
+        let (leaf_d, identity_d) = node(&pki, scratch.path(), "bench-d")?;
+        assert!(admit_chosen(&pki, &word("bench-a", &leaf_a, &identity_a, "10.0.0.1:17300")?, &chosen(1)).is_ok());
+        assert!(admit_chosen(&pki, &word("bench-a", &leaf_a, &identity_a, "10.0.0.9:17300")?, &chosen(1)).is_err(), "another address than its listed one");
+        assert!(admit_chosen(&pki, &word("bench-d", &leaf_d, &identity_d, "10.0.0.4:17300")?, &chosen(1)).is_err(), "a runner not listed");
+        assert!(admit_chosen(&pki, &word("bench-a", &leaf_a, &identity_a, "10.0.0.1:17300")?, &crate::config::SlatesFleet::default()).is_err(), "no fleet declared");
+        Ok(())
+    }
+
+    /// K3: the manifest a chosen runner writes is read by Slates' own reader exactly as its instance's start reads it
+    /// (`slates_api::role::check_fleet`): the fleet's name, its `f`, the runner's two peers and kiln's CA as the one root.
+    /// A manifest its start would refuse (this node's key not its certificate's) is refused here first, in Slates' words.
+    #[test]
+    fn k3_slates_reads_the_manifest_a_chosen_runner_writes_as_its_start_will() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
+        let directory = Directory::default();
+        let mut identities = BTreeMap::new();
+        for (name, address) in [("bench-a", "10.0.0.1:17300"), ("bench-b", "10.0.0.2:17300"), ("bench-c", "runner-c.lan:17302")] {
+            let (leaf, identity) = node(&pki, scratch.path(), name)?;
+            directory.admit(admit_chosen(&pki, &word(name, &leaf, &identity, address)?, &chosen(1))?);
+            identities.insert(name, identity);
+        }
+        let a = identities.get("bench-a").ok_or_else(|| anyhow::anyhow!("bench-a"))?.clone();
+        let dir = scratch.path().join("bench-a");
+        let place = place_of(&chosen(1), "bench-a").map_err(|e| anyhow::anyhow!(e))?.ok_or_else(|| anyhow::anyhow!("bench-a has no place"))?;
+        let manifest = write_manifest(&dir, &a, "bench-a", &directory.members(|_| true), place.f)?;
+        let selection = checked(&manifest, "bench-a")?;
+        assert_eq!(selection.node, "bench-a");
+        let read = slates_api::role::check_fleet(&selection).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(read, slates_api::role::FleetCheck { name: FLEET.to_owned(), f: 1, peers: 2, enrollment_roots: 1 });
+        // This node's key replaced by another's: Slates' start would refuse it, and so does the check, first.
+        std::fs::copy(scratch.path().join("bench-b").join(KEY), dir.join(KEY))?;
+        assert!(checked(&manifest, "bench-a").is_err());
         Ok(())
     }
 }

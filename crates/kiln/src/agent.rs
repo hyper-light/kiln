@@ -2049,6 +2049,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let root = ca.clone();
     // The machine's certificate, its capacity holder's proof (docs/lb.md "A machine's keeper").
     let machine_leaf = leaf.clone();
+    // What this runner's Slates needs to join kiln's Slates fleet where the server's `[slates_fleet]` chooses it (docs/agentic.md
+    // W7; `workspace::slates_fleet`): asked as its machine's instance starts. Never in a job pod or an outpost.
+    if !o.ephemeral && !o.outpost {
+        crate::workspace::slates_fleet::set_source(crate::workspace::slates_fleet::Source {
+            dir: o.state_dir.join("slates-fleet"),
+            server_url: o.server_url.clone(),
+            ca_pem: crate::pki::cert_pem(&root),
+            machine_name: name.clone(),
+            machine: machine_leaf.clone(),
+        });
+    }
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {

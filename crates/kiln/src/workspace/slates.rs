@@ -282,14 +282,17 @@ pub fn started_anchor() -> Option<u32> {
 }
 
 /// What starts the machine's instance: kiln's own executable in Slates' roles, [`SHARDS`] shards,
-/// a laptop's instance of its own (no fleet), handed `launcher`'s secret when there is one, and
-/// asked to stop if none of its daemons ever serves (`StartSpec::until_served`, Slates' A-366): kiln
-/// mounts nothing on it before [`ensure_up`]'s wait and first call succeed, so no mount can wait on
-/// an instance that never answered, and that wait needs no deadline of its own.
-fn start_spec(launcher: Option<LauncherSecret>) -> anyhow::Result<StartSpec> {
+/// as a node of kiln's Slates fleet where the operator chose this runner (`fleet`, its manifest
+/// checked by Slates' own reader: `super::slates_fleet::join`) and an instance of its own
+/// otherwise, handed `launcher`'s secret when there is one, and asked to stop if none of its
+/// daemons ever serves (`StartSpec::until_served`, Slates' A-366): kiln mounts nothing on it before
+/// [`ensure_up`]'s wait and first call succeed, so no mount can wait on an instance that never
+/// answered, and that wait needs no deadline of its own.
+fn start_spec(launcher: Option<LauncherSecret>, fleet: Option<slates_api::role::FleetSelection>) -> anyhow::Result<StartSpec> {
     let mut spec = StartSpec::new(&instance(), program()?, &[ROLE_ARG]).until_served();
     spec.shards = Some(SHARDS);
     spec.quick = OVERRIDE.get().is_some_and(|o| o.quick);
+    spec.fleet = fleet;
     Ok(match launcher {
         Some(secret) => spec.with_launcher(secret),
         None => spec,
@@ -328,10 +331,10 @@ fn scope_wrapper(unit: &str) -> Vec<OsString> {
     ["systemd-run", "--user", "--scope", "--quiet", "--collect", &format!("--unit={unit}"), "--"].into_iter().map(OsString::from).collect()
 }
 
-/// The anchor's command, handed `launcher`'s secret: run under [`scope_wrapper`] where it starts
-/// under systemd (`scoped`), as itself elsewhere.
-fn anchor_command(launcher: LauncherSecret, scoped: bool) -> anyhow::Result<Command> {
-    let spec = start_spec(Some(launcher))?;
+/// The anchor's command, handed `launcher`'s secret, a node of `fleet` where there is one: run under
+/// [`scope_wrapper`] where it starts under systemd (`scoped`), as itself elsewhere.
+fn anchor_command(launcher: LauncherSecret, scoped: bool, fleet: Option<slates_api::role::FleetSelection>) -> anyhow::Result<Command> {
+    let spec = start_spec(Some(launcher), fleet)?;
     let command = if scoped {
         let wrapper = scope_wrapper(&format!("{}-slates", instance()));
         spec.anchor_command_under(&wrapper.iter().map(OsString::as_os_str).collect::<Vec<&OsStr>>())
@@ -346,8 +349,8 @@ fn anchor_command(launcher: LauncherSecret, scoped: bool) -> anyhow::Result<Comm
 /// ([`starts_in_a_scope`], [`scope_wrapper`]), in its own process group elsewhere, with what it says
 /// (systemd-run's own refusal included) appended to `log`. The process started is the anchor
 /// itself, which [`ensure_up`] watches while it waits for its daemon to answer.
-fn start_anchor(log: &Path) -> anyhow::Result<std::process::Child> {
-    let mut anchor = anchor_command(launcher_secret()?, starts_in_a_scope())?;
+fn start_anchor(log: &Path, fleet: Option<slates_api::role::FleetSelection>) -> anyhow::Result<std::process::Child> {
+    let mut anchor = anchor_command(launcher_secret()?, starts_in_a_scope(), fleet)?;
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -376,7 +379,15 @@ pub async fn ensure_up() -> anyhow::Result<()> {
         return Ok(());
     }
     let h = here()?;
-    let anchor = start_anchor(&h.log)?;
+    // A runner the operator chose joins kiln's Slates fleet (`[slates_fleet]`, K3): its place asked of the server, its
+    // node's identity, word and manifest made, and the manifest read by Slates' own reader before the instance starts on
+    // it. Any other process's instance runs alone. A chosen runner that can't join starts nothing: the next start asks
+    // again, rather than starting an instance outside the fleet it was chosen for.
+    let fleet = match super::slates_fleet::source() {
+        Some(source) => super::slates_fleet::join(source).await?,
+        None => None,
+    };
+    let anchor = start_anchor(&h.log, fleet)?;
     let name = instance();
     // The anchor started here is watched while it's waited for, and never after: it outlives this process. The wait
     // lasts while the anchor lives, with no deadline of kiln's: the anchor judges its starting daemon by the daemon's
@@ -1268,7 +1279,7 @@ mod tests {
     /// apart from an anchor that ended for another reason.
     #[test]
     fn w1_kiln_waits_on_its_anchor_while_it_lives_and_hears_a_start_that_never_served() -> anyhow::Result<()> {
-        assert!(start_spec(None)?.until_served, "kiln asks until_served");
+        assert!(start_spec(None, None)?.until_served, "kiln asks until_served");
         let never = start_refused(&slates_api::Error::Start(slates_api::StartFault::NeverServed));
         assert!(never.contains("never answered") && never.contains("none of them served"), "{never}");
         let ended = start_refused(&slates_api::Error::Start(slates_api::StartFault::AnchorExited { code: Some(4) }));
@@ -1427,10 +1438,10 @@ mod tests {
     /// its shards and its quick profile only where a test asked.
     #[test]
     fn w1_the_anchor_is_kilns_own_executable_in_slates_role() -> anyhow::Result<()> {
-        let spec = start_spec(None)?;
+        let spec = start_spec(None, None)?;
         assert_eq!(spec.prefix, vec![ROLE_ARG.to_owned()]);
         assert_eq!(spec.shards, Some(SHARDS));
-        assert!(spec.fleet.is_none(), "a machine's instance runs alone");
+        assert!(spec.fleet.is_none(), "a machine the operator didn't choose runs its instance alone");
         let command = spec.anchor_command()?;
         let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(args.first().map(String::as_str), Some(ROLE_ARG), "{args:?}");
@@ -1438,11 +1449,25 @@ mod tests {
         assert!(args.iter().any(|a| a == "anchor"), "{args:?}");
         // With kiln's secret, the anchor is told its standard input carries it (and the secret is in no argument).
         let secret = LauncherSecret::generate()?;
-        let handed = start_spec(Some(secret.clone()))?.anchor_command()?;
+        let handed = start_spec(Some(secret.clone()), None)?.anchor_command()?;
         let marked = handed.get_envs().any(|(k, v)| k == "SLATES_LAUNCHER" && v.is_some_and(|v| v == "stdin"));
         assert!(marked, "{:?}", handed.get_envs().collect::<Vec<_>>());
         let hex: String = secret.bytes().iter().map(|b| format!("{b:02x}")).collect();
         assert!(handed.get_args().all(|a| !a.to_string_lossy().contains(&hex)), "the secret rides no argument");
+        Ok(())
+    }
+
+    /// K3 (kiln goal 95101ef32ffb8b099942fe076619c310): a runner the operator chose starts its instance as the node its
+    /// manifest names: the anchor's command carries the manifest and the machine's name (`--fleet PATH --node NAME`),
+    /// as Slates' anchor reads them.
+    #[test]
+    fn k3_a_chosen_runners_anchor_is_started_as_the_fleets_node() -> anyhow::Result<()> {
+        let selection = slates_api::role::FleetSelection { manifest: "/state/slates-fleet/fleet.json".to_owned(), node: "bench-a".to_owned() };
+        let spec = start_spec(None, Some(selection.clone()))?;
+        assert_eq!(spec.fleet, Some(selection));
+        let args: Vec<String> = spec.anchor_command()?.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| matches!(w, [flag, path] if flag == "--fleet" && path == "/state/slates-fleet/fleet.json")), "{args:?}");
+        assert!(args.windows(2).any(|w| matches!(w, [flag, node] if flag == "--node" && node == "bench-a")), "{args:?}");
         Ok(())
     }
 
@@ -1468,13 +1493,13 @@ mod tests {
     fn w1_under_systemd_the_anchor_runs_in_a_scope_of_its_own_handed_the_secret() -> anyhow::Result<()> {
         let text = |os: &OsStr| os.to_string_lossy().into_owned();
         let secret = LauncherSecret::generate()?;
-        let scoped = anchor_command(secret.clone(), true)?;
+        let scoped = anchor_command(secret.clone(), true, None)?;
         assert_eq!(scoped.get_program(), "systemd-run");
         let args: Vec<String> = scoped.get_args().map(text).collect();
         let unit = format!("--unit={}-slates", instance());
         let wrapper = ["--user", "--scope", "--quiet", "--collect", unit.as_str(), "--"];
         assert_eq!(args.get(..wrapper.len()), Some(&wrapper.map(str::to_owned)[..]), "{args:?}");
-        let own = anchor_command(secret.clone(), false)?;
+        let own = anchor_command(secret.clone(), false, None)?;
         let mut execed = vec![text(own.get_program())];
         execed.extend(own.get_args().map(text));
         assert_eq!(args.get(wrapper.len()..), Some(&execed[..]), "what the scope execs is the anchor's own command");
