@@ -262,7 +262,9 @@ choice made) and `agents.start`. Several agents on one folder each get their own
 agent's folder on that agent's machine (a child placed in its parent's folder, above all) works in that agent's
 volume, as two agents in one folder did (`workspace.owner` names whose it is): a volume is never laid over a volume,
 which Slates refuses (its A-227). An isolated agent's workspace is its microVM's boundary's to share (W8), and a
-conversation taken up (`resume`) stays in the folder its harness keeps it by. A server sets the default with
+conversation taken up (`resume`) stays in the folder its harness keeps it by, and an agent started in a person's shell
+(`shell`) works beside them in the shell's folder, as the composer shows it (it takes the shell's environment, whose
+`PWD` names that folder). A server sets the default with
 `[agents] workspace`: `volume` (kiln's own) or `folder`, the folder itself as before; kiln's test servers and
 scratch hubs say `folder`, so no test leaves a volume or a mount behind on the machine that runs it, and a test of
 workspaces asks for its volumes.

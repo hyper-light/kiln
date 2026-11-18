@@ -4415,14 +4415,15 @@ impl Registry {
         // 01a1ec34599974448aed2672bafaf9a2; docs/agentic.md W2): one whose folder lies in a workspace an agent there
         // works in now works in that one; one whose start named none gets a volume of its own where its machine can make
         // one, else its folder, saying why (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
-        // its boundary's sharing decides, and a conversation taken up stays in the folder its harness keeps it by
-        // (`resume`).
+        // its boundary's sharing decides; a conversation taken up stays in the folder its harness keeps it by
+        // (`resume`); and an agent started in a person's shell (`shell`) works beside them in the shell's folder, as the
+        // composer shows it, since it takes the shell's environment, whose `PWD` names that folder.
         if spec.isolation.is_none() && spec.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
             let here = loc.target();
             let live: Vec<(String, crate::workspace::Workspace)> = self.list().into_iter().filter(|i| Location::of_target(&i.target).target() == here).filter_map(|i| i.workspace.filter(|w| w.made.is_some()).map(|w| (i.id, w))).collect();
             if let Some(shared) = spec.cwd.as_deref().and_then(|cwd| crate::workspace::sharing(cwd, &live)) {
                 spec.workspace = Some(shared);
-            } else if spec.workspace.is_none() && spec.resume.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
+            } else if spec.workspace.is_none() && spec.resume.is_none() && spec.shell.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
                 spec.workspace = Some(crate::workspace::by_default(crate::harness::lineage::workspaces_on(hub, target).await));
             }
         }
