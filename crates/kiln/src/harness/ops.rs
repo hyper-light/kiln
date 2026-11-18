@@ -3141,9 +3141,10 @@ for line in sys.stdin:
     /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2): what an agent works in when its start names no
     /// workspace is the server's `[agents] workspace`: on a server that says `folder` (a test's, a lab's) its folder
     /// itself, nothing made for it; and a person's `folder` is kept as asked on a server whose default is a volume, its
-    /// machine asked nothing about one, as is the folder of one started in a person's shell; and where its machine can't
-    /// make a volume the start is refused, naming what it lacks (`lineage::NoWorkspace`), never run in its folder instead
-    /// (the coordinator's ruling of 2026-11-18: that fallback was a second path). None needs Slates, so this holds on
+    /// machine asked nothing about one; and where its machine can't make a volume the start is refused, naming what it
+    /// lacks (`lineage::NoWorkspace`), never run in its folder instead (the coordinator's ruling of 2026-11-18: that
+    /// fallback was a second path), one started in a person's shell like any other: it works on a volume too, its folder
+    /// and environment moved onto it, never beside it in the person's folder (I11). None needs Slates, so this holds on
     /// every machine.
     #[test]
     fn w2_a_start_naming_no_workspace_follows_the_servers_setting_and_a_folder_asked_for_is_kept() -> anyhow::Result<()> {
@@ -3168,17 +3169,16 @@ for line in sys.stdin:
             let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
             anyhow::ensure!(ws.pointer("/workspace/kind") == Some(&json!("folder")) && ws.get("drift") == Some(&json!([])), "{ws}");
             anyhow::ensure!(ws.pointer("/workspace/volume") == Some(&Value::Null), "{ws}");
-            // One started in a person's shell works beside them in the shell's folder, its machine asked nothing.
-            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: Some("t1".into()), ..Default::default() };
-            let shelled = hub.harness.open(&hub, "local", spec, 1).await?;
-            anyhow::ensure!(shelled.first().is_some_and(|i| i.workspace.is_none()), "{shelled:?}");
             // A machine that can't make a volume (here its kiln is older than workspaces) refuses a start that names
-            // none, typed, naming what it lacks: it never runs the agent in its plain folder instead (no second path).
+            // none, typed, naming what it lacks: it never runs the agent in its plain folder instead (no second path);
+            // one started in a person's shell there is refused alike, since it too works on a volume.
             hub.put_agent(crate::hub::tests::live_runner("old", "linux", "x86_64"));
-            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), ..Default::default() };
-            let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
-            let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
-            anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "{refused:?}");
+            for shell in [None, Some("t1")] {
+                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: shell.map(str::to_owned), ..Default::default() };
+                let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
+                let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
+                anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "shell {shell:?}: {refused:?}");
+            }
             Ok(())
         })
     }

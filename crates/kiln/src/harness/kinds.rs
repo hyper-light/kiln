@@ -1458,6 +1458,26 @@ mod tests {
         Ok(())
     }
 
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2, I11): a harness starts with `PWD` naming the
+    /// folder it starts in, whatever environment it was handed. One started in a person's shell is handed the shell's,
+    /// whose `PWD` names the person's own folder (as it was when the shell started), while it works on its volume at the
+    /// mount: a command that trusts `PWD` would write past its volume into the person's folder.
+    #[test]
+    #[cfg(unix)]
+    fn w2_a_harness_starts_with_pwd_naming_the_folder_it_starts_in() -> anyhow::Result<()> {
+        let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
+        let mount = tempfile::tempdir()?;
+        let cwd = mount.path().join("src");
+        std::fs::create_dir_all(&cwd)?;
+        let shells = vec![("PWD".to_owned(), "/Users/person/project/src".to_owned()), ("OLDPWD".to_owned(), "/Users/person".to_owned())];
+        let spec = Spec { kind: "devin".into(), program: Some("/path/to/devin".into()), cwd: Some(cwd.to_string_lossy().into_owned()), shell: Some("t1".into()), env: shells, ..Spec::default() };
+        let launch = kind.launch(&spec, "session")?;
+        let env: std::collections::HashMap<_, _> = launch.get_envs().collect();
+        assert_eq!(env.get(std::ffi::OsStr::new("PWD")), Some(&Some(cwd.as_os_str())), "its PWD is where it starts, the shell's no longer");
+        assert_eq!(env.get(std::ffi::OsStr::new("OLDPWD")), Some(&Some(std::ffi::OsStr::new("/Users/person"))), "a folder outside the volume's stays as the shell had it");
+        Ok(())
+    }
+
     /// Cursor's CLI runs its ACP server (`agent acp`, cursor.com/docs/cli/acp), told to open no
     /// browser on the machine; its own terminal interface is `agent`. Its modes are known before it
     /// says them, each placed in lineage's order, so a child starts in one within its parent's.
