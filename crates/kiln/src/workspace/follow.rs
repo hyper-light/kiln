@@ -603,6 +603,26 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(120)).unwrap_or_else(|_| Err(anyhow::anyhow!("not done within two minutes")))
     }
 
+    /// What a server runs for a comment to reach its agent, as `server::run` starts them: its own machine's sessions,
+    /// the agents' mail pump, and the follower. The pump is the one a test forgets: since W20 a message to an agent is
+    /// published to the mail ledger and waits there (`Disposition::Waiting`) until the pump hands it over, so without
+    /// it the follower's `deliver` says the message went and its agent, idle with nothing queued, never hears it.
+    #[cfg(unix)]
+    fn serve(hub: &Arc<Hub>) {
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::registry::Registry::run_local(h).await;
+        });
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::mail_delivery::run(h).await;
+        });
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            let _ = follow_loop(h).await;
+        });
+    }
+
     /// What kiln's fake harness in `dir` was sent, each message's text.
     #[cfg(unix)]
     fn heard(dir: &std::path::Path) -> Vec<String> {
@@ -630,14 +650,7 @@ mod tests {
     fn w26_r18_a_persons_reply_reaches_the_agent_with_its_place() -> anyhow::Result<()> {
         within(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
-            let h = Arc::clone(&hub);
-            crate::rt::spawn(async move {
-                let _ = crate::harness::registry::Registry::run_local(h).await;
-            });
-            let h = Arc::clone(&hub);
-            crate::rt::spawn(async move {
-                let _ = follow_loop(h).await;
-            });
+            serve(&hub);
             let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude/claude");
             hub.store.call(|c| Ok(c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('acme', 'acme/app', 'https://example.invalid/app.git', 1);")?)).await?;
             let mut agents = Vec::new();
@@ -718,14 +731,7 @@ mod tests {
     fn w26_ac10_agents_feedback_starts_a_fix_only_where_the_switch_is_on() -> anyhow::Result<()> {
         within(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
-            let h = Arc::clone(&hub);
-            crate::rt::spawn(async move {
-                let _ = crate::harness::registry::Registry::run_local(h).await;
-            });
-            let h = Arc::clone(&hub);
-            crate::rt::spawn(async move {
-                let _ = follow_loop(h).await;
-            });
+            serve(&hub);
             let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude/claude");
             hub.store.call(|c| Ok(c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('acme', 'acme/app', 'https://example.invalid/app.git', 1);")?)).await?;
             let mut agents = Vec::new();
