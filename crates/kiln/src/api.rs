@@ -402,6 +402,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "agents", "capacity"]) => return boxed(|| enroll_capacity(&hub, req)).await,
         (&Method::POST, ["api", "agents", "slates-fleet"]) => return boxed(|| enroll_slates_node(&hub, req)).await,
         (&Method::POST, ["api", "agents", "slates-fleet", "members"]) => return boxed(|| slates_fleet_members(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet", "place"]) => return boxed(|| slates_fleet_place(&hub, req)).await,
         (&Method::POST, ["api", "agents", "rekey"]) => return boxed(|| rekey_agent(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
@@ -4593,12 +4594,28 @@ async fn slates_fleet_members(hub: &Hub, req: Request) -> R {
     if !agents.iter().any(|a| a.name == name) {
         return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
     }
-    let member = crate::workspace::slates_fleet::admit(&hub.pki, &ask).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let member = crate::workspace::slates_fleet::admit_chosen(&hub.pki, &ask, &hub.cfg.slates_fleet).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
     tracing::debug!(agent = %name, address = %member.address, "a Slates fleet node's word");
     hub.slates_fleet.admit(member);
     let connected: std::collections::BTreeSet<&str> = agents.iter().filter(|a| a.connected).map(|a| a.name.as_str()).collect();
     let members = hub.slates_fleet.members(|machine| machine == name || connected.contains(machine));
     Ok(srv::json(StatusCode::OK, &members))
+}
+
+/// `POST /api/agents/slates-fleet/place`: the place the server's `[slates_fleet]` gives the runner that asks (its
+/// fleet, `f`, and where its node is reached), `null` when it lists it not (`crate::workspace::slates_fleet::place_of`;
+/// kiln goal 95101ef32ffb8b099942fe076619c310, K3). Needs no token: the request proves the machine as
+/// `POST /api/agents/instance`'s does, and only a machine this server still knows is answered. A setting that can't
+/// make a fleet is refused, naming what's wrong, so no runner starts on it.
+async fn slates_fleet_place(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::AskPlace = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let known = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.iter().any(|a| a.name == name);
+    if !known {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
+    }
+    let place = crate::workspace::slates_fleet::place_of(&hub.cfg.slates_fleet, &name).map_err(|e| err(StatusCode::CONFLICT, e))?;
+    Ok(srv::json(StatusCode::OK, &place))
 }
 
 /// `POST /api/capacity/keeper`: a capacity keeper's certificate from kiln's CA, for its request

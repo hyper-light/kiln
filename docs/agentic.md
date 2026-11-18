@@ -391,9 +391,24 @@ fleet manifest reads it, with kiln's CA as the fleet's enrollment root. Its seco
 (`POST /api/agents/slates-fleet/members`: a runner says where its node is reached, taken only for
 its own machine's node and an address Slates can dial, and hears of every node whose runner is
 connected) and Slates' fleet manifest written beside the node's files (every node's address, failure
-domain and certificate, this node's key, kiln's CA as the root). Still owed: the operator's choice of
-which runners join and the fleet's fault tolerance, starting a runner's Slates with the fleet, and
-the move itself.
+domain and certificate, this node's key, kiln's CA as the root). Its third: the operator's choice, in
+the server's configuration (off until declared):
+
+```toml
+[slates_fleet]
+f = 1                                   # a write commits at f + 1 of 2f + 1 copies: at least 2f + 1 runners
+[slates_fleet.nodes]
+"adas-mac-studio" = "192.168.1.20:17300"  # where each runner's node is reached: IPv4 or DNS name, and the
+"adas-macbook-pro" = "192.168.1.21:17300" # base of its two UDP ports, which the other runners must reach
+"adas-mac-mini" = "192.168.1.22:17300"
+```
+
+A listed runner asks its place as its machine's instance starts (`POST /api/agents/slates-fleet/place`),
+makes or renews its node's certificate, says its word (taken only at its listed address) and hears the
+others', writes the manifest, has Slates' own reader read it (`slates_api::role::check_fleet`, which
+refuses what the instance's start would), and starts its instance as the fleet's node
+(`StartSpec.fleet`). A runner not listed starts its instance alone, as before; one listed that can't
+join starts none until it can. A running instance joins at its next start. Still owed: the move itself.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.
