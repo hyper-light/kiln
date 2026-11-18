@@ -727,20 +727,6 @@ async fn mounted_now(dir: &Path) -> bool {
     }
 }
 
-/// Lets go of workspace `m`'s mount at `dir`, which something still held past `patience` (`refused`: the last refusal),
-/// then says what came of it: let go, or still mounted, with what holds it, looked up only then, so a slow look never
-/// stands between the let-go and the agent's end.
-async fn let_go_of(m: &Made, dir: &Path, refused: &str, patience: Duration) {
-    let how = let_go(m.mount.clone()).await;
-    if !mounted_now(dir).await {
-        tracing::info!(mount = %m.mount, %refused, ?patience, let_go = ?how.ok(), "an ended agent's workspace was still in use past its agent's end: let go");
-        return;
-    }
-    let holders = holders(&m.mount).await;
-    let error = how.err().map(|e| format!("{e:#}")).unwrap_or_default();
-    tracing::warn!(mount = %m.mount, %refused, %holders, ?patience, %error, "an ended agent's workspace stays mounted: what holds it holds it past its agent's end");
-}
-
 /// What came of taking a workspace's mount down ([`unmount_patiently`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Unmounted {
@@ -820,23 +806,98 @@ async fn holders(_mount: &str) -> String {
 /// and a Windows drive stays mounted, kiln saying so. Its volume is destroyed all the same: nothing is kept for an agent
 /// that has ended.
 pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
-    let dir = PathBuf::from(&m.mount);
+    take_down(&Live { made: m }, &m.mount, patience).await?;
     if !m.mount.is_empty() {
-        if mounted_as_made(m).await? {
-            match unmount_patiently(|| unmount(m), || mounted_now(&dir), patience).await {
-                Unmounted::Gone => tracing::info!(mount = %m.mount, "an ended agent's workspace is unmounted"),
-                Unmounted::StillHeld(refused) => let_go_of(m, &dir, &refused, patience).await,
-            }
-        } else {
-            tracing::info!(mount = %m.mount, "an ended agent's workspace had nothing of its own mounted at its point");
-        }
-    }
-    let volume = volume_id(&m.volume)?;
-    call("volume destroy", move |i| i.destroy(volume)).await?;
-    if !m.mount.is_empty() {
-        super::place::clear(&dir);
+        super::place::clear(Path::new(&m.mount));
     }
     Ok(())
+}
+
+/// A workspace's volume kept because its mount is still in the kernel's table after kiln asked it gone, let go
+/// included: destroying the volume then would leave a mount with nothing behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountStays {
+    /// The mount point.
+    pub mount: String,
+    /// The last refusal of the unmount, in its words.
+    pub refused: String,
+    /// What the let-go said, where it refused.
+    pub let_go: String,
+    /// What holds the mount, as `lsof` names it.
+    pub holders: String,
+}
+
+impl std::fmt::Display for MountStays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} stays mounted, so its volume is kept: unmount refused ({}), let-go ({}), held by {}", self.mount, self.refused, self.let_go, self.holders)
+    }
+}
+
+impl std::error::Error for MountStays {}
+
+/// The steps of taking a workspace down ([`take_down`]), each this machine's word: whether its own mount is in the
+/// kernel's table (on Windows, its own drive), the OS's unmount, its let-go, what holds the mount, and the volume's
+/// destroy. Apart from [`remove`] so a test holds their order.
+trait TakeDown {
+    async fn mounted(&self) -> bool;
+    async fn unmount(&self) -> anyhow::Result<()>;
+    async fn let_go(&self) -> anyhow::Result<slates_api::LetGo>;
+    async fn holders(&self) -> String;
+    async fn destroy(&self) -> anyhow::Result<()>;
+}
+
+/// [`TakeDown`] for workspace `made` on this machine.
+struct Live<'a> {
+    made: &'a Made,
+}
+
+impl TakeDown for Live<'_> {
+    /// A table or a volume that can't be read counts its mount there, so nothing is destroyed beneath it unseen.
+    async fn mounted(&self) -> bool {
+        mounted_as_made(self.made).await.unwrap_or(true)
+    }
+
+    async fn unmount(&self) -> anyhow::Result<()> {
+        unmount(self.made).await
+    }
+
+    async fn let_go(&self) -> anyhow::Result<slates_api::LetGo> {
+        let_go(self.made.mount.clone()).await
+    }
+
+    async fn holders(&self) -> String {
+        holders(&self.made.mount).await
+    }
+
+    async fn destroy(&self) -> anyhow::Result<()> {
+        let volume = volume_id(&self.made.volume)?;
+        call("volume destroy", move |i| i.destroy(volume)).await
+    }
+}
+
+/// Takes a workspace with mount point `mount` down by `steps`: unmounted, asked again for as long as `patience`
+/// ([`unmount_patiently`]), let go where still held, then its volume destroyed.
+async fn take_down(steps: &impl TakeDown, mount: &str, patience: Duration) -> anyhow::Result<()> {
+    if !mount.is_empty() {
+        if steps.mounted().await {
+            match unmount_patiently(|| steps.unmount(), || steps.mounted(), patience).await {
+                Unmounted::Gone => tracing::info!(mount, "an ended agent's workspace is unmounted"),
+                Unmounted::StillHeld(refused) => {
+                    let how = steps.let_go().await;
+                    if steps.mounted().await {
+                        let holders = steps.holders().await;
+                        let error = how.err().map(|e| format!("{e:#}")).unwrap_or_default();
+                        tracing::warn!(mount, %refused, %holders, ?patience, %error, "an ended agent's workspace stays mounted: what holds it holds it past its agent's end");
+                    } else {
+                        tracing::info!(mount, %refused, ?patience, let_go = ?how.ok(), "an ended agent's workspace was still in use past its agent's end: let go");
+                    }
+                }
+            }
+        } else {
+            tracing::info!(mount, "an ended agent's workspace had nothing of its own mounted at its point");
+        }
+    }
+    steps.destroy().await
 }
 
 /// The files of the folder below workspace `m` that changed on disk after the agent changed them
@@ -1227,6 +1288,66 @@ mod tests {
         assert_eq!(plan.get("conflicted"), Some(&json!([{"path": "/README.md", "class": "ModifyModify"}])), "{plan}");
         assert_eq!(plan.get("conflicted"), outcome_json(&met).get("conflicts"), "typed as a landing's own outcome types them");
         assert!(plan.get("manifest").is_none(), "{plan}");
+    }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a workspace's volume is never destroyed while the kernel's mount
+    /// table still holds its point: a mount kiln's unmount and let-go both leave (they refused, or one answered done and
+    /// the table says otherwise) keeps its volume and is refused typed (`MountStays`); one that goes, or none there, takes
+    /// its volume with it. The macOS bare-metal drive met it: the Ask agent's volume destroyed, its NFS mount left in the
+    /// table (f3f618f2, kiln 68eda5b1, 2026-11-18).
+    #[test]
+    fn w3_a_volume_is_never_destroyed_while_its_mount_is_in_the_table() -> anyhow::Result<()> {
+        use std::cell::Cell;
+        #[derive(Default)]
+        struct Fake {
+            mounted: Cell<bool>,
+            refuses: bool,
+            lies: bool,
+            unmounts: Cell<u32>,
+            destroyed: Cell<u32>,
+        }
+        impl TakeDown for Fake {
+            async fn mounted(&self) -> bool {
+                self.mounted.get()
+            }
+            async fn unmount(&self) -> anyhow::Result<()> {
+                self.unmounts.set(self.unmounts.get() + 1);
+                match (self.refuses, self.lies) {
+                    (true, _) => anyhow::bail!("Slates' unmount: umount couldn't run: No such file or directory (os error 2)"),
+                    (false, true) => Ok(()),
+                    (false, false) => {
+                        self.mounted.set(false);
+                        Ok(())
+                    }
+                }
+            }
+            async fn let_go(&self) -> anyhow::Result<slates_api::LetGo> {
+                if self.refuses || self.lies { anyhow::bail!("Slates' unmount: umount -f couldn't run") } else { Ok(slates_api::LetGo::Forced) }
+            }
+            async fn holders(&self) -> String {
+                "nothing lsof can see".to_owned()
+            }
+            async fn destroy(&self) -> anyhow::Result<()> {
+                self.destroyed.set(self.destroyed.get() + 1);
+                Ok(())
+            }
+        }
+        crate::rt::block_on(async {
+            for (refuses, lies) in [(true, false), (false, true)] {
+                let stuck = Fake { mounted: Cell::new(true), refuses, lies, ..Fake::default() };
+                let kept = take_down(&stuck, "/state/workspaces/kiln-a", Duration::ZERO).await;
+                anyhow::ensure!(stuck.destroyed.get() == 0, "refuses {refuses}, lies {lies}: destroyed under a mount the table holds");
+                let stays = kept.as_ref().err().and_then(|e| e.downcast_ref::<MountStays>()).cloned();
+                anyhow::ensure!(stays.as_ref().is_some_and(|s| s.mount == "/state/workspaces/kiln-a"), "refuses {refuses}, lies {lies}: {kept:?}");
+            }
+            let goes = Fake { mounted: Cell::new(true), ..Fake::default() };
+            take_down(&goes, "/state/workspaces/kiln-b", Duration::ZERO).await?;
+            anyhow::ensure!((goes.unmounts.get(), goes.destroyed.get()) == (1, 1), "unmounted once, then destroyed");
+            let none = Fake::default();
+            take_down(&none, "/state/workspaces/kiln-c", Duration::ZERO).await?;
+            anyhow::ensure!((none.unmounts.get(), none.destroyed.get()) == (0, 1), "nothing mounted: destroyed, nothing asked");
+            Ok(())
+        })
     }
 
     #[test]
