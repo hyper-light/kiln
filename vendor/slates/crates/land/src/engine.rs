@@ -52,9 +52,9 @@ use crate::grant::{
   GrantBinding, GrantId, GrantRecord, GrantRefusal, GrantScope, Grants, LandingLease,
   LandingLeaseHeld, TargetIdentity, lease_key,
 };
-use crate::manifest::{Action, Filter, LandingEntry, Manifest, OverlayIdentity, Summary};
+use crate::manifest::{Action, Filter, Judged, LandingEntry, Manifest, OverlayIdentity, Summary};
 pub use crate::source::Source;
-use crate::verdict::{ConflictClass, DiskState, Verdict, verdict};
+use crate::verdict::{ConflictClass, DiskState, Verdict, content_verdict, verdict};
 
 /// Format: the prefix of every hidden sibling a landing creates inside the granted target; the
 /// landing id follows, then a per-landing counter, so a sweep recognizes its own names.
@@ -302,6 +302,9 @@ pub struct LandingReport {
   /// The batch barriers the landing took (A-130): each made a batch of written-out files durable before any of them
   /// was placed, so fewer than the files written whenever a batch held more than one.
   pub barriers: usize,
+  /// The files whose bytes were shared with an identical file their batch had already staged rather than written
+  /// (§4.15 step 6, A-445): the clone path's own count, so a landing that never clones where it could shows it.
+  pub cloned: usize,
   /// The costs measured.
   pub costs: LandingCosts,
   /// Hidden siblings of an earlier landing swept before this one ran.
@@ -545,6 +548,11 @@ struct Landing<'a, H: LandFs> {
   /// Whether the filesystem gives unnamed temporaries (`O_TMPFILE`); where it does not, a temporary is
   /// named from its creation.
   unnamed_temporaries: bool,
+  /// Whether the filesystem shares one file's bytes with another (`LandCapabilities::reflink`, A-445): where it does,
+  /// a file whose bytes its batch already staged is cloned from that temporary ([`clone_source`]).
+  reflink: bool,
+  /// The files cloned so far ([`LandingReport::cloned`]).
+  cloned: usize,
   hidden_counter: u64,
   bytes_written: u64,
   widest_window_ns: u64,
@@ -570,6 +578,11 @@ struct Landing<'a, H: LandFs> {
   /// put-back for an outsider's edit and reported `ModifyModify` on every entry a no-exchange crash had
   /// set aside — hidden by a simulated clock that never moved.
   restored: BTreeMap<Box<str>, Fingerprint>,
+  /// Each entry judged by content (a captured clone's, A-291) whose validation found the disk still holding what the
+  /// capture held, by path, with the fingerprint of the object found there: its write is bound to that object, as an
+  /// overlay's is to its witness ([`Landing::witness_of`]), so an outsider's change between the validation and the
+  /// write is a conflict, never overwritten or removed.
+  observed: BTreeMap<Box<str>, Fingerprint>,
 }
 
 /// What the writer needs besides the host: the volume, the grant, the observer, the audit log.
@@ -924,6 +937,18 @@ impl<H: LandFs> Landing<'_, H> {
   /// ([`Landing::restored`]).
   fn witness_of(&self, entry: &LandingEntry) -> Option<Witness> {
     let witness = entry.witnessed?;
+    if entry.judged == Judged::Content {
+      // Judged by content: the write is bound to the object the validation found holding the captured bytes; with
+      // none found the witness's fingerprint names nothing on this disk, and the write is refused.
+      return Some(Witness {
+        fingerprint: self
+          .observed
+          .get(&entry.path)
+          .copied()
+          .unwrap_or(witness.fingerprint),
+        ..witness
+      });
+    }
     let restored = self
       .restored
       .get(&entry.path)
@@ -939,6 +964,10 @@ impl<H: LandFs> Landing<'_, H> {
   }
 
   fn needs_hash(&mut self, entry: &LandingEntry) -> Result<bool, HostError> {
+    // An entry judged by content compares the disk's bytes with what the capture held, whatever its fingerprint.
+    if entry.judged == Judged::Content && matches!(entry.action, Action::Replace | Action::Delete) {
+      return Ok(true);
+    }
     let witness = self.witness_of(entry);
     match (&entry.action, witness.as_ref()) {
       (Action::Create, _) | (Action::Replace, None) => Ok(true),
@@ -967,14 +996,20 @@ impl<H: LandFs> Landing<'_, H> {
   fn validate_entry(
     &mut self,
     entry: &LandingEntry,
-    ours: &BTreeSet<String>,
+    ours: &Ours,
   ) -> Result<EntryReport, HostError> {
     {
       let hash = self.needs_hash(entry)?;
       // Every entry's directory is synced at the end, written or not, so a resumed landing
       // makes the previous attempt's entries durable too.
       self.touched.insert(split(&entry.path).0.into());
-      let check_ours = matches!(entry.action, Action::Clear).then_some(ours);
+      // A clear's own fresh directory holds only what the manifest makes beneath it; a directory a content manifest
+      // removes may hold only what the manifest removes beneath it.
+      let check_ours = match (&entry.action, entry.judged) {
+        (Action::Clear, _) => Some(&ours.created),
+        (Action::Rmdir, Judged::Content) => Some(&ours.removed),
+        _ => None,
+      };
       let disk = match &entry.action {
         Action::Rename { from } => {
           self.touched.insert(split(from).0.into());
@@ -982,13 +1017,18 @@ impl<H: LandFs> Landing<'_, H> {
         }
         _ => self.disk_state(&entry.path, hash, check_ours)?,
       };
-      let witness = self.witness_of(entry);
-      let v = verdict(
-        &entry.action,
-        witness.as_ref(),
-        disk,
-        entry.overlay.as_ref(),
-      );
+      let v = match entry.judged {
+        Judged::Witness => {
+          let witness = self.witness_of(entry);
+          verdict(
+            &entry.action,
+            witness.as_ref(),
+            disk,
+            entry.overlay.as_ref(),
+          )
+        }
+        Judged::Content => self.judge_by_content(entry, disk)?,
+      };
       Ok(EntryReport {
         path: entry.path.clone(),
         action: entry.action.clone(),
@@ -997,6 +1037,41 @@ impl<H: LandFs> Landing<'_, H> {
         window_ns: None,
       })
     }
+  }
+
+  /// An entry judged by content (A-291): its verdict, and, where it is written over or removes what the capture held,
+  /// the object found there now, which binds the write ([`Landing::observed`]).
+  fn judge_by_content(
+    &mut self,
+    entry: &LandingEntry,
+    disk: DiskState,
+  ) -> Result<Verdict, HostError> {
+    let v = content_verdict(
+      &entry.action,
+      entry.witnessed.as_ref(),
+      disk,
+      entry.overlay.as_ref(),
+    );
+    self.observed.remove(&entry.path);
+    if v == Verdict::Apply && matches!(entry.action, Action::Replace | Action::Delete) {
+      let found = match (&entry.action, disk) {
+        (Action::Replace, DiskState::File { fingerprint, .. }) => Some(fingerprint),
+        (Action::Delete, _) => {
+          let (dir_path, name) = split(&entry.path);
+          let dir = self.open_dir_path(dir_path)?;
+          match self.host.entry_fingerprint(dir, name) {
+            Ok(found) => Some(found),
+            Err(HostError::NotFound) => None,
+            Err(e) => return Err(e),
+          }
+        }
+        _ => None,
+      };
+      if let Some(found) = found {
+        self.observed.insert(entry.path.clone(), found);
+      }
+    }
+    Ok(v)
   }
 
   // ------------------------------------------------------------- writing
@@ -1141,6 +1216,11 @@ impl<H: LandFs> Landing<'_, H> {
     progress: &mut WriteProgress,
   ) -> EntryStep {
     let window = cx.store.content.chunk_bytes().max(1);
+    match self.begin_clone(entry, cx.vol, cx.store, progress) {
+      Ok(Some(copy)) => return self.stage_step(entry, index, copy, cx.store, progress),
+      Ok(None) => {}
+      Err(failure) => return EntryStep::Done(self.written_of(Err(failure))),
+    }
     let mut copy = match self.begin_copy(entry, cx.vol, cx.store) {
       Ok(copy) => copy,
       Err(failure) => return EntryStep::Done(self.written_of(Err(failure))),
@@ -1495,7 +1575,7 @@ impl<H: LandFs> Landing<'_, H> {
         let dir = self.open_dir_path(dir_path)?;
         let mode = entry.overlay.map_or(STAGE_MODE, |o| o.mode);
         self.touched.insert(dir_path.into());
-        match self.host.mkdir(dir, name, mode) {
+        match self.host.mkdir(dir, name, mode, entry.windows.bits()) {
           Ok(()) => Outcome::Written,
           Err(HostError::Unavailable(ERRNO_EXIST)) => self.existing_directory(dir, name)?,
           Err(e) => return Err(e.into()),
@@ -1504,7 +1584,13 @@ impl<H: LandFs> Landing<'_, H> {
       Action::Symlink { target } => {
         let dir = self.open_dir_path(dir_path)?;
         self.touched.insert(dir_path.into());
-        match self.host.symlink(dir, name, target) {
+        // Where a writer that makes a link in two steps stages it (Windows, A-438): this landing's own hidden name,
+        // which its sweep removes after a crash between the steps.
+        let staged = self.hidden_name();
+        match self
+          .host
+          .symlink(dir, name, target, &staged, entry.windows.bits())
+        {
           Ok(()) => Outcome::Written,
           Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Conflict(ConflictClass::TargetInUse),
           Err(e) => return Err(e.into()),
@@ -1512,7 +1598,17 @@ impl<H: LandFs> Landing<'_, H> {
       }
       // A file is staged for its batch's barrier by `write_one` (A-130), never written here.
       Action::Create | Action::Replace => return Err(WriteFailure::Volume(VfsError::Invalid)),
-      Action::Delete => self.delete(dir_path, name, entry.witnessed.as_ref())?,
+      Action::Delete => {
+        // An entry judged by content is removed as the object its validation found (A-291).
+        let witness = match entry.judged {
+          Judged::Witness => entry.witnessed,
+          Judged::Content => self.witness_of(entry),
+        };
+        self.delete(dir_path, name, witness.as_ref())?
+      }
+      Action::Rmdir if entry.judged == Judged::Content => {
+        self.remove_emptied_dir(dir_path, name)?
+      }
       Action::Rmdir => self.remove_tree_entry(dir_path, name, entry.witnessed.as_ref())?,
       Action::Clear => return self.clear_entry(dir_path, name, entry),
       Action::Rename { from } => self.rename_dir(from, dir_path, name, entry.witnessed.as_ref())?,
@@ -1557,6 +1653,51 @@ impl<H: LandFs> Landing<'_, H> {
   /// (AUD-29-04). Before 2026-09-30 a replacement's temporary was created at its aside name, where a crash
   /// mid-write left bytes that matched neither the witness nor the overlay, and the resume kept them (a
   /// named-temporary filesystem: APFS).
+  /// A file's bytes shared with an identical file its batch has already staged (§4.15 step 6, A-445: "reflink instead
+  /// of writev when the target filesystem supports it and an identical file already exists in the target tree, found
+  /// through the landing's own hash index of the manifest, never by scanning the disk"): the staged temporary with the
+  /// same BLAKE3 and length ([`clone_source`]), cloned into a new temporary that is then complete, as a copy is once its
+  /// last window is written. `None` where the filesystem has no reflinks, the batch holds no such file, or the host
+  /// refused to share this pair (`EOPNOTSUPP`, nothing made): the bytes are then written as they always were.
+  fn begin_clone(
+    &mut self,
+    entry: &LandingEntry,
+    vol: &mut Volume,
+    store: &mut Store,
+    progress: &WriteProgress,
+  ) -> Result<Option<FileCopy>, WriteFailure> {
+    if !self.reflink {
+      return Ok(None);
+    }
+    let overlay = entry
+      .overlay
+      .ok_or(WriteFailure::Volume(VfsError::Invalid))?;
+    let Some(from) = clone_source(&progress.staged, &overlay) else {
+      return Ok(None);
+    };
+    let (dir_path, _) = split(&entry.path);
+    let located = self.request.source.resolve(vol, store, &entry.path)?;
+    let dir = self.open_dir_path(dir_path)?;
+    self.touched.insert(dir_path.into());
+    let created = self.hidden_name();
+    let started = Instant::now();
+    let temp = match self.host.clone_temp(dir, &created, from, overlay.size) {
+      Ok(temp) => temp,
+      Err(HostError::Unavailable(errno)) if no_clone(errno) => return Ok(None),
+      Err(e) => return Err(e.into()),
+    };
+    self.cloned = self.cloned.saturating_add(1);
+    Ok(Some(FileCopy {
+      temp,
+      dir,
+      created,
+      inode: located.inode,
+      next: overlay.size,
+      overlay,
+      started,
+    }))
+  }
+
   fn begin_copy(
     &mut self,
     entry: &LandingEntry,
@@ -1627,6 +1768,7 @@ impl<H: LandFs> Landing<'_, H> {
     let filled = self
       .host
       .set_mode(copy.temp, copy.overlay.mode)
+      .and_then(|()| self.host.set_windows(copy.temp, entry.windows.bits()))
       .and_then(|()| self.host.set_mtime(copy.temp, copy.overlay.mtime_ns))
       .and_then(|()| self.host.write_out(copy.temp));
     if let Err(e) = filled {
@@ -2045,6 +2187,22 @@ impl<H: LandFs> Landing<'_, H> {
     }
   }
 
+  /// A directory a content manifest removes (A-291): by then the landing removed what it held, so it goes only while
+  /// empty, and one an outsider wrote into since its validation stays with what it holds (`TargetInUse`). Never a
+  /// recursive removal: what the capture never held is not this landing's to remove.
+  fn remove_emptied_dir(&mut self, dir_path: &str, name: &str) -> Result<Outcome, WriteFailure> {
+    let dir = self.open_dir_path(dir_path)?;
+    self.touched.insert(dir_path.into());
+    // The handles this landing holds beneath it are closed first: a host may refuse to remove a directory held open.
+    self.forget_dirs_under(&join(dir_path, name));
+    match self.host.rmdir(dir, name) {
+      Ok(()) => Ok(Outcome::Written),
+      Err(HostError::NotFound) => Ok(Outcome::Skipped(SkipReason::AlreadyThere)),
+      Err(HostError::Unavailable(_)) => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
+      Err(e) => Err(e.into()),
+    }
+  }
+
   /// A clear: a fresh directory (the overlay's mode) is made beside the old one and exchanged
   /// with it in one step, so the name always holds a directory, old or new; the displaced
   /// tree is verified to be the witnessed one (else exchanged back) and then removed. Without
@@ -2060,7 +2218,7 @@ impl<H: LandFs> Landing<'_, H> {
     let mode = entry.overlay.map_or(STAGE_MODE, |o| o.mode);
     match self.verify_dir(dir, name, entry.witnessed.as_ref())? {
       None => {
-        let outcome = match self.host.mkdir(dir, name, mode) {
+        let outcome = match self.host.mkdir(dir, name, mode, entry.windows.bits()) {
           Ok(()) => Outcome::Written,
           Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Conflict(ConflictClass::TargetInUse),
           Err(e) => return Err(e.into()),
@@ -2083,7 +2241,7 @@ impl<H: LandFs> Landing<'_, H> {
     // The fresh directory takes the entry's aside name: the exchange leaves the displaced directory under
     // it, and a sweep after a crash checks it before removing it (AUD-29-04).
     let fresh = self.aside_name(&path);
-    self.host.mkdir(dir, &fresh, mode)?;
+    self.host.mkdir(dir, &fresh, mode, entry.windows.bits())?;
     // The fresh directory's identity, taken while only this landing's hidden name holds it.
     let made = self.host.entry_fingerprint(dir, &fresh)?;
     if !self.exchange_names(dir, &fresh, name)? {
@@ -2659,18 +2817,68 @@ fn sweep_parents(manifest: &Manifest) -> Vec<Box<str>> {
   parents.into_iter().collect()
 }
 
-/// The paths a manifest creates, for a resumed clear to recognize its own directory.
-fn owned_paths(manifest: &Manifest) -> BTreeSet<String> {
-  manifest
+/// The paths a manifest makes and removes: what a resumed clear recognizes as its own directory's, and what a directory
+/// a content manifest removes may still hold at its validation (A-291).
+struct Ours {
+  /// The paths the manifest creates.
+  created: BTreeSet<String>,
+  /// The paths the manifest removes.
+  removed: BTreeSet<String>,
+}
+
+/// The paths a manifest makes and removes.
+fn owned_paths(manifest: &Manifest) -> Ours {
+  let paths = |made: bool| -> BTreeSet<String> {
+    manifest
+      .entries
+      .iter()
+      .filter(|e| match e.action {
+        Action::Create | Action::Mkdir | Action::Symlink { .. } | Action::Clear => made,
+        Action::Delete | Action::Rmdir => !made,
+        Action::Replace | Action::Rename { .. } => false,
+      })
+      .map(|e| e.path.to_string())
+      .collect()
+  };
+  Ours {
+    created: paths(true),
+    removed: paths(false),
+  }
+}
+
+/// The touched directories the sync phase syncs: every one but those a removal of this landing took away or found gone,
+/// whose removal the sync of its parent (touched too) makes durable. A content manifest (A-424) deletes a directory's
+/// files and then the directory, so the directory was touched by its files' entries and is gone by the sync: syncing it
+/// could only fail, and would hold every entry in it as unsynced.
+fn directories_to_sync(
+  touched: &BTreeSet<Box<str>>,
+  manifest: &Manifest,
+  reports: &[EntryReport],
+) -> Vec<Box<str>> {
+  let gone: Vec<&str> = manifest
     .entries
     .iter()
-    .filter(|e| {
-      matches!(
-        e.action,
-        Action::Create | Action::Mkdir | Action::Symlink { .. } | Action::Clear
-      )
+    .zip(reports)
+    .filter(|(entry, report)| {
+      entry.action == Action::Rmdir
+        && matches!(
+          report.outcome,
+          Some(Outcome::Written | Outcome::Skipped(SkipReason::AlreadyThere))
+        )
     })
-    .map(|e| e.path.to_string())
+    .map(|(entry, _)| entry.path.as_ref())
+    .collect();
+  touched
+    .iter()
+    .filter(|dir| {
+      !gone.iter().any(|removed| {
+        dir.as_ref() == *removed
+          || dir
+            .strip_prefix(*removed)
+            .is_some_and(|rest| rest.starts_with('/'))
+      })
+    })
+    .cloned()
     .collect()
 }
 
@@ -2714,6 +2922,24 @@ fn batch_pages(store: &Store) -> u64 {
     .checked_div(store.content.page().max(1))
     .unwrap_or(0);
   u64::try_from(pages).unwrap_or(u64::MAX).max(1)
+}
+
+/// The staged temporary a file with `overlay`'s bytes may be cloned from (A-445): the first of the batch's staged files
+/// with the same BLAKE3 and length, each complete and written out. The batch is the index: bounded by its pages
+/// ([`batch_pages`]), and its temporaries are held open until it is placed, so the one found is still this landing's.
+fn clone_source(staged: &VecDeque<Staged>, overlay: &OverlayIdentity) -> Option<HostFile> {
+  staged
+    .iter()
+    .find(|staged| {
+      staged.copy.overlay.hash == overlay.hash && staged.copy.overlay.size == overlay.size
+    })
+    .map(|staged| staged.copy.temp)
+}
+
+/// Whether a clone was refused for want of sharing (`ENOTSUP` on macOS, `EOPNOTSUPP` on Linux and from the Windows
+/// writer): the bytes are then written instead.
+fn no_clone(errno: i32) -> bool {
+  errno == ERRNO_NOTSUP_MACOS || errno == ERRNO_NOTSUP_LINUX
 }
 
 fn no_exchange(errno: i32) -> bool {
@@ -2857,7 +3083,7 @@ pub fn settle_grant(
 /// volume's or the target's. [`Beginning`] run to its end in one call, then [`begin_planned`].
 #[allow(clippy::too_many_arguments)]
 pub fn begin_landing<'h, H: LandFs>(
-  mut host: HostSlot<'h, H>,
+  host: HostSlot<'h, H>,
   target: &LandingTarget,
   vol: &mut Volume,
   store: &mut Store,
@@ -2866,10 +3092,23 @@ pub fn begin_landing<'h, H: LandFs>(
   audit: &mut Audit,
   request: &LandingRequest,
 ) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
-  let mut beginning = match Beginning::new(vol, target, request) {
+  let beginning = match Beginning::new(vol, target, request) {
     Ok(beginning) => beginning,
     Err(refusal) => return Err((host, refusal)),
   };
+  begin_landing_from(beginning, host, vol, store, grants, lease, audit)
+}
+
+/// [`begin_landing`] from a [`Beginning`] its caller made: a captured clone's ([`Beginning::against_capture`]).
+pub fn begin_landing_from<'h, H: LandFs>(
+  mut beginning: Beginning,
+  mut host: HostSlot<'h, H>,
+  vol: &mut Volume,
+  store: &mut Store,
+  grants: &mut Grants,
+  lease: Option<&LandingLease>,
+  audit: &mut Audit,
+) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
   let planned = loop {
     let stepped = match host.get() {
       Some(lent) => beginning.unit(lent, vol, store, grants, audit),
@@ -2915,7 +3154,7 @@ struct Verdicting {
   manifest: Manifest,
   binding: GrantBinding,
   saved: Saved,
-  ours: BTreeSet<String>,
+  ours: Ours,
   reports: Vec<EntryReport>,
 }
 
@@ -2950,6 +3189,27 @@ impl Beginning {
     let began = Instant::now();
     let walk =
       crate::manifest::PlanWalk::new(vol, request.source).map_err(LandingRefusal::Volume)?;
+    Ok(Beginning {
+      target: target.clone(),
+      request: request.clone(),
+      began,
+      stage: BeginStage::Plan(walk),
+    })
+  }
+
+  /// [`Beginning::new`] for a clone of a captured base (§4.15 `capture_base`, A-291's landing): its manifest is the
+  /// change of `request.source` since the capture `base` (a snapshot's tree in the same store, pinned while the clone
+  /// lives), every entry judged by content ([`crate::manifest::PlanWalk::against_capture`]), and its finish leaves the
+  /// volume as it was.
+  pub fn against_capture(
+    vol: &Volume,
+    target: &LandingTarget,
+    request: &LandingRequest,
+    base: slates_vfs::captured::FrozenTree,
+  ) -> Result<Beginning, LandingRefusal> {
+    let began = Instant::now();
+    let walk = crate::manifest::PlanWalk::against_capture(vol, request.source, base)
+      .map_err(LandingRefusal::Volume)?;
     Ok(Beginning {
       target: target.clone(),
       request: request.clone(),
@@ -3128,6 +3388,8 @@ struct Saved {
   touched: BTreeSet<Box<str>>,
   exchange: bool,
   unnamed_temporaries: bool,
+  reflink: bool,
+  cloned: usize,
   hidden_counter: u64,
   bytes_written: u64,
   widest_window_ns: u64,
@@ -3139,6 +3401,7 @@ struct Saved {
   media_failed: bool,
   placed: BTreeMap<Box<str>, Fingerprint>,
   restored: BTreeMap<Box<str>, Fingerprint>,
+  observed: BTreeMap<Box<str>, Fingerprint>,
 }
 
 impl Saved {
@@ -3150,6 +3413,8 @@ impl Saved {
       touched: BTreeSet::new(),
       exchange: caps.exchange,
       unnamed_temporaries: caps.unnamed_temporaries,
+      reflink: caps.reflink,
+      cloned: 0,
       hidden_counter: 0,
       bytes_written: 0,
       widest_window_ns: 0,
@@ -3161,6 +3426,7 @@ impl Saved {
       media_failed: false,
       placed: BTreeMap::new(),
       restored: BTreeMap::new(),
+      observed: BTreeMap::new(),
     }
   }
 }
@@ -3176,6 +3442,8 @@ impl<'a, H: LandFs> Landing<'a, H> {
       touched: saved.touched,
       exchange: saved.exchange,
       unnamed_temporaries: saved.unnamed_temporaries,
+      reflink: saved.reflink,
+      cloned: saved.cloned,
       hidden_counter: saved.hidden_counter,
       bytes_written: saved.bytes_written,
       widest_window_ns: saved.widest_window_ns,
@@ -3187,6 +3455,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       media_failed: saved.media_failed,
       placed: saved.placed,
       restored: saved.restored,
+      observed: saved.observed,
     }
   }
 
@@ -3198,6 +3467,8 @@ impl<'a, H: LandFs> Landing<'a, H> {
       touched: self.touched,
       exchange: self.exchange,
       unnamed_temporaries: self.unnamed_temporaries,
+      reflink: self.reflink,
+      cloned: self.cloned,
       hidden_counter: self.hidden_counter,
       bytes_written: self.bytes_written,
       widest_window_ns: self.widest_window_ns,
@@ -3209,6 +3480,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       media_failed: self.media_failed,
       placed: self.placed,
       restored: self.restored,
+      observed: self.observed,
     }
   }
 }
@@ -3240,7 +3512,7 @@ enum Phase {
   /// Settling a crashed earlier attempt's hidden siblings, one directory per unit.
   Sweep { parents: Vec<Box<str>>, next: usize },
   /// Taking each entry's verdict against the disk, one entry per unit.
-  Validate { ours: BTreeSet<String>, next: usize },
+  Validate { ours: Ours, next: usize },
   /// Writing: per unit, one entry, one window of a large file, one batch's barrier or one staged file placed (A-130).
   Write {
     next: usize,
@@ -3669,7 +3941,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
         );
         if done {
           next_phase = Some(Phase::Sync {
-            touched: landing.touched.iter().cloned().collect(),
+            touched: directories_to_sync(&landing.touched, manifest, reports),
             next: 0,
             progress: SyncProgress::default(),
           });
@@ -3816,6 +4088,13 @@ fn advance_step<H: LandFs>(
   store: &mut Store,
   request: &LandingRequest,
 ) -> Option<Result<(), LandingRefusal>> {
+  // A captured clone's landing (judged by content, A-291) takes no base from the target and forgets nothing: the clone
+  // stays the movable scratch volume it was, and its next landing is judged against its capture again.
+  let keeps_volume = manifest.basis == Judged::Content;
+  if !advance.begun && keeps_volume {
+    advance.begun = true;
+    return None;
+  }
   if !advance.begun {
     return match vol
       .with_host(landing.host)
@@ -3829,7 +4108,9 @@ fn advance_step<H: LandFs>(
     };
   }
   let Some(report) = reports.get(advance.next) else {
-    vol.with_host(landing.host).land_advance_end();
+    if !keeps_volume {
+      vol.with_host(landing.host).land_advance_end();
+    }
     return Some(Ok(()));
   };
   advance.next = advance.next.saturating_add(1);
@@ -3855,8 +4136,8 @@ fn advance_step<H: LandFs>(
     advance.held = advance.held.saturating_add(1);
   }
   // Only a completed landing advances (`Aborted` iff it crashed, §4.15), and only an entry that left the overlay and
-  // reached the durability boundary.
-  if advance.crashed || !takes_out || !durable {
+  // reached the durability boundary; a captured clone's entries leave nothing (above).
+  if advance.crashed || !takes_out || !durable || keeps_volume {
     return None;
   }
   // The landing's own write left a fresh ctime, so its witness is racy by the design's rule (A-49): a later verdict
@@ -3960,6 +4241,7 @@ fn finish_report<H: LandFs>(
     durability,
     degraded: landing.degraded,
     barriers: landing.barriers,
+    cloned: landing.cloned,
     costs,
     swept,
     target: target.dir,
@@ -3998,4 +4280,79 @@ fn same_object_after_a_move(witness: &Fingerprint, after: &Fingerprint) -> bool 
     windows: (after.windows & !MOVE_SETS) | (witness.windows & MOVE_SETS),
     ..*after
   } == *witness
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A staged file of `size` bytes whose content hashes to `hash`, held as temporary `temp`.
+  fn staged(temp: u64, hash: u8, size: u64) -> Staged {
+    Staged {
+      index: 0,
+      copy: FileCopy {
+        temp: HostFile(temp),
+        dir: HostDir(1),
+        created: ".slates-0000000000000001-0".into(),
+        inode: slates_vfs::ids::InodeNo(temp),
+        next: size,
+        overlay: OverlayIdentity {
+          hash: [hash; 32],
+          size,
+          mode: 0o644,
+          mtime_ns: 1,
+        },
+        started: Instant::now(),
+      },
+      witness: None,
+      entry_start_ns: 0,
+    }
+  }
+
+  /// §4.15 step 6, A-445 (the landing's own index, never a scan of the disk). Do: look up a file's bytes in a staged batch
+  /// holding two files with its hash, one of another length, and one of another hash. Expect the first staged file with
+  /// both the same BLAKE3 and the same length; none for a length or a hash the batch does not hold, or an empty batch.
+  #[test]
+  fn a_file_is_cloned_only_from_a_staged_file_with_its_hash_and_its_length() {
+    let batch: VecDeque<Staged> = [
+      staged(7, 0xAA, 10),
+      staged(8, 0xBB, 4096),
+      staged(9, 0xBB, 4096),
+      staged(10, 0xBB, 99),
+    ]
+    .into();
+    let wanted = |hash: u8, size: u64| OverlayIdentity {
+      hash: [hash; 32],
+      size,
+      mode: 0o600,
+      mtime_ns: 2,
+    };
+    assert_eq!(
+      clone_source(&batch, &wanted(0xBB, 4096)),
+      Some(HostFile(8)),
+      "the first such file"
+    );
+    assert_eq!(clone_source(&batch, &wanted(0xBB, 99)), Some(HostFile(10)));
+    assert_eq!(
+      clone_source(&batch, &wanted(0xBB, 100)),
+      None,
+      "a length the batch does not hold"
+    );
+    assert_eq!(
+      clone_source(&batch, &wanted(0xCC, 4096)),
+      None,
+      "a hash the batch does not hold"
+    );
+    assert_eq!(clone_source(&VecDeque::new(), &wanted(0xAA, 10)), None);
+  }
+
+  /// A-445. Do: ask whether each refusal means "this pair cannot share" (the bytes are then written) or a failure.
+  /// Expect `ENOTSUP` (macOS 45) and `EOPNOTSUPP` (Linux's and the Windows writer's 95) to fall back, and no other.
+  #[test]
+  fn only_a_refusal_to_share_falls_back_to_writing_the_bytes() {
+    assert!(no_clone(ERRNO_NOTSUP_MACOS) && no_clone(ERRNO_NOTSUP_LINUX));
+    for errno in [ERRNO_EXIST, ERRNO_INVAL, ERRNO_NOSPC, 1, 5] {
+      assert!(!no_clone(errno), "{errno}");
+    }
+  }
 }

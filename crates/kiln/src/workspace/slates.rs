@@ -98,7 +98,17 @@ pub const INSTANCE: &str = "kiln";
 /// fleet member (33) and a captured base (34); their refusals kiln shows in Slates' words. The
 /// revision brings Slates' A-384 too, a term for a command line's attachment, which kiln makes
 /// none of (module docs).
-pub const CONTRACT: u32 = 36;
+///
+/// 40 since kiln took Slates at b2909fcf5 (from 36; kiln goal 95101ef3, K5). kiln uses what 33 and
+/// 34 added since: a volume's move to another fleet member (33, `workspace::slates_move`, K4) and
+/// a captured base (34: every workspace is a clone of its folder's captured base, [`make`], so it is
+/// a plain volume a move takes), with Slates' A-424 behind it (a captured clone's landing judged
+/// against its capture by content); and 39, its fleet manifest read by Slates' own reader before
+/// its instance starts on it (`role::check_fleet`, which kiln carried as a recorded change of its
+/// own until this revision). It maps 37's `MountMissing::MountManager` (Windows) to its own
+/// can't-mount refusal, and needs none of the rest: a snapshot's archive exported (38) and a volume
+/// imported from one (40).
+pub const CONTRACT: u32 = 40;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -247,7 +257,7 @@ fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
             slates_api::MountMissing::FuseDevice => WorkspaceMissing::FuseDevice,
             slates_api::MountMissing::WinFsp => WorkspaceMissing::WinFsp,
             slates_api::MountMissing::MountNfs => WorkspaceMissing::MountNfs,
-            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared => WorkspaceMissing::Mount,
+            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared | slates_api::MountMissing::MountManager => WorkspaceMissing::Mount,
         },
         _ => WorkspaceMissing::Mount,
     }
@@ -460,6 +470,27 @@ pub struct Made {
     pub volume: String,
     pub name: String,
     pub mount: String,
+    /// The captured base its volume is a clone of, on a runner in kiln's Slates fleet (K5, [`make`]); none for an
+    /// overlay laid over its folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(skip))]
+    pub base: Option<Base>,
+    /// It moved here with its agent from another runner (K4, [`arrived`]): Slates judges a landing of a moved clone
+    /// against its capture only once the move carries the capture (its stage 2), so kiln lands none until then
+    /// ([`landing`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(skip))]
+    pub moved: bool,
+}
+
+/// What a workspace's volume is a clone of (K5): its folder's captured base, an overlay of the folder whose whole tree
+/// Slates' capture made its own (`Instance::capture_base`, A-291), and that capture's snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Base {
+    /// The base overlay's volume id (32 hexadecimal digits).
+    pub volume: String,
+    /// The captured snapshot's id.
+    pub snapshot: u64,
 }
 
 /// A volume's id from its text (Slates' 32 hexadecimal digits, as [`slates_api::volume_id_text`]
@@ -488,17 +519,18 @@ fn hex_bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(bytes)
 }
 
-/// A new workspace `name` laid over `over`, mounted where its machine mounts workspaces (`super::place`): its folder
-/// under the workspaces folder, or on Windows the highest drive letter free, the next one free when Slates refuses that
-/// one as another volume's or another start took it meanwhile ([`another_letter_may_serve`]).
+/// A new workspace `name` over `over`, mounted where its machine mounts workspaces (`super::place`): its folder under the
+/// workspaces folder, or on Windows the highest drive letter free, the next one free when Slates refuses that one as
+/// another volume's or another start took it meanwhile ([`another_letter_may_serve`]). On a runner in kiln's Slates fleet
+/// it's a clone of its folder's captured base, a plain volume Slates moves with its agent (K5, [`provision`]); elsewhere an
+/// overlay laid over the folder, which reads nothing of it until it's used.
 pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
-    let spec = VolumeSpec::overlay(name, over, volume_max());
-    let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+    let (id, base) = provision(name, over, in_fleet().await).await?;
     let volume = slates_api::volume_id_text(id);
     let mut failed = anyhow::anyhow!(super::place::NO_POINT);
     for point in super::place::points(&here()?.root, name) {
-        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned() };
+        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone(), moved: false };
         // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
         // volume, not this one, and Slates refuses a second mount at it.
         match mount_typed(&m).await {
@@ -519,8 +551,13 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
             }
         }
     }
-    if let Err(gone) = call("volume destroy", move |i| i.destroy(id)).await {
-        tracing::warn!(%volume, error = %format!("{gone:#}"), "a workspace that couldn't be mounted stayed");
+    match call("volume destroy", move |i| i.destroy(id)).await {
+        Ok(()) => {
+            if let Some(base) = &base {
+                release_base(base, id).await;
+            }
+        }
+        Err(gone) => tracing::warn!(%volume, error = %format!("{gone:#}"), "a workspace that couldn't be mounted stayed"),
     }
     Err(failed)
 }
@@ -532,7 +569,176 @@ pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
     let spec = VolumeSpec::overlay(name, over, volume_max());
     let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
-    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new() })
+    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None, moved: false })
+}
+
+/// A workspace's volume `name` over folder `over`, unmounted (K5): with `captured`, a clone of the folder's captured base
+/// ([`base_for`]), chosen and cloned while no other start or end of this process takes or lets go of a base
+/// ([`bases_held`]), so no base is let go between its choice and its clone; else an overlay laid over the folder. Its id,
+/// and the base it's a clone of.
+pub(super) async fn provision(name: &str, over: &Path, captured: bool) -> anyhow::Result<(VolumeId, Option<Base>)> {
+    if !captured {
+        let spec = VolumeSpec::overlay(name, over, volume_max());
+        let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+        return Ok((id, None));
+    }
+    let _held = bases_held().lock().await;
+    let base = base_for(over).await?;
+    let spec = VolumeSpec::clone_of(name, volume_id(&base.volume)?, slates_api::SnapshotId { value: base.snapshot });
+    match call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await {
+        Ok(id) => Ok((id, Some(base))),
+        Err(e) => {
+            // The base may have gone meanwhile (its last clone, moved to another runner, ended there): the next start
+            // captures the folder again, and a base no clone holds goes now.
+            let_go_of_base(&base).await;
+            forget(&base);
+            Err(e)
+        }
+    }
+}
+
+/// Whether this runner is in kiln's Slates fleet (the server's `[slates_fleet]` lists it, K3): where its workspaces are
+/// captured clones a move takes (K5). Asked of the server at each workspace's start, as the operator's choice may change;
+/// a server that can't be asked says no, and the workspace is an overlay, which a move refuses by kind (`not_plain`).
+async fn in_fleet() -> bool {
+    let Some(source) = super::slates_fleet::source() else { return false };
+    matches!(super::slates_fleet::ask_place(source).await, Ok(Some(_)))
+}
+
+/// Each folder's captured base, kept for the next agent over it while one is a clone of it (K5): a base goes with its last
+/// clone ([`release_base`]), so nothing kiln captured outlives the workspaces made from it.
+fn kept() -> &'static parking_lot::Mutex<std::collections::HashMap<PathBuf, Base>> {
+    static KEPT: OnceLock<parking_lot::Mutex<std::collections::HashMap<PathBuf, Base>>> = OnceLock::new();
+    KEPT.get_or_init(Default::default)
+}
+
+/// `base` kept for its folder no more.
+fn forget(base: &Base) {
+    kept().lock().retain(|_, held| *held != *base);
+}
+
+/// One choice, clone or letting go of a captured base at a time in this process (K5): a start holds it from choosing its
+/// base until its clone pins the base's snapshot, and an end from asking Slates to let the snapshot go until the base is
+/// destroyed, so Slates' pin decides every time whether a base is still used.
+fn bases_held() -> &'static futures::lock::Mutex<()> {
+    static HELD: OnceLock<futures::lock::Mutex<()>> = OnceLock::new();
+    HELD.get_or_init(|| futures::lock::Mutex::new(()))
+}
+
+/// The captured base a workspace over folder `over` is cloned from (K5): the one kept for the folder while the folder is
+/// as it was captured ([`as_captured`]), so agents started over one folder share one capture; else a new capture, the one
+/// before let go once no clone holds it. Its caller holds [`bases_held`].
+async fn base_for(over: &Path) -> anyhow::Result<Base> {
+    let held = kept().lock().get(over).cloned();
+    if let Some(base) = held {
+        if as_captured(&base).await {
+            return Ok(base);
+        }
+        // The folder changed since its capture: the next agents get a new one, and this one goes once no clone holds it.
+        forget(&base);
+        let_go_of_base(&base).await;
+    }
+    let base = capture(over).await?;
+    kept().lock().insert(over.to_path_buf(), base.clone());
+    Ok(base)
+}
+
+/// Whether the folder under captured base `base` is as it was captured: Slates re-checks every entry the capture
+/// witnessed against the disk (its base overlay's drift) and finds none drifted or unverified ([`unchanged`]).
+async fn as_captured(base: &Base) -> bool {
+    let Ok(id) = volume_id(&base.volume) else { return false };
+    matches!(call("status", move |i| i.drift(id)).await, Ok(Some(report)) if unchanged(&report))
+}
+
+/// Whether a base overlay's drift `report` says its folder is as the volume witnessed it: nothing drifted, nothing
+/// unverified, nothing past what a reply carries.
+fn unchanged(report: &DriftReport) -> bool {
+    report.drifted.is_empty() && report.unverified.is_empty() && report.elided == 0
+}
+
+/// How many captures of a folder are asked before kiln says it's being written: each one after the first follows a file
+/// that changed while Slates read it (`RetryCause::ChangedWhileRead`), which a folder at rest never causes. Three covers
+/// an editor's save landing during two captures running, as a review's [`super::review`] tries do; a folder a build or a
+/// checkout is writing is refused in Slates' words, and the agent starts once it's quiet.
+const CAPTURE_TRIES: u32 = 3;
+
+/// Folder `over` captured as a base (K5): an overlay laid over it, its whole tree made the volume's own and frozen into a
+/// snapshot (Slates' `capture_base`, A-291), each pause before a capture asked again Slates' own; any refusal destroys the
+/// overlay. Never a copy through a disk: Slates reads the folder, and nothing is written to it.
+async fn capture(over: &Path) -> anyhow::Result<Base> {
+    let name = format!("kiln-base-{}", crate::util::random_token().chars().filter(char::is_ascii_alphanumeric).take(16).collect::<String>().to_ascii_lowercase());
+    let spec = VolumeSpec::overlay(&name, over, volume_max());
+    let id = call("base create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+    let mut captured = call("base capture", move |i| Ok(i.capture_base(id))).await;
+    for _ in 1..CAPTURE_TRIES {
+        let Ok(Err(slates_api::Error::Retry { pause_ns, .. })) = &captured else { break };
+        pause_for_move(Duration::from_nanos(*pause_ns)).await;
+        captured = call("base capture", move |i| Ok(i.capture_base(id))).await;
+    }
+    let failed = match captured {
+        Ok(Ok(snapshot)) => return Ok(Base { volume: slates_api::volume_id_text(id), snapshot: snapshot.value }),
+        Ok(Err(refused)) => anyhow::anyhow!("Slates' capture of {}: {refused}", over.display()),
+        Err(e) => e,
+    };
+    if let Err(gone) = call("base destroy", move |i| i.destroy(id)).await {
+        tracing::warn!(base = %slates_api::volume_id_text(id), error = %format!("{gone:#}"), "a folder's base whose capture failed stayed");
+    }
+    Err(failed)
+}
+
+/// Destroyed workspace volume `clone`'s base let go, unless another workspace is a clone of it still (K5): once Slates has
+/// finished the clone's destroy ([`destroyed`]), which gives the clone's pin on the base's snapshot back, the snapshot and
+/// then the base are destroyed ([`let_go_of_base`]). Where the destroy can't be followed, the base stays, said in the log.
+async fn release_base(base: &Base, clone: VolumeId) {
+    if !destroyed(clone).await {
+        tracing::warn!(base = %base.volume, volume = %slates_api::volume_id_text(clone), "a workspace's base stayed: its clone's destroy couldn't be followed to its end");
+        return;
+    }
+    let _held = bases_held().lock().await;
+    let_go_of_base(base).await;
+}
+
+/// Whether volume `clone`'s destroy is finished: Slates answers it missing. While its slices run Slates answers it
+/// `Destroying` (or asks for a pause), and each pause is the one the library derives: Slates bounds the destroy itself
+/// (sliced on its owner, and finished after a restart by its recovery), so no clock of kiln's ends the wait. Any other
+/// answer, or none, is no.
+async fn destroyed(clone: VolumeId) -> bool {
+    let mut pause_ns = 0;
+    loop {
+        let previous = pause_ns;
+        match call("status", move |i| Ok((i.status(clone).map(|_| ()), i.retry_pause_ns(previous)))).await {
+            Ok((Err(slates_api::Error::NotFound(_)), _)) => return true,
+            Ok((Err(slates_api::Error::Unusable(slates_api::Unusable::Destroying)), next)) => pause_ns = next,
+            Ok((Err(slates_api::Error::Retry { pause_ns: asked, .. }), _)) => pause_ns = asked,
+            _ => return false,
+        }
+        pause_for_move(Duration::from_nanos(pause_ns)).await;
+    }
+}
+
+/// Captured base `base` destroyed, its snapshot first, unless Slates refuses the snapshot's destroy as a clone pins it
+/// still (another workspace is a clone of it: its end lets the base go). Its caller holds [`bases_held`].
+async fn let_go_of_base(base: &Base) {
+    let Ok(id) = volume_id(&base.volume) else { return };
+    let snapshot = slates_api::SnapshotId { value: base.snapshot };
+    match call("base snapshot destroy", move |i| Ok(i.destroy_snapshot(id, snapshot))).await {
+        Ok(Ok(()) | Err(slates_api::Error::NotFound(_))) => {}
+        Ok(Err(slates_api::Error::Busy(_))) => return,
+        Ok(Err(refused)) => {
+            tracing::warn!(base = %base.volume, error = %refused, "a workspace's base stayed: Slates refused its capture's destroy");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(base = %base.volume, error = %format!("{e:#}"), "a workspace's base stayed: its capture's destroy wasn't answered");
+            return;
+        }
+    }
+    forget(base);
+    match call("base destroy", move |i| Ok(i.destroy(id))).await {
+        Ok(Ok(()) | Err(slates_api::Error::NotFound(_))) => {}
+        Ok(Err(refused)) => tracing::warn!(base = %base.volume, error = %refused, "a workspace's base stayed: Slates refused its destroy"),
+        Err(e) => tracing::warn!(base = %base.volume, error = %format!("{e:#}"), "a workspace's base stayed: its destroy wasn't answered"),
+    }
 }
 
 /// Whether a volume is mounted at `dir` (`super::place::is_mount`: a folder's device, a drive's file system).
@@ -553,13 +759,21 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     mount_at(m).await
 }
 
-/// Workspace `m` as this machine places it: where its mount names another machine's place for workspaces (it moved here
-/// with its agent, K4), its own place under this machine's ([`super::place::points`]); as it was otherwise.
-pub fn placed_here(m: &Made) -> anyhow::Result<Made> {
-    placed_under(m, &here()?.root)
+/// Workspace `m` as it arrived here with its agent: placed as this machine places it ([`placed_under`]), and marked moved
+/// where it came from another machine (`from_elsewhere`, K4), whose clone Slates lands against its capture only from its
+/// stage 2 ([`landing`]).
+pub fn arrived(m: &Made, from_elsewhere: bool) -> anyhow::Result<Made> {
+    arrived_under(m, &here()?.root, from_elsewhere)
 }
 
-/// [`placed_here`] with this machine's place for workspaces `root`.
+/// [`arrived`] with this machine's place for workspaces `root`.
+fn arrived_under(m: &Made, root: &Path, from_elsewhere: bool) -> anyhow::Result<Made> {
+    Ok(Made { moved: m.moved || from_elsewhere, ..placed_under(m, root)? })
+}
+
+/// Workspace `m` as this machine places it, its place for workspaces `root`: where its mount names another machine's
+/// place for workspaces (it moved here with its agent, K4), its own place under `root` ([`super::place::points`]); as it
+/// was otherwise.
 fn placed_under(m: &Made, root: &Path) -> anyhow::Result<Made> {
     let mount = Path::new(&m.mount);
     if m.mount.is_empty() || mount.starts_with(root) || mount.starts_with(super::place::real(root)) {
@@ -603,8 +817,8 @@ pub(super) async fn ask_move(volume: &str, member: u64) -> anyhow::Result<Result
     call("move", move |i| Ok(i.move_volume(id, member))).await
 }
 
-/// A pause between two asks of a move, or of a mount of a volume that just moved here.
-#[allow(clippy::disallowed_methods)] // (e) a move's measured pause
+/// A pause between two asks of a move, of a mount of a volume that just moved here, of a capture, or of a destroy's end.
+#[allow(clippy::disallowed_methods)] // (c) Slates' own derived pause between two asks: no notification of the end
 pub(super) async fn pause_for_move(pause: Duration) {
     crate::rt::sleep(pause).await;
 }
@@ -727,20 +941,6 @@ async fn mounted_now(dir: &Path) -> bool {
     }
 }
 
-/// Lets go of workspace `m`'s mount at `dir`, which something still held past `patience` (`refused`: the last refusal),
-/// then says what came of it: let go, or still mounted, with what holds it, looked up only then, so a slow look never
-/// stands between the let-go and the agent's end.
-async fn let_go_of(m: &Made, dir: &Path, refused: &str, patience: Duration) {
-    let how = let_go(m.mount.clone()).await;
-    if !mounted_now(dir).await {
-        tracing::info!(mount = %m.mount, %refused, ?patience, let_go = ?how.ok(), "an ended agent's workspace was still in use past its agent's end: let go");
-        return;
-    }
-    let holders = holders(&m.mount).await;
-    let error = how.err().map(|e| format!("{e:#}")).unwrap_or_default();
-    tracing::warn!(mount = %m.mount, %refused, %holders, ?patience, %error, "an ended agent's workspace stays mounted: what holds it holds it past its agent's end");
-}
-
 /// What came of taking a workspace's mount down ([`unmount_patiently`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Unmounted {
@@ -766,8 +966,11 @@ where
     let mut pause: Option<Duration> = None;
     loop {
         let asked = Instant::now();
+        // Gone is the mount table's word, never the unmount's alone: one that answers done while the table still holds
+        // the mount is asked again, as a refused one is.
         let refused = match ask().await {
-            Ok(()) => return Unmounted::Gone,
+            Ok(()) if !held().await => return Unmounted::Gone,
+            Ok(()) => "the unmount answered done, but the mount table still holds it".to_owned(),
             Err(e) => format!("{e:#}"),
         };
         if !held().await {
@@ -817,32 +1020,118 @@ async fn holders(_mount: &str) -> String {
 /// destroyed and its mount point removed. What it held is lost. A mount still in
 /// use is asked again for as long as `patience` (its agent's own end took that long: [`unmount_patiently`]); still in
 /// use then, it's let go on a Unix host, detached on Linux and forced on macOS ([`let_go`]), kiln saying what held it,
-/// and a Windows drive stays mounted, kiln saying so. Its volume is destroyed all the same: nothing is kept for an agent
-/// that has ended.
+/// and a Windows drive stays mounted, kiln saying so. Its volume is destroyed once the mount has gone, and kept,
+/// refused typed ([`MountStays`]), while it stays: never destroyed beneath a live mount.
 pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
-    let dir = PathBuf::from(&m.mount);
+    take_down(&Live { made: m }, &m.mount, patience).await?;
     if !m.mount.is_empty() {
-        if mounted_as_made(m).await? {
-            match unmount_patiently(|| unmount(m), || mounted_now(&dir), patience).await {
-                Unmounted::Gone => tracing::info!(mount = %m.mount, "an ended agent's workspace is unmounted"),
-                Unmounted::StillHeld(refused) => let_go_of(m, &dir, &refused, patience).await,
-            }
-        } else {
-            tracing::info!(mount = %m.mount, "an ended agent's workspace had nothing of its own mounted at its point");
-        }
+        super::place::clear(Path::new(&m.mount));
     }
-    let volume = volume_id(&m.volume)?;
-    call("volume destroy", move |i| i.destroy(volume)).await?;
-    if !m.mount.is_empty() {
-        super::place::clear(&dir);
+    // Its base goes with the last workspace that's a clone of it (K5).
+    if let Some(base) = &m.base {
+        release_base(base, volume_id(&m.volume)?).await;
     }
     Ok(())
+}
+
+/// A workspace's volume kept because its mount is still in the kernel's table after kiln asked it gone, let go
+/// included: destroying the volume then would leave a mount with nothing behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountStays {
+    /// The mount point.
+    pub mount: String,
+    /// The last refusal of the unmount, in its words.
+    pub refused: String,
+    /// What the let-go said, where it refused.
+    pub let_go: String,
+    /// What holds the mount, as `lsof` names it.
+    pub holders: String,
+}
+
+impl std::fmt::Display for MountStays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} stays mounted, so its volume is kept: unmount refused ({}), let-go ({}), held by {}", self.mount, self.refused, self.let_go, self.holders)
+    }
+}
+
+impl std::error::Error for MountStays {}
+
+/// The steps of taking a workspace down ([`take_down`]), each this machine's word: whether its own mount is in the
+/// kernel's table (on Windows, its own drive), the OS's unmount, its let-go, what holds the mount, and the volume's
+/// destroy. Apart from [`remove`] so a test holds their order.
+trait TakeDown {
+    async fn mounted(&self) -> bool;
+    async fn unmount(&self) -> anyhow::Result<()>;
+    async fn let_go(&self) -> anyhow::Result<slates_api::LetGo>;
+    async fn holders(&self) -> String;
+    async fn destroy(&self) -> anyhow::Result<()>;
+}
+
+/// [`TakeDown`] for workspace `made` on this machine.
+struct Live<'a> {
+    made: &'a Made,
+}
+
+impl TakeDown for Live<'_> {
+    /// A table or a volume that can't be read counts its mount there, so nothing is destroyed beneath it unseen.
+    async fn mounted(&self) -> bool {
+        mounted_as_made(self.made).await.unwrap_or(true)
+    }
+
+    async fn unmount(&self) -> anyhow::Result<()> {
+        unmount(self.made).await
+    }
+
+    async fn let_go(&self) -> anyhow::Result<slates_api::LetGo> {
+        let_go(self.made.mount.clone()).await
+    }
+
+    async fn holders(&self) -> String {
+        holders(&self.made.mount).await
+    }
+
+    async fn destroy(&self) -> anyhow::Result<()> {
+        let volume = volume_id(&self.made.volume)?;
+        call("volume destroy", move |i| i.destroy(volume)).await
+    }
+}
+
+/// Takes a workspace with mount point `mount` down by `steps`: unmounted, asked again for as long as `patience`
+/// ([`unmount_patiently`]), let go where still held, then its volume destroyed, only once the kernel's mount table no
+/// longer holds the point. A mount that stays keeps its volume, refused typed ([`MountStays`]) and logged: a volume
+/// destroyed beneath a live mount leaves the mount with nothing behind it (the macOS bare-metal drive, f3f618f2, kiln
+/// 68eda5b1, 2026-11-18).
+async fn take_down(steps: &impl TakeDown, mount: &str, patience: Duration) -> anyhow::Result<()> {
+    if !mount.is_empty() {
+        if steps.mounted().await {
+            match unmount_patiently(|| steps.unmount(), || steps.mounted(), patience).await {
+                Unmounted::Gone => tracing::info!(mount, "an ended agent's workspace is unmounted"),
+                Unmounted::StillHeld(refused) => {
+                    let how = steps.let_go().await;
+                    if steps.mounted().await {
+                        // Never destroyed beneath a mount the table still holds: the mount would stay with nothing
+                        // behind it. The volume is kept, and the refusal says why.
+                        let holders = steps.holders().await;
+                        let let_go = how.err().map(|e| format!("{e:#}")).unwrap_or_default();
+                        let stays = MountStays { mount: mount.to_owned(), refused, let_go, holders };
+                        tracing::warn!(%stays, ?patience, "an ended agent's workspace stays mounted: what holds it holds it past its agent's end, and its volume is kept");
+                        return Err(stays.into());
+                    }
+                    tracing::info!(mount, %refused, ?patience, let_go = ?how.ok(), "an ended agent's workspace was still in use past its agent's end: let go");
+                }
+            }
+        } else {
+            tracing::info!(mount, "an ended agent's workspace had nothing of its own mounted at its point");
+        }
+    }
+    steps.destroy().await
 }
 
 /// The files of the folder below workspace `m` that changed on disk after the agent changed them
 /// in its workspace, each as kiln shows it (`/README.md (Modified)`, `drift_lines`).
 pub async fn drift(m: &Made) -> anyhow::Result<Vec<String>> {
-    let volume = volume_id(&m.volume)?;
+    // A captured clone reads no folder: what changed on disk since its capture is its base overlay's drift (K5).
+    let volume = volume_id(drift_volume(m))?;
     let report = call("status", move |i| i.drift(volume)).await?;
     Ok(report.as_ref().map(drift_lines).unwrap_or_default())
 }
@@ -896,8 +1185,17 @@ pub async fn excludes(m: &Made) -> Vec<String> {
     out
 }
 
-/// The landing of workspace `m`'s head into `over`, each of `excludes` left out.
+/// The volume whose drift says what changed on disk under workspace `m` (K5): its base overlay for a captured clone, whose
+/// capture witnessed the folder whole; itself for an overlay.
+fn drift_volume(m: &Made) -> &str {
+    m.base.as_ref().map_or(&m.volume, |b| &b.volume)
+}
+
+/// The landing of workspace `m`'s head into `over`, each of `excludes` left out. None for a workspace that moved here
+/// from another runner (K4): Slates lands a moved clone as a volume with no capture (every file a creation, no removal
+/// carried) until its move carries the capture (Slates' A-424 stage 2), so kiln refuses it rather than write that.
 fn landing(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<LandingRequest> {
+    anyhow::ensure!(!m.moved, "its workspace moved here from another runner, and Slates writes a moved workspace back against the folder it was captured from only from its next step (its A-424 stage 2): put the work up for review instead");
     Ok(LandingRequest { volume: volume_id(&m.volume)?, snapshot: None, target: over.to_owned(), filter: Filter { include: Vec::new(), exclude: excludes.to_vec() } })
 }
 
@@ -1229,6 +1527,66 @@ mod tests {
         assert!(plan.get("manifest").is_none(), "{plan}");
     }
 
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a workspace's volume is never destroyed while the kernel's mount
+    /// table still holds its point: a mount kiln's unmount and let-go both leave (they refused, or one answered done and
+    /// the table says otherwise) keeps its volume and is refused typed (`MountStays`); one that goes, or none there, takes
+    /// its volume with it. The macOS bare-metal drive met it: the Ask agent's volume destroyed, its NFS mount left in the
+    /// table (f3f618f2, kiln 68eda5b1, 2026-11-18).
+    #[test]
+    fn w3_a_volume_is_never_destroyed_while_its_mount_is_in_the_table() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+        #[derive(Default)]
+        struct Fake {
+            mounted: AtomicBool,
+            refuses: bool,
+            lies: bool,
+            unmounts: AtomicU32,
+            destroyed: AtomicU32,
+        }
+        impl TakeDown for Fake {
+            async fn mounted(&self) -> bool {
+                self.mounted.load(Relaxed)
+            }
+            async fn unmount(&self) -> anyhow::Result<()> {
+                self.unmounts.fetch_add(1, Relaxed);
+                match (self.refuses, self.lies) {
+                    (true, _) => anyhow::bail!("Slates' unmount: umount couldn't run: No such file or directory (os error 2)"),
+                    (false, true) => Ok(()),
+                    (false, false) => {
+                        self.mounted.store(false, Relaxed);
+                        Ok(())
+                    }
+                }
+            }
+            async fn let_go(&self) -> anyhow::Result<slates_api::LetGo> {
+                if self.refuses || self.lies { anyhow::bail!("Slates' unmount: umount -f couldn't run") } else { Ok(slates_api::LetGo::Forced) }
+            }
+            async fn holders(&self) -> String {
+                "nothing lsof can see".to_owned()
+            }
+            async fn destroy(&self) -> anyhow::Result<()> {
+                self.destroyed.fetch_add(1, Relaxed);
+                Ok(())
+            }
+        }
+        crate::rt::block_on(async {
+            for (refuses, lies) in [(true, false), (false, true)] {
+                let stuck = Fake { mounted: AtomicBool::new(true), refuses, lies, ..Fake::default() };
+                let kept = take_down(&stuck, "/state/workspaces/kiln-a", Duration::ZERO).await;
+                anyhow::ensure!(stuck.destroyed.load(Relaxed) == 0, "refuses {refuses}, lies {lies}: destroyed under a mount the table holds");
+                let stays = kept.as_ref().err().and_then(|e| e.downcast_ref::<MountStays>()).cloned();
+                anyhow::ensure!(stays.as_ref().is_some_and(|s| s.mount == "/state/workspaces/kiln-a"), "refuses {refuses}, lies {lies}: {kept:?}");
+            }
+            let goes = Fake { mounted: AtomicBool::new(true), ..Fake::default() };
+            take_down(&goes, "/state/workspaces/kiln-b", Duration::ZERO).await?;
+            anyhow::ensure!((goes.unmounts.load(Relaxed), goes.destroyed.load(Relaxed)) == (1, 1), "unmounted once, then destroyed");
+            let none = Fake::default();
+            take_down(&none, "/state/workspaces/kiln-c", Duration::ZERO).await?;
+            anyhow::ensure!((none.unmounts.load(Relaxed), none.destroyed.load(Relaxed)) == (0, 1), "nothing mounted: destroyed, nothing asked");
+            Ok(())
+        })
+    }
+
     #[test]
     fn a_landing_is_weighed_against_what_git_sees_changed() {
         // ` M a`, `?? n`, a rename (its source a field of its own), a deletion.
@@ -1258,7 +1616,7 @@ mod tests {
 
     /// An approval of `manifest` writing two files and making a directory, of a landing into `/src/kiln`.
     fn approval(manifest: [u8; 32]) -> anyhow::Result<LandingApproval> {
-        let m = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into() };
+        let m = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), ..Default::default() };
         Ok(LandingApproval {
             request: landing(&m, "/src/kiln", &EXCLUDES.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>())?,
             presentation: 7,
@@ -1284,8 +1642,14 @@ mod tests {
                 let n = asks.fetch_add(1, Ordering::Relaxed);
                 async move { if n < free_at { anyhow::bail!("Resource busy") } else { Ok(()) } }
             };
-            let gone = unmount_patiently(|| busy_until(2), || async { true }, Duration::from_secs(60)).await;
+            // Mounted until an ask has taken it down: the table's word follows the asks.
+            let up_until = |free_at: u32| asks.load(Ordering::Relaxed) <= free_at;
+            let gone = unmount_patiently(|| busy_until(2), || async { up_until(2) }, Duration::from_secs(60)).await;
             anyhow::ensure!(gone == Unmounted::Gone && asks.load(Ordering::Relaxed) == 3, "taken down at its third ask: {gone:?} after {asks:?}");
+            asks.store(0, Ordering::Relaxed);
+            // An unmount that answers done while the table still holds the mount isn't believed: asked again, then held.
+            let told = unmount_patiently(|| busy_until(0), || async { true }, Duration::from_millis(50)).await;
+            anyhow::ensure!(told == Unmounted::StillHeld("the unmount answered done, but the mount table still holds it".into()) && asks.load(Ordering::Relaxed) > 1, "an unmount the table belies: {told:?} after {asks:?}");
             asks.store(0, Ordering::Relaxed);
             let once = unmount_patiently(|| busy_until(u32::MAX), || async { true }, Duration::ZERO).await;
             anyhow::ensure!(once == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) == 1, "no patience: asked once: {once:?} after {asks:?}");
@@ -1545,13 +1909,93 @@ mod tests {
     fn k4_a_workspace_that_moved_here_is_placed_under_this_machines_own_place() -> anyhow::Result<()> {
         let scratch = tempfile::tempdir()?;
         let root = scratch.path().join("workspaces");
-        let moved = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into() };
+        let moved = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), ..Default::default() };
         let placed = placed_under(&moved, &root)?;
         let here = super::super::place::real(&root).join("kiln-a");
         assert_eq!(placed, Made { mount: here.to_string_lossy().into_owned(), ..moved.clone() });
         assert_eq!(placed_under(&placed, &root)?, placed, "placed here already");
         let unmounted = Made { mount: String::new(), ..moved };
         assert_eq!(placed_under(&unmounted, &root)?, unmounted);
+        Ok(())
+    }
+
+    /// A captured clone's record, as a fleet runner makes one (K5).
+    fn captured() -> Made {
+        let base = Some(Base { volume: "00017f80ff10abcdef1234567890ffff".into(), snapshot: 7 });
+        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base, moved: false }
+    }
+
+    /// K5 (kiln goal 95101ef32ffb8b099942fe076619c310): a workspace that arrives from another machine is placed as K4
+    /// places it and marked moved; one an older runner process of this machine hands over is placed and not marked; one
+    /// marked once stays marked.
+    #[cfg(unix)]
+    #[test]
+    fn k5_a_workspace_from_another_machine_is_marked_moved_and_a_local_hand_over_is_not() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let root = scratch.path().join("workspaces");
+        let came = captured();
+        let moved = arrived_under(&came, &root, true)?;
+        assert_eq!(moved, Made { moved: true, ..placed_under(&came, &root)? });
+        let here = placed_under(&came, &root)?;
+        assert_eq!(arrived_under(&here, &root, false)?, here, "a hand-over between two runner processes of this machine moves nothing");
+        assert!(arrived_under(&moved, &root, false)?.moved, "a workspace that moved stays moved");
+        Ok(())
+    }
+
+    /// K5: a workspace that moved here is written back to no folder (Slates lands a moved clone against its capture only
+    /// from its A-424 stage 2: before, as a volume with no capture, every file a creation and no removal carried); one
+    /// that stayed lands into its folder as before.
+    #[test]
+    fn k5_a_moved_workspace_is_written_back_nowhere_until_slates_carries_its_capture() -> anyhow::Result<()> {
+        let stayed = captured();
+        let request = landing(&stayed, "/src/kiln", &["/.git".to_owned()])?;
+        assert_eq!((request.target.as_str(), request.filter.exclude.as_slice()), ("/src/kiln", ["/.git".to_owned()].as_slice()));
+        let refused = match landing(&Made { moved: true, ..stayed }, "/src/kiln", &[]) {
+            Ok(request) => anyhow::bail!("a moved workspace's landing was asked: {request:?}"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(refused.contains("moved here from another runner"), "{refused}");
+        Ok(())
+    }
+
+    /// K5: what changed on disk under a captured clone is read from its base, whose capture witnessed the folder whole (the
+    /// clone reads no folder); an overlay's from itself.
+    #[test]
+    fn k5_a_captured_clones_drift_is_read_from_its_base() {
+        let clone = captured();
+        assert_eq!(drift_volume(&clone), "00017f80ff10abcdef1234567890ffff");
+        let overlay = Made { base: None, ..clone };
+        assert_eq!(drift_volume(&overlay), "00017f80ff10abcdef123456789abcde");
+    }
+
+    /// K5: a folder's capture is shared by the next agent only while Slates finds the folder as it was captured: nothing
+    /// drifted, nothing unverified and nothing past what its reply carries; any of them, and the next agent's capture is
+    /// new.
+    #[test]
+    fn k5_a_capture_is_shared_only_while_its_folder_is_as_captured() {
+        let quiet = DriftReport { drifted: Vec::new(), unverified: Vec::new(), watcher: slates_api::Watcher::Live, elided: 0 };
+        assert!(unchanged(&quiet));
+        assert!(unchanged(&DriftReport { watcher: slates_api::Watcher::Unavailable, ..quiet.clone() }), "the watcher's hints are no fact: Slates re-checks every entry");
+        let edited = DriftReport { drifted: vec![slates_api::Drift { path: "/README.md".into(), kind: slates_api::DriftKind::Modified }], ..quiet.clone() };
+        let unread = DriftReport { unverified: vec!["/src/a.rs".into()], ..quiet.clone() };
+        let elided = DriftReport { elided: 1, ..quiet };
+        for report in [edited, unread, elided] {
+            assert!(!unchanged(&report), "{report:?}");
+        }
+    }
+
+    /// K5: a workspace's record from before (an overlay's: no base, never moved) reads as it did and is written as it was,
+    /// so a runner or server of either age reads the other's; a captured clone's carries its base, and a moved one says so.
+    #[test]
+    fn k5_a_workspace_record_from_before_reads_and_writes_as_it_did() -> anyhow::Result<()> {
+        let before = json!({"volume": "00017f80ff10abcdef123456789abcde", "name": "kiln-a", "mount": "/w/kiln-a"});
+        let read: Made = serde_json::from_value(before.clone())?;
+        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None, moved: false });
+        assert_eq!(serde_json::to_value(&read)?, before);
+        let moved = Made { moved: true, ..captured() };
+        let written = serde_json::to_value(&moved)?;
+        assert_eq!((written.pointer("/base/snapshot"), written.get("moved")), (Some(&json!(7)), Some(&json!(true))));
+        assert_eq!(serde_json::from_value::<Made>(written)?, moved);
         Ok(())
     }
 
@@ -1577,7 +2021,7 @@ mod tests {
         let said = "!! target/\0 M src/a.rs\0R  new.rs\0old.rs\0!! src/gen.o\0?? src/n.rs\0 R moved.rs\0!! was.rs\0!! node_modules/\0";
         assert_eq!(ignored_prefixes(said), ["/target", "/src/gen.o", "/node_modules"]);
         assert!(ignored_prefixes("").is_empty());
-        let m = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into() };
+        let m = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), ..Default::default() };
         let request = landing(&m, "/src/kiln", &["/target".to_owned(), "/.git".to_owned()])?;
         assert_eq!(request.filter.exclude, ["/target", "/.git"]);
         assert!(request.filter.include.is_empty() && request.snapshot.is_none() && request.target == "/src/kiln");

@@ -151,10 +151,16 @@ pub fn mount_table() -> anyhow::Result<Vec<PathBuf>> {
     if cfg!(target_os = "linux") {
         return Ok(linux_points(&std::fs::read_to_string("/proc/self/mountinfo")?));
     }
-    let listed = std::process::Command::new("mount").output()?;
+    // The system's own `mount` by its place, never a search of `PATH`: a runner started with a narrower one (the
+    // bare-metal drive's, which held no `/sbin`) would read no table at all.
+    let listed = std::process::Command::new(BSD_MOUNT).output()?;
     anyhow::ensure!(listed.status.success(), "mount: {}", String::from_utf8_lossy(&listed.stderr).trim());
     Ok(bsd_points(&String::from_utf8_lossy(&listed.stdout)))
 }
+
+/// Format: where macOS and the BSDs keep `mount(8)` (in their base system, `/sbin`), which lists the mount table.
+#[cfg(unix)]
+const BSD_MOUNT: &str = "/sbin/mount";
 
 /// The mount points a Linux `/proc/self/mountinfo` lists: each line's fifth field, which the kernel writes with a
 /// space, a tab, a newline and a backslash as octal escapes (proc(5)).

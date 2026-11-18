@@ -336,7 +336,7 @@ async fn in_volume(hub: &Hub, id: &str, parent: Option<&str>, mode: &str, sharin
 /// [`in_volume`], launched in mode `launched` and working in `mode` now (it, or its harness, moved its mode since).
 async fn launched_in(hub: &Hub, id: &str, parent: Option<&str>, launched: &str, mode: &str, sharing: Option<&str>) -> anyhow::Result<()> {
     let volume = sharing.unwrap_or(id);
-    let made = crate::workspace::slates::Made { volume: format!("v-{volume}"), name: format!("kiln-{volume}"), mount: format!("/w/kiln-{volume}") };
+    let made = crate::workspace::slates::Made { volume: format!("v-{volume}"), name: format!("kiln-{volume}"), mount: format!("/w/kiln-{volume}"), ..Default::default() };
     let workspace = crate::workspace::Workspace { kind: "volume".into(), over: Some("/src/project".into()), made: Some(made), owner: sharing.map(str::to_owned), ..Default::default() };
     let info = crate::harness::session::Info {
         id: id.into(),

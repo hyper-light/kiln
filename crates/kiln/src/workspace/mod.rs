@@ -29,6 +29,8 @@ pub mod slates_move;
 
 #[cfg(test)]
 mod bare_metal_tests;
+#[cfg(test)]
+mod captured_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -283,24 +285,26 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
 
 /// A session that arrived with a workspace volume (it moved here with its agent, K4, `harness::host`'s take-over): its
 /// mount re-placed under this machine's own place for workspaces where it named another machine's, and its folder there
-/// (the mount's top, with the agent's place beneath it). Whether it has a workspace volume to mount here as it starts
-/// ([`mounted_for`]), so its folder is never taken for one this machine lacks.
-pub fn arrived_here(spec: &mut crate::harness::session::Spec) -> bool {
+/// (the mount's top, with the agent's place beneath it); marked moved where it came from another machine
+/// (`from_elsewhere`: the server's package, never a hand-over between two runner processes of this one), which kiln
+/// writes back to no folder until Slates' move carries its capture (`slates::arrived`, K5). Whether it has a workspace
+/// volume to mount here as it starts ([`mounted_for`]), so its folder is never taken for one this machine lacks.
+pub fn arrived_here(spec: &mut crate::harness::session::Spec, from_elsewhere: bool) -> bool {
     let Some(w) = spec.workspace.as_mut().filter(|w| w.kind == "volume") else { return false };
     let Some(m) = w.made.as_ref().filter(|m| !m.mount.is_empty()) else { return false };
-    let placed = match slates::placed_here(m) {
-        Ok(placed) => placed,
+    let arrived = match slates::arrived(m, from_elsewhere) {
+        Ok(arrived) => arrived,
         Err(e) => {
             tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "a workspace that arrived couldn't be placed here");
             return false;
         }
     };
-    if placed.mount != m.mount {
-        let top = place::top(&placed.mount);
+    if arrived.mount != m.mount {
+        let top = place::top(&arrived.mount);
         let here = if w.sub.is_empty() { top } else { top.join(&w.sub) };
         spec.cwd = Some(here.to_string_lossy().into_owned());
-        w.made = Some(placed);
     }
+    w.made = Some(arrived);
     true
 }
 
@@ -344,6 +348,34 @@ pub fn made_alone(spec: &crate::harness::session::Spec) -> Option<slates::Made> 
 /// Whether `spec` needs its workspace made (or mounted again) before its harness starts.
 pub fn needs_preparing(spec: &crate::harness::session::Spec) -> bool {
     spec.workspace.as_ref().is_some_and(|w| w.kind == "volume")
+}
+
+/// An ended agent's conversation sent back from the project its harness kept for the agent's folder on its mount to the
+/// one it keeps for its person's folder, where they resume it from where they work (the reverse of a conversation
+/// taken up onto a volume, I12): Claude Code's transcript and its session's own files, Gemini CLI's chat and its
+/// subagents' folder (`harness::homes::return_home`). Its harness's conversation is `conversation` (its own id for it).
+/// Asked as its agent ends, before its volume's mount goes. One that can't go back stays where it is, both records
+/// kept, and kiln says why, typed (`homes::NotMoved`) and logged; a branch's copy of another conversation stays.
+pub async fn send_conversation_home(spec: &crate::harness::session::Spec, conversation: Option<String>) {
+    let (Some(session), Some((mount, person))) = (conversation, record_places(spec)) else { return };
+    let (kind, dirs, asked) = (spec.kind.clone(), crate::harness::homes::Dirs::here(&spec.env), session.clone());
+    match crate::rt::blocking(move || crate::harness::homes::return_home(&kind, &dirs, &asked, &mount, &person)).await {
+        Ok(Ok(true)) => tracing::info!(%session, "an ended agent's conversation went back to its person's folder"),
+        Ok(Ok(false)) => {}
+        Ok(Err(not)) => tracing::warn!(%session, %not, "an ended agent's conversation stays where its harness kept it on its volume"),
+        Err(e) => tracing::warn!(%session, error = %format!("{e:#}"), "an ended agent's conversation stays where its harness kept it on its volume"),
+    }
+}
+
+/// Where agent `spec`'s harness kept its conversation, its folder on its volume's mount, and its person's folder that the
+/// volume shows there (the folder it's laid over, `over`, and its place beneath, `sub`); none for an agent with no
+/// mount.
+fn record_places(spec: &crate::harness::session::Spec) -> Option<(String, String)> {
+    let w = spec.workspace.as_ref()?;
+    w.made.as_ref().filter(|m| !m.mount.is_empty())?;
+    let (over, on_mount) = (w.over.as_deref()?, spec.cwd.clone()?);
+    let person = if w.sub.is_empty() { PathBuf::from(over) } else { Path::new(over).join(&w.sub) };
+    Some((on_mount, person.to_string_lossy().into_owned()))
 }
 
 /// Ends agent session `spec`'s workspace for good, when it has a volume: the volume and what it held go
@@ -637,11 +669,26 @@ mod tests {
     use super::*;
 
     fn made(volume: &str, mount: &str) -> slates::Made {
-        slates::Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: mount.into() }
+        slates::Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: mount.into(), ..Default::default() }
     }
 
     fn volume_at(volume: &str, mount: &str, over: &str) -> Workspace {
         Workspace { kind: "volume".into(), over: Some(over.into()), made: Some(made(volume, mount)), ..Workspace::default() }
+    }
+
+    /// W2: an ended agent's conversation goes back from its folder on its volume's mount to its person's folder the
+    /// volume shows there, its place beneath the folder laid over kept; an agent with no mount has none to send back.
+    #[test]
+    fn w2_an_ended_agents_conversation_goes_back_to_the_folder_its_volume_showed() {
+        let spec = |sub: &str, mount: &str| crate::harness::session::Spec {
+            cwd: Some(format!("/state/workspaces/kiln-a/{sub}").trim_end_matches('/').to_owned()),
+            workspace: Some(Workspace { sub: sub.into(), ..volume_at("v1", mount, "/Users/person/project") }),
+            ..Default::default()
+        };
+        assert_eq!(record_places(&spec("src", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a/src".to_owned(), "/Users/person/project/src".to_owned())));
+        assert_eq!(record_places(&spec("", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a".to_owned(), "/Users/person/project".to_owned())));
+        assert_eq!(record_places(&spec("src", "")), None, "no mount: an isolated agent's, kept in its microVM's volume");
+        assert_eq!(record_places(&crate::harness::session::Spec::default()), None);
     }
 
     /// I11 (kiln goal 01a1ec34599974448aed2672bafaf9a2, docs/agentic.md W2): an agent started in a person's shell works

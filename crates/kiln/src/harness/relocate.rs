@@ -418,7 +418,7 @@ mod tests {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             hub.put_agent(crate::hub::tests::live_runner("elsewhere", "linux", "x86_64"));
-            let made = crate::workspace::slates::Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-ws".into(), mount: "/state/workspaces/kiln-ws".into() };
+            let made = crate::workspace::slates::Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-ws".into(), mount: "/state/workspaces/kiln-ws".into(), ..Default::default() };
             let workspace = crate::workspace::Workspace { kind: "volume".into(), made: Some(made), ..crate::workspace::Workspace::default() };
             let held = Info { id: "ws".into(), kind: "codex".into(), status: Status::Idle, workspace: Some(workspace), ..Info::default() };
             hub.harness.ingest(&Location::Machine("box".into()), "ws", Update::Open { info: Box::new(held), since: None }).await;
