@@ -195,7 +195,7 @@ fn g265_a_volume_with_no_mount_is_served_on_a_stream_and_reviewed_from_its_own_c
     // Removed: its volume is gone, and nothing of it was ever mounted.
     kiln::rt::block_on({
         let made = made.clone();
-        async move { slates::remove(&made).await }
+        async move { slates::remove(&made, std::time::Duration::ZERO).await }
     })?;
     let until = Instant::now() + TORN_DOWN_WITHIN;
     while library.list()?.iter().any(|v| v.id == volume) {
