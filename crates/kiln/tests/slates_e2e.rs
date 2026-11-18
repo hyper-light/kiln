@@ -10,9 +10,10 @@
 //! then asks kiln itself, as the agent, to write its work to disk (the stand-in's `LAND`). What each drive reads, all of
 //! it what a person or an agent could observe:
 //!
-//! 1. **Slates through its library alone.** The runner finds no `slates` executable (its PATH holds none and `KILN_SLATES`
-//!    is empty), so a workspace made at all was made without Slates' command line; and no `slates` process of the drive's
-//!    own instance runs at any of its looks ([`cli_of_instance`]).
+//! 1. **Slates through its library alone, at kiln's pin.** The runner finds no `slates` executable (its PATH holds none
+//!    and `KILN_SLATES` is empty), so a workspace made at all was made without Slates' command line; no `slates` process
+//!    of the drive's own instance runs at any of its looks ([`cli_of_instance`]); and the runner's facts name the Slates
+//!    it links as the revision this checkout's `vendor/MANIFEST.toml` pins ([`links_the_pin`]).
 //! 2. **The volume.** kiln's word on the session names its volume over the project ([`workspace_of`]). On the host
 //!    (`bare_metal`), its mount is in the host's table as Slates' (NFS on loopback on macOS, FUSE on Linux; WinFsp keeps
 //!    no table to read) and the harness works in it. In a microVM (`microvm`), no host mount: kiln names none, the host's
@@ -533,6 +534,31 @@ pub fn workspaces_said(all: &Value, machine: &str) -> Result<(), String> {
     Err(entry.get("why_not").and_then(Value::as_str).unwrap_or("kiln says no, and not why").to_owned())
 }
 
+/// The Slates revision a kiln vendor manifest (`vendor/MANIFEST.toml`) pins: its `[projects.slates]`'s `commit`.
+pub fn vendored_slates(manifest: &str) -> Option<String> {
+    let table = toml::from_str::<toml::Table>(manifest).ok()?;
+    table.get("projects")?.get("slates")?.get("commit")?.as_str().map(str::to_owned)
+}
+
+/// What runner `machine`'s facts, in kiln's list of its runners (`GET /api/agents`), say of the Slates it links
+/// (`facts.workspaces.slates`).
+pub fn linked_slates(runners: &Value, machine: &str) -> Option<String> {
+    let list = runners.as_array().or_else(|| runners.get("agents").and_then(Value::as_array))?;
+    let runner = list.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(machine))?;
+    runner.pointer("/facts/workspaces/slates").and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Whether the Slates a runner says it links (`said`) is the one this checkout of kiln vendors at its pinned commit
+/// (`vendored`), as kiln names it (`slates <commit>`): kiln links its vendored Slates, at the revision its manifest pins.
+pub fn links_the_pin(said: Option<&str>, vendored: Option<&str>) -> Result<(), String> {
+    let vendored = vendored.ok_or("this checkout's vendor/MANIFEST.toml pins no Slates: kiln vendors none")?;
+    match said {
+        Some(s) if s == format!("slates {vendored}") => Ok(()),
+        Some(s) => Err(format!("the runner links {s:?}, not the Slates this kiln pins (slates {vendored})")),
+        None => Err(format!("the runner names no Slates it links; this kiln pins slates {vendored}")),
+    }
+}
+
 /// A session's volume, as kiln's word on it names it (`workspace.made`): the volume, its name, its mount where it has
 /// one, and the folder it lies over.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,12 +731,20 @@ impl Looks {
 /// own under `dir`, through kiln's REST API, and checks them end to end (the module's 1 to 5). `dir`: the drive's
 /// folder, where its runner keeps its state.
 pub fn drive(f: &vm_e2e::Fixture, dir: &Path, instance: &Instance, engine: Engine, image: Option<&str>) -> anyhow::Result<()> {
+    links_pinned(f)?;
     let mut looks = Looks::default();
     for mode in Mode::ALL {
         let project = Project::new(&dir.join(mode.word()))?;
         drive_agent(f, dir, &project, instance, engine, image, mode, &mut looks)?;
     }
     looks.check().map_err(|e| anyhow::anyhow!("{engine:?}: {e}\n{}", f.runner_log()))
+}
+
+/// The runner links the Slates this checkout vendors, at its pinned commit ([`links_the_pin`]).
+pub fn links_pinned(f: &vm_e2e::Fixture) -> anyhow::Result<()> {
+    let manifest = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/MANIFEST.toml"))?;
+    let said = linked_slates(&f.get("/api/agents")?, &f.machine);
+    links_the_pin(said.as_deref(), vendored_slates(&manifest).as_deref()).map_err(|e| anyhow::anyhow!("{e}\n{}", f.runner_log()))
 }
 
 /// Drives one agent in `mode` on `engine`, in its own volume over `project`, and checks it end to end; `looks`
@@ -967,6 +1001,23 @@ mod checks {
         let unnamed = with(&ok, "LAND_APPROVAL", Some("LAND_APPROVAL not-a-manifest"));
         assert!(check_turn(&unnamed, "p.txt", Mode::Ask).is_err() && approval_said(&unnamed).is_none(), "a request naming no manifest");
         assert!(check_turn(&with(&ok, "LAND_APPROVAL", Some("LAND_REFUSED plan mode")), "p.txt", Mode::Ask).is_err(), "refused outright");
+    }
+
+    /// The Slates a runner links is read from its facts and held to the commit this checkout's manifest pins; another
+    /// revision, none, or a manifest that pins no Slates fails, saying which.
+    #[test]
+    fn g266_a_runner_links_the_slates_this_kiln_pins() {
+        let manifest = "[projects.hyper-raft]\ncommit = \"aa\"\n\n[projects.slates]\nkind = \"git\"\ncommit = \"dbf53afa21bf0e88f7099247c00c2c252ff96b1b\"\npath = \"vendor/slates\"\n";
+        assert_eq!(vendored_slates(manifest).as_deref(), Some("dbf53afa21bf0e88f7099247c00c2c252ff96b1b"));
+        assert_eq!(vendored_slates("[projects.hex]\ncommit = \"bb\"\n"), None);
+        assert_eq!(vendored_slates("not toml ["), None);
+        let runners = json!([{"name": "m0", "facts": {}}, {"name": "m1", "facts": {"workspaces": {"available": true, "slates": "slates dbf53afa21bf0e88f7099247c00c2c252ff96b1b", "mount": "nfs"}}}]);
+        let said = linked_slates(&runners, "m1");
+        assert_eq!(links_the_pin(said.as_deref(), vendored_slates(manifest).as_deref()), Ok(()));
+        assert!(links_the_pin(linked_slates(&runners, "m0").as_deref(), Some("dbf53")).is_err_and(|e| e.contains("names no Slates")));
+        assert!(links_the_pin(Some("slates 0b850153f"), Some("dbf53afa2")).is_err_and(|e| e.contains("not the Slates this kiln pins")));
+        assert!(links_the_pin(said.as_deref(), None).is_err_and(|e| e.contains("vendors none")));
+        assert_eq!(linked_slates(&json!({"agents": [{"name": "m1", "facts": {"workspaces": {"slates": "slates x"}}}]}), "m1").as_deref(), Some("slates x"));
     }
 
     /// Drift is read whether kiln lists it as Slates' lines or as its typed drifts.
