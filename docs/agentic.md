@@ -291,7 +291,9 @@ workspaces asks for its volumes.
 **W3 How.** On the agent's machine, before its harness starts: an **overlay volume** laid over its
 folder's repository (the library's overlay over `<top>`), mounted under the runner's state
 directory (`workspaces/kiln-<id>`), its harness's folder the same place in the volume as the one
-asked for. What the agent hasn't touched is read from the folder as it is now; what it changes
+asked for, as git places it (`git rev-parse --show-prefix`: a path spelled through a symbolic link, or on
+Windows with a short 8.3 name or a name in another case, isn't the one git names the repository's top by).
+What the agent hasn't touched is read from the folder as it is now; what it changes
 (edits, build output, git's own writes) is held in the volume alone, so the folder and other
 agents never see it. Ended for good, the agent's volume goes with it, once no other agent works in it: the last
 of the agents working in one ends it (on its machine's runner process), and an agent that couldn't start after all
@@ -300,8 +302,11 @@ still holds it for as long as the agent's own end took, then let go: detached on
 `mount::unmount_busy`, contract 36), kiln saying what held it where it stays. kiln names a mount by its real path, as
 the kernel's mount table names it (macOS reaches `/var`, where temporary folders lie, through a link to
 `/private/var`), and judges whether it's still there by that table, never by looking into the mount, which on a hard
-NFS mount waits on its server and takes any refusal for no mount. A mount is its own attachment in Slates (its file-system
-bridge's), lasting until it's unmounted, as a microVM's stream lasts until it closes (W8): none of kiln's attachments
+NFS mount waits on its server and takes any refusal for no mount. A mount is its own attachment in Slates (its
+file-system bridge's), lasting until it's unmounted, as a microVM's stream lasts until it closes (W8). On Windows a
+drive letter is any workspace's to take, so a workspace's drive is its own only while its volume reports a mount
+there: a Slates drive at its letter that it doesn't report is neither used as its mount at a restart nor taken down at
+its end, which detaches its volume's own attachment at the letter. None of kiln's attachments
 has the term Slates gives its command line's, which lapses once nothing renews it (Slates' A-384), so nothing kiln
 keeps between an agent's turns needs renewing.
 
@@ -381,6 +386,17 @@ kiln's policies and approvals until it starts again.
 machine's restart loses it: Slates keeps volumes in memory. An agent with a volume doesn't move to
 another machine yet (refused, saying why); that waits on a snapshot of an overlay that can be
 cloned, or shipped, elsewhere.
+Built toward it (kiln goal 95101ef3…, its first piece, 2026-11-18): each runner's identity as a node
+of kiln's Slates fleet (`workspace::slates_fleet`): its key made on the runner and never sent, its
+certificate from kiln's CA (`POST /api/agents/slates-fleet`, the machine's proof as a second runner
+process gives it) for the fleet's name and the runner's own failure domain alone, kept as Slates'
+fleet manifest reads it, with kiln's CA as the fleet's enrollment root. Its second piece: discovery
+(`POST /api/agents/slates-fleet/members`: a runner says where its node is reached, taken only for
+its own machine's node and an address Slates can dial, and hears of every node whose runner is
+connected) and Slates' fleet manifest written beside the node's files (every node's address, failure
+domain and certificate, this node's key, kiln's CA as the root). Still owed: the operator's choice of
+which runners join and the fleet's fault tolerance, starting a runner's Slates with the fleet, and
+the move itself.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.

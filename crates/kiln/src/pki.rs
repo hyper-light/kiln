@@ -449,6 +449,23 @@ impl Pki {
         Ok(signed.der().to_vec())
     }
 
+    /// Sign a runner's Slates fleet node CSR (DER; `crate::workspace::slates_fleet`, kiln goal
+    /// 95101ef32ffb8b099942fe076619c310, K1): a certificate for its key carrying exactly the fleet's
+    /// TLS name `fleet` and the node's placement name `r0.d<domain>.<fleet>`, whatever it asked.
+    /// Slates checks both: every peer verifies its sessions against `fleet`, and an enrolling node's
+    /// announced failure domain against the second name (its `discovery::scope_name`, region 0). For
+    /// both sides of the fleet's sessions (serverAuth and clientAuth), valid as a machine's is, its
+    /// serial its own. Parsing checks the CSR's signature (possession of its key). DER.
+    pub fn sign_slates_node(&self, csr_der: &[u8], fleet: &str, domain: u64) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(sanitize_name(fleet) == fleet && !fleet.is_empty(), "a fleet's name is a DNS name kiln issues as written, and {fleet:?} isn't");
+        anyhow::ensure!(!reserved(fleet), "{SERVER_NAME} is the server's own identity; a fleet can't be named so");
+        let csr = CertificateSigningRequestParams::from_der(&csr_der.to_vec().into()).context("parse the fleet node's CSR")?;
+        let mut params = leaf_params(vec![fleet.to_owned(), format!("r0.d{domain}.{fleet}")], LEAF_DAYS)?;
+        params.serial_number = Some(random_serial());
+        let signed = CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&self.issuer).context("sign the fleet node's CSR")?;
+        Ok(signed.der().to_vec())
+    }
+
     /// A machine known by its name moving to its machine id (docs/machines.md): the same proof as
     /// [`Self::sign_instance`], and a certificate for the same key named `to`. Returns the name it
     /// had and the new certificate.
