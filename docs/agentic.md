@@ -358,7 +358,11 @@ memory, where an overlay reads only what the agent uses: so only a fleet runner,
 move, pays for one, and a folder larger than a workspace's share of memory is refused there in
 Slates' words. Owed: a capture of what git tracks alone; a second landing judged against what the
 first landed (Slates' A-424 advance: an outsider's later edit of a file the agent landed is a
-conflict until then); and a moved workspace's landing (below).
+conflict until then); and a moved workspace's landing (below). An agent whose volume moves with it works at the
+mount its volume is placed at on the runner it goes to, its folder and its environment with it: every path of its
+environment on the mount it left (moved there as it started, W2: an activated virtual environment, a
+`CARGO_TARGET_DIR`) names its place on the new one. Only a runner in kiln's Slates fleet captures: a workspace
+elsewhere can't move (a move needs the fleet), so a capture there would read the folder whole into memory for nothing.
 
 **W4 Changes** are its harness's as today; its change request (C1) takes everything that changed in
 its volume, its commands' changes too, since nothing else writes there.

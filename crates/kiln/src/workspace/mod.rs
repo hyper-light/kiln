@@ -284,8 +284,8 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
 }
 
 /// A session that arrived with a workspace volume (it moved here with its agent, K4, `harness::host`'s take-over): its
-/// mount re-placed under this machine's own place for workspaces where it named another machine's, and its folder there
-/// (the mount's top, with the agent's place beneath it); marked moved where it came from another machine
+/// mount re-placed under this machine's own place for workspaces where it named another machine's, and its folder and
+/// environment there ([`follow_to`]: the mount's top, with the agent's place beneath it); marked moved where it came from another machine
 /// (`from_elsewhere`: the server's package, never a hand-over between two runner processes of this one), which kiln
 /// writes back to no folder until Slates' move carries its capture (`slates::arrived`, K5). Whether it has a workspace
 /// volume to mount here as it starts ([`mounted_for`]), so its folder is never taken for one this machine lacks.
@@ -300,8 +300,10 @@ pub fn arrived_here(spec: &mut crate::harness::session::Spec, from_elsewhere: bo
     }
 }
 
-/// Agent `spec`'s workspace volume as it was placed here, `arrived`: where its mount moved, its folder follows it (the
-/// mount's top, with the agent's place beneath it). Whether it has a workspace volume to mount here.
+/// Agent `spec`'s workspace volume as it was placed here, `arrived`: where its mount moved, its folder and its
+/// environment follow it (the mount's top, with the agent's place beneath it; every path of its environment on the
+/// mount it left, which I11 moved there as it started and a move carries, [`rehomed`] to its place on this one). Whether
+/// it has a workspace volume to mount here.
 fn follow_to(spec: &mut crate::harness::session::Spec, arrived: slates::Made) -> bool {
     let Some(w) = spec.workspace.as_mut().filter(|w| w.kind == "volume") else { return false };
     let Some(was) = w.made.as_ref().filter(|m| !m.mount.is_empty()).map(|m| m.mount.clone()) else { return false };
@@ -309,7 +311,8 @@ fn follow_to(spec: &mut crate::harness::session::Spec, arrived: slates::Made) ->
     let now = arrived.mount.clone();
     w.made = Some(arrived);
     if now != was {
-        let top = place::top(&now);
+        let (left, top) = (place::top(&was), place::top(&now));
+        spec.env = rehomed(&spec.env, &left.to_string_lossy(), &top.to_string_lossy());
         let here = if sub.is_empty() { top } else { top.join(&sub) };
         spec.cwd = Some(here.to_string_lossy().into_owned());
     }
