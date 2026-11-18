@@ -375,6 +375,13 @@ kiln's policies and approvals until it starts again.
 machine's restart loses it: Slates keeps volumes in memory. An agent with a volume doesn't move to
 another machine yet (refused, saying why); that waits on a snapshot of an overlay that can be
 cloned, or shipped, elsewhere.
+Built toward it (kiln goal 95101ef3…, its first piece, 2026-11-18): each runner's identity as a node
+of kiln's Slates fleet (`workspace::slates_fleet`): its key made on the runner and never sent, its
+certificate from kiln's CA (`POST /api/agents/slates-fleet`, the machine's proof as a second runner
+process gives it) for the fleet's name and the runner's own failure domain alone, kept as Slates'
+fleet manifest reads it, with kiln's CA as the fleet's enrollment root. Still owed: the runners'
+discovery and manifest, the operator's choice of which runners join, starting a runner's Slates
+with the fleet, and the move itself.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.

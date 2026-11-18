@@ -400,6 +400,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "agents", "enroll"]) => return boxed(|| enroll(&hub, req)).await,
         (&Method::POST, ["api", "agents", "instance"]) => return boxed(|| enroll_instance(&hub, req)).await,
         (&Method::POST, ["api", "agents", "capacity"]) => return boxed(|| enroll_capacity(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet"]) => return boxed(|| enroll_slates_node(&hub, req)).await,
         (&Method::POST, ["api", "agents", "rekey"]) => return boxed(|| rekey_agent(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
@@ -4556,6 +4557,27 @@ async fn enroll_capacity(hub: &Hub, req: Request) -> R {
     hub.store.audit(name.clone(), "agent.capacity".into(), String::new()).await;
     tracing::info!(agent = %name, "issued a capacity holder's certificate");
     Ok(srv::json(StatusCode::OK, &enrolled))
+}
+
+/// `POST /api/agents/slates-fleet`: the certificate a runner's Slates node joins kiln's Slates fleet with
+/// (`crate::workspace::slates_fleet`; kiln goal 95101ef32ffb8b099942fe076619c310, K1): for the node's key, made on the
+/// runner, named the fleet and the node's failure domain (its machine's), whatever it asked. Needs no token: the
+/// request proves the machine as `POST /api/agents/instance`'s does, and only a machine this server still knows gets
+/// one.
+async fn enroll_slates_node(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::EnrollNode = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let known = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.iter().any(|a| a.name == name);
+    if !known {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
+    }
+    let issued = crate::workspace::slates_fleet::issue(&hub.pki, &ask).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    // Every certificate kiln issues is recorded first (W27-R01).
+    let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(&issued.certificate) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::identities::record(&hub.store, "slates-node", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit(name.clone(), "agent.slates_fleet".into(), String::new()).await;
+    tracing::info!(agent = %name, domain = issued.domain, "issued a Slates fleet node's certificate");
+    Ok(srv::json(StatusCode::OK, &issued))
 }
 
 /// `POST /api/capacity/keeper`: a capacity keeper's certificate from kiln's CA, for its request
