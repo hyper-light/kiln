@@ -1,10 +1,11 @@
-// An agent's Engine tab, the one tab agent chat gains for a session in a microVM (kiln plan
-// 01a1cd8e862e7169a074db3d5fa33f3d, P2, P3, P5), against the mock: reached from the desktop's tab bar and
-// the phone's tab strip (which scrolls sideways to it); a microVM session's sandbox, its line with its
-// round controls, then its bars each with its last hour, what it is, its network default deny, its
-// components; a session on bare metal, with no Engine tab and only its subagents in its Mission row's
-// dropdown; and after its sandboxes the agent's own definition, its variant a swatch and a name, never
-// a letter, then the agents, found by a filter.
+// An agent's Engine tab, the one tab agent chat gains, for every session (kiln plan
+// 01a1cd8e862e7169a074db3d5fa33f3d, P2, P3, P5; decided by the user, 2026-11-18), against the mock: reached
+// from the desktop's tab bar and the phone's tab strip (which scrolls sideways to it); a microVM session's
+// sandbox, its line with its round controls, then its bars each with its last hour, what it is, its
+// network default deny, its components; a session on bare metal, only its subagents in its Mission row's
+// dropdown and an Engine tab of its environments and agents, no sandboxes; and after its sandboxes and
+// environments the agent's own definition, its variant a swatch and a name, never a letter, then the
+// agents, found by a filter.
 import { expect as expectNow, test, type Page } from "@playwright/test";
 
 const expect = expectNow.configure({ timeout: 15_000 });
@@ -67,8 +68,8 @@ test("a microVM session's Engine: its line and controls, its bars each with its 
   await expect(body.getByRole("button", { name: "Swap" }).first()).toBeVisible();
   // Its network's last hour, under its bars; the tab's sections each fold (none nests in another).
   await expect(body.locator(".df-unet").first()).toContainText("Network");
-  // Only its two sections fold; a card's sections are shown whole (no collapsible nested in another).
-  await expect(body.locator(".in-sec-toggle")).toHaveText([/^Sandboxes/, /^Agents/]);
+  // Only its sections fold; a card's sections are shown whole (no collapsible nested in another).
+  await expect(body.locator(".in-sec-toggle")).toHaveText([/^Sandboxes/, /^Environments/, /^Agents/]);
   for (const s of ["MicroVM", "Components", "Network", "Volumes"]) await expect(body.locator(".in-sec-static", { hasText: s }).first()).toBeVisible();
   expect(said, said.join("\n")).toEqual([]);
 });
@@ -110,7 +111,7 @@ test("a volume given live: read and execute by default, as every mount is; execu
   expect(others, others.join("\n")).toEqual([]);
 });
 
-test("a session on bare metal: its Mission row's dropdown has its subagents only, and agent chat no Engine tab", async ({ page }) => {
+test("a session on bare metal: its Mission row's dropdown has its subagents only, and agent chat's Engine tab its environments and agents, no sandboxes", async ({ page }) => {
   const said = errors(page);
   await page.goto("/agents?open=fam-docs");
   const row = page.locator('.ms-row[data-agent="fam-docs"]');
@@ -129,7 +130,10 @@ test("a session on bare metal: its Mission row's dropdown has its subagents only
       .filter({ visible: true })
       .first(),
   ).toBeVisible();
-  await expect(page.getByRole("tab", { name: "Engine" })).toHaveCount(0);
+  await tab(page, "Engine");
+  const body = page.locator(".hx-inspector-body").filter({ visible: true }).first();
+  await expect(body.locator(".in-sec-toggle")).toHaveText([/^Environments/, /^Agents/]);
+  await expect(body.locator("li.df-vm")).toHaveCount(0);
   // One in a microVM started from no agent of yours: all its groups, its settings kiln's agent for its harness.
   await page.goto("/agents?open=demo-claude");
   await page.locator('.ms-row[data-agent="demo-claude"]').scrollIntoViewIfNeeded();
