@@ -2,13 +2,13 @@
 
 Agents' workspaces of their own (docs/agentic.md, W; kiln plan 01a157fdefce75f698e67bc147f47586, CP-T4.1): an
 agent's folder is a Slates volume laid over the real one. kiln is to drive Slates through its library (`slates-api`,
-Slates' A-278), linked from here, never through its command line (the person, 2026-11-18).
-`crates/kiln/src/workspace/slates.rs` moves onto it once the library also starts an instance from kiln's own
-executable (A-278's next piece). Then kiln runs no Slates binary, and its daemon is the same code as the client kiln
-links.
+Slates' A-278), linked from here, never through its command line (the person, 2026-11-18). This revision's library
+also starts an instance from its host's own executable (A-278's second piece: `slates_api::role::main`,
+`Instance::start`), so `crates/kiln/src/workspace/slates.rs` moves onto it next. Then kiln runs no Slates binary, and
+its daemon is the same code as the client kiln links.
 
 - **Upstream:** https://github.com/hyper-light/slates, branch `main`, commit
-  `0b850153fcd47c94fec129f1b417b034528d695b` (2026-11-18), MIT (`LICENSE`).
+  `dbf53afa21bf0e88f7099247c00c2c252ff96b1b` (2026-11-18), MIT (`LICENSE`).
 - **What is here:** upstream's tree, at upstream's paths: its crates (`crates/*`), its root manifest, its toolchain,
   lint and format settings with the budgets its own checks read (`clippy.toml`, `rustfmt.toml`,
   `rust-toolchain.toml`, `unsafe-budget.toml`, `ratchets.toml`), its `xtask`, its agents' skills (`skills/`, which its
