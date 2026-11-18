@@ -17,6 +17,7 @@ mod windows;
 /// What a session's environment starts from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvBase"))]
 #[serde(rename_all = "snake_case")]
 pub enum Base {
     /// The machine's user's environment (docs/agents.md, "Where a harness is found").
@@ -29,6 +30,7 @@ pub enum Base {
 /// Where a variable's value comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvFrom"))]
 #[serde(rename_all = "snake_case")]
 pub enum From {
     /// The machine's user's variable `of` (its own name when none), read on the machine.
@@ -45,6 +47,7 @@ pub enum From {
 /// (a secret by its name, never its value).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvVar"))]
 pub struct Var {
     pub name: String,
     pub from: From,
@@ -67,9 +70,12 @@ pub struct Var {
 pub enum Set {
     /// The machine's user's variable of this name.
     Machine(String),
-    /// This value (a `value` variable's, or a secret's).
+    /// This value: a `value` variable's.
     Value(String),
     Unset,
+    /// One of its owner's secrets, its value opened (a `secret` variable's): never in a microVM, where a secret is
+    /// granted by name alone. Appended last.
+    Secret(String),
 }
 
 impl std::fmt::Debug for Set {
@@ -79,6 +85,7 @@ impl std::fmt::Debug for Set {
             // A secret's value may be one: never written out.
             Self::Value(_) => f.write_str("Value(..)"),
             Self::Unset => f.write_str("Unset"),
+            Self::Secret(_) => f.write_str("Secret(..)"),
         }
     }
 }
@@ -97,6 +104,7 @@ pub struct Resolved {
 /// Where a machine's user's variable is set (docs/agents.md, "What a machine's user has").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvSource"))]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     LoginShell,
@@ -111,6 +119,7 @@ pub enum Source {
 /// A variable a machine's user has, by name alone, and where it's set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvMachineVar"))]
 pub struct MachineVar {
     pub name: String,
     pub sources: Vec<Source>,
@@ -123,6 +132,7 @@ pub struct Ask {}
 /// Its answer (`AgentMsg::Answer`): its user's variables, by name.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvMachine"))]
 pub struct Answer {
     pub vars: Vec<MachineVar>,
 }
@@ -420,9 +430,9 @@ mod tests {
 
     #[test]
     fn a_resolved_values_debug_never_shows_it() {
-        let r = Resolved { id: "e".into(), name: "n".into(), version: 1, base: Base::User, vars: vec![("K".into(), Set::Value("sk-ant-secret".into())), ("M".into(), Set::Machine("HOME".into()))] };
+        let r = Resolved { id: "e".into(), name: "n".into(), version: 1, base: Base::User, vars: vec![("K".into(), Set::Value("sk-ant-secret".into())), ("S".into(), Set::Secret("sk-ant-other".into())), ("M".into(), Set::Machine("HOME".into()))] };
         let shown = format!("{r:?}");
-        assert!(!shown.contains("sk-ant-secret"), "{shown}");
+        assert!(!shown.contains("sk-ant-secret") && !shown.contains("sk-ant-other") && shown.contains("Secret(..)"), "{shown}");
         assert!(shown.contains("HOME"), "{shown}");
     }
 }

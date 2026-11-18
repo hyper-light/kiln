@@ -313,6 +313,7 @@ pub fn own() -> &'static [Op] {
             .chain(crate::plans::ops::list_ops())
             .chain(crate::agentfiles::ops::list_ops())
             .chain(crate::secrets::mine::list_ops())
+            .chain(crate::agentenvs::ops::list_ops())
             .chain(crate::agentdefs::ops::list_ops())
             .chain(crate::confirms::list_ops())
             .chain(crate::push::api::list_ops())

@@ -3149,6 +3149,12 @@ impl Registry {
     /// left of it when the owner's turn ran out (`over`, [`Registry::apply`]; goal 9), to take first next.
     #[allow(clippy::too_many_arguments)]
     pub fn take_from(&self, s: &mut Shard, hub: &Arc<Hub>, from: &Location, id: &str, u: Update, shipped: bool, over: &dyn Fn(u64) -> bool) -> Option<Ingest> {
+        // A runner process announcing a session without the environment kiln keeps it runs with is given it
+        // (`crate::agentenvs::resolve::opened`): one that took it over, or started again, holds none; a branch new
+        // here runs with its source's.
+        if let Update::Open { info, .. } = &u {
+            crate::agentenvs::resolve::opened(hub, from, id, info, s.get(id).is_none());
+        }
         let ingest = self.prepare(hub, from, id, u, shipped)?;
         self.apply(s, hub, ingest, over)
     }
@@ -4576,6 +4582,7 @@ impl Registry {
                         launched: spec.launched,
                         workspace: spec.workspace.clone(),
                         isolation: spec.isolation.clone(),
+                        agentenv: spec.agentenv.as_ref().map(crate::agentenvs::Brief::of),
                         runs: None,
                         starts: Vec::new(),
                     };
@@ -5080,6 +5087,50 @@ impl Registry {
         self.resolve(hub, id, c, pending).await
     }
 
+    /// kiln's own `Command::Agentenv` to session `id` (docs/agents.md, "Environments"): its environment, its secrets'
+    /// values opened (none: its machine's user's), in place of the one it has, its harness started again on it unless
+    /// `restart` is false. Never a client's ([`Registry::dispatch`] refuses one): sent here, on the session's own
+    /// command stream, its answer waited for.
+    pub async fn send_agentenv(&self, hub: &Hub, id: &str, agentenv: Option<super::agentenv::Resolved>, restart: bool) -> Sent {
+        let Some(loc) = self.location(id) else { return Sent::NoSession };
+        let c = Command::Agentenv { agentenv, restart };
+        match loc {
+            Location::Local => {
+                if self.local.command_at(id, c, Some(self.epoch_of(id))) {
+                    Sent::Taken
+                } else {
+                    Sent::NoSession
+                }
+            }
+            Location::Machine(machine) => {
+                let json = match serde_json::to_string(&c) {
+                    Ok(json) => json,
+                    Err(e) => return Sent::Rejected { code: crate::wire::channel::Refusal::Malformed, why: format!("its environment couldn't be written: {e}") },
+                };
+                let p = hub.command_start(&machine, &ServerMsg::HarnessCmd { session: id.to_owned(), json }).await;
+                Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await)
+            }
+        }
+    }
+
+    /// Session `id`'s environment opened again and given to it ahead of a restart ([`Registry::dispatch`]), where kiln
+    /// keeps that it runs with one: why not, where it can't be (a secret its owner deleted, a `secret` variable added
+    /// since for a session in a microVM, its runner away).
+    async fn agentenv_again(&self, hub: &Hub, id: &str) -> Result<(), String> {
+        if crate::agentenvs::linked(hub, id).is_none() {
+            return Ok(());
+        }
+        let microvm = self.info(id).is_some_and(|i| i.isolation.is_some());
+        match crate::agentenvs::resolve::again(hub, id, microvm, "restarted").await {
+            Ok(None) => Ok(()),
+            Ok(Some(r)) => match self.send_agentenv(hub, id, Some(r), false).await.failure() {
+                None => Ok(()),
+                Some((_, why)) => Err(format!("its environment couldn't be given to it first: {why}")),
+            },
+            Err(e) => Err(e.said()),
+        }
+    }
+
     /// [`Registry::dispatch`], to session `id` alone.
     async fn dispatch_one(&self, hub: &Hub, id: &str, c: Command) -> Pending {
         self.dispatch_relayed(hub, id, c, None).await
@@ -5090,6 +5141,27 @@ impl Registry {
     async fn dispatch_relayed(&self, hub: &Hub, id: &str, c: Command, relayed: Option<&Value>) -> Pending {
         if matches!(&c, Command::Admit { .. } | Command::MailAck { .. } | Command::MailPeers { .. } | Command::MailHandoff { .. }) {
             return Pending::Now(Sent::PublicationRefused(super::mail::Error::Invalid { reason: "mail grants and receipts belong to the authenticated server relay".into() }));
+        }
+        // A session's environment, its secrets' values opened, is kiln's alone to give it (docs/agents.md, "Environments"):
+        // one sent as a command is refused, from whichever client (the UI's socket, the command route, a broadcast, an
+        // operation). kiln's own goes by [`Registry::send_agentenv`].
+        if matches!(&c, Command::Agentenv { .. }) {
+            return Pending::Now(Sent::Rejected {
+                code: crate::wire::channel::Refusal::Refused,
+                why: "a session's environment is kiln's to give it: apply one with agentenvs.apply (PUT /api/harness/sessions/:id/agentenv)".into(),
+            });
+        }
+        // A harness started again starts with its environment opened again, its newest version and its secrets read
+        // again (docs/agents.md, "Where they apply"): given to it first, on its own command stream, then the restart
+        // (a stop by force is one too: `sessions.restart` of a running session). A restart it can't be opened for is
+        // refused, saying why; a stop by force never is, so a session can always be stopped.
+        if matches!(&c, Command::Restart | Command::ForceStop)
+            && let Err(why) = self.agentenv_again(hub, id).await
+        {
+            if matches!(&c, Command::Restart) {
+                return Pending::Now(Sent::Rejected { code: crate::wire::channel::Refusal::Refused, why });
+            }
+            tracing::warn!(target: "kiln.agentenvs", session = %id, %why, "a session stopped by force goes on with the environment it had: its own couldn't be opened again");
         }
         // A person's message, or kiln's own, to a runner that predates mail-flow goes to its
         // inbox below, as before W20: that runner never pushes the capacity custody waits for.
@@ -5248,6 +5320,12 @@ impl Registry {
         // plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5; `lineage::kept_agentfile`).
         let person = pkg.spec.isolation.as_ref().and_then(|i| i.person.clone());
         super::lineage::kept_agentfile(hub, pkg.spec.isolation.as_ref(), person.as_deref()).await?.into_spec(&mut pkg.spec);
+        // Its environment, where kiln keeps that it runs with one, opened again for its harness's start there
+        // (docs/agents.md, "Where they apply"): refused, staying where it is, where that runner runs none.
+        if crate::agentenvs::linked(hub, id).is_some() && !crate::agentenvs::resolve::speaks(hub, to) {
+            return Err(format!("it runs with an environment, and {}'s kiln runs no session with one: upgrade it (System → Updates)", hub.shown(to)));
+        }
+        pkg.spec.agentenv = crate::agentenvs::resolve::again(hub, id, pkg.spec.isolation.is_some(), "resumed from kiln's copy").await.map_err(|e| e.said())?;
         // kiln takes it for the process that held it, which can't hand it on: the package carries
         // the take, which the receipt follows as a hand-on's (docs/ci.md W27-R08).
         let heard = hub.agents.load().get(&from_name).map(|a| a.last_seen).unwrap_or_default();
@@ -5286,6 +5364,8 @@ impl Registry {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
         tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
+        // Given its environment in the process it goes to: announcing it with it there asks nothing more.
+        crate::agentenvs::resolve::given(hub, id, &format!("agent:{to}"));
         send_package(hub, id, to, &bytes).await
     }
 
@@ -5306,7 +5386,13 @@ impl Registry {
         if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
             return Err(format!("{} runs a kiln too old to take a session from the server; upgrade it first", hub.shown(to)));
         }
-        let spec = s.resume_spec();
+        let mut spec = s.resume_spec();
+        // Its environment, where kiln keeps that it runs with one, opened again for its harness's start there
+        // (docs/agents.md, "Where they apply").
+        if crate::agentenvs::linked(hub, id).is_some() && !crate::agentenvs::resolve::speaks(hub, to) {
+            return Err(format!("it runs with an environment, and {}'s kiln runs no session with one: upgrade it (System → Updates)", hub.shown(to)));
+        }
+        spec.agentenv = crate::agentenvs::resolve::again(hub, id, spec.isolation.is_some(), "moved from the kiln server").await.map_err(|e| e.said())?;
         let (events, mut state) = {
             let core = s.core.lock();
             (core.events().cloned().collect::<Vec<_>>(), core.state.clone())
@@ -5317,6 +5403,7 @@ impl Registry {
         let from_cwd = state.cwd.clone();
         let pkg = super::moving::pack(id, spec, cwd, "the kiln server", &from_cwd, super::moving::Carry::Nothing, events, state);
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
+        crate::agentenvs::resolve::given(hub, id, &format!("agent:{to}"));
         send_package(hub, id, to, &bytes).await?;
         self.raise_epoch(id, next);
         if let Some(store) = &self.convo {

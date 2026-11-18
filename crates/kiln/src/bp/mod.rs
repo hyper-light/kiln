@@ -349,6 +349,8 @@ impl Feed {
             E::Agentfile(a) => self.changed(&format!("person:{}", a.owner), "agentfiles".into()),
             // Its builds ahead of its sessions changed (`crate::agentfiles::prebuild`): theirs alone read again.
             E::AgentfileBuilds(b) => self.changed(&format!("person:{}", b.owner), format!("agentfiles/builds/{}", b.id)),
+            // One person's environments for agent sessions changed (`crate::agentenvs`): their list read again.
+            E::Agentenv(e) => self.changed(&format!("person:{}", e.owner), "agentenvs".into()),
             E::Program { program } => self.changed("", format!("program/{program}")),
             E::FrontDoor { runner } => self.changed("", format!("front-door/{runner}")),
             E::AgentLimit { runner } => self.changed("", format!("agent-limit/{runner}")),

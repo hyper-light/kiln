@@ -115,6 +115,8 @@ impl Meta {
             "attention" => v.get("principal"),
             // An Agentfile's owner (`crate::agentfiles`), of a change or of its builds.
             "agentfile" | "agentfile_builds" => v.get("owner"),
+            // An environment's owner (`crate::agentenvs`).
+            "agentenv" => v.get("owner"),
             _ => None,
         }
         .and_then(Value::as_str)

@@ -756,6 +756,10 @@ pub static ROUTES: &[Rule] = &[
     // `agentfiles.manage` reach everyone's.
     any("/api/agentfiles", "agents.run", At::Server),
     any("/api/agentfiles/**", "agents.run", At::Server),
+    // Environments for agent sessions (`crate::agentenvs`): the handler keeps a person to their own, an
+    // admin's included. Applying one to a session is under `/api/harness/**`.
+    any("/api/agentenvs", "agents.run", At::Server),
+    any("/api/agentenvs/**", "agents.run", At::Server),
     // Agent definitions (`crate::agentdefs`): the handler keeps a person to their own; the owner and
     // `agentdefs.manage` reach everyone's.
     any("/api/agentdefs", "agents.run", At::Server),

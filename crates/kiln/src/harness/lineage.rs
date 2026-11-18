@@ -629,6 +629,10 @@ pub struct Ask {
     pub reach: Option<String>,
     /// The terminal session it belongs to (`Spec::shell`): a person's start from a terminal.
     pub shell: Option<String>,
+    /// The environment it starts with (docs/agents.md, "Environments"): one of its person's own, by id
+    /// ([`chosen_env`]); none, its parent's where an agent starts it, else its machine's user's. kiln opens it
+    /// into `Spec::agentenv`.
+    pub agentenv: Option<String>,
     /// Its microVM's vCPUs and MiB, as a definition's experiment's variant sizes it (P7.1): never from what's
     /// asked.
     #[serde(skip)]
@@ -1297,6 +1301,14 @@ pub async fn kept_agentfile(hub: &Hub, isolation: Option<&Isolation>, person: Op
     Ok(Kept { text: Some(text), secrets })
 }
 
+/// The environment `id` a start asks for (docs/agents.md, "Environments"): `person`'s own (an agent's start, the
+/// person it acts for's).
+async fn chosen_env(hub: &Hub, person: Option<&str>, id: &str) -> Result<crate::agentenvs::Agentenv, Refused> {
+    use crate::agentenvs::Refusal;
+    let person = person.ok_or_else(|| Refusal::Forbidden("this start acts for no person, and an environment is a person's".into()).fail())?;
+    crate::agentenvs::get(hub, person, id).await.map_err(|r| r.fail())
+}
+
 /// What [`kept_agentfile`] read for a start: its person's own Agentfile's text, and the secrets its
 /// build is given.
 #[derive(Debug, Default)]
@@ -1765,6 +1777,15 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // person they act for's. A person's own Agentfile is read as theirs before anything is placed.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
     let kept = kept_agentfile(hub, isolation.as_ref(), person.as_deref()).await.map_err(bad)?;
+    // The environment it starts with, its person's own, or its parent's where it names none, read before anything
+    // is placed; its secrets are opened once each machine it goes to is known to run it (below).
+    let env = match ask.agentenv.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        Some(id) => Some(chosen_env(hub, person.as_deref(), id).await?),
+        None => match &by.parent {
+            Some(p) => crate::agentenvs::of_session(hub, &p.id).await.map_err(|r| r.fail())?,
+            None => None,
+        },
+    };
     // Its agent's volumes (P6.2), as the definition it starts from had them at its version then: the disk its
     // placement asks for them, and each given to its microVM as its harness starts ([`Spec::volumes`]).
     let volumes = match &ask.definition {
@@ -1799,6 +1820,10 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
             // An isolated agent's harness is its image's, in its microVM: what the machine has
             // installed isn't its (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
             let isolated = boundary(target).is_some();
+            // Its environment runs there: its runner names feature `agentenv`, and a microVM takes no `secret` variable.
+            if let Some(e) = &env {
+                crate::agentenvs::resolve::runs_there(hub, e, target, isolated).map_err(|r| r.fail())?;
+            }
             // Its agent's volumes are kept in a machine's microVM store alone (P6.2): never given to a harness on
             // its machine's host.
             if !isolated && !volumes.is_empty() {
@@ -1837,6 +1862,21 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
     };
     let target = placed.first().map_or_else(|| "local".to_owned(), |(t, _)| t.clone());
+    // Its environment opened (docs/agents.md, "Where they apply"): each secret read from its person's own, marked
+    // used and audited by name, for these sessions alone.
+    let agentenv = match &env {
+        Some(e) => {
+            let microvm = placed.iter().any(|(t, _)| boundary(t).is_some());
+            match crate::agentenvs::resolve::open(hub, e, microvm, &by.actor, "an agent's start").await {
+                Ok(r) => Some(r),
+                Err(r) => {
+                    let_go(hub, &placed).await;
+                    return Err(r.fail());
+                }
+            }
+        }
+        None => None,
+    };
     // Whose they are: the person who asked, whatever token they used; kiln's own starts are the
     // person they act for's.
     let person = by.asker.as_ref().and_then(person_of).or_else(|| by.opener.clone());
@@ -1862,6 +1902,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         resume: resume.clone(),
         agentfile: kept.text,
         build_secrets: kept.secrets,
+        agentenv,
         // Its agent's volumes, its person's own on each machine (P6.2).
         volumes: given.clone(),
         // Whose its opening prompt is: its input admits it as theirs (step 35).
@@ -1900,6 +1941,13 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
         if let Some(p) = &by.parent {
             let _ = hub.store.kv_set(parent_key(&i.id), p.id.clone()).await;
+        }
+        // The environment it runs with, kept by its id: opened again whenever its harness starts again.
+        if let Some(e) = &env {
+            if let Err(r) = crate::agentenvs::link(hub, &i.id, Some(e), &by.actor).await {
+                tracing::warn!(target: "kiln.agentenvs", session = %i.id, error = %r, "the environment an agent started with couldn't be kept: its harness starts again with its machine's user's");
+            }
+            crate::agentenvs::resolve::given(hub, &i.id, &i.target);
         }
         // The definition it started from, for that definition's sessions and its own `agents.get`.
         if let Some(d) = &ask.definition {
