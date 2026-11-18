@@ -1277,8 +1277,9 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   **Write to disk…** shows what it would create, replace and delete (git's own directory stays
   out), and any file changed in the folder since the agent changed it, in which
   case nothing is written until they agree. Only a person writes it: an agent's `agents.land` with
-  a plan is refused. Slates takes a person's go-ahead from kiln on macOS and Windows; not on Linux
-  yet (Slates can't take a grant from outside its anchor's own session there), and the plan says so.
+  a plan is refused. kiln approves it with a secret of its own that it hands Slates at every start,
+  on every system; not yet where Slates runs under a systemd unit (Linux), which can't take it, and
+  there the plan says so.
   kiln leaves out `.git` and writes only what git sees changed: when the agent's build output or
   dependencies would be written too, the plan says to put the work up for review instead.
 - **How long it lasts.** As long as the agent: ended for good, its volume goes with it. It outlives
