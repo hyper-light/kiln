@@ -282,9 +282,12 @@ pub struct PolicyRecord {
   /// harness through the issuer, never by an agent. `None` until one is set: merges at once, lands under approval.
   /// Appended.
   pub write: Option<WritePolicy>,
-  /// How many times the write policy was set (A-285): a setter names the version it read, so a captured proof sets
-  /// nothing once the policy has moved. Appended.
+  /// How many times the write policy or the trusted signers were set (A-285, A-321): a setter names the version it
+  /// read, so a captured proof sets nothing once the policy has moved. Appended.
   pub write_version: u64,
+  /// The keys trusted to sign the volume's work (signed work, A-321), in SSH wire form, in the order the launcher set
+  /// them: a merge's signature verifies under its work's and its green's, a landing's under its volume's. Appended.
+  pub signers: Vec<Vec<u8>>,
 }
 
 /// How one kind of write is permitted (A-285): the mode the user gave the harness or agent.
@@ -298,13 +301,16 @@ pub enum WriteMode {
   Forbid,
 }
 
-/// A volume's write policy (A-285): the mode for its merges and the mode for its landings.
+/// A volume's write policy (A-285): the mode for its merges and the mode for its landings, and whether its merges must
+/// be signed (A-321).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WritePolicy {
   /// How a merge into the volume is permitted.
   pub merge: WriteMode,
   /// How a landing of the volume is permitted.
   pub land: WriteMode,
+  /// Merges into the volume (a green) or from it (a work) must carry a signature that verifies under a trusted signer.
+  pub require_signed_merges: bool,
 }
 
 /// A live shipper's holder set and the epoch it ships under (A-240): the `2f` candidates it ships to, as their host
@@ -422,6 +428,23 @@ pub struct VolumeRecord {
   /// the access list, the base — so the owner ships each change as a newer record and a takeover adopts the
   /// newest (AUD-29-17). Raised in `apply`, so replay reproduces it.
   pub catalog_version: u64,
+  /// The takeover that made this node the volume's owner (AC-8.3, A-325), recorded with the volume when the successor
+  /// materializes it, so its loss report survives the successor's restart over its anchor; `None` for a volume made
+  /// here. Appended.
+  pub taken_over: Option<TakeoverRecord>,
+}
+
+/// The takeover that made a node a volume's owner (AC-8.3, A-325; the loss report in `slates status`): the epoch the head
+/// was placed under, the head sequence the volume was served from, and whether it was rebuilt from the volume's live log
+/// (no acknowledged write lost) or from the seal the head names (the lost owner's edits after it are the loss window).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeoverRecord {
+  /// The epoch the adopted head was placed under.
+  pub epoch: u64,
+  /// The head sequence the volume was served from.
+  pub head_sequence: u64,
+  /// Whether the volume was rebuilt from its live log rather than from the seal the head names.
+  pub from_live_log: bool,
 }
 
 /// Where a snapshot's records and content are held (§4.8).
@@ -1073,6 +1096,57 @@ pub struct NameAliasRecord {
   pub volume: VolumeId,
   /// Whether the clone was made and the alias confirmed; until then the alias holds the name and resolves nothing.
   pub confirmed: bool,
+}
+
+/// A work being created on its name's partition while its green's owner admits it (A-247): the id it was given, which
+/// this record's own log entry consumes so no other volume is given it, and the name it holds meanwhile.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PendingCreationRecord {
+  /// The name.
+  pub name: String,
+  /// The work's id.
+  pub work: VolumeId,
+  /// The completion key's origin.
+  pub origin: u64,
+  /// The completion key's client.
+  pub client: u32,
+  /// The completion key's sequence.
+  pub sequence: u32,
+}
+
+/// A work's submit that went to its green's owner and whose answer the work has not yet settled (A-247): kept on the
+/// work's partition from the ask until the settle, so no other verb of the work runs between the owner's verdict and
+/// the work's reset, across a lost answer or a restart. The request is kept whole, to be run again under its own key
+/// once the owner answers it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PendingSubmitRecord {
+  /// The work.
+  pub work: VolumeId,
+  /// The completion key's origin.
+  pub origin: u64,
+  /// The completion key's client.
+  pub client: u32,
+  /// The completion key's sequence.
+  pub sequence: u32,
+  /// The client the request was served for.
+  pub client_id: u32,
+  /// The principal it was asked as.
+  pub principal: Principal,
+  /// The request, in the wire's encoding.
+  pub body: Vec<u8>,
+}
+
+/// A live work's hold on a version of its green (A-247), kept on the green's partition whichever partition the work
+/// lives on: the green's reachable floor is the minimum over these and its pins, so a checkpoint never folds past a
+/// base a work still reads and composes against.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkFloorRecord {
+  /// The green.
+  pub green: VolumeId,
+  /// The work, on the partition its id encodes.
+  pub work: VolumeId,
+  /// The version the work is based on.
+  pub base: u64,
 }
 
 /// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;

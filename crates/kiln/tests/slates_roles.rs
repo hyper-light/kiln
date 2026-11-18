@@ -3,8 +3,10 @@
 //! its anchor starts the same way), with no Slates binary anywhere, and drives it through Slates' library alone, in its
 //! typed contract: a volume laid over a folder, its plan for writing back, its drift, its write policy as kiln (its
 //! launcher) sets it under its own secret, the launcher's approval, and its removal. Nothing is mounted, so it runs on
-//! any Unix machine. The test owns the instance it starts and stops exactly its processes,
-//! by the pid kiln kept of the anchor it started (its process group), never by a pattern.
+//! any Unix machine; on Linux under the user's service manager (a runner's user unit) its anchor runs in a systemd
+//! scope of its own, as a runner's does, and the secret reaches it through the scope. The test owns the instance it
+//! starts and stops exactly its processes, by the pid kiln kept of the anchor it started (its process group), never by
+//! a pattern.
 
 #![cfg(unix)]
 
@@ -113,6 +115,16 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
     for (pid, exe, _) in &processes {
         assert!(Path::new(exe).file_stem().is_none_or(|s| s != "slates"), "process {pid} runs a Slates binary: {exe}");
     }
+    // Under the user's service manager (a runner's user unit) the anchor runs in a systemd scope of its own, named for
+    // the instance, so the runner's restart never takes it along; the policy and approvals below verify under the
+    // secret it was handed through the scope. Elsewhere it runs in its own process group.
+    if slates::starts_in_a_scope() {
+        let cgroup = std::fs::read_to_string(format!("/proc/{anchor}/cgroup"))?;
+        let scope = format!("/{instance}-slates.scope");
+        assert!(cgroup.lines().any(|l| l.strip_prefix("0::").is_some_and(|path| path.trim_end().ends_with(&scope))), "the anchor's cgroup isn't the scope {scope}: {cgroup}");
+    } else {
+        eprintln!("the anchor runs in its own process group here: this test doesn't run under the user's service manager on Linux");
+    }
     // A second start finds it up and starts nothing.
     kiln::rt::block_on(slates::ensure_up())?;
     assert_eq!(processes_of(&instance).len(), processes.len(), "a second anchor was started");
@@ -162,7 +174,6 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
 
     // kiln's own authority, the launcher secret it handed the anchor it started (kept 0600 in its state), approves
     // exactly the plan's manifest; another manifest approves nothing.
-    slates::can_take_grants()?;
     let approve = |manifest: String| {
         let (made, over) = (made.clone(), over.clone());
         kiln::rt::block_on(async move { slates::approve(&made, &over, &manifest).await })

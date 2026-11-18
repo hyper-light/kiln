@@ -128,9 +128,9 @@ fn refusal_of_image(error: ImageError) -> Refusal {
     }
     ImageError::NameNotUtf8 { path } => format!("a name not UTF-8 at {path}"),
     ImageError::TargetNotUtf8 { path } => format!("a symlink target not UTF-8 at {path}"),
-    ImageError::NodeUnsupported { path } => {
-      format!("a device at {path}, which a volume cannot hold")
-    }
+    ImageError::DeviceNumberUnencodable { path, major, minor } => format!(
+      "a device numbered {major}:{minor} at {path}, past the image's 12-bit major and 20-bit minor"
+    ),
     ImageError::Inconsistent { reason } => format!("the merge disagreed with itself: {reason}"),
   };
   Refusal::ImageRefused { reason }
@@ -218,7 +218,9 @@ pub(crate) fn complete_once_durable(
 }
 
 /// Where the reply of in-flight `request` goes, taken, for a task that hands the request on to another deferral (a
-/// bypass presentation's granted landing, A-285) rather than completing it here.
+/// bypass presentation's granted landing, A-285) rather than completing it here. Unix's, where a landing is presented
+/// (the Windows writer is owed, `crate::landing::land_verb`).
+#[cfg(unix)]
 pub(crate) fn take_in_flight(
   state: &mut ShardState,
   request: (u64, RequestId),
@@ -583,6 +585,7 @@ impl BuildJob {
         live_holders: None,
         write: None,
         write_version: 0,
+        signers: Vec::new(),
       },
       base: BaseRecord::Image {
         volume: self.source,
@@ -598,6 +601,7 @@ impl BuildJob {
       access: Vec::new(),
       created_ns: state.clock.monotonic_ns(),
       catalog_version: 0,
+      taken_over: None,
     };
     let Admitted {
       volume,

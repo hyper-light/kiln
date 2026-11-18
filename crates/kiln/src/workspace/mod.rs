@@ -295,12 +295,8 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
         Ask::Plan => {
             let (m, over) = own(ws)?;
             let plan = slates::plan_landing(m, over).await?;
-            // Why it can't be written from kiln: this machine's Slates takes no go-ahead from it, or
-            // the landing would write what git ignores.
-            let why_not = match slates::can_take_grants() {
-                Err(e) => Some(format!("{e:#}")),
-                Ok(()) => slates::writable(m, over, &plan).await.err(),
-            };
+            // Why it can't be written from kiln: the landing would write what git ignores.
+            let why_not = slates::writable(m, over, &plan).await.err();
             Ok(json!({"plan": plan, "excludes": slates::EXCLUDES, "can_write": why_not.is_none(), "why_not": why_not}))
         }
         Ask::Land { manifest } => {

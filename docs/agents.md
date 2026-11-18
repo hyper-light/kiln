@@ -1278,13 +1278,13 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   out), and any file changed in the folder since the agent changed it, in which
   case nothing is written until they agree. Only a person writes it: an agent's `agents.land` with
   a plan is refused. kiln approves it with a secret of its own that it hands Slates at every start,
-  on every system; not yet where Slates runs under a systemd unit (Linux), which can't take it, and
-  there the plan says so.
+  on every system.
   kiln leaves out `.git` and writes only what git sees changed: when the agent's build output or
   dependencies would be written too, the plan says to put the work up for review instead.
 - **How long it lasts.** As long as the agent: ended for good, its volume goes with it. It outlives
-  the runner's restarts and upgrades (Slates' anchor runs apart from the runner: its own systemd
-  user unit on Linux), but not the machine's (Slates keeps volumes in memory). An agent in one
+  the runner's restarts and upgrades (Slates' anchor runs apart from the runner: a systemd user
+  scope of its own on Linux, its own process group elsewhere), but not the machine's (Slates keeps
+  volumes in memory). An agent in one
   doesn't move to another machine yet.
 - **Where it can.** Any machine with a mount it can make: FUSE through `fusermount3` on Linux, NFS
   on loopback on macOS. Nothing needs installing: Slates is built into kiln (vendored, and driven

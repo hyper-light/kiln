@@ -124,13 +124,72 @@ pub enum WriteMode {
   Forbid,
 }
 
-/// A write policy: the mode for merges and the mode for landings (A-285).
+/// A write policy: the mode for merges and the mode for landings (A-285), and whether merges must be signed (A-321).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WritePolicy {
   /// How a merge is permitted.
   pub merge: WriteMode,
   /// How a landing is permitted.
   pub land: WriteMode,
+  /// Merges must carry a signature that verifies under a trusted signer (signed work, A-321): on a green, every merge
+  /// into it; on a work, every merge from it. A requirement on what the volume accepts, never a permission: an unsigned
+  /// or invalid merge is refused `SignatureRequired` even in bypass, and a verified one still follows its mode. A
+  /// consumer's policy cannot set it (refused `BadRequest`): it is the volume's rule.
+  pub require_signed_merges: bool,
+}
+
+/// The kind of key that signed (signed work, A-321): the ones the daemon's verifier accepts.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignerKey {
+  /// `ssh-ed25519` (RFC 8709).
+  Ed25519,
+  /// `sk-ssh-ed25519@openssh.com`: a FIDO key, whose every signature carries the holder's touch.
+  SecurityKeyEd25519,
+}
+
+/// Who signed (A-321): the key's kind and its SHA-256 fingerprint over its SSH wire form (`ssh-keygen -l -E sha256`
+/// prints the base64 of these bytes after `SHA256:`).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Signer {
+  /// The key's kind.
+  pub key: SignerKey,
+  /// The key's fingerprint.
+  pub fingerprint: [u8; 32],
+}
+
+/// Why a signature did not verify (A-321): `slates_server::signed_work::SignatureRefusal`, one to one.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureFault {
+  /// The armour, the base64 or the blob's grammar is wrong.
+  Malformed,
+  /// Made under another namespace than `slates-work` (for a git commit, a file).
+  Namespace,
+  /// A key type, signature type or hash slates does not accept.
+  Unsupported,
+  /// The key is not one of the volume's trusted signers.
+  UnregisteredKey,
+  /// The signature does not verify over the act's statement.
+  BadSignature,
+  /// A security key signed without its holder's touch.
+  NotTouched,
+}
+
+/// How an act's signature was judged (signed work, A-321): recorded with the merge or the landing as provenance and
+/// answered, never a permission.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verification {
+  /// The signature verified over the act's statement under a trusted signer.
+  Verified {
+    /// Who signed.
+    signer: Signer,
+  },
+  /// The act carried no signature.
+  Unsigned,
+  /// The act carried a signature that did not verify.
+  Invalid {
+    /// Why.
+    reason: SignatureFault,
+  },
 }
 
 /// What a write policy is set on (A-285): an enrolled consumer (a session's agent) or a volume. The stricter of the
@@ -886,12 +945,16 @@ pub enum RequestBody {
   },
   /// A `Submit` whose caller's own policy asks (A-285): served as a submit under an ask mode whatever the volumes'
   /// modes, so the merge is answered `MergeApprovalRequired` (or refused, if a volume forbids it). What an agent's
-  /// channel sends in place of `Submit` when the consumer's merge mode asks; never needed from a client. Appended.
+  /// channel sends in place of `Submit` (or `SubmitSigned`) when the consumer's merge mode asks, and what a signer sends
+  /// to learn the increment's identity its merge statement names (signed work, A-321): nothing is merged either way.
+  /// Appended.
   SubmitHeld {
     /// The work volume.
     work: VolumeId,
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
+    /// The signature a `SubmitSigned` carried, kept through the hold and judged for the approval request (A-321).
+    signature: Option<Vec<u8>>,
   },
   /// An `EditSubmit` whose caller's own policy asks (A-285): the edit applies, and the submit is held as
   /// `SubmitHeld`'s is. Appended.
@@ -923,6 +986,47 @@ pub enum RequestBody {
     identity: [u8; 32],
     /// The keyed hash under the issuer secret.
     proof: [u8; 32],
+    /// The signature over the merge's statement, when the merge is signed work (A-321): the approval carries it again,
+    /// since the held submit kept nothing. Its reply is then `SubmittedSigned`.
+    signature: Option<Vec<u8>>,
+  },
+  /// A `Submit` carrying a signature over its merge's statement (signed work, A-321; `slates_server::signed_work::
+  /// merge_statement`, signed under the namespace `slates-work`): judged under the work's and the green's trusted
+  /// signers, recorded with the version as provenance and answered `SubmittedSigned`. The signature never permits
+  /// anything: the merge follows its write modes as a `Submit` does, and a volume that requires signed merges refuses
+  /// one whose signature does not verify when it would merge (`SignatureRequired`). Appended.
+  SubmitSigned {
+    /// The work volume.
+    work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+    /// The SSH signature blob (the armour's base64, decoded).
+    signature: Vec<u8>,
+  },
+  /// Sets a volume's trusted signers (signed work, A-321): the public keys, in SSH wire form, whose signatures over the
+  /// volume's work verify; the whole set, so a key is removed by setting the set without it. The launcher's act, proven
+  /// as a write policy is (`slates_server::landing::signers_proof`, over the volume, the keys and the policy version it
+  /// read) and refused alike on a consumer-bound channel; a key slates does not verify is refused `BadRequest`. The set
+  /// moves the volume's policy version. Served on the volume's owner shard. Appended.
+  SetSigners {
+    /// The volume.
+    volume: VolumeId,
+    /// The public keys, in SSH wire form.
+    keys: Vec<Vec<u8>>,
+    /// The policy version the setter read (`Policy`'s `version`): refused `PolicyChanged` once the policy has moved.
+    version: u64,
+    /// The keyed hash under the launcher's secret.
+    proof: [u8; 32],
+  },
+  /// A green version's merge record as a consumer reads it back (§4.16, A-321): how the signature of the merge that made
+  /// the version was judged, its provenance, kept with the green's accepted record (the version's chain entry, then the
+  /// checkpoint that folds it). Served on the green's owner shard; version 0 is the origin, which no merge made; a
+  /// version not yet committed is `NotFound`. A read. Appended.
+  MergeRecord {
+    /// The green.
+    green: VolumeId,
+    /// The version.
+    version: u64,
   },
 }
 
@@ -1588,6 +1692,7 @@ impl RequestBody {
       | RequestBody::EditSubmit { work: volume, .. }
       | RequestBody::EditSubmitHeld { work: volume, .. }
       | RequestBody::SubmitHeld { work: volume, .. }
+      | RequestBody::SubmitSigned { work: volume, .. }
       | RequestBody::FsWrite { volume, .. }
       | RequestBody::FsWriteStaged { volume, .. }
       | RequestBody::FsRemove { volume, .. }
@@ -1606,6 +1711,10 @@ impl RequestBody {
         subject: PolicySubject::Volume { volume },
       } => Some(*volume),
       RequestBody::SetPolicy { .. } | RequestBody::Policy { .. } => None,
+      // A volume's signers live in its record too (A-321); a green's version records on the green's owner shard.
+      RequestBody::SetSigners { volume, .. } | RequestBody::MergeRecord { green: volume, .. } => {
+        Some(*volume)
+      }
       // A checkout writes its green's base volume, on the owner shard of both (`green --base` runs there).
       RequestBody::Checkout { base, .. } => Some(base.volume),
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
@@ -1650,6 +1759,7 @@ impl RequestBody {
         | RequestBody::EditSubmit { .. }
         | RequestBody::EditSubmitHeld { .. }
         | RequestBody::SubmitHeld { .. }
+        | RequestBody::SubmitSigned { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
         | RequestBody::SubmitApproved { .. }
@@ -1670,6 +1780,7 @@ impl RequestBody {
         | RequestBody::FsMkdir { .. }
         | RequestBody::Checkout { .. }
         | RequestBody::SetPolicy { .. }
+        | RequestBody::SetSigners { .. }
     )
   }
 
@@ -1682,6 +1793,7 @@ impl RequestBody {
       self,
       RequestBody::Status { .. }
         | RequestBody::Versions { .. }
+        | RequestBody::MergeRecord { .. }
         | RequestBody::ChangedSince { .. }
         | RequestBody::Read { .. }
         | RequestBody::ReadRange { .. }
@@ -1883,6 +1995,11 @@ pub struct DaemonReport {
   /// This node's certificate anchor (A-237): the host a principal of this node names, as a share to one of its
   /// accounts must name it. Stable across the node's restarts. Appended.
   pub anchor: u64,
+  /// The anchor has judged this daemon recovered (A-311): it has served as long as its start took, so its exit from
+  /// here on is no failed start and is restarted at once, where an exit before would count toward a crash loop. Whoever
+  /// ends a daemon on purpose (a test's kill, an operator's) waits for it first. `false` with no anchor, which judges
+  /// nothing. Appended.
+  pub recovered: bool,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or
@@ -2102,7 +2219,8 @@ pub enum WorkOp {
     /// The attribute name.
     name: String,
   },
-  /// Create an IPC namespace inode with explicit metadata and no endpoint state.
+  /// Create a namespace inode with no content, with explicit metadata and no endpoint state: a FIFO or socket name
+  /// (A-26), or a device node and its number (A-294).
   Mknod {
     /// The new path.
     path: String,
@@ -2111,20 +2229,35 @@ pub enum WorkOp {
   },
 }
 
-/// A-26: a declared IPC kind. Device nodes have no wire representation here.
+/// A declared kind of name with no content: a FIFO or socket name (A-26), or a device node with its number, metadata
+/// nothing opens as a device (A-294). The device kinds are appended, so the two earlier tags are unchanged.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcNodeKind {
   /// A named pipe without queued bytes.
   Fifo,
   /// A socket name without a listener or connection.
   Socket,
+  /// A block device node (A-294).
+  BlockDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
+  /// A character device node (A-294); a whiteout is one numbered 0/0.
+  CharDevice {
+    /// The major number.
+    major: u32,
+    /// The minor number.
+    minor: u32,
+  },
 }
 
-/// Metadata supplied by a work's declared IPC creation (§4.16, A-26). These are volume
-/// metadata, not host credentials or endpoint authority. Replay never reads a local clock.
+/// Metadata supplied by a work's declared creation of a name with no content (§4.16, A-26, A-294). These are volume
+/// metadata, not host credentials, endpoint authority or device access. Replay never reads a local clock.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IpcNode {
-  /// The IPC kind.
+  /// The kind, with a device node's number.
   pub kind: IpcNodeKind,
   /// Permission bits.
   pub mode: u32,
@@ -2202,6 +2335,9 @@ pub struct StatusReport {
   /// text for people, for a consumer to match. `None` for a volume with no base folder (a scratch volume, a clone of
   /// one, a green, a work volume). Appended.
   pub base: Option<BaseReport>,
+  /// What an owner loss would lose of the volume now, and what the takeover that made this node its owner lost (§4.10
+  /// "Auto-seal", AC-8.3, D-18). Appended.
+  pub loss: LossReport,
 }
 
 /// An overlay's base as a status read it (§4.15 "Drift"; A-299). Append-only.
@@ -2251,6 +2387,40 @@ pub enum WatcherState {
   Overflowed,
   /// None on this host or folder: fingerprints alone.
   Unavailable,
+}
+
+/// A volume's loss window (§4.10 "Auto-seal", AC-8.3, D-18): what of it lives on its owner alone, and what the takeover
+/// that made this node its owner lost. Every time is this host's own clock's, so no two hosts' clocks are compared; a
+/// seal is named by its head sequence, which the owner and every successor share.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LossReport {
+  /// The window an owner loss would lose now, nanoseconds (the design's `last_placed_snapshot_age`, made exact): zero
+  /// when every change is on another host too (the head sealed and placed with nothing changed since, or a live-shipped
+  /// log in a fleet, whose acknowledged writes are durable on its holders); otherwise the age of the newest seal placed
+  /// on `f + 1` hosts, or of the volume itself when none is (on a laptop, `f = 0`, nothing is on another host). `None`
+  /// when the time is unknown (taken under another boot of this host's clock) or not measured: never reported as zero.
+  pub at_risk_ns: Option<u64>,
+  /// The head sequence of the newest seal placed on `f + 1` hosts: the one a takeover would serve from now, so the
+  /// edits after it are the window. `None` while no seal is placed on another host.
+  pub placed_sequence: Option<u64>,
+  /// Whether the volume ships its live log to holders in a fleet (A-200), so an owner loss loses no write acknowledged
+  /// at durability.
+  pub live_shipped: bool,
+  /// Set on a node that took the volume over from a lost owner: what it serves from, and so what the loss took. Kept in
+  /// this node's memory: a restart of this node forgets it.
+  pub taken_over: Option<VolumeTakeover>,
+}
+
+/// The takeover that made this node a volume's owner (AC-8.3): the loss window an owner loss left.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct VolumeTakeover {
+  /// The epoch the volume has been served under since.
+  pub epoch: u64,
+  /// Served from the volume's live log: every write the lost owner acknowledged at durability survived.
+  pub from_live_log: bool,
+  /// The head sequence served from: when the volume was not served from its live log, the lost owner's edits after the
+  /// seal it names (its `placed_sequence` when it was lost) are the loss window.
+  pub head_sequence: u64,
 }
 
 /// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
@@ -3394,6 +3564,78 @@ pub enum Refusal {
     /// The policy's version now.
     current: u64,
   },
+  /// The merge's work or green requires signed merges (A-321), and the merge's signature was absent or did not verify:
+  /// nothing was merged. A requirement on what the volume accepts, met in every write mode when the merge would happen
+  /// (a bypass merge at once, an asked one at its approval). Appended.
+  SignatureRequired {
+    /// The volume whose policy requires signed merges.
+    by: PolicySubject,
+    /// How the merge's signature was judged.
+    verification: Verification,
+  },
+  /// The volume core refused the verb for a reason the variants before this one do not name (A-299): until
+  /// 2026-11-18 each reached a client as `BadRequest` carrying the reason's name, which a consumer could only read as
+  /// words. Appended.
+  Volume {
+    /// Why, typed.
+    refusal: VolumeRefusal,
+  },
+}
+
+/// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
+/// class of a volume-core error (`slates_vfs::VfsError`) by the same name. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeRefusal {
+  /// `ENOTDIR`: not a directory where one was needed.
+  NotDirectory,
+  /// `EISDIR`: a directory where a file was needed.
+  IsDirectory,
+  /// `ENOTEMPTY`: a directory that must be empty is not.
+  NotEmpty,
+  /// `EINVAL`: an argument the operation does not take.
+  Invalid,
+  /// `ENODATA`: no such extended attribute.
+  NoAttribute,
+  /// `EPERM`: the volume's rules forbid the operation.
+  NotPermitted,
+  /// A link protected against the operation (a sticky directory's, a hard link's).
+  LinkProtected,
+  /// An operation a special file (a FIFO, a socket name) does not support.
+  SpecialFileOperation,
+  /// `EMLINK`: a file at its link bound.
+  TooManyLinks,
+  /// `EFBIG`: past a file's largest size.
+  FileTooLarge,
+  /// `EXDEV`: a move across volumes.
+  CrossVolumeMove,
+  /// A handle or number that no longer names anything (a freed inode, a destroyed snapshot).
+  StaleHandle,
+  /// The snapshot is pinned by a live clone, or the volume is a green's origin: destroy the clone first.
+  Pinned,
+  /// A guest maps the file in a way the change cannot keep its map equal to, so the change waits for the map's end.
+  DaxMapped,
+  /// A witnessed base entry changed on the disk beneath an unpinned range: the read refuses rather than mix states.
+  BaseDrift,
+  /// The verb names an overlay's base, and the volume has none.
+  NotOverlay,
+  /// The digest cache is at its bound.
+  DigestCacheFull,
+  /// A memory refusal the variants before [`Refusal::Volume`] do not name.
+  Memory,
+  /// A journal reader asked for records retention has dropped.
+  JournalIncomplete {
+    /// The record it needed.
+    needed: u64,
+    /// The oldest record retained.
+    oldest: u64,
+  },
+  /// A recovery image of another format version.
+  RecoveryVersion {
+    /// The version found.
+    found: u16,
+    /// The version this build reads.
+    expected: u16,
+  },
 }
 
 /// Why recovery could not rebuild a volume its catalog holds ([`Refusal::NotRecovered`], §4.8). Append-only.
@@ -3433,15 +3675,17 @@ pub enum RecoveryCause {
     /// Which, and the refusal.
     reason: String,
   },
-  /// A green this node took over from a departed owner (§4.16 owner-loss recovery) could not be materialized within the
-  /// takeover's bound: the failover SLO's worth of the fleet's periods, each one attempt. Every verb on it answers this
-  /// rather than waiting without end. Appended.
+  /// A volume or green this node took over from a departed owner (§4.8, §4.16 owner-loss recovery) could not be adopted
+  /// or materialized within the takeover's bound: the failover SLO's worth of the fleet's periods without progress, each
+  /// one attempt. Every verb on it answers this rather than waiting without end. Appended.
   TakeoverIncomplete {
-    /// What the last attempt waited on: `catalog` (its catalog register or that register's placement never adopted),
-    /// `chain` (a version's record not known here: the adopted version beyond this node's accepted records), `inputs`
-    /// (an input its ledger names not held here, and not served whole by the survivors that reported the adopted
-    /// version), `placement` (no placement of the adopted record, or no shard for its partition), or `refused` (the
-    /// owner shard refused the rebuilt green).
+    /// What the last attempt waited on: `promises` (a recovery cohort never gave its quorum of promises in the takeover
+    /// round, A-304), `catalog` (its catalog register or that register's placement never adopted), `catalog_placement`,
+    /// `content` (a volume's content not held here, and not served whole by a recorded holder), `live` (a live-shipped
+    /// volume's log), `shard` (no shard here for its partition), `chain` (a version's record not known here: the adopted
+    /// version beyond this node's accepted records), `inputs` (an input its ledger names not held here, and not served
+    /// whole by the survivors that reported the adopted version), `placement` (no placement of the adopted record, or no
+    /// shard for its partition), or `refused` (the owner shard refused the rebuilt volume or green).
     waited_on: String,
   },
 }
@@ -3895,8 +4139,12 @@ pub enum ReplyBody {
   Policy {
     /// The policy.
     policy: Option<WritePolicy>,
-    /// The policy's version: how many times it was set, which a `SetPolicy` names.
+    /// The policy's version: how many times it or the subject's signers were set, which a `SetPolicy` and a
+    /// `SetSigners` name.
     version: u64,
+    /// The subject's trusted signers (A-321), in SSH wire form, in the order set; none for a consumer, whose policy
+    /// keeps none.
+    signers: Vec<Vec<u8>>,
   },
   /// A merge an ask policy holds for approval (A-285): nothing was merged. `identity` names the increment exactly
   /// (`blake3` of the work, its base, its post-state and its ops document, §4.16), so an approval
@@ -3908,6 +4156,33 @@ pub enum ReplyBody {
     identity: [u8; 32],
     /// The paths the increment changes.
     paths: u64,
+    /// The exact statement a signature over this merge signs (signed work, A-321; `slates_server::signed_work::
+    /// merge_statement`: the work, its green, the base and the identity, one field a line): sign it under the namespace
+    /// `slates-work` and submit with the signature (`SubmitSigned`, or `SubmitApproved` carrying it).
+    statement: Vec<u8>,
+    /// How the held submit's signature was judged (A-321): `Unsigned` when it carried none.
+    verification: Verification,
+  },
+  /// A signed submit's verdict (A-321): the committed green version, or the windows of a conflict, as `Submitted`
+  /// answers them, and how the submit's signature was judged — recorded with the version when it was accepted.
+  /// Appended.
+  SubmittedSigned {
+    /// The committed green version, when the increment was accepted; `None` on conflict.
+    version: Option<u64>,
+    /// The conflict windows to rebase against, when not accepted.
+    conflicts: Vec<MergeWindow>,
+    /// How the signature was judged.
+    verification: Verification,
+  },
+  /// A volume's trusted signers were set (A-321). Appended.
+  SignersSet,
+  /// A green version's merge record (A-321): how the signature of the merge that made it was judged (`Unsigned` for
+  /// version 0, the origin, and for a merge that carried none). Appended.
+  MergeRecord {
+    /// The version.
+    version: u64,
+    /// How the merge's signature was judged.
+    verification: Verification,
   },
 }
 

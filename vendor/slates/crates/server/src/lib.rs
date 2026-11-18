@@ -67,7 +67,6 @@ mod fuse_hold;
 mod own_nfs;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
 mod checkout;
-pub mod grant_signature;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
@@ -79,9 +78,12 @@ pub mod lease;
 mod lease_wait;
 mod live_ship;
 mod member_task;
+// Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
+mod merge_origin;
 pub mod merge_service;
 mod mirror;
 mod remote_attach;
+mod work_home;
 #[cfg(target_os = "linux")]
 mod write_log;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
@@ -120,6 +122,8 @@ mod recovery_slices;
 pub mod seal_keys;
 // A client's session key (GAP-A9-9's threat model): what a client resuming under its id proves before its seat is served.
 pub mod session_key;
+// Signed work (A-321): SSH signatures over a merge's or a landing's statement, verified as provenance, never a permission.
+pub mod signed_work;
 mod snapshot_view;
 // The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
 // stream, on the volume's owning shard: a socket pair on Unix, a duplex named pipe on Windows served by the runtime's
