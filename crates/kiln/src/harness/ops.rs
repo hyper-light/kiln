@@ -2035,6 +2035,36 @@ mod tests {
         assert_eq!(key_scope(&caller("ada", None, Some("u1"))), key_scope(&caller("Ada L", None, Some("u1"))));
         assert_ne!(key_scope(&caller("x", Some("01a1"), None)), key_scope(&caller("x", None, Some("01a1"))), "an agent's key isn't a person's");
     }
+
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W6; Slates' `LandOutcome::Conflicted`, "the disk
+    /// changed entries the volume changed too: each conflict, typed. Nothing was written"): a landing whose plan met
+    /// conflicts answers `conflicted`, each conflict typed, whoever asks and whatever their mode, never an approval
+    /// request that names no manifest, which nobody can approve. The bare-metal drift drive's bypass agent, landing over
+    /// a file its person had changed on disk, read `approval_required` with a null manifest (Linux and macOS, kiln
+    /// a2cc1e429, 2026-11-18). A policy's refusal answers `refused`; a plan to approve, `approval_required` as before.
+    #[test]
+    fn w6_a_landing_whose_plan_met_conflicts_answers_conflicted_and_a_policys_refusal_refused() {
+        let readme = json!([{"path": "/README.md", "class": "ModifyModify"}]);
+        let met = typed_landing(json!({"plan": {"grant_required": true, "conflicts": ["/README.md"], "conflicted": readme}, "excludes": ["/.git"], "can_write": true, "why_not": null}));
+        assert_eq!(met.get("outcome"), Some(&json!("conflicted")), "{met}");
+        assert_eq!(met.get("conflicts"), Some(&readme), "each conflict typed: {met}");
+        assert!(met.get("approval").is_none(), "nothing to approve: {met}");
+        assert_eq!(met.pointer("/plan/conflicts"), Some(&json!(["/README.md"])), "the fields the UI reads stay: {met}");
+        // A runner older than the typed conflicts names each by its path alone.
+        let older = typed_landing(json!({"plan": {"grant_required": true, "conflicts": ["/README.md"]}, "excludes": [], "can_write": true}));
+        assert_eq!((older.get("outcome"), older.get("conflicts")), (Some(&json!("conflicted")), Some(&json!([{"path": "/README.md"}]))), "{older}");
+        // Approved, then met conflicts before it was written: nothing written, and the conflicts are the answer.
+        let moved = typed_landing(json!({"changed": true, "plan": {"grant_required": true, "conflicts": ["/a"], "conflicted": [{"path": "/a", "class": "CreateCreate"}]}, "excludes": []}));
+        assert_eq!(moved.get("outcome"), Some(&json!("conflicted")), "{moved}");
+        let refusal = json!({"act": "land", "by": {"volume": "00"}, "reason": "Forbidden", "said": "the volume's policy forbids landing"});
+        let refused = typed_landing(json!({"plan": {"grant_required": true, "refused": refusal}, "excludes": []}));
+        assert_eq!((refused.get("outcome"), refused.get("refusal")), (Some(&json!("refused")), Some(&refusal)), "{refused}");
+        let manifest = "ab".repeat(32);
+        let asked = typed_landing(json!({"plan": {"grant_required": true, "manifest": manifest, "summary": {"files": 1}, "conflicts": []}, "excludes": [], "can_write": true}));
+        assert_eq!((asked.get("outcome"), asked.pointer("/approval/manifest")), (Some(&json!("approval_required")), Some(&json!(manifest))), "{asked}");
+        let landed = typed_landing(json!({"landed": {"grant_required": false, "outcome": {"files": 1}}}));
+        assert_eq!((landed.get("outcome"), landed.get("written")), (Some(&json!("written")), Some(&json!({"files": 1}))), "{landed}");
+    }
 }
 
 /// The operations end to end on a hub of their own, under a timeout: a parent that asks starts a

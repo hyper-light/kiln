@@ -1054,6 +1054,19 @@ mod tests {
         assert!((1..=MAX_VOLUME_GIB).contains(&(max >> 30)), "{max}");
     }
 
+    /// W6: a plan that met conflicts carries each conflict typed (`conflicted`: its path and class, as `outcome_json`
+    /// names them), beside the paths the UI reads (`conflicts`), and no manifest: the server answers it `conflicted`
+    /// from these (`harness::ops::typed_landing`), never as an approval nobody could give.
+    #[test]
+    fn w6_a_plan_that_met_conflicts_carries_each_typed_and_no_manifest() {
+        let met = LandOutcome::Conflicted(vec![LandingConflict { path: "/README.md".into(), class: slates_api::ConflictClass::ModifyModify, planned: None }]);
+        let plan = plan_json(&met);
+        assert_eq!(plan.get("conflicts"), Some(&json!(["/README.md"])), "{plan}");
+        assert_eq!(plan.get("conflicted"), Some(&json!([{"path": "/README.md", "class": "ModifyModify"}])), "{plan}");
+        assert_eq!(plan.get("conflicted"), outcome_json(&met).get("conflicts"), "typed as a landing's own outcome types them");
+        assert!(plan.get("manifest").is_none(), "{plan}");
+    }
+
     #[test]
     fn a_landing_is_weighed_against_what_git_sees_changed() {
         // ` M a`, `?? n`, a rename (its source a field of its own), a deletion.
