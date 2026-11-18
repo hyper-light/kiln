@@ -310,10 +310,22 @@ the agent asking to write was given (the person's rule, 2026-11-18, kiln goals 0
 01a1ec34…569750…): kiln, the launcher, decides it from the lower of the asking agent's permission mode
 and that of the agent whose work it is (an agent lands its own work, or the work of one it started;
 `workspace::landing_policy`) and sets the mode its agent starts in as the workspace's policy when it
-makes the volume (`workspace::slates::set_policy`; a person's later change of the agent's mode is what
-`agents.land` judges by), so a landing is written at once in a mode that edits unasked (accept edits, auto, bypass), held as an
-approval request in one that asks (Claude Code's default, ask), and refused in one that only plans;
-no agent can set or raise its own. `agents.land` follows the same rule: an agent in a mode that edits
+makes the volume (`workspace::slates::set_policy`), so a landing is written at once in a mode that edits unasked (accept edits, auto, bypass), held as an
+approval request in one that asks (Claude Code's default, ask), and refused in one that only plans.
+No agent raises its own permission (the person's rule, 2026-11-18): each agent's mode is judged as far
+as it was granted (`lineage::granted`), the lower of its mode now and the level kiln recorded as its
+launcher started it (`launched`, on kiln's one scale of modes, so it means the same in whichever
+harness the agent goes on in; kiln's alone to record, never what a start asks, and carried through
+restarts, moves and switches of harness). A harness that reports a higher mode, or an agent that
+moved itself, writes nothing more, and a mode lowered since, by anyone, holds; so does what it hands
+its children and its goals' and plan steps' subagents. Nor can an agent move itself: every way a
+command reaches an agent (the REST command, the console's socket, `agents.broadcast`,
+`agents.control`) refuses an agent's `set_mode` above its own grant, its own or a child's, and an
+agent's change of any permission control (Codex's approvals and sandbox, an ACP agent's mode options:
+`lineage::may_command`); a person sets those. A session an older kiln began has no launch level
+recorded and is held to its harness's own default. A person's later raise of an agent's mode is not
+yet a grant: its landings still ask until kiln records the person's change as one (owed).
+`agents.land` follows the same rule: an agent in a mode that edits
 unasked lands at once, its plan as it stands or the manifest it names; one in a mode that asks reads
 its plan, and its writing waits on its person's click (`crate::confirms`: asked in their chat turn, 428
 until they confirm, then the same call runs once as theirs; outside a turn there's no one to ask, and

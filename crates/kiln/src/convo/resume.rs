@@ -149,6 +149,9 @@ pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown
         parent: info.parent.clone(),
         plan_run: info.plan_run.clone(),
         allow_bypass: !info.no_bypass,
+        // How much its launcher let it do goes along as given, never the mode it works in now: an agent never raises its
+        // own permission by moving (the person's rule, 2026-11-18; docs/agentic.md W6).
+        launched: Some(crate::harness::lineage::launched(&info)),
         // Held as it was: one in a microVM goes on in a microVM of its own, from its image and for its
         // person, never as a process on its machine (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
         // Its Agentfile's text, a person's own, is kiln's to read again (`registry::resume_on`).

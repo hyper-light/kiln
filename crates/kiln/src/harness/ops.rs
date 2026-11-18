@@ -766,8 +766,8 @@ fn landing_by(cx: &Cx, info: &Info) -> Result<LandingBy, Fail> {
         slates_api::WriteMode::Bypass => Ok(LandingBy::Writing),
         slates_api::WriteMode::Ask => Ok(LandingBy::Asking),
         slates_api::WriteMode::Forbid => {
-            // Only a mode that plans refuses: the asker's, or else the one whose work it is.
-            let planner = if lineage::level(&asker.kind, &asker.mode) == Some(lineage::Level::Plan) { &asker } else { info };
+            // Only a mode that plans refuses: the asker's, or else the one whose work it is (each as far as it was granted).
+            let planner = if lineage::granted(&asker) == lineage::Level::Plan { &asker } else { info };
             Err((StatusCode::FORBIDDEN, format!("{}'s mode plans and changes nothing, so it writes nothing to disk: a person lands {}'s work from its Changes, or gives {} a mode that edits", planner.name, info.name, planner.name)))
         }
     }
@@ -839,6 +839,10 @@ async fn interrupt(cx: Cx, v: Value) -> Out {
 /// Agents page's rename and keep going are (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S2).
 async fn control(cx: Cx, v: Value) -> Out {
     let c = Command::Control { id: text(&v, "control")?, value: v.get("value").cloned() };
+    // A permission control (Codex's approvals or sandbox, an ACP agent's mode options) is a person's to set: an agent
+    // never raises its own permission (the person's rule, 2026-11-18; docs/agentic.md W6).
+    let info = known(&cx, &agent_of(&v)?)?;
+    lineage::may_command(&cx.hub, &cx.caller, &info.id, &c)?;
     commanded(&cx, &v, c, "set").await
 }
 
@@ -876,7 +880,7 @@ async fn broadcast_to(cx: Cx, v: Value) -> Out {
         b.key = command.as_ref().and_then(super::registry::message_id);
     }
     let among = super::lineage::reached(&cx.hub, &cx.caller, cx.hub.harness.list(), super::lineage::Access::Act).await;
-    let report = super::broadcast::run(&cx.hub, &b, &key_scope(&cx.caller), &among).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let report = super::broadcast::run(&cx.hub, &b, &cx.caller, &key_scope(&cx.caller), &among).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // A command that only reads or refreshes (a snapshot, MCP servers' state) isn't a use (attention plan
     // 01a199e1b177752e84dad5dc990e6a15, step 1), as on every other path (`attention_hooks::command_kind`).
     let kind = if b.approvals.is_some() {

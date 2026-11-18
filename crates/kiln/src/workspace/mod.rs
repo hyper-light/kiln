@@ -118,12 +118,20 @@ pub fn write_mode(level: Option<crate::harness::lineage::Level>) -> slates_api::
     }
 }
 
+/// The write mode agent `info` was granted: the stricter of how much its launcher let it do as it started
+/// (`Info::launched`; a session an older kiln began, its harness's own default) and its mode now (`lineage::granted`).
+/// Its harness reports its mode now, and it may move itself (an ACP agent switching its own mode, a harness that says
+/// what it likes), so a mode it works in that is higher than its launcher gave it writes nothing more: an agent never
+/// raises its own permission (the person's rule, 2026-11-18). A mode lowered since, by anyone, is honoured.
+pub fn granted_mode(info: &crate::harness::session::Info) -> slates_api::WriteMode {
+    write_mode(Some(crate::harness::lineage::granted(info)))
+}
+
 /// The write mode of agent `asker`'s landing of agent `target`'s workspace (`target` itself, or an agent below the one
-/// asking): the stricter of their two modes, so a landing never writes past the grant of the agent asking or of the
-/// agent whose work it is.
+/// asking): the stricter of their two granted modes ([`granted_mode`]), so a landing never writes past the grant of the
+/// agent asking or of the agent whose work it is.
 pub fn landing_policy(asker: &crate::harness::session::Info, target: &crate::harness::session::Info) -> slates_api::WriteMode {
-    let mode = |i: &crate::harness::session::Info| write_mode(crate::harness::lineage::level(&i.kind, &i.mode));
-    mode(asker).stricter(mode(target))
+    granted_mode(asker).stricter(granted_mode(target))
 }
 
 /// A drive letter's path (`K:`), the mount of a Windows workspace.
@@ -195,10 +203,10 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     // 01a1ec34599974448f6b7663ddb07001; `sandbox::isolated::served_project`): its harness works in the folder's own place
     // in its guest, and nothing of the volume is in this machine's mount table.
     let made = if spec.isolation.is_some() { slates::make_unmounted(&name, &over).await? } else { slates::make(&name, &over).await? };
-    // Its landings follow the mode its agent starts in (the person's rule, 2026-11-18; W6), as kiln, the launcher, sets
-    // the volume's write policy; no agent can raise it. Where kiln can't set one (an instance it started under a systemd
-    // unit), Slates' unset policy holds: its landings ask, and kiln's own `agents.land` judges each by the agent's mode.
-    let mode = write_mode(crate::harness::lineage::level(&spec.kind, spec.mode.as_deref().unwrap_or_default()));
+    // Its landings follow how much its launcher let its agent do (the person's rule, 2026-11-18; W6), as kiln, the
+    // launcher, sets the volume's write policy; no agent can raise it. Where kiln can't set one, Slates' unset policy
+    // holds: its landings ask, and kiln's own `agents.land` judges each by the agent's granted mode.
+    let mode = write_mode(Some(spec.launched_level()));
     if let Err(e) = slates::set_policy(&made, slates_api::WritePolicy { merge: mode, land: mode, require_signed_merges: false }).await {
         tracing::info!(volume = %made.volume, error = %format!("{e:#}"), "a workspace's write policy wasn't set: its landings ask, as Slates' unset policy does");
     }
@@ -605,7 +613,8 @@ mod tests {
             assert_eq!(write_mode(Some(edits)), WriteMode::Bypass, "{edits:?}");
         }
         assert_eq!(write_mode(None), WriteMode::Ask, "a mode kiln can't place asks");
-        let agent = |kind: &str, mode: &str| crate::harness::session::Info { kind: kind.into(), mode: mode.into(), ..Default::default() };
+        // Each launched in the mode it works in now.
+        let agent = |kind: &str, mode: &str| crate::harness::session::Info { kind: kind.into(), mode: mode.into(), launched: crate::harness::lineage::level(kind, mode), ..Default::default() };
         let (bypass, asks, plans) = (agent("claude", "bypassPermissions"), agent("claude", "default"), agent("claude", "plan"));
         assert_eq!(landing_policy(&bypass, &bypass), WriteMode::Bypass);
         assert_eq!(landing_policy(&agent("claude", "acceptEdits"), &agent("codex", "full-access")), WriteMode::Bypass);
@@ -620,6 +629,29 @@ mod tests {
         assert_eq!(landing_policy(&bypass, &unplaced), WriteMode::Ask);
         assert_eq!(landing_policy(&unplaced, &plans), WriteMode::Forbid);
         assert_eq!(landing_policy(&unplaced, &unplaced), WriteMode::Ask);
+    }
+
+    /// W6, the person's rule of 2026-11-18 (an agent never raises its own permission): an agent writes no more than its
+    /// launcher let it, whatever mode it works in now, as its harness reports it or it set it itself; a mode lowered
+    /// since is honoured; the launch level means the same in whichever harness it goes on in; a session an older kiln
+    /// began, with none recorded, is held to its harness's own default.
+    #[test]
+    fn w6_an_agent_that_raised_its_own_mode_lands_as_its_launcher_let_it() {
+        use crate::harness::lineage::Level;
+        use slates_api::WriteMode;
+        let agent = |kind: &str, launched: Option<Level>, now: &str| crate::harness::session::Info { kind: kind.into(), mode: now.into(), launched, ..Default::default() };
+        let raised = agent("claude", Some(Level::Ask), "bypassPermissions");
+        assert_eq!(granted_mode(&raised), WriteMode::Ask, "raised past its launcher's mode: still asks");
+        assert_eq!(landing_policy(&raised, &raised), WriteMode::Ask);
+        assert_eq!(landing_policy(&agent("claude", Some(Level::Bypass), "bypassPermissions"), &raised), WriteMode::Ask, "nor does a parent's bypass write the raised one's work");
+        assert_eq!(granted_mode(&agent("claude", Some(Level::Plan), "acceptEdits")), WriteMode::Forbid, "launched to plan: plans still");
+        assert_eq!(granted_mode(&agent("claude", Some(Level::Bypass), "bypassPermissions")), WriteMode::Bypass);
+        assert_eq!(granted_mode(&agent("claude", Some(Level::Bypass), "plan")), WriteMode::Forbid, "lowered since: honoured");
+        assert_eq!(granted_mode(&agent("claude", Some(Level::Bypass), "default")), WriteMode::Ask);
+        assert_eq!(granted_mode(&agent("codex", Some(Level::Bypass), "full-access")), WriteMode::Bypass, "switched to Codex, its launch level holds there");
+        assert_eq!(granted_mode(&agent("gemini", Some(Level::Plan), crate::harness::acp::KILN_ASK)), WriteMode::Forbid, "switched to a harness with no plan mode: still plans");
+        assert_eq!(granted_mode(&agent("claude", None, "bypassPermissions")), WriteMode::Ask, "none recorded: its harness's own default");
+        assert_eq!(granted_mode(&agent("codex", None, "full-access")), WriteMode::Bypass, "Codex's own default edits unasked");
     }
 
     /// W2: an agent in its folder, whatever the reason, has no workspace of its own to ask about.

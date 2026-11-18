@@ -165,10 +165,12 @@ fn g265_a_volume_with_no_mount_is_served_on_a_stream_and_reviewed_from_its_own_c
     assert_eq!(std::fs::read(project.path().join("a.txt"))?, b"a\n", "nothing of the volume reached the folder");
 
     // A landing of it would write the two files git ignores: refused, as a mounted workspace's is.
-    let plan = kiln::rt::block_on({
+    let (plan, excludes) = kiln::rt::block_on({
         let (made, over) = (made.clone(), over.clone());
         async move { slates::plan_landing(&made, &over).await }
     })?;
+    // No mount to ask git in: what every landing leaves out, alone (what git ignores is judged from the entries).
+    assert_eq!(excludes, slates::EXCLUDES, "{excludes:?}");
     let refused = kiln::rt::block_on({
         let (made, over, plan) = (made.clone(), over.clone(), plan.clone());
         async move { anyhow::Ok(slates::writable(&made, &over, &plan).await) }

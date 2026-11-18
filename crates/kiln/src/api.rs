@@ -6847,6 +6847,9 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     spec.build_secrets = Vec::new();
     // The engine setting its boundary is decided under is kiln's (kiln plan 01a1dd2e…, P2.3).
     spec.engine_version = None;
+    // How much its launcher lets it do unasked is kiln's to record, from the mode asked (`Registry::open_as`), never
+    // what's asked: an agent never raises its own permission (the person's rule, 2026-11-18; docs/agentic.md W6).
+    spec.launched = None;
     // An isolated agent's person, whose volume its harness's configuration is on, is whoever asks
     // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 18): never what's asked. Its agent's volumes, and
     // the disk they ask, are its definition's (P6.2): never what's asked.
@@ -7029,6 +7032,9 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     if let Some(op) = op {
         return Err(err(StatusCode::BAD_REQUEST, format!("an agent's {op} is agents.{op}'s: POST /api/harness/agents/{id}/{op}")));
     }
+    // An agent never raises its own permission, nor another's past its own (the person's rule, 2026-11-18; docs/agentic.md
+    // W6): refused before anything is sent.
+    crate::harness::lineage::may_command(hub, &caller, id, &c).map_err(|(code, why)| err(code, why))?;
     if let Some(k) = &key {
         let made = crate::util::derive_id(&["api.command", &crate::harness::ops::key_scope(&caller), id, k]);
         match &mut c {
@@ -7766,6 +7772,11 @@ async fn audit_command(hub: &Hub, audit: &mut Option<crate::memory::queue::Sende
     }
 }
 
+/// Why `caller`'s command `c` to agent `id` is refused for the permission it sets, when it is (`lineage::may_command`).
+fn permission_refused(hub: &Hub, caller: Option<&crate::authz::Caller>, id: &str, c: &crate::harness::model::Command) -> Option<String> {
+    caller.and_then(|caller| crate::harness::lineage::may_command(hub, caller, id, c).err()).map(|(_, why)| why)
+}
+
 /// What a viewer that may watch an agent but not command it is told of a command.
 const WATCHING: &str = "you may watch this agent but not command it: an agent commands only itself and the agents it started";
 
@@ -8225,6 +8236,16 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     // Watching isn't commanding: refused, under its id when it came under one.
                     Ok(SessionUp::Under { id: cmd, .. }) if !acts => tx.send(ws::text(crate::harness::asked::nack(Some(&cmd), "refused", WATCHING))).await?,
                     Ok(SessionUp::Bare(_)) if !acts => tx.send(ws::text(session_error(WATCHING.into()))).await?,
+                    // An agent never raises its own permission, nor another's past its own (the person's rule,
+                    // 2026-11-18; docs/agentic.md W6): refused before it's sent, under its id when it came under one.
+                    Ok(SessionUp::Under { id: cmd, c, .. }) if permission_refused(&hub, caller.as_ref(), &id, &c).is_some() => {
+                        let why = permission_refused(&hub, caller.as_ref(), &id, &c).unwrap_or_default();
+                        tx.send(ws::text(crate::harness::asked::nack(Some(&cmd), "refused", &why))).await?
+                    }
+                    Ok(SessionUp::Bare(c)) if permission_refused(&hub, caller.as_ref(), &id, &c).is_some() => {
+                        let why = permission_refused(&hub, caller.as_ref(), &id, &c).unwrap_or_default();
+                        tx.send(ws::text(session_error(why))).await?
+                    }
                     // Sent now, in the order the viewer sent them; each answer comes later. Under
                     // its client's id (docs/wire.md, "The UI's sockets"): taken once however often
                     // it comes, and answered on this socket once, `ack` or `nack`.

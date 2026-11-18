@@ -4427,6 +4427,11 @@ impl Registry {
                 spec.workspace = Some(crate::workspace::by_default(crate::harness::lineage::workspaces_on(hub, target).await));
             }
         }
+        // How much its launcher lets it do unasked, kept as given whatever it or its harness says later (the person's
+        // rule, 2026-11-18: an agent never raises its own permission; docs/agentic.md W6): what its permissions are
+        // judged by beside its mode now. One restarted, moved or taken up keeps the one it was first given; a start
+        // asked of kiln arrives with none (`api::as_asked`), so it is its mode's.
+        spec.launched = Some(spec.launched_level());
         // A machine whose kiln is to be upgraded takes no new agent (`crate::skew`).
         if let Location::Machine(m) = &loc
             && let Some(why) = hub.skew_holds(m)
@@ -4568,6 +4573,7 @@ impl Registry {
                         subagent: spec.subagent,
                         variant_of: spec.variant_of.clone(),
                         no_bypass: !spec.allow_bypass,
+                        launched: spec.launched,
                         workspace: spec.workspace.clone(),
                         isolation: spec.isolation.clone(),
                         runs: None,

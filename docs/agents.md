@@ -1037,7 +1037,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
 | `agents.refs` | `GET /api/harness/agents/:id/refs` | → `{refs: {branches, tags, commits: [{sha, subject, at, ...}], trunk}}` ("Compare", below) |
 | `agents.compare` | `GET /api/harness/agents/:id/compare?from=&to=&split=&path=` | → `{compared: {files: [FileChange], counts_only, split, changed_by: {path: [who]}}}`; a point is `now`, `began`, `agent:<who>` or a branch, tag or commit ("Compare", below) |
-| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
+| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}` (an agent whose granted mode edits unasked: written at once); `{manifest}` (that plan's: a person's, or an agent's as its granted mode lets it) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more; each answer names its `outcome` (`written` or `approval_required`) |
 | `agents.credential` | `POST /api/harness/agents/:id/credential` | → `{token, expires_at}`: the agent's own token for git, for a day, so its pushes to kiln's repositories go as the agent, for its person (ci.md W27-R03). Only that very agent is given it, as its runner asks when its git needs it: never a person or another agent, and it's no tool of an agent's |
 
 Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
@@ -1283,7 +1283,11 @@ agent's folder on that agent's machine works in that agent's volume:
   **Write to disk…** shows what it would create, replace and delete (git's own directory stays
   out), and any file changed in the folder since the agent changed it, in which
   case nothing is written until they agree. A person writes it; an agent writes it as its mode
-  lets it (the lower of its own and that of the agent whose work it is): at once in a mode that edits
+  lets it (the lower of its own and that of the agent whose work it is, each as far as it was
+  granted: the lower of its mode now and the one its launcher started it in, which kiln alone
+  records, so an agent or a harness that raises its own mode gains nothing; and no agent can raise
+  its own mode or set a permission control, its own or a child's past its own grant, by any way in):
+  at once in a mode that edits
   unasked (accept edits, auto, bypass); after its person's click in one that asks (asked in their
   chat turn: 428 until they confirm, then the same call again; refused outside one); never in one that
   only plans (403). The answer names its `outcome`: `written` (Slates' outcome) or

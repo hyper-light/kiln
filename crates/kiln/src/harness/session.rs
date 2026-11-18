@@ -359,6 +359,14 @@ pub struct Spec {
     /// On unless a session says otherwise, so a person can always choose it.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub allow_bypass: bool,
+    /// How much its launcher let it do unasked as kiln started it: its `mode` then, on kiln's one scale of modes
+    /// (`lineage::Level`), so it means the same in whichever harness it goes on in. Kiln's alone to set
+    /// (`Registry::open_as`, never what a start asks), set once and carried as it's restarted, moved, taken up or
+    /// switched to another harness: what its permissions are judged by beside its mode now, which its harness reports
+    /// and which neither it nor its harness can raise past this (the person's rule, 2026-11-18: an agent never raises its
+    /// own permission; docs/agentic.md W6). None: not set yet ([`Spec::launched_level`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched: Option<super::lineage::Level>,
     /// Run this executable instead of the harness's usual one (a custom install, tests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
@@ -496,6 +504,14 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+impl Spec {
+    /// How much its launcher lets it do unasked: `launched` where kiln set it, else its `mode`'s level (a start kiln
+    /// hasn't set it on yet, or one begun from a spec an older kiln kept), a mode kiln can't place asking.
+    pub fn launched_level(&self) -> super::lineage::Level {
+        self.launched.unwrap_or_else(|| super::lineage::level(&self.kind, self.mode.as_deref().unwrap_or_default()).unwrap_or(super::lineage::Level::Ask))
+    }
+}
+
 impl Default for Spec {
     fn default() -> Self {
         Self {
@@ -511,6 +527,7 @@ impl Default for Spec {
             shell: None,
             env: Vec::new(),
             allow_bypass: true,
+            launched: None,
             program: None,
             effort: None,
             speed: None,
@@ -867,6 +884,12 @@ pub struct Info {
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_bypass: bool,
+    /// How much its launcher let it do unasked as it started (as `Spec::launched`), never what its harness reports
+    /// since: what its permissions are judged by beside its mode now (`lineage::granted`). None: a session an older
+    /// kiln began, held to its harness's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "\"plan\" | \"ask\" | \"accept_edits\" | \"auto\" | \"bypass\""))]
+    pub launched: Option<super::lineage::Level>,
     /// Where it works, when its start decided (as `Spec::workspace`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -1027,7 +1050,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, workspace, isolation, runs, starts } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, runs, starts } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -1090,6 +1113,7 @@ impl Info {
             && *subagent == o.subagent
             && *variant_of == o.variant_of
             && *no_bypass == o.no_bypass
+            && *launched == o.launched
             && *workspace == o.workspace
             && *isolation == o.isolation
             && *runs == o.runs
@@ -2555,6 +2579,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         subagent: spec.subagent,
         variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
+        launched: Some(spec.launched_level()),
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
         runs: None,
@@ -8347,6 +8372,7 @@ sys.exit(1)
             helper: None,
             subagent: false,
             no_bypass: false,
+            launched: None,
             workspace: None,
             isolation: None,
             runs: None,

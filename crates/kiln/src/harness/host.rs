@@ -3972,6 +3972,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         subagent: spec.subagent,
         variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
+        launched: Some(spec.launched_level()),
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
         runs: None,
