@@ -11,7 +11,12 @@
 //! - **Never read back.** A list names each with its size and when it was set and last used; no
 //!   answer, log or audit row carries a value. An agent lists its person's names (to name them in an
 //!   Agentfile) and sets none: a value it set would have passed through its conversation.
-//! - **Given to their builds alone.** One of a person's own Agentfiles names each secret a build of
+//! - **Given to their builds, and to the sessions they choose them for.** Decided by the user
+//!   (2026-11-18), widening decision 6 (until then, their Agentfiles' builds alone): an environment of
+//!   theirs (`crate::agentenvs`) names a secret by its name, and an agent session they start with it, or
+//!   apply it to, is given its value as its harness starts ([`for_session`]), marked used and audited by
+//!   name; never a session in a microVM, which is granted a secret by name, never by value.
+//! - **Given to their builds.** One of a person's own Agentfiles names each secret a build of
 //!   it is given as `LABEL kiln.secret.<ID>=user:<NAME>` ([`references`]): `<ID>` is the build
 //!   secret Shards reads (`GIT_AUTH_TOKEN`, `GIT_AUTH_TOKEN.<host>`, `HTTP_AUTH_HEADER_<host>`,
 //!   `AWS_ACCESS_KEY_ID`, … for an `AGENT`/`HARNESS` source; any `RUN --mount=type=secret,id=<ID>`),
@@ -218,6 +223,20 @@ pub async fn for_build(hub: &crate::hub::Hub, person: &str, text: &str) -> Resul
     Ok(refs.into_iter().filter_map(|r| held.get(&r.name).map(|v| BuildSecret { id: r.id, value: v.clone(), given: r.given })).collect())
 }
 
+/// What an agent session of `person`'s is given of their own secrets `names`, as an environment of theirs
+/// names them (`crate::agentenvs`; decided by the user, 2026-11-18): each read and marked used, and the use
+/// audited by name alone as `by`'s, `for_what`; else the names they hold none of, nothing audited. No value
+/// is logged or audited.
+pub async fn for_session(hub: &crate::hub::Hub, person: &str, names: &[String], by: &str, for_what: &str) -> anyhow::Result<Result<std::collections::BTreeMap<String, String>, Vec<String>>> {
+    let (held, missing) = store::for_build(hub, person, names).await?;
+    if !missing.is_empty() {
+        return Ok(Err(missing));
+    }
+    let named: Vec<&str> = held.keys().map(String::as_str).collect();
+    hub.store.audit(by.to_owned(), "secret.use".into(), format!("{} of {person} for {for_what}", named.join(", "))).await;
+    Ok(Ok(held))
+}
+
 /// Whose own the caller reaches: the person they are, or the person an agent acts for.
 fn person(cx: &Cx) -> Result<String, Fail> {
     crate::harness::lineage::person_of(&cx.caller).ok_or_else(|| (StatusCode::FORBIDDEN, format!("{} acts for no person here, and a person's own secrets are theirs", cx.caller.name)))
@@ -259,7 +278,7 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "secrets.mine.list",
-            summary: "Your own secrets (the `user` scope): each one's name, size, and when it was set and last used, never its value. A build of one of your Agentfiles is given those it names as `LABEL kiln.secret.<ID>=user:<NAME>`; no one else sees them, the server's owner included.",
+            summary: "Your own secrets (the `user` scope): each one's name, size, and when it was set and last used, never its value. A build of one of your Agentfiles is given those it names as `LABEL kiln.secret.<ID>=user:<NAME>`, and an agent session you start with one of your environments, or apply it to, those it names (`agentenvs.*`); no one else sees them, the server's owner included.",
             read_only: true,
             destructive: false,
             input: Input::of::<input::SecretsMineList>(),

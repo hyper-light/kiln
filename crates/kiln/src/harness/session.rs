@@ -439,8 +439,9 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agentfile: Option<String>,
     /// The secrets a build of that Agentfile is given (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
-    /// decision 6, P4.7): each its `LABEL kiln.secret.<ID>=user:<NAME>` names, read by kiln's server
-    /// from its person's own as it started (`secrets::mine::for_build`). Set by kiln, never from what
+    /// decision 6, P4.7; a person's secrets reach their sessions too since 2026-11-18, by their
+    /// environments alone: [`Spec::agentenv`]): each its `LABEL kiln.secret.<ID>=user:<NAME>` names, read
+    /// by kiln's server from its person's own as it started (`secrets::mine::for_build`). Set by kiln, never from what
     /// was asked; its machine takes them out of the session as it starts it, for its build alone, so
     /// no copy of the session (a move, a hand-over, a resume) carries them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -905,6 +906,13 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub isolation: Option<Isolation>,
+    /// The environment it runs with (docs/agents.md, "Environments"), as its machine holds it: the version
+    /// its harness started with. None: its machine's user's. Its runner says it; the server gives it again
+    /// to a runner process that announces the session without the one kiln keeps it runs with
+    /// (`crate::agentenvs::resolve::opened`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub agentenv: Option<crate::agentenvs::Brief>,
     /// Where its harness runs now (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17): a process of
     /// its machine's, by its pid, or its image's member in a microVM of its own, which no host pid
     /// is. None while none runs.
@@ -1061,7 +1069,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, runs, starts } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, agentenv, runs, starts } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -1127,6 +1135,7 @@ impl Info {
             && *launched == o.launched
             && *workspace == o.workspace
             && *isolation == o.isolation
+            && *agentenv == o.agentenv
             && *runs == o.runs
             && *starts == o.starts)
     }
@@ -2625,6 +2634,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         launched: Some(spec.launched_level()),
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
+        agentenv: spec.agentenv.as_ref().map(crate::agentenvs::Brief::of),
         runs: None,
         starts: Vec::new(),
     };
@@ -8457,6 +8467,7 @@ sys.exit(1)
             launched: None,
             workspace: None,
             isolation: None,
+            agentenv: None,
             runs: None,
             starts: Vec::new(),
         };

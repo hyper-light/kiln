@@ -431,7 +431,12 @@ CI's secrets (docs/ci.md W09), sealed as every scope's are (`crate::secrets::min
 lists and deletes their own; no one else sees them, by name or value: not an admin, not
 `secrets.manage` (`/api/ci/secrets` refuses `scope=user:…` for everyone, 400), not the server's
 owner, whose admin token reaches the owner's own alone. No answer carries a value. An agent lists its
-person's names, to name them in an Agentfile, and sets none (403). Each route is an operation too
+person's names, to name them in an Agentfile, and sets none (403). They're given to their Agentfiles'
+builds (below) and, decided by the user (2026-11-18, widening decision 6), to the agent sessions their
+person chooses them for: an environment of theirs names one by its name (a `secret` variable, "Your
+environments"), and a session started with it, or that it's applied to, is given its value as its
+harness starts, marked used and audited by name; never a session in a microVM, which is granted a
+secret by name, never by value. Each route is an operation too
 (`secrets.mine.*`: `POST /api/ops/<name>`, kiln's MCP tools `secrets_mine_*`, code mode's
 `kiln.secrets.mine.*`), and each change is audited, by name.
 
@@ -461,6 +466,54 @@ file in the build's own folder, read by its owner alone and gone with it); an `A
 SSH (`ssh://git@host/repo.git#ref`, `git@host:repo.git#ref`) is fetched with agent `default`. Its label is read,
 refused and kept out of the image as a `kiln.secret.` one is.
 
+## Your environments
+
+Environments for agent sessions (docs/agents.md, "Environments"; `crate::agentenvs`; decided by the user,
+2026-11-18): a person's named sets of variables an agent session runs with, apart from CI's and CD's
+environments (`agentenv` in every route, operation and type). Each is its owner's alone, an admin
+included, as their secrets are; another's answers 404. A person keeps, applies and chooses their own: an
+agent's call is refused (403), and so is an agent's `agents.start` naming one. Each route is an operation
+too (`agentenvs.*`: `POST /api/ops/<name>`, kiln's MCP tools `agentenvs_*`, code mode's
+`kiln.agentenvs.*`), and each change is audited; each secret a session is given is audited by name
+(`secret.use`), never its value. The routes need `agents.run`.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/agentenvs` | `{ agentenvs: Agentenv[] }`: yours, by name (`agentenvs.list`) |
+| POST | `/api/agentenvs` | `{ name, description?, base, vars }` → `Agentenv`, version 1 (`agentenvs.create`) |
+| GET | `/api/agentenvs/machine?target=` | `{ vars: { name, sources }[] }`: the variables a machine you may start agents on (`local`, the server) has for its user, by name and where each is set, never a value (`agentenvs.machine`); 409 where its runner doesn't say (an older kiln), 502 while it's away |
+| GET | `/api/agentenvs/<id>` | `Agentenv` (`agentenvs.get`) |
+| PATCH | `/api/agentenvs/<id>` | `{ version, name?, description?, base?, vars? }` → `Agentenv`, one version up (`agentenvs.update`); `description: null` takes it out |
+| DELETE | `/api/agentenvs/<id>` | 204 (`agentenvs.delete`) |
+| PUT | `/api/harness/sessions/<agent>/agentenv` | `{ agentenv: id \| null, restart?: true }` → `{ agent, agentenv: { id, name, version } \| null, restarted }` (`agentenvs.apply`): an agent you may steer runs with it from now on (null: its machine's user's environment), its harness started again on its conversation unless `restart` is false. 409 while its machine is away, its environment as it was |
+
+`POST /api/harness/agents` (`agents.start`) takes `agentenv?: id`, the environment the agents it starts run with;
+`POST /api/harness/sessions` carries none (a `spec.agentenv` asked for is dropped: kiln opens one from one its
+person chose). `AgentInfo` says `agentenv?: { id, name, version }`, the environment a session's harness started
+with, as its machine says it. Each change of one, and of the sessions running with it, is an
+`{type: "agentenv", owner, agentenv /* its id */, deleted?}` event on `/api/events`, to its owner alone.
+
+```ts
+interface Var { name; from: "machine" | "value" | "secret" | "unset"; of?: string /* machine: the machine's variable, when not its own name */;
+  value?: string /* value */; secret?: string /* secret: one of your secrets, by name */ }
+interface Agentenv { id; owner /* "owner" | "user:<id>" */; name; description?; base: "user" | "clean"; vars: Var[] /* in order: a later one of a name wins */;
+  version; created_at; updated_at; sessions: string[] /* the agents running with it */ }
+```
+
+A refusal is `{ error, code }`, its words the page's to show, where it has a code: `agentenv_unknown` (404: none
+of yours has that id), `agentenv_name_taken` (409), `agentenv_stale` (409: `version` isn't its current one),
+`agentenv_in_use` (409, with `sessions`: the ids of those running with it), `agentenv_secret_missing` (400: a secret it names
+that you hold none of, by name, as it's kept or as a session starts), `agentenv_secret_in_microvm` (409: its
+`secret` variables, by name, for a session in a microVM), `agentenv_bad_var` (400: a variable's name, or what its
+`from` takes). A start or an apply on a runner whose kiln runs no session with an environment is refused, 409,
+without a code; so is moving or resuming one that runs with an environment to such a runner.
+
+The server keeps which environment each session runs with and opens it again (its newest version, its secrets
+read again) whenever it starts the session's harness: a restart (`agents.restart`, `sessions.restart`, a
+command's `restart`; refused with its code where it can't be opened, a stop by force never), a resume from kiln's
+copy, a move from the server, and a runner process that holds the session without it (one it moved or was
+handed over to, or a runner started again: given it, its harness started again on it).
+
 ## WebSockets
 
 * `GET /api/events` — server → client JSON messages:
@@ -473,7 +526,9 @@ refused and kept out of the image as a `kiln.secret.` one is.
   deleted?}` (one of a person's Agentfiles was kept, changed or deleted, told once for each change: to its
   owner, and whoever reaches everyone's; refetch `/api/agentfiles`), `{type:"agentfile_builds", owner, id}`
   (its builds ahead of its sessions moved, and nothing else of it, told once for each move, to whoever hears
-  of it: refetch `/api/agentfiles/:id/builds`), `{type:"experiment", repo, experiment: { id, repo,
+  of it: refetch `/api/agentfiles/:id/builds`), `{type:"agentenv", owner, agentenv, deleted?}` (one of a
+  person's environments for agent sessions was kept, changed or deleted, or the sessions running with it
+  changed: to its owner alone; refetch `/api/agentenvs`), `{type:"experiment", repo, experiment: { id, repo,
   state, measured?, runs?, decision? }}` (an experiment of options changed), `{type:"ship", repo, rows: [{ row, yours?,
   whose?, dv?, base?, parts?, items? }], gone?, pace?, whole?}` (ci.md W21-R15: a repository's Ship
   rows that changed in one refresh of Ship's read model, each once, as `GET /api/ship/commits`
