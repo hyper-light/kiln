@@ -1281,8 +1281,14 @@ agent's folder on that agent's machine works in that agent's volume:
   request**, `agents.change`: everything that changed there), or back into the folder:
   **Write to disk…** shows what it would create, replace and delete (git's own directory stays
   out), and any file changed in the folder since the agent changed it, in which
-  case nothing is written until they agree. Only a person writes it: an agent's `agents.land` with
-  a plan is refused. Slates takes a person's go-ahead from kiln on macOS and Windows; not on Linux
+  case nothing is written until they agree. A person writes it; an agent writes it as its mode
+  lets it (the lower of its own and that of the agent whose work it is): at once in a mode that edits
+  unasked (accept edits, auto, bypass); after its person's click in one that asks (asked in their
+  chat turn: 428 until they confirm, then the same call again; refused outside one); never in one that
+  only plans (403). The answer names its `outcome`: `written` (Slates' outcome) or
+  `approval_required` (`approval`: the manifest to approve, its summary and conflicts). An agent
+  working in another's volume lands nothing of its own while that one works: the volume lands whole,
+  from its owner. Slates takes a go-ahead from kiln on macOS and Windows; not on Linux
   yet (Slates can't take a grant from outside its anchor's own session there), and the plan says so.
   kiln leaves out what git ignores in the workspace (the agent's build output and dependencies) and
   `.git`, and writes only what git sees changed; on a machine whose Slates leaves out one path per

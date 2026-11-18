@@ -9,9 +9,11 @@
 //!   child works in it, and goes with the child.
 //! - Review: a change request from a volume holds what changed there.
 //! - Drift: a file the agent changed, changed on disk after, is drift.
-//! - Landing: the plan leaves out what git ignores and git's own directory; under a person's grant it writes the agent's file into the
-//!   folder, its repository's HEAD as it was (where this machine's Slates takes a grant from kiln: not Linux yet,
-//!   Slates' GAP-A9-10, and there the plan says so); an agent can't land, whatever it asks.
+//! - Landing, as each agent's mode lets it (the person's rule, 2026-11-18): the plan leaves out what git ignores and
+//!   git's own directory; an agent whose mode asks reads its plan and its writing waits on its person's click, then the
+//!   person writes it; one whose mode edits unasked writes its own at once; each into the folder, its repository's
+//!   HEAD as it was (where this machine's Slates takes a grant from kiln: not Linux yet, Slates' GAP-A9-10, and there
+//!   the plan and each write say so).
 //!
 //! The test owns the instance it starts: it ends every agent it started, then stops the anchor kiln started for it (by
 //! the pid kiln kept, `super::slates::started_anchor`) only once none of its volumes is mounted. A mount whose server is
@@ -98,8 +100,8 @@ fn project(bare: &Path, work: &Path) -> anyhow::Result<String> {
 }
 
 /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (W2–W6): every harness kiln runs works on a Slates volume of its own when
-/// it names none, a child works in its parent's, and their work is reviewed, drifts and lands under a person's grant,
-/// each volume going with the last agent working in it.
+/// it names none, a child works in its parent's, and their work is reviewed, drifts and lands as each agent's mode lets
+/// it, each volume going with the last agent working in it.
 #[test]
 fn w2_every_harness_and_agent_works_on_a_volume_reviews_drifts_and_lands_under_a_grant() -> anyhow::Result<()> {
     let Some(bin) = std::env::var_os("KILN_TEST_SLATES") else {
@@ -205,7 +207,7 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
         anyhow::ensure!(std::fs::read_to_string(place::top(&made.mount).join("target").join("out"))? == "built\n", "{}: target/out", kind.id);
         each.push(info);
     }
-    let (Some(parent), Some(lander)) = (each.first().cloned(), each.get(1).cloned()) else { anyhow::bail!("fewer than two harnesses") };
+    let Some(parent) = each.first().cloned() else { anyhow::bail!("no harness") };
     let parent_made = made_of(&parent)?;
 
     // A child in its parent's folder: its parent's volume, no new one.
@@ -235,29 +237,48 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
         anyhow::ensure!(get(&ws, "/drift").as_array().is_some_and(|d| d.iter().any(|x| x.as_str().is_some_and(|s| s.contains("a.rs")))), "{}: {ws}", who.name);
     }
 
-    // Landing: another agent's new file, git's own directory left out, under a person's grant where Slates takes one.
-    std::fs::write(Path::new(&lander.cwd).join("landed.rs"), "landed\n")?;
+    // Landing, as each agent's mode lets it (docs/agentic.md W6, the person's rule of 2026-11-18), what git ignores and
+    // git's own directory left out: one whose mode asks reads its plan, and its writing waits on its person's click (no
+    // person's turn here: refused, nothing written), then the person writes it; one whose mode edits unasked writes its
+    // own at once. Each under a grant where this machine's Slates takes one from kiln (not Linux yet, Slates'
+    // GAP-A9-10, and there the plan and each write say so).
+    let now = |i: &Info| hub.harness.info(&i.id).unwrap_or_else(|| i.clone());
+    let others: Vec<Info> = each.iter().skip(1).map(now).collect();
+    let policy = |i: &Info| super::landing_policy(i, i);
+    let asking = others.iter().find(|i| policy(i) == super::WritePolicy::Approve).cloned().ok_or_else(|| anyhow::anyhow!("no harness whose own default mode asks"))?;
+    let writing = others.iter().find(|i| policy(i) == super::WritePolicy::Write).cloned().ok_or_else(|| anyhow::anyhow!("no harness whose own default mode edits unasked"))?;
+    let as_agent = |i: &Info| {
+        let (hub, id) = (Arc::clone(hub), i.id.clone());
+        async move { Ok::<_, anyhow::Error>(Cx { caller: crate::mcp::session_caller(&hub, &id, None).await.map_err(anyhow::Error::msg)?, hub }) }
+    };
     let head = git(work.path(), &["rev-parse", "HEAD"])?;
-    let plan = call(cx.clone(), "agents.land", json!({"agent": lander.id})).await.map_err(fail)?;
-    anyhow::ensure!(get(&plan, "/plan/grant_required") == &json!(true), "{plan}");
+    std::fs::write(Path::new(&asking.cwd).join("asked.rs"), "asked\n")?;
+    let plan = call(as_agent(&asking).await?, "agents.land", json!({"agent": asking.id})).await.map_err(fail)?;
+    anyhow::ensure!(get(&plan, "/outcome") == &json!("approval_required") && get(&plan, "/plan/grant_required") == &json!(true), "{}: {plan}", asking.name);
     // What git ignores (the folder's build output, seen through the volume) and git's own directory, left out.
     anyhow::ensure!(get(&plan, "/excludes") == &json!(["/target", "/.git"]), "{plan}");
-    let manifest = get(&plan, "/plan/manifest").as_str().unwrap_or_default().to_owned();
-    // An agent can't land it, whatever it asks.
-    let as_agent = Cx { hub: Arc::clone(hub), caller: crate::mcp::session_caller(hub, &lander.id, None).await.map_err(anyhow::Error::msg)? };
-    let refused = call(as_agent, "agents.land", json!({"agent": lander.id, "manifest": manifest})).await.err().map(|(c, m)| format!("{c} {m}")).unwrap_or_default();
-    anyhow::ensure!(refused.contains("403") && refused.contains("a person's to say"), "{refused}");
-    if get(&plan, "/can_write") == &json!(true) {
-        let landed = call(cx.clone(), "agents.land", json!({"agent": lander.id, "manifest": manifest})).await.map_err(fail)?;
-        anyhow::ensure!(landed.get("landed").is_some(), "{landed}");
-        anyhow::ensure!(std::fs::read_to_string(src.join("landed.rs"))? == "landed\n", "the folder holds the landed file");
+    let manifest = get(&plan, "/approval/manifest").as_str().unwrap_or_default().to_owned();
+    let refused = call(as_agent(&asking).await?, "agents.land", json!({"agent": asking.id, "manifest": manifest})).await.err().map(|(c, m)| format!("{c} {m}")).unwrap_or_default();
+    anyhow::ensure!(refused.contains("403") && refused.contains("isn't serving a person's chat turn"), "{}'s own writing waits on its person: {refused}", asking.name);
+    anyhow::ensure!(!src.join("asked.rs").exists(), "nothing written while it waits");
+    let can_write = get(&plan, "/can_write") == &json!(true);
+    std::fs::write(Path::new(&writing.cwd).join("wrote.rs"), "wrote\n")?;
+    if can_write {
+        let landed = call(cx.clone(), "agents.land", json!({"agent": asking.id, "manifest": manifest})).await.map_err(fail)?;
+        anyhow::ensure!(get(&landed, "/outcome") == &json!("written") && landed.get("landed").is_some(), "{landed}");
+        anyhow::ensure!(std::fs::read_to_string(src.join("asked.rs"))? == "asked\n", "the folder holds the person's landing");
+        let wrote = call(as_agent(&writing).await?, "agents.land", json!({"agent": writing.id})).await.map_err(fail)?;
+        anyhow::ensure!(get(&wrote, "/outcome") == &json!("written"), "{}'s own landing, at once: {wrote}", writing.name);
+        anyhow::ensure!(std::fs::read_to_string(src.join("wrote.rs"))? == "wrote\n", "the folder holds its own landing");
         anyhow::ensure!(git(work.path(), &["rev-parse", "HEAD"])? == head, "its HEAD as it was");
     } else {
-        // Slates' issuer surface on Linux is owed (GAP-A9-10): the plan and the write say so.
+        // Slates' issuer surface on Linux is owed (GAP-A9-10): the plan and each write say so.
         anyhow::ensure!(cfg!(target_os = "linux"), "only Linux may refuse a grant from kiln: {plan}");
         let why = get(&plan, "/why_not").as_str().unwrap_or_default().to_owned();
         anyhow::ensure!(why.contains("Linux"), "{plan}");
-        let refused = call(cx.clone(), "agents.land", json!({"agent": lander.id, "manifest": manifest})).await.err().map(|(_, m)| m).unwrap_or_default();
+        let refused = call(cx.clone(), "agents.land", json!({"agent": asking.id, "manifest": manifest})).await.err().map(|(_, m)| m).unwrap_or_default();
+        anyhow::ensure!(refused.contains("Linux"), "{refused}");
+        let refused = call(as_agent(&writing).await?, "agents.land", json!({"agent": writing.id})).await.err().map(|(_, m)| m).unwrap_or_default();
         anyhow::ensure!(refused.contains("Linux"), "{refused}");
     }
 

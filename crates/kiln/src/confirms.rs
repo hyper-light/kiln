@@ -15,6 +15,10 @@
 //!   didn't start); and any change to their agent definitions. Asked in a person's turn, kiln keeps the
 //!   ask (the op, its exact arguments, its target's version then) and answers 428: it waits on the
 //!   person. Outside a person's turn, there's no one to click: refused, and today's rules stand.
+//! - **An agent's landing** (`agents.land` with a plan's manifest, of its own workspace or one of an agent it
+//!   started: docs/agentic.md W6, the person's rule of 2026-11-18): its mode decides (`landing_click`): it waits for
+//!   the click where its mode asks before it edits, held to the manifest, and runs at once otherwise, the op writing
+//!   where the mode edits unasked and refusing where it only plans.
 //! - **The click** (`confirms.answer`, a person's alone: an agent's call is refused, and nothing an
 //!   agent or a page it reads writes in chat can stand for it). Confirmed, the agent's same call (the
 //!   same op and arguments, its target unchanged) runs once, as the person whose click it was: their
@@ -112,6 +116,11 @@ async fn needs_click(cx: &Cx, me: &str, name: &str, read_only: bool, destructive
     if read_only {
         return None;
     }
+    if name == "agents.land"
+        && let Some(decided) = landing_click(cx, me, input)
+    {
+        return decided;
+    }
     match target_of(cx, name, input).await {
         Target::Def(_) if DEFS_UNCHANGED.contains(&name) => None,
         Target::Def(id) => {
@@ -144,6 +153,31 @@ async fn needs_click(cx: &Cx, me: &str, name: &str, read_only: bool, destructive
         Target::PersonsRun | Target::Op if destructive => Some((format!("{name} {}", canonical(input)), String::new())),
         Target::PersonsRun | Target::Op => None,
     }
+}
+
+/// An agent's landing of its own workspace, or of the workspace of an agent it started (docs/agentic.md W6; the
+/// person's rule of 2026-11-18, kiln goal 01a1ec34599974448aed2672bafaf9a2): the modes decide, not the registry's mark
+/// (`crate::workspace::landing_policy`). It waits on the click where the lower of the two modes asks before it edits,
+/// held to the plan's manifest in its arguments, which binds what is written: no version beside it, since the asking
+/// agent's own session moves on while it waits, and a volume that changed meanwhile lands nothing (the op answers
+/// `changed`). A plan asked for (no manifest), a mode that edits unasked, one that only plans, and a workspace that
+/// isn't a volume of its own run at once, the op answering for each. None: another agent's workspace, which the gate's
+/// rules for acts on others answer.
+fn landing_click(cx: &Cx, me: &str, input: &Value) -> Option<Option<(String, String)>> {
+    let target = input.get("agent").and_then(Value::as_str).and_then(|a| crate::harness::ops::known(cx, a).ok())?;
+    if target.id != me && !crate::harness::lineage::descends(&cx.hub.harness.list(), &target.id, me) {
+        return None;
+    }
+    let manifest = input.get("manifest").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty());
+    let workspace = target.workspace.as_ref().filter(|w| w.made.is_some() && w.owner.as_deref().is_none_or(|o| cx.hub.harness.info(o).is_none()));
+    let asker = cx.hub.harness.info(me);
+    let (Some(manifest), Some(workspace), Some(asker)) = (manifest, workspace, asker) else { return Some(None) };
+    if crate::workspace::landing_policy(&asker, &target) != crate::workspace::WritePolicy::Approve {
+        return Some(None);
+    }
+    let over = workspace.over.as_deref().unwrap_or_default();
+    let plan = manifest.get(..12).unwrap_or(manifest);
+    Some(Some((format!("agents.land on {} ({}): its work written to {over}, exactly as plan {plan} says", target.name, crate::harness::lineage::short(&target.id)), String::new())))
 }
 
 fn what_def(name: &str, input: &Value) -> String {

@@ -294,7 +294,17 @@ review and the land queue (C).
 what it would create, replace and delete (what git ignores and git's own directory left out), and any file changed in
 the folder since the agent changed it, in which case
 nothing is written until they agree. On a person's go-ahead kiln gives Slates the grant for exactly
-that plan and lands it; no agent can (refused by kind, whatever it asks). Slates holds a plan only
+that plan and lands it. An agent lands as its mode lets it (the person's rule, 2026-11-18, kiln goal
+01a1ec34…: writing to disk follows the permission the person gave the harness or agent asking to write),
+the lower of its own mode and that of the agent whose work it is (an agent lands its own work, or the
+work of one it started): in a mode that edits unasked (accept edits, auto, bypass) its landing writes at
+once, its plan as it stands or the manifest it names; in one that asks (Claude Code's default, ask) it
+reads its plan, and its writing waits on its person's click (`crate::confirms`: asked in their chat turn,
+428 until they confirm, then the same call runs once as theirs; outside a turn there's no one to ask, and
+it's refused); in one that only plans it lands nothing (403). `agents.land` names the outcome
+(`outcome`: `written` with Slates' outcome, or `approval_required` with the plan to approve by its
+manifest), beside the fields the UI reads. A volume lands whole, so an agent working in another agent's
+volume lands nothing of its own while that one works (409, naming whose it is). Slates holds a plan only
 while the command that made it runs (a client's departure abandons it, AUD-29-07), so kiln plans
 again at the go-ahead and grants only when the new plan's manifest is the one the person saw; if
 anything changed, nothing is written and the new plan is shown instead. kiln leaves out what git
