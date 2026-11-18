@@ -1,0 +1,12 @@
+[
+  {"name": "server-runner",
+   "client": {"url": "/api/agents", "pick": {"name": "{machine}"}, "pointer": "/link/runner/suite"},
+   "server": {"url": "/api/agents", "pick": {"name": "{machine}"}, "pointer": "/link/server/suite"}},
+  {"name": "agent-control",
+   "client": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/controller/suite"},
+   "server": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/endpoint/suite"},
+   "lanes": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/lanes"}},
+  {"name": "mcp",
+   "client": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/controller/suite"},
+   "server": {"url": "/api/harness/sessions/{session}", "pointer": "/runs/control/endpoint/suite"}}
+]

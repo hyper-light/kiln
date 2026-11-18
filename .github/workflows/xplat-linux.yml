@@ -1,0 +1,69 @@
+name: xplat linux e2e
+
+# kiln's step35 harness suites (rest, mcp, narrowed, engine) through kiln, in a container of a Linux distro on a
+# GitHub-hosted runner's KVM: ci/xplat/run-linux.sh DISTRO KILN HEX SHARDS, its inputs in ci/xplat/inputs. Each
+# push of this branch is one run, and nothing else starts it.
+on:
+  push:
+    branches: [xplat/linux-e2e]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux-${{ matrix.distro }}
+    runs-on: ubuntu-24.04
+    # GitHub's own bound on a hosted runner's job: 6 hours.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Probe
+        run: |
+          uname -a
+          nproc
+          free -m
+          df -h / /mnt || df -h /
+          ls -l /dev/kvm
+          lscpu | grep -E 'Model name|Virtualization|Hypervisor' || true
+      # The runner's /dev/kvm is root:kvm 0660, and its user is not in kvm: a udev rule, since a later udevd
+      # restart (an apt install's) undoes a chmod alone.
+      - name: KVM for this user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm
+      # The run's folder on /mnt: the home disk holds 14 GB.
+      - name: The run's folder
+        run: |
+          sudo mkdir -p /mnt/xplat
+          sudo chown "$(id -u):$(id -g)" /mnt/xplat
+          df -h /mnt/xplat
+      - name: Run
+        env:
+          DISTRO: ${{ matrix.distro }}
+          JOBS: "4"
+          XPLAT_R: /mnt/xplat
+          GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+          GIT_HTTP_LOW_SPEED_TIME: "60"
+        run: |
+          read -r kiln hex shards < ci/xplat/inputs
+          bash ci/xplat/run-linux.sh "$DISTRO" "$kiln" "$hex" "$shards"
+      - name: After
+        if: always()
+        run: |
+          free -m
+          df -h / /mnt || df -h /
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.distro }}
+          path: /mnt/xplat/linux-${{ matrix.distro }}/logs/
+          if-no-files-found: warn
