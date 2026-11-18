@@ -314,7 +314,7 @@ fn again(r: &Refusal) -> &'static str {
     match r {
         Refusal::Volume { cause: VolumeCause::Clearing, .. } => " (start it again once that volume's clearing has answered)",
         Refusal::Volume { cause: VolumeCause::Bound, .. } => " (its volume's bound changed: start it again once no other session of this agent on this machine holds that volume)",
-        Refusal::Volume { cause: VolumeCause::InUse | VolumeCause::Unknown, .. } | Refusal::NoSuchProgram(_) | Refusal::Invalid { .. } | Refusal::Unsupported(_) | Refusal::Full { .. } | Refusal::Ended => "",
+        Refusal::Volume { cause: VolumeCause::InUse | VolumeCause::Unknown, .. } | Refusal::NoSuchProgram(_) | Refusal::Invalid { .. } | Refusal::Unsupported(_) | Refusal::Full { .. } | Refusal::Ended | Refusal::Failed(_) => "",
     }
 }
 

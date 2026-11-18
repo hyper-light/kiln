@@ -48,7 +48,7 @@
 //!   deny, so a run names its destinations; limits it doesn't hold ([`HOLDS`]), and credentials where no broker
 //!   leases them ([`NO_BROKER`]); a warm pool kept for its launches, until Hex's image class takes Shards' pools
 //!   ([`NO_POOLS`]; kiln plan 01a1dd2e…, P3.1); a pause or a resume of its run, until Hex pauses a box ([`NO_PAUSE`];
-//!   P5.5b); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`).
+//!   P5.5b); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`, a run's own failure as `Failed`).
 //! - **Its MCP lane** (Shards D254; #75 step 3): its harness member is asked for its MCP bridge (`/run/shards/mcp`,
 //!   `ImageMember::mcp`), and each connection its harness makes to it is taken through Hex (`Runtime::mcp`, over its
 //!   run's agent-control endpoint) as `super::Lanes`' next, for the runner to serve kiln's MCP over in its own
@@ -578,11 +578,16 @@ fn allocation(asked: Option<(u32, u64)>, disk: u64) -> Result<Allocation, Refusa
 /// box, which its caller then deletes ([`finish`]).
 fn boot(runtime: &dyn Runtime, spec: BoxSpec, id: &BoxId, member: &Member) -> Result<(Box<dyn Proc>, hex_api::Given), (hex_api::Refusal, bool)> {
     runtime.create(spec).map_err(|why| (why, false))?;
-    // A start answering `Lifecycle { Pending }` (its boot past Hex's learned patience, decision 9) is refused with
-    // the rest: Hex's `Runtime` has no call that waits on a booting box (`member` and `inspect` answer at once), and
-    // kiln asks again on no clock of its own (R03). Its delete ends the boot (Hex's change (b), in its push after
-    // c7603b0b, which kiln vendors: c7603b0b may still answer that delete `Pending`, said as it is).
-    let taken = runtime.start(id).and_then(|()| runtime.member(id, member)).and_then(|mut p| {
+    // A start past Hex's learned patience answers `Lifecycle { Pending }` (decision 9), its boot going on, and
+    // `Runtime::started` follows that boot to its answer as a wait follows its party, on no clock of kiln's (R03):
+    // its run started, or its run's own failure (`Failed`). r41 (jupiter) took that answer as the start's refusal and
+    // deleted the box, which ended its boot.
+    let taken = match runtime.start(id) {
+        Err(hex_api::Refusal::Lifecycle { cause: hex_api::LifecycleCause::Pending, .. }) => runtime.started(id).map(|_| ()),
+        started => started,
+    }
+    .and_then(|()| runtime.member(id, member))
+    .and_then(|mut p| {
         let given = p.streams()?;
         Ok((p, given))
     });
@@ -590,7 +595,8 @@ fn boot(runtime: &dyn Runtime, spec: BoxSpec, id: &BoxId, member: &Member) -> Re
 }
 
 /// Hex's refusal as the seam's: an invalid request as it is; what Hex awaits, or its platform or configuration
-/// doesn't give, unsupported; a node full, full; a box gone, ended; the rest invalid, in Hex's words.
+/// doesn't give, unsupported; a node full, full; a box gone, ended; a run that failed, its own failure; the rest
+/// invalid, in Hex's words.
 fn seam(r: hex_api::Refusal) -> Refusal {
     use hex_api::Refusal as H;
     match r {
@@ -601,6 +607,7 @@ fn seam(r: hex_api::Refusal) -> Refusal {
         H::Full(limit) | H::Exhausted { bound: limit, .. } => Refusal::Full { limit },
         H::NoSuchBox(_) | H::NotRunning(..) => Refusal::Ended,
         H::Volume { cause, why } => Refusal::Volume { cause: volume_cause(cause), why },
+        H::Failed { why, .. } => Refusal::Failed(why),
         other => Refusal::Invalid { what: "its microVM", why: other.to_string() },
     }
 }
@@ -1384,7 +1391,9 @@ pub(crate) mod tests {
     /// Hex's simulator with a VM's host use as Hex's image runtime answers it (`host_use`, and the final use
     /// `delete_with_host_use` answers, its window the whole run, `None` for a box never started), which the
     /// simulator doesn't model. Read `n` is `use_at(n)`. Its first delete may lose its answer (the box deleted,
-    /// an error said), and its start may be refused. Its started runs may be taken to have ended on their own with
+    /// an error said), and its start may be refused, or answer `Lifecycle { Pending }` with its box started, as an
+    /// image box's start does past Hex's learned patience (decision 9), `started` then answering it or its run's own
+    /// failure. Its started runs may be taken to have ended on their own with
     /// no final use told (Shards' D260: a VM whose process was killed tells none), each delete with its use then
     /// refused `NotRunning` and its box left as it was, as Hex's image class refuses it; otherwise a run that ended
     /// on its own is answered its final use, as one still running is. Its credentials as Hex's image class leases
@@ -1400,6 +1409,11 @@ pub(crate) mod tests {
         deletes: AtomicU64,
         lose_first_answer: AtomicBool,
         refuse_start: AtomicBool,
+        pending_start: AtomicBool,
+        /// What `started` answers in place of its box: its run's own failure (`Failed`), in these words.
+        start_failed: parking_lot::Mutex<Option<String>>,
+        /// How many times `started` was asked.
+        followed: AtomicU64,
         ended_untold: AtomicBool,
         lessors: parking_lot::Mutex<Option<Arc<dyn hex_api::lease::Lessors>>>,
         lessees: parking_lot::Mutex<Vec<(String, Arc<dyn hex_api::lease::Lessor>)>>,
@@ -1461,7 +1475,19 @@ pub(crate) mod tests {
             }
             self.sim.start(id)?;
             self.started.lock().insert(id.to_string());
+            if self.pending_start.load(Ordering::Acquire) {
+                return Err(H::Lifecycle { id: id.clone(), cause: hex_api::LifecycleCause::Pending, why: None });
+            }
             Ok(())
+        }
+        /// As Hex's image class answers it once a boot has come to its end: [`Metered::start_failed`]'s failure, or
+        /// the box as inspect answers it.
+        fn started(&self, id: &BoxId) -> Result<BoxInfo, H> {
+            self.followed.fetch_add(1, Ordering::AcqRel);
+            if let Some(why) = self.start_failed.lock().clone() {
+                return Err(H::Failed { id: id.clone(), why });
+            }
+            self.sim.inspect(id)
         }
         fn exec(&self, id: &BoxId, program: Program, stdio: Stdio) -> Result<Box<dyn Proc>, H> {
             self.sim.exec(id, program, stdio)
@@ -1659,6 +1685,43 @@ pub(crate) mod tests {
             assert_eq!(rt.sim.list()?, []);
             assert_eq!(charged(&records, "kiln-z7-0").await?, None, "charged nothing");
             assert!(vms.meter("kiln-z7-0").is_none());
+            anyhow::Ok(())
+        })
+    }
+
+    /// r41 (jupiter, 2026-11-18T07:07:53Z; Hex's `hex.image.boot` ran out at its learned 7.745 s): a start past Hex's
+    /// patience answers `Lifecycle { Pending }`, its boot going on (decision 9), and the launch follows that boot to its
+    /// answer through `started` and takes its run. Red: the answer taken as the start's refusal, the launch refused
+    /// "its microVM isn't valid: box kiln-z7-0: native operation is pending", r41's words, and its box deleted.
+    #[test]
+    fn s17_p7_a_start_past_hexs_patience_is_followed_to_its_run() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, _records, vms) = metered();
+            rt.pending_start.store(true, Ordering::Release);
+            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
+            assert_eq!(rt.followed.load(Ordering::Acquire), 1, "its boot followed once, by started");
+            run.stdin(b"one\n".to_vec()).await?;
+            run.close_stdin();
+            let (out, ends) = drain(run.as_ref()).await;
+            assert_eq!(String::from_utf8_lossy(&out), "one\n");
+            assert_eq!(ends, [Exit::Code(0)]);
+            anyhow::Ok(())
+        })
+    }
+
+    /// A start followed to its run's own failure (Hex's `Failed`: its command never started, or its VM failed; Shards'
+    /// D249) is refused `Failed` in Hex's words, never as a launch that isn't valid, and its box is deleted. Red: Hex's
+    /// `Failed` taken for an invalid microVM.
+    #[test]
+    fn s17_p7_a_start_followed_to_its_runs_failure_is_refused_failed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let (rt, _records, vms) = metered();
+            rt.pending_start.store(true, Ordering::Release);
+            *rt.start_failed.lock() = Some("its command never started: no such file".into());
+            let refused = vms.launch(launch(Egress::Only(Vec::new()))).await.err();
+            assert_eq!(refused, Some(Refusal::Failed("its command never started: no such file".into())));
+            assert_eq!(refused.map(|r| r.to_string()).as_deref(), Some("its run failed: its command never started: no such file"));
+            assert_eq!(rt.sim.list()?, [], "its box deleted");
             anyhow::Ok(())
         })
     }
