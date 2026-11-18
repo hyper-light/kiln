@@ -534,7 +534,8 @@ pub fn kept_out(cwd: &Path, kiln: &[&Path]) -> Option<String> {
 /// its workspace of its own (a Slates volume kiln made for it and mounted beneath its state, `crate::workspace::prepare`),
 /// the folder that workspace lies over, at the same place in it, whose files the volume holds.
 fn given(spec: &Spec, cwd: &Path) -> std::path::PathBuf {
-    let own = spec.workspace.as_ref().and_then(|w| Some((w.made.as_ref()?.mount.as_str(), w.over.as_deref()?)));
+    // A workspace with no mount (one Slates serves its microVM, [`served_project`]) leaves its session in the folder itself.
+    let own = spec.workspace.as_ref().and_then(|w| Some((w.made.as_ref().filter(|m| !m.mount.is_empty())?.mount.as_str(), w.over.as_deref()?)));
     let Some((mount, over)) = own else { return cwd.to_path_buf() };
     let real = canonical(cwd);
     match real.strip_prefix(canonical(Path::new(mount))) {
