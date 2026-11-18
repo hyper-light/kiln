@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// What a session's environment starts from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvBase"))]
 #[serde(rename_all = "snake_case")]
 pub enum Base {
     /// The machine's user's environment (docs/agents.md, "Where a harness is found").
@@ -25,6 +26,7 @@ pub enum Base {
 /// Where a variable's value comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvFrom"))]
 #[serde(rename_all = "snake_case")]
 pub enum From {
     /// The machine's user's variable `of` (its own name when none), read on the machine.
@@ -41,6 +43,7 @@ pub enum From {
 /// (a secret by its name, never its value).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvVar"))]
 pub struct Var {
     pub name: String,
     pub from: From,
@@ -93,6 +96,7 @@ pub struct Resolved {
 /// Where a machine's user's variable is set (docs/agents.md, "What a machine's user has").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvSource"))]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     LoginShell,
@@ -107,6 +111,7 @@ pub enum Source {
 /// A variable a machine's user has, by name alone, and where it's set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvMachineVar"))]
 pub struct MachineVar {
     pub name: String,
     pub sources: Vec<Source>,
@@ -119,6 +124,7 @@ pub struct Ask {}
 /// Its answer (`AgentMsg::Answer`): its user's variables, by name.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvMachine"))]
 pub struct Answer {
     pub vars: Vec<MachineVar>,
 }

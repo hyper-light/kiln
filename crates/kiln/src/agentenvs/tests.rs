@@ -220,9 +220,8 @@ fn a_start_runs_with_its_persons_environment_or_is_refused() -> anyhow::Result<(
         let child = Starter { parent: Some(parent), actor: "agent:p1".into(), ..Starter::default() };
         let (code, _) = start(&hub, &child, ask(&env.id)).await.err().unwrap_or((StatusCode::OK, String::new()));
         anyhow::ensure!(code == StatusCode::FORBIDDEN, "{code}");
-        // In a microVM its secret is refused, naming the variable.
-        let vm = Ask { isolation: Some("microvm".into()), ..ask(&env.id) };
-        let why = start(&hub, &by, vm).await.err().map(|(_, w)| w).unwrap_or_default();
+        // In a microVM its secret is refused, naming the variable (a start's check of each target it's placed on).
+        let why = resolve::runs_there(&hub, &env, "local", true).map_err(|r| r.said()).err().unwrap_or_default();
         anyhow::ensure!(why.starts_with("agentenv_secret_in_microvm: ") && why.contains("ANTHROPIC_API_KEY") && !why.contains(FAKE), "{why}");
         // A runner that runs none.
         hub.put_agent(crate::hub::tests::live_runner("old-box", "linux", "x86_64"));
