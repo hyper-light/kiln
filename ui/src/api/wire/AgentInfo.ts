@@ -177,7 +177,7 @@ variant_of?: string,
  */
 no_bypass?: boolean, 
 /**
- * Its workspace of its own, when it has one (as `Spec::workspace`).
+ * Where it works, when its start decided (as `Spec::workspace`).
  */
 workspace?: Workspace, 
 /**
