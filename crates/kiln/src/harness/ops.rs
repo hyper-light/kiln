@@ -3144,8 +3144,8 @@ for line in sys.stdin:
     /// machine asked nothing about one; and where its machine can't make a volume the start is refused, naming what it
     /// lacks (`lineage::NoWorkspace`), never run in its folder instead (the coordinator's ruling of 2026-11-18: that
     /// fallback was a second path), one started in a person's shell like any other: it works on a volume too, its folder
-    /// and environment moved onto it, never beside it in the person's folder (I11). None needs Slates, so this holds on
-    /// every machine.
+    /// and environment moved onto it, never beside it in the person's folder (I11), and so does a conversation taken up
+    /// (I12). None needs Slates, so this holds on every machine.
     #[test]
     fn w2_a_start_naming_no_workspace_follows_the_servers_setting_and_a_folder_asked_for_is_kept() -> anyhow::Result<()> {
         run(async {
@@ -3171,13 +3171,14 @@ for line in sys.stdin:
             anyhow::ensure!(ws.pointer("/workspace/volume") == Some(&Value::Null), "{ws}");
             // A machine that can't make a volume (here its kiln is older than workspaces) refuses a start that names
             // none, typed, naming what it lacks: it never runs the agent in its plain folder instead (no second path);
-            // one started in a person's shell there is refused alike, since it too works on a volume.
+            // one started in a person's shell there is refused alike, since it too works on a volume, and so is a
+            // conversation taken up there (I12).
             hub.put_agent(crate::hub::tests::live_runner("old", "linux", "x86_64"));
-            for shell in [None, Some("t1")] {
-                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: shell.map(str::to_owned), ..Default::default() };
+            for (shell, resume) in [(None, None), (Some("t1"), None), (None, Some("0e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b"))] {
+                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: shell.map(str::to_owned), resume: resume.map(str::to_owned), ..Default::default() };
                 let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
                 let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
-                anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "shell {shell:?}: {refused:?}");
+                anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "shell {shell:?}, resume {resume:?}: {refused:?}");
             }
             Ok(())
         })

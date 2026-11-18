@@ -869,6 +869,14 @@ fn some_of(v: &[String]) -> String {
     format!("{}{}", shown.join(", "), if v.len() > 6 { format!(" and {} more", v.len() - 6) } else { String::new() })
 }
 
+/// Harness `kind`'s own record of conversation `session` moved to where the harness looks for it from folder `cwd`, a
+/// conversation taken up there (on its agent's volume, at the mount: kiln goal 01a1ec34599974448aed2672bafaf9a2, I12).
+/// Whether anything moved.
+pub fn rehome(kind: &str, dirs: &Dirs, session: &str, cwd: &str) -> Result<bool, String> {
+    let _ = (kind, dirs, session, cwd);
+    Ok(false)
+}
+
 /// Put `home` (from machine `from`) where harness `kind` looks for it on this machine, for session
 /// `session` (its own id) going on in `cwd`; `folder`: that is the folder it worked in (else it
 /// isn't on this machine, the session works in the home folder, and the project's memory stays
@@ -1026,6 +1034,60 @@ mod tests {
         assert_eq!(claude_project_base(&repo.join(".claude").join("worktrees").join("not-yet")), repo);
         let plain = t.path().join("notes");
         assert_eq!(claude_project_base(&plain), plain);
+        Ok(())
+    }
+
+    /// I12 (kiln goal 01a1ec34599974448aed2672bafaf9a2, docs/agentic.md W2): a Claude Code conversation taken up on its
+    /// agent's volume goes on from the project folder Claude Code keeps for the mount's folder: its transcript and the
+    /// folder of its session's own files (its subagents' transcripts) moved there from the person's folder's, one record
+    /// of it, not two; asked again, nothing moves.
+    #[test]
+    fn i12_a_claude_conversation_taken_up_on_a_volume_is_rehomed_to_the_mounts_project() -> anyhow::Result<()> {
+        let t = tempfile::tempdir()?;
+        let config = t.path().join(".claude");
+        let dirs = Dirs::at(t.path(), &[("CLAUDE_CONFIG_DIR".to_owned(), config.to_string_lossy().into_owned())]);
+        let session = "0e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b";
+        let theirs = super::super::handoff::claude_project_dir(&config, "/Users/person/project/src");
+        put(&theirs.join(format!("{session}.jsonl")), "{\"type\":\"user\",\"cwd\":\"/Users/person/project/src\"}\n")?;
+        put(&theirs.join(session).join("subagents").join("agent-a.jsonl"), "{}\n")?;
+        put(&theirs.join("another.jsonl"), "{}\n")?;
+        let mount = "/state/workspaces/kiln-a/src";
+        assert_eq!(rehome("claude", &dirs, session, mount), Ok(true));
+        let ours = super::super::handoff::claude_project_dir(&config, mount);
+        assert!(ours.join(format!("{session}.jsonl")).is_file(), "its transcript in the mount's project");
+        assert!(ours.join(session).join("subagents").join("agent-a.jsonl").is_file(), "its session's own files beside it");
+        assert!(!theirs.join(format!("{session}.jsonl")).exists() && !theirs.join(session).exists(), "one record of it, not two");
+        assert!(theirs.join("another.jsonl").is_file(), "another conversation of the folder stays");
+        assert_eq!(super::super::transcript::find(&config, session), Some(ours.join(format!("{session}.jsonl"))));
+        assert_eq!(rehome("claude", &dirs, session, mount), Ok(false), "there already");
+        assert_eq!(rehome("codex", &dirs, session, mount), Ok(false), "Codex goes on by its thread's id, the folder given");
+        Ok(())
+    }
+
+    /// I12: a Gemini CLI conversation taken up on its agent's volume goes on from the project Gemini CLI keeps for the
+    /// mount's folder (`session/load` finds it among that project's chats): its chat file and its subagents' folder moved
+    /// there, the project named and marked as Gemini CLI names it; another conversation of the person's folder stays.
+    #[test]
+    fn i12_a_gemini_conversation_taken_up_on_a_volume_is_rehomed_to_the_mounts_project() -> anyhow::Result<()> {
+        let t = tempfile::tempdir()?;
+        let g = t.path().join(".gemini");
+        let dirs = Dirs::at(t.path(), &[]);
+        let session = "7f3e2d1c-0b9a-4876-a5b4-c3d2e1f0a9b8";
+        put(&g.join("projects.json"), r#"{"projects": {"/Users/person/project": "project"}}"#)?;
+        put(&g.join("tmp").join("project").join(".project_root"), "/Users/person/project")?;
+        let chats = g.join("tmp").join("project").join("chats");
+        let file = format!("session-2026-11-18T10-00-{}.jsonl", session.get(..8).unwrap_or(session));
+        put(&chats.join(&file), &format!("{{\"sessionId\":\"{session}\",\"projectHash\":\"ab\"}}\n{{\"type\":\"user\"}}\n"))?;
+        put(&chats.join(session).join("sub.jsonl"), "{}\n")?;
+        put(&chats.join("session-2026-11-18T09-00-aaaaaaaa.jsonl"), "{\"sessionId\":\"aaaaaaaa-0000-0000-0000-000000000000\"}\n")?;
+        let mount = "/state/workspaces/kiln-a";
+        assert_eq!(rehome("gemini", &dirs, session, mount), Ok(true));
+        let id = gemini_known(&g, &gemini_key(mount)).ok_or_else(|| anyhow::anyhow!("no project for the mount's folder"))?;
+        let ours = g.join("tmp").join(&id).join("chats");
+        assert!(ours.join(&file).is_file() && ours.join(session).join("sub.jsonl").is_file(), "{id}: its chat and its subagents' folder");
+        assert!(!chats.join(&file).exists() && !chats.join(session).exists(), "one record of it, not two");
+        assert!(chats.join("session-2026-11-18T09-00-aaaaaaaa.jsonl").is_file(), "another conversation of the folder stays");
+        assert_eq!(rehome("gemini", &dirs, session, mount), Ok(false), "there already");
         Ok(())
     }
 
