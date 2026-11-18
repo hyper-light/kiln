@@ -12,9 +12,8 @@
 //! - Landing, as each agent's mode lets it (the person's rule, 2026-11-18): the plan leaves out what git ignores and
 //!   git's own directory; an agent whose mode asks reads its plan and its writing waits on its person's click, then the
 //!   person writes it; one whose mode edits unasked writes its own at once; each into the folder, its repository's
-//!   HEAD as it was, approved with kiln's launcher secret (an instance kiln started under a systemd unit can't take
-//!   one yet, and there the plan and each write say so); each volume's write policy is its agent's mode, as kiln set
-//!   it.
+//!   HEAD as it was, approved with kiln's launcher secret on every system (on Linux the anchor's systemd scope keeps
+//!   it on its standard input, Slates' contract 14); each volume's write policy is its agent's mode, as kiln set it.
 //!
 //! The test owns the instance it starts: it ends every agent it started, then stops the anchor kiln started for it (by
 //! the pid kiln kept, `super::slates::started_anchor`) only once none of its volumes is mounted. A mount whose server is
@@ -243,7 +242,7 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
     // Landing, as each agent's mode lets it (docs/agentic.md W6, the person's rule of 2026-11-18), what git ignores and
     // git's own directory left out: one whose mode asks reads its plan, and its writing waits on its person's click (no
     // person's turn here: refused, nothing written), then the person writes it; one whose mode edits unasked writes its
-    // own at once. Each approved with kiln's launcher secret, which an instance under a systemd unit can't take yet.
+    // own at once. Each approved with kiln's launcher secret, on every system.
     let now = |i: &Info| hub.harness.info(&i.id).unwrap_or_else(|| i.clone());
     let others: Vec<Info> = each.iter().skip(1).map(now).collect();
     let policy = |i: &Info| super::landing_policy(i, i);
@@ -268,27 +267,16 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
     let refused = call(as_agent(&asking).await?, "agents.land", json!({"agent": asking.id, "manifest": manifest})).await.err().map(|(c, m)| format!("{c} {m}")).unwrap_or_default();
     anyhow::ensure!(refused.contains("403") && refused.contains("isn't serving a person's chat turn"), "{}'s own writing waits on its person: {refused}", asking.name);
     anyhow::ensure!(!src.join("asked.rs").exists(), "nothing written while it waits");
-    let can_write = get(&plan, "/can_write") == &json!(true);
+    // kiln approves on every system: on Linux its anchor's systemd scope keeps the launcher secret (Slates' contract 14).
+    anyhow::ensure!(get(&plan, "/can_write") == &json!(true), "kiln can write a landing here: {plan}");
     std::fs::write(Path::new(&writing.cwd).join("wrote.rs"), "wrote\n")?;
-    if can_write {
-        let landed = call(cx.clone(), "agents.land", json!({"agent": asking.id, "manifest": manifest})).await.map_err(fail)?;
-        anyhow::ensure!(get(&landed, "/outcome") == &json!("written") && landed.get("landed").is_some(), "{landed}");
-        anyhow::ensure!(std::fs::read_to_string(src.join("asked.rs"))? == "asked\n", "the folder holds the person's landing");
-        let wrote = call(as_agent(&writing).await?, "agents.land", json!({"agent": writing.id})).await.map_err(fail)?;
-        anyhow::ensure!(get(&wrote, "/outcome") == &json!("written"), "{}'s own landing, at once: {wrote}", writing.name);
-        anyhow::ensure!(std::fs::read_to_string(src.join("wrote.rs"))? == "wrote\n", "the folder holds its own landing");
-        anyhow::ensure!(git(work.path(), &["rev-parse", "HEAD"])? == head, "its HEAD as it was");
-    } else {
-        // Only an instance kiln started under a systemd unit takes no launcher secret yet (Linux): the plan and each
-        // write say so.
-        anyhow::ensure!(cfg!(target_os = "linux"), "only Linux's systemd units refuse kiln's approvals: {plan}");
-        let why = get(&plan, "/why_not").as_str().unwrap_or_default().to_owned();
-        anyhow::ensure!(why.contains("systemd"), "{plan}");
-        let refused = call(cx.clone(), "agents.land", json!({"agent": asking.id, "manifest": manifest})).await.err().map(|(_, m)| m).unwrap_or_default();
-        anyhow::ensure!(refused.contains("systemd"), "{refused}");
-        let refused = call(as_agent(&writing).await?, "agents.land", json!({"agent": writing.id})).await.err().map(|(_, m)| m).unwrap_or_default();
-        anyhow::ensure!(refused.contains("systemd"), "{refused}");
-    }
+    let landed = call(cx.clone(), "agents.land", json!({"agent": asking.id, "manifest": manifest})).await.map_err(fail)?;
+    anyhow::ensure!(get(&landed, "/outcome") == &json!("written") && landed.get("landed").is_some(), "{landed}");
+    anyhow::ensure!(std::fs::read_to_string(src.join("asked.rs"))? == "asked\n", "the folder holds the person's landing");
+    let wrote = call(as_agent(&writing).await?, "agents.land", json!({"agent": writing.id})).await.map_err(fail)?;
+    anyhow::ensure!(get(&wrote, "/outcome") == &json!("written"), "{}'s own landing, at once: {wrote}", writing.name);
+    anyhow::ensure!(std::fs::read_to_string(src.join("wrote.rs"))? == "wrote\n", "the folder holds its own landing");
+    anyhow::ensure!(git(work.path(), &["rev-parse", "HEAD"])? == head, "its HEAD as it was");
 
     // The parent ends: its volume stays while its child works in it, and goes with the child.
     anyhow::ensure!(hub.harness.close(hub, &parent.id).await, "the parent didn't end");
