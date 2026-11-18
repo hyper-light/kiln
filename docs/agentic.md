@@ -244,7 +244,8 @@ run on kiln's blocking pool (`crate::workspace::slates`). kiln carries no Slates
 machine installs one: kiln's own executable is Slates' anchor and daemon (`kiln slates-role
 --instance <name> anchor`, and the daemon its anchor starts the same way), handed to Slates' own
 main before kiln's runtime starts, so the daemon a runner talks to is the same code as the client it
-links, built with every kiln on every platform kiln builds. A role's process ends at any panic, as
+links, built with every kiln on every platform kiln builds (CI builds it natively on each:
+`.github/workflows/ci.yml`, Linux on x86-64 and arm64, Apple silicon, Windows on x86-64 and arm64). A role's process ends at any panic, as
 Slates' own builds do, so its anchor starts a daemon again rather than leave one serving with a
 thread gone. A runner keeps one instance, `kiln`, for all the machine's runner processes. The
 instance's anchor starts apart from the runner: on Linux, where the runner runs under the user's
