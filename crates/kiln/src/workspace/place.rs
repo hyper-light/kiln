@@ -55,7 +55,7 @@ pub fn points(root: &Path, name: &str) -> Vec<PathBuf> {
 /// and the kernel's mount table names the mount by it: macOS reaches `/var`, where every temporary folder lies, through
 /// a link to `/private/var`), or, where it isn't there yet, its nearest ancestor's real path with the rest as given. A
 /// mount named by another spelling is one kiln unmounts, reports and is told about by a name the table doesn't hold.
-fn real(path: &Path) -> PathBuf {
+pub fn real(path: &Path) -> PathBuf {
     let mut below = Vec::new();
     let mut at = path;
     loop {

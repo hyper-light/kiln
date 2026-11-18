@@ -78,7 +78,7 @@ test("the model chosen if offered, its default shown otherwise; the speeds go wi
   assert.equal(oneOf(speedsFor(k, "sonnet"), "fast"), "");
 });
 
-test("the spec: a shell's folder is its own, home is no folder, a volume only over a folder", () => {
+test("the spec: a shell's folder is its own, home is no folder, a shell's agent asks for its workspace as any other", () => {
   const base = { kind: "claude", cwd: "~/src/kiln", shell: "", mode: "default", model: "", effort: "", speed: "fast", name: " ", prompt: " fix it ", reach: "", volume: true };
   assert.deepEqual(specOf(base), {
     kind: "claude",
@@ -95,12 +95,14 @@ test("the spec: a shell's folder is its own, home is no folder, a volume only ov
   });
   const inShell = specOf({ ...base, shell: "t1" });
   assert.equal(inShell.cwd, undefined);
-  assert.equal(inShell.workspace, undefined);
+  // A shell's agent works on a volume too, its folder and environment moved onto the mount (kiln goal 01a1ec34…, I11).
+  assert.deepEqual(inShell.workspace, { kind: "volume" });
   assert.equal(specOf({ ...base, cwd: "~" }).cwd, undefined);
   // Its folder itself only as the person chose it: otherwise the server gives a volume where the machine can make one.
   assert.deepEqual(specOf({ ...base, volume: false, folder: true }).workspace, { kind: "folder" });
   assert.equal(specOf({ ...base, volume: false }).workspace, undefined);
-  assert.equal(specOf({ ...base, volume: false, folder: true, shell: "t1" }).workspace, undefined);
+  assert.deepEqual(specOf({ ...base, volume: false, folder: true, shell: "t1" }).workspace, { kind: "folder" });
+  assert.equal(specOf({ ...base, volume: false, shell: "t1" }).workspace, undefined);
 });
 
 test("recent folders: the latest first, eight at most, home left out", () => {

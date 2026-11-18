@@ -255,8 +255,8 @@ function resolve(c: Choices, m: Machines) {
     speeds,
     speed,
     canVolume,
-    volume: c.workspace === "volume" && canVolume && !c.shell,
-    folder: c.workspace === "folder" && !c.shell,
+    volume: c.workspace === "volume" && canVolume,
+    folder: c.workspace === "folder",
     others,
     shells: m.shells.filter((s) => s.target === target && !s.exited),
     kindName: info?.name ?? kind,
@@ -506,7 +506,7 @@ function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past
               type="button"
               role="radio"
               aria-checked={s.volume}
-              disabled={!s.canVolume || Boolean(c.shell)}
+              disabled={!s.canVolume}
               title={
                 s.canVolume
                   ? "A Slates volume over the folder: what it changes stays its own until it's up for review or you write it to disk"

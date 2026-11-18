@@ -136,6 +136,12 @@ impl Kind {
         }
         p.current_dir(&cwd);
         set_env(&mut p, spec);
+        // `PWD` names where it starts, as a shell sets it for what it runs (POSIX `cd`), whatever environment it was
+        // handed: a person's shell's names their own folder, as it was when that shell started, where an agent on a
+        // volume starts at the mount (docs/agentic.md W2).
+        if cfg!(unix) {
+            p.env("PWD", &cwd);
+        }
         match self.protocol {
             Protocol::ClaudeStreamJson => {
                 let session_id = spec.resume.is_none().then(|| uuid::Uuid::now_v7().to_string());
