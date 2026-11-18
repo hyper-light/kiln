@@ -1,0 +1,856 @@
+//! Handshake-flight fragmentation (§4.10a; RFC 9000 §19.6 CRYPTO frames, in slates' owned dialect).
+//!
+//! A handshake flight — the bytes `rustls::quic::Connection::write_hs` produces for one turn of the
+//! TLS 1.3 handshake — can be larger than a single datagram: a mutual-TLS server flight carries the
+//! server's certificate chain, and an operator's chain of a leaf plus an intermediate or two exceeds the
+//! [`MIN_DATAGRAM_BYTES`] path floor. Before this the whole flight
+//! rode one datagram, so a flight above the receiver's buffer was refused typed
+//! (`EndpointError::FlightTooLarge`) and a flight above the path MTU relied on IP fragmentation (which a
+//! router may drop). This splits a flight into fragments that each fit the path floor and reassembles
+//! them at the peer, so any chain a real deployment provisions handshakes.
+//!
+//! **The stream.** Each direction of a handshake is one byte stream (RFC 9000 §19.6: CRYPTO offsets are
+//! cumulative within an encryption level; slates keeps one level, so one stream per direction). A flight
+//! occupies `[start, start + total)` of its sender's stream, where `start` is the count of handshake
+//! bytes the sender had sent before it. The receiver keeps how much of the peer's stream it has
+//! **consumed** (fed to the TLS state), so a fragment is placed exactly: a flight starting at `consumed`
+//! is the next one; a flight starting below it is a retransmit of one already consumed (the peer's
+//! reply raced ours — it is still asking, and it must not be fed twice); a flight starting above it is
+//! impossible in TLS (the peer cannot advance without our reply) and is dropped as malformed. Naming
+//! the flight by its offset, not its content, is what makes a stale fragment of an earlier flight
+//! harmless: before this a fragment was placed by its offset *within* a flight alone, so a late
+//! fragment of flight N with the same length as flight N + 1 would have written into N + 1's buffer.
+//!
+//! **Framing.** A fragment is `[tag][start: u16 LE][within: u16 LE][total: u16 LE][len: u16 LE][payload…]`,
+//! and bytes past the `len`-byte payload are padding: a client pads its Initial-level datagrams to the
+//! path floor ([`pad`]) so a server's anti-amplification allowance — three times what it received from an
+//! unvalidated address (RFC 9000 §8.1; AUD-29-49) — covers its reply. The tag
+//! is [`FRAGMENT_TAG`], chosen with the QUIC fixed bit (`0x40`) **clear** so the demultiplexer and the
+//! endpoint still route it as a handshake datagram, not a 1-RTT packet
+//! ([`crate::endpoint::is_short_header`] stays the discriminator), and distinct from any TLS 1.3
+//! handshake-message first byte (a message type, all `< 0x40`). `u16` fields suffice: a direction's
+//! whole handshake is a few kilobytes, and the sender refuses a stream past [`MAX_STREAM_BYTES`] or a
+//! flight past [`MAX_FLIGHT_BYTES`] typed, so a hostile or corrupt field cannot allocate without bound.
+//!
+//! **Encryption levels (RFC 9001 §4.1.3; AUD-29-47).** TLS writes a handshake at two levels before the
+//! 1-RTT keys: the Initial level (ClientHello, ServerHello — no identity) and the Handshake level
+//! (EncryptedExtensions, Certificate, CertificateVerify, Finished — the peer identities). `rustls::quic`
+//! hands the transport both as unencrypted bytes, and protecting the second is the transport's job. Each
+//! level is its own stream with its own offsets. Initial-level bytes cross as the plain fragments above;
+//! Handshake-level bytes cross as **sealed** fragments: `[SEALED_FRAGMENT_TAG][number: u32 LE]` followed
+//! by the plain fragment's body (start, within, total, payload) AEAD-sealed under that level's packet key,
+//! with the tag and number as associated data ([`seal`], [`open`]). The number is the AEAD nonce input: a
+//! sender numbers every sealed fragment it sends, retransmits included, and never reuses one under its
+//! keys. An opened sealed fragment is the plain fragment again, so one [`Reassembler`] per level serves
+//! both. Until 2026-09-30 both levels were flattened into one plaintext stream, and a passive observer read
+//! the certificates off the wire.
+//!
+//! **Reliability.** Fragmentation is stateless and deterministic: the same flight at the same start
+//! fragments to the same bytes every time, so a retransmit of a flight (the handshake's own loss
+//! recovery) resends identical fragments, and the [`Reassembler`] is idempotent under duplicates and
+//! reorder — it holds the bytes it has by offset and yields the flight once every byte is present.
+
+use crate::endpoint::{MIN_DATAGRAM_BYTES, is_short_header};
+
+/// Format: the first byte of a fragment — the QUIC fixed bit (0x40) clear so it routes as a handshake
+/// datagram, the high bit set so it is distinct from every TLS 1.3 handshake-message type (all `< 0x40`)
+/// and from a 1-RTT short header (fixed bit set).
+pub const FRAGMENT_TAG: u8 = 0x80;
+
+/// Format: the offset of the flight's stream start (`u16` LE) in a fragment: after the tag.
+const AT_START: usize = 1;
+/// Format: the offset of the fragment's position within the flight (`u16` LE): after the start.
+const AT_WITHIN: usize = AT_START + 2;
+/// Format: the offset of the flight's total length (`u16` LE): after the position.
+const AT_TOTAL: usize = AT_WITHIN + 2;
+/// Format: the offset of the payload's length (`u16` LE): after the total. Bytes past the payload are padding.
+const AT_LEN: usize = AT_TOTAL + 2;
+/// Format: the fragment header — the tag, the flight's stream start (`u16` LE), the fragment's offset
+/// within the flight (`u16` LE), the flight's total length (`u16` LE), the payload's length (`u16` LE); the
+/// payload follows, then any padding.
+pub const FRAGMENT_HEADER: usize = AT_LEN + 2;
+
+/// Derived: the most flight bytes one fragment carries — the path-floor datagram less the header, so a
+/// fragment never needs IP fragmentation. Anchored to [`MIN_DATAGRAM_BYTES`].
+pub const FRAGMENT_PAYLOAD: usize = MIN_DATAGRAM_BYTES - FRAGMENT_HEADER;
+
+/// Format: the first byte of a **sealed** fragment, one carrying Handshake-level bytes (see the module
+/// doc): the fixed bit clear and the high bit set, as the plain tag, and distinct from it.
+pub const SEALED_FRAGMENT_TAG: u8 = 0x81;
+/// Format: a sealed fragment's number (`u32` LE) after its tag — the AEAD nonce input.
+const SEALED_NUMBER_BYTES: usize = 4;
+/// Format: a sealed fragment's associated data: its tag and number.
+pub const SEALED_HEADER: usize = 1 + SEALED_NUMBER_BYTES;
+/// Format: the AEAD tag every TLS 1.3 suite appends (16 bytes, RFC 8446 §5.2 over AES-GCM and
+/// ChaCha20-Poly1305).
+const SEALED_TAG_BYTES: usize = 16;
+/// Derived: the most flight bytes one sealed fragment carries — the path floor less the sealed header, the
+/// sealed body's own field header and the AEAD tag.
+pub const SEALED_FRAGMENT_PAYLOAD: usize =
+  MIN_DATAGRAM_BYTES - SEALED_HEADER - (FRAGMENT_HEADER - 1) - SEALED_TAG_BYTES;
+
+/// Shape: the largest handshake flight the endpoint fragments or reassembles — the reassembler will not
+/// buffer past it, so a corrupt or hostile `total` cannot allocate without bound. A mutual-TLS flight
+/// with a certificate chain of several certificates is a few kilobytes; this is sixteen path-floor
+/// fragments, a generous chain.
+pub const MAX_FLIGHT_BYTES: usize = 16 * MIN_DATAGRAM_BYTES;
+
+/// Derived: the most fragments one flight spans, for bounding a receive loop. Anchored to
+/// [`MAX_FLIGHT_BYTES`] and the smaller of the two payloads, [`SEALED_FRAGMENT_PAYLOAD`].
+pub const MAX_FLIGHT_FRAGMENTS: usize = MAX_FLIGHT_BYTES.div_ceil(SEALED_FRAGMENT_PAYLOAD);
+
+/// Format: the most bytes one direction of a handshake may send in all — what the `u16` stream offset
+/// can name. A TLS 1.3 direction is a few kilobytes; this is the field's range.
+pub const MAX_STREAM_BYTES: usize = u16::MAX as usize;
+
+/// Splits `flight`, which begins at stream offset `start`, into fragments each at most one path-floor
+/// datagram. A flight that fits one fragment produces one. `None` if the flight is longer than
+/// [`MAX_FLIGHT_BYTES`], or would end past [`MAX_STREAM_BYTES`] — the caller refuses it typed rather
+/// than sending an unreassemblable stream. An empty flight produces no fragments (nothing to say).
+pub fn fragment(flight: &[u8], start: usize) -> Option<Vec<Vec<u8>>> {
+  fragment_within(flight, start, FRAGMENT_PAYLOAD)
+}
+
+/// [`fragment`] with each fragment's payload at most `payload` bytes.
+fn fragment_within(flight: &[u8], start: usize, payload: usize) -> Option<Vec<Vec<u8>>> {
+  if flight.len() > MAX_FLIGHT_BYTES
+    || start.checked_add(flight.len())? > MAX_STREAM_BYTES
+    || payload == 0
+  {
+    return None;
+  }
+  let start_word = u16::try_from(start).ok()?;
+  let total_word = u16::try_from(flight.len()).ok()?;
+  let mut out = Vec::with_capacity(flight.len().div_ceil(payload));
+  let mut within = 0usize;
+  while within < flight.len() {
+    let end = flight.len().min(within.checked_add(payload)?);
+    let piece = end.saturating_sub(within);
+    let mut datagram = Vec::with_capacity(FRAGMENT_HEADER.saturating_add(piece));
+    datagram.push(FRAGMENT_TAG);
+    datagram.extend_from_slice(&start_word.to_le_bytes());
+    datagram.extend_from_slice(&u16::try_from(within).ok()?.to_le_bytes());
+    datagram.extend_from_slice(&total_word.to_le_bytes());
+    datagram.extend_from_slice(&u16::try_from(piece).ok()?.to_le_bytes());
+    datagram.extend_from_slice(flight.get(within..end)?);
+    out.push(datagram);
+    within = end;
+  }
+  Some(out)
+}
+
+/// Whether `datagram` is a handshake fragment (routed as a handshake datagram and tagged as a fragment).
+pub fn is_fragment(datagram: &[u8]) -> bool {
+  !is_short_header(datagram) && datagram.first() == Some(&FRAGMENT_TAG)
+}
+
+/// Whether `datagram` is a sealed handshake fragment (Handshake-level bytes, see the module doc).
+pub fn is_sealed_fragment(datagram: &[u8]) -> bool {
+  !is_short_header(datagram) && datagram.first() == Some(&SEALED_FRAGMENT_TAG)
+}
+
+/// Format: the first byte of a **sealed close**: an accepting end that abandons its handshake tells its dialer so, sealed
+/// under the Handshake keys (RFC 9000 §10.2.3's immediate close during the handshake). The fixed bit clear and the high
+/// bit set, as the fragment tags, and distinct from both. Never sent unprotected: a close anyone could forge would let a
+/// stranger cost a dialer its socket.
+pub const SEALED_CLOSE_TAG: u8 = 0x82;
+/// Format: the one byte a sealed close's body carries, so an opened close is told from an opened fragment.
+const CLOSE_BODY: u8 = 0x01;
+
+/// Whether `datagram` is shaped as a sealed close. Whether it is one is [`open_close`]'s to say.
+pub fn is_sealed_close(datagram: &[u8]) -> bool {
+  !is_short_header(datagram) && datagram.first() == Some(&SEALED_CLOSE_TAG)
+}
+
+/// Seals a close under `key`, numbered `next_number` (advanced, so no nonce is used twice under the key the sealed
+/// fragments share).
+pub fn seal_close(
+  key: &dyn rustls::quic::PacketKey,
+  next_number: &mut u32,
+) -> Result<Vec<u8>, SealRefusal> {
+  let number = *next_number;
+  *next_number = number.checked_add(1).ok_or(SealRefusal::NumbersExhausted)?;
+  let mut datagram = Vec::with_capacity(
+    SEALED_HEADER
+      .saturating_add(1)
+      .saturating_add(key.tag_len()),
+  );
+  datagram.push(SEALED_CLOSE_TAG);
+  datagram.extend_from_slice(&number.to_le_bytes());
+  let mut body = vec![CLOSE_BODY];
+  let tag = key
+    .encrypt_in_place(u64::from(number), &datagram, &mut body)
+    .map_err(|_| SealRefusal::Sealing)?;
+  datagram.extend_from_slice(&body);
+  datagram.extend_from_slice(tag.as_ref());
+  Ok(datagram)
+}
+
+/// Whether `datagram` is a close sealed under `key`. A forged, tampered, truncated or other-keyed one is not, and is
+/// dropped like any datagram that does not open.
+pub fn open_close(datagram: &[u8], key: &dyn rustls::quic::PacketKey) -> bool {
+  if !is_sealed_close(datagram) {
+    return false;
+  }
+  let (Some(header), Some(number), Some(sealed)) = (
+    datagram.get(..SEALED_HEADER),
+    datagram.get(1..SEALED_HEADER),
+    datagram.get(SEALED_HEADER..),
+  ) else {
+    return false;
+  };
+  let Ok(number) = <[u8; SEALED_NUMBER_BYTES]>::try_from(number) else {
+    return false;
+  };
+  let mut body = sealed.to_vec();
+  key
+    .decrypt_in_place(u64::from(u32::from_le_bytes(number)), header, &mut body)
+    .is_ok_and(|plain| plain == [CLOSE_BODY])
+}
+
+/// Why a flight could not be sealed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealRefusal {
+  /// The flight is past [`MAX_FLIGHT_BYTES`], or would end past [`MAX_STREAM_BYTES`].
+  TooLarge,
+  /// The sender has numbered every sealed fragment a `u32` can name: another would reuse a nonce.
+  NumbersExhausted,
+  /// The AEAD refused (a payload past the suite's limit).
+  Sealing,
+}
+
+/// Seals `flight`, which begins at offset `start` of its level's stream, into fragments under `key`, each
+/// numbered from `next_number` onward (advanced past the last used). An empty flight seals to nothing.
+pub fn seal(
+  flight: &[u8],
+  start: usize,
+  key: &dyn rustls::quic::PacketKey,
+  next_number: &mut u32,
+) -> Result<Vec<Vec<u8>>, SealRefusal> {
+  let plain =
+    fragment_within(flight, start, SEALED_FRAGMENT_PAYLOAD).ok_or(SealRefusal::TooLarge)?;
+  let mut sealed = Vec::with_capacity(plain.len());
+  for fragment in plain {
+    let number = *next_number;
+    *next_number = number.checked_add(1).ok_or(SealRefusal::NumbersExhausted)?;
+    let mut datagram = Vec::with_capacity(
+      SEALED_HEADER
+        .saturating_add(fragment.len())
+        .saturating_add(key.tag_len()),
+    );
+    datagram.push(SEALED_FRAGMENT_TAG);
+    datagram.extend_from_slice(&number.to_le_bytes());
+    let mut body = fragment.get(1..).ok_or(SealRefusal::Sealing)?.to_vec();
+    let tag = key
+      .encrypt_in_place(u64::from(number), &datagram, &mut body)
+      .map_err(|_| SealRefusal::Sealing)?;
+    datagram.extend_from_slice(&body);
+    datagram.extend_from_slice(tag.as_ref());
+    sealed.push(datagram);
+  }
+  Ok(sealed)
+}
+
+/// Opens a sealed fragment under `key`: the plain fragment it carries, for its level's [`Reassembler`], or
+/// `None` when it is not a sealed fragment or does not authenticate (tampered, forged, or sealed under
+/// other keys) — dropped and counted by the caller, never fed to the TLS state.
+pub fn open(datagram: &[u8], key: &dyn rustls::quic::PacketKey) -> Option<Vec<u8>> {
+  if !is_sealed_fragment(datagram) {
+    return None;
+  }
+  let header = datagram.get(..SEALED_HEADER)?;
+  let number: [u8; SEALED_NUMBER_BYTES] = datagram.get(1..SEALED_HEADER)?.try_into().ok()?;
+  let mut body = datagram.get(SEALED_HEADER..)?.to_vec();
+  let plain = key
+    .decrypt_in_place(u64::from(u32::from_le_bytes(number)), header, &mut body)
+    .ok()?;
+  let mut fragment = Vec::with_capacity(plain.len().saturating_add(1));
+  fragment.push(FRAGMENT_TAG);
+  fragment.extend_from_slice(plain);
+  Some(fragment)
+}
+
+/// What pushing a fragment into a [`Reassembler`] yields.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reassembly {
+  /// More fragments of the next flight are needed; nothing to feed the TLS state yet.
+  Pending,
+  /// The next flight is complete: its bytes, to feed to the TLS state once.
+  Flight(Vec<u8>),
+  /// A fragment of a flight already consumed (the peer retransmitted it — its reply raced ours): not
+  /// to be fed again (a repeated `read_hs` of a consumed flight faults the stream), but a live sign the
+  /// peer is still asking, so the caller resends its own flight.
+  Repeat,
+  /// A later fragment of a flight already consumed: the same retransmit as its first fragment's [`Reassembly::Repeat`],
+  /// so one retransmitted flight is one repeat however many fragments it spans.
+  RepeatRest,
+  /// The fragment did not parse, named a flight past the bounds, one ahead of the stream (impossible in
+  /// TLS), or one inconsistent with the fragments already held: dropped and counted by the caller,
+  /// never a fault.
+  Malformed,
+}
+
+/// Reassembles the peer's handshake stream flight by flight (see the module doc). One per endpoint.
+#[derive(Debug, Default)]
+pub struct Reassembler {
+  /// Bytes of the peer's stream consumed so far: the start of the next flight.
+  consumed: usize,
+  /// The next flight's total length, once a fragment has announced it; `None` between flights.
+  total: Option<usize>,
+  /// The next flight's bytes received so far, sized to `total`; a fragment writes its slice, so
+  /// duplicates and reorder are idempotent.
+  bytes: Vec<u8>,
+  /// Which bytes of the next flight have arrived (one flag per byte): complete when all are set. A byte
+  /// count would miscount an overlapping duplicate; per-byte presence is exact.
+  present: Vec<bool>,
+  /// How many distinct bytes of the next flight are present, so completion is one compare.
+  filled: usize,
+}
+
+impl Reassembler {
+  /// A fresh reassembler at the start of the peer's stream.
+  pub fn new() -> Reassembler {
+    Reassembler::default()
+  }
+
+  /// Bytes of the peer's stream consumed so far (the start of the flight awaited).
+  pub fn consumed(&self) -> usize {
+    self.consumed
+  }
+
+  /// Pushes one received fragment. Returns whether the next flight is now complete, needs more, was a
+  /// retransmit of a consumed flight, or was malformed.
+  pub fn push(&mut self, datagram: &[u8]) -> Reassembly {
+    let Some((start, within, total, payload)) = parse(datagram) else {
+      return Reassembly::Malformed;
+    };
+    if total > MAX_FLIGHT_BYTES
+      || total == 0
+      || within.saturating_add(payload.len()) > total
+      || start.saturating_add(total) > MAX_STREAM_BYTES
+    {
+      return Reassembly::Malformed;
+    }
+    // Placed by the flight's stream start: behind the consumed prefix is a retransmit of a flight
+    // already fed; ahead of it cannot exist (the peer needs our reply to advance); exactly at it is the
+    // flight awaited. A retransmit that would straddle the consumed prefix is corrupt.
+    if start < self.consumed {
+      return if start.saturating_add(total) <= self.consumed {
+        if within == 0 {
+          Reassembly::Repeat
+        } else {
+          Reassembly::RepeatRest
+        }
+      } else {
+        Reassembly::Malformed
+      };
+    }
+    if start > self.consumed {
+      return Reassembly::Malformed;
+    }
+    match self.total {
+      None => self.begin(total),
+      Some(seen) if seen != total => return Reassembly::Malformed,
+      Some(_) => {}
+    }
+    // `within + payload.len() <= total` was checked above and both buffers hold `total` bytes, so every
+    // slot exists; a missing one would be skipped, never indexed.
+    let slots = self
+      .present
+      .iter_mut()
+      .zip(self.bytes.iter_mut())
+      .skip(within)
+      .zip(payload);
+    for ((present, slot), byte) in slots {
+      if !*present {
+        *present = true;
+        *slot = *byte;
+        self.filled = self.filled.saturating_add(1);
+      }
+    }
+    if self.filled < total {
+      return Reassembly::Pending;
+    }
+    let flight = std::mem::take(&mut self.bytes);
+    self.consumed = self.consumed.saturating_add(total);
+    self.total = None;
+    self.present = Vec::new();
+    self.filled = 0;
+    Reassembly::Flight(flight)
+  }
+
+  /// Begins the next flight of `total` bytes (sizes the buffers).
+  fn begin(&mut self, total: usize) {
+    self.total = Some(total);
+    self.bytes = vec![0u8; total];
+    self.present = vec![false; total];
+    self.filled = 0;
+  }
+}
+
+/// Parses a fragment into `(start, within, total, payload)`, or `None` if it is not a well-formed
+/// fragment.
+fn parse(datagram: &[u8]) -> Option<(usize, usize, usize, &[u8])> {
+  if datagram.first() != Some(&FRAGMENT_TAG) || datagram.len() < FRAGMENT_HEADER {
+    return None;
+  }
+  let word = |at: usize| {
+    let pair = datagram.get(at..at.checked_add(2)?)?;
+    let pair: [u8; 2] = pair.try_into().ok()?;
+    Some(usize::from(u16::from_le_bytes(pair)))
+  };
+  let len = word(AT_LEN)?;
+  Some((
+    word(AT_START)?,
+    word(AT_WITHIN)?,
+    word(AT_TOTAL)?,
+    datagram.get(FRAGMENT_HEADER..FRAGMENT_HEADER.checked_add(len)?)?,
+  ))
+}
+
+/// Pads a plain fragment with zeros to `to` bytes (a no-op for one already that long): what a client does to
+/// its Initial-level datagrams, so the server's anti-amplification allowance covers its reply (RFC 9000 §8.1).
+/// The fragment's `len` field bounds its payload, so the padding is never read as flight bytes.
+pub fn pad(datagram: &mut Vec<u8>, to: usize) {
+  if datagram.len() < to {
+    datagram.resize(to, 0);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Real QUIC packet keys for the sealed-fragment tests: the Initial keys a connection id derives (RFC 9001
+  /// §5.2), as the client (`local` seals toward the server) and as the server (`remote` opens them).
+  fn keys(connection_id: &[u8], side: rustls::Side) -> rustls::quic::Keys {
+    let suite = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
+      .tls13()
+      .unwrap();
+    rustls::quic::Keys::initial(
+      rustls::quic::Version::V1,
+      suite,
+      suite.quic.unwrap(),
+      connection_id,
+      side,
+    )
+  }
+
+  /// AUD-29-47 (the sealed codec, by use): do: seal a multi-fragment flight from the client's keys and open
+  /// every fragment with the server's; expect the plain fragments back, the reassembled flight equal to the
+  /// original, numbers advanced one per fragment, and no plaintext byte of the flight on the wire.
+  /// A close sealed by the server's end, with the keys both ends hold: (sealed close, client keys, server keys).
+  fn a_sealed_close() -> (Vec<u8>, rustls::quic::Keys, rustls::quic::Keys) {
+    let (client, server) = (
+      keys(b"cid", rustls::Side::Client),
+      keys(b"cid", rustls::Side::Server),
+    );
+    let mut numbers = 0u32;
+    let close = seal_close(server.local.packet.as_ref(), &mut numbers).unwrap();
+    assert_eq!(
+      numbers, 1,
+      "a close uses a number of the counter the sealed fragments share"
+    );
+    (close, client, server)
+  }
+
+  /// RFC 9000 §10.2.3 under this dialect's keys: a close sealed by one end opens at the other and under no other keys.
+  /// Do: open a sealed close under the peer's keys, its own end's, and another connection's. Expect: only the first.
+  #[test]
+  fn a_sealed_close_opens_only_under_its_peers_keys() {
+    let (close, client, server) = a_sealed_close();
+    assert!(open_close(&close, client.remote.packet.as_ref()));
+    assert!(
+      !open_close(&close, server.remote.packet.as_ref()),
+      "its own end's keys"
+    );
+    let other = keys(b"other", rustls::Side::Client);
+    assert!(
+      !open_close(&close, other.remote.packet.as_ref()),
+      "another connection's keys"
+    );
+    assert!(
+      open(&close, client.remote.packet.as_ref()).is_none(),
+      "a close is no fragment"
+    );
+  }
+
+  /// Hostile input: a close that is not whole does not open. Do: open it truncated at every length and with each byte
+  /// flipped. Expect: none opens.
+  #[test]
+  fn a_truncated_or_altered_close_does_not_open() {
+    let (close, client, _) = a_sealed_close();
+    let key = client.remote.packet;
+    for cut in 0..close.len() {
+      assert!(
+        !open_close(close.get(..cut).unwrap(), key.as_ref()),
+        "truncated at {cut}"
+      );
+    }
+    for index in 0..close.len() {
+      let mut flipped = close.clone();
+      if let Some(byte) = flipped.get_mut(index) {
+        *byte ^= 0x01;
+      }
+      assert!(!open_close(&flipped, key.as_ref()), "byte {index} flipped");
+    }
+  }
+
+  /// Hostile input: a fragment sealed under the right keys is no close, even under the close's tag. Do: open a sealed
+  /// fragment as a close, as it is and retagged. Expect: neither opens.
+  #[test]
+  fn a_sealed_fragment_is_no_close() {
+    let (_, client, server) = a_sealed_close();
+    let mut numbers = 1u32;
+    let sealed_fragment = seal(b"flight", 0, server.local.packet.as_ref(), &mut numbers).unwrap();
+    let fragment = sealed_fragment.first().unwrap();
+    assert!(!open_close(fragment, client.remote.packet.as_ref()));
+    let mut retagged = fragment.clone();
+    if let Some(first) = retagged.first_mut() {
+      *first = SEALED_CLOSE_TAG;
+    }
+    assert!(!open_close(&retagged, client.remote.packet.as_ref()));
+  }
+
+  #[test]
+  fn sealed_fragments_open_to_the_flight_and_hide_it() {
+    let (client, server) = (
+      keys(b"cid", rustls::Side::Client),
+      keys(b"cid", rustls::Side::Server),
+    );
+    let flight: Vec<u8> = (0..3 * SEALED_FRAGMENT_PAYLOAD)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let mut numbers = 0u32;
+    let sealed = seal(&flight, 0, client.local.packet.as_ref(), &mut numbers).unwrap();
+    assert_eq!(numbers, u32::try_from(sealed.len()).unwrap());
+    assert!(
+      sealed
+        .iter()
+        .all(|datagram| datagram.len() <= MIN_DATAGRAM_BYTES)
+    );
+    let marker = flight.get(..32).unwrap();
+    assert!(
+      !sealed
+        .iter()
+        .any(|datagram| datagram.windows(marker.len()).any(|w| w == marker))
+    );
+    let mut reassembler = Reassembler::new();
+    let mut rebuilt = None;
+    for datagram in &sealed {
+      let plain = open(datagram, server.remote.packet.as_ref()).unwrap();
+      if let Reassembly::Flight(bytes) = reassembler.push(&plain) {
+        rebuilt = Some(bytes);
+      }
+    }
+    assert_eq!(rebuilt, Some(flight));
+  }
+
+  /// AUD-29-47: do: flip one byte of a sealed fragment's number, its ciphertext and its tag in turn, and
+  /// open an intact one under keys from another connection; expect every one refused.
+  #[test]
+  fn a_tampered_or_foreign_sealed_fragment_does_not_open() {
+    let (client, server) = (
+      keys(b"cid", rustls::Side::Client),
+      keys(b"cid", rustls::Side::Server),
+    );
+    let other = keys(b"other", rustls::Side::Server);
+    let mut numbers = 0u32;
+    let sealed = seal(b"finished", 0, client.local.packet.as_ref(), &mut numbers).unwrap();
+    let datagram = sealed.first().unwrap();
+    for at in [1, SEALED_HEADER + 1, datagram.len() - 1] {
+      let mut tampered = datagram.clone();
+      *tampered.get_mut(at).unwrap() ^= 0x01;
+      assert_eq!(
+        open(&tampered, server.remote.packet.as_ref()),
+        None,
+        "byte {at}"
+      );
+    }
+    assert_eq!(open(datagram, other.remote.packet.as_ref()), None);
+    assert!(open(datagram, server.remote.packet.as_ref()).is_some());
+  }
+
+  /// AUD-29-47: do: seal with the next number at the last a `u32` names; expect `NumbersExhausted` — a number
+  /// with no successor is not issued, so the counter never has to wrap into a reused nonce.
+  #[test]
+  fn sealed_numbers_end_without_a_repeat() {
+    let client = keys(b"cid", rustls::Side::Client);
+    let mut numbers = u32::MAX;
+    assert_eq!(
+      seal(b"one", 0, client.local.packet.as_ref(), &mut numbers),
+      Err(SealRefusal::NumbersExhausted)
+    );
+  }
+
+  /// A pseudo-random stream for the oracle, seeded so a failure replays (`xorshift64*`).
+  struct Rng(u64);
+
+  impl Rng {
+    fn next(&mut self) -> u64 {
+      let mut x = self.0;
+      x ^= x >> 12;
+      x ^= x << 25;
+      x ^= x >> 27;
+      self.0 = x;
+      x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+      if n == 0 {
+        0
+      } else {
+        usize::try_from(self.next() % u64::try_from(n).unwrap_or(u64::MAX)).unwrap_or(0)
+      }
+    }
+  }
+
+  /// Shape: the oracle's sample — random flights and delivery orders, enough to cover every fragment
+  /// count up to the bound many times over.
+  const ORACLE_CASES: usize = 2_000;
+
+  /// A flight of `len` bytes whose content is a function of its position and `salt`, so two flights
+  /// of one length differ.
+  fn flight_of(len: usize, salt: u8) -> Vec<u8> {
+    (0..len)
+      .map(|i| {
+        u8::try_from(i % 251)
+          .unwrap_or(0)
+          .wrapping_mul(31)
+          .wrapping_add(salt)
+      })
+      .collect()
+  }
+
+  /// The step at which the last not-yet-seen fragment index appears in `order`.
+  fn last_new_index(order: &[usize], count: usize) -> usize {
+    let mut seen = vec![false; count];
+    let mut remaining = count;
+    for (step, &which) in order.iter().enumerate() {
+      if !seen[which] {
+        seen[which] = true;
+        remaining -= 1;
+        if remaining == 0 {
+          return step;
+        }
+      }
+    }
+    order.len().saturating_sub(1)
+  }
+
+  /// A shuffled delivery order of `count` fragments with each sometimes duplicated.
+  fn shuffled_with_duplicates(rng: &mut Rng, count: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = Vec::new();
+    for i in 0..count {
+      order.push(i);
+      if rng.below(2) == 0 {
+        order.push(i);
+      }
+    }
+    for i in (1..order.len()).rev() {
+      order.swap(i, rng.below(i + 1));
+    }
+    order
+  }
+
+  /// Do: fragment a flight at a random stream start, push its fragments in an arbitrary order with
+  /// duplicates. Expect: every fragment fits the path floor; the flight comes back exactly, once, at the
+  /// step the last new byte arrived, and the stream advanced by the flight. Oracle over random flights
+  /// and orders.
+  #[test]
+  fn a_flight_reassembles_from_its_fragments_in_any_order_with_duplicates() {
+    let mut rng = Rng(0x51A7_u64 ^ 0x9E37_79B9_7F4A_7C15);
+    for case in 0..ORACLE_CASES {
+      let len = 1 + rng.below(MAX_FLIGHT_BYTES);
+      let flight = flight_of(len, u8::try_from(case % 200).unwrap_or(0));
+      let fragments = fragment(&flight, 0).expect("within the bound");
+      assert!(
+        fragments.iter().all(|f| f.len() <= MIN_DATAGRAM_BYTES),
+        "every fragment fits the path floor"
+      );
+      assert_eq!(
+        fragments.len(),
+        len.div_ceil(FRAGMENT_PAYLOAD),
+        "as many fragments as needed"
+      );
+      let order = shuffled_with_duplicates(&mut rng, fragments.len());
+      let (delivered, consumed) = deliver(&fragments, &order);
+      assert_eq!(
+        delivered.as_deref(),
+        Some(flight.as_slice()),
+        "the flight came back exactly"
+      );
+      assert_eq!(consumed, len, "the stream advanced by the flight");
+    }
+  }
+
+  /// Delivers `fragments` in `order` to a fresh reassembler, asserting each step's verdict against the
+  /// step the last new byte arrives; returns the flight delivered and the stream consumed.
+  fn deliver(fragments: &[Vec<u8>], order: &[usize]) -> (Option<Vec<u8>>, usize) {
+    let complete_at = last_new_index(order, fragments.len());
+    let mut reassembler = Reassembler::new();
+    let mut delivered: Option<Vec<u8>> = None;
+    for (step, &which) in order.iter().enumerate() {
+      match reassembler.push(&fragments[which]) {
+        Reassembly::Flight(f) => {
+          assert!(delivered.is_none(), "the flight is delivered once");
+          assert_eq!(
+            step, complete_at,
+            "delivered when the last new byte arrived"
+          );
+          delivered = Some(f);
+        }
+        Reassembly::Pending => assert!(step < complete_at, "pending only before completion"),
+        Reassembly::Repeat => assert!(step > complete_at, "a repeat only after completion"),
+        Reassembly::RepeatRest => assert!(step > complete_at, "a repeat only after completion"),
+        Reassembly::Malformed => panic!("a well-formed fragment was refused at step {step}"),
+      }
+    }
+    (delivered, reassembler.consumed())
+  }
+
+  /// A conversation of consecutive flights on one stream, each starting where the last ended, with
+  /// the peer's retransmit of a consumed flight in between: the retransmit is a `Repeat` (its fragments
+  /// name a start behind the consumed prefix), and a stale fragment of the earlier flight arriving
+  /// *after* the next flight began is a `Repeat` too — never written into the next flight, which comes
+  /// back intact. This is the case the per-flight offset scheme got wrong.
+  #[test]
+  fn consecutive_flights_and_a_stale_fragment_of_the_previous_one() {
+    let first = flight_of(1500, 1);
+    let second = flight_of(1500, 2); // the same length as the first, the confusable case
+    let mut reassembler = Reassembler::new();
+    let f1 = fragment(&first, 0).unwrap();
+    let f2 = fragment(&second, first.len()).unwrap();
+    let mut last = Reassembly::Pending;
+    for frag in &f1 {
+      last = reassembler.push(frag);
+    }
+    assert_eq!(last, Reassembly::Flight(first.clone()));
+    // The whole first flight again: one repeat, on its first fragment, however many fragments it has.
+    for (index, frag) in f1.iter().enumerate() {
+      let expected = if index == 0 {
+        Reassembly::Repeat
+      } else {
+        Reassembly::RepeatRest
+      };
+      assert_eq!(reassembler.push(frag), expected);
+    }
+    // The second flight begins; a stale fragment of the first arrives in the middle of it.
+    assert_eq!(reassembler.push(&f2[0]), Reassembly::Pending);
+    assert_eq!(
+      reassembler.push(&f1[1]),
+      Reassembly::RepeatRest,
+      "the stale fragment is placed by its start"
+    );
+    assert_eq!(
+      reassembler.push(&f2[1]),
+      Reassembly::Flight(second),
+      "the second flight is intact"
+    );
+    assert_eq!(reassembler.consumed(), 3000);
+  }
+
+  /// A fragment header with the given fields and no payload.
+  fn header(start: u16, within: u16, total: u16) -> Vec<u8> {
+    let mut d = vec![FRAGMENT_TAG];
+    d.extend_from_slice(&start.to_le_bytes());
+    d.extend_from_slice(&within.to_le_bytes());
+    d.extend_from_slice(&total.to_le_bytes());
+    d
+  }
+
+  /// Hostile fragments at the header: a truncated header, a total past the bound, a zero total, an
+  /// offset+payload past the total, and a flight ahead of the stream are each `Malformed` — dropped,
+  /// never a panic.
+  #[test]
+  fn hostile_fragment_headers_are_malformed_never_a_fault() {
+    let mut reassembler = Reassembler::new();
+    assert_eq!(
+      reassembler.push(&[FRAGMENT_TAG, 0]),
+      Reassembly::Malformed,
+      "truncated header"
+    );
+    assert_eq!(
+      reassembler.push(&header(0, 0, u16::MAX)),
+      Reassembly::Malformed,
+      "total past the bound"
+    );
+    assert_eq!(
+      reassembler.push(&header(0, 0, 0)),
+      Reassembly::Malformed,
+      "a zero total"
+    );
+    let mut past = header(0, 10, 4);
+    past.extend_from_slice(&[1, 2, 3, 4]);
+    assert_eq!(
+      reassembler.push(&past),
+      Reassembly::Malformed,
+      "offset past total"
+    );
+    let mut ahead = header(100, 0, 4);
+    ahead.extend_from_slice(&[1, 2, 3, 4]);
+    assert_eq!(
+      reassembler.push(&ahead),
+      Reassembly::Malformed,
+      "a flight ahead of the stream"
+    );
+  }
+
+  /// Hostile fragments against the stream: a retransmit that straddles the consumed prefix, and a
+  /// fragment naming a different total mid-flight, are `Malformed` — the flight in progress is kept.
+  #[test]
+  fn hostile_fragments_against_the_stream_are_malformed_never_a_fault() {
+    let mut reassembler = Reassembler::new();
+    let flight = flight_of(100, 9);
+    for frag in fragment(&flight, 0).unwrap() {
+      let _ = reassembler.push(&frag);
+    }
+    assert_eq!(reassembler.consumed(), 100);
+    let mut straddle = header(50, 0, 100);
+    straddle.push(0);
+    assert_eq!(
+      reassembler.push(&straddle),
+      Reassembly::Malformed,
+      "a retransmit straddling the prefix"
+    );
+    let next = fragment(&flight_of(1500, 3), 100).unwrap();
+    assert_eq!(reassembler.push(&next[0]), Reassembly::Pending);
+    let mut other_total = header(100, 0, 999);
+    other_total.push(0);
+    assert_eq!(
+      reassembler.push(&other_total),
+      Reassembly::Malformed,
+      "a different total mid-flight"
+    );
+    assert_eq!(
+      reassembler.push(&next[1]),
+      Reassembly::Flight(flight_of(1500, 3)),
+      "the flight in progress was kept"
+    );
+  }
+
+  /// A flight under the path floor (the common case) is one fragment, routes as a fragment, and costs
+  /// one datagram — the normal handshake's path, unchanged in datagram count; a flight past the bound
+  /// or past the stream's range is refused before a byte leaves.
+  #[test]
+  fn a_small_flight_is_one_fragment_and_an_oversize_one_is_refused() {
+    let flight = vec![0x0bu8; 700];
+    let fragments = fragment(&flight, 0).unwrap();
+    assert_eq!(fragments.len(), 1, "one fragment under the path floor");
+    assert!(is_fragment(&fragments[0]), "and it routes as a fragment");
+    let mut reassembler = Reassembler::new();
+    assert_eq!(reassembler.push(&fragments[0]), Reassembly::Flight(flight));
+    assert!(
+      fragment(&vec![0u8; MAX_FLIGHT_BYTES + 1], 0).is_none(),
+      "past the flight bound"
+    );
+    assert!(
+      fragment(&[0u8; 10], MAX_STREAM_BYTES - 5).is_none(),
+      "past the stream's range"
+    );
+    assert!(
+      fragment(&[], 0).unwrap().is_empty(),
+      "an empty flight sends nothing"
+    );
+  }
+}

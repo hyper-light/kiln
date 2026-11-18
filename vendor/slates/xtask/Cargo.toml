@@ -1,0 +1,63 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+# `cargo xtask` runs this binary; the release lane runs `--bin release` (src/bin/release.rs).
+default-run = "xtask"
+description = "Workspace tasks: the structural test (R1/R2 by construction) and the literal check (R3)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The ratchet task keys ceilings by the machine identity the profile computes.
+slates-machine = { workspace = true }
+# ratchets.toml is read and rewritten by the ratchet task.
+toml = { workspace = true }
+# The conformance harness: the pure records, parsers and matrix live in the crate; this tool
+# mounts, runs and traces (docs/wip/conformance.md).
+slates-conformance = { workspace = true }
+# The Linux conformance mount obtains the same host-mount authority as the CLI (§4.13).
+slates-client = { workspace = true }
+# Derive the small traced workload's quota from its inode footprint (§4.2 admission).
+slates-vfs = { workspace = true }
+# The pinned upstream suite sources are verified by SHA-256 (aws-lc-rs) before they are built.
+aws-lc-rs = { workspace = true }
+# The workload manifests digest every file with BLAKE3.
+blake3 = { workspace = true }
+# The KIND lane mints self-signed fleet identities, as the fleet tests mint theirs (kind.rs).
+rcgen = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The Linux grant path reopens the anchor's memfd handoff and makes it inheritable.
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# The Windows conformance suites' C (the WinFsp fsx port, winfstest's driver) is built with MSVC's cl.exe, found with
+# its environment as every build script finds it (`cc::windows_registry`), so the lane needs no developer prompt.
+cc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The hermeticity tracer names the daemon's own socket node by the route's own path function (A-161).
+slates-ipc = { workspace = true }
+
+[dev-dependencies]
+# Exercise the harness's mount source against the real daemon without a privileged kernel mount.
+slates-server = { workspace = true }
+
+# xtask is a development tool, not shipped code: it reads sources and runs cargo, so the
+# workspace lints that forbid std::fs and panics are relaxed here, with the reasons in main.rs.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"

@@ -1,0 +1,31 @@
+[package]
+name = "slates-sdk-node"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = "https://github.com/hyper-light/slates"
+description = "The TypeScript/Node SDK (§2.3, D-19; Phase 5): a napi-rs addon over the typed `slates-client`, exposing the lifecycle verbs and mapping typed refusals to JS errors. Async-primary: the `AsyncClient` JS wrapper (`async.mjs`) resolves each verb's Promise by the completion fd's readiness (a libuv-polled `net.Socket`, uv_poll, no tokio); the sync `Client` on the addon is the thin blocking facade."
+
+[lib]
+# The Node addon is a cdylib; napi names the loadable `.node` from it.
+crate-type = ["cdylib"]
+
+[features]
+# Forwards blake3's pure-Rust backend so the addon cross-lints for a Windows target from a host with
+# no MSVC assembler (the napi build on the native Windows runner uses the SIMD C path). Off by default.
+pure-hash = ["slates-client/pure-hash"]
+
+[dependencies]
+slates-client = { workspace = true }
+# The napi-rs binding (D-19: "napi-rs SDK with uv_poll completion"). napi 2 + the derive macros;
+# pure Rust, so no C toolchain and no cross-compile C surface.
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
+
+[lints]
+workspace = true

@@ -1,0 +1,558 @@
+# The unsafe budget (Phase 0, 2026-09-05; Ada: "we SHOULD find a way to minimize unsafe blocks").
+#
+# `cargo xtask unsafe` counts `unsafe` blocks, functions and impls in each shipped crate's sources
+# (comments and tests excluded) and fails when a crate exceeds its budget; `--tighten` lowers a
+# budget to the current count. A budget only goes down. Raising one is an edit here that names the
+# new site and its reason. What each crate still holds, as of the counts below:
+#
+# slates-machine (50): Apple sysctl, mach host statistics and IOKit power queries, for which no
+#   safe wrapper exists (7 sites, one helper each); the macOS thread-affinity hint (1); the
+#   file-backed map of the profile segment (1); the Win32 facts, probes and section (the rest,
+#   compiled only for Windows) — raised 43 → 44 on 2026-09-14 for `GetProcessAffinityMask`, the
+#   mask the core matrix puts back on the calling thread after it pinned it (a spawned daemon
+#   inherited the one-core mask: docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md).
+#   Raised 44 → 45 on 2026-09-17 for clock::monotonic_ns's QueryInterruptTimePrecise output pointer:
+#   one Win32 FFI query with no safe wrapper, a common boot origin for cross-process heartbeats.
+#   Raised 45 → 49 on 2026-09-22 for the wake probe (`wake.rs`, docs/bugs/2026-09-22-wake-probe-mixes-two-
+#   events-and-reports-an-unconverged-tail.md), which confirms a waiter asleep and learns each thread's CPU:
+#   macOS `pthread_cpu_number_np`, `pthread_mach_thread_np` and `thread_info` (3) and Windows
+#   `GetCurrentProcessorNumber` (1) — FFI with no safe wrapper; Linux uses rustix and `/proc` (none).
+#   Corrected 49 → 50 on 2026-10-01 (AUD-29-31), no new site: the shared-memory map of the profile segment's
+#   macOS/Linux object (`segment.rs` platform module, `MmapOptions::map_mut`) had gone uncounted, because the
+#   scanner took that production module for a test module after a `#[cfg(test)] fn` above it.
+#   Raised 50 → 51 on 2026-10-19 for `bench::involuntary_switches` (`bench.rs`): one `libc::getrusage`
+#   with `RUSAGE_SELF` into a zeroed, fully sized `rusage` this crate owns. It reads `ru_nivcsw`, so a probe
+#   that overran its bound can say whether the scheduler took the thread away instead of reporting the
+#   overrun as the machine's cost — the busy-machine discriminator a timing gate needs. rustix 1.1.4 has no
+#   `getrusage` and no `Rusage` of any kind, so there is no safe wrapper to reach for; the non-Unix arm is a
+#   paired `#[cfg(not(unix))]` returning `None` rather than a zero, and holds no `unsafe`.
+# slates-mem (22): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
+#   Unix) (4); the shared memory object of §4.7 (`shared.rs`, added 2026-09-05 for Phase 2):
+#   the file-backed map of a memory object (1), the descriptor a child inherits (1), the one
+#   atomic word view both objects share (`word_view`, 1; it replaced the two per-width views
+#   2026-09-26), and the Windows section (create, open, view, drop, the two byte views and the
+#   lock: 8); the sparse object (2026-09-26, the anchor segment and content object on a
+#   `SEC_RESERVE` section — CI run 36202635768's 167 GB layout refused 1450 on a 16 GB runner):
+#   `GetSystemInfo` for the commit granule (1), `VirtualAlloc(MEM_COMMIT)` of a range (1), and the
+#   two committed-range views (2).
+#   Lock on fault (`region.rs` `lock_map`, 2026-10-03, D-12): one `rustix::mm::mlock_with(ONFAULT)` over a map's
+#   own live range (1, Linux only) — memmap2's safe `lock` is a plain `mlock`, which faults the whole range in under
+#   the process's memory-map lock and stalled every shard behind one strict volume's arena lock
+#   (docs/bugs/2026-10-03-locking-an-arena-stalled-every-shard-on-the-memory-map-lock.md). 23 → 24.
+#   Congruent placement of a shared object's mapping (`shared.rs` `Mapped`, 2026-10-20, §4.6 L1): a huge page
+#   behind a memory object is addressed twice over — by where it sits in this process and by where it sits in
+#   the object — and the kernel forms one only where the two agree, so the window is now placed instead of left
+#   to `mmap`. Measured on Linux 6.12.76 (aarch64): 13 of 16 objects came back incongruent, `MADV_COLLAPSE` over
+#   an incongruent span is refused `EINVAL`, and the DAX sandbox was reserved for 0 or for 8 of 8 volumes by
+#   address luck alone (docs/bugs/2026-10-20-the-dax-sandbox-was-reserved-by-mmap-address-luck.md). memmap2
+#   offers no placement, so the mapper is rustix: the `PROT_NONE` reservation (1), the `MAP_FIXED` of the object
+#   over the congruent address inside it (1), the `munmap` of that reservation when the placement is refused (1)
+#   and again in `Drop` (1), the huge-page advice the placement finally makes worth asking (1), and the two byte
+#   views the owner lends (`Deref`, `DerefMut`: 2), less the memmap2 map they replace (−1): +6. Locking moved
+#   with it, since a mapping is its bytes whoever made it (`region.rs` `lock_bytes_whole`/`lock_bytes_range`):
+#   the whole-map lock on fault and its macOS arm (2) and the range lock with `MADV_DONTDUMP` (2), less the two
+#   that took a memmap2 map and are now thin callers (−2): +2. 37 → 45.
+# slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
+#   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
+#   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
+#   kqueue read-filter `kevent` (unsafe by signature, one change record, 1) and the epoll
+#   `BorrowedFd::borrow_raw` of a live socket for the `epoll_ctl` that arms either interest (1 — the
+#   readable and writable registrations share one helper since 2026-09-14, when the epoll re-add
+#   defect was fixed: docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md; 49 → 48); the TCP
+#   write-readiness registration (§4.6, added 2026-09-09 for the async loopback server): the kqueue
+#   write-filter `kevent` (1).
+#   The Windows socket stack (added 2026-09-09, compiled only for Windows — the daemon and the
+#   QUIC fleet transport run there; TCP stays macOS/Linux for the NFS mount): the **AFD readiness
+#   reactor** `afd.rs` that gives the completion-native IOCP driver edge readiness the way wepoll/mio
+#   do — the ntdll FFI windows-sys does not wrap (`NtCreateFile` of `\Device\Afd`, `NtDeviceIoControlFile`
+#   for `IOCTL_AFD_POLL`, `RtlNtStatusToDosError`, `CloseHandle` on drop), `WSAIoctl(SIO_BASE_HANDLE)`
+#   for the base socket, a zeroed `OVERLAPPED` poll block, and the `Box::into_raw`/`from_raw` that leak
+#   one block into the kernel per poll and reclaim it on completion (11); the **Winsock 2 datagram
+#   seam** `netsys.rs` (the platform UDP arm behind the cross-platform socket) — `WSAStartup`, a zeroed
+#   `WSADATA`, `WSAGetLastError`, `closesocket` on drop, `socket`/`ioctlsocket(FIONBIO)`/`bind`/
+#   `getsockname`/`recvfrom`/`sendto`, and the `S_addr` address-union read (14); and the IOCP driver's
+#   `iocp.rs` AFD wiring — associating the AFD device with the port, arming a poll, and reclaiming a
+#   delivered block (3). All are Win32/ntdll FFI without a safe wrapper, each with a `// SAFETY:` line.
+#   The simulation clock (`sim.rs`, 2026-09-16): the runtime holds the clock's allocation as a raw
+#   pointer and frees it in `Drop` with `Box::from_raw` after the contexts are reclaimed (1) — a `Box`
+#   field's move was a unique retag that invalidated the drivers' shared borrows under Stacked Borrows
+#   (Miri, the differential test); the `&'static` the drivers hold is derived from that pointer (1,
+#   the site the box version already had). 65 → 66.
+#   io_uring socket readiness (`uring.rs` `arm_poll`, 2026-09-16): one `unsafe` submission-queue push
+#   of a `PollAdd` SQE (no buffer; the fd is borrowed by number for the single submission), the same
+#   shape `arm_kick` already had. `register_readable`/`register_writable` were stubs returning
+#   `DriverRefused`, so async TCP and the UDP transport were dead the first time they awaited readiness
+#   on io_uring (docs/bugs/2026-09-16-io-uring-driver-carries-no-socket-readiness.md). 66 → 67.
+#   The long-poll attribution (`attribution.rs`, 2026-09-25, §4.3 A-31): Linux's per-thread voluntary
+#   context switches through `getrusage(RUSAGE_THREAD)` — rustix offers no `getrusage`, so one libc
+#   call over a zeroed `rusage` this frame owns (1, Linux only). The ceiling had the room (58 of 59).
+#   Don't-fragment on every datagram socket (`netsys.rs` `set_dont_fragment`, 2026-09-28, RFC 8899 §3
+#   for path MTU discovery): one `setsockopt(IP_DONTFRAG)` on macOS, which rustix does not wrap (1), and
+#   one `setsockopt(IP_DONTFRAGMENT)` on Windows (1); Linux uses rustix's safe `set_ip_mtu_discover`.
+#   59 → 61.
+#   The io_uring non-blocking harvest (`uring.rs` `harvest_ready`, 2026-09-26, §4.3): one raw
+#   `io_uring_enter(GETEVENTS, min_complete = 0)` with no argument pointer — the crate's safe helpers set
+#   GETEVENTS only when waiting for a completion, and a zero-timeout wait for one slept the shard
+#   0.3–1.0 ms per harvest (docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md). 59 of 59.
+#   A shard's CPU clock read from another thread (`thread_clock.rs`, 2026-10-03, §4.14): Linux
+#   `pthread_getcpuclockid` of the calling thread and `clock_gettime` of that clock (2), macOS `mach_thread_self`, a
+#   zeroed `thread_basic_info` and `thread_info` (3); rustix wraps neither a thread's CPU clock id nor Mach. Windows
+#   `GetCurrentThreadId`, `OpenThread` with query rights, `GetThreadTimes`, `QueryThreadCycleTime` and the handle's
+#   `CloseHandle` (5), Win32 without a safe wrapper. An observation counts its budget in the observed shard's own time,
+#   so a starved shard is not read as wedged (docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md).
+#   63 → 73.
+#   The held NFS connection (`tcp.rs`, 2026-10-06, §4.6 A-113): one integer `setsockopt` for the receive and send
+#   low-water marks (`SO_RCVLOWAT`, `SO_SNDLOWAT`), which rustix does not wrap (1) — the send mark is what makes a send
+#   of a whole record all-or-nothing on macOS; and one `getsockopt` of the first byte of the kernel's TCP connection
+#   record (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`) for the peer's close, which a peeking reader cannot see
+#   behind an unfinished record (1). 73 → 75.
+#   TCP on Windows (`netsys.rs`'s stream half, 2026-10-26, `docs/wip/platforms.md` gap 1): the Winsock 2 stream calls,
+#   none with a safe wrapper: `WSASocketW` with inheritance off, one `setsockopt` helper for every integer option
+#   (`TCP_NODELAY`, `SO_EXCLUSIVEADDRUSE`, the buffers, `SO_RCVLOWAT`), `SetHandleInformation` for an accepted or
+#   adopted socket's inheritance, `listen`, `accept`, `connect`, one `recv` helper for read, peek and discard, `send`,
+#   the gathering `WSASend`, `WSAIoctl(SIO_TCP_INFO)` for the peer's close, `shutdown`, and the
+#   `OwnedSocket::from_raw_socket` that hands a socket over (12). The Unix stream calls moved from `tcp.rs` into the
+#   seam unchanged in number. 84 → 96.
+# slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
+# slates-wire-derive (0).
+# slates-base (11): rustix marks kevent unsafe because the kernel fills the output list; one
+#   registration and one drain of the macOS/BSD directory watcher (2); the Windows fingerprint
+#   through the stable Win32 file-information calls (2), since the standard library's handle
+#   metadata is unstable on 1.98 (its two zeroed records are now built as literals); and the
+#   Windows contained opens (AUD-29-62, 2026-10-01: 6) — `NtCreateFile` relative to a retained
+#   directory handle, which no safe wrapper offers; adopting the handle it returns; the
+#   attribute-and-tag query on the opened object; the directory enumeration of a retained handle;
+#   `FSCTL_GET_REPARSE_POINT` on a link's own handle; and the NT status's Win32 translation. Since
+#   2026-11-06 (A-227: 11) also `QueryDosDeviceW` in `windows.rs`'s `drive_is_own`, which names a base path's
+#   drive by the object manager, never the volume, so a base on this daemon's own WinFsp drive is refused
+#   before any request reaches it; no safe wrapper offers the call. The reparse read is shared with the
+#   root path's walk (`reparse_target`), so it is still one site.
+# slates-vfs (0): the volume core is safe Rust over the arenas and slabs of slates-mem; the block
+#   layout is read and written through byte slices, never a cast.
+# slates-anchor (6): the segment is byte slices and the atomic views of slates-mem; the Windows
+#   job object that ends the daemon with the anchor (`supervise.rs`, added 2026-09-05 with the
+#   CLI of Phase 2 task 5): create, the zeroed limit record, set the kill-on-close limit, assign
+#   the child, and the two closes (6), compiled only for Windows.
+# slates-ipc (49): the macOS wait-on-address and wake-by-address calls libc exposes without a
+#   safe wrapper (`wake.rs`), each on a live word of a shared mapping (2); the Linux rendezvous
+#   adopting the region descriptor it duplicated for the handoff before sending it (1) and
+#   borrowing the shard's leaked kick descriptor to duplicate it for the client (1); and the
+#   Windows named-Event wake (`wake.rs`, added 2026-09-09, compiled only for Windows): the four
+#   Win32 calls windows-sys exposes without a safe wrapper — `CreateEventW` to create-or-open the
+#   named auto-reset Event, `SetEvent` and `WaitForSingleObject` on the handle it owns, and
+#   `CloseHandle` on drop (4). The consumer-capability delivery channel (`delivery.rs`, added
+#   2026-09-14, §4.13 / GAP-A9-9 — the inherited descriptor): on Unix, `pre_exec` clearing
+#   close-on-exec on the one descriptor in the forked child (unsafe by signature; the closure is one
+#   async-signal-safe `fcntl`) (1), borrowing the harness-named number for the `fstat` that checks it
+#   before adoption (1), and adopting it once checked (1); on Windows, compiled only there, the Win32
+#   calls windows-sys exposes without a safe wrapper — `CreatePipe` (the captured output), `WriteFile`,
+#   `CloseHandle` on drop, `DuplicateHandle` for the duplicates (the twin and the inheritable pair that
+#   lives only across the spawn),
+#   `GetStdHandle`, the two `InitializeProcThreadAttributeList` calls (size query, init),
+#   `UpdateProcThreadAttribute`, `DeleteProcThreadAttributeList` on drop, the two zeroed records
+#   (`STARTUPINFOEXW`, `PROCESS_INFORMATION`), `CreateProcessW` itself, `WaitForSingleObject`,
+#   `GetExitCodeProcess`, `TerminateProcess`, `SetHandleInformation`, `GetFileType`, `PeekNamedPipe`,
+#   `ReadFile` for the record, the `ReadFile` loop that drains a captured output with the
+#   `GetLastError` that tells its end of stream, and the two `GetLastError` reads beside the rest;
+#   and, since 2026-09-28 (`docs/bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md`),
+#   the named pipe whose name identifies the channel — `GetProcessTimes` for the name's process
+#   creation time, `CreateNamedPipeW` and `CreateFileW` for its two ends, `SetNamedPipeHandleState`
+#   for the record's non-blocking write — and the take's checks before it adopts anything —
+#   `GetHandleInformation`, `CompareObjectHandles`, `GetFileInformationByHandleEx` (30). The standard
+#   library's `Command` cannot
+#   restrict inheritance on Windows (the handle-list attribute is unstable on the pinned toolchain), so
+#   the spawn is made here like `slates-rt`'s AFD reactor: from the headers, each call with its
+#   invariant stated. The client's exit watch on the daemon's process (`exit_watch.rs`, added
+#   2026-10-01, AUD-29-20 — a killed daemon's bootstrap object outlives it, so its start stamp alone
+#   read "alive"): on macOS, rustix's `kevent` (unsafe by signature for its user-data pointer) to
+#   register `EVFILT_PROC`/`NOTE_EXIT` and to read it with a zero timeout (2); on Windows, compiled only
+#   there, `OpenProcess(SYNCHRONIZE)`, adopting its handle as an `OwnedHandle`, and
+#   `WaitForSingleObject` with a zero timeout (3). The anchor-held rendezvous (`rendezvous.rs` `adopt`, 2026-10-06,
+#   A-114): on Linux, borrowing the listening socket the anchor handed over by number to duplicate it close-on-exec,
+#   the shape the segment handoff already has (1). 46 → 47. The Shards stream's socket route (`route.rs`, 2026-10-24,
+#   A-161, compiled only for macOS): `confstr(_CS_DARWIN_USER_TEMP_DIR)` naming the user's own temporary directory,
+#   which libc exposes without a safe wrapper, into a buffer whose length it is given (1). 47 → 48. A client handing
+#   a Shards stream end to a program at the number it names (`stream.rs` `exec_with`, 2026-10-24, A-161, Unix):
+#   `pre_exec` (unsafe by signature) whose closure makes one `dup2` in this process just before `execvp`, the shape of
+#   the delivery channel's `fcntl` above (1). 48 → 49.
+# slates-server (5): the Windows liveness probe of a client's
+#   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
+#   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
+#   NFS-listener descriptor (`daemon.rs`, added 2026-09-09 for the anchor-held listener, §4.6):
+#   `OwnedFd::from_raw_fd` on the number the anchor handed over across the spawn (1, Unix only);
+#   and the daemon adopting a fleet node's inherited serve sockets (`fleet.rs` `adopt_inherited`,
+#   added 2026-09-28 with the anchor-held fleet ports, §4.8): the same `OwnedFd::from_raw_fd` on each
+#   number in `SLATES_ANCHOR_FLEET_SERVE`, one site called per plane (1, Unix only).
+#   The daemon reading Windows Error Reporting's `LocalDumps` setting (`local_dumps.rs`, 2026-11-07, A-239): one
+#   `RegGetValueW` of a DWORD into a local, unprivileged (1, Windows only). 7 → 8.
+# slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
+# slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
+# slates-client (0): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
+#   same-kernel zero-copy read (§4.6, A-135): `MappedRead` mapped the daemon's arena block into this process
+#   (rustix `mmap`, `munmap`, and `slice::from_raw_parts` over the mapped bytes). Lowered 3 → 0 on 2026-10-25
+#   (A-171): the map is slates-mem's `PeerView` now, reusing the placed `mmap` and the atomic loads of the DAX
+#   object, so the racy-memory rule and its unsafe live in one crate; the slice was unsound once the daemon
+#   kept writing the copy.
+# slates-cli (4): the stop flag's handlers (`signal.rs`): `signal(2)` for SIGINT and SIGTERM on
+#   Unix (1), and on Windows the console control handler, an `unsafe extern` function by
+#   signature and its registration (2); the launcher's `unshare_unsafe` (`exec.rs`, Linux),
+#   marked unsafe because it changes every thread's namespace, sound in the single-threaded
+#   pre-exec launcher (1); and the macOS mount (`mount.rs`, added 2026-09-26, §4.6 A-34):
+#   `mount(2)` with the XDR NFS arguments, which rustix does not wrap on macOS (1) — moved to
+#   slates-api on 2026-11-18 (A-278), lowering this crate 7 → 6.
+# slates-api (1): the macOS mount moved from slates-cli (A-278, 2026-11-18): `mount(2)` with the XDR
+#   NFS arguments, which rustix does not wrap on macOS (1); the same block, not a new site.
+# slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
+#   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
+#   mount (Unix, added later) will carry their own budgeted sites.
+# slates-land (4): the libc calls rustix does not wrap, each on a descriptor the writer owns:
+#   macOS fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
+#   renameatx_np(RENAME_SWAP, RENAME_EXCL) as the exchange and the rename that replaces nothing;
+#   and (raised 3 -> 4 on 2026-10-10, A-130) Linux sync_file_range(SYNC_FILE_RANGE_WRITE) as a
+#   file's write-out, measured 1.5-2.6x faster a file with the concurrent barrier, quiet and busy.
+#   the Winsock `getsockopt(SO_RCVBUF)` of a live socket (§4.10a, added 2026-09-10 for the
+#   demultiplexer's per-session queue sizing; Win32, unsafe by signature, 1).
+#
+# slates-archive (0): the archive format is byte buffers written and read in field order
+#   through a sequential reader/writer (`wire.rs`), never a cast; content-addressed and verified
+#   by BLAKE3.
+
+[budget]
+slates-machine = 70
+# 2026-11-08 (+7, the start judgment per thread): another process's threads, each one's CPU (`process_clock.rs`,
+#   `busiest_of` and `busiest_thread_ns`): on macOS `proc_pidinfo(PROC_PIDLISTTHREADS)` and `proc_pidinfo
+#   (PROC_PIDTHREADINFO)` (the thread record built field by field, not zeroed); on Windows `CreateToolhelp32Snapshot`,
+#   `Thread32First`, `Thread32Next`, `OpenThread` with the limited query right and `GetThreadTimes`. Linux reads `/proc`
+#   (none). None has a safe wrapper.
+# 2026-11-07 (+2, compiled only for Linux): the process clock reads the whole process's CPU-time clock,
+#   `clock_getcpuclockid` and `clock_gettime`; `/proc/<pid>/schedstat`, which it read before, is the main thread's alone.
+#   Neither call has a safe wrapper in rustix.
+# 2026-11-07 (+8, the anchor's start judgment): another process's CPU clock (`process_clock.rs`): on macOS the zeroed
+#   `proc_taskinfo`, `proc_pidinfo(PROC_PIDTASKINFO)` and `mach_timebase_info` (declared here, as `facts.rs` declares
+#   `mach_host_self`); on Windows `OpenProcess` with the limited query right, `GetProcessTimes`, `QueryProcessCycleTime`
+#   and the handle's `CloseHandle`. None has a safe wrapper.
+# 2026-11-04 (+2, A-205, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
+#   `K32GetProcessMemoryInfo`, which has no safe wrapper.
+#   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):
+#   the two plain copies across the mapping's raw pointer (`copy_out`, `copy_in`), the two racy copies
+#   through `AtomicU8` for seqlock payloads (`racy_out`, `racy_in`), and `ExclusiveObject::new`, the one
+#   constructor that carries the single-accessor promise a region's arena needs; the Windows sparse
+#   object's two committed-range views are gone (-2): no reference into a mapping is formed any more.
+#   Raised 22 → 23 on 2026-10-03 for A-64 (content resident once in anchor RAM): `ExclusiveObject::open_range`,
+#   the constructor that carries the same single-accessor promise for one shard's arena range of the content
+#   object. Its maps reuse the existing `mmap` and `MapViewOfFile` sites (now taking an offset) and the sparse
+#   section's commit, so no new block.
+# 2026-10-05 (+2, A-92 sealing root): `SparseObject::lock_range` locks the one page the node's sealing root lives on
+# (the anchor's supervision block) without locking the whole segment: Unix `mlock` over a sub-range of the map
+# (`region::lock_map_range`; memmap2 locks only whole maps, and its `advise_range` covers `MADV_DONTDUMP` safely) and
+# Windows `VirtualLock` over a sub-range of the view. Each is one OS call with no safe wrapper for a range.
+# 2026-10-06 (+4, a strict volume locks only its own content —
+# `docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`): `region::os::lock_slice` and `unlock_slice`,
+# `mlock`/`munlock` over one block of a region (Unix, 2) and `VirtualLock`/`VirtualUnlock` over it (Windows, 2). A block
+# is the unit a strict volume locks; memmap2 locks only whole maps and has no unlock of a range.
+# 2026-10-06 (+2, A-105, an idle shard gives its free content pages back —
+# `docs/bugs/2026-10-06-a-deleted-files-ram-never-went-back-to-the-os.md`): `region::os::discard_slice`
+# (`MADV_REMOVE`/`MADV_DONTNEED` over a free block's whole pages, Linux, 1) and `shared::platform::Inner::discard`
+# (`MADV_REMOVE` over a sparse object's emptied write-log pages, Linux, 1). rustix's `madvise` is unsafe because the
+# advice replaces bytes; `fallocate(PUNCH_HOLE)` is the safe call but a file write, allowed only in `slates-land` (R1).
+# 2026-10-06 (+4, A-110, the macOS give-back): `region::os::discard_slice` and `reuse_slice` on macOS
+# (`MADV_FREE_REUSABLE` over a free block's whole pages and `MADV_FREE_REUSE` before it is handed out again, 2; rustix
+# has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
+# (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
+# give-back's tests observe what macOS counts.
+slates-mem = 63
+# 2026-11-04 (+2, A-205, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
+#   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
+#   `Inner::discard`). The call has no safe wrapper.
+# 2026-10-26 (+1, §4.6 A-180, a Shards DAX object on Windows, `dax_object.rs` compiled only for Windows): the object is
+#   a reserved section committed a range at a time, `VirtualAlloc(MEM_COMMIT)` over a range's fresh view (1). Its view
+#   at an offset shares the map's one `MapViewOfFile` site, and the handed duplicate and the peer's read-only one share
+#   one `DuplicateHandle` and its ownership, so the section's other calls are the peer section's sites above.
+# 2026-10-25 (+11, §4.6 A-175, the Windows direct map's peer section, `dax_object.rs` compiled only for Windows): there is
+#   no safe wrapper for a section under a security descriptor. `CreateFileMappingW` under the descriptor, the SDDL
+#   parsed into one and freed (`ConvertStringSecurityDescriptorToSecurityDescriptorW`, `LocalFree`), and the section's
+#   handle owned (4); the view mapped, asked its extent and unmapped (`MapViewOfFile`, `VirtualQuery`,
+#   `UnmapViewOfFile`, 3); the read-only duplicate a peer is handed and its ownership (`DuplicateHandle`,
+#   `from_raw_handle`, 2); the page size (`GetSystemInfo`, 1) and the last error (1). The atomic loads and stores are
+#   the shared racy-view trait's, moved out of the Unix module so both platforms keep one copy.
+# 2026-10-25 (+0, §4.6 A-171, the direct map's sealed copy): `PeerObject` and the client's read-only `PeerView` reuse the
+#   placed `mmap` (which now takes the mapping's access, read-write or read alone) and the two atomic views below, whose
+#   trait is split into loads and stores so a read-only view can only load. No new block.
+# 2026-10-24 (+4, §4.6 the Shards route's DAX object, `dax_object.rs`; `docs/wip/shards/dax-protocol.md`): one memory
+#   object per attachment and file that a VMM maps, sized once to 2^63 − 2 MiB and viewed a 2 MiB range at a time.
+#   Every byte of it is racy (the guest stores into it at any moment), so slates reaches it only through atomics:
+#   `Racy::word` and `Racy::byte`, the `AtomicU64` and `AtomicU8` views of a live, aligned address in a range view (2;
+#   the views themselves reuse the placed `mmap`, no new block). On macOS, the random name the object holds for the
+#   moment between `shm_open` and `shm_unlink`, drawn by `libc::getentropy` (1; rustix's `getrandom` is Linux-only),
+#   and the `libc::mincore` that finds the pages holding bytes, so zeroing commits no memory (1; rustix has no
+#   `mincore`). 45 → 49.
+# 2026-10-19 (+1, §4.6 L1): `region::collapse_huge` — one `libc::madvise(MADV_COLLAPSE)` block. The sandbox
+#   needs physical contiguity, not a preference for it, and neither memmap2 0.9.11 nor rustix 1.1.4 exposes the
+#   advice, so the call is made directly; it only changes how the kernel backs pages the map already owns.
+# 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
+# `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
+# blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous
+# entry's drop after the generation moved past every reader; the `'static` borrow of the kick fd into
+# the boxed entry: 2), `registry::unregister` (the retired entry's borrow after the join: 1),
+# `registry::entry` (the live-or-retired entry deref under the generation check: 1),
+# `registry::lend_pair_ring` (the entry borrow and the ring's `'static` lend: 2). Each site's `SAFETY:`
+# names the slot protocol invariant it rests on; the loom lane's coverage of this crate is owed.
+# 2026-09-14 (+4, the context reclaimed — `docs/bugs/2026-09-14-shard-context-and-fleet-sockets-leak-per-boot.md`):
+# `ShardContext::build` (the `&'static` handed out over the box `Box::into_raw` produced: 1),
+# `registry::reclaim_context` (the `Box::from_raw` of that same pointer on the owning thread after its
+# loop returned, when no reference is live: 1), `ShardContext::keep` (a per-shard singleton's borrow
+# extended to `'static` over a heap box the context drops last, after its tasks: 1), and
+# `registry::read_counted` (the entry deref under the reader count, which a re-registration waits on
+# before freeing the previous entry: 1 — the counted form every foreign reader now takes).
+# 2026-09-14 (+2, the simulation's leaks closed): `registry::register`'s `RegisterKick::Sim` arm (the
+# simulated flags' `'static` borrow into the boxed entry, the descriptor's pattern: 1) and
+# `SimRuntime::new` (the clock's `'static` borrow for the drivers over the box the runtime owns and drops
+# after its contexts: 1).
+# 2026-09-14 (−1, the KIND lane: the epoll one-shot re-arm — `docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md`):
+# the second `BorrowedFd::borrow_raw` of the readiness re-add is gone with the re-add itself (the
+# descriptor is re-armed with `EPOLL_CTL_MOD` through the one remaining borrow).
+# 2026-09-19 (-8): generational Unix/simulation kicks remove KickFd's UnsafeCell,
+# unsafe Send/Sync, escaping descriptor borrows, and self-references. Registry retirement
+# pins foreign borrows before closing. Forced-overlap regression fails before and passes after.
+# 2026-09-28 (+2): don't-fragment on datagram sockets (macOS `IP_DONTFRAG`, Windows `IP_DONTFRAGMENT`).
+# 2026-09-30 (+1): the simulation clock is read through `SimRuntime::clock` (`sim.rs`), a borrow bounded by
+# `&self`, instead of a `&'static` field — a runtime passed by value had that field protected while its drop
+# freed the clock (Miri, `--test ownership`). (+1) the same for `LocalRuntime::context` (`runtime.rs`), whose
+# context its own `Drop` frees.
+# 2026-10-26 (+11, A-179): a Windows named pipe's end served by the IOCP driver (`pipe.rs`, `iocp.rs`), Win32 FFI
+# without a safe wrapper. In `pipe.rs`:
+# - the end's association with the port, `CreateIoCompletionPort` (1);
+# - the release's `CancelIoEx` (1);
+# - `PipeEnd::disconnect`'s `DisconnectNamedPipe` and `CancelIoEx` (2);
+# - `Pipes::complete`, an `unsafe fn` by contract, and its `Box::from_raw` of a delivered block (2);
+# - in `start`: the zeroed `OVERLAPPED` of a block (1), the `ReadFile`/`WriteFile` handing a leaked block to the
+#   kernel (1), its `GetLastError` (1), and the `Box::from_raw` of a block the kernel refused at once (1).
+# In `iocp.rs`, the wait's call of `Pipes::complete` (1). `afd.rs`'s `RtlNtStatusToDosError` moved into `dos_error`,
+# which both modules call (0).
+# 2026-10-26 (-1, A-183): the Windows datagram and stream sockets are made by one `WSASocketW` (`exclusive_socket`),
+# where the datagram socket had its own `socket()` call; the new half-close shares the one `shutdown` call
+# (`shutdown_directions`).
+# 2026-11-08 (+3, A-228, `thread_clock.rs`, compiled only for Windows): the run state of a shard's thread, which tells a
+#   starved shard from a stuck one. `Query`, the `unsafe extern` signature of `NtQuerySystemInformation`; one block that
+#   resolves it at run time, as Microsoft directs (`GetModuleHandleW`, `GetProcAddress`, the cast to that signature); and
+#   one block that calls it. Windows offers no other query of a thread's scheduling state.
+# 2026-11-08 (+2, A-228's sibling in the anchor's start judgment, `thread_clock.rs` `process_runnable`, compiled only for
+#   macOS): whether any thread of another process is runnable, from `proc_pidinfo(PROC_PIDTASKALLINFO)`'s
+#   `pti_numrunning`: the zeroed record and the call that fills it. Linux reads `/proc` and Windows reuses the snapshot
+#   above, so neither adds a site. A start held off its CPUs was killed as stuck without it.
+slates-rt = 101
+# 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
+#   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
+#   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
+slates-base = 11
+slates-vfs = 0
+slates-land = 4
+# 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
+# attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
+# event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.
+# 2026-11-04 (+4, A-213): the anchor's end keeps a read posted so its loop wakes on the channel: the read posted, its
+# result taken without waiting, its cancellation and join at the channel's drop, and the supervisor's wait on the read's
+# event and the daemon's process handle together. The completion event's two sites are shared with the timed reads.
+slates-anchor = 14
+slates-db = 0
+# 2026-11-02, A-198: one DuplicateHandle out of a child, two process-exit polling calls, and one message-mode pipe
+# setting call. The existing explicit handle-list spawn and kill-on-close job are reused.
+# 2026-11-02 (+1, A-198 Step 9.3): `win_spawn::clear_inheritance` calls SetHandleInformation on the one owned
+# inherited handle before it can enter any later child. There is no safe Win32 wrapper for the inheritance flag.
+# 2026-11-02 (+3, A-198 Step 9.4): the holder's process descriptor is converted from SDDL, applied before acquiring
+# held objects, and freed with LocalFree (`process_access.rs`). CreateProcessW borrows that same descriptor at birth;
+# these Win32 security calls have no safe wrapper and add no file or privilege requirement.
+slates-ipc = 139
+# 2026-11-06 (+26, GAP-A9-9, `mach_claim.rs` and one in `owner_name.rs`, compiled only for macOS): a client's region is
+#   handed over as a Mach fileport, never by a name a same-uid stranger could open. The Mach message calls the SDK
+#   wraps nothing for: `mach_msg` for the owner thread's receive, each answer (a refusal, a delivery), the client's fetch
+#   send and receive, the daemon's keep, and the owner's own control; `mach_msg_destroy` for each message refused or
+#   not expected, so no right a stranger sent is kept; `fileport_makeport`/`fileport_makefd` on each side;
+#   `audit_token_to_pid` for the sender of each message; `proc_pidinfo` for a keep's sender's parent;
+#   `mach_port_allocate`/`mach_port_mod_refs`/`mach_port_deallocate` for the client's reply port and the fileports;
+#   `OwnedFd::from_raw_fd` for a descriptor a fileport made; the byte view of the receive buffer the trailer is read
+#   from; `bootstrap_look_up` for the token's send right (`owner_name::look_up`); and the tests' plants.
+# 2026-11-01 (+1, Step 6.1 of the VFS and DAX plan, `stream.rs` `spawn_bound` compiled only for Linux): `slates pmem`
+#   must stay its VMM's parent to hold the VMM's map and compare it back, so it spawns rather than replacing itself as
+#   `exec_with` does. `pre_exec` (unsafe by signature) whose closure sets the parent-death signal (`prctl`, through
+#   rustix), checks the parent is still the launcher (`getppid`) and makes one `dup2`, the shape of `exec_with`'s.
+# 2026-10-27 (+1, `peer.rs` compiled only for Linux; docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-
+#   refused-by-undefined-behaviour.md): one `getsockopt(SOL_SOCKET, SO_PEERCRED)` into a `libc::ucred` of plain
+#   integers. rustix 1.1's `socket_peercred`, the safe wrapper it replaces at both of its call sites (the rendezvous and
+#   the vhost-user seam), reads the peer's pid into a non-zero `Pid`, and the kernel reports pid 0 for a peer whose
+#   process the reader cannot see: an invalid value, read back as an error through the pid's niche (a KIND pod's
+#   ephemeral container, refused "SO_PEERCRED refused (code Some(4))").
+# 2026-10-26 (+4, §4.6 A-180, Windows' Shards DAX claim, `handle_route.rs` compiled only for Windows): there is no safe
+#   wrapper for another process's handle table. The claimed handle and each known holder's duplicated out of their
+#   processes into this one and owned (`DuplicateHandle`, `from_raw_handle`, 2); the two compared as kernel objects
+#   (`CompareObjectHandles`, 1), never by a name query, which waits on a synchronous handle's lock; and the section
+#   duplicated into the claimant's process (`DuplicateHandle`, 1).
+# 2026-10-26 (+5, §4.6 A-181, `slates shards` on Windows, `win_spawn.rs` compiled only for Windows): the handle-list
+#   spawn moved out of `delivery.rs` unchanged in its sites, and three new things Win32 has no safe wrapper for. The
+#   kill-on-close job: made (`CreateJobObjectW`, 1), its limit record zeroed (1) and set (`SetInformationJobObject`, 1);
+#   the console-event handler registered (`SetConsoleCtrlHandler`, 1), and the handler itself, an `extern "system"`
+#   function the console calls (1). The job list rides the attribute list's one update call, now shared by both lists.
+# 2026-10-26 (+15, §4.6 A-179, the Shards stream on Windows, `stream_pipe.rs` compiled only for Windows): Win32 has no
+#   safe wrapper for a named pipe. The pair: the name's 128 bits from `BCryptGenRandom` (1); the owner-only descriptor
+#   parsed and freed (2); the server end made and owned (`CreateNamedPipeW`, `from_raw_handle`, 2) and the client end
+#   opened and owned (`CreateFileW`, `from_raw_handle`, 2); the connection confirmed (`ConnectNamedPipe`, 1), and a
+#   wait that pended cancelled and awaited (1); the pipe's name read from a handle (`GetFileInformationByHandleEx`, 1);
+#   a waited read or write on the handed end: its event made and owned (2), the operation started (1) and awaited
+#   (`GetOverlappedResult`, 1); the last error (1). `OVERLAPPED::default` stands for two zeroed records.
+# 2026-10-26 (+9, §4.7 A-178, the macOS owner's token, `owner_name.rs` compiled only for macOS): the bootstrap and
+#   Mach port calls libSystem has without a safe wrapper (`<servers/bootstrap.h>`, `<mach/mach_port.h>`). Their
+#   declarations (1); the process's own bootstrap port read (1) and each step up the chain (`bootstrap_parent`, 1);
+#   the registration (`bootstrap_register`, 1) and the look-up that tells a holder from another refusal (1); the
+#   token's receive right allocated (1) and its send right made (1); both given back at the token's drop or a failed
+#   claim (1); and a send right the walk or the look-up was given, given back (1).
+# 2026-10-25 (+21, §4.6 A-175, the Windows handle route, `handle_route.rs` compiled only for Windows): Win32 has no safe
+#   wrapper for any of it. The hand-off: the client's process opened and owned (`OpenProcess`, `from_raw_handle`, 2),
+#   the read-only handle duplicated into it (1), and a handed handle closed there (`DUPLICATE_CLOSE_SOURCE`, 1); the
+#   judge: the section mapped read alone, asked its extent and unmapped (3), a duplicate that writes or that may rewrite
+#   the descriptor asked and a granted one owned and closed (2), a writable view asked and a granted one unmapped (2);
+#   the same-user check: this process's pseudo-handle borrowed (1), each token opened, owned and asked its user twice (4),
+#   the users compared and the refused one's relative id read (2); the client's adoption: the value checked live and
+#   owned (2); the last error (1).
+# 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
+# 2026-09-28 (+1): the inherited fleet serve sockets (`fleet.rs` `adopt_inherited`).
+#   Raised 5 → 6 on 2026-10-03 for A-64 (content resident once): `daemon::arena_region` maps the shard's arena range of
+#   the anchor's content object through `ExclusiveObject::open_range`, whose promise (no other mapping reaches the
+#   range) the layout keeps: the daemon's copies reach only the write log and image slots.
+# 2026-11-02 (+1, A-198 Step 9.3): `anchor_hold_windows::adopted` takes unique ownership of an explicitly inherited
+# handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
+slates-server = 8
+slates-client = 0
+slates-api = 1
+slates-cli = 6
+# 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
+#   its VMM's pidfd and on its signals together, so its signals arrive as bytes in a self-pipe: the handler's one
+#   `write(2)`, async-signal-safe, into the pipe's write end (1), and `signal(2)` installing that handler for SIGUSR1,
+#   SIGINT and SIGTERM (1).
+slates-wire = 4
+# slates-bridge-core (0): the operation layer is the trait, neutral data structs and the
+# volume-core implementation; no syscalls, no unsafe.
+slates-bridge-core = 0
+slates-bridge-fuse = 0
+# slates-bridge-nfs (0): the XDR/RPC codec is bounds-checked byte slices; the blocking demo socket uses
+# safe std::net, and the production async server (`serve_connection_async`) uses the runtime's safe
+# `TcpStream` (the socket unsafe lives in slates-rt) — no unsafe in this crate.
+slates-bridge-nfs = 0
+slates-merge = 0
+# slates-transport (0): the control-datagram codec is byte slices read and written in field order
+# through a bounded reader, never a cast; the owned QUIC dialect and the AEAD seal (later slices, §4.10a)
+# will carry their own budgeted sites (the rt UDP driver's unsafe lives in slates-rt).
+slates-transport = 0
+# slates-mcp (0): the JSON-RPC dispatch is safe Rust over serde_json and the client SDK.
+slates-mcp = 0
+slates-archive = 0
+slates-wire-derive = 0
+# slates-cluster (0): the register-commit dispatch is safe Rust — spawned tasks, a channel, and the
+# db acceptance rules over the transport; no raw pointers.
+slates-cluster = 0
+# slates-sdk-python (0): the PyO3 bindings are safe Rust over the typed client; the FFI unsafety lives
+# in PyO3's macro-generated code, not this crate's own source (which has no `unsafe` block).
+slates-sdk-python = 0
+# slates-sdk-node (0): the napi-rs bindings are safe Rust over the typed client; the FFI unsafety lives
+# in napi's macro-generated code, not this crate's own source (which has no `unsafe` block).
+slates-sdk-node = 0
+# slates-bridge-fskit (9): the FSKit shim wire codec is safe Rust (bounds-checked byte slices onto the
+# Bridge trait, exactly like the NFS codec). The 9 sites are all in `src/ffi.rs`, the `test-harness`
+# in-process transport (§4.6): two `extern "C"` entries and the raw-pointer handling they need to hand
+# the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
+# note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
+slates-bridge-fskit = 9
+# slates-bridge-winfsp (131 since 2026-11-04: A-206's `FspVersion` export type and its one call in `checked_dll`, the DLL's
+# version check, replacing the read of the reserved field that check once looked at, so a net one more).
+# slates-bridge-winfsp (104): the VfsError->NTSTATUS refusal taxonomy and the notification records stay safe Rust
+# (lib.rs, notify.rs: 0). The WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the
+# rt AFD reactor from the WDK) and compiled only for Windows, each block with a `// SAFETY:` line (clippy
+# `undocumented_unsafe_blocks` enforces it): `ffi.rs` declares the `FspFileSystem*` export signatures and the
+# `FSP_FILE_SYSTEM_INTERFACE` callback signatures, and finds the exports at run time (`LoadLibraryW` twice, by name and
+# by the registry's install directory; `RegGetValueW`; `GetProcAddress`; one reinterpretation of each found address as
+# its header signature, sealed to those signatures); `host.rs` is the mount driver — the 16
+# `FSP_FILE_SYSTEM_INTERFACE` trampolines that read WinFsp's raw pointers (the file system's `UserContext` handler, the
+# opaque `FileContext` open-files, UTF-16 path strings, the read/write buffers) under WinFsp's COARSE operation guard
+# that serializes them, the calls through the loaded exports (create, mount point, dispatcher, the directory fill, and
+# the notification round's begin, notify and end), the leaked `Handler`/`OpenFile` boxes, and the
+# `ConvertStringSecurityDescriptor…`/`GetSecurityDescriptorLength`/`LocalFree` for the reference descriptor. All are
+# Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync` (the file system is owned by its mount
+# thread and the volume by its shard, shared only over channels, R2/D-7). Raised 86 -> 104 on 2026-10-25 (G-mount
+# step 2): the library loaded at run time rather than linked, so a daemon starts on a Windows host without WinFsp
+# (the loader's five sites), and the notification round that tells Windows of another path's change (§4.6 "Windows").
+# Raised 104 -> 111 on 2026-10-30 (A-190, the mapped-view purge): `FspFileSystemOperationProcessIdF`'s export type and
+# its call inside an open (which process made it); `CreateFileW` of a changed file through the drive, unbuffered, the
+# `OwnedHandle` taking its handle, and `WriteFile` of each piece, which make WinFsp purge coherently; the write callback's
+# out-parameters for a purge's write, answered without being applied; and the cleanup's read of a purge's open-file.
+# Raised 111 -> 112 on 2026-11-01 (Step 8 of the VFS and DAX plan, the purge Windows did not take): `ReadFile` of each
+# purged piece, through the purge's unbuffered open and a cached one, which tells a purge Windows took from one whose
+# page it kept (`CcCoherencyFlushAndPurgeCache`'s `STATUS_CACHE_PAGE_LOCKED`, which WinFsp reports as success).
+# 2026-11-02 (112 -> 104, A-198 Step 9.3): opaque generation/slot contexts replace the per-open heap-pointer reads
+# and frees. New sites own the drive link (`DefineDosDeviceW`, `NtOpenSymbolicLinkObject`, `NtMakeTemporaryObject`
+# and the returned handle), remove that exact definition at drop, and substitute/duplicate the held control handle.
+# The safe ledger and held-record codecs have no unsafe sites. The net count falls by eight, measured by xtask.
+# 2026-11-02 (+1, A-198 Step 9.4): the public FSP_FILE_SYSTEM_OPERATION function-pointer ABI, invoked only with a
+# live DLL object and aligned checked working packets by the owned receive worker (`ffi.rs`).
+# The retained receiver adds its section view/map release and checked slice, event creation/ownership, control
+# transaction/completion, and public operation-table access/call. Host sites check the DLL layout and duplicate the
+# held receive section. Removing the DLL dispatcher/guard/process-id exports offsets the new sites; xtask counts 113.
+# One additional control-handle borrow announces Transact0 before the drive is exposed, matching the vendor's
+# StartDispatcher readiness handshake; an unannounced receiver causes STATUS_CANCELLED on every early open.
+# 2026-11-02 (114 -> 126): a private purge carries a mount-specific restricting SID in its own less privileged
+# token. The receiver borrows only a fresh Create's kernel token handle and checks its restricting SIDs before any
+# identity-addressed open. purge_token.rs owns the random marker, primary/restricted token handles, their native
+# query layouts, and thread-local impersonation/restoration. These twelve FFI sites replace the PID/unbuffered
+# heuristic, which could not distinguish an embedding program's ordinary opens. The held sparse-name section reuses
+# mem's existing checked commit/copy wrappers and adds no unsafe site. Measured by `target/debug/xtask unsafe`.
+# 2026-11-02 (126 -> 130): an owned auto-reset event wakes the receiver for private Begin/End messages even when
+# Windows rejects an open without a callback. The four sites create/own/signal that event and wait for it beside
+# the control completion event. Every control operation is still settled before its borrowed buffers can be freed.
+# 2026-11-05 (131 -> 132, A-209): the `CanDelete` callback reads the handler from the file system's user context, as every
+# other callback does (`host.rs`, `can_delete`), so a directory with a child refuses before Windows marks it for
+# deletion; it had answered success unread (winfstest `t/base/03.t` case 3).
+# 2026-11-07 (132 -> 130, A-249): the purge in progress is one seqlock slot in a section both threads map, never a
+# channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
+# intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
+# go (-3). Measured by `cargo xtask unsafe`.
+slates-bridge-winfsp = 130
+# Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
+# confined a guest's DAX window to a descriptor covering only that window
+# (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25
+# (A-168): the message placer now hands the VMM a file's own backing, which authorizes that file's bytes by
+# construction, so `udmabuf.rs` and both sites are gone.
+# slates-bridge-virtiofs (3): the virtqueue machine and the FUSE-over-virtio device read and write
+# guest memory only through the `GuestMemory` seam — bounded, checked copies into byte arrays, fields
+# decoded in order, never a cast or a pointer into the guest (the FUSE codec's discipline). The
+# simulated seams are `Vec<u8>` and `Cell`/`RefCell`; the doorbell descriptors are `rustix` reads and
+# writes on owned descriptors. The 3 sites are all in `src/dax.rs`, the DAX cache region (§4.6): the
+# window's reservation `map_mut` (held as an `MmapMut`, which owns and unmaps the whole range on drop,
+# so the region is `Send` and its window reads are safe slices — no raw pointer, no manual `Drop`); and
+# the two `MAP_FIXED` overlays — a pinned content block's descriptor (`map`) and the anonymous restore
+# (`unmap`). Each overlay stays strictly within the owned reservation, and the block it maps is pinned
+# by the gate, so its pages are stable — the invariants on each `// SAFETY:` line.
+slates-bridge-virtiofs = 3
+# slates-bridge-oci (1): the macOS `getfsstat(MNT_NOWAIT)` pair — the count query and the fill of a
+# buffer sized for exactly that count, plus the `set_len` to what the kernel wrote — in one block
+# (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a
+# `statfs` of the path would touch the very mount the daemon serves. The Linux read of
+# `/proc/self/mountinfo` is safe rustix; the parser, verification and entry are pure.
+slates-bridge-oci = 1
+# slates-conformance (0): pure parsers and records; no FFI, no I/O.
+slates-conformance = 0
+# slates-test-seeds (0): a proptest persistence over compiled seed text; no FFI, no I/O.
+slates-test-seeds = 0
+# slates-guest-probe (5): a VM guest's /init for the mount-route tests (2026-10-22; docs/wip/virtiofs.md §8 item 7),
+# which never runs on a host. Its shared map of a file the VMM shares in: the `mmap`, the `munmap` on drop, the
+# `msync`, and one volatile read and one volatile write of a byte the map's bounds check has placed inside it. rustix's
+# map calls are unsafe by signature, and DAX is reached only through the map; the protocol it speaks is pure.
+# Raised to 8 on 2026-10-25 by its pod probe (`src/pod.rs`, G-mount step 5, the KIND lane's map leg): its read-only
+# shared map of a file through kubelet's NFS mount, the `munmap` on drop, and one volatile read of a byte below the
+# map's length.
+slates-guest-probe = 8
+# slates-image (0): the disk-image form of a volume (A-160) is byte buffers built field by field and read by checked
+# offset (`format.rs`), with every block pointer range-checked before use; no casts, no maps, no FFI.
+slates-image = 0
+# slates-seal (0): the rendezvous seal (A-187) is safe Rust over aws-lc-rs's own safe API: X25519 agreement, HKDF-SHA256
+# and AES-256-GCM through its types, keys and nonces as owned arrays; aws-lc-rs holds every FFI call. Recorded
+# 2026-10-29, when `cargo xtask unsafe` found the crate unbudgeted since A-187 added it (CI runs the structural and
+# literal checks, not the budget).
+slates-seal = 0

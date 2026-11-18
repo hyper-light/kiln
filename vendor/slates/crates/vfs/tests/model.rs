@@ -1,0 +1,1468 @@
+//! The executable model (Phase 1 task 8; AC-1.1, AC-1.7): a map with POSIX rules that is the
+//! specification of the volume core, and a proptest state machine that drives the real volume and
+//! the model through the same generated histories, comparing every refusal, every listing, every
+//! byte read, every inode number and the exact accounting after every step, with shrinking.
+
+// Test harness code: an unwrap here is a failed test, which is what it should be. proptest's
+// strategy macros expand to `Arc`-carrying unions; the test harness exception of D-8 covers it.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::disallowed_types,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
+
+use std::collections::BTreeMap;
+
+use proptest::prelude::*;
+use slates_vfs::dir::Child;
+use slates_vfs::dirblocks::class_for;
+use slates_vfs::error::VfsError;
+use slates_vfs::ids::{InodeNo, SnapshotId};
+use slates_vfs::inode::Kind;
+use slates_vfs::names::NameEquivalence;
+
+mod common;
+use common::steps::{Step, XattrMode, step};
+use common::{clone_config, store, volume};
+use slates_vfs::volume::{Store, Volume};
+
+/// A file's extended attributes: `(name, value)`, ascending by name.
+type Xattrs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Directory listings by path, file bytes by inode counter, and the extended attributes of every
+/// file that has any, by inode counter.
+type AbstractState = (
+  Vec<(String, Vec<String>)>,
+  BTreeMap<u64, Vec<u8>>,
+  BTreeMap<u64, Xattrs>,
+);
+
+// ------------------------------------------------------------------ the model
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Node {
+  Dir(BTreeMap<String, Node>),
+  File { ino: u64 },
+  Symlink { ino: u64, target: String },
+}
+
+/// A file's bytes and what the chunk rule of §4.5 says is materialized: inline content is
+/// charged byte for byte until a write ends past the inline threshold; after that every chunk
+/// window touched by a write is materialized from the window's start to the furthest write end in
+/// it and charged its arena block — the smallest power-of-two number of pages holding that length,
+/// at most a chunk (§4.2 "physical_used includes allocator rounding": the buddy's block) — and
+/// extending by truncate charges nothing (a hole). Every materialized piece carries the epoch it was born in: a window is reborn when a
+/// write touches it after a snapshot (the copy-on-write reopen) or when a truncate cuts it to a
+/// smaller page count (the window is rebuilt at its new length), inline content whenever the inode
+/// record is copied.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ModelFile {
+  bytes: Vec<u8>,
+  inline: bool,
+  /// The inline bytes actually held (a truncate past them leaves a hole, charged nothing).
+  inline_len: u64,
+  /// The epoch the inode record (and so its inline bytes) was last copied in.
+  inline_born: u64,
+  /// Window index → (materialized bytes from the window's start, birth epoch).
+  windows: BTreeMap<u64, (u64, u64)>,
+  /// The window being written (§4.5 chunk rule; A-118): the one window whose block still grows, so it is charged its
+  /// buddy block. Every other window is sealed and charged its length's pages. A write leaves the last window it
+  /// touched open and seals the one it left; a copy of the record seals it.
+  open: Option<u64>,
+  /// The epoch the inode record was last copied in: every mutation copies it once per epoch (the first change
+  /// after a snapshot), and that copy seals the open window.
+  record_born: u64,
+}
+
+/// An open window's charge: its arena block — the smallest power-of-two number of pages holding the
+/// materialized length (the buddy's block), at most a chunk.
+fn charged_window(materialized: u64, page: u64, chunk: u64) -> u64 {
+  if materialized == 0 {
+    0
+  } else {
+    (materialized.div_ceil(page).next_power_of_two() * page).min(chunk)
+  }
+}
+
+/// A sealed window's charge (A-118): its block trimmed to the pages holding the materialized length.
+fn sealed_window(materialized: u64, page: u64) -> u64 {
+  materialized.div_ceil(page) * page
+}
+
+/// A window's charge, open or sealed.
+fn window_charge(window: u64, materialized: u64, open: Option<u64>, page: u64, chunk: u64) -> u64 {
+  if open == Some(window) {
+    charged_window(materialized, page, chunk)
+  } else {
+    sealed_window(materialized, page)
+  }
+}
+
+impl ModelFile {
+  /// The bytes the file is charged.
+  fn charged(&self, page: u64, chunk: u64) -> u64 {
+    if self.inline {
+      self.inline_len
+    } else {
+      self
+        .windows
+        .iter()
+        .map(|(w, (m, _))| window_charge(*w, *m, self.open, page, chunk))
+        .sum()
+    }
+  }
+
+  /// The record is copied in `epoch` (every mutation does, once per epoch): the first copy in an epoch seals the open
+  /// window, as the copy-up seals the open extent before anything changes. Its inline bytes are reborn.
+  fn copy_record(&mut self, epoch: u64) {
+    if self.record_born != epoch {
+      self.open = None;
+      self.record_born = epoch;
+    }
+    self.inline_born = epoch;
+  }
+
+  /// The charged bytes born after `last_snapshot`: what dropping the head would free.
+  fn unique(&self, last_snapshot: Option<u64>, page: u64, chunk: u64) -> u64 {
+    let fresh = |born: u64| last_snapshot.is_none_or(|s| born > s);
+    if self.inline {
+      if fresh(self.inline_born) {
+        self.inline_len
+      } else {
+        0
+      }
+    } else {
+      self
+        .windows
+        .iter()
+        .filter(|(_, (_, born))| fresh(*born))
+        .map(|(w, (m, _))| window_charge(*w, *m, self.open, page, chunk))
+        .sum()
+    }
+  }
+
+  /// The windows after a write of `[off, end)` under the chunk rule, or `None` when the file
+  /// stays inline.
+  fn windows_after(
+    &self,
+    off: u64,
+    end: u64,
+    chunk: u64,
+    inline: u64,
+    epoch: u64,
+  ) -> Option<BTreeMap<u64, (u64, u64)>> {
+    if self.inline && end <= inline {
+      return None;
+    }
+    let mut after = self.windows.clone();
+    if self.inline {
+      after.insert(0, (self.inline_len, epoch));
+    }
+    let mut cursor = off;
+    while cursor < end {
+      let window = cursor / chunk;
+      let write_end = end.min((window + 1) * chunk);
+      let entry = after.entry(window).or_insert((0, epoch));
+      *entry = (entry.0.max(write_end - window * chunk), epoch);
+      cursor = write_end;
+    }
+    Some(after)
+  }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Model {
+  root: BTreeMap<String, Node>,
+  /// Inode contents by number (hard links share).
+  files: BTreeMap<u64, ModelFile>,
+  /// Each file's extended attributes by name (§4.5): every value is an attribute inode's content,
+  /// charged by the same chunk rule as a file's.
+  xattrs: BTreeMap<u64, BTreeMap<String, ModelFile>>,
+  links: BTreeMap<u64, u32>,
+  next_ino: u64,
+  quota: u64,
+  chunk: u64,
+  inline: u64,
+  /// The base page: the allocation granule a window's charge rounds up to.
+  page: u64,
+  policy: NameEquivalence,
+  /// The head epoch: advanced by every snapshot.
+  epoch: u64,
+  last_snapshot: Option<u64>,
+}
+
+impl Model {
+  fn new(quota: u64, chunk: u64, inline: u64, page: u64) -> Self {
+    Self {
+      quota,
+      chunk,
+      inline,
+      page,
+      next_ino: 2,
+      policy: NameEquivalence::Fold,
+      ..Default::default()
+    }
+  }
+
+  /// Every content body the head holds: the files and the attribute values.
+  fn bodies(&self) -> impl Iterator<Item = &ModelFile> {
+    self
+      .files
+      .values()
+      .chain(self.xattrs.values().flat_map(BTreeMap::values))
+  }
+
+  fn referenced(&self) -> u64 {
+    self
+      .bodies()
+      .map(|f| f.charged(self.page, self.chunk))
+      .sum()
+  }
+
+  fn unique(&self) -> u64 {
+    self
+      .bodies()
+      .map(|f| f.unique(self.last_snapshot, self.page, self.chunk))
+      .sum()
+  }
+
+  /// Drops a file whose last link went: its content and its attributes with it (§4.5).
+  fn forget(&mut self, ino: u64) {
+    self.files.remove(&ino);
+    self.links.remove(&ino);
+    self.xattrs.remove(&ino);
+  }
+
+  /// Sets an extended attribute (§4.5 "Extended attributes"). The flags are checked first; past
+  /// them the attempt issues one inode number whatever follows (the counter never rewinds). The new
+  /// value is written into a fresh attribute body under the file chunk rule, admitted while the old
+  /// value is still charged; only then does it replace the old one. The owner's record is copied, so
+  /// its inline bytes are reborn.
+  fn set_xattr(
+    &mut self,
+    ino: u64,
+    name: &str,
+    value: &[u8],
+    mode: XattrMode,
+  ) -> Result<(), VfsError> {
+    if !self.files.contains_key(&ino) {
+      return Err(VfsError::NotFound);
+    }
+    let exists = self
+      .xattrs
+      .get(&ino)
+      .is_some_and(|set| set.contains_key(name));
+    match (mode, exists) {
+      (XattrMode::Create, true) => return Err(VfsError::AlreadyExists),
+      (XattrMode::Replace, false) => return Err(VfsError::NoAttribute),
+      _ => {}
+    }
+    self.next_ino += 1;
+    let epoch = self.epoch;
+    let mut fresh = ModelFile {
+      inline: true,
+      inline_born: epoch,
+      record_born: epoch,
+      ..Default::default()
+    };
+    if !value.is_empty() {
+      let end = u64::try_from(value.len()).unwrap();
+      let last = Some((end - 1) / self.chunk);
+      let windows = fresh.windows_after(0, end, self.chunk, self.inline, epoch);
+      let after = windows
+        .as_ref()
+        .map_or(end, |w| self.charged_windows(w, last));
+      if self.referenced() + after > self.quota {
+        return Err(VfsError::NoSpace);
+      }
+      match windows {
+        Some(w) => {
+          fresh.windows = w;
+          fresh.inline = false;
+          fresh.open = last;
+        }
+        None => fresh.inline_len = end,
+      }
+      fresh.bytes = value.to_vec();
+    }
+    self
+      .xattrs
+      .entry(ino)
+      .or_default()
+      .insert(name.to_owned(), fresh);
+    if let Some(f) = self.files.get_mut(&ino) {
+      f.copy_record(epoch);
+    }
+    Ok(())
+  }
+
+  /// Removes an extended attribute; the owner's record is copied.
+  fn remove_xattr(&mut self, ino: u64, name: &str) -> Result<(), VfsError> {
+    if !self.files.contains_key(&ino) {
+      return Err(VfsError::NotFound);
+    }
+    let set = self.xattrs.get_mut(&ino).ok_or(VfsError::NoAttribute)?;
+    set.remove(name).ok_or(VfsError::NoAttribute)?;
+    if set.is_empty() {
+      self.xattrs.remove(&ino);
+    }
+    if let Some(f) = self.files.get_mut(&ino) {
+      f.copy_record(self.epoch);
+    }
+    Ok(())
+  }
+
+  /// The charge of a window map.
+  fn charged_windows(&self, windows: &BTreeMap<u64, (u64, u64)>, open: Option<u64>) -> u64 {
+    windows
+      .iter()
+      .map(|(w, (m, _))| window_charge(*w, *m, open, self.page, self.chunk))
+      .sum()
+  }
+
+  fn snapshot(&mut self) {
+    self.last_snapshot = Some(self.epoch);
+    self.epoch += 1;
+  }
+
+  /// The directory at `path`: a missing component is `ENOENT`, one that is not a directory
+  /// is `ENOTDIR`, as POSIX resolves paths.
+  fn dir_mut(&mut self, path: &[String]) -> Result<&mut BTreeMap<String, Node>, VfsError> {
+    let mut cur = &mut self.root;
+    for p in path {
+      let key = cur
+        .keys()
+        .find(|k| self.policy.same(k, p))
+        .cloned()
+        .ok_or(VfsError::NotFound)?;
+      match cur.get_mut(&key) {
+        Some(Node::Dir(d)) => cur = d,
+        _ => return Err(VfsError::NotDirectory),
+      }
+    }
+    Ok(cur)
+  }
+
+  fn dir(&self, path: &[String]) -> Result<&BTreeMap<String, Node>, VfsError> {
+    let mut cur = &self.root;
+    for p in path {
+      let key = cur
+        .keys()
+        .find(|k| self.policy.same(k, p))
+        .ok_or(VfsError::NotFound)?;
+      match cur.get(key) {
+        Some(Node::Dir(d)) => cur = d,
+        _ => return Err(VfsError::NotDirectory),
+      }
+    }
+    Ok(cur)
+  }
+
+  fn find_key(dir: &BTreeMap<String, Node>, policy: NameEquivalence, name: &str) -> Option<String> {
+    dir.keys().find(|k| policy.same(k, name)).cloned()
+  }
+
+  fn create(&mut self, dir: &[String], name: &str) -> Result<u64, VfsError> {
+    let policy = self.policy;
+    let ino = self.next_ino;
+    let d = self.dir_mut(dir)?;
+    if Self::find_key(d, policy, name).is_some() {
+      return Err(VfsError::AlreadyExists);
+    }
+    d.insert(name.to_owned(), Node::File { ino });
+    self.next_ino += 1;
+    self.files.insert(
+      ino,
+      ModelFile {
+        inline: true,
+        record_born: self.epoch,
+        ..Default::default()
+      },
+    );
+    self.links.insert(ino, 1);
+    Ok(ino)
+  }
+
+  fn symlink(&mut self, dir: &[String], name: &str, target: &str) -> Result<(), VfsError> {
+    let policy = self.policy;
+    let ino = self.next_ino;
+    let d = self.dir_mut(dir)?;
+    if Self::find_key(d, policy, name).is_some() {
+      return Err(VfsError::AlreadyExists);
+    }
+    d.insert(
+      name.to_owned(),
+      Node::Symlink {
+        ino,
+        target: target.to_owned(),
+      },
+    );
+    self.next_ino += 1;
+    self.links.insert(ino, 1);
+    Ok(())
+  }
+
+  fn mkdir(&mut self, dir: &[String], name: &str) -> Result<(), VfsError> {
+    let policy = self.policy;
+    let d = self.dir_mut(dir)?;
+    if Self::find_key(d, policy, name).is_some() {
+      return Err(VfsError::AlreadyExists);
+    }
+    d.insert(name.to_owned(), Node::Dir(BTreeMap::new()));
+    self.next_ino += 1;
+    Ok(())
+  }
+
+  fn unlink(&mut self, dir: &[String], name: &str) -> Result<(), VfsError> {
+    let policy = self.policy;
+    let d = self.dir_mut(dir)?;
+    let key = Self::find_key(d, policy, name).ok_or(VfsError::NotFound)?;
+    let ino = match d.get(&key) {
+      Some(Node::Dir(_)) => return Err(VfsError::IsDirectory),
+      Some(Node::File { ino }) | Some(Node::Symlink { ino, .. }) => *ino,
+      None => return Err(VfsError::NotFound),
+    };
+    d.remove(&key);
+    self.drop_link(ino);
+    Ok(())
+  }
+
+  /// Takes one link from `ino`: the file goes with its last link; a surviving record is copied for its link count.
+  fn drop_link(&mut self, ino: u64) {
+    let links = self.links.entry(ino).or_insert(1);
+    *links -= 1;
+    if *links == 0 {
+      self.forget(ino);
+    } else if let Some(f) = self.files.get_mut(&ino) {
+      f.copy_record(self.epoch);
+    }
+  }
+
+  fn rmdir(&mut self, dir: &[String], name: &str) -> Result<(), VfsError> {
+    let policy = self.policy;
+    let d = self.dir_mut(dir)?;
+    let key = Self::find_key(d, policy, name).ok_or(VfsError::NotFound)?;
+    match d.get(&key) {
+      Some(Node::Dir(inner)) if inner.is_empty() => {
+        d.remove(&key);
+        Ok(())
+      }
+      Some(Node::Dir(_)) => Err(VfsError::NotEmpty),
+      Some(_) => Err(VfsError::NotDirectory),
+      None => Err(VfsError::NotFound),
+    }
+  }
+
+  fn write(&mut self, ino: u64, off: usize, bytes: &[u8]) -> Result<(), VfsError> {
+    let file = self.files.get(&ino).ok_or(VfsError::NotFound)?;
+    if bytes.is_empty() {
+      // POSIX: a zero-length write changes nothing, not even the size.
+      return Ok(());
+    }
+    let end = off + bytes.len();
+    let (off64, end64) = (u64::try_from(off).unwrap(), u64::try_from(end).unwrap());
+    let epoch = self.epoch;
+    // The record is copied first (sealing the open window in a new epoch), then the write lands; it leaves the last
+    // window it touched open.
+    let mut file = file.clone();
+    file.copy_record(epoch);
+    let last = Some((end64 - 1) / self.chunk);
+    let windows = file.windows_after(off64, end64, self.chunk, self.inline, epoch);
+    let charged = file.charged(self.page, self.chunk);
+    let after = windows
+      .as_ref()
+      .map_or(end64.max(charged), |w| self.charged_windows(w, last));
+    let added = after.saturating_sub(charged);
+    if self.referenced() + added > self.quota {
+      return Err(VfsError::NoSpace);
+    }
+    match windows {
+      Some(w) => {
+        file.windows = w;
+        file.inline = false;
+        file.open = last;
+      }
+      None => {
+        file.inline_len = file.inline_len.max(end64);
+      }
+    }
+    if file.bytes.len() < end {
+      file.bytes.resize(end, 0);
+    }
+    file.bytes[off..end].copy_from_slice(bytes);
+    self.files.insert(ino, file);
+    Ok(())
+  }
+
+  /// An SDK edit: the volume truncates at `at`, writes the new bytes, then the old tail; the
+  /// model composes the same three rules (T-1.18's model side).
+  fn edit(&mut self, ino: u64, at: usize, delete_len: usize, bytes: &[u8]) -> Result<(), VfsError> {
+    let file = self.files.get(&ino).ok_or(VfsError::NotFound)?;
+    let size = file.bytes.len();
+    if at > size {
+      return Err(VfsError::Invalid);
+    }
+    let delete_len = delete_len.min(size - at);
+    let tail = file.bytes[at + delete_len..].to_vec();
+    // The quota is checked once, on the final length, before anything changes.
+    let end = u64::try_from(at + bytes.len() + tail.len()).unwrap();
+    let epoch = self.epoch;
+    let probe = file.windows_after(
+      u64::try_from(at).unwrap(),
+      end,
+      self.chunk,
+      self.inline,
+      epoch,
+    );
+    let charged = file.charged(self.page, self.chunk);
+    let after = probe.as_ref().map_or(end.max(charged), |w| {
+      self.charged_windows(w, Some(end.saturating_sub(1) / self.chunk))
+    });
+    if self.referenced() + after.saturating_sub(charged) > self.quota {
+      return Err(VfsError::NoSpace);
+    }
+    self.truncate(ino, at)?;
+    if let Some(f) = self.files.get_mut(&ino) {
+      f.copy_record(epoch);
+    }
+    if !bytes.is_empty() {
+      self.write(ino, at, bytes)?;
+    }
+    if !tail.is_empty() {
+      self.write(ino, at + bytes.len(), &tail)?;
+    }
+    Ok(())
+  }
+
+  fn truncate(&mut self, ino: u64, len: usize) -> Result<(), VfsError> {
+    let chunk = self.chunk;
+    let epoch = self.epoch;
+    let file = self.files.get_mut(&ino).ok_or(VfsError::NotFound)?;
+    file.bytes.resize(len, 0);
+    let len64 = u64::try_from(len).unwrap();
+    file.inline_len = file.inline_len.min(len64);
+    // The inode record is copied on every truncate, so its inline bytes are reborn (and, first in an epoch, the open
+    // window is sealed).
+    file.copy_record(epoch);
+    file.windows.retain(|w, _| w * chunk < len64);
+    if file
+      .open
+      .is_some_and(|open| !file.windows.contains_key(&open))
+    {
+      file.open = None;
+    }
+    let open = file.open;
+    if let Some((w, (m, born))) = file.windows.iter_mut().next_back() {
+      let cut = (*m).min(len64 - w * chunk);
+      // A window cut to fewer pages of its charge is rebuilt at its new length, born now: an open window's buddy block,
+      // a sealed one's trimmed pages (A-118).
+      let smaller = if open == Some(*w) {
+        charged_window(cut, self.page, chunk) < charged_window(*m, self.page, chunk)
+      } else {
+        sealed_window(cut, self.page) < sealed_window(*m, self.page)
+      };
+      if smaller {
+        *born = epoch;
+      }
+      *m = cut;
+    }
+    Ok(())
+  }
+
+  fn rename(
+    &mut self,
+    from_dir: &[String],
+    from: &str,
+    to_dir: &[String],
+    to: &str,
+  ) -> Result<(), VfsError> {
+    let policy = self.policy;
+    // Both parent paths resolve before the source name is checked, as `renameat2` does.
+    let fd = self.dir(from_dir)?;
+    let td = self.dir(to_dir)?;
+    let from_key = Self::find_key(fd, policy, from).ok_or(VfsError::NotFound)?;
+    let node = fd.get(&from_key).cloned().unwrap();
+    let to_key = Self::find_key(td, policy, to);
+    // The same directory is the same under the policy: on a folding volume `["A"]` and `["a"]` name one directory, so
+    // a rename between them is a rename within it (found 2026-10-05 by a fresh seed: `Mkdir a`, `Mkdir a/A`, then
+    // `A/A` renamed to `a/a` kept `A` in the model while the volume respelled it, as EQUIVALENCE §4 says).
+    let same_dir =
+      from_dir.len() == to_dir.len() && from_dir.iter().zip(to_dir).all(|(a, b)| policy.same(a, b));
+    if same_dir && policy.same(from, to) {
+      // The same entry: the same bytes change nothing; another spelling respells it (EQUIVALENCE §4).
+      if from == to {
+        return Ok(());
+      }
+      let fd = self.dir_mut(from_dir).unwrap();
+      let node = fd.remove(&from_key).unwrap();
+      let moved_ino = match &node {
+        Node::File { ino } | Node::Symlink { ino, .. } => Some(*ino),
+        Node::Dir(_) => None,
+      };
+      fd.insert(to.to_owned(), node);
+      if let Some(ino) = moved_ino
+        && let Some(f) = self.files.get_mut(&ino)
+      {
+        f.copy_record(self.epoch);
+      }
+      return Ok(());
+    }
+    let target = to_key.as_ref().and_then(|k| td.get(k)).cloned();
+    if let (Some(Node::File { ino: a }), Node::File { ino: b }) = (&target, &node)
+      && a == b
+    {
+      return Ok(());
+    }
+    if let Node::Dir(_) = node {
+      // Moving into its own subtree: the target path starts with the source path.
+      let mut source_path = from_dir.to_vec();
+      source_path.push(from_key.clone());
+      if to_dir.len() >= source_path.len()
+        && to_dir
+          .iter()
+          .zip(&source_path)
+          .all(|(a, b)| policy.same(a, b))
+      {
+        return Err(VfsError::Invalid);
+      }
+      match &target {
+        None => {}
+        Some(Node::Dir(inner)) if inner.is_empty() => {}
+        Some(Node::Dir(_)) => return Err(VfsError::NotEmpty),
+        Some(_) => return Err(VfsError::NotDirectory),
+      }
+    } else if matches!(target, Some(Node::Dir(_))) {
+      return Err(VfsError::IsDirectory);
+    }
+    if let Some(Node::File { ino }) | Some(Node::Symlink { ino, .. }) = &target {
+      // A replaced target loses its link as `unlink` takes one, its surviving record copied for its link count (found
+      // 2026-10-10 by a fresh seed: `Link d` to `A`, a one-byte edit, `Snapshot`, then a symlink renamed over `A`; the
+      // volume sealed A's open window at the copy, 16384 → 12288 bytes referenced, while the model left it open).
+      self.drop_link(*ino);
+    }
+    let fd = self.dir_mut(from_dir).unwrap();
+    let node = fd.remove(&from_key).unwrap();
+    let moved_ino = match &node {
+      Node::File { ino } | Node::Symlink { ino, .. } => Some(*ino),
+      Node::Dir(_) => None,
+    };
+    let td = self.dir_mut(to_dir).unwrap();
+    // Replacing another entry keeps its spelling on a folding volume, as APFS does (EQUIVALENCE §4).
+    let spelling = match to_key {
+      Some(k) => {
+        td.remove(&k);
+        k
+      }
+      None => to.to_owned(),
+    };
+    td.insert(spelling, node);
+    // The moved file's record is copied (its home follows it), so its inline bytes are reborn.
+    if let Some(ino) = moved_ino
+      && let Some(f) = self.files.get_mut(&ino)
+    {
+      f.copy_record(self.epoch);
+    }
+    Ok(())
+  }
+
+  fn link(&mut self, dir: &[String], name: &str, ino: u64) -> Result<(), VfsError> {
+    let policy = self.policy;
+    if !self.files.contains_key(&ino) {
+      return Err(VfsError::NotFound);
+    }
+    let d = self.dir_mut(dir)?;
+    if Self::find_key(d, policy, name).is_some() {
+      return Err(VfsError::AlreadyExists);
+    }
+    d.insert(name.to_owned(), Node::File { ino });
+    *self.links.entry(ino).or_insert(1) += 1;
+    if let Some(f) = self.files.get_mut(&ino) {
+      f.copy_record(self.epoch);
+    }
+    Ok(())
+  }
+
+  /// The listing of every directory as (path, sorted names) and every file's bytes.
+  fn abstract_state(&self) -> AbstractState {
+    let mut dirs = Vec::new();
+    fn walk(prefix: &str, d: &BTreeMap<String, Node>, out: &mut Vec<(String, Vec<String>)>) {
+      let mut names: Vec<String> = d.keys().cloned().collect();
+      names.sort();
+      out.push((prefix.to_owned(), names));
+      for (k, v) in d {
+        if let Node::Dir(inner) = v {
+          walk(&format!("{prefix}/{k}"), inner, out);
+        }
+      }
+    }
+    walk("", &self.root, &mut dirs);
+    dirs.sort();
+    (
+      dirs,
+      self
+        .files
+        .iter()
+        .map(|(k, f)| (*k, f.bytes.clone()))
+        .collect(),
+      self
+        .xattrs
+        .iter()
+        .map(|(ino, set)| {
+          let rows = set
+            .iter()
+            .map(|(name, value)| (name.as_bytes().to_vec(), value.bytes.clone()))
+            .collect();
+          (*ino, rows)
+        })
+        .collect(),
+    )
+  }
+}
+
+// ------------------------------------------------------------------ the driver
+
+/// The real volume's view: directory listings and file bytes by inode counter.
+fn real_state(vol: &Volume, store: &Store) -> AbstractState {
+  let mut dirs = Vec::new();
+  let mut files = BTreeMap::new();
+  let mut xattrs = BTreeMap::new();
+  let mut stack = vec![(String::new(), vol.root())];
+  while let Some((prefix, dir)) = stack.pop() {
+    let rows = vol.readdir(store, dir).unwrap();
+    let mut names: Vec<String> = rows.iter().map(|r| r.name.to_string()).collect();
+    names.sort();
+    dirs.push((prefix.clone(), names));
+    for row in rows {
+      match row.kind {
+        Kind::Dir => {
+          let located = vol.lookup(store, dir, row.name).unwrap();
+          if let Child::Dir(h) = located.child {
+            stack.push((format!("{prefix}/{}", row.name), h));
+          }
+        }
+        Kind::File => {
+          files.insert(row.inode.counter(), read_all(vol, store, row.inode));
+          let rows = read_xattrs(vol, store, row.inode);
+          if !rows.is_empty() {
+            xattrs.insert(row.inode.counter(), rows);
+          }
+        }
+        Kind::Symlink => {}
+        #[allow(clippy::panic)] // Harness invariant: these generated operations never create IPC.
+        Kind::Fifo | Kind::Socket => panic!("this history creates no IPC names"),
+      }
+    }
+  }
+  dirs.sort();
+  (dirs, files, xattrs)
+}
+
+fn read_xattrs(vol: &Volume, store: &Store, ino: InodeNo) -> Xattrs {
+  vol
+    .xattr_names(store, ino)
+    .unwrap()
+    .into_iter()
+    .map(|name| {
+      let len = vol.xattr_len(store, ino, &name).unwrap();
+      let mut value = vec![0u8; usize::try_from(len).unwrap()];
+      let n = vol.xattr_read(store, ino, &name, 0, &mut value).unwrap();
+      value.truncate(n);
+      (name.to_vec(), value)
+    })
+    .collect()
+}
+
+fn read_all(vol: &Volume, store: &Store, ino: InodeNo) -> Vec<u8> {
+  let size = vol.stat(store, ino).unwrap().size;
+  let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+  let n = vol.read(store, ino, 0, &mut buf).unwrap();
+  buf.truncate(n);
+  buf
+}
+
+fn ino_of(model: &Model, pick: u8) -> Option<u64> {
+  let inos: Vec<u64> = model.files.keys().copied().collect();
+  if inos.is_empty() {
+    None
+  } else {
+    Some(inos[usize::from(pick) % inos.len()])
+  }
+}
+
+/// The directory at `path`, or the refusal path resolution gives: `ENOENT` for a missing
+/// component, `ENOTDIR` for one that is not a directory.
+fn dir_handle(
+  vol: &Volume,
+  store: &Store,
+  path: &[String],
+) -> Result<slates_mem::Handle<slates_vfs::dir::DirNode>, VfsError> {
+  let mut dir = vol.root();
+  for p in path {
+    match vol.lookup(store, dir, p)?.child {
+      Child::Dir(h) => dir = h,
+      _ => return Err(VfsError::NotDirectory),
+    }
+  }
+  Ok(dir)
+}
+
+/// The real and the expected outcome of one step.
+type Outcomes = (Result<(), VfsError>, Result<(), VfsError>);
+
+/// One step against both the volume and the model.
+fn apply(step: &Step, vol: &mut Volume, store: &mut Store, model: &mut Model) -> Option<Outcomes> {
+  match step {
+    Step::Link(..)
+    | Step::Write(..)
+    | Step::Truncate(..)
+    | Step::Edit(..)
+    | Step::Snapshot
+    | Step::SetXattr(..)
+    | Step::RemoveXattr(..) => apply_content(step, vol, store, model),
+    _ => Some(apply_names(step, vol, store, model)),
+  }
+}
+
+fn apply_names(step: &Step, vol: &mut Volume, store: &mut Store, model: &mut Model) -> Outcomes {
+  match step {
+    Step::Create(p, n) => (
+      with_dir(vol, store, p, |v, s, d| {
+        v.create_file(s, d, n, 0o644).map(|_| ())
+      }),
+      model.create(p, n).map(|_| ()),
+    ),
+    Step::Mkdir(p, n) => (
+      with_dir(vol, store, p, |v, s, d| v.mkdir(s, d, n, 0o755).map(|_| ())),
+      model.mkdir(p, n),
+    ),
+    Step::Symlink(p, n) => (
+      with_dir(vol, store, p, |v, s, d| {
+        v.symlink(s, d, n, "target").map(|_| ())
+      }),
+      model.symlink(p, n, "target"),
+    ),
+    Step::Unlink(p, n) => (
+      with_dir(vol, store, p, |v, s, d| v.unlink(s, d, n)),
+      model.unlink(p, n),
+    ),
+    Step::Rmdir(p, n) => (
+      with_dir(vol, store, p, |v, s, d| v.rmdir(s, d, n)),
+      model.rmdir(p, n),
+    ),
+    Step::Rename(fp, fnm, tp, tn) => (
+      match (dir_handle(vol, store, fp), dir_handle(vol, store, tp)) {
+        (Ok(f), Ok(t)) => vol.rename(store, f, fnm, t, tn),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+      },
+      model.rename(fp, fnm, tp, tn),
+    ),
+    _ => (Ok(()), Ok(())),
+  }
+}
+
+fn apply_content(
+  step: &Step,
+  vol: &mut Volume,
+  store: &mut Store,
+  model: &mut Model,
+) -> Option<Outcomes> {
+  Some(match step {
+    Step::Link(p, n, pick) => {
+      let ino = ino_of(model, *pick)?;
+      (
+        with_dir(vol, store, p, |v, s, d| {
+          v.link(s, d, n, InodeNo::compose(7, ino))
+        }),
+        model.link(p, n, ino),
+      )
+    }
+    Step::Write(pick, off, bytes) => {
+      let ino = ino_of(model, *pick)?;
+      (
+        vol
+          .write(store, InodeNo::compose(7, ino), u64::from(*off), bytes)
+          .map(|_| ()),
+        model.write(ino, usize::from(*off), bytes),
+      )
+    }
+    Step::Truncate(pick, len) => {
+      let ino = ino_of(model, *pick)?;
+      (
+        vol.truncate(store, InodeNo::compose(7, ino), u64::from(*len)),
+        model.truncate(ino, usize::from(*len)),
+      )
+    }
+    Step::Edit(pick, at, del, bytes) => {
+      let ino = ino_of(model, *pick)?;
+      // The offset is clamped to the size: an edit past the end is a refusal both sides agree
+      // on, and the interesting histories are the ones inside the file.
+      let size = model.files.get(&ino).map_or(0, |f| f.bytes.len());
+      let at = usize::from(*at) % (size + 1);
+      (
+        vol.edit(
+          store,
+          InodeNo::compose(7, ino),
+          u64::try_from(at).unwrap(),
+          u64::from(*del),
+          bytes,
+        ),
+        model.edit(ino, at, usize::from(*del), bytes),
+      )
+    }
+    Step::Snapshot => {
+      vol.snapshot(store).unwrap();
+      model.snapshot();
+      (Ok(()), Ok(()))
+    }
+    Step::SetXattr(pick, name, value, mode) => {
+      let ino = ino_of(model, *pick)?;
+      (
+        vol.xattr_set(
+          store,
+          InodeNo::compose(7, ino),
+          name.as_bytes(),
+          value,
+          common::drive::xattr_set(*mode),
+        ),
+        model.set_xattr(ino, name, value, *mode),
+      )
+    }
+    Step::RemoveXattr(pick, name) => {
+      let ino = ino_of(model, *pick)?;
+      (
+        vol.xattr_remove(store, InodeNo::compose(7, ino), name.as_bytes()),
+        model.remove_xattr(ino, name),
+      )
+    }
+    _ => (Ok(()), Ok(())),
+  })
+}
+
+fn with_dir(
+  vol: &mut Volume,
+  store: &mut Store,
+  path: &[String],
+  op: impl FnOnce(
+    &mut Volume,
+    &mut Store,
+    slates_mem::Handle<slates_vfs::dir::DirNode>,
+  ) -> Result<(), VfsError>,
+) -> Result<(), VfsError> {
+  let dir = dir_handle(vol, store, path)?;
+  op(vol, store, dir)
+}
+
+/// A-68's oracle, after every step: the volume's publication — its full image, or a delta over the last one
+/// published — applied to what was published must equal the volume's full image now, and the publication the daemon
+/// encodes from the store (`encode_publication`, 2026-10-06) must be byte for byte the publication's encoding. Returns
+/// whether this step's publication was a delta (the count a test asserts moved, so a dead delta path cannot pass as a
+/// full-image one).
+fn check_publication(
+  vol: &mut Volume,
+  store: &Store,
+  published: &mut Option<slates_vfs::recover::VolumeImage>,
+  step: &Step,
+) -> bool {
+  let publication = vol.publication(store, None).unwrap();
+  let mut streamed = vec![0xA5];
+  vol.encode_publication(store, None, &mut streamed).unwrap();
+  let mut encoded = Vec::new();
+  slates_wire::Wire::encode(&publication, &mut encoded);
+  assert_eq!(
+    streamed.get(1..),
+    Some(&encoded[..]),
+    "the streamed publication after {step:?}"
+  );
+  let delta = matches!(publication, slates_vfs::delta::VolumeRecord::Delta { .. });
+  if let slates_vfs::delta::VolumeRecord::Delta { delta } = &publication {
+    PATCHES_TAKEN.fetch_add(
+      u64::try_from(delta.patches.len()).unwrap(),
+      std::sync::atomic::Ordering::Relaxed,
+    );
+  }
+  match publication {
+    slates_vfs::delta::VolumeRecord::Full { image } => *published = Some(image),
+    slates_vfs::delta::VolumeRecord::Delta { delta } => published
+      .as_mut()
+      .expect("a delta follows a published image")
+      .apply(&delta)
+      .unwrap(),
+  }
+  assert_eq!(
+    published.as_ref(),
+    Some(&vol.to_image(store, None).unwrap()),
+    "the published image after {step:?}"
+  );
+  vol.mark_published(store);
+  delta
+}
+
+/// The deltas the model runs took (A-68's non-vacuity count).
+static DELTAS_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The files the model runs' deltas patched rather than imaged whole (A-126's non-vacuity count).
+static PATCHES_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shape: a page small enough that the model's writes, at offsets up to `u16::MAX`, cross many chunk windows (sixteen
+/// 512-byte pages: 8 KiB windows), so a publication's patch of a file's written windows (A-126) is exercised across
+/// windows, not within the first alone.
+const SMALL_PAGE: usize = 512;
+
+fn run(steps: Vec<Step>, quota: u64) {
+  run_on(store(), steps.clone(), quota);
+  run_on(
+    common::store_shaped(1 << 16, 4, SMALL_PAGE, SMALL_PAGE),
+    steps.clone(),
+    quota,
+  );
+  // The daemon's shape on a large-page host: chunks of sixteen 16 KiB pages, blocks in 4 KiB granules. The charge
+  // rule rounds to the granule, never the page.
+  run_on(
+    common::store_shaped(1 << 16, 4, common::LARGE_PAGE, common::PAGE),
+    steps,
+    quota,
+  );
+}
+
+/// Shape: the inode numbers the model's store reserves ahead of a volume's counter (A-150). Nonzero, so a publication
+/// records a counter apart from the live one, and the streamed-equals-built oracle in [`check_publication`] compares
+/// the counter the daemon actually writes: with no reserve the two counters coincide, and the streamed encoders once
+/// wrote the live counter while the built ones wrote the reserved ceiling, unseen.
+const MODEL_INODE_RESERVE: u64 = 3;
+
+fn run_on(mut store: Store, steps: Vec<Step>, quota: u64) {
+  store.inode_reserve = MODEL_INODE_RESERVE;
+  let mut vol = volume(&mut store, quota);
+  let mut published = None;
+  let mut model = Model::new(
+    quota,
+    u64::try_from(store.content.chunk_bytes()).unwrap(),
+    u64::try_from(store.inline_bytes).unwrap(),
+    u64::try_from(store.content.granule()).unwrap(),
+  );
+  for step in steps {
+    let Some((real, expected)) = apply(&step, &mut vol, &mut store, &mut model) else {
+      continue;
+    };
+    assert_eq!(real, expected, "step {step:?}");
+    let (real_dirs, real_files, real_xattrs) = real_state(&vol, &store);
+    let (model_dirs, model_files, model_xattrs) = model.abstract_state();
+    assert_eq!(real_dirs, model_dirs, "listings after {step:?}");
+    assert_eq!(real_files, model_files, "bytes after {step:?}");
+    assert_eq!(
+      real_xattrs, model_xattrs,
+      "extended attributes after {step:?}"
+    );
+    assert_eq!(
+      vol.accounting().referenced_bytes,
+      model.referenced(),
+      "referenced after {step:?}"
+    );
+    assert_eq!(
+      vol.accounting().unique_bytes,
+      model.unique(),
+      "unique after {step:?}"
+    );
+    check_blocks(&vol, &store, &step);
+    if check_publication(&mut vol, &store, &mut published, &step) {
+      DELTAS_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+  }
+}
+
+thread_local! {
+  /// The block classes this thread's model runs' directories were seen in, one bit a class (A-203's non-vacuity
+  /// record; per thread, so a test reads only its own runs).
+  static CLASSES_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A-203: the block store holds exactly the directory blocks the volume holds (its head's and snapshots' and their
+/// deadlists'): none leaked, none freed while reached. Each class's census counts them, every class's list of pages
+/// with room is sound, and every block is at most twice the class that fits its live bytes (the fixtures have room,
+/// so no shrink was passed over).
+fn check_blocks(vol: &Volume, store: &Store, step: &Step) {
+  let held = vol.directory_blocks(store);
+  assert_eq!(
+    store.blocks.len(),
+    held.len(),
+    "blocks the store holds after {step:?}"
+  );
+  let census = store.blocks.census();
+  for (class, counted) in census.iter().enumerate() {
+    let expected = held
+      .iter()
+      .filter(|(_, size, _)| class_for(*size) == Some(class))
+      .count();
+    assert_eq!(
+      counted.blocks, expected,
+      "class {class}'s blocks after {step:?}"
+    );
+    if expected > 0 {
+      CLASSES_SEEN.with(|seen| seen.set(seen.get() | 1 << class));
+    }
+  }
+  assert!(
+    store.blocks.lists_are_sound(),
+    "the class lists after {step:?}"
+  );
+  for (block, size, fitted) in &held {
+    assert!(
+      *size <= 2 * fitted,
+      "{block:?}: {size} bytes for entries that fit {fitted}, after {step:?}"
+    );
+  }
+}
+
+/// A-203. Do: on a folding volume, fill one directory with 200 files of 13- to 40-byte names (the blocks grow through
+/// the classes and split), snapshot, remove 190 of them (copies of the shared path, merges and shrinks) and fill
+/// again, checking the store's blocks against what the volume holds after every step. Expect: every step passes the
+/// model and [`check_blocks`], and the blocks were seen in at least eight classes, the largest among them.
+#[test]
+fn directory_blocks_grow_split_and_shrink_as_the_volume_holds_them() {
+  let name = |n: usize| format!("entry-{n:06}{}", "q".repeat(n % 28));
+  let wide = || vec!["wide".to_owned()];
+  let mut steps = vec![Step::Mkdir(vec![], "wide".to_owned())];
+  steps.extend((0..200).map(|n| Step::Create(wide(), name(n))));
+  steps.push(Step::Snapshot);
+  steps.extend((10..200).map(|n| Step::Unlink(wide(), name(n))));
+  steps.extend((200..260).map(|n| Step::Create(wide(), name(n))));
+  CLASSES_SEEN.with(|seen| seen.set(0));
+  run_on(store(), steps, 1 << 20);
+  let seen = CLASSES_SEEN.with(std::cell::Cell::get);
+  assert!(seen.count_ones() >= 8, "classes seen: {seen:#b}");
+  let largest = u32::try_from(slates_vfs::dirblocks::CLASSES - 1).unwrap();
+  assert!(
+    seen & (1 << largest) != 0,
+    "a block reached the largest class: {seen:#b}"
+  );
+}
+
+/// A-126 (a written file's delta is its written windows): do write a file across several windows, publish, then
+/// overwrite one window, append past the end, rewrite the open window, truncate and write again, checking every
+/// step's publication against the full image on a store whose windows are 8 KiB. Expect patches taken (the writes to a
+/// chunked body after the first publication) and every publication to agree with the full image, the truncate's among
+/// them imaged whole.
+#[test]
+fn a_written_file_publishes_its_written_windows_and_rebuilds_its_full_image() {
+  let name = |n: &str| n.to_owned();
+  let window = 8 * 1024u16;
+  let bytes = |len: usize, fill: u8| vec![fill; len];
+  let steps = vec![
+    Step::Create(vec![], name("f")),
+    Step::Write(0, 0, bytes(40, 1)),
+    Step::Write(0, window - 20, bytes(40, 2)),
+    Step::Write(0, 3 * window, bytes(40, 3)),
+    Step::Write(0, window + 5, bytes(40, 4)),
+    Step::Write(0, 6 * window - 10, bytes(40, 5)),
+    Step::Write(0, 6 * window, bytes(40, 6)),
+    Step::Truncate(0, 2 * window),
+    Step::Write(0, 4 * window, bytes(40, 7)),
+    Step::Write(0, 10, bytes(40, 8)),
+  ];
+  let before = PATCHES_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+  run_on(
+    common::store_shaped(1 << 16, 4, SMALL_PAGE, SMALL_PAGE),
+    steps,
+    1 << 20,
+  );
+  let taken = PATCHES_TAKEN.load(std::sync::atomic::Ordering::Relaxed) - before;
+  assert!(
+    taken >= 4,
+    "the written file was patched, not imaged whole ({taken})"
+  );
+}
+
+/// A-68 (incremental publication): do run a fixed history of creates, writes, renames, links, unlinks and removals
+/// on a folding volume, checking every step's publication against the full image; expect deltas taken (not a full
+/// image every time) and every one to agree.
+#[test]
+fn a_volume_publishes_deltas_that_rebuild_its_full_image() {
+  let name = |n: &str| n.to_owned();
+  let steps = vec![
+    Step::Mkdir(vec![], name("a")),
+    Step::Create(vec![name("a")], name("b")),
+    Step::Write(0, 0, b"hello".to_vec()),
+    Step::Create(vec![], name("C")),
+    Step::Rename(vec![], name("C"), vec![name("a")], name("d")),
+    Step::Link(vec![name("a")], name("e"), 0),
+    Step::Unlink(vec![name("A")], name("B")),
+    Step::Write(1, 100, b"later bytes".to_vec()),
+    Step::Rename(vec![name("a")], name("d"), vec![name("a")], name("D")),
+    Step::Unlink(vec![name("a")], name("e")),
+    Step::Rmdir(vec![], name("a")),
+  ];
+  let before = DELTAS_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+  run(steps, 1 << 20);
+  let taken = DELTAS_TAKEN.load(std::sync::atomic::Ordering::Relaxed) - before;
+  assert!(
+    taken >= 5,
+    "the history published deltas, not full images ({taken})"
+  );
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::seeded(ProptestConfig { cases: slates_test_seeds::cases(400), max_shrink_iters: 4000, .. ProptestConfig::default() }, include_str!("model.proptest-regressions")).unwrap())]
+
+  #[test]
+  fn the_volume_equals_the_model_on_every_history(steps in prop::collection::vec(step(), 1..40)) {
+    run(steps, 1 << 20);
+  }
+
+  #[test]
+  fn a_tight_quota_refuses_the_same_writes_as_the_model(steps in prop::collection::vec(step(), 1..30)) {
+    run(steps, 150);
+  }
+}
+
+/// AC-1.1: the model-based suite over 10^6 generated operations with shrinking on. CI runs it
+/// as `cargo test -p slates-vfs --release --test model -- --ignored ac_1_1`; the count is
+/// exact because every applied step is counted, not estimated from the case count.
+#[test]
+#[ignore = "AC-1.1: 10^6 operations; CI runs it with --ignored"]
+fn ac_1_1_one_million_generated_operations_agree_with_the_model() {
+  use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+  /// Format: the design's operation count for AC-1.1.
+  const OPERATIONS: u64 = 1_000_000;
+  /// Shape: cases per runner; a runner keeps its success count, so each batch gets a fresh
+  /// one, seeded from the batch number so a failing batch can be rerun.
+  const CASES_PER_BATCH: u32 = 1000;
+  let applied = std::cell::Cell::new(0u64);
+  let strategy = prop::collection::vec(step(), 1..40);
+  let mut batch = 0u64;
+  while applied.get() < OPERATIONS {
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&batch.to_le_bytes());
+    let mut runner = TestRunner::new_with_rng(
+      // A failing seed is reported, never written (A-50; AUD-29-63).
+      slates_test_seeds::unseeded(Config {
+        cases: CASES_PER_BATCH,
+        max_shrink_iters: 4000,
+        ..Config::default()
+      }),
+      TestRng::from_seed(RngAlgorithm::ChaCha, &seed),
+    );
+    let result = runner.run(&strategy, |steps| {
+      applied.set(applied.get() + u64::try_from(steps.len()).unwrap());
+      run(steps, 1 << 20);
+      Ok(())
+    });
+    if let Err(e) = result {
+      panic!(
+        "AC-1.1 failed in batch {batch} after {} operations: {e}",
+        applied.get()
+      );
+    }
+    batch += 1;
+  }
+  println!(
+    "AC-1.1: {} generated operations agreed with the model",
+    applied.get()
+  );
+}
+
+/// A file with two versions: "version one" under snapshot `s1`, "VERSION TWO" at the head.
+fn two_versions() -> (Store, Volume, InodeNo, SnapshotId) {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 24);
+  let root = vol.root();
+  let f = vol.create_file(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f, 0, b"version one").unwrap();
+  let s1 = vol.snapshot(&mut store).unwrap();
+  vol.write(&mut store, f, 0, b"VERSION TWO").unwrap();
+  (store, vol, f, s1)
+}
+
+/// AC-1.2: a snapshot is O(1) and keeps the old bytes readable while the head moves on.
+#[test]
+fn a_snapshot_keeps_the_old_bytes_readable_while_the_head_moves_on() {
+  let (store, vol, f, s1) = two_versions();
+  let mut buf = [0u8; 512];
+  let n = vol.read_in(&store, s1, f, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"version one");
+  let n = vol.read(&store, f, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"VERSION TWO");
+  assert_eq!(vol.accounting().referenced_bytes, 11);
+}
+
+/// A clone of `vol` at `snapshot`, folding names, with a 16 MiB bounded quota.
+fn clone_at(store: &Store, vol: &mut Volume, snapshot: SnapshotId) -> Volume {
+  Volume::clone_of(store, vol, snapshot, clone_config(8)).unwrap()
+}
+
+/// Destroys a volume in slices of eight releases until it reports done.
+fn destroy_fully(vol: &mut Volume, store: &mut Store) {
+  vol.destroy(store).unwrap();
+  while vol.destroy_step(store, 8).unwrap() != slates_vfs::volume::DestroyProgress::Done {}
+}
+
+/// AC-1.2: a clone reads its snapshot and diverges without touching the origin.
+#[test]
+fn a_clone_reads_its_snapshot_and_diverges_without_touching_the_origin() {
+  let (mut store, mut vol, f, s1) = two_versions();
+  let mut buf = [0u8; 512];
+  let mut clone = clone_at(&store, &mut vol, s1);
+  assert_eq!(clone.accounting().referenced_bytes, 11);
+  assert_eq!(clone.accounting().unique_bytes, 0);
+  let cf = clone.resolve(&store, "/f").unwrap().inode;
+  assert_eq!(cf, f, "inode numbers survive the clone");
+  let n = clone.read(&store, cf, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"version one");
+  clone.write(&mut store, cf, 0, b"clone").unwrap();
+  let n = clone.read(&store, cf, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"cloneon one");
+  let n = vol.read(&store, f, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"VERSION TWO", "the origin is untouched");
+  let n = vol.read_in(&store, s1, f, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"version one", "the snapshot is untouched");
+}
+
+/// AC-1.5: destroying a clone releases only the bytes it wrote; the origin's snapshot still
+/// reads and can be destroyed afterwards.
+#[test]
+fn destroying_a_clone_releases_only_its_own_bytes() {
+  let (mut store, mut vol, f, s1) = two_versions();
+  let mut buf = [0u8; 512];
+  let mut clone = clone_at(&store, &mut vol, s1);
+  let cf = clone.resolve(&store, "/f").unwrap().inode;
+  // A write past the inline threshold takes content memory of the clone's own.
+  let before = store.content.allocated_bytes();
+  let big = vec![b'c'; 300];
+  clone.write(&mut store, cf, 0, &big).unwrap();
+  assert!(
+    store.content.allocated_bytes() > before,
+    "the clone's write took content memory"
+  );
+  let n = clone.read(&store, cf, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], &big[..]);
+  destroy_fully(&mut clone, &mut store);
+  assert_eq!(
+    store.content.allocated_bytes(),
+    before,
+    "only the clone's bytes went"
+  );
+  let n = vol.read_in(&store, s1, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"version one",
+    "the origin's snapshot still reads"
+  );
+  assert_eq!(
+    vol.destroy_snapshot(&mut store, s1),
+    Err(VfsError::Pinned),
+    "the clone's pin outlives the clone until its owner releases it"
+  );
+  vol.unpin(s1).unwrap();
+  assert_eq!(vol.destroy_snapshot(&mut store, s1), Ok(()));
+}
+
+/// T-1.2, EQUIVALENCE §4: a folding volume keeps names as spelled, as APFS and NTFS do, so a rename
+/// to another spelling of the same entry respells it and a rename to the same bytes changes nothing.
+/// Do: rename `readme` to `README`, then `README` to `README`. Expect: one entry, spelled `README`,
+/// the same inode; then no change.
+#[test]
+fn a_case_only_rename_respells_the_entry_on_a_folding_volume() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root();
+  let file = vol.create_file(&mut store, root, "readme", 0o644).unwrap();
+  assert_eq!(
+    vol.rename(&mut store, root, "readme", root, "README"),
+    Ok(())
+  );
+  let names: Vec<String> = vol
+    .readdir(&store, root)
+    .unwrap()
+    .into_iter()
+    .map(|entry| entry.name.to_string())
+    .collect();
+  assert_eq!(names, vec!["README".to_owned()], "respelled, one entry");
+  assert_eq!(vol.resolve(&store, "/README").unwrap().inode, file);
+  assert_eq!(
+    vol.rename(&mut store, root, "README", root, "README"),
+    Ok(())
+  );
+  assert_eq!(vol.readdir(&store, root).unwrap().len(), 1);
+}
+
+/// EQUIVALENCE §4: on a folding volume, a rename that replaces another entry keeps that entry's
+/// spelling, as APFS does. Do: create `A` and `d`, rename `d` onto `a`. Expect: one entry, spelled `A`,
+/// now `d`'s inode.
+#[test]
+fn a_rename_onto_another_spelling_keeps_the_replaced_entrys_spelling() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root();
+  vol.create_file(&mut store, root, "A", 0o644).unwrap();
+  let moved = vol.create_file(&mut store, root, "d", 0o644).unwrap();
+  assert_eq!(vol.rename(&mut store, root, "d", root, "a"), Ok(()));
+  let names: Vec<String> = vol
+    .readdir(&store, root)
+    .unwrap()
+    .into_iter()
+    .map(|entry| entry.name.to_string())
+    .collect();
+  assert_eq!(names, vec!["A".to_owned()], "the replaced entry's spelling");
+  assert_eq!(vol.resolve(&store, "/A").unwrap().inode, moved);
+}
+
+#[test]
+fn posix_rename_rules_and_no_change_on_refusal() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root();
+  let d = vol.mkdir(&mut store, root, "d", 0o755).unwrap();
+  let e = vol.mkdir(&mut store, d, "e", 0o755).unwrap();
+  vol.create_file(&mut store, root, "f", 0o644).unwrap();
+  assert_eq!(
+    vol.rename(&mut store, root, "d", e, "x"),
+    Err(VfsError::Invalid),
+    "into its own subtree"
+  );
+  assert_eq!(
+    vol.rename(&mut store, root, "f", root, "d"),
+    Err(VfsError::IsDirectory)
+  );
+  assert_eq!(
+    vol.rename(&mut store, root, "d", root, "f"),
+    Err(VfsError::NotDirectory)
+  );
+  assert_eq!(vol.rename(&mut store, root, "d", root, "missing"), Ok(()));
+  assert!(vol.resolve(&store, "/missing/e").is_ok());
+  assert!(vol.resolve(&store, "/d").is_err());
+  let moved = vol.resolve(&store, "/missing").unwrap().inode;
+  assert_eq!(
+    vol.link(&mut store, root, "dl", moved),
+    Err(VfsError::NotPermitted)
+  );
+  assert_eq!(
+    vol.create_file(&mut store, root, "F", 0o644),
+    Err(VfsError::AlreadyExists),
+    "folds equal"
+  );
+  assert_eq!(vol.readdir(&store, root).unwrap().len(), 2);
+}
+
+#[test]
+fn truncate_to_a_non_page_boundary_then_extend_reads_zeros_in_the_tail() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 24);
+  let root = vol.root();
+  let f = vol.create_file(&mut store, root, "t", 0o644).unwrap();
+  let data: Vec<u8> = (0..u8::MAX).cycle().take(9000).collect();
+  vol.write(&mut store, f, 0, &data).unwrap();
+  vol.truncate(&mut store, f, 5000).unwrap();
+  vol.truncate(&mut store, f, 7000).unwrap();
+  let mut buf = vec![1u8; 2000];
+  assert_eq!(vol.read(&store, f, 5000, &mut buf).unwrap(), 2000);
+  assert!(buf.iter().all(|b| *b == 0));
+  vol.write(&mut store, f, 6000, b"z").unwrap();
+  let mut buf = vec![1u8; 1001];
+  assert_eq!(vol.read(&store, f, 5000, &mut buf).unwrap(), 1001);
+  assert!(
+    buf[..1000].iter().all(|b| *b == 0),
+    "the reopened chunk's tail stays zero"
+  );
+  assert_eq!(buf[1000], b'z');
+}

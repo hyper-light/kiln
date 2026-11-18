@@ -1,0 +1,664 @@
+//! The workload roster and its byte-identity comparison (Part 6 "Real workloads": "vendored git,
+//! cargo, npm, python, rg, rsync, sqlite, editors, watchers … outputs byte-identical to the host
+//! run; `git status` clean; incremental builds reuse artifacts"; AC-3.2, AC-4.2). Each workload is
+//! a short POSIX shell script the harness runs twice with the same environment — once in a host
+//! directory, once in a directory inside the mount — capturing the exit code, the output and a
+//! manifest of the resulting tree. "Byte-identical" is then exactly: equal exit codes, equal
+//! outputs after the two directory roots are replaced by one token, and equal manifests (path,
+//! kind, mode bits, size, BLAKE3 of the bytes, symlink target) under the reviewed exclusions the
+//! roster names per workload with the reason (`EQUIVALENCE.md` §2: timestamps and inode numbers
+//! are not compared; the exclusions here are the files that embed a timestamp or an absolute
+//! path by the tool's own design).
+
+use serde::{Deserialize, Serialize};
+
+use crate::record::{WorkloadStatus, detail};
+
+/// One workload of the roster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Workload {
+  /// The name (the record's `tools[].name`).
+  pub name: &'static str,
+  /// The tool the harness probes on the `PATH`; absent means the cell is skipped naming it.
+  pub tool: &'static str,
+  /// The POSIX shell script, run with `sh -e` inside a fresh directory.
+  pub script: &'static str,
+  /// Path prefixes excluded from the manifest comparison, each with its reason.
+  pub excluded: &'static [(&'static str, &'static str)],
+}
+
+/// The git workload: a repository with files, a directory, a symlink, a mode change and two
+/// commits; the tree hash proves byte-identical content and modes, `git status` must be clean. The
+/// object count is compared, not `git count-objects`' kilobytes: those are `st_blocks`, the host
+/// filesystem's allocation unit (APFS rounds every loose object up to 4 KiB, the export reports the
+/// bytes held), a property of the filesystem under the repository, not of git (the CI macOS runner,
+/// 2026-09-16: "10 objects, 40 kilobytes" on the host, "10 objects, 5 kilobytes" on the mount).
+const GIT: &str = r#"
+git init -q .
+printf 'hello\n' > a.txt
+mkdir -p d
+printf 'world\n' > d/b.txt
+ln -s a.txt link
+chmod u=rwx,go=rx d/b.txt
+git add -A
+git commit -q -m first
+printf 'more\n' >> a.txt
+git mv d/b.txt d/c.txt
+git add -A
+git commit -q -m second
+git status --porcelain
+git log --format='%H %T %P'
+git ls-files -s
+git fsck --strict --no-progress
+git count-objects -v | grep '^count:'
+"#;
+
+/// The cargo workload: a dependency-free crate built twice; the second build must report the
+/// crate `Fresh` (AC-3.2 "incremental builds reuse artifacts") and the binary must run. The crate is its
+/// own workspace root (`[workspace]`), so it builds the same wherever its directory sits — a volume or a
+/// scratch inside another workspace included (the harness's scratch moved into the repository's `target/`
+/// on 2026-09-30, and cargo then took the repository's manifest for this crate's workspace).
+const CARGO: &str = r#"
+mkdir -p mini/src
+printf '[package]\nname = "mini"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n\n[workspace]\n' > mini/Cargo.toml
+printf 'fn main() { println!("mini says hello with {} args", std::env::args().count()); }\n' > mini/src/main.rs
+cd mini
+cargo build -q --offline
+./target/debug/mini
+cargo build -v --offline 2>&1 | grep -c '^ *Fresh mini'
+"#;
+
+/// The npm workload: a local package installed into an application and required from it.
+const NPM: &str = r#"
+mkdir -p pkg app
+printf '{"name":"slates-pkg","version":"1.0.0","main":"index.js","license":"MIT"}\n' > pkg/package.json
+printf 'module.exports = { greet: () => "hello from slates-pkg" };\n' > pkg/index.js
+printf '{"name":"app","version":"1.0.0","private":true,"license":"MIT"}\n' > app/package.json
+cd app
+npm install ../pkg --no-audit --no-fund --loglevel=silent
+node -e 'console.log(require("slates-pkg").greet())'
+npm ls --depth=0
+"#;
+
+/// The python workload: a package imported, files written and read back, a bytecode compile.
+const PYTHON: &str = r#"
+mkdir -p pkg
+printf 'def greet():\n    return "hello from pkg"\n' > pkg/__init__.py
+printf 'import json, os, pkg\nprint(pkg.greet())\nwith open("out.json", "w") as f:\n    json.dump({"names": sorted(os.listdir("."))}, f)\nprint(open("out.json").read())\n' > main.py
+python3 -B main.py
+python3 -m py_compile pkg/__init__.py
+python3 -c 'import pkg; print(pkg.greet())'
+"#;
+
+/// The ripgrep workload: a tree searched, counted and listed in path order.
+const RIPGREP: &str = r#"
+mkdir -p src/nested
+printf 'alpha needle\nbeta\n' > src/a.txt
+printf 'needle gamma\n' > src/nested/b.txt
+printf 'delta\n' > src/c.txt
+rg -n --sort path needle src
+rg -c --sort path needle src
+rg --files --sort path src
+"#;
+
+/// The rsync workload: a tree with a symlink and a mode copied, then re-synced (nothing to do).
+const RSYNC: &str = r#"
+mkdir -p src/sub
+printf 'one\n' > src/one.txt
+printf 'two\n' > src/sub/two.txt
+ln -s one.txt src/link
+chmod u=rw,g=r,o= src/one.txt
+rsync -a src/ dst/
+rsync -ai src/ dst/ | wc -l | tr -d ' '
+diff -r src dst && echo same
+"#;
+
+/// The sqlite workload (T-3.3): a WAL-mode database written by two processes at once (each waiting out
+/// the other's lock for [`ENV_SQLITE_BUSY_MS`]), then checked and checkpointed back to rollback mode. The
+/// two `journal_mode` PRAGMA outputs are discarded, not compared: WAL needs shared-memory mmap, which a
+/// network mount does not provide, so sqlite correctly falls back to a rollback journal there and
+/// `PRAGMA journal_mode=WAL` answers `delete` on the mount and `wal` on the host — a property of the fs's
+/// mmap support, not of the workload. What is compared is the data the concurrent writers produced (the
+/// six rows) and the integrity check; the database file itself is excluded (its bytes embed the journal
+/// history and page-allocation order, which the fallback changes).
+const SQLITE: &str = r#"
+sqlite3 db.sqlite 'PRAGMA journal_mode=WAL;' > /dev/null
+sqlite3 db.sqlite 'CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);'
+sqlite3 -cmd ".timeout $SLATES_SQLITE_BUSY_MS" db.sqlite "INSERT INTO t(x) VALUES ('a'),('b'),('c');" &
+sqlite3 -cmd ".timeout $SLATES_SQLITE_BUSY_MS" db.sqlite "INSERT INTO t(x) VALUES ('d'),('e'),('f');" &
+wait
+sqlite3 db.sqlite 'SELECT count(*), group_concat(x) FROM (SELECT x FROM t ORDER BY x);'
+sqlite3 db.sqlite 'PRAGMA integrity_check;'
+sqlite3 db.sqlite 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;' > /dev/null
+"#;
+
+/// The editor workload: vim's save pattern in batch mode — the original renamed to a backup and
+/// a new file written (`backupcopy=no`), the write-new-then-rename shape editors use.
+/// Clear the temporary-path exclusion so both roots exercise backup creation; reading the backup
+/// makes a missing backup fail even when both roots would otherwise skip it (T-3.3).
+const EDITOR: &str = r#"
+printf 'draft\n' > note.txt
+vim -u NONE -N -i NONE -es -c 'set backup backupdir=. writebackup backupcopy=no backupskip=' -c 'normal! ihello ' -c 'wq' note.txt
+cat note.txt
+cat note.txt~
+ls -A
+"#;
+
+/// The macOS watcher workload: fswatch reports the creation of a file (FSEvents/kqueue). The assertion
+/// is that the watcher *observed* the creation, not the raw `events.txt` — its exact bytes depend on the
+/// fs's event delivery (a network mount coalesces differently and fires an extra event for the AppleDouble
+/// sidecar the NFS client writes), which is the transport's behaviour, not the workload's; `events.txt` is
+/// excluded from the tree for the same reason.
+///
+/// The watcher's readiness is observed, never assumed: FSEvents gives no signal that a stream is live,
+/// so probe files are created until the watcher reports one, and only then is `new.txt` created; each
+/// wait is bounded by [`ENV_WATCH_SECONDS`]. (A fixed one-second sleep before the creation let a loaded
+/// runner's host watcher miss it: CI 36281600448.) The probes are removed before the tree is compared.
+const WATCHER_MACOS: &str = r#"
+mkdir -p watched
+# Shape: FSEvents' coalescing latency (fswatch --latency), the resolution the watcher reports at, so
+# the waits poll at it.
+latency=0.1
+# The output file exists before the watcher starts, so no poll reads a file not yet created.
+: > events.txt
+fswatch --event Created --latency "$latency" watched > events.txt &
+watcher=$!
+deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
+probe=0
+until grep -qs 'ready\.[0-9]' events.txt; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+  probe=$((probe + 1))
+  : > "watched/ready.$probe"
+  sleep "$latency"
+done
+rm -f watched/ready.*
+printf 'x\n' > watched/new.txt
+deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
+until grep -qs 'new\.txt' events.txt; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+  sleep "$latency"
+done
+kill $watcher 2>/dev/null || true
+wait $watcher 2>/dev/null || true
+if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else echo "missed new.txt"; fi
+"#;
+
+/// The Linux watcher workload: inotifywait reports the creation of a file within [`ENV_WATCH_SECONDS`].
+/// As with the macOS form, the assertion is that the creation was observed, not the raw `events.txt`.
+/// The watcher's readiness is observed: inotifywait prints `Watches established.` once its watch is
+/// in place, and the file is created only after that line (bounded by the same wait). The output files
+/// are created before the watcher starts: over a network mount the background job's redirect can land
+/// after the first poll (CI 36284404440: `grep: watch.log: No such file or directory` in the output).
+const WATCHER_LINUX: &str = r#"
+mkdir -p watched
+# Shape: how often the watcher's readiness is checked, far below the recorded wait.
+poll=0.1
+# The output files exist before the watcher starts, so no poll reads a file not yet created.
+: > events.txt
+: > watch.log
+inotifywait -e create -t "$SLATES_WATCH_SECONDS" --format '%e %f' watched > events.txt 2> watch.log &
+watcher=$!
+deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
+until grep -qs 'Watches established' watch.log; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+  sleep "$poll"
+done
+printf 'x\n' > watched/new.txt
+wait $watcher || true
+if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else echo "missed new.txt"; fi
+"#;
+
+/// Format: the environment variable the sqlite script reads its busy timeout from, in
+/// milliseconds; the harness sets it from its recorded bound.
+pub const ENV_SQLITE_BUSY_MS: &str = "SLATES_SQLITE_BUSY_MS";
+/// Format: the environment variable the watcher scripts read their wait from, in seconds; the
+/// harness sets it from its recorded bound.
+pub const ENV_WATCH_SECONDS: &str = "SLATES_WATCH_SECONDS";
+/// Shape: the busy timeout the sqlite workload waits out a sibling's lock with, milliseconds; the two inserts
+/// race by design and the loser must wait rather than fail. One value for every leg that runs the roster (host,
+/// container, guest), so their runs are judged under one bound.
+pub const SQLITE_BUSY_MS: u64 = 5_000;
+/// Shape: how long the watcher workloads wait for their event, seconds; one value for every leg, as above.
+pub const WATCH_SECONDS: u64 = 3;
+
+/// The roster, in the design's order (Part 6 "Real workloads"); both watcher forms are listed
+/// and the harness keeps the one for its operating system.
+pub const ROSTER: &[Workload] = &[
+  Workload {
+    name: "git",
+    tool: "git",
+    script: GIT,
+    excluded: &[
+      (
+        ".git/index",
+        "the index caches stat data (mtime, inode, device) by design",
+      ),
+      (
+        ".git/logs/",
+        "reflog lines carry the wall-clock time of each update",
+      ),
+      (".git/COMMIT_EDITMSG", "a scratch file of the last commit"),
+      (".git/ORIG_HEAD", "a scratch ref"),
+    ],
+  },
+  Workload {
+    name: "cargo",
+    tool: "cargo",
+    script: CARGO,
+    excluded: &[(
+      "mini/target/",
+      "fingerprints and dep-info embed the absolute source path and mtimes by cargo's design",
+    )],
+  },
+  Workload {
+    name: "npm",
+    tool: "npm",
+    script: NPM,
+    excluded: &[],
+  },
+  Workload {
+    name: "python",
+    tool: "python3",
+    script: PYTHON,
+    excluded: &[
+      (
+        "pkg/__pycache__/",
+        "a .pyc header embeds the source's mtime and size by design",
+      ),
+      ("__pycache__/", "same"),
+    ],
+  },
+  Workload {
+    name: "rg",
+    tool: "rg",
+    script: RIPGREP,
+    excluded: &[],
+  },
+  Workload {
+    name: "rsync",
+    tool: "rsync",
+    script: RSYNC,
+    excluded: &[],
+  },
+  Workload {
+    name: "sqlite",
+    tool: "sqlite3",
+    script: SQLITE,
+    excluded: &[(
+      "db.sqlite",
+      "the database file's bytes embed the journal mode and page-allocation history, which the mount's WAL fallback changes; the six rows and the integrity check are verified in the output",
+    )],
+  },
+  Workload {
+    name: "editor",
+    tool: "vim",
+    script: EDITOR,
+    excluded: &[],
+  },
+  Workload {
+    name: "watcher",
+    tool: "fswatch",
+    script: WATCHER_MACOS,
+    excluded: &[(
+      "events.txt",
+      "the watcher's raw event log; its bytes depend on the fs's event delivery (coalescing, ordering, sidecar events), so the workload asserts the creation was observed instead",
+    )],
+  },
+  Workload {
+    name: "watcher",
+    tool: "inotifywait",
+    script: WATCHER_LINUX,
+    excluded: &[(
+      "events.txt",
+      "the watcher's raw event log; its bytes depend on the fs's event delivery (coalescing, ordering, sidecar events), so the workload asserts the creation was observed instead",
+    )],
+  },
+];
+
+/// The kind of a manifest entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum EntryKind {
+  /// A regular file.
+  File,
+  /// A directory.
+  Directory,
+  /// A symbolic link with its target text.
+  Symlink {
+    /// The link's target, as stored.
+    target: String,
+  },
+  /// A fifo, socket or device.
+  Other,
+}
+
+/// One entry of a tree manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+  /// The path relative to the workload directory, `/`-separated.
+  pub path: String,
+  /// The kind.
+  pub kind: EntryKind,
+  /// The permission bits (the low twelve of `st_mode`).
+  pub mode: u32,
+  /// The size in bytes (files only; 0 otherwise).
+  pub size: u64,
+  /// The BLAKE3 of the bytes (files only; empty otherwise), hexadecimal.
+  pub digest: String,
+}
+
+/// A tree manifest: the entries sorted by path.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Manifest {
+  /// The entries.
+  pub entries: Vec<Entry>,
+}
+
+impl Manifest {
+  /// The manifest without the excluded prefixes.
+  pub fn without(&self, excluded: &[(&str, &str)]) -> Manifest {
+    Manifest {
+      entries: self
+        .entries
+        .iter()
+        .filter(|e| {
+          !excluded
+            .iter()
+            .any(|(prefix, _)| e.path.starts_with(prefix) || e.path == prefix.trim_end_matches('/'))
+        })
+        .cloned()
+        .collect(),
+    }
+  }
+}
+
+/// One run of a workload script.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+  /// The directory the script ran in (replaced in the output before comparison).
+  pub directory: String,
+  /// The script's exit code.
+  pub exit_code: i32,
+  /// The script's combined output.
+  pub output: String,
+  /// The tree afterwards.
+  pub manifest: Manifest,
+}
+
+/// Format: the token both directory roots become in a normalized output.
+const ROOT_TOKEN: &str = "<dir>";
+
+/// The output with the run's directory replaced by one token, in each spelling a tool prints it:
+/// as given, with its `/private` twin on macOS, and with every UUID-shaped path segment as `***`,
+/// which is how npm prints a path (it redacts UUIDs from its output; seen 2026-09-26 when the scratch
+/// directory's name was a UUID: `app@1.0.0 /private/tmp/.../***/scratchpad/...`).
+pub fn normalize_output(output: &str, directory: &str) -> String {
+  let trimmed = directory.trim_end_matches('/');
+  let redacted = redact_uuids(trimmed);
+  let mut spellings = vec![format!("/private{trimmed}"), trimmed.to_owned()];
+  if redacted != trimmed {
+    spellings.insert(0, format!("/private{redacted}"));
+    spellings.insert(1, redacted);
+  }
+  spellings.iter().fold(output.to_owned(), |text, spelling| {
+    text.replace(spelling, ROOT_TOKEN)
+  })
+}
+
+/// A path with every UUID-shaped segment (8-4-4-4-12 hexadecimal digits) replaced by `***`.
+fn redact_uuids(path: &str) -> String {
+  /// Format: the lengths of a UUID's hyphen-separated groups (RFC 9562 §4).
+  const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+  let is_uuid = |segment: &str| {
+    let groups: Vec<&str> = segment.split('-').collect();
+    groups.len() == UUID_GROUPS.len()
+      && groups
+        .iter()
+        .zip(UUID_GROUPS)
+        .all(|(group, len)| group.len() == len && group.chars().all(|c| c.is_ascii_hexdigit()))
+  };
+  path
+    .split('/')
+    .map(|segment| if is_uuid(segment) { "***" } else { segment })
+    .collect::<Vec<_>>()
+    .join("/")
+}
+
+/// The first differing line of two texts, as a bounded detail.
+fn first_output_difference(host: &str, mount: &str) -> Option<String> {
+  let mut host_lines = host.lines();
+  let mut mount_lines = mount.lines();
+  let mut number = 0usize;
+  loop {
+    number = number.saturating_add(1);
+    match (host_lines.next(), mount_lines.next()) {
+      (None, None) => return None,
+      (h, m) if h == m => {}
+      (h, m) => {
+        return Some(detail(&format!(
+          "output line {number}: host {:?}, mount {:?}",
+          h.unwrap_or("<end>"),
+          m.unwrap_or("<end>")
+        )));
+      }
+    }
+  }
+}
+
+/// The first differing entry of two manifests, as a bounded detail.
+fn first_manifest_difference(host: &Manifest, mount: &Manifest) -> Option<String> {
+  let mut host_entries = host.entries.iter();
+  let mut mount_entries = mount.entries.iter();
+  loop {
+    match (host_entries.next(), mount_entries.next()) {
+      (None, None) => return None,
+      (Some(h), Some(m)) if h == m => {}
+      (h, m) => {
+        return Some(detail(&format!(
+          "tree entry: host {}, mount {}",
+          h.map_or("<end>".to_owned(), describe),
+          m.map_or("<end>".to_owned(), describe)
+        )));
+      }
+    }
+  }
+}
+
+/// Shape: the leading hexadecimal characters of a digest a difference names (enough to tell two
+/// digests apart by eye; the record never carries the whole 64).
+const DIGEST_PREVIEW_CHARS: usize = 12;
+
+fn describe(entry: &Entry) -> String {
+  format!(
+    "{} ({:?}, mode {:o}, {} bytes, {})",
+    entry.path,
+    entry.kind,
+    entry.mode,
+    entry.size,
+    if entry.digest.is_empty() {
+      "-"
+    } else {
+      entry
+        .digest
+        .get(..DIGEST_PREVIEW_CHARS)
+        .unwrap_or(&entry.digest)
+    }
+  )
+}
+
+/// Compares a workload's host run with its mounted run.
+pub fn compare(workload: &Workload, host: &Run, mount: &Run) -> WorkloadStatus {
+  if host.exit_code != mount.exit_code {
+    return WorkloadStatus::Differs {
+      detail: detail(&format!(
+        "exit code: host {}, mount {}; mount output tail: {}",
+        host.exit_code,
+        mount.exit_code,
+        crate::exerciser::tail(&mount.output)
+      )),
+    };
+  }
+  let host_output = normalize_output(&host.output, &host.directory);
+  let mount_output = normalize_output(&mount.output, &mount.directory);
+  if let Some(difference) = first_output_difference(&host_output, &mount_output) {
+    return WorkloadStatus::Differs { detail: difference };
+  }
+  let host_tree = host.manifest.without(workload.excluded);
+  let mount_tree = mount.manifest.without(workload.excluded);
+  match first_manifest_difference(&host_tree, &mount_tree) {
+    Some(difference) => WorkloadStatus::Differs { detail: difference },
+    None => WorkloadStatus::Identical,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// AC-4.2 (workloads): npm prints a path with its UUID-shaped segments as `***`. Do normalize npm's
+  /// `ls` line from a run directory whose name is a UUID; expect the root token, as for any tool.
+  #[test]
+  fn a_path_npm_redacted_normalizes_to_the_root_token() {
+    let directory = "/tmp/claude/5bcbc28d-64b0-4c59-8918-79563c747af3/scratch/npm";
+    let npm = "app@1.0.0 /private/tmp/claude/***/scratch/npm/app\n";
+    assert_eq!(normalize_output(npm, directory), "app@1.0.0 <dir>/app\n");
+    assert_eq!(
+      normalize_output(
+        "x /tmp/claude/5bcbc28d-64b0-4c59-8918-79563c747af3/scratch/npm/y",
+        directory
+      ),
+      "x <dir>/y"
+    );
+    assert_eq!(redact_uuids("/a/not-a-uuid/b"), "/a/not-a-uuid/b");
+  }
+
+  fn file(path: &str, digest: &str) -> Entry {
+    Entry {
+      path: path.to_owned(),
+      kind: EntryKind::File,
+      mode: 0o644,
+      size: 5,
+      digest: digest.to_owned(),
+    }
+  }
+
+  fn run(directory: &str, output: &str, entries: Vec<Entry>) -> Run {
+    Run {
+      directory: directory.to_owned(),
+      exit_code: 0,
+      output: output.to_owned(),
+      manifest: Manifest { entries },
+    }
+  }
+
+  /// Identical runs whose outputs differ only by their directory roots (including macOS's
+  /// `/private` twin) compare identical; an excluded prefix hides a difference by design.
+  #[test]
+  fn identical_runs_compare_identical_under_the_exclusions() {
+    let workload = ROSTER[0];
+    let host = run(
+      "/h/git",
+      "app /h/git\nok\n",
+      vec![file("a.txt", "aa"), file(".git/index", "11")],
+    );
+    let mount = run(
+      "/m/git",
+      "app /private/m/git\nok\n",
+      vec![file("a.txt", "aa"), file(".git/index", "22")],
+    );
+    assert_eq!(compare(&workload, &host, &mount), WorkloadStatus::Identical);
+  }
+
+  /// The detail of a differing comparison; a test that expected a difference fails otherwise.
+  fn difference(status: WorkloadStatus) -> String {
+    match status {
+      WorkloadStatus::Differs { detail } => detail,
+      other => panic!("expected a difference, got {other:?}"),
+    }
+  }
+
+  /// A differing exit code is named first, with the mounted output's tail.
+  #[test]
+  fn a_differing_exit_code_is_named() {
+    let workload = ROSTER[4];
+    let host = run("/h", "same\n", vec![file("a", "aa")]);
+    let mut mount = run("/m", "same\n", vec![file("a", "aa")]);
+    mount.exit_code = 1;
+    let detail = difference(compare(&workload, &host, &mount));
+    assert!(detail.starts_with("exit code: host 0, mount 1"), "{detail}");
+  }
+
+  /// A differing output line is named with its number.
+  #[test]
+  fn a_differing_output_line_is_named() {
+    let workload = ROSTER[4];
+    let host = run("/h", "same\n", vec![file("a", "aa")]);
+    let mount = run("/m", "other\n", vec![file("a", "aa")]);
+    let detail = difference(compare(&workload, &host, &mount));
+    assert!(detail.contains("output line 1"), "{detail}");
+  }
+
+  /// AC-3.2 / AC-4.2: every visible name participates in the comparison, including `._` names.
+  /// A transport-created sidecar changes the tree; an application can also own such a name.
+  #[test]
+  fn dot_underscore_names_are_compared_like_other_visible_files() {
+    let workload = ROSTER[4];
+    let host = run("/h", "same\n", vec![file("a", "aa")]);
+    let mount = run(
+      "/m",
+      "same\n",
+      vec![file("._a", "sidecar"), file("a", "aa")],
+    );
+    assert!(difference(compare(&workload, &host, &mount)).starts_with("tree entry"));
+    let host = run("/h", "same\n", vec![file("._user-file", "original")]);
+    let mount = run("/m", "same\n", vec![file("._user-file", "changed")]);
+    assert!(difference(compare(&workload, &host, &mount)).starts_with("tree entry"));
+    let host = run("/h", "same\n", vec![file("a", "aa")]);
+    let mount = run(
+      "/m",
+      "same\n",
+      vec![file("._a", "sidecar"), file("a", "bb")],
+    );
+    let detail = difference(compare(&workload, &host, &mount));
+    assert!(detail.starts_with("tree entry"), "{detail}");
+  }
+
+  /// A differing tree entry, or an extra one, is named with both sides.
+  #[test]
+  fn a_differing_tree_entry_is_named() {
+    let workload = ROSTER[4];
+    let host = run("/h", "same\n", vec![file("a", "aa")]);
+    let mount = run("/m", "same\n", vec![file("a", "bb")]);
+    let detail = difference(compare(&workload, &host, &mount));
+    assert!(detail.starts_with("tree entry"), "{detail}");
+    let mount = run("/m", "same\n", vec![file("a", "aa"), file("b", "bb")]);
+    let detail = difference(compare(&workload, &host, &mount));
+    assert!(detail.contains("<end>"), "{detail}");
+  }
+
+  /// Every roster entry has a name, a tool and a script, and every exclusion carries its reason.
+  #[test]
+  fn the_roster_is_complete() {
+    for workload in ROSTER {
+      assert!(!workload.name.is_empty() && !workload.tool.is_empty());
+      assert!(
+        workload.script.trim().lines().count() >= 2,
+        "{}",
+        workload.name
+      );
+      for (prefix, reason) in workload.excluded {
+        assert!(
+          !prefix.is_empty() && !reason.is_empty(),
+          "{}",
+          workload.name
+        );
+      }
+    }
+    let names: Vec<&str> = ROSTER.iter().map(|w| w.name).collect();
+    for expected in [
+      "git", "cargo", "npm", "python", "rg", "rsync", "sqlite", "editor", "watcher",
+    ] {
+      assert!(names.contains(&expected), "{expected}");
+    }
+  }
+}

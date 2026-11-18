@@ -1,0 +1,1583 @@
+//! The root configuration group (§4.8 "Configuration, by consensus", D-14 — "a root group across regions
+//! holds region membership and cross-region promotions") — the cross-region counterpart of the
+//! [`RegionalCouncil`](crate::config_group::RegionalCouncil). Where a regional council agrees on a region's
+//! host membership, neighbourhoods and epochs, the **root group** agrees on the fleet's `RootConfiguration`:
+//! which regions exist, the home region of each moved volume, and the region a lost region is promoted to. It
+//! is touched **only** on a region-membership change, a home move, or a region-loss promotion — never on a
+//! per-write path (banned item 10) — and its commit rate is near zero, a tripwire.
+//!
+//! The configuration is the deterministic fold of a **committed Raft log** ([`crate::raft`], the hecate
+//! dialect), exactly as the regional council's is: each change is a [`RootCommand`] the leader proposes and
+//! every voter applies once committed, and the version bumps once per applied change. Degenerate on a laptop
+//! (the sole region): the single voter self-elects and its append commits at once, the identical code path a
+//! multi-region root group runs through replication, never a mode switch (R8).
+//!
+//! [`RootGroup`] is one node's participant in that consensus. Its Raft voters are the **hosts** that carry
+//! the root group (a small set, one or a few per region — the same small-elected-set shape as a regional
+//! council's voters); its committed configuration names **regions**. It is sans-io: the drive (election and
+//! replication over the cross-region transport) lives in the daemon, exactly as the regional council's drive
+//! does. This module realizes the root group's state machine and consensus; wiring it to the cross-region
+//! transport is the daemon's, and is owed.
+//!
+//! The **voter set follows the committed regions**: the root voters are the representatives of the regions
+//! in the committed root configuration ([`root_representatives`] — the lowest-id live host of each
+//! region), so when a committed retirement or promotion drops a region, or a region's representative host
+//! changes, the leader moves the Raft voter set to match through the core's joint-consensus change
+//! ([`reconcile_voters`](RootGroup::reconcile_voters)); a dead representative stops counting toward every
+//! root majority. Before this the voter set was fixed at boot and never shrank
+//! (`docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`).
+
+use std::collections::BTreeMap;
+use std::mem::size_of;
+
+use slates_db::register::{HostId, OBJECT_BYTES, ObjectId, RegionId, RootConfiguration};
+
+use crate::fold::{Fold, Snapshotted};
+use crate::raft::{
+  CatchUp, ElectionPriority, ElectionView, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow,
+  TransferRefusal,
+};
+use crate::raft_wire::{RaftMessage, decode_root_configuration, encode_root_configuration};
+
+/// A root configuration rides a root-group snapshot as the bytes a learner's fetch ships.
+impl Snapshotted for RootConfiguration {
+  fn encode(&self) -> Vec<u8> {
+    encode_root_configuration(self)
+  }
+
+  fn decode(bytes: &[u8]) -> Option<Self> {
+    decode_root_configuration(bytes).ok()
+  }
+}
+
+/// A root-configuration change as it rides the Raft log — the command a committed
+/// [`LogEntry`](crate::raft::LogEntry) carries, decoded and applied to the [`RootConfiguration`] in commit
+/// order so every voter reaches the same configuration. The Raft core treats it as opaque bytes; this is the
+/// root group's interpretation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootCommand {
+  /// Admit a region to the fleet (a region joins).
+  AdmitRegion(RegionId),
+  /// Retire a region cleanly (an operator removal — no promotion, nothing served from a mirror).
+  RetireRegion(RegionId),
+  /// Promote `mirror` to serve a **lost** region (§4.8 "region loss promotes the mirror through the root
+  /// group"): the lost region drops from the membership and its volumes are thereafter served from `mirror`.
+  PromoteRegion {
+    /// The lost region.
+    lost: RegionId,
+    /// The region promoted to serve it.
+    mirror: RegionId,
+  },
+  /// Move a volume's home to another region (§4.8 "the homes of moved volumes"; "a region-home move also
+  /// carries root-group authority").
+  MoveHome {
+    /// The volume whose home moves.
+    volume: ObjectId,
+    /// The region it moves to.
+    to: RegionId,
+  },
+}
+
+/// Format: a root command is a one-byte tag followed by its little-endian fields; these are the tags.
+const COMMAND_ADMIT_REGION: u8 = 0;
+const COMMAND_RETIRE_REGION: u8 = 1;
+const COMMAND_PROMOTE_REGION: u8 = 2;
+const COMMAND_MOVE_HOME: u8 = 3;
+
+impl RootCommand {
+  /// The command's canonical bytes for the log: the tag, then its fields little-endian (a region id is a
+  /// u64; a moved home is the 16-byte volume id then the destination region).
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::new();
+    match self {
+      RootCommand::AdmitRegion(region) => {
+        out.push(COMMAND_ADMIT_REGION);
+        out.extend_from_slice(&region.0.to_le_bytes());
+      }
+      RootCommand::RetireRegion(region) => {
+        out.push(COMMAND_RETIRE_REGION);
+        out.extend_from_slice(&region.0.to_le_bytes());
+      }
+      RootCommand::PromoteRegion { lost, mirror } => {
+        out.push(COMMAND_PROMOTE_REGION);
+        out.extend_from_slice(&lost.0.to_le_bytes());
+        out.extend_from_slice(&mirror.0.to_le_bytes());
+      }
+      RootCommand::MoveHome { volume, to } => {
+        out.push(COMMAND_MOVE_HOME);
+        out.extend_from_slice(&volume.0);
+        out.extend_from_slice(&to.0.to_le_bytes());
+      }
+    }
+    out
+  }
+
+  /// Decodes a command from a committed log entry, or `None` if the bytes are malformed (a corrupt log
+  /// entry — never expected from our own [`encode`](RootCommand::encode), applied as a no-op if seen).
+  pub fn decode(bytes: &[u8]) -> Option<RootCommand> {
+    let (&tag, rest) = bytes.split_first()?;
+    match tag {
+      COMMAND_ADMIT_REGION => Some(RootCommand::AdmitRegion(take_region(rest)?.0)),
+      COMMAND_RETIRE_REGION => Some(RootCommand::RetireRegion(take_region(rest)?.0)),
+      COMMAND_PROMOTE_REGION => {
+        let (lost, rest) = take_region(rest)?;
+        let (mirror, _) = take_region(rest)?;
+        Some(RootCommand::PromoteRegion { lost, mirror })
+      }
+      COMMAND_MOVE_HOME => {
+        let (volume, rest) = take_object(rest)?;
+        let (to, _) = take_region(rest)?;
+        Some(RootCommand::MoveHome { volume, to })
+      }
+      _ => None,
+    }
+  }
+}
+
+/// Reads a u64 region id at the front of `bytes`, returning it and the remainder, or `None` if truncated.
+fn take_region(bytes: &[u8]) -> Option<(RegionId, &[u8])> {
+  if bytes.len() < size_of::<u64>() {
+    return None;
+  }
+  let (head, rest) = bytes.split_at(size_of::<u64>());
+  let mut word = [0u8; size_of::<u64>()];
+  word.copy_from_slice(head);
+  Some((RegionId(u64::from_le_bytes(word)), rest))
+}
+
+/// Reads an object (volume) id at the front of `bytes`, returning it and the remainder, or `None`.
+fn take_object(bytes: &[u8]) -> Option<(ObjectId, &[u8])> {
+  if bytes.len() < OBJECT_BYTES {
+    return None;
+  }
+  let (head, rest) = bytes.split_at(OBJECT_BYTES);
+  let mut id = [0u8; OBJECT_BYTES];
+  id.copy_from_slice(head);
+  Some((ObjectId(id), rest))
+}
+
+/// Each region's **representative** host among `hosts` — the lowest host id in the region — the one host
+/// per region that carries the root group's consensus (§4.8, D-14 — "a small set, one or a few per
+/// region"). A host absent from `regions` is in the sole region `RegionId(0)`. Deterministic from the hosts
+/// and their regions, so every node derives the same representatives: at boot from the manifest's members
+/// (the initial root voters), and each period from the hosts currently alive (the target
+/// [`RootGroup::reconcile_voters`] moves the voter set to, so a region whose representative died is carried
+/// by its next host).
+pub fn root_representatives(
+  hosts: &[HostId],
+  regions: &BTreeMap<HostId, RegionId>,
+) -> BTreeMap<RegionId, HostId> {
+  let mut by_region: BTreeMap<RegionId, HostId> = BTreeMap::new();
+  for &host in hosts {
+    let region = regions.get(&host).copied().unwrap_or(RegionId(0));
+    by_region
+      .entry(region)
+      .and_modify(|representative| {
+        if host.0 < representative.0 {
+          *representative = host;
+        }
+      })
+      .or_insert(host);
+  }
+  by_region
+}
+
+/// The **root configuration group** on one node (§4.8, D-14 — the root group across regions): the multi-voter
+/// [`RaftNode`] over the root-group hosts, producing the [`RootConfiguration`] every region learns. A change
+/// commits at a majority over the (cross-region) transport — the leader [`propose`](RootGroup::propose)s, the
+/// followers serve, and each committed command applies to the root configuration. The drive primitives ride
+/// the same [`RaftMessage`] wire the transport carries, exactly as the regional council's do.
+pub struct RootGroup {
+  raft: RaftNode,
+  /// The root configuration as the fold of the committed log over the state at the log's snapshot boundary
+  /// (the formed configuration before the first compaction), compacted by the thesis's size rule
+  /// ([`crate::fold`]). A node promoted to voter re-folds from the base, never on top of an adopted
+  /// configuration.
+  fold: Fold<RootConfiguration>,
+  /// A newer read view fetched while a learner. It is never the input to Raft replay:
+  /// applying its commands again would repeat epochs or home changes (§4.8, AUD-07).
+  /// A changed learner view must survive before it is published to serving shards.
+  view_pending: bool,
+  learned: Option<RootConfiguration>,
+  /// Monotone count of the events that defer this node's own election — a leader's append answered here, or a
+  /// vote this node granted a candidate (Raft Figure 2's two follower timer-resets). The drive loop's election
+  /// timer reads it: while it advances, either a leader is alive or a candidate this node backed is still
+  /// contesting the election, so this node does not campaign; once it stalls for the election timeout, contact
+  /// is presumed lost and a pre-election begins.
+  leader_contact: u64,
+  /// A leader's invitation to campaign at once (thesis §3.10, leadership transfer), recorded by the serve
+  /// path and acted on by the drive loop ([`invited_campaign`](Self::invited_campaign)), which alone starts
+  /// elections and broadcasts — one slot, so bounded; a newer invitation replaces an older one.
+  invitation: Option<TimeoutNow>,
+  /// Stagings aborted by [`reconcile_voters`](Self::reconcile_voters) (the non-vacuity counter).
+  stagings_aborted: u64,
+}
+
+impl RootGroup {
+  /// A fresh member with no authority to vote or campaign (§4.8, AUD-07). Its first state must
+  /// come from an existing group, or from the explicit first-time bootstrap operation.
+  pub fn learner(node: HostId) -> RootGroup {
+    let mut group = Self::new(node, Vec::new(), Vec::new());
+    let mut base = group.fold.base().clone();
+    base.version = 0;
+    group.fold = Fold::new(base);
+    group
+  }
+
+  /// Whether this node has received the group's common base and consensus prefix.
+  pub fn initialized(&self) -> bool {
+    !self.raft.all_voters().is_empty()
+  }
+
+  /// The consensus prefix and its common fold base for a fresh member. An uninitialized node
+  /// has no group state to offer. The transport authenticates the sender and bounds the frame.
+  pub fn join_state(&self) -> Option<(SavedRaft, RootConfiguration)> {
+    self
+      .initialized()
+      .then(|| (self.raft.saved(), self.fold.base().clone()))
+  }
+
+  /// Creates the first voter of an explicitly authorized replacement group (§4.8).
+  /// The caller must fence the former group and bind approval to this recovered application
+  /// state. Ordinary bootstrap, startup and discovery never call this operation.
+  pub fn reform(node: HostId, configuration: RootConfiguration) -> Self {
+    let mut group = Self::new(node, configuration.regions.clone(), vec![node]);
+    group.fold = Fold::new(configuration);
+    group.apply_committed();
+    group
+  }
+
+  /// Restores this voter's complete retained state without clearing its vote (§4.8).
+  /// A sole voter runs the ordinary election rule; a fleet voter waits for its peers.
+  pub fn restore_from(
+    &mut self,
+    saved: SavedRaft,
+    base: RootConfiguration,
+  ) -> Result<(), RaftRecoveryError> {
+    if saved.id != self.raft.id() {
+      return Err(RaftRecoveryError::ReusedIdentity);
+    }
+    let fold = Fold::for_saved(&saved, base)?;
+    self.raft = RaftNode::restore(saved)?;
+    self.fold = fold;
+    self.learned = None;
+    self.apply_committed();
+    if self.raft.all_voters() == [self.raft.id()] {
+      self.election_timeout();
+    }
+    Ok(())
+  }
+
+  /// Whether a consensus transition still needs its anchor publication.
+  pub fn retention_pending(&self) -> bool {
+    self.view_pending || self.raft.retention_pending()
+  }
+
+  /// Stops proposing while an authorized replacement is fetched, retaining the old prefix.
+  pub fn suspend(&mut self) {
+    self.raft.suspend();
+  }
+
+  /// Records successful publication by the caller that owns the anchor.
+  pub fn retained(&mut self) {
+    self.view_pending = false;
+    self.raft.retained();
+  }
+
+  /// Installs the group's state once under this member's fresh identity. A later fetch cannot
+  /// erase a vote or replace the log: initialized nodes advance through Raft messages.
+  pub fn join_from(
+    &mut self,
+    mut saved: SavedRaft,
+    base: RootConfiguration,
+  ) -> Result<(), RaftRecoveryError> {
+    if self.initialized() {
+      return Err(RaftRecoveryError::AlreadyInitialized);
+    }
+    if saved.id == self.raft.id() {
+      return Err(RaftRecoveryError::ReusedIdentity);
+    }
+    // A compacted donor's base is its snapshot's state; a snapshot paired with another base would fold a
+    // different history, so it is refused before anything is installed.
+    let fold = Fold::for_saved(&saved, base)?;
+    saved.id = self.raft.id();
+    saved.voted_for = None;
+    let raft = RaftNode::restore(saved)?;
+    self.raft = raft;
+    self.fold = fold;
+    self.learned = None;
+    self.apply_committed();
+    Ok(())
+  }
+
+  /// A root group on this `node` (one of the `voters` — the hosts that carry the root group) holding the
+  /// fleet's initial `regions`. A multi-voter group waits for an election over the transport (the drive
+  /// loop); a **sole voter** self-elects at once (the laptop's single-region degenerate — the same root-group
+  /// code a multi-region fleet runs, immediately its own leader so it may propose with no messages, R8).
+  pub fn new(node: HostId, regions: Vec<RegionId>, voters: Vec<HostId>) -> RootGroup {
+    let mut raft = RaftNode::new(node, voters);
+    // A group of one is immediately its own majority: elect at once so the laptop's root group is the
+    // authority with no drive loop. A multi-voter group must win a real election over the transport.
+    if raft.all_voters().len() == 1 {
+      let _ = raft.start_election();
+    }
+    let configuration = RootConfiguration::formed(regions);
+    let mut group = RootGroup {
+      raft,
+      fold: Fold::new(configuration),
+      learned: None,
+      view_pending: false,
+      leader_contact: 0,
+      invitation: None,
+      stagings_aborted: 0,
+    };
+    group.finish_election(false);
+    group
+  }
+
+  /// The root configuration the group has agreed on so far — every region derives its home lookups from it
+  /// ([`RootConfiguration::home_of`]).
+  pub fn configuration(&self) -> &RootConfiguration {
+    self.learned.as_ref().unwrap_or(self.fold.state())
+  }
+
+  /// The compactions this group's log has taken (the thesis's size rule, [`crate::fold`]).
+  pub fn compactions(&self) -> u64 {
+    self.fold.compactions()
+  }
+
+  /// The index through which this group's log is folded into its snapshot (zero before the first
+  /// compaction).
+  pub fn snapshot_index(&self) -> u64 {
+    self.raft.snapshot_index()
+  }
+
+  /// Whether this node leads the root group (only the leader may propose).
+  pub fn is_leader(&self) -> bool {
+    self.raft.is_leader()
+  }
+
+  /// The host that currently leads the root group — itself when it leads, else the last leader it heard from
+  /// (`None` while unsettled). A redirection hint for an operator command that must reach the leader (a
+  /// region-loss promotion); a stale hint costs a retry, never a safety violation.
+  pub fn leader(&self) -> Option<HostId> {
+    self.raft.leader()
+  }
+
+  /// The root group's voter set in force (Raft §6): its base voters, and the incoming voters too while a
+  /// joint change is in flight — who elections ask and learners fetch from.
+  pub fn voters(&self) -> Vec<HostId> {
+    self.raft.all_voters()
+  }
+
+  /// The peers the drive loop replicates to ([`RaftNode::replication_targets`]): the voters, plus — while a
+  /// membership change's entry is still uncommitted — the voters it is removing, so a live host demoted from
+  /// representative receives the entry that removes it, plus the representatives being caught up to join
+  /// (thesis §4.2.1).
+  pub fn replication_targets(&self) -> Vec<HostId> {
+    self.raft.replication_targets()
+  }
+
+  /// The voting set after the membership transition and its log have committed. During
+  /// a joint change this is absent: observing application membership alone cannot prove admission.
+  pub fn committed_voters(&self) -> Option<Vec<HostId>> {
+    (self.initialized() && self.caught_up() && !self.raft.in_joint_configuration())
+      .then(|| self.raft.all_voters())
+  }
+
+  /// The leader-contact count (see the field): the drive loop's election timer resets while this advances.
+  pub fn leader_contact(&self) -> u64 {
+    self.leader_contact
+  }
+
+  /// **DRIVE**: the election timer heard no leader for the minimum election timeout
+  /// (`crate::timing::FollowerStep::LeaderLapsed`): forget it, so a candidate's pre-vote is granted, without
+  /// campaigning (`RaftNode::forget_leader`, thesis §4.2.3).
+  pub fn forget_leader(&mut self) {
+    self.raft.forget_leader();
+  }
+
+  /// **DRIVE**: begins a **pre-election** on an election timeout (Raft §9.6), returning the [`crate::raft::PreVote`]s to
+  /// ship to the other voters — asked without inflating the term, so a partitioned node cannot disrupt a
+  /// healthy leader. A lone voter proceeds straight to leading with no messages (the degenerate case).
+  pub fn election_timeout(&mut self) -> Vec<RaftMessage> {
+    let was_leader = self.is_leader();
+    // A term with no successor cannot campaign: nothing is sent (counted in the node's `terms_exhausted`).
+    let messages = self
+      .raft
+      .on_election_timeout()
+      .unwrap_or_default()
+      .into_iter()
+      .map(RaftMessage::PreVote)
+      .collect();
+    self.finish_election(was_leader);
+    messages
+  }
+
+  /// A new leader appends a current-term no-op (Raft §5.4.2), so an inherited uncommitted
+  /// tail can commit before the caught-up reconfiguration gate is consulted. Empty commands
+  /// change no application state. A singleton applies its local majority immediately.
+  fn finish_election(&mut self, was_leader: bool) {
+    if !was_leader && self.is_leader() {
+      self.raft.append_command(Vec::new());
+      self.apply_committed();
+    }
+  }
+
+  /// What the leader replicates to `follower` now — an append carrying at most `budget` entry bytes (a
+  /// heartbeat when nothing is owed), or the snapshot when the entries it needs were compacted away (Raft
+  /// §7) — or `None` when this node does not lead.
+  pub fn replication_for(&mut self, follower: HostId, budget: usize) -> Option<RaftMessage> {
+    self
+      .raft
+      .replicate_to(follower, budget)
+      .map(RaftMessage::AppendEntries)
+      .or_else(|| {
+        self
+          .raft
+          .install_snapshot_for(follower)
+          .map(RaftMessage::InstallSnapshot)
+      })
+  }
+
+  /// **DRIVE**: the root leader's CheckQuorum tick (Raft §6.2), on the election-timeout cadence — the root
+  /// group's parallel of [`RegionalCouncil::check_quorum`](crate::config_group::RegionalCouncil::check_quorum):
+  /// a leader that has not heard from a majority of root voters since the previous tick steps down and the
+  /// contact window resets; a non-leader is unaffected; the sole root voter (a single-region fleet) never
+  /// steps down.
+  pub fn check_quorum(&mut self) {
+    self.raft.check_quorum();
+  }
+  /// **DRIVE**: the election a leader invited this node to start (thesis §3.10), if an invitation arrived
+  /// since the last call: the vote requests to broadcast, exactly as an election timeout's pre-votes are
+  /// broadcast — no pre-vote round, since the leader invited it. Empty when no invitation is pending, or when
+  /// the invitation is from another term or this node leads or does not vote (the core ignores it).
+  pub fn invited_campaign(&mut self) -> Vec<RaftMessage> {
+    let Some(invitation) = self.invitation.take() else {
+      return Vec::new();
+    };
+    let was_leader = self.is_leader();
+    let votes = self
+      .raft
+      .on_timeout_now(invitation)
+      .into_iter()
+      .map(RaftMessage::RequestVote)
+      .collect();
+    self.finish_election(was_leader);
+    votes
+  }
+
+  /// **DRIVE**: starts a leadership transfer to `target` (thesis §3.10); refused, typed, when this node does
+  /// not lead, `target` is itself or not a voter, or a transfer is already in flight. While it is in flight
+  /// the leader refuses proposals; [`take_timeout_now`](Self::take_timeout_now) yields the invitation once
+  /// the target has caught up; it ends when this node stops leading or is aborted after an election timeout.
+  pub fn transfer_leadership(&mut self, target: HostId) -> Result<(), TransferRefusal> {
+    self.raft.transfer_leadership(target)
+  }
+
+  /// **DRIVE**: the invitation to ship once the transfer's target has caught up — `(target, message)`, sent
+  /// once — or `None`.
+  pub fn take_timeout_now(&mut self) -> Option<(HostId, RaftMessage)> {
+    self
+      .raft
+      .take_timeout_now()
+      .map(|(target, invitation)| (target, RaftMessage::TimeoutNow(invitation)))
+  }
+
+  /// The target of the leadership transfer in flight, if one is.
+  pub fn transferring_to(&self) -> Option<HostId> {
+    self.raft.transferring_to()
+  }
+
+  /// The voter a leader handing off should pick: the most caught-up other voter (thesis §3.10), or `None`
+  /// when this node does not lead or votes alone.
+  pub fn most_caught_up_voter(&self) -> Option<HostId> {
+    self.raft.most_caught_up_voter()
+  }
+
+  /// **SERVE**: answers a request received over the transport — a pre-vote, a vote request, or an append —
+  /// returning the reply to ship back and applying whatever newly committed to the root configuration (a
+  /// follower applies on the append). A reply is not a request and is not answered here — its sender folds it
+  /// with [`fold_reply`](RootGroup::fold_reply).
+  pub fn answer(&mut self, request: RaftMessage) -> Option<RaftMessage> {
+    if !self.initialized() {
+      return None;
+    }
+    match request {
+      RaftMessage::PreVote(pre) => Some(RaftMessage::PreVoteReply(self.raft.on_pre_vote(pre))),
+      RaftMessage::RequestVote(vote) => {
+        let reply = self.raft.on_request_vote(vote);
+        if reply.granted {
+          // Granting a vote defers this node's own election (Raft §5.2, Figure 2 "Rules for Servers →
+          // Followers": the election timer resets on *granting a vote* as well as on a current leader's
+          // append). So the candidate this node just voted for has a full election timeout to win and send
+          // its first heartbeat before this node would campaign in competition. Without this reset a fleet
+          // livelocks under heavy CPU load: a newly elected leader is slow to send its first append (its
+          // coordinator loop is starved for the core), the voters that elected it keep aging out and campaign
+          // against it, and leadership never settles (docs/bugs/2026-09-13-election-timer-not-reset-on-vote-grant.md).
+          self.leader_contact = self.leader_contact.saturating_add(1);
+        }
+        Some(RaftMessage::VoteReply(reply))
+      }
+      RaftMessage::AppendEntries(append) => {
+        let append_term = append.term;
+        let reply = self.raft.on_append_entries(append);
+        // Any append from a current-or-newer-term leader is contact from the leader — reset the election timer
+        // (Raft §5.2, Figure 2 "Followers": the timer resets on *receiving AppendEntries from the current
+        // leader"). This holds even when the log-consistency check rejects the append (`reply.success == false`
+        // while the follower is still catching its log up): the leader is live and this node must not campaign
+        // against it — `on_append_entries` has already set `has_leader`, so this node also refuses others'
+        // pre-votes, and gating the timer on `success` instead would leave it aging while it defends the leader,
+        // campaigning uselessly (its own pre-vote refused by that leader) until it catches up. A stale-term
+        // append (`append_term < reply.term`, from a deposed leader) is not contact and does not reset.
+        if append_term >= reply.term {
+          self.leader_contact = self.leader_contact.saturating_add(1);
+        }
+        self.apply_committed();
+        Some(RaftMessage::AppendReply(reply))
+      }
+      RaftMessage::TimeoutNow(invitation) => {
+        // No reply: the invited node's vote requests are its answer, broadcast by the drive loop.
+        self.invitation = Some(invitation);
+        None
+      }
+      RaftMessage::InstallSnapshot(snapshot) => {
+        // A leader's snapshot is contact from it exactly as its append is (the timer rule above).
+        let snapshot_term = snapshot.term;
+        let reply = self.fold.install(&mut self.raft, snapshot, apply_command);
+        if snapshot_term >= reply.term {
+          self.leader_contact = self.leader_contact.saturating_add(1);
+        }
+        self.discard_superseded_view();
+        Some(RaftMessage::InstallSnapshotReply(reply))
+      }
+      // A fast proposal is answered with this voter's vote (research record §3.7); a vote the leader
+      // receives is tallied, and it decides the next indices it can.
+      RaftMessage::FastPropose(proposal) => self
+        .raft
+        .on_fast_propose(proposal)
+        .map(RaftMessage::FastVote),
+      RaftMessage::FastVote(vote) => {
+        self.raft.on_fast_vote(vote);
+        self.apply_committed();
+        None
+      }
+      RaftMessage::VoteReply(_)
+      | RaftMessage::PreVoteReply(_)
+      | RaftMessage::AppendReply(_)
+      | RaftMessage::InstallSnapshotReply(_) => None,
+    }
+  }
+
+  /// **DRIVE**: folds a reply to one of this node's requests, returning any follow-on messages to ship — a
+  /// granted pre-vote majority yields the real [`crate::raft::RequestVote`]s (the pre-election succeeded, so the term is
+  /// advanced only now); a vote reply or append reply yields none. Applies whatever newly committed to the
+  /// root configuration on an append reply (the leader once a majority acknowledges).
+  pub fn fold_reply(&mut self, reply: RaftMessage) -> Vec<RaftMessage> {
+    let was_leader = self.is_leader();
+    let messages = match reply {
+      RaftMessage::PreVoteReply(reply) => self
+        .raft
+        .on_pre_vote_reply(reply)
+        .map(|votes| votes.into_iter().map(RaftMessage::RequestVote).collect())
+        .unwrap_or_default(),
+      RaftMessage::VoteReply(reply) => {
+        self.raft.on_vote_reply(reply);
+        Vec::new()
+      }
+      RaftMessage::AppendReply(reply) => {
+        self.raft.on_append_reply(reply);
+        self.apply_committed();
+        Vec::new()
+      }
+      RaftMessage::InstallSnapshotReply(reply) => {
+        self.raft.on_install_snapshot_reply(reply);
+        self.apply_committed();
+        Vec::new()
+      }
+      // A voter's answer to this node's fast proposal: tallied when this node leads.
+      RaftMessage::FastVote(vote) => {
+        self.raft.on_fast_vote(vote);
+        self.apply_committed();
+        Vec::new()
+      }
+      RaftMessage::PreVote(_)
+      | RaftMessage::RequestVote(_)
+      | RaftMessage::AppendEntries(_)
+      | RaftMessage::TimeoutNow(_)
+      | RaftMessage::InstallSnapshot(_)
+      | RaftMessage::FastPropose(_) => Vec::new(),
+    };
+    self.finish_election(was_leader);
+    messages
+  }
+
+  /// Proposes a root-configuration change on the leader **without waiting**: it commits — and applies to the
+  /// root configuration — only once a majority of the group acknowledge it over the transport. Returns whether
+  /// the leader appended it (a non-leader, or a change already reflected in the configuration, returns
+  /// `false`, so the log grows only for real changes).
+  pub fn propose(&mut self, command: RootCommand) -> bool {
+    let would_change = match command {
+      RootCommand::AdmitRegion(region) => !self.fold.state().regions.contains(&region),
+      RootCommand::RetireRegion(region) => self.fold.state().regions.contains(&region),
+      RootCommand::PromoteRegion { lost, mirror } => {
+        lost != mirror
+          && self.fold.state().regions.contains(&lost)
+          && self.fold.state().regions.contains(&mirror)
+      }
+      RootCommand::MoveHome { volume, to } => {
+        self.fold.state().regions.contains(&to) && self.fold.state().homes.get(&volume) != Some(&to)
+      }
+    };
+    if !would_change {
+      return false;
+    }
+    let appended = self.raft.append_command(command.encode());
+    // A single-voter bootstrap already reached its majority. Apply any local commit here;
+    // waiting for a remote append reply would leave its membership frozen forever (AUD-07).
+    self.apply_committed();
+    appended
+  }
+
+  /// Whether the group's log is fully committed — nothing proposed is still in flight
+  /// (`last_log_index == commit_index`). A reconcile reads it so a change proposed but not yet committed is not
+  /// re-proposed each period (the same caught-up gate the regional council uses).
+  pub fn caught_up(&self) -> bool {
+    self.raft.last_log_index() == self.raft.commit_index()
+  }
+
+  /// Reconciles the region membership with the set of regions currently **alive** — as the leader — the
+  /// cross-region counterpart of [`RegionalCouncil::reconcile_alive`](crate::config_group::RegionalCouncil::reconcile_alive):
+  /// proposes admitting every alive region not yet a member, and retiring a member region no host is alive in
+  /// **only when it has no mirror** in `mirrors` — each through the root log so it commits at a majority over
+  /// the transport and applies on every voter. Returns whether anything was proposed. A non-leader proposes
+  /// nothing (only the elected root master decides), and the [`caught_up`](RootGroup::caught_up) gate keeps a
+  /// change in flight from being re-proposed, so the log grows only for real changes.
+  ///
+  /// A lost region **with a mirror is left in place** for a deliberate operator promotion (§4.8 "region loss
+  /// promotes the mirror through the root group at operator cadence"): auto-failing-over a region that is
+  /// merely partitioned would promote its mirror while it is still serving — a second owner (split-brain). A
+  /// lost region **without a mirror** has no failover target, so its confirmed loss is a clean retirement (no
+  /// second owner is created, and SWIM re-admits it on recovery).
+  pub fn reconcile_regions(
+    &mut self,
+    alive: &[RegionId],
+    mirrors: &std::collections::BTreeMap<RegionId, RegionId>,
+  ) -> bool {
+    if !self.is_leader() || !self.caught_up() {
+      return false;
+    }
+    let mut proposed = false;
+    for region in alive {
+      proposed |= self.propose(RootCommand::AdmitRegion(*region));
+    }
+    let stale: Vec<RegionId> = self
+      .fold
+      .state()
+      .regions
+      .iter()
+      .copied()
+      .filter(|region| !alive.contains(region))
+      .collect();
+    for region in stale {
+      // A lost region that has a **mirror** is not auto-retired: cross-region failover is deliberate
+      // ("region loss promotes the mirror through the root group at operator cadence", §4.8), because a region
+      // that is merely partitioned — not truly lost — would otherwise be failed over while it is still
+      // serving, promoting a second owner (split-brain). It stays in the membership, unreachable, until an
+      // operator promotes it (`PromoteRegion`, driven by the daemon's operator control). A lost region with
+      // **no** mirror has no failover target, so its confirmed loss is a clean retirement — no second owner is
+      // ever created, and SWIM re-admits the region if it recovers.
+      if mirrors.contains_key(&region) {
+        continue;
+      }
+      proposed |= self.propose(RootCommand::RetireRegion(region));
+    }
+    proposed
+  }
+
+  /// Whether `node` is a **voter** of this root group — a host of its Raft consensus set in effect now. A
+  /// non-voter learns the committed root configuration by fetching it and [`adopt`](RootGroup::adopt)ing it.
+  /// A voter a committed change removed is no longer one.
+  pub fn is_voter(&self, node: HostId) -> bool {
+    self.raft.is_voter(node)
+  }
+
+  /// **DRIVE** (leader): keeps the root group's Raft voter set equal to the representatives of the regions in
+  /// the committed root configuration — `representatives` is the caller's current map of each alive region
+  /// to its representative host ([`root_representatives`] over the hosts alive now) — one joint change at a
+  /// time (Raft §6), exactly as [`RegionalCouncil::reconcile_voters`](crate::config_group::RegionalCouncil::reconcile_voters):
+  /// begin the joint change when the target differs from the voters in force, complete it once the joint
+  /// entry has committed, no-op once `C_new` has. A committed region without a representative in the map
+  /// (no host of it alive yet) contributes no voter; an empty target is never proposed. Returns whether it
+  /// appended a configuration entry. A dead representative thereby leaves the root consensus set; a region
+  /// whose representative died is carried by its next live host once the caller's map names it.
+  pub fn reconcile_voters(&mut self, representatives: &BTreeMap<RegionId, HostId>) -> bool {
+    if !self.is_leader() || !self.caught_up() {
+      return false;
+    }
+    if self.raft.in_joint_configuration() {
+      return self.raft.complete_membership_change();
+    }
+    let mut target: Vec<HostId> = self
+      .fold
+      .state()
+      .regions
+      .iter()
+      .filter_map(|region| representatives.get(region).copied())
+      .collect();
+    target.sort_unstable_by_key(|host| host.0);
+    target.dedup();
+    let sitting = self.raft.all_voters();
+    if target.is_empty() || target == sitting {
+      // Nothing to add: unstage anything a previous target named.
+      self.raft.catch_up(&sitting);
+      return false;
+    }
+    // A representative the change adds is caught up first (thesis §4.2.1), so the joint configuration never
+    // waits on a voter with a stale log.
+    match self.raft.catch_up(&target) {
+      CatchUp::Ready => self.raft.begin_membership_change(target),
+      CatchUp::Aborted { .. } => {
+        self.stagings_aborted = self.stagings_aborted.saturating_add(1);
+        // One stalled representative must not hold back the ones caught up (`RaftNode::promote_caught_up`).
+        self.raft.promote_caught_up(&target)
+      }
+      CatchUp::Pending | CatchUp::NotLeader => false,
+    }
+  }
+
+  /// Whether this leader is catching `node` up to join the voters (thesis §4.2.1). The drive keeps direct
+  /// contact with a staged member so the rounds can reach it.
+  pub fn is_staged(&self, node: HostId) -> bool {
+    self.raft.staged().iter().any(|(member, _)| *member == node)
+  }
+
+  /// The stagings this group aborted — a representative that could not catch up — over its life.
+  pub fn stagings_aborted(&self) -> u64 {
+    self.stagings_aborted
+  }
+
+  /// Records this node's own election priority, as its drive measured it this period (§3.4).
+  pub fn set_priority(&mut self, priority: ElectionPriority) {
+    self.raft.set_priority(priority);
+  }
+
+  /// Sets this node's window, as its drive derived it this period from its measured voter paths
+  /// (`ElectionTiming::window_budget`; `docs/wip/research/consensus-enhancements.md` §3.5): how far its
+  /// leader sends ahead of acknowledgements and what it holds ahead of a hole ([`RaftNode::set_window_budget`]).
+  pub fn set_window_budget(&mut self, bytes: usize) {
+    self.raft.set_window_budget(bytes);
+  }
+
+  /// Sets the wire bytes this node's log may hold — its share of the retained record's room — which a won
+  /// election's recovery is admitted against before anything is appended ([`RaftNode::set_log_budget`];
+  /// AUD-29-37).
+  pub fn set_log_budget(&mut self, bytes: usize) {
+    self.raft.set_log_budget(bytes);
+  }
+
+  /// The wire bytes of this node's log above its snapshot ([`RaftNode::log_bytes`]).
+  pub fn log_bytes(&self) -> usize {
+    self.raft.log_bytes()
+  }
+
+  /// The wire bytes this node's log may hold ([`RaftNode::log_budget`]).
+  pub fn log_budget(&self) -> usize {
+    self.raft.log_budget()
+  }
+
+  /// This node's election rank among the voters the caller holds `alive` (§3.4,
+  /// [`RaftNode::election_rank`]): the timer yields one timeout per rank.
+  pub fn election_rank(&self, alive: &[HostId]) -> usize {
+    self.raft.election_rank(alive)
+  }
+
+  /// This node's election state, for `status` ([`RaftNode::election_view`]).
+  pub fn election_view(&self) -> ElectionView {
+    self.raft.election_view()
+  }
+
+  /// Hands leadership to a live, caught-up voter that outranks this leader, when one does (§3.4 with thesis
+  /// §3.10, [`RaftNode::priority_transfer`]); the drive ships the invitation as for any transfer.
+  pub fn priority_transfer(&mut self, alive: &[HostId]) -> Option<HostId> {
+    self.raft.priority_transfer(alive)
+  }
+
+  /// The priority transfers this node started as leader, over its life.
+  pub fn priority_transfers(&self) -> u64 {
+    self.raft.priority_transfers()
+  }
+
+  /// Adopts a root configuration fetched from a group voter (§4.8, D-14: the root group is a small elected
+  /// set, so a region that does not vote learns the committed configuration rather than voting on it). Returns
+  /// whether it advanced — a fetch not newer than what this node holds is ignored, so adoption only moves
+  /// forward.
+  pub fn adopt(&mut self, configuration: RootConfiguration) -> bool {
+    if configuration.version <= self.configuration().version {
+      return false;
+    }
+    self.view_pending = true;
+    self.learned = Some(configuration);
+    true
+  }
+
+  /// Applies each newly committed command once from the common base, and compacts the log when the
+  /// thesis's size rule says so ([`crate::fold`]). A fetched read view never feeds this fold and is
+  /// discarded when replay reaches its version (§4.8, AUD-07).
+  fn apply_committed(&mut self) {
+    self.fold.advance(&mut self.raft, apply_command);
+    self.discard_superseded_view();
+  }
+
+  /// Drops a fetched read view once the fold has reached its version.
+  fn discard_superseded_view(&mut self) {
+    if self
+      .learned
+      .as_ref()
+      .is_some_and(|learned| learned.version <= self.fold.state().version)
+    {
+      self.learned = None;
+    }
+  }
+}
+
+/// Applies one committed entry's command bytes to the root configuration; a configuration entry's (empty)
+/// or a malformed command's bytes change nothing.
+fn apply_command(configuration: &mut RootConfiguration, command: &[u8]) {
+  match RootCommand::decode(command) {
+    Some(RootCommand::AdmitRegion(region)) => {
+      configuration.admit_region(region);
+    }
+    Some(RootCommand::RetireRegion(region)) => {
+      configuration.retire_region(region);
+    }
+    Some(RootCommand::PromoteRegion { lost, mirror }) => {
+      configuration.promote_region(lost, mirror);
+    }
+    Some(RootCommand::MoveHome { volume, to }) => {
+      configuration.move_home(volume, to);
+    }
+    None => {}
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Shape: an append budget no batch reaches, for the tests of every rule but batching and compaction.
+  const UNBOUNDED: usize = usize::MAX;
+
+  /// AC-8.1, §4.8: a new sole voter commits its inherited tail even when the previous
+  /// leader's final commit notice is lost. Otherwise the next reconfiguration waits forever.
+  #[test]
+  fn a_replacement_leader_commits_the_previous_terms_membership_tail() {
+    let old = HostId(1);
+    let fresh = HostId(2);
+    let region = RegionId(0);
+    let mut leader = RootGroup::new(old, vec![region], vec![old]);
+    let mut replacement = RootGroup::learner(fresh);
+    let (saved, base) = leader.join_state().unwrap();
+    replacement.join_from(saved, base).unwrap();
+    let representatives = BTreeMap::from([(region, fresh)]);
+    // The replacement is caught up before the joint change adds it (thesis §4.2.1): staged, then one
+    // round brings it the leader's log.
+    assert!(!leader.reconcile_voters(&representatives), "staged first");
+    let reply = replacement
+      .answer(leader.replication_for(fresh, UNBOUNDED).unwrap())
+      .unwrap();
+    leader.fold_reply(reply);
+    assert!(
+      leader.reconcile_voters(&representatives),
+      "caught up: the change begins"
+    );
+    let reply = replacement
+      .answer(leader.replication_for(fresh, UNBOUNDED).unwrap())
+      .unwrap();
+    leader.fold_reply(reply);
+    assert!(leader.reconcile_voters(&representatives));
+    // Deliver the final entry, but lose its acknowledgement and the old leader.
+    let _lost_reply = replacement.answer(leader.replication_for(fresh, UNBOUNDED).unwrap());
+    replacement.election_timeout();
+    assert!(replacement.is_leader());
+    assert_eq!(replacement.committed_voters(), Some(vec![fresh]));
+    assert!(replacement.propose(RootCommand::AdmitRegion(RegionId(1))));
+    assert!(replacement.configuration().regions.contains(&RegionId(1)));
+  }
+
+  /// AC-8.1, §4.8, AUD-07: root admission transfers the original region history, retains
+  /// the replacement's later vote, and never counts it as the failed representative.
+  #[test]
+  fn a_fresh_root_member_joins_the_prefix_without_reusing_a_vote() {
+    let replacement_id = HostId(4);
+    let mut roots = groups();
+    elect_among(&mut roots, P0, &[P0, P1]);
+    roots.get_mut(&P0).unwrap().propose(RootCommand::MoveHome {
+      volume: ObjectId::new(P2, 1),
+      to: R1,
+    });
+    replicate_round(&mut roots, P0, &[P0, P1]);
+    replicate_round(&mut roots, P0, &[P0, P1]);
+    let (saved, base) = roots[&P0].join_state().unwrap();
+    let expected = roots[&P0].configuration().clone();
+    let mut joining = RootGroup::learner(replacement_id);
+    assert!(joining.election_timeout().is_empty());
+    joining.join_from(saved.clone(), base.clone()).unwrap();
+    assert_eq!(joining.configuration(), &expected);
+    assert!(!joining.is_voter(replacement_id));
+    let expected = fetch_ahead_of_root_log(&mut roots, &mut joining);
+    roots.insert(replacement_id, joining);
+    let representatives = [(R0, P0), (R1, P1), (R2, replacement_id)].into();
+    // Two membership entries, each with a delivery round and a commit-notification round.
+    for _ in 0..(2 * 2) {
+      roots
+        .get_mut(&P0)
+        .unwrap()
+        .reconcile_voters(&representatives);
+      replicate_round(&mut roots, P0, &[P0, P1, replacement_id]);
+    }
+    assert!(roots[&replacement_id].is_voter(replacement_id));
+    assert!(!roots[&replacement_id].is_voter(P2));
+    assert_join_vote_retained(
+      roots.get_mut(&replacement_id).unwrap(),
+      saved,
+      base,
+      replacement_id,
+    );
+    assert_eq!(roots[&replacement_id].configuration(), &expected);
+  }
+
+  /// Fetch two later home changes without their suffix; replay must not advance the version twice.
+  fn fetch_ahead_of_root_log(
+    roots: &mut BTreeMap<HostId, RootGroup>,
+    joining: &mut RootGroup,
+  ) -> RootConfiguration {
+    for to in [R0, R2] {
+      assert!(roots.get_mut(&P0).unwrap().propose(RootCommand::MoveHome {
+        volume: ObjectId::new(P2, 1),
+        to,
+      }));
+    }
+    replicate_round(roots, P0, &[P0, P1]);
+    replicate_round(roots, P0, &[P0, P1]);
+    let expected = roots[&P0].configuration().clone();
+    assert!(joining.adopt(expected.clone()));
+    expected
+  }
+
+  /// A late join response cannot erase an initialized member's first vote (AUD-07).
+  fn assert_join_vote_retained(
+    replacement: &mut RootGroup,
+    saved: SavedRaft,
+    base: RootConfiguration,
+    replacement_id: HostId,
+  ) {
+    let (prefix, _) = replacement.join_state().unwrap();
+    // A candidate exactly as up to date as the replacement: its last index and term, past any compaction.
+    let request = crate::raft::RequestVote {
+      term: prefix.term + 1,
+      candidate: P0,
+      last_log_index: prefix.snapshot_index + prefix.log.len() as u64,
+      last_log_term: prefix
+        .log
+        .last()
+        .map_or(prefix.snapshot_term, |entry| entry.term),
+    };
+    assert!(
+      matches!(replacement.answer(RaftMessage::RequestVote(request)),
+      Some(RaftMessage::VoteReply(reply)) if reply.granted && reply.voter == replacement_id)
+    );
+    assert_eq!(
+      replacement.join_from(saved, base),
+      Err(RaftRecoveryError::AlreadyInitialized)
+    );
+    assert!(
+      matches!(replacement.answer(RaftMessage::RequestVote(crate::raft::RequestVote { candidate: P1, ..request })),
+      Some(RaftMessage::VoteReply(reply)) if !reply.granted)
+    );
+  }
+
+  const P0: HostId = HostId(1);
+  const P1: HostId = HostId(2);
+  const R0: RegionId = RegionId(0);
+  const R1: RegionId = RegionId(1);
+  const R2: RegionId = RegionId(2);
+  const P2: HostId = HostId(3);
+
+  /// A root group per representative host: the regions `[R0, R1, R2]` with `[P0, P1, P2]` as their
+  /// representatives and voters.
+  fn groups() -> BTreeMap<HostId, RootGroup> {
+    [P0, P1, P2]
+      .into_iter()
+      .map(|node| {
+        (
+          node,
+          RootGroup::new(node, vec![R0, R1, R2], vec![P0, P1, P2]),
+        )
+      })
+      .collect()
+  }
+
+  /// Elects `candidate` with the votes of the `reachable` peers (pre-vote then vote), broadcasting each
+  /// request and folding every reply until the exchange settles.
+  fn elect_among(
+    groups: &mut BTreeMap<HostId, RootGroup>,
+    candidate: HostId,
+    reachable: &[HostId],
+  ) {
+    let mut pending = groups
+      .get_mut(&candidate)
+      .map(RootGroup::election_timeout)
+      .unwrap_or_default();
+    while let Some(request) = pending.pop() {
+      pending.clear();
+      for &peer in reachable.iter().filter(|peer| **peer != candidate) {
+        let reply = groups
+          .get_mut(&peer)
+          .and_then(|group| group.answer(request.clone()));
+        if let Some(reply) = reply
+          && let Some(group) = groups.get_mut(&candidate)
+        {
+          pending.extend(group.fold_reply(reply));
+        }
+      }
+    }
+  }
+
+  /// One replication round from `leader` to each of its targets that is `reachable`.
+  fn replicate_round(
+    groups: &mut BTreeMap<HostId, RootGroup>,
+    leader: HostId,
+    reachable: &[HostId],
+  ) {
+    replicate_round_within(groups, leader, reachable, UNBOUNDED);
+  }
+
+  /// [`replicate_round`] with appends carrying at most `budget` entry bytes.
+  fn replicate_round_within(
+    groups: &mut BTreeMap<HostId, RootGroup>,
+    leader: HostId,
+    reachable: &[HostId],
+    budget: usize,
+  ) {
+    let targets: Vec<HostId> = groups
+      .get(&leader)
+      .map(RootGroup::replication_targets)
+      .unwrap_or_default()
+      .into_iter()
+      .filter(|peer| *peer != leader && reachable.contains(peer))
+      .collect();
+    for peer in targets {
+      let Some(message) = groups
+        .get_mut(&leader)
+        .and_then(|l| l.replication_for(peer, budget))
+      else {
+        continue;
+      };
+      let reply = groups
+        .get_mut(&peer)
+        .and_then(|group| group.answer(message));
+      if let Some(reply) = reply
+        && let Some(group) = groups.get_mut(&leader)
+      {
+        group.fold_reply(reply);
+      }
+    }
+  }
+
+  /// Shape: leader periods the widening test allows (a stall judged at the second CheckQuorum tick, then a
+  /// period each for the joint change and `C_new`).
+  const WIDENING_PERIODS: usize = 12;
+
+  /// §4.8 (D-14) and thesis §4.2.1, for the root group. Do: a root group whose only voter is P0, over regions
+  /// R0–R2 represented by P0–P2; the leader reaches P1 but never P2; drive leader periods (reconcile the voters,
+  /// CheckQuorum, replicate). Expect: P1 is promoted once P2's staging stalls — the voters become `[P0, P1]` —
+  /// and P2 once it is reachable. Before 2026-09-30 one representative that could not catch up held back one
+  /// that had, as in the regional council
+  /// (`docs/bugs/2026-09-30-one-lagging-member-held-back-every-council-promotion.md`).
+  #[test]
+  fn a_representative_that_cannot_catch_up_does_not_hold_back_one_that_has() {
+    let mut groups: BTreeMap<HostId, RootGroup> = [P0, P1, P2]
+      .into_iter()
+      .map(|node| (node, RootGroup::new(node, vec![R0, R1, R2], vec![P0])))
+      .collect();
+    elect_among(&mut groups, P0, &[P0]);
+    assert!(groups[&P0].is_leader());
+    let representatives: BTreeMap<RegionId, HostId> =
+      [(R0, P0), (R1, P1), (R2, P2)].into_iter().collect();
+    let drive = |groups: &mut BTreeMap<HostId, RootGroup>, reachable: &[HostId]| {
+      for _ in 0..WIDENING_PERIODS {
+        if let Some(leader) = groups.get_mut(&P0) {
+          leader.reconcile_voters(&representatives);
+          leader.check_quorum();
+        }
+        replicate_round(groups, P0, reachable);
+        replicate_round(groups, P0, reachable);
+      }
+    };
+    drive(&mut groups, &[P0, P1]);
+    assert_eq!(
+      groups[&P0].voters(),
+      vec![P0, P1],
+      "P1 promoted though P2 stalled"
+    );
+    drive(&mut groups, &[P0, P1, P2]);
+    assert_eq!(
+      groups[&P0].voters(),
+      vec![P0, P1, P2],
+      "P2 promoted once reachable"
+    );
+  }
+
+  /// AC (§4.8, D-14; Raft §6): a retired region's **representative leaves the root voter set** — it stops
+  /// counting toward every root majority — and the surviving representatives commit alone. Three regions
+  /// with representatives {P0, P1, P2}; region R2's hosts die; the leader retires R2 (committed by P0 and
+  /// P1), then moves the voter set to the representatives of the committed regions: the joint change and
+  /// `C_new` each commit with P0 and P1; afterwards `is_voter(P2)` is false on both survivors and a further
+  /// root change commits with P1's acknowledgement alone. Before this the root voter set was fixed at boot
+  /// and the dead representative counted toward every majority for good.
+  #[test]
+  fn a_retired_regions_representative_leaves_the_root_voters() {
+    let mut groups = groups();
+    elect_among(&mut groups, P0, &[P0, P1, P2]);
+    assert!(groups[&P0].is_leader());
+    replicate_round(&mut groups, P0, &[P0, P1, P2]);
+    replicate_round(&mut groups, P0, &[P0, P1, P2]);
+
+    // Region R2's hosts die: the leader retires the region (no mirror), committed by the survivors. The
+    // retirement alone leaves the voter set untouched — the voter change follows.
+    let survivors = [P0, P1];
+    let proposed = groups
+      .get_mut(&P0)
+      .is_some_and(|leader| leader.reconcile_regions(&[R0, R1], &BTreeMap::new()));
+    replicate_round(&mut groups, P0, &survivors);
+    replicate_round(&mut groups, P0, &survivors);
+    assert_eq!(
+      (
+        proposed,
+        groups[&P0].configuration().regions.contains(&R2),
+        groups[&P0].is_voter(P2),
+      ),
+      (true, false, true),
+      "the retirement was proposed, committed and dropped R2; P2 still votes until the voter change"
+    );
+
+    // The voter set follows the committed regions' representatives: the joint change, then C_new, each
+    // committed by the survivors; then nothing more.
+    let representatives: BTreeMap<RegionId, HostId> = [(R0, P0), (R1, P1)].into_iter().collect();
+    let mut steps = Vec::new();
+    for rounds in [1, 2, 0] {
+      steps.push(
+        groups
+          .get_mut(&P0)
+          .is_some_and(|leader| leader.reconcile_voters(&representatives)),
+      );
+      for _ in 0..rounds {
+        replicate_round(&mut groups, P0, &survivors);
+      }
+    }
+    assert_eq!(
+      steps,
+      vec![true, true, false],
+      "began the joint change, completed it once committed, then settled"
+    );
+    assert_eq!(
+      (
+        groups[&P0].is_voter(P2),
+        groups[&P1].is_voter(P2),
+        groups[&P0].voters(),
+      ),
+      (false, false, vec![P0, P1]),
+      "P2 left the root voter set on both survivors"
+    );
+
+    // A further root change commits with P1's acknowledgement alone.
+    let admitted = RegionId(3);
+    let proposed = groups
+      .get_mut(&P0)
+      .is_some_and(|leader| leader.propose(RootCommand::AdmitRegion(admitted)));
+    replicate_round(&mut groups, P0, &survivors);
+    replicate_round(&mut groups, P0, &survivors);
+    assert_eq!(
+      (
+        proposed,
+        groups[&P0].configuration().regions.contains(&admitted),
+        groups[&P1].configuration().regions.contains(&admitted),
+      ),
+      (true, true, true),
+      "the surviving representatives commit and apply a further change alone"
+    );
+  }
+
+  /// Each root command round-trips through encode/decode, and a malformed entry decodes to `None` (applied as
+  /// a safe no-op rather than panicking).
+  #[test]
+  fn root_command_round_trips() {
+    let commands = [
+      RootCommand::AdmitRegion(R2),
+      RootCommand::RetireRegion(R1),
+      RootCommand::PromoteRegion {
+        lost: R1,
+        mirror: R0,
+      },
+      RootCommand::MoveHome {
+        volume: ObjectId::new(P0, 7),
+        to: R1,
+      },
+    ];
+    for command in commands {
+      assert_eq!(
+        RootCommand::decode(&command.encode()),
+        Some(command),
+        "round-trip is identity"
+      );
+    }
+    assert_eq!(
+      RootCommand::decode(&[]),
+      None,
+      "empty bytes decode to nothing"
+    );
+    assert_eq!(
+      RootCommand::decode(&[9, 9, 9]),
+      None,
+      "an unknown tag decodes to nothing"
+    );
+  }
+
+  /// Sends one request from `from` to `to`: `to` answers it (serve) and `from` folds the answer (drive),
+  /// returning the follow-on messages `from` must send next (the pre-vote → vote transition emits the real
+  /// vote requests). In process; the transport-carried form is the daemon's (owed).
+  fn exchange(from: &mut RootGroup, to: &mut RootGroup, request: RaftMessage) -> Vec<RaftMessage> {
+    match to.answer(request) {
+      Some(reply) => from.fold_reply(reply),
+      None => Vec::new(),
+    }
+  }
+
+  /// A two-voter root group on `node`, holding `[R0, R1]` as its initial regions and `[P0, P1]` as voters.
+  fn group(node: HostId) -> RootGroup {
+    RootGroup::new(node, vec![R0, R1], vec![P0, P1])
+  }
+
+  /// Elects `leader` over `follower` through the full pre-vote then real-vote round (§9.6), draining every
+  /// follow-on message until the exchange settles — the in-process form of the transport election.
+  fn elect(leader: &mut RootGroup, follower: &mut RootGroup) {
+    let mut pending = leader.election_timeout();
+    while let Some(request) = pending.pop() {
+      pending.extend(exchange(leader, follower, request));
+    }
+  }
+
+  /// Runs `rounds` replication rounds from `leader` to `follower` (round one replicates the entry and the
+  /// leader commits at the majority; round two's heartbeat carries the advanced commit index, so the follower
+  /// applies too).
+  fn replicate(leader: &mut RootGroup, follower: &mut RootGroup, rounds: usize) {
+    for _ in 0..rounds {
+      if let Some(message) = leader.replication_for(P1, UNBOUNDED) {
+        exchange(leader, follower, message);
+      }
+    }
+  }
+
+  /// AC (§4.8, D-14 — Raft Figure 2's follower timer-resets, the root group's parallel of the council's):
+  /// **granting a real vote** advances the voter's leader-contact signal, so the drive loop's election timer
+  /// resets and the voter defers its own campaign a full timeout — the candidate it backed gets time to win
+  /// and send its first heartbeat (docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md, sibling
+  /// fixes). By use: after the election the follower has granted a real vote but answered no append yet, and
+  /// its contact has advanced; the leader's first heartbeat then advances it again.
+  #[test]
+  fn granting_a_root_vote_defers_the_voters_own_election() {
+    let mut leader = group(P0);
+    let mut follower = group(P1);
+    assert_eq!(
+      follower.leader_contact(),
+      0,
+      "no contact before any election"
+    );
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+    let after_vote = follower.leader_contact();
+    assert!(
+      after_vote > 0,
+      "granting the real vote advanced the follower's contact — the drive loop defers its campaign"
+    );
+    replicate(&mut leader, &mut follower, 1);
+    assert!(
+      follower.leader_contact() > after_vote,
+      "the leader's first heartbeat advances it again"
+    );
+  }
+
+  /// AC (§4.8, D-14 — Raft Figure 2's follower timer-resets, the root group's parallel of the council's): an
+  /// append from the **current** root leader resets the election timer **even when the log-consistency check
+  /// rejects it** — a follower still catching up has a live leader and must not campaign against it. A
+  /// stale-term append is not contact and does not reset.
+  #[test]
+  fn a_current_root_leaders_rejected_append_still_resets_the_election_timer() {
+    let mut leader = group(P0);
+    let mut follower = group(P1);
+    elect(&mut leader, &mut follower);
+    let before = follower.leader_contact();
+    let Some(RaftMessage::AppendEntries(mut rejected)) = leader.replication_for(P1, UNBOUNDED)
+    else {
+      panic!("the leader owes its follower a heartbeat");
+    };
+    rejected.prev_log_index = rejected.prev_log_index.saturating_add(10);
+    rejected.prev_log_term = rejected.prev_log_term.saturating_add(1);
+    let reply = follower.answer(RaftMessage::AppendEntries(rejected));
+    assert!(
+      matches!(reply, Some(RaftMessage::AppendReply(ref r)) if !r.success),
+      "the append was rejected by the log-consistency check"
+    );
+    let after_rejected = follower.leader_contact();
+    assert!(
+      after_rejected > before,
+      "a rejected current-term append is still leader contact — the election timer resets"
+    );
+    let Some(RaftMessage::AppendEntries(mut stale)) = leader.replication_for(P1, UNBOUNDED) else {
+      panic!("the leader owes its follower a heartbeat");
+    };
+    stale.term = 0;
+    let reply = follower.answer(RaftMessage::AppendEntries(stale));
+    assert!(
+      matches!(reply, Some(RaftMessage::AppendReply(ref r)) if !r.success),
+      "a stale-term append is refused"
+    );
+    assert_eq!(
+      follower.leader_contact(),
+      after_rejected,
+      "and it is not contact — the timer does not reset for a deposed leader"
+    );
+  }
+
+  /// AC (§4.8, D-14 — Raft §6.2 CheckQuorum on the root group, the parallel of the council's): a root leader
+  /// that hears from no majority across a whole window steps down; one whose voters keep acknowledging stays.
+  #[test]
+  fn a_root_leader_that_hears_from_no_majority_steps_down_at_its_check_quorum_tick() {
+    let mut leader = group(P0);
+    let mut follower = group(P1);
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+    leader.check_quorum();
+    assert!(
+      leader.is_leader(),
+      "the first window still counts the majority that elected it"
+    );
+    replicate(&mut leader, &mut follower, 1);
+    leader.check_quorum();
+    assert!(
+      leader.is_leader(),
+      "a voter's acknowledgement this window keeps it leader"
+    );
+    leader.check_quorum();
+    assert!(
+      !leader.is_leader(),
+      "a whole window with no acknowledgement steps it down"
+    );
+  }
+
+  /// AC (§4.8, D-14): the root group elects a leader and commits a **region-membership** change at a majority,
+  /// applying it to the root configuration on every voter — the distributed root master. The drive rides the
+  /// same Raft the transport carries.
+  #[test]
+  fn a_root_group_commits_a_region_membership_change_at_a_majority() {
+    let mut leader = group(P0);
+    let mut follower = group(P1);
+
+    elect(&mut leader, &mut follower);
+    assert!(
+      leader.is_leader(),
+      "the leader won the pre-vote then the real vote"
+    );
+
+    // A non-leader may not propose; the leader admits a new region, which commits only at the majority.
+    assert!(
+      !follower.propose(RootCommand::AdmitRegion(R2)),
+      "a non-leader proposes nothing"
+    );
+    assert!(
+      leader.propose(RootCommand::AdmitRegion(R2)),
+      "the leader appended the region-membership change"
+    );
+    replicate(&mut leader, &mut follower, 2);
+    assert!(
+      leader.configuration().regions.contains(&R2),
+      "the region-membership change committed and applied at the leader"
+    );
+    assert!(
+      follower.configuration().regions.contains(&R2),
+      "and at the follower — the root group agrees on region membership"
+    );
+  }
+
+  /// AC (§4.8 "region loss promotes the mirror through the root group"): the leader commits a **promotion** of
+  /// a lost region to its mirror at a majority; every voter drops the lost region and routes a volume homed
+  /// there to the mirror. This is the cross-region takeover the root group exists to decide.
+  #[test]
+  fn a_root_group_commits_a_region_promotion_at_a_majority() {
+    let mut leader = group(P0);
+    let mut follower = group(P1);
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+
+    let volume = ObjectId::new(P0, 7); // created in region R0
+    assert!(
+      leader.propose(RootCommand::PromoteRegion {
+        lost: R0,
+        mirror: R1,
+      }),
+      "the leader proposes promoting the lost region's mirror"
+    );
+    replicate(&mut leader, &mut follower, 2);
+
+    for group in [&leader, &follower] {
+      assert!(
+        !group.configuration().regions.contains(&R0),
+        "the lost region is dropped from the membership on every voter"
+      );
+      assert_eq!(
+        group.configuration().home_of(volume, R0),
+        R1,
+        "a volume homed in the lost region is served from its promoted mirror"
+      );
+    }
+  }
+
+  /// AC (§4.8, D-14): the leader reconciles the region membership from the alive set — a newly-alive region is
+  /// admitted, a region no host is alive in is retired, each committed at the majority; a non-leader proposes
+  /// nothing, and a change still in flight is not re-proposed (the caught-up gate).
+  #[test]
+  fn the_leader_reconciles_region_membership_from_the_alive_set() {
+    let mut leader = group(P0); // regions [R0, R1]
+    let mut follower = group(P1);
+    elect(&mut leader, &mut follower);
+    replicate(&mut leader, &mut follower, 2); // commit the election no-op before reconfiguration
+    assert!(leader.is_leader());
+
+    // R2 has become alive; R1 has lost every host and has **no mirror**, so it is retired. A non-leader
+    // proposes nothing.
+    let alive = [R0, R2];
+    let no_mirrors = std::collections::BTreeMap::new();
+    assert!(
+      !follower.reconcile_regions(&alive, &no_mirrors),
+      "a non-leader proposes nothing"
+    );
+    assert!(
+      leader.reconcile_regions(&alive, &no_mirrors),
+      "the leader proposes admitting R2 and retiring the mirror-less lost R1"
+    );
+    assert!(
+      !leader.reconcile_regions(&alive, &no_mirrors),
+      "a change in flight is not re-proposed (the caught-up gate)"
+    );
+
+    replicate(&mut leader, &mut follower, 2);
+    for g in [&leader, &follower] {
+      assert!(g.configuration().regions.contains(&R2), "R2 was admitted");
+      assert!(
+        !g.configuration().regions.contains(&R1),
+        "the mirror-less lost R1 was retired"
+      );
+    }
+    assert!(
+      !leader.reconcile_regions(&alive, &no_mirrors),
+      "the settled membership reconciles to a no-op — the log grows only for real changes"
+    );
+  }
+
+  /// AC (§4.8 — region-loss promotion at operator cadence): a lost region that has a **mirror** is left in
+  /// the membership (it awaits a deliberate operator promotion, not an automatic failover of a possibly-just-
+  /// partitioned region — split-brain), whereas a mirror-less lost region is retired.
+  #[test]
+  fn a_lost_mirrored_region_is_not_auto_retired() {
+    let mut leader = group(P0); // regions [R0, R1]
+    let mut follower = group(P1);
+    elect(&mut leader, &mut follower);
+    replicate(&mut leader, &mut follower, 2); // commit the election no-op before reconfiguration
+    assert!(leader.is_leader());
+
+    // R1 is lost. With R0 declared as its mirror, the reconcile does not retire it.
+    let mirrors = std::collections::BTreeMap::from([(R1, R0)]);
+    assert!(
+      !leader.reconcile_regions(&[R0], &mirrors),
+      "a lost region with a mirror is not auto-retired — cross-region failover is the operator's"
+    );
+    assert!(
+      leader.configuration().regions.contains(&R1),
+      "the mirrored lost region stays in the membership, awaiting an operator promotion"
+    );
+
+    // The same region with no mirror declared is retired on its loss (no failover target).
+    assert!(
+      leader.reconcile_regions(&[R0], &std::collections::BTreeMap::new()),
+      "a mirror-less lost region is retired"
+    );
+    replicate(&mut leader, &mut follower, 2);
+    assert!(!leader.configuration().regions.contains(&R1));
+  }
+
+  /// Shape: an append budget of about two root commands (a home move is 25 command bytes, 38 on the wire),
+  /// so these tests cross batch boundaries.
+  const SMALL_BUDGET: usize = 80;
+  /// Shape: the home moves the compaction tests commit — far past the first compaction of a three-region
+  /// root configuration.
+  const MOVES: u64 = 120;
+
+  /// Commits `MOVES` home moves one at a time from `leader` to the `reachable` peers with the small budget,
+  /// returning the configuration an oracle applying them directly reaches from `oracle`.
+  fn commit_moves(
+    groups: &mut BTreeMap<HostId, RootGroup>,
+    leader: HostId,
+    reachable: &[HostId],
+    mut oracle: RootConfiguration,
+  ) -> RootConfiguration {
+    for index in 0..MOVES {
+      let volume = ObjectId::new(P2, index % 8);
+      let to = [R0, R1, R2][usize::try_from(index % 3).unwrap()];
+      let command = RootCommand::MoveHome { volume, to };
+      if !groups.get_mut(&leader).unwrap().propose(command) {
+        continue;
+      }
+      oracle.move_home(volume, to);
+      for _ in 0..4 {
+        replicate_round_within(groups, leader, reachable, SMALL_BUDGET);
+      }
+      assert!(groups[&leader].caught_up(), "move {index} committed");
+    }
+    oracle
+  }
+
+  /// Thesis §5.1.2 and Raft §7 through the root group: every representative that compacts folds exactly
+  /// the configuration an oracle reaches, and one cut off while the others commit past their compaction is
+  /// sent the leader's snapshot when it returns and catches up to the same configuration. Non-vacuity: the
+  /// leader compacted, and the returning representative installed a snapshot.
+  #[test]
+  fn a_representative_left_behind_the_snapshot_catches_up_to_the_same_configuration() {
+    let mut roots = groups();
+    elect_among(&mut roots, P0, &[P0, P1, P2]);
+    replicate_round(&mut roots, P0, &[P0, P1, P2]);
+    replicate_round(&mut roots, P0, &[P0, P1, P2]);
+    let oracle = roots[&P0].configuration().clone();
+    let oracle = commit_moves(&mut roots, P0, &[P0, P1], oracle);
+    assert_eq!(roots[&P0].configuration(), &oracle);
+    assert_eq!(roots[&P1].configuration(), &oracle);
+    assert!(roots[&P0].compactions() > 0, "the leader compacted");
+    assert!(matches!(
+      roots
+        .get_mut(&P0)
+        .unwrap()
+        .replication_for(P2, SMALL_BUDGET),
+      Some(RaftMessage::InstallSnapshot(_))
+    ));
+    let mut rounds = 0;
+    while roots[&P2].configuration() != &oracle {
+      replicate_round_within(&mut roots, P0, &[P0, P1, P2], SMALL_BUDGET);
+      rounds += 1;
+      assert!(
+        rounds <= MOVES,
+        "P2 catches up in a bounded number of rounds"
+      );
+    }
+    assert!(roots[&P2].snapshot_index() > 0, "P2 installed a snapshot");
+  }
+}

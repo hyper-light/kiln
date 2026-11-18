@@ -1,0 +1,228 @@
+//! The loopback server's stream loop and RPC dispatch (§4.6, the socket half the codec sits behind).
+//!
+//! [`serve_connection`] reads ONC RPC records off one connected stream, dispatches portmap `GETPORT`,
+//! MOUNT `MNT`, and the NFSv3 procedures onto an [`crate::procedures::Export`] (which wraps the volume's [`slates_bridge_core::Bridge`]), and
+//! writes the framed replies, until the client closes the connection. It is transport-generic (any
+//! `Read + Write`), so a test drives it over a socket pair and the `nfs_loopback` example serves a real
+//! `mount_nfs` client over TCP. This is a blocking, one-connection-at-a-time serve — enough for a mount
+//! and file access; the production server multiplexes it on slates's runtime.
+
+use std::io::{Read, Write};
+
+use crate::mount::{
+  MOUNT_PROGRAM, MOUNTPROC3_MNT, MOUNTPROC3_NULL, MOUNTPROC3_UMNT, parse_mount_path,
+};
+use crate::multi::NfsService;
+use crate::portmap::{PMAPPROC_GETPORT, PMAPPROC_NULL, PORTMAP_PROGRAM, getport_reply};
+use crate::procedures::{Dialect, NFS_PROGRAM, NFS_VERSION as NFS_V3};
+use crate::rpc::{AcceptStatus, RecordReader, parse_call};
+use crate::xdr::{XdrReader, XdrWriter};
+use crate::{reply_bytes, write_record};
+
+use slates_rt::RtError;
+use slates_rt::tcp::TcpStream;
+
+/// Shape: bytes read from the stream per `read` when more of an RPC record is needed. A large NFS
+/// transfer fits in one read, and the record assembler stitches any split across reads, so this
+/// bounds the number of syscalls per record, never correctness.
+const RECORD_READ_CHUNK: usize = 1 << 16;
+
+/// Dispatches one decoded RPC call onto `service`, returning the accept status and encoded results.
+/// The `service` serves one volume ([`Export`](crate::procedures::Export)) or many
+/// ([`MultiExport`](crate::multi::MultiExport)) behind the same trait. The `port` answers a portmap
+/// `GETPORT` (this server serves every program on one port). Public so a multi-shard daemon can run it
+/// both on the accepting shard (for a local volume) and, over the cross-shard bridge queue, on the
+/// owning shard (for a remote one) — the same engine either place.
+/// NFS calls are served for version 3 here, answering for `dialect` (the wire client's, or the NFSv4
+/// front end's when it routes an operation's v3 call here, A-38); version 4 is the caller's to serve
+/// first ([`crate::v4`]), and any other version is refused `PROG_MISMATCH` naming the served range.
+#[allow(clippy::too_many_arguments)] // one decoded call: its dialect, program, version, procedure, args, port
+pub fn serve_call(
+  service: &mut dyn NfsService,
+  dialect: Dialect,
+  program: u32,
+  version: u32,
+  procedure: u32,
+  args: &mut XdrReader<'_>,
+  port: u16,
+) -> (AcceptStatus, Vec<u8>) {
+  match program {
+    PORTMAP_PROGRAM => match procedure {
+      PMAPPROC_NULL => (AcceptStatus::Success, Vec::new()),
+      PMAPPROC_GETPORT => (AcceptStatus::Success, getport_reply(u32::from(port))),
+      _ => (AcceptStatus::ProcUnavail, Vec::new()),
+    },
+    MOUNT_PROGRAM => match procedure {
+      MOUNTPROC3_NULL => (AcceptStatus::Success, Vec::new()),
+      MOUNTPROC3_MNT => {
+        let path = parse_mount_path(args).unwrap_or("/").to_owned();
+        let reply = service.serve_mount(&path);
+        let mut writer = XdrWriter::new();
+        reply.encode(&mut writer);
+        (AcceptStatus::Success, writer.as_slice().to_vec())
+      }
+      MOUNTPROC3_UMNT => (AcceptStatus::Success, Vec::new()),
+      _ => (AcceptStatus::ProcUnavail, Vec::new()),
+    },
+    NFS_PROGRAM if version != NFS_V3 => (
+      AcceptStatus::ProgMismatch {
+        low: NFS_V3,
+        high: crate::v4::NFS_V4,
+      },
+      Vec::new(),
+    ),
+    NFS_PROGRAM => match service.serve_procedure(dialect, procedure, args) {
+      Some(results) => (AcceptStatus::Success, results),
+      None => (AcceptStatus::ProcUnavail, Vec::new()),
+    },
+    _ => (AcceptStatus::ProgUnavail, Vec::new()),
+  }
+}
+
+/// Serves NFS/MOUNT/portmap RPC over one connected `stream` against `service`, until the client closes
+/// it. `v4` is the listener's NFSv4 state: it outlives the connection, since a v4 client's session and
+/// opens continue on its next connection (RFC 8881 §2.10.3). `port` is the port the server listens on
+/// (answered to a portmap `GETPORT`). Returns when the stream reaches end of file or a read/write fails;
+/// a malformed record ends the connection rather than risking a desynchronised stream.
+pub fn serve_connection<S: Read + Write>(
+  stream: &mut S,
+  service: &mut dyn NfsService,
+  v4: &mut crate::v4::compound::Server,
+  port: u16,
+) {
+  let mut buffer: Vec<u8> = Vec::new();
+  let mut records = RecordReader::default();
+  let mut chunk = [0u8; RECORD_READ_CHUNK];
+  loop {
+    match records.read(&buffer) {
+      Ok((Some(body), consumed)) => {
+        let reply = dispatch(service, v4, &body, port);
+        if stream.write_all(&write_record(&reply)).is_err() {
+          return;
+        }
+        buffer.drain(..consumed.min(buffer.len()));
+      }
+      Ok((None, consumed)) => {
+        buffer.drain(..consumed.min(buffer.len()));
+        match stream.read(&mut chunk) {
+          Ok(0) | Err(_) => return,
+          Ok(n) => buffer.extend_from_slice(chunk.get(..n).unwrap_or(&chunk)),
+        }
+      }
+      Err(_) => return,
+    }
+  }
+}
+
+/// One RPC record's reply: an NFSv4 call served against `v4`, anything else through [`serve_call`].
+fn dispatch(
+  service: &mut dyn NfsService,
+  v4: &mut crate::v4::compound::Server,
+  body: &[u8],
+  port: u16,
+) -> Vec<u8> {
+  match parse_call(body) {
+    Ok((call, mut args)) if call.program == NFS_PROGRAM && call.version == crate::v4::NFS_V4 => {
+      let principal = crate::rpc::auth_sys_uid(body).unwrap_or(0);
+      let (status, results) = serve_v4(
+        service,
+        v4,
+        (principal, body.len()),
+        call.procedure,
+        &mut args,
+      );
+      reply_bytes(call.xid, status, &results)
+    }
+    // The extension procedures (A-35) are the v4 front end's, never the wire's.
+    Ok((call, _))
+      if call.program == NFS_PROGRAM
+        && !crate::procedures::is_rfc1813_procedure(call.procedure) =>
+    {
+      reply_bytes(call.xid, AcceptStatus::ProcUnavail, &[])
+    }
+    Ok((call, mut args)) => {
+      let (status, results) = serve_call(
+        service,
+        Dialect::LOOPBACK_NFS3,
+        call.program,
+        call.version,
+        call.procedure,
+        &mut args,
+        port,
+      );
+      reply_bytes(call.xid, status, &results)
+    }
+    Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),
+  }
+}
+
+/// Serves one NFSv4 call over a synchronous service (A-35): `NULL`, or a `COMPOUND` against the v4 state,
+/// from `principal` in a call of `request_bytes` (its RPC headers included, which the session's
+/// request size bounds).
+pub fn serve_v4(
+  service: &mut dyn NfsService,
+  v4: &mut crate::v4::compound::Server,
+  (principal, request_bytes): (u32, usize),
+  procedure: u32,
+  args: &mut XdrReader<'_>,
+) -> (AcceptStatus, Vec<u8>) {
+  match procedure {
+    crate::v4::NFSPROC4_NULL => (AcceptStatus::Success, Vec::new()),
+    crate::v4::NFSPROC4_COMPOUND => {
+      let now_ns = crate::v4::backend::monotonic_ns();
+      match crate::v4::backend::serve_compound(
+        service,
+        v4,
+        principal,
+        now_ns,
+        (args.rest(), request_bytes),
+      ) {
+        Some(reply) => (AcceptStatus::Success, reply),
+        None => (AcceptStatus::SystemErr, Vec::new()),
+      }
+    }
+    _ => (AcceptStatus::ProcUnavail, Vec::new()),
+  }
+}
+
+/// Serves NFS/MOUNT/portmap RPC over one connected runtime `stream` against `service`, until the client
+/// closes it — the async analogue of [`serve_connection`] for the production server, which multiplexes
+/// connections on slates's own runtime (§4.6). It shares the RPC engine ([`serve_call`]) and the record
+/// codec with the blocking form; only the transport differs. Reads and writes await the shard's driver
+/// through the runtime's [`TcpStream`], so a write to a stalled client (a soft-mounted NFS client that
+/// stopped reading, filling the send buffer) yields the shard rather than blocking it — the reason the
+/// production server runs here and the blocking form stays the example-and-test driver of the same
+/// engine. Returns `Ok(())` when the stream reaches end of file; a malformed record ends the
+/// connection rather than risk a desynchronised stream; a transport error is returned for the caller
+/// to log and drop the connection.
+pub async fn serve_connection_async(
+  stream: &mut TcpStream,
+  service: &mut dyn NfsService,
+  v4: &mut crate::v4::compound::Server,
+  port: u16,
+) -> Result<(), RtError> {
+  let mut buffer: Vec<u8> = Vec::new();
+  let mut records = RecordReader::default();
+  let mut chunk = [0u8; RECORD_READ_CHUNK];
+  loop {
+    match records.read(&buffer) {
+      Ok((Some(body), consumed)) => {
+        let reply = dispatch(service, v4, &body, port);
+        stream.write_all(&write_record(&reply)).await?;
+        buffer.drain(..consumed.min(buffer.len()));
+        // Readiness can remain true across many calls. One completed RPC is the cooperative
+        // work boundary even when neither direction reaches WouldBlock (§4.3, §4.6).
+        slates_rt::futures::yield_now().await;
+      }
+      Ok((None, consumed)) => {
+        buffer.drain(..consumed.min(buffer.len()));
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+          return Ok(());
+        }
+        buffer.extend_from_slice(chunk.get(..read).unwrap_or(&chunk));
+      }
+      Err(_) => return Ok(()),
+    }
+  }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "slates-merge"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The merge engine (D-27, §4.16): the deterministic two-pass verdict over declared operations — accept, accept-identical, or a byte-exact conflict, never an inferred merge (Phase 6)."
+
+[dependencies]
+blake3 = { workspace = true }
+
+[dev-dependencies]
+slates-test-seeds = { workspace = true }
+proptest = { workspace = true }
+
+# shuttle builds only under `RUSTFLAGS="--cfg shuttle"` for the sixteen-agent randomized schedule of
+# T-6.7 (`tests/shuttle_green.rs`); a dev-dependency, so nothing shipped links it.
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = "0.9"
+
+[lints]
+workspace = true

@@ -1,0 +1,37 @@
+[package]
+name = "slates-anchor"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The anchor process's library: the shared segment (profile, op logs, catalog snapshots, audit log, landing manifests), attach, and supervision of the daemon (design §2.5, §2.6, §4.8; Phase 2 task 1)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-mem = { workspace = true }
+slates-wire = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+# The Windows hold channel (A-198): a message-mode named-pipe pair (`slates_ipc::stream::message_pair`) and the
+# child-spawn helpers that hand exactly the held handles to the next daemon (`slates_ipc::win_spawn`). ipc does not
+# depend on anchor, so this edge is acyclic.
+slates-ipc = { workspace = true }
+
+# The hold channel (A-61, A-113): a socketpair and `SCM_RIGHTS`, through rustix's safe wrappers.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+# The NFS-listener-inheritance test binds a listener and checks the supervised child inherited it
+# (Unix only; NFS is the macOS/Linux bridge).
+[dev-dependencies]
+slates-vfs = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+slates-rt = { workspace = true }
+rustix = { workspace = true }
+
+[lints]
+workspace = true

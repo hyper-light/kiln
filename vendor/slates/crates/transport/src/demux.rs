@@ -1,0 +1,763 @@
+//! One socket, many sessions — the connection-ID demultiplexer (§4.10a §8 "connection IDs"; §4.8 the
+//! fleet's serve side). A node serving its peers binds **one** socket per plane and lets every peer dial
+//! it: the [`Demux`] owns the socket, runs its receive loop, and routes each datagram to the session it
+//! belongs to — a raw handshake datagram by its **source address** (the session under handshake from
+//! that dialer), a 1-RTT packet by the **connection id** in its short header (`endpoint.rs`: eight bytes
+//! both ends derive from the TLS exporter once the handshake completes, so the id needs no wire
+//! negotiation and is unique per session). A datagram from an unknown source opens a new server session
+//! and hands it to whoever awaits [`DemuxId::accept`]; a 1-RTT packet naming no session is dropped and
+//! counted, never a panic.
+//!
+//! **Stateless reset (A-261, RFC 9000 §10.3).** A 1-RTT packet naming no session, from a source with no session here,
+//! is answered with a stateless reset: this node lost that session (it restarted under the same identity), and the
+//! token at the reset's tail, made from the identity's private key and the packet's connection id, is the one this node
+//! issued its dialer inside the session, so the dialer ends it at once instead of waiting out its own timers on a
+//! session that is gone. A 1-RTT packet naming no session from an established session's dialer goes to that session
+//! instead: it may be the dialer's own reset, from a process restarted onto its port, which only the session holds the
+//! token to recognise. A source with a session here gets none (a dialer's packet can outrun the binding of its new
+//! id: a reset then would end a session about to exist). Each reset is shorter than its trigger (§10.3.3), and a
+//! source draws at most one per initial probe timeout, from a table no larger than the pool, so a flood of strays
+//! costs the path at most what it sent.
+//!
+//! **Why this shape.** Before it, the fleet bound one serve socket per peer per plane because an
+//! accepting endpoint pinned the first source it heard — `N·(N−1)` sockets for the mesh, a block of `2N`
+//! ports per node in the deployment manifest, and no way for a peer to *re-dial* after losing its
+//! session (its pinned accept side never rebuilt). With the id in every packet, one socket carries every
+//! peer, a node advertises two ports, and a re-dialing peer's new session **replaces** its old one
+//! ([`Demux::bind`] closes the session previously established under the same peer certificate, whose
+//! serve loop then ends with [`EndpointError::Closed`]) — reconnection after a mid-run loss, by
+//! construction.
+//!
+//! **Ownership and bounds (D-8, banned item 8).** The demultiplexer is owned by the shard that starts it,
+//! for that shard's life (`ShardContext::keep_with`: one per socket per boot, named by its [`DemuxId`]
+//! handle and dropped with the shard's context after its tasks, its socket closed and its port free
+//! again) — and its state is a `RefCell` on the one shard thread that runs it (no lock, no `Arc`). Sessions live in a slab of at most `max_sessions` slots
+//! (three per unit of peer capacity: one pending handshake, a live authenticated session and its
+//! replacement). Pending work cannot consume the authenticated reservation. Authentication checks the
+//! distinct-peer bound and the certificate's two-slot bound before replacing a connection. A closed
+//! endpoint retains its charge until drop. Addresses never identify peers: NAT and pod movement do not
+//! change the certificate's quota. See `docs/bugs/2026-09-17-authenticated-session-fairness.md`.
+//! named by generational [`Slot`]s so a stale handle is a typed miss. Each session's inbox holds as
+//! many datagrams as the socket's own kernel receive buffer would (`SO_RCVBUF` over the minimum datagram
+//! — the queue the per-peer socket it replaces had); past that a datagram is dropped and counted, and
+//! the peer's tail-loss probe retransmits it. The receive loop yields after every datagram it routes, so
+//! the sessions drain their inboxes between arrivals instead of after a whole burst. An [`Endpoint`]
+//! built on a shared link releases its slot when dropped.
+//!
+//! Everything outside the demultiplexer — an endpoint on a shared link, the task running its receive loop,
+//! the fleet's accept loops — names it by its [`DemuxId`], never by reference: the id is the shard's
+//! [`Kept`] handle, reached only inside a closure while the owning shard runs on the calling thread
+//! (AUD-29-08). The demultiplexer's state is this thread's alone (a `RefCell`), so a reference to it could
+//! not cross threads, while the endpoint stays `Send` as every other endpoint is. Used from another
+//! thread, or after the shard's context ended, a handle finds no demultiplexer and is refused typed
+//! (`Closed`) — never a data race and never freed memory. Until 2026-09-30 the demultiplexer was lent as a
+//! `&'static` and listed in a thread-local table of such references, which safe code could keep past the
+//! context that freed it.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, VecDeque};
+use std::task::{Context, Poll, Waker};
+
+use rustls::pki_types::CertificateDer;
+use slates_rt::error::ReceiveRefusal;
+use slates_rt::shard::{Kept, ShardContext};
+use slates_rt::udp::{SocketAddrV4, UdpSocket};
+
+use crate::connection::ConnectionShape;
+use crate::endpoint::{
+  ConnectionId, Endpoint, EndpointError, MIN_DATAGRAM_BYTES, connection_id_of, is_short_header,
+};
+use crate::handshake::{HandshakeError, Identity, server_connection};
+
+/// Shape: one live authenticated session and the endpoint its replacement has closed but not yet dropped.
+pub const AUTHENTICATED_SESSIONS_PER_PEER: usize = 2;
+/// Derived: each unit of peer capacity reserves its authenticated pair plus one pending handshake.
+/// Both the transport and the fleet's serve-task budget use this total (§4.3, §4.10a).
+pub const SESSION_SLOTS_PER_PEER: usize = AUTHENTICATED_SESSIONS_PER_PEER + 1;
+
+/// Admission refused before a new authenticated connection could replace the current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionRefusal {
+  /// The requested slab size cannot be represented by its generational handles, or is empty.
+  InvalidCapacity,
+  /// Every admitted identity's reservation is occupied.
+  PeerCapacity,
+  /// This certificate still owns both its live and replaced endpoints.
+  PeerSessions,
+}
+
+/// A demultiplexer's handle: the shard's [`Kept`] handle of it (see the module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DemuxId(Kept<Demux>);
+
+/// Runs `f` on the demultiplexer `id` names, or `None` when its shard does not run on this thread (another
+/// thread, or its context ended).
+pub(crate) fn with_demux<R>(id: DemuxId, f: impl FnOnce(&Demux) -> R) -> Option<R> {
+  id.0.with(f)
+}
+
+impl DemuxId {
+  /// Runs `f` on the demultiplexer, on its shard's thread while the shard runs (a task): `None` otherwise.
+  pub fn with<R>(self, f: impl FnOnce(&Demux) -> R) -> Option<R> {
+    self.0.with(f)
+  }
+
+  /// Runs `f` on the demultiplexer through a borrow of its shard's context (an owner between steps — a
+  /// test holding `LocalRuntime::context`): `None` when `context` is not its shard's.
+  pub fn with_in<R>(self, context: &ShardContext, f: impl FnOnce(&Demux) -> R) -> Option<R> {
+    self.0.with_in(context, f)
+  }
+
+  /// The receive loop: reads every datagram off the socket and routes it. Runs until the socket is gone
+  /// ([`ReceiveRefusal::SocketGone`]) or the demultiplexer is unreachable (`Closed`); the caller owns the task
+  /// (spawns it on this shard and cancels it at shutdown). Any other refused receive is counted by its kind
+  /// ([`DemuxCounters::receive_refused_earlier_send`] and its siblings) and the loop reads on, after yielding
+  /// the shard, so a refusal that repeats costs a turn each and never holds it. Before 2026-11-07 every refusal
+  /// ended the loop, and one earlier send's ICMP report (Windows' WSAECONNRESET, which Linux reports as
+  /// ECONNREFUSED, udp(7)) stopped a node's plane for the daemon's life.
+  pub async fn run(self) -> Result<(), EndpointError> {
+    loop {
+      // Routed straight out of the shard's receive buffer (`crate::receive`), lent only for the read; an
+      // empty socket hands back its readiness future, awaited outside the handle's borrow.
+      let next = with_demux(self, |demux| -> Result<_, EndpointError> {
+        match crate::receive::with_datagram(&demux.socket, |datagram, from| {
+          demux.route(datagram, from)
+        }) {
+          Ok(Some(())) => Ok(Next::Routed),
+          Ok(None) => Ok(Next::Empty(demux.socket.readable())),
+          Err(refusal) => match refusal.receive_refusal() {
+            ReceiveRefusal::SocketGone => Err(EndpointError::Io(refusal)),
+            kind => {
+              demux.count_receive_refusal(kind);
+              Ok(Next::Refused)
+            }
+          },
+        }
+      })
+      .ok_or(EndpointError::Closed)??;
+      match next {
+        Next::Empty(readable) => readable.await?,
+        // Yield between datagrams: a burst queued in the kernel would otherwise be routed whole before any
+        // session task ran, filling an inbox the session had no chance to drain. A refused receive yields too.
+        Next::Routed | Next::Refused => slates_rt::futures::yield_now().await,
+      }
+    }
+  }
+
+  /// A future that yields the next server session a new source opened — un-established: the caller
+  /// drives [`Endpoint::establish`] as for any endpoint. `Closed` once the demultiplexer is unreachable.
+  pub fn accept(self) -> Accept {
+    Accept { demux: self }
+  }
+}
+
+/// What one turn of the receive loop found.
+enum Next<Readable> {
+  /// A datagram, routed.
+  Routed,
+  /// Nothing waiting: the socket's readiness to await.
+  Empty(Readable),
+  /// A refused receive that does not end the loop, counted.
+  Refused,
+}
+
+/// A session's slot in the demultiplexer's table: an index and the generation it was allotted under,
+/// so a released and reused slot never answers to its old handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slot {
+  index: u32,
+  generation: u32,
+}
+
+/// The counters an operator (or a test) reads to see what the demultiplexer refused or dropped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DemuxCounters {
+  /// 1-RTT packets whose connection id named no live session (a stale packet, a stray, or a session
+  /// already closed).
+  pub unknown_id: u64,
+  /// Datagrams dropped because their session's inbox was full.
+  pub inbox_full: u64,
+  /// New sources refused because the pending-handshake reservation is full — capacity only.
+  /// Authenticated peer limits and endpoint setup faults have separate counters below.
+  pub sessions_refused: u64,
+  /// Handshakes from new sources refused because the session's endpoint could not be built (its TLS server
+  /// state, `EndpointError::Handshake` — a misconfigured identity or roster), the slot given back. Counted
+  /// apart from capacity so a setup fault never reads as a full pool, nor a full pool as a setup fault.
+  pub setup_refused: u64,
+  /// Authenticated dials refused because this certificate still owns both generations.
+  pub peer_sessions_refused: u64,
+  /// Authenticated identities refused because the peer reservation is full.
+  pub peers_refused: u64,
+  /// Sessions closed because their peer established a new one (a re-dial after a loss).
+  pub replaced: u64,
+  /// Server sessions opened for a new source.
+  pub opened: u64,
+  /// Receives refused by an earlier send's report (a peer's port or host unreachable, a time to live expired:
+  /// `ReceiveRefusal::EarlierSend`); the loop read on.
+  pub receive_refused_earlier_send: u64,
+  /// Receives refused for want of the OS's memory or buffers (`ReceiveRefusal::Resources`); the loop read on.
+  pub receive_refused_resources: u64,
+  /// Receives refused for any other reason but the socket's end (`ReceiveRefusal::Other`); the loop read on.
+  pub receive_refused_other: u64,
+  /// Stateless resets sent for a 1-RTT packet naming no session (A-261).
+  pub resets_sent: u64,
+  /// Stateless resets not sent: the source drew one within the last initial probe timeout, the table of sources
+  /// answered is full, the trigger was too short to answer with a shorter datagram, or the random source refused.
+  pub resets_withheld: u64,
+  /// The most sessions ever held at once — opened and not yet released, a pending handshake and a
+  /// replaced-but-undropped session both counting — against [`Demux::capacity`]: the pool's high-water mark.
+  pub high_water: u64,
+}
+
+/// A session's inbox: its peer, the datagrams waiting for it, the waker of the task reading it, and
+/// whether the demultiplexer closed it.
+struct Inbox {
+  peer: SocketAddrV4,
+  queue: VecDeque<Vec<u8>>,
+  waker: Option<Waker>,
+  closed: bool,
+  /// Set only after admission; remains charged after routing is closed, until endpoint drop.
+  certificate: Option<Vec<u8>>,
+  connection_id: Option<ConnectionId>,
+}
+
+/// A certificate's current route and all its still-owned endpoints, including replaced ones.
+struct PeerSessions {
+  current: Option<Slot>,
+  held: usize,
+}
+
+impl Inbox {
+  fn wake(&mut self) {
+    if let Some(waker) = self.waker.take() {
+      waker.wake();
+    }
+  }
+}
+
+/// The mutable state behind the `RefCell`.
+struct Inner {
+  slots: Vec<Option<Inbox>>,
+  generations: Vec<u32>,
+  free: Vec<u32>,
+  /// Every live session by the source it dials from (set when opened; a source maps to one session).
+  by_source: BTreeMap<SocketAddrV4, Slot>,
+  /// Every established session by its connection id.
+  by_id: BTreeMap<ConnectionId, Slot>,
+  /// Every established session by the peer certificate it authenticated with.
+  by_peer: BTreeMap<Vec<u8>, PeerSessions>,
+  pending_handshakes: usize,
+  /// Server sessions opened for a new source, awaiting [`DemuxId::accept`].
+  pending: VecDeque<Endpoint>,
+  accept_waker: Option<Waker>,
+  counters: DemuxCounters,
+  /// The most recent setup refusal's error, for whoever reads `setup_refused` climbing — one bounded
+  /// string, replaced by each later refusal, never a list.
+  last_setup_refusal: Option<String>,
+  /// When each source last drew a stateless reset: at most one per [`RESET_INTERVAL_NS`], and no more sources than
+  /// the pool holds sessions; an entry older than the interval is forgotten when the table is next written.
+  resets_sent_at: BTreeMap<SocketAddrV4, u64>,
+}
+
+/// Derived: the least time between two stateless resets to one source — the initial probe timeout (666 ms). A dialer
+/// whose session this node lost sends its next packet at its own probe timeout or sooner, so the first draws a reset
+/// at once; the interval bounds only a lost reset's repeat and a flood's.
+const RESET_INTERVAL_NS: u64 = crate::rtt::INITIAL_PTO_NS;
+
+/// The demultiplexer over one socket: see the module doc.
+pub struct Demux {
+  id: DemuxId,
+  socket: UdpSocket,
+  identity: Kept<Identity>,
+  /// The identity's stateless reset key (`crate::reset`), derived once at start; `None` when it could not be, and
+  /// then no reset is sent or issued.
+  reset_key: Option<crate::reset::ResetKey>,
+  allowed: Vec<CertificateDer<'static>>,
+  /// The connection shape every session on this socket is built with.
+  shape: ConnectionShape,
+  /// Derived: the datagrams one session's inbox holds — the socket's kernel receive buffer over the
+  /// minimum datagram, the queue the per-peer socket this shares out used to give each peer.
+  inbox_datagrams: usize,
+  /// The pool's size ([`Demux::capacity`]).
+  capacity: usize,
+  /// Derived: one pending handshake and one authenticated reservation per enrolled peer-capacity unit.
+  peer_capacity: usize,
+  inner: RefCell<Inner>,
+}
+
+impl Demux {
+  /// Takes ownership of `socket` and serves up to `peer_capacity` identities on it, presenting `identity` and
+  /// requiring each dialer's certificate among `allowed` (mutual TLS — the same trust a single-peer
+  /// server enforces). Owned by the calling shard for its life (`ShardContext::keep_with`) and named by
+  /// the returned [`DemuxId`]; dropped — the socket closed, its port free again — when the shard's context
+  /// is, after its tasks. Before 2026-09-14 it was leaked, so a stopped in-process daemon never freed its
+  /// serve ports. Refused when the caller is not on a shard thread. The caller spawns [`DemuxId::run`] on
+  /// the shard that will drive the sessions, and owns that task.
+  pub fn start(
+    socket: UdpSocket,
+    identity: Kept<Identity>,
+    allowed: Vec<CertificateDer<'static>>,
+    shape: ConnectionShape,
+    peer_capacity: usize,
+  ) -> Result<DemuxId, EndpointError> {
+    let max_sessions = peer_capacity
+      .checked_mul(SESSION_SLOTS_PER_PEER)
+      .filter(|slots| *slots != 0 && u32::try_from(*slots).is_ok())
+      .ok_or(EndpointError::Admission(SessionRefusal::InvalidCapacity))?;
+    let mut slots = Vec::with_capacity(max_sessions);
+    slots.resize_with(max_sessions, || None);
+    let free: Vec<u32> = (0..max_sessions)
+      .rev()
+      .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
+      .collect();
+    // A socket that will not say has the smallest queue a datagram socket can be given: one datagram.
+    let inbox_datagrams = socket
+      .recv_buffer_bytes()
+      .map(|bytes| bytes / MIN_DATAGRAM_BYTES)
+      .unwrap_or(1)
+      .max(1);
+    let reset_key = identity.with(Identity::reset_key).flatten();
+    let build = |kept| Demux {
+      id: DemuxId(kept),
+      socket,
+      identity,
+      reset_key,
+      allowed,
+      shape,
+      inbox_datagrams,
+      capacity: max_sessions,
+      peer_capacity,
+      inner: RefCell::new(Inner {
+        slots,
+        generations: vec![0; max_sessions],
+        free,
+        by_source: BTreeMap::new(),
+        by_id: BTreeMap::new(),
+        by_peer: BTreeMap::new(),
+        pending_handshakes: 0,
+        pending: VecDeque::new(),
+        accept_waker: None,
+        counters: DemuxCounters::default(),
+        last_setup_refusal: None,
+        resets_sent_at: BTreeMap::new(),
+      }),
+    };
+    let kept = slates_rt::registry::with_current(|ctx| ctx.keep_with(build))
+      .ok_or(EndpointError::Io(
+        slates_rt::error::RtError::NotOnShardThread,
+      ))?
+      .map_err(EndpointError::Io)?;
+    Ok(DemuxId(kept))
+  }
+
+  /// This demultiplexer's id on its shard — what an endpoint on its socket names it by.
+  pub fn id(&self) -> DemuxId {
+    self.id
+  }
+
+  /// A fresh TLS server state presenting this demultiplexer's identity and pinning its allowed peers —
+  /// one per accepted session.
+  pub(crate) fn server_connection(&self) -> Result<rustls::quic::ServerConnection, HandshakeError> {
+    self
+      .identity
+      .with(|identity| {
+        server_connection(
+          identity,
+          &self.allowed,
+          &crate::params::TransportParameters::local(),
+        )
+      })
+      .ok_or_else(|| {
+        HandshakeError::Setup("the shard's identity is not reachable on this thread".to_owned())
+      })?
+  }
+
+  /// The connection shape every session on this socket is built with.
+  pub(crate) fn shape(&self) -> ConnectionShape {
+    self.shape
+  }
+
+  /// The socket's local address (the port peers dial).
+  pub fn local_addr(&self) -> Result<SocketAddrV4, EndpointError> {
+    self.socket.local_addr().map_err(EndpointError::Io)
+  }
+
+  /// The counters so far.
+  pub fn counters(&self) -> DemuxCounters {
+    self.inner.borrow().counters
+  }
+
+  /// Counts a refused receive of `kind` that did not end the loop.
+  fn count_receive_refusal(&self, kind: ReceiveRefusal) {
+    let mut inner = self.inner.borrow_mut();
+    let counter = match kind {
+      ReceiveRefusal::EarlierSend => &mut inner.counters.receive_refused_earlier_send,
+      ReceiveRefusal::Resources => &mut inner.counters.receive_refused_resources,
+      ReceiveRefusal::Other | ReceiveRefusal::SocketGone => {
+        &mut inner.counters.receive_refused_other
+      }
+    };
+    *counter = counter.saturating_add(1);
+  }
+
+  /// The most recent setup refusal's error ([`DemuxCounters::setup_refused`]), if any — what an operator
+  /// reads to tell a misconfigured identity from a broken roster; the latest only, never a list.
+  pub fn last_setup_refusal(&self) -> Option<String> {
+    self.inner.borrow().last_setup_refusal.clone()
+  }
+
+  /// How many sessions are held right now (opened and not released — a pending handshake and a
+  /// replaced-but-undropped session both count), against [`Demux::capacity`].
+  pub fn sessions(&self) -> usize {
+    self
+      .inner
+      .borrow()
+      .slots
+      .iter()
+      .filter(|s| s.is_some())
+      .count()
+  }
+
+  /// The pool's size — the most sessions this demultiplexer holds at once, every one counted from its
+  /// slot's allotment (before the handshake authenticates the source) to its endpoint's drop. The
+  /// caller's peer capacity times [`SESSION_SLOTS_PER_PEER`], shared by the separately bounded
+  /// pending and authenticated populations (the module doc).
+  pub fn capacity(&self) -> usize {
+    self.capacity
+  }
+
+  /// The datagrams one session's inbox holds before a further one is dropped (see the module doc).
+  pub fn inbox_datagrams(&self) -> usize {
+    self.inbox_datagrams
+  }
+
+  /// The identity's stateless reset key, which an accepted session issues its dialer a token from.
+  pub(crate) fn reset_key(&self) -> Option<crate::reset::ResetKey> {
+    self.reset_key.clone()
+  }
+
+  /// Answers a 1-RTT packet of `trigger_bytes` naming the unknown session `id` from `from` with a stateless reset (see
+  /// the module doc), unless the source has a session here or drew one within [`RESET_INTERVAL_NS`].
+  fn reset_unknown(
+    &self,
+    inner: &mut Inner,
+    id: ConnectionId,
+    trigger_bytes: usize,
+    from: SocketAddrV4,
+  ) {
+    let Some(key) = &self.reset_key else {
+      return;
+    };
+    if inner.by_source.contains_key(&from) {
+      return;
+    }
+    let now = slates_rt::futures::now_ns();
+    inner
+      .resets_sent_at
+      .retain(|_, at| now.saturating_sub(*at) < RESET_INTERVAL_NS);
+    let datagram = (!inner.resets_sent_at.contains_key(&from)
+      && inner.resets_sent_at.len() < self.capacity)
+      .then(|| {
+        crate::reset::reset_datagram(&key.token(&id), trigger_bytes, |out| {
+          crate::handshake::secure_random(out).is_ok()
+        })
+      })
+      .flatten();
+    let Some(datagram) = datagram else {
+      inner.counters.resets_withheld = inner.counters.resets_withheld.saturating_add(1);
+      return;
+    };
+    inner.resets_sent_at.insert(from, now);
+    // A refused send is a lost reset: the dialer's next packet after the interval draws another.
+    if self.send_to(&datagram, from).is_ok() {
+      inner.counters.resets_sent = inner.counters.resets_sent.saturating_add(1);
+    }
+  }
+
+  /// Sends `datagram` to `peer` on the shared socket (every session sends through it directly).
+  pub(crate) fn send_to(&self, datagram: &[u8], peer: SocketAddrV4) -> Result<(), EndpointError> {
+    self
+      .socket
+      .send_to(datagram, peer)
+      .map(|_| ())
+      .map_err(EndpointError::Io)
+  }
+
+  /// Polls the session's inbox: a datagram (copied into `buf`, with its source), `Closed` once the
+  /// demultiplexer closed the session, or `Pending` with the task's waker parked in the inbox.
+  pub(crate) fn poll_recv(
+    &self,
+    slot: Slot,
+    cx: &mut Context<'_>,
+  ) -> Poll<Result<(Vec<u8>, SocketAddrV4), EndpointError>> {
+    let mut inner = self.inner.borrow_mut();
+    let Some(inbox) = inner.inbox_mut(slot) else {
+      return Poll::Ready(Err(EndpointError::Closed));
+    };
+    if inbox.closed {
+      return Poll::Ready(Err(EndpointError::Closed));
+    }
+    if let Some(datagram) = inbox.queue.pop_front() {
+      return Poll::Ready(Ok((datagram, inbox.peer)));
+    }
+    inbox.waker = Some(cx.waker().clone());
+    Poll::Pending
+  }
+
+  /// Records an established session's connection id and peer certificate so 1-RTT packets route to it,
+  /// and **replaces** the session previously established under the same certificate (the peer
+  /// re-dialed after losing its session: the old one is closed, its serve loop ends).
+  pub(crate) fn bind(
+    &self,
+    slot: Slot,
+    id: ConnectionId,
+    peer: Option<Vec<u8>>,
+  ) -> Result<(), EndpointError> {
+    let mut inner = self.inner.borrow_mut();
+    let inbox = inner.inbox_mut(slot).ok_or(EndpointError::Closed)?;
+    if inbox.closed {
+      return Err(EndpointError::Closed);
+    }
+    if inbox.certificate.is_some() {
+      return Ok(());
+    }
+    let peer = peer.ok_or(EndpointError::NotReady)?;
+    if let Some(held) = inner.by_peer.get(&peer) {
+      if held.held >= AUTHENTICATED_SESSIONS_PER_PEER {
+        inner.counters.peer_sessions_refused =
+          inner.counters.peer_sessions_refused.saturating_add(1);
+        return Err(EndpointError::Admission(SessionRefusal::PeerSessions));
+      }
+    } else if inner.by_peer.len() >= self.peer_capacity {
+      inner.counters.peers_refused = inner.counters.peers_refused.saturating_add(1);
+      return Err(EndpointError::Admission(SessionRefusal::PeerCapacity));
+    }
+    if let Some(inbox) = inner.inbox_mut(slot) {
+      inbox.certificate = Some(peer.clone());
+      inbox.connection_id = Some(id);
+    }
+    inner.pending_handshakes = inner.pending_handshakes.saturating_sub(1);
+    inner.by_id.insert(id, slot);
+    let reservation = inner.by_peer.entry(peer).or_insert(PeerSessions {
+      current: None,
+      held: 0,
+    });
+    reservation.held = reservation.held.saturating_add(1);
+    if let Some(previous) = reservation.current.replace(slot) {
+      inner.counters.replaced = inner.counters.replaced.saturating_add(1);
+      inner.close(previous);
+    }
+    Ok(())
+  }
+
+  /// Releases a session's slot (its endpoint dropped): every route to it is forgotten and the slot
+  /// is reusable under a new generation.
+  pub(crate) fn release(&self, slot: Slot) {
+    let mut inner = self.inner.borrow_mut();
+    if inner.inbox_mut(slot).is_none() {
+      return;
+    }
+    let index = usize::try_from(slot.index).unwrap_or(usize::MAX);
+    inner.close(slot);
+    let Some(inbox) = inner.slots.get_mut(index).and_then(Option::take) else {
+      return;
+    };
+    if let Some(certificate) = inbox.certificate {
+      if let Some(reservation) = inner.by_peer.get_mut(&certificate) {
+        reservation.held = reservation.held.saturating_sub(1);
+        if reservation.current == Some(slot) {
+          reservation.current = None;
+        }
+        if reservation.held == 0 {
+          inner.by_peer.remove(&certificate);
+        }
+      }
+    } else {
+      inner.pending_handshakes = inner.pending_handshakes.saturating_sub(1);
+    }
+    if let Some(generation) = inner.generations.get_mut(index) {
+      *generation = generation.wrapping_add(1);
+    }
+    inner.free.push(slot.index);
+  }
+
+  /// Routes one datagram: a 1-RTT packet by its connection id; a raw handshake datagram by its source,
+  /// opening a session for a source not yet seen.
+  fn route(&self, datagram: &[u8], from: SocketAddrV4) {
+    let mut inner = self.inner.borrow_mut();
+    if is_short_header(datagram) {
+      let id = connection_id_of(datagram);
+      match id.and_then(|id| inner.by_id.get(&id).copied()) {
+        Some(slot) => inner.deliver(self.inbox_datagrams, slot, datagram),
+        None => {
+          inner.counters.unknown_id = inner.counters.unknown_id.saturating_add(1);
+          // From an established session's dialer it may be that dialer's stateless reset (a process restarted onto
+          // its port): the session compares it with the token its dialer issued (RFC 9000 §10.3.1, the tokens for
+          // that remote address). A session still in its handshake is never handed one.
+          match inner.by_source.get(&from).copied() {
+            Some(slot) if inner.established(slot) => {
+              inner.deliver(self.inbox_datagrams, slot, datagram)
+            }
+            Some(_) => {}
+            None => {
+              if let Some(id) = id {
+                self.reset_unknown(&mut inner, id, datagram.len(), from);
+              }
+            }
+          }
+        }
+      }
+      return;
+    }
+    if let Some(slot) = inner.by_source.get(&from).copied() {
+      inner.deliver(self.inbox_datagrams, slot, datagram);
+      return;
+    }
+    // A source the pool cannot open a session for is refused under the reason's own category — capacity
+    // and a setup fault are never one count (a saturation proof must not pass on a broken roster, nor a
+    // roster fault read as a full pool).
+    match inner.open(self, from) {
+      Ok(slot) => {
+        inner.deliver(self.inbox_datagrams, slot, datagram);
+        if let Some(waker) = inner.accept_waker.take() {
+          waker.wake();
+        }
+      }
+      Err(OpenRefusal::Exhausted) => {
+        inner.counters.sessions_refused = inner.counters.sessions_refused.saturating_add(1)
+      }
+      Err(OpenRefusal::Setup(error)) => {
+        inner.counters.setup_refused = inner.counters.setup_refused.saturating_add(1);
+        inner.last_setup_refusal = Some(format!("{error:?}"));
+      }
+    }
+  }
+}
+
+/// Why a server session could not be opened for a new source ([`Inner::open`]); [`Demux::route`] counts
+/// each under its own category.
+enum OpenRefusal {
+  /// The pending-handshake reservation is held; authenticated slots cannot be borrowed for it.
+  Exhausted,
+  /// The session's endpoint could not be built (its TLS server state); the slot was given back.
+  Setup(EndpointError),
+}
+
+impl Inner {
+  fn inbox_mut(&mut self, slot: Slot) -> Option<&mut Inbox> {
+    let index = usize::try_from(slot.index).ok()?;
+    if self.generations.get(index).copied() != Some(slot.generation) {
+      return None;
+    }
+    self.slots.get_mut(index)?.as_mut()
+  }
+
+  /// Whether the session at `slot` is established (its connection id bound).
+  fn established(&mut self, slot: Slot) -> bool {
+    self
+      .inbox_mut(slot)
+      .is_some_and(|inbox| inbox.connection_id.is_some())
+  }
+
+  /// Queues a datagram for a session and wakes its reader; an inbox at `capacity` drops it, counted.
+  fn deliver(&mut self, capacity: usize, slot: Slot, datagram: &[u8]) {
+    let Some(inbox) = self.inbox_mut(slot) else {
+      self.counters.unknown_id = self.counters.unknown_id.saturating_add(1);
+      return;
+    };
+    if inbox.queue.len() >= capacity {
+      self.counters.inbox_full = self.counters.inbox_full.saturating_add(1);
+      return;
+    }
+    inbox.queue.push_back(datagram.to_vec());
+    inbox.wake();
+  }
+
+  /// Closes a session: its reader is woken with `Closed` and every route to it is forgotten (the slot
+  /// itself is released when the endpoint drops).
+  fn close(&mut self, slot: Slot) {
+    let Some(inbox) = self.inbox_mut(slot) else {
+      return;
+    };
+    inbox.closed = true;
+    inbox.queue.clear();
+    inbox.wake();
+    let (source, connection) = (inbox.peer, inbox.connection_id);
+    if self.by_source.get(&source) == Some(&slot) {
+      self.by_source.remove(&source);
+    }
+    if let Some(connection) = connection
+      && self.by_id.get(&connection) == Some(&slot)
+    {
+      self.by_id.remove(&connection);
+    }
+  }
+
+  /// Opens a server session for a new source: takes a free slot, builds the un-established endpoint on
+  /// the shared link, and queues it for `accept`. Refused typed when no slot is free, or when the
+  /// endpoint could not be built (the slot given back) — the caller counts each under its own category.
+  fn open(&mut self, demux: &Demux, from: SocketAddrV4) -> Result<Slot, OpenRefusal> {
+    if self.pending_handshakes >= demux.peer_capacity {
+      return Err(OpenRefusal::Exhausted);
+    }
+    let index = self.free.pop().ok_or(OpenRefusal::Exhausted)?;
+    let Some((at, generation)) = usize::try_from(index)
+      .ok()
+      .and_then(|at| self.generations.get(at).map(|generation| (at, *generation)))
+    else {
+      // Unreachable for an index the pool minted (`start` numbers its slots from zero); the index is
+      // given back rather than lost, and the source refused as the pool being full.
+      self.free.push(index);
+      return Err(OpenRefusal::Exhausted);
+    };
+    let slot = Slot { index, generation };
+    let endpoint = match Endpoint::accepted(demux.id, slot, from, demux) {
+      Ok(endpoint) => endpoint,
+      Err(error) => {
+        self.free.push(index);
+        return Err(OpenRefusal::Setup(error));
+      }
+    };
+    if let Some(entry) = self.slots.get_mut(at) {
+      *entry = Some(Inbox {
+        peer: from,
+        queue: VecDeque::new(),
+        waker: None,
+        closed: false,
+        certificate: None,
+        connection_id: None,
+      });
+    }
+    self.by_source.insert(from, slot);
+    self.pending.push_back(endpoint);
+    self.pending_handshakes = self.pending_handshakes.saturating_add(1);
+    self.counters.opened = self.counters.opened.saturating_add(1);
+    // The pool's high-water mark: every slot not on the free list is held, whatever its session's state.
+    let held = u64::try_from(self.slots.len().saturating_sub(self.free.len())).unwrap_or(u64::MAX);
+    self.counters.high_water = self.counters.high_water.max(held);
+    Ok(slot)
+  }
+}
+
+/// The future [`DemuxId::accept`] returns: the next server session a new source opened, or `Closed` once
+/// the demultiplexer is unreachable (its shard's context ended, or polled on another thread).
+pub struct Accept {
+  demux: DemuxId,
+}
+
+impl std::future::Future for Accept {
+  type Output = Result<Endpoint, EndpointError>;
+  fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    let polled = with_demux(self.demux, |demux| {
+      let mut inner = demux.inner.borrow_mut();
+      if let Some(endpoint) = inner.pending.pop_front() {
+        return Poll::Ready(Ok(endpoint));
+      }
+      inner.accept_waker = Some(cx.waker().clone());
+      Poll::Pending
+    });
+    polled.unwrap_or(Poll::Ready(Err(EndpointError::Closed)))
+  }
+}
+
+impl Unpin for Accept {}

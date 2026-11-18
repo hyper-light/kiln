@@ -1,0 +1,3014 @@
+//! The argument grammar: verbs, the flags each takes, and the parse into a typed command.
+//! Every flag is listed here once; an unknown flag or a missing value is a usage refusal.
+
+use std::collections::BTreeMap;
+
+use slates_client::{GrantScope, GreenBase, Intent, NamePolicy, ReadAt, Rights, SizeClass};
+
+use crate::format::{parse_size, parse_snapshot, parse_volume_id};
+
+/// The usage text: the verbs.
+pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
+
+  anchor   [--quick] [--shards N] [--fleet PATH --node NAME]   run the anchor: own the segment, supervise the daemon
+  daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
+  profile  [--quick] [--json]                      measure and print the machine profile
+  version                                          print this binary's version (`slates VERSION`)
+  mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
+
+  volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR] [--json]
+  volume list [--json]
+  volume stat ID [--json]
+  volume snapshot ID [--json]
+  volume destroy-snapshot ID SNAPSHOT [--json]
+  volume clone ID SNAPSHOT NAME [--json]
+  volume resize ID (--bounded SIZE | --dynamic MAX) [--json]
+  volume destroy ID [--json]
+  green NAME [--require-evidence] [--base VOLUME --snapshot N] [--json]   create a green merge target
+  versions GREEN [--json]                          its head version
+  changed-since GREEN VERSION [--json]             files changed since a version
+  work GREEN NAME [--json]                         a work volume over a green
+  edit WORK PATH AT DELETE TEXT [--json]           declare an edit (a splice)
+  submit WORK [--evidence HEX] [--json]            submit a work's increment
+  rebase WORK [--json]                             rebase a work onto its green's head
+  checkout GREEN VOLUME ATTACHMENT --snapshot N [--json]   write a green's head into the volume it was made from
+  advance ATTACHMENT [VERSION] [--json]            re-pin a green attachment (the head when no VERSION)
+  read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
+  write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
+  volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
+  attach ID [--read | --write] [--snapshot N]
+            [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
+  detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
+  bootstrap (root | region) [--json]             explicitly create a new consensus group
+  recovery-plan (root | region) [--join-group HASH] [--json]
+  recover (root | region) --confirm PLAN --fenced --accept-loss [--join-group HASH] [--json]
+  status [--json]                                  the daemon's status
+  oci-check SOURCE MOUNT_ID DEVICE                 is SOURCE still the mount an `attach --oci` verified (run before binding)
+  oci-runtime RUNTIME                              the profile of the runtime that will bind it, and the evidence it holds
+  status ID [--drift] [--json]
+  base read ID PATH
+  base digest ID PATH [--json]                     a clean base file's verified content digest
+  base rewitness ID [PATH ...] [--json]
+  base pin ID [PATH ...] [--json]
+  land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+  image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
+  image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
+  grants [--json]
+  grant LANDING MANIFEST [--session] [--term SECONDS] [--json]   approve a presented landing
+  audit [--since N] [--json]
+  enroll [--account UID] [--json]                  enroll a consumer; its capability is shown once
+  revoke CONSUMER [--json]                         revoke a consumer's enrollment
+  share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
+  run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
+  exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
+  shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
+            run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
+  shards ID [--subtree DIR] [--read-only] [--json] -- CMD [ARG ...]
+            run CMD with a Shards fs stream of the volume as a handle: {handle} in its arguments names its value,
+            e.g. `shards run --slates-fs-handle {handle} ...` (Windows)
+  vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
+            run VMM with slates' own virtio-fs device of the volume: {socket} in its arguments names the device's
+            socket end (/proc/self/fd/N) and {fd} its descriptor (N), e.g. `crosvm run --vhost-user
+            type=fs,socket={socket} ...` or `qemu-system-x86_64 -chardev socket,id=fs,fd={fd} ...` (Linux)
+  pmem ID FILE --fd N [--json] -- VMM [ARG ...]
+            run VMM with a writable copy of FILE (2 MiB multiples) at descriptor N as its pmem device's backing, with no
+            host mount: {pmem} in its arguments names the copy (/proc/self/fd/N), {fd} its descriptor (N), {len} its
+            length; SIGUSR1 compares the copy back into the file, as the VM's exit does; the guest's own flush does not
+            (Linux)
+";
+
+/// Format: the usage notes: the size grammar's examples, the instance's discovery, the exit codes.
+pub(crate) const USAGE_NOTES: &str =
+  "SIZE is bytes with a binary unit: 512MiB, 4GiB (B, KiB, MiB, GiB, TiB).
+The instance is --instance, else SLATES_ENDPOINT, else `default`.
+Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed; `run` and `shards` exit as their command did.
+PRINCIPAL is uid:N, consumer:N (under your account) or consumer:ACCOUNT/N.
+--json emits machine-readable JSON on every client verb (the MCP schema), except `base read` which
+streams raw bytes. Ids come back as `{\"id\"}`, an outcome-only verb as `{\"ok\":true}`.";
+
+/// A parse refusal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ParseError {
+  /// Help was asked for.
+  Help,
+  /// A verb that does not exist.
+  UnknownCommand(String),
+  /// A flag the verb does not take.
+  UnknownFlag(String),
+  /// A flag that takes a value, given none.
+  MissingValue(String),
+  /// A positional argument the verb needs, missing.
+  Missing(&'static str),
+  /// An argument the verb does not take.
+  Extra(String),
+  /// A value that does not parse.
+  BadValue {
+    /// The flag or argument.
+    what: &'static str,
+    /// Why.
+    reason: String,
+  },
+}
+
+impl std::fmt::Display for ParseError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Help => f.write_str("help"),
+      Self::UnknownCommand(c) => write!(f, "unknown command `{c}`"),
+      Self::UnknownFlag(flag) => write!(f, "unknown flag `{flag}`"),
+      Self::MissingValue(flag) => write!(f, "`{flag}` takes a value"),
+      Self::Missing(what) => write!(f, "missing {what}"),
+      Self::Extra(arg) => write!(f, "unexpected argument `{arg}`"),
+      Self::BadValue { what, reason } => write!(f, "bad {what}: {reason}"),
+    }
+  }
+}
+
+/// Options of the anchor and the daemon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessOptions {
+  /// The instance.
+  pub instance: String,
+  /// Measure the quick profile (tests; a full profile takes seconds).
+  pub quick: bool,
+  /// Shards, when the caller overrides the derivation (tests).
+  pub shards: Option<u16>,
+  /// The fleet to join, when this daemon is a fleet node (§2.6 boot step 6); a laptop has none.
+  pub fleet: Option<FleetSelection>,
+}
+
+/// Which fleet node this process is: the operator's shared manifest and this node's name in it
+/// (`--fleet PATH --node NAME`; `slates_server::deploy` derives everything else from the two).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FleetSelection {
+  /// The path of the shared manifest.
+  pub manifest: String,
+  /// This node's name in it.
+  pub node: String,
+}
+
+/// Options of `profile`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProfileOptions {
+  /// Quick.
+  pub quick: bool,
+  /// JSON instead of the derived constants.
+  pub json: bool,
+}
+
+/// Options of `mcp`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpOptions {
+  /// The daemon instance to connect to.
+  pub instance: String,
+  /// A loopback port to serve Streamable HTTP on, instead of stdio.
+  pub http: Option<u16>,
+}
+
+/// A client verb.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Verb {
+  /// Create.
+  Create {
+    /// The name.
+    name: String,
+    /// The size class.
+    size: SizeClass,
+    /// The name policy.
+    names: NamePolicy,
+    /// Locked memory required.
+    require_locked: bool,
+    /// The base directory.
+    base: Option<String>,
+  },
+  /// List.
+  List,
+  /// The daemon's status (`status` with no volume).
+  DaemonStatus,
+  /// Explicitly create a consensus group bound to the daemon's current identity (§4.8, AUD-07).
+  Bootstrap {
+    /// Also create the root group, exactly once for a new fleet.
+    root: bool,
+  },
+  /// Inspect the retained copy and bind a proposed quorum-loss recovery.
+  RecoveryPlan {
+    /// Root or regional group.
+    root: bool,
+    /// Explicit replacement group to join, or none to recover this copy as its first voter.
+    target: Option<[u8; 32]>,
+  },
+  /// Authorize one reviewed recovery after fencing the former group and accepting possible loss.
+  Recover {
+    /// Root or regional group.
+    root: bool,
+    /// The replacement group to join.
+    target: Option<[u8; 32]>,
+    /// The exact reviewed plan.
+    plan: [u8; 32],
+  },
+  /// Promote a lost region's declared mirror through the root group (§4.8, D-14).
+  PromoteRegion {
+    /// The lost region's id.
+    region: u64,
+  },
+  /// Status (`volume stat`, `status ID`).
+  Status {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// Drifted entries only.
+    drift: bool,
+  },
+  /// Mount a volume at a path over the loopback NFS bridge (`mount ID PATH [--read-only]`): a mount
+  /// attachment under the volume's mount capability (§4.13), writable — taking the write lease — unless
+  /// `--read-only`.
+  Mount {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The mount point: an existing user-owned directory.
+    path: String,
+    /// A read-only mount: a read attachment (no write lease taken, a read-only capability) and a
+    /// read-only kernel mount.
+    read_only: bool,
+    /// `--subtree DIR`: present only that directory of the volume (AUD-29-76), the export enforcing the scope.
+    subtree: Option<String>,
+    /// `--shared`: a Linux FUSE mount other local users' processes may reach (`allow_other`), for a container
+    /// runtime to bind (§4.6 A-9).
+    shared: bool,
+  },
+  /// Print a network export path for the volume (`export ID [--read-only] [--subtree DIR] [--uid UID]`; §4.6 "Kubernetes
+  /// publication without privilege", AUD-29-75): the export's own attachment, and the path
+  /// `/<name>@<attachment>.<token>` its mount capability authorizes — what a PersistentVolume names as its `nfs`
+  /// path on a fleet node's RPC-with-TLS export. The attachment ends with `detach` or the volume's destroy.
+  Export {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// A read-only export: a read attachment (no write lease) and a read-only capability.
+    read_only: bool,
+    /// `--subtree DIR`: present only that directory of the volume (AUD-29-76).
+    subtree: Option<String>,
+    /// `--uid UID`: serve only that Unix identity (§4.6 A-115); every other caller, root included, sees attributes
+    /// and nothing else, so no client cache of what UID read is served to another user.
+    uid: Option<u32>,
+  },
+  /// Unmount a loopback bridge mount at a path (`unmount PATH`).
+  Unmount {
+    /// The mount point.
+    path: String,
+  },
+  /// Snapshot.
+  Snapshot {
+    /// The volume.
+    volume: slates_client::VolumeId,
+  },
+  /// Destroy a snapshot.
+  DestroySnapshot {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: slates_client::SnapshotId,
+  },
+  /// Create a green volume (§4.16 merge), from scratch or over a complete immutable base.
+  Green {
+    /// The name.
+    name: String,
+    /// Whether an increment must carry evidence.
+    evidence: bool,
+    /// The complete immutable base (a volume's snapshot), or none for a scratch green.
+    base: Option<GreenBase>,
+  },
+  /// Re-pin a green attachment to a version, or the head.
+  Advance {
+    /// The attachment.
+    attachment: u64,
+    /// The version, or the head when none.
+    version: Option<u64>,
+  },
+  /// Replace a plain volume's file with the bytes on stdin, under the caller's write attachment (A-97).
+  Write {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The caller's write attachment of it.
+    attachment: u64,
+    /// The file.
+    path: String,
+    /// The permission bits a created file takes.
+    mode: u32,
+  },
+  /// A file's bytes at a view: a green's head, a version, or an attachment's pinned version.
+  Read {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The file.
+    path: String,
+    /// The view.
+    at: ReadAt,
+  },
+  /// A green's head version.
+  Versions {
+    /// The green.
+    green: slates_client::VolumeId,
+  },
+  /// The files a green changed since a version.
+  ChangedSince {
+    /// The green.
+    green: slates_client::VolumeId,
+    /// The base version.
+    version: u64,
+  },
+  /// Create a work volume over a green.
+  Work {
+    /// The green.
+    green: slates_client::VolumeId,
+    /// The name.
+    name: String,
+  },
+  /// Declare an edit on a work volume (a splice; the inserted bytes are the text argument).
+  Edit {
+    /// The work volume.
+    work: slates_client::VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at the offset.
+    delete_len: u64,
+    /// Bytes inserted.
+    bytes: Vec<u8>,
+  },
+  /// Submit a work volume's increment to its green.
+  Submit {
+    /// The work volume.
+    work: slates_client::VolumeId,
+    /// The evidence references (opaque identities), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
+  /// Rebase a work volume onto its green's head (the corrective path).
+  Rebase {
+    /// The work volume.
+    work: slates_client::VolumeId,
+  },
+  /// Check a green's head out into the volume and snapshot it was created from, through the caller's write
+  /// attachment of that volume (§4.16 A-201); the volume then lands like any other.
+  Checkout {
+    /// The green.
+    green: slates_client::VolumeId,
+    /// The volume and snapshot the green was created from.
+    base: GreenBase,
+    /// The caller's write attachment of the volume.
+    attachment: u64,
+  },
+  /// Await a durability scope (`volume placed`).
+  Placed {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// A snapshot, or the head when none.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The scope.
+    scope: slates_client::Scope,
+  },
+  /// Clone.
+  Clone {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: slates_client::SnapshotId,
+    /// The clone's name.
+    name: String,
+  },
+  /// Resize.
+  Resize {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The size class.
+    size: SizeClass,
+  },
+  /// Destroy.
+  Destroy {
+    /// The volume.
+    volume: slates_client::VolumeId,
+  },
+  /// Attach.
+  Attach {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The intent.
+    intent: Intent,
+    /// The form: the record under the root mount, or a container bind of the host mount at
+    /// `--oci-source` to `--oci-destination` (§4.6 A-9).
+    form: slates_client::AttachRequest,
+  },
+  /// Detach.
+  Detach {
+    /// The attachment.
+    attachment: u64,
+    /// `--volume ID`: the attachment's volume, which routes the detach to its owner when that is another host
+    /// (A-222).
+    volume: Option<slates_client::VolumeId>,
+  },
+  /// Read a base entry.
+  ReadBase {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The path.
+    path: String,
+  },
+  /// A clean base file's verified content digest (§4.15).
+  Digest {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The path.
+    path: String,
+  },
+  /// Re-witness.
+  Rewitness {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The paths, or every drifted entry.
+    paths: Option<Vec<String>>,
+  },
+  /// Pin.
+  Pin {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The paths, or the whole base.
+    paths: Option<Vec<String>>,
+  },
+  /// Build a snapshot's disk image (`image build`, A-160).
+  ImageBuild {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: slates_client::SnapshotId,
+    /// The image volume's name.
+    name: String,
+    /// The image's size in bytes.
+    capacity: u64,
+  },
+  /// Merge an image into a new clone of its snapshot (`image merge`, A-160).
+  ImageMerge {
+    /// The image volume.
+    image: slates_client::VolumeId,
+    /// The clone's name.
+    name: String,
+  },
+  /// Land (`land`).
+  Land {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// A snapshot, or the head when none.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The host directory to write into.
+    target: String,
+    /// The filter.
+    filter: slates_client::Filter,
+    /// A grant the caller holds.
+    grant: Option<u64>,
+  },
+  /// The caller's grants (`grants`).
+  Grants,
+  /// The audit log (`audit`).
+  Audit {
+    /// Every record at or after this sequence.
+    since: u64,
+  },
+  /// Issue a grant for a presented landing (`grant LANDING MANIFEST`): the human's approval of the
+  /// exact manifest `land` showed, proven under the anchor's issuer secret (§4.13).
+  Grant {
+    /// The presented landing's id.
+    landing: u64,
+    /// The manifest hash the human approves — the one `land` printed.
+    manifest: [u8; 32],
+    /// Once (the default), or every landing of the volume into the target for the session.
+    scope: GrantScope,
+    /// The grant's validity, nanoseconds from issue.
+    term_ns: u64,
+  },
+  /// Enroll a consumer under an account (`enroll`): the human surface's verb, proven under the
+  /// anchor's issuer secret (§4.13 "Principals"); the capability is shown once.
+  Enroll {
+    /// The account, or the caller's own when none is given.
+    account: Option<u32>,
+  },
+  /// Revoke a consumer's enrollment (`revoke CONSUMER`): the human surface's verb.
+  Revoke {
+    /// The consumer.
+    consumer: u64,
+  },
+  /// Set a principal's rights on a volume (`share ID PRINCIPAL [--read] [--write] [--admin]`).
+  Share {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The principal.
+    principal: SharePrincipal,
+    /// The rights; all off removes the entry.
+    rights: Rights,
+  },
+  /// Turn a volume's live shipping on, or off with `--off` (`live-ship ID [--off]`, A-200).
+  LiveShip {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// Whether it is live-shipped from now on.
+    live_shipped: bool,
+  },
+}
+
+/// A principal as `share` names it: a host account (`uid:N`), or a consumer — under the caller's own
+/// account (`consumer:N`) or an explicit one (`consumer:ACCOUNT/N`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SharePrincipal {
+  /// A host account.
+  Uid {
+    /// The uid.
+    uid: u32,
+    /// The host whose account it is, by its certificate anchor as `slates status` prints it, or this daemon's own
+    /// when none is given (A-237).
+    host: Option<u64>,
+  },
+  /// An enrolled consumer.
+  Consumer {
+    /// The account, or the caller's own when none is given.
+    account: Option<u32>,
+    /// The consumer id.
+    consumer: u64,
+    /// The host whose account the consumer was enrolled under, or this daemon's own when none is given (A-237).
+    host: Option<u64>,
+  },
+}
+
+/// A client request: the instance and the verb.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClientRequest {
+  /// The instance.
+  pub instance: String,
+  /// The verb.
+  pub verb: Verb,
+  /// Emit machine-readable JSON instead of the plain text form (the read verbs; §4.12 "consistent
+  /// JSON"). The `--json` switch, allowed on any client verb like `--instance`.
+  pub json: bool,
+}
+
+/// A `slates exec` request: the volume, the path to show it at, and the command to run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExecRequest {
+  /// The volume to make visible.
+  pub volume: String,
+  /// The path to make it visible at.
+  pub at: String,
+  /// The command and its arguments.
+  pub command: Vec<String>,
+}
+
+/// A `slates run` request: the harness verb (§4.13) — enroll a consumer, deliver its capability to
+/// the command on an inherited descriptor, wait, and revoke it unless kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RunRequest {
+  /// The instance the command's client will find (`SLATES_ENDPOINT` in its environment).
+  pub instance: String,
+  /// Keep the enrollment after the command ends (default: revoke it).
+  pub keep: bool,
+  /// Announce the consumer as JSON.
+  pub json: bool,
+  /// The command and its arguments.
+  pub command: Vec<String>,
+}
+
+/// A `slates shards` request (§4.6, the Shards route; A-161, A-179): attach a volume in the Shards form and run a command
+/// with the stream end: on Unix at a descriptor number it names, the way a Shards spawner hands its VMM `--slates-fs-fd`;
+/// on Windows as a handle whose value replaces `{handle}` in its arguments, as `--slates-fs-handle {handle}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShardsRequest {
+  /// The instance.
+  pub instance: String,
+  /// The volume.
+  pub volume: slates_client::VolumeId,
+  /// Only this directory of it, when given.
+  pub subtree: Option<String>,
+  /// Every change refused (`--read-only`); otherwise for writing, as `mount` attaches.
+  pub read_only: bool,
+  /// Where the command finds its end.
+  pub handed: HandOff,
+  /// Announce the attachment as JSON.
+  pub json: bool,
+  /// The command and its arguments.
+  pub command: Vec<String>,
+}
+
+/// A `slates vhost-user` request (§4.6; goal G-vhost): attach a volume to slates' own virtio-fs device and run a VMM with
+/// the device's socket end, named in its arguments where `{socket}` or `{fd}` stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VhostUserRequest {
+  /// The instance.
+  pub instance: String,
+  /// The volume.
+  pub volume: slates_client::VolumeId,
+  /// The tag the guest mounts.
+  pub tag: String,
+  /// Only this directory of it, when given.
+  pub subtree: Option<String>,
+  /// Every change refused (`--read-only`); otherwise for writing, as `mount` attaches.
+  pub read_only: bool,
+  /// The DAX window offered to the VMM, in bytes, when given.
+  pub dax_window: Option<u64>,
+  /// Announce the attachment as JSON.
+  pub json: bool,
+  /// The VMM and its arguments, `{socket}` or `{fd}` among them.
+  pub command: Vec<String>,
+}
+
+/// A `slates pmem` request (Step 6 of the VFS and DAX plan; A-186's writable copy as a pmem VMM's backing): map a file of
+/// a volume to write with a 2 MiB granule and run a VMM as this process's child with the copy at descriptor `fd`, named
+/// in its arguments where `{pmem}`, `{fd}` or `{len}` stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PmemRequest {
+  /// The instance.
+  pub instance: String,
+  /// The volume.
+  pub volume: slates_client::VolumeId,
+  /// The file the VMM's pmem device presents, in the volume.
+  pub file: String,
+  /// The descriptor number the VMM finds the copy at.
+  pub fd: i32,
+  /// Announce as JSON.
+  pub json: bool,
+  /// The VMM and its arguments.
+  pub command: Vec<String>,
+}
+
+/// The parsed command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+  /// The launcher.
+  Exec(ExecRequest),
+  /// The harness verb.
+  Run(RunRequest),
+  /// A command run with a Shards stream end.
+  Shards(ShardsRequest),
+  /// A VMM run with slates' own virtio-fs device's socket end.
+  VhostUser(VhostUserRequest),
+  /// A VMM run with a writable copy of a file as its pmem device's backing.
+  Pmem(PmemRequest),
+  /// The anchor.
+  Anchor(ProcessOptions),
+  /// The daemon.
+  Daemon(ProcessOptions),
+  /// The profile.
+  Profile(ProfileOptions),
+  /// The binary's version.
+  Version,
+  /// The MCP server (stdio, or Streamable HTTP on a loopback port).
+  Mcp(McpOptions),
+  /// A client verb.
+  Client(ClientRequest),
+  /// The check a container harness runs just before its runtime binds a verified source (AUD-29-66).
+  OciCheck(OciCheck),
+  /// The handshake a container harness runs with the runtime that will bind a verified source (AUD-29-67):
+  /// the runtime's command.
+  OciRuntime(String),
+}
+
+/// `oci-check SOURCE MOUNT_ID DEVICE`: whether `source` is still the mount instance an attach verified, by
+/// the identity its evidence named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OciCheck {
+  /// The bind's source path.
+  pub(crate) source: String,
+  /// The verified mount id.
+  pub(crate) mount_id: u64,
+  /// The verified device.
+  pub(crate) device: u64,
+}
+
+/// Every flag that takes a value, across the verbs.
+const VALUES: &[&str] = &[
+  "--capacity",
+  "--join-group",
+  "--subtree",
+  "--confirm",
+  "--instance",
+  "--shards",
+  "--fleet",
+  "--node",
+  "--bounded",
+  "--dynamic",
+  "--base",
+  "--snapshot",
+  "--grant",
+  "--since",
+  "--include",
+  "--exclude",
+  "--volume",
+  "--at",
+  "--oci-source",
+  "--oci-destination",
+  "--http",
+  "--term",
+  "--evidence",
+  "--version",
+  "--attachment",
+  "--account",
+  "--uid",
+  "--fd",
+  "--tag",
+  "--dax-window",
+];
+/// Every switch, across the verbs.
+const SWITCHES: &[&str] = &[
+  "--shared",
+  "--fenced",
+  "--accept-loss",
+  "--quick",
+  "--json",
+  "--fold",
+  "--locked",
+  "--read",
+  "--read-only",
+  "--write",
+  "--admin",
+  "--drift",
+  "--mirror",
+  "--session",
+  "--require-evidence",
+  "--keep",
+];
+
+/// Takes the untouched command after `--` (`exec` and `run` share this boundary).
+fn command_after(rest: &[String]) -> Result<Vec<String>, ParseError> {
+  let Some(split) = rest.iter().position(|a| a == "--") else {
+    return Err(ParseError::Missing("`--` then the command"));
+  };
+  let command = rest
+    .get(split.saturating_add(1)..)
+    .map(<[String]>::to_vec)
+    .unwrap_or_default();
+  if command.is_empty() {
+    return Err(ParseError::Missing("a command after `--`"));
+  }
+  Ok(command)
+}
+
+/// Parses `run [--keep] [--json] [--instance NAME] -- CMD ...`.
+fn parse_run(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  refuse_extra_command_words(taken)?;
+  taken.only(&Spec {
+    values: &[],
+    switches: &["--keep"],
+  })?;
+  Ok(Command::Run(RunRequest {
+    instance: taken.instance(),
+    keep: taken.switch("--keep"),
+    json: taken.json(),
+    command,
+  }))
+}
+
+/// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
+fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  refuse_extra_command_words(taken)?;
+  taken.only(&Spec {
+    values: &["--volume", "--at"],
+    switches: &[],
+  })?;
+  let volume = taken
+    .value("--volume")
+    .ok_or(ParseError::Missing("--volume"))?
+    .to_owned();
+  let at = taken
+    .value("--at")
+    .ok_or(ParseError::Missing("--at"))?
+    .to_owned();
+  Ok(Command::Exec(ExecRequest {
+    volume,
+    at,
+    command,
+  }))
+}
+
+/// Format: the lowest descriptor number `shards --fd` takes: standard input, output and error are 0, 1 and 2, which a
+/// program reads and writes as itself (`slates_ipc::stream::exec_with` refuses below its `FIRST_HANDED_NUMBER`, the same
+/// number, too).
+const FIRST_HANDED_FD: i32 = 3;
+
+/// Format: where a `shards` command's arguments name its stream end on Windows: each occurrence becomes the handle's
+/// value in the command's process, in decimal, as Shards' `--slates-fs-handle V` takes it (A-179).
+pub(crate) const HANDLE_PLACEHOLDER: &str = "{handle}";
+
+/// How a platform hands a `shards` command its stream end: Unix places a descriptor at a number the command is told
+/// with `--fd N` before it replaces itself with the command; Windows starts the command inheriting a handle whose value
+/// is written where `{handle}` stands in its arguments, since a handle's value is not the caller's to choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandOffKind {
+  /// At a descriptor number (`--fd N`).
+  // The other platform's kind is parsed only by the tests, which check both forms on every host.
+  #[cfg_attr(all(windows, not(test)), allow(dead_code))]
+  Descriptor,
+  /// As a handle named in the arguments (`{handle}`).
+  #[cfg_attr(all(unix, not(test)), allow(dead_code))]
+  Handle,
+}
+
+/// This platform's hand-off.
+#[cfg(unix)]
+const PLATFORM_HAND_OFF: HandOffKind = HandOffKind::Descriptor;
+/// This platform's hand-off.
+#[cfg(windows)]
+const PLATFORM_HAND_OFF: HandOffKind = HandOffKind::Handle;
+
+/// Where a parsed `shards` command finds its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandOff {
+  /// At this descriptor number.
+  Descriptor(i32),
+  /// As the handle whose value replaces [`HANDLE_PLACEHOLDER`] in its arguments.
+  Handle,
+}
+
+/// Parses `shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD ...` (Unix) or `shards ID [--subtree DIR]
+/// [--read-only] [--json] -- CMD ... {handle} ...` (Windows): one volume and the flags before `--`, the command after
+/// it.
+fn parse_shards(
+  taken: &Taken,
+  arguments: &[String],
+  kind: HandOffKind,
+) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  let handed = match kind {
+    HandOffKind::Descriptor => {
+      taken.only(&Spec {
+        values: &["--subtree", "--fd"],
+        switches: &["--read-only"],
+      })?;
+      HandOff::Descriptor(handed_fd(taken)?)
+    }
+    HandOffKind::Handle => {
+      if taken.value("--fd").is_some() {
+        return Err(ParseError::BadValue {
+          what: "--fd",
+          reason: format!(
+            "Windows hands the command a handle, not a descriptor: name it {HANDLE_PLACEHOLDER} in the command's arguments"
+          ),
+        });
+      }
+      taken.only(&Spec {
+        values: &["--subtree"],
+        switches: &["--read-only"],
+      })?;
+      HandOff::Handle
+    }
+  };
+  let id = match taken.words.as_slice() {
+    [_, id] => id,
+    [_, _, extra, ..] => return Err(ParseError::Extra(extra.clone())),
+    _ => return Err(ParseError::Missing("volume ID")),
+  };
+  if handed == HandOff::Handle
+    && !command
+      .iter()
+      .skip(1)
+      .any(|argument| argument.contains(HANDLE_PLACEHOLDER))
+  {
+    return Err(ParseError::Missing(
+      "{handle} in the command's arguments, where the stream end's handle goes (e.g. --slates-fs-handle {handle})",
+    ));
+  }
+  Ok(Command::Shards(ShardsRequest {
+    instance: taken.instance(),
+    volume: volume(id)?,
+    subtree: taken.value("--subtree").map(str::to_owned),
+    read_only: taken.switch("--read-only"),
+    handed,
+    json: taken.json(),
+    command,
+  }))
+}
+
+/// The descriptor number `--fd N` names: required, and past standard input, output and error.
+fn handed_fd(taken: &Taken) -> Result<i32, ParseError> {
+  let fd = taken
+    .value("--fd")
+    .ok_or(ParseError::Missing(
+      "--fd N (the descriptor number the command finds what it is handed at: a stream end, a pmem copy)",
+    ))?
+    .parse::<i32>()
+    .map_err(|e| ParseError::BadValue {
+      what: "--fd",
+      reason: e.to_string(),
+    })?;
+  if fd < FIRST_HANDED_FD {
+    return Err(ParseError::BadValue {
+      what: "--fd",
+      reason: format!(
+        "{fd} is standard input, output or error, or no descriptor; {FIRST_HANDED_FD} is the lowest a command is handed its end at"
+      ),
+    });
+  }
+  Ok(fd)
+}
+
+/// Format: the tag a guest mounts when `vhost-user` names none: the product's name, which the guest probe and the
+/// crosvm harness mount (`mount -t virtiofs slates /mnt`).
+pub(crate) const DEFAULT_GUEST_TAG: &str = "slates";
+
+/// Format: where a `vhost-user` command's arguments name the device's socket end: each occurrence becomes
+/// `/proc/self/fd/N`, the end's descriptor in the VMM, which crosvm takes as an inherited socket.
+pub(crate) const SOCKET_PLACEHOLDER: &str = "{socket}";
+
+/// Format: where a `vhost-user` command's arguments name the device's socket end by its number alone: each occurrence
+/// becomes `N`, the end's descriptor in the VMM. QEMU takes an inherited socket this way (`-chardev socket,id=fs,fd=N`)
+/// and cannot take `/proc/self/fd/N`, which it would connect to as a path.
+pub(crate) const FD_PLACEHOLDER: &str = "{fd}";
+
+/// Format: where a `pmem` command's arguments name the writable copy: each occurrence becomes `/proc/self/fd/N`, the
+/// copy's descriptor in the VMM, which Firecracker (`path_on_host`), Cloud Hypervisor (`--pmem file=`) and QEMU
+/// (`memory-backend-file,mem-path=`) open as their backing. A Firecracker configuration file, which the launcher never
+/// rewrites, names `/proc/self/fd/N` itself. Linux alone runs a VMM with one.
+#[cfg(target_os = "linux")]
+pub(crate) const PMEM_PLACEHOLDER: &str = "{pmem}";
+
+/// Format: where a `pmem` command's arguments name the copy's length in bytes, which QEMU's memory backend is told
+/// (`size=`).
+#[cfg(target_os = "linux")]
+pub(crate) const LEN_PLACEHOLDER: &str = "{len}";
+
+/// Parses `vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM ...`: one volume
+/// and the flags before `--`, the VMM after it, `{socket}` or `{fd}` in at least one of its arguments (the device is
+/// reached through it alone).
+fn parse_vhost_user(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  taken.only(&Spec {
+    values: &["--tag", "--subtree", "--dax-window"],
+    switches: &["--read-only"],
+  })?;
+  let id = match taken.words.as_slice() {
+    [_, id] => id,
+    [_, _, extra, ..] => return Err(ParseError::Extra(extra.clone())),
+    _ => return Err(ParseError::Missing("volume ID")),
+  };
+  if !command
+    .iter()
+    .skip(1)
+    .any(|argument| argument.contains(SOCKET_PLACEHOLDER) || argument.contains(FD_PLACEHOLDER))
+  {
+    return Err(ParseError::Missing(
+      "{socket} or {fd} in the VMM's arguments, where the device's socket end goes (e.g. --vhost-user \
+       type=fs,socket={socket}, or -chardev socket,id=fs,fd={fd})",
+    ));
+  }
+  let dax_window = taken
+    .value("--dax-window")
+    .map(|size| {
+      parse_size(size).map_err(|reason| ParseError::BadValue {
+        what: "--dax-window",
+        reason,
+      })
+    })
+    .transpose()?;
+  Ok(Command::VhostUser(VhostUserRequest {
+    instance: taken.instance(),
+    volume: volume(id)?,
+    tag: taken.value("--tag").unwrap_or(DEFAULT_GUEST_TAG).to_owned(),
+    subtree: taken.value("--subtree").map(str::to_owned),
+    read_only: taken.switch("--read-only"),
+    dax_window,
+    json: taken.json(),
+    command,
+  }))
+}
+
+/// Parses `pmem ID FILE --fd N [--json] -- VMM ...`: one volume, the file in it, the descriptor number the VMM finds the
+/// copy at, and the VMM after `--`. No placeholder is required: a Firecracker configuration file names the copy's
+/// `/proc/self/fd/N` itself.
+fn parse_pmem(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  taken.only(&Spec {
+    values: &["--fd"],
+    switches: &[],
+  })?;
+  let (id, file) = match taken.words.as_slice() {
+    [_, id, file] => (id, file),
+    [_, _, _, extra, ..] => return Err(ParseError::Extra(extra.clone())),
+    [_, _] => {
+      return Err(ParseError::Missing(
+        "FILE, the file in the volume the VMM's pmem device presents",
+      ));
+    }
+    _ => return Err(ParseError::Missing("volume ID")),
+  };
+  Ok(Command::Pmem(PmemRequest {
+    instance: taken.instance(),
+    volume: volume(id)?,
+    file: file.clone(),
+    fd: handed_fd(taken)?,
+    json: taken.json(),
+    command,
+  }))
+}
+
+/// Harness verbs have exactly one positional word before the command boundary: the verb itself.
+fn refuse_extra_command_words(taken: &Taken) -> Result<(), ParseError> {
+  match taken.words.get(1) {
+    Some(extra) => Err(ParseError::Extra(extra.clone())),
+    None => Ok(()),
+  }
+}
+
+/// The flags one verb takes: those with a value and the switches (the instance is every
+/// verb's).
+struct Spec {
+  values: &'static [&'static str],
+  switches: &'static [&'static str],
+}
+
+/// The arguments with the flags taken out: the words in order, the flags by name.
+struct Taken {
+  words: Vec<String>,
+  values: BTreeMap<&'static str, String>,
+  switches: BTreeMap<&'static str, bool>,
+}
+
+impl Taken {
+  fn value(&self, flag: &str) -> Option<&str> {
+    self.values.get(flag).map(String::as_str)
+  }
+
+  fn switch(&self, flag: &str) -> bool {
+    self.switches.get(flag).copied().unwrap_or(false)
+  }
+
+  /// Refuses a flag the verb does not take.
+  fn only(&self, spec: &Spec) -> Result<(), ParseError> {
+    let stray = self
+      .values
+      .keys()
+      .filter(|k| **k != "--instance" && !spec.values.contains(k))
+      .chain(
+        self
+          .switches
+          .keys()
+          .filter(|k| **k != "--json" && !spec.switches.contains(k)),
+      )
+      .next();
+    match stray {
+      Some(flag) => Err(ParseError::UnknownFlag((*flag).to_owned())),
+      None => Ok(()),
+    }
+  }
+
+  fn instance(&self) -> String {
+    self
+      .value("--instance")
+      .map(str::to_owned)
+      .unwrap_or_else(slates_ipc::instance_from_env)
+  }
+
+  /// Whether `--json` was given: a global switch (like `--instance`) allowed on any client verb.
+  fn json(&self) -> bool {
+    self.switch("--json")
+  }
+}
+
+fn known(list: &[&'static str], flag: &str) -> Option<&'static str> {
+  list.iter().copied().find(|k| *k == flag)
+}
+
+/// Separates the flags from the words.
+fn take(arguments: &[String]) -> Result<Taken, ParseError> {
+  let mut taken = Taken {
+    words: Vec::new(),
+    values: BTreeMap::new(),
+    switches: BTreeMap::new(),
+  };
+  let mut rest = arguments.iter();
+  while let Some(argument) = rest.next() {
+    if argument == "--help" || argument == "-h" {
+      return Err(ParseError::Help);
+    }
+    let Some(flag) = argument.strip_prefix("--") else {
+      taken.words.push(argument.clone());
+      continue;
+    };
+    let (name, inline) = match flag.split_once('=') {
+      Some((n, v)) => (n, Some(v.to_owned())),
+      None => (flag, None),
+    };
+    let full = format!("--{name}");
+    if let Some(key) = known(VALUES, &full) {
+      let value = match inline {
+        Some(v) => v,
+        None => rest
+          .next()
+          .cloned()
+          .ok_or_else(|| ParseError::MissingValue(full.clone()))?,
+      };
+      taken.values.insert(key, value);
+    } else if let Some(key) = known(SWITCHES, &full) {
+      if inline.is_some() {
+        return Err(ParseError::BadValue {
+          what: "switch",
+          reason: format!("`{full}` takes no value"),
+        });
+      }
+      taken.switches.insert(key, true);
+    } else {
+      return Err(ParseError::UnknownFlag(full));
+    }
+  }
+  Ok(taken)
+}
+
+fn shards_of(taken: &Taken) -> Result<Option<u16>, ParseError> {
+  taken
+    .value("--shards")
+    .map(|s| {
+      s.parse::<u16>().map_err(|e| ParseError::BadValue {
+        what: "--shards",
+        reason: e.to_string(),
+      })
+    })
+    .transpose()
+}
+
+/// `--fleet PATH --node NAME`, both or neither: a manifest without the node to be in it, or a node
+/// without the manifest naming it, is a usage error.
+fn fleet_of(taken: &Taken) -> Result<Option<FleetSelection>, ParseError> {
+  match (taken.value("--fleet"), taken.value("--node")) {
+    (Some(manifest), Some(node)) => Ok(Some(FleetSelection {
+      manifest: manifest.to_owned(),
+      node: node.to_owned(),
+    })),
+    (Some(_), None) => Err(ParseError::Missing(
+      "--node NAME (which node of the fleet this is)",
+    )),
+    (None, Some(_)) => Err(ParseError::Missing("--fleet PATH (the fleet manifest)")),
+    (None, None) => Ok(None),
+  }
+}
+
+fn size_of(taken: &Taken) -> Result<SizeClass, ParseError> {
+  match (taken.value("--bounded"), taken.value("--dynamic")) {
+    (Some(limit), None) => Ok(SizeClass::Bounded {
+      limit: parse_size(limit).map_err(|reason| ParseError::BadValue {
+        what: "--bounded",
+        reason,
+      })?,
+    }),
+    (None, Some(max)) => Ok(SizeClass::Dynamic {
+      max: parse_size(max).map_err(|reason| ParseError::BadValue {
+        what: "--dynamic",
+        reason,
+      })?,
+    }),
+    (None, None) => Err(ParseError::Missing("--bounded SIZE or --dynamic MAX")),
+    (Some(_), Some(_)) => Err(ParseError::BadValue {
+      what: "size",
+      reason: "one of --bounded and --dynamic, not both".to_owned(),
+    }),
+  }
+}
+
+fn volume(text: &str) -> Result<slates_client::VolumeId, ParseError> {
+  parse_volume_id(text).map_err(|reason| ParseError::BadValue {
+    what: "volume ID",
+    reason,
+  })
+}
+
+/// Format: a second in nanoseconds — `--term SECONDS` is the operator's unit, the wire's is nanoseconds.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Format: a manifest hash is 32 bytes (BLAKE3's output), printed by `land` as hexadecimal.
+const MANIFEST_BYTES: usize = 32;
+/// Format: hexadecimal — two characters per byte, radix sixteen.
+const HEX_CHARS_PER_BYTE: usize = 2;
+/// Format: see `HEX_CHARS_PER_BYTE`.
+const HEX_RADIX: u32 = 16;
+
+/// The manifest hash `land` printed, as hexadecimal characters back into its bytes — the human re-states
+/// exactly the hash they saw, so the approval binds that manifest and no other (§4.13).
+fn manifest_hash(text: &str) -> Result<[u8; MANIFEST_BYTES], ParseError> {
+  let bad = |reason: &str| ParseError::BadValue {
+    what: "MANIFEST",
+    reason: reason.to_owned(),
+  };
+  let bytes = text.as_bytes();
+  if bytes.len() != MANIFEST_BYTES * HEX_CHARS_PER_BYTE {
+    return Err(bad("64 hexadecimal characters"));
+  }
+  let mut out = [0u8; MANIFEST_BYTES];
+  let (pairs, _) = bytes.as_chunks::<HEX_CHARS_PER_BYTE>();
+  for (byte, pair) in out.iter_mut().zip(pairs) {
+    let hex = std::str::from_utf8(pair).map_err(|_| bad("hexadecimal"))?;
+    *byte = u8::from_str_radix(hex, HEX_RADIX).map_err(|_| bad("hexadecimal"))?;
+  }
+  Ok(out)
+}
+
+fn snapshot(text: &str) -> Result<slates_client::SnapshotId, ParseError> {
+  parse_snapshot(text).map_err(|reason| ParseError::BadValue {
+    what: "SNAPSHOT",
+    reason,
+  })
+}
+
+fn number(text: &str) -> Result<u64, ParseError> {
+  text.parse().map_err(|_| ParseError::BadValue {
+    what: "a number",
+    reason: text.to_owned(),
+  })
+}
+
+fn account(text: &str) -> Result<u32, ParseError> {
+  text.parse().map_err(|_| ParseError::BadValue {
+    what: "an account (uid)",
+    reason: text.to_owned(),
+  })
+}
+
+/// `uid:N`, `consumer:N` or `consumer:ACCOUNT/N`, each optionally `@ANCHOR`: the host whose account it is, by the
+/// `anchor` `slates status` prints on that host (A-237; a uid means something only on its host). Without one, this
+/// daemon's own host.
+fn share_principal(text: &str) -> Result<SharePrincipal, ParseError> {
+  let bad = || ParseError::BadValue {
+    what: "PRINCIPAL",
+    reason: format!(
+      "{text} (uid:N, consumer:N or consumer:ACCOUNT/N, each optionally @ANCHOR from `slates status`)"
+    ),
+  };
+  let (kind, value) = text.split_once(':').ok_or_else(bad)?;
+  let (value, host) = match value.split_once('@') {
+    Some((value, anchor)) => (value, Some(number(anchor).map_err(|_| bad())?)),
+    None => (value, None),
+  };
+  match kind {
+    "uid" => Ok(SharePrincipal::Uid {
+      uid: account(value).map_err(|_| bad())?,
+      host,
+    }),
+    "consumer" => match value.split_once('/') {
+      Some((owner, consumer)) => Ok(SharePrincipal::Consumer {
+        account: Some(account(owner).map_err(|_| bad())?),
+        consumer: number(consumer).map_err(|_| bad())?,
+        host,
+      }),
+      None => Ok(SharePrincipal::Consumer {
+        account: None,
+        consumer: number(value).map_err(|_| bad())?,
+        host,
+      }),
+    },
+    _ => Err(bad()),
+  }
+}
+
+/// The verbs of the enrollment surface (§4.13): `enroll`, `revoke`, `share`.
+fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
+  match words {
+    ["enroll"] => {
+      taken.only(&Spec {
+        values: &["--account"],
+        switches: &[],
+      })?;
+      let account = taken.value("--account").map(account).transpose()?;
+      Ok(Some(client(taken, Verb::Enroll { account })))
+    }
+    ["revoke", consumer] => {
+      taken.only(&NONE)?;
+      Ok(Some(client(
+        taken,
+        Verb::Revoke {
+          consumer: number(consumer)?,
+        },
+      )))
+    }
+    ["share", id, principal] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--read", "--write", "--admin"],
+      })?;
+      Ok(Some(client(
+        taken,
+        Verb::Share {
+          volume: volume(id)?,
+          principal: share_principal(principal)?,
+          rights: Rights {
+            read: taken.switch("--read"),
+            write: taken.switch("--write"),
+            admin: taken.switch("--admin"),
+          },
+        },
+      )))
+    }
+    ["live-ship", id] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--off"],
+      })?;
+      Ok(Some(client(
+        taken,
+        Verb::LiveShip {
+          volume: volume(id)?,
+          live_shipped: !taken.switch("--off"),
+        },
+      )))
+    }
+    ["revoke"] => Err(ParseError::Missing("CONSUMER")),
+    ["share", ..] => Err(ParseError::Missing("share ID PRINCIPAL")),
+    ["live-ship", ..] => Err(ParseError::Missing("live-ship ID")),
+    _ => Ok(None),
+  }
+}
+
+fn paths(words: &[String]) -> Option<Vec<String>> {
+  if words.is_empty() {
+    None
+  } else {
+    Some(words.to_vec())
+  }
+}
+
+fn client(taken: &Taken, verb: Verb) -> Command {
+  Command::Client(ClientRequest {
+    instance: taken.instance(),
+    verb,
+    json: taken.json(),
+  })
+}
+
+const NONE: Spec = Spec {
+  values: &[],
+  switches: &[],
+};
+
+/// `green NAME [--require-evidence] [--base VOLUME --snapshot N]`: a green from scratch, or over the
+/// complete immutable base the pair names (one without the other is a usage refusal).
+fn parse_green(taken: &Taken, name: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--base", "--snapshot"],
+    switches: &["--require-evidence"],
+  })?;
+  let base = match (taken.value("--base"), taken.value("--snapshot")) {
+    (None, None) => None,
+    (Some(base), Some(snap)) => Some(GreenBase {
+      volume: volume(base)?,
+      snapshot: snapshot(snap)?,
+    }),
+    _ => {
+      return Err(ParseError::BadValue {
+        what: "--base",
+        reason: "--base VOLUME and --snapshot N go together".to_owned(),
+      });
+    }
+  };
+  Ok(client(
+    taken,
+    Verb::Green {
+      name: name.to_owned(),
+      evidence: taken.switch("--require-evidence"),
+      base,
+    },
+  ))
+}
+
+/// `advance ATTACHMENT [VERSION]`: the head when no version is given.
+fn parse_advance(
+  taken: &Taken,
+  attachment: &str,
+  version: Option<&str>,
+) -> Result<Command, ParseError> {
+  taken.only(&NONE)?;
+  Ok(client(
+    taken,
+    Verb::Advance {
+      attachment: number(attachment)?,
+      version: version.map(number).transpose()?,
+    },
+  ))
+}
+
+/// `read VOLUME PATH [--version N | --attachment A]`: the head when neither is given.
+fn parse_read(taken: &Taken, id: &str, path: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--version", "--attachment"],
+    switches: &[],
+  })?;
+  let at = match (taken.value("--version"), taken.value("--attachment")) {
+    (Some(version), _) => ReadAt::Version {
+      version: number(version)?,
+    },
+    (None, Some(attachment)) => ReadAt::Attachment {
+      attachment: number(attachment)?,
+    },
+    (None, None) => ReadAt::Head,
+  };
+  Ok(client(
+    taken,
+    Verb::Read {
+      volume: volume(id)?,
+      path: path.to_owned(),
+      at,
+    },
+  ))
+}
+
+/// Format: the permission bits a file `write` creates when no `--mode` is given (`rw-r--r--`, a regular file's
+/// usual mode).
+const WRITE_MODE: u32 = 0o644;
+/// Format: the radix `--mode` is read in (octal, as `chmod` takes it).
+const MODE_RADIX: u32 = 8;
+
+/// `write VOLUME ATTACHMENT PATH [--mode OCTAL]`.
+fn parse_write(
+  taken: &Taken,
+  id: &str,
+  attachment: &str,
+  path: &str,
+) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--mode"],
+    switches: &[],
+  })?;
+  let mode = match taken.value("--mode") {
+    Some(octal) => u32::from_str_radix(octal, MODE_RADIX).map_err(|e| ParseError::BadValue {
+      what: "--mode",
+      reason: e.to_string(),
+    })?,
+    None => WRITE_MODE,
+  };
+  Ok(client(
+    taken,
+    Verb::Write {
+      volume: volume(id)?,
+      attachment: number(attachment)?,
+      path: path.to_owned(),
+      mode,
+    },
+  ))
+}
+
+/// `submit WORK [--evidence HEX]`: the evidence reference, when given, as the 64-hex identity.
+fn parse_submit(taken: &Taken, work: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--evidence"],
+    switches: &[],
+  })?;
+  let evidence = taken
+    .value("--evidence")
+    .map(manifest_hash)
+    .transpose()?
+    .into_iter()
+    .collect();
+  Ok(client(
+    taken,
+    Verb::Submit {
+      work: volume(work)?,
+      evidence,
+    },
+  ))
+}
+
+/// Parses the arguments (without the program name).
+pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
+  parse_on(arguments, PLATFORM_HAND_OFF)
+}
+
+/// Parses the arguments as a platform that hands a `shards` command its end by `hand_off` would: [`parse`] for this
+/// platform, and the other platform's form in the tests, so both are checked on every host.
+fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, ParseError> {
+  let boundary = arguments.iter().position(|argument| argument == "--");
+  let before_boundary = arguments
+    .get(..boundary.unwrap_or(arguments.len()))
+    .unwrap_or(arguments);
+  let taken = take(before_boundary)?;
+  let words: Vec<&str> = taken.words.iter().map(String::as_str).collect();
+  match words.first().copied() {
+    Some("run") => return parse_run(&taken, arguments),
+    Some("exec") => return parse_exec(&taken, arguments),
+    Some("shards") => return parse_shards(&taken, arguments, hand_off),
+    Some("vhost-user") => return parse_vhost_user(&taken, arguments),
+    Some("pmem") => return parse_pmem(&taken, arguments),
+    _ if boundary.is_some() => return Err(ParseError::UnknownFlag("--".to_owned())),
+    _ => {}
+  }
+  if let Some(command) = parse_enrollment(&taken, &words)? {
+    return Ok(command);
+  }
+  match words.as_slice() {
+    [] => Err(ParseError::Help),
+    ["anchor" | "daemon"] => {
+      taken.only(&Spec {
+        values: &["--shards", "--fleet", "--node"],
+        switches: &["--quick"],
+      })?;
+      let options = ProcessOptions {
+        instance: taken.instance(),
+        quick: taken.switch("--quick"),
+        shards: shards_of(&taken)?,
+        fleet: fleet_of(&taken)?,
+      };
+      Ok(if words.first() == Some(&"anchor") {
+        Command::Anchor(options)
+      } else {
+        Command::Daemon(options)
+      })
+    }
+    ["oci-check", source, mount_id, device] => {
+      let number = |what: &'static str, text: &str| {
+        text.parse::<u64>().map_err(|e| ParseError::BadValue {
+          what,
+          reason: e.to_string(),
+        })
+      };
+      Ok(Command::OciCheck(OciCheck {
+        source: (*source).to_owned(),
+        mount_id: number("MOUNT_ID", mount_id)?,
+        device: number("DEVICE", device)?,
+      }))
+    }
+    ["oci-runtime", runtime] => Ok(Command::OciRuntime((*runtime).to_owned())),
+    ["version"] => {
+      taken.only(&NONE)?;
+      Ok(Command::Version)
+    }
+    ["profile"] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--quick", "--json"],
+      })?;
+      Ok(Command::Profile(ProfileOptions {
+        quick: taken.switch("--quick"),
+        json: taken.switch("--json"),
+      }))
+    }
+    ["mcp"] => {
+      taken.only(&Spec {
+        values: &["--http"],
+        switches: &[],
+      })?;
+      let http = match taken.value("--http") {
+        Some(port) => Some(
+          u16::try_from(number(port)?).map_err(|_| ParseError::BadValue {
+            what: "a port",
+            reason: port.to_owned(),
+          })?,
+        ),
+        None => None,
+      };
+      Ok(Command::Mcp(McpOptions {
+        instance: taken.instance(),
+        http,
+      }))
+    }
+    ["volume", rest @ ..] => parse_volume(&taken, rest),
+    ["attach", id] => {
+      taken.only(&Spec {
+        values: &["--snapshot", "--oci-source", "--oci-destination"],
+        switches: &["--read", "--write"],
+      })?;
+      let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
+      let intent = if taken.switch("--write") {
+        Intent::Write
+      } else {
+        Intent::Read
+      };
+      let form = match (
+        taken.value("--oci-source"),
+        taken.value("--oci-destination"),
+      ) {
+        (Some(source), Some(destination)) => slates_client::AttachRequest::Oci {
+          source: source.to_owned(),
+          destination: destination.to_owned(),
+        },
+        // A CLI attachment outlives this process for a term, for later `slates` processes to name (A-230).
+        (None, None) => slates_client::AttachRequest::Termed,
+        (Some(_), None) => return Err(ParseError::Missing("--oci-destination CONTAINER_PATH")),
+        (None, Some(_)) => return Err(ParseError::Missing("--oci-source HOST_PATH")),
+      };
+      Ok(client(
+        &taken,
+        Verb::Attach {
+          volume: volume(id)?,
+          snapshot,
+          intent,
+          form,
+        },
+      ))
+    }
+    ["attach"] => Err(ParseError::Missing("volume ID")),
+    ["detach", attachment] => {
+      taken.only(&Spec {
+        values: &["--volume"],
+        switches: &[],
+      })?;
+      let attachment = attachment
+        .parse::<u64>()
+        .map_err(|e| ParseError::BadValue {
+          what: "ATTACHMENT",
+          reason: e.to_string(),
+        })?;
+      let volume = taken.value("--volume").map(volume).transpose()?;
+      Ok(client(&taken, Verb::Detach { attachment, volume }))
+    }
+    ["detach"] => Err(ParseError::Missing("ATTACHMENT")),
+    ["status", id] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--drift"],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::Status {
+          volume: volume(id)?,
+          drift: taken.switch("--drift"),
+        },
+      ))
+    }
+    ["status"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::DaemonStatus))
+    }
+    ["bootstrap", "root"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Bootstrap { root: true }))
+    }
+    ["bootstrap", "region"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Bootstrap { root: false }))
+    }
+    ["recovery-plan", scope @ ("root" | "region")] => {
+      taken.only(&Spec {
+        values: &["--join-group"],
+        switches: &[],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::RecoveryPlan {
+          root: *scope == "root",
+          target: taken.value("--join-group").map(manifest_hash).transpose()?,
+        },
+      ))
+    }
+    ["recover", scope @ ("root" | "region")] => {
+      taken.only(&Spec {
+        values: &["--join-group", "--confirm"],
+        switches: &["--fenced", "--accept-loss"],
+      })?;
+      if !taken.switch("--fenced") {
+        return Err(ParseError::Missing(
+          "--fenced (the former group must be fenced first)",
+        ));
+      }
+      if !taken.switch("--accept-loss") {
+        return Err(ParseError::Missing(
+          "--accept-loss (unavailable copies may hold newer committed state)",
+        ));
+      }
+      let plan = manifest_hash(
+        taken
+          .value("--confirm")
+          .ok_or(ParseError::Missing("--confirm PLAN from recovery-plan"))?,
+      )?;
+      Ok(client(
+        &taken,
+        Verb::Recover {
+          root: *scope == "root",
+          plan,
+          target: taken.value("--join-group").map(manifest_hash).transpose()?,
+        },
+      ))
+    }
+    ["promote-region", region] => {
+      taken.only(&NONE)?;
+      let region = region.parse::<u64>().map_err(|e| ParseError::BadValue {
+        what: "region",
+        reason: e.to_string(),
+      })?;
+      Ok(client(&taken, Verb::PromoteRegion { region }))
+    }
+    ["mount", id, path] => {
+      taken.only(&Spec {
+        values: &["--subtree"],
+        switches: &["--read-only", "--shared"],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::Mount {
+          volume: volume(id)?,
+          path: (*path).to_owned(),
+          read_only: taken.switch("--read-only"),
+          subtree: taken.value("--subtree").map(str::to_owned),
+          shared: taken.switch("--shared"),
+        },
+      ))
+    }
+    ["mount", ..] => Err(ParseError::Missing(
+      "mount ID PATH [--read-only] [--subtree DIR] [--shared]",
+    )),
+    ["export", id] => {
+      taken.only(&Spec {
+        values: &["--subtree", "--uid"],
+        switches: &["--read-only"],
+      })?;
+      let uid = match taken.value("--uid") {
+        Some(text) => Some(text.parse::<u32>().map_err(|e| ParseError::BadValue {
+          what: "--uid",
+          reason: e.to_string(),
+        })?),
+        None => None,
+      };
+      Ok(client(
+        &taken,
+        Verb::Export {
+          volume: volume(id)?,
+          read_only: taken.switch("--read-only"),
+          subtree: taken.value("--subtree").map(str::to_owned),
+          uid,
+        },
+      ))
+    }
+    ["export", ..] => Err(ParseError::Missing(
+      "export ID [--read-only] [--subtree DIR] [--uid UID]",
+    )),
+    ["unmount", path] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Unmount {
+          path: (*path).to_owned(),
+        },
+      ))
+    }
+    ["unmount"] => Err(ParseError::Missing("unmount PATH")),
+    ["base", rest @ ..] => parse_base(&taken, rest),
+    ["image", rest @ ..] => parse_image(&taken, rest),
+    ["land", id, target] => {
+      taken.only(&Spec {
+        values: &["--snapshot", "--grant", "--include", "--exclude"],
+        switches: &[],
+      })?;
+      let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
+      let grant = taken
+        .value("--grant")
+        .map(|s| {
+          s.parse::<u64>().map_err(|e| ParseError::BadValue {
+            what: "--grant",
+            reason: e.to_string(),
+          })
+        })
+        .transpose()?;
+      let filter = slates_client::Filter {
+        include: taken
+          .value("--include")
+          .map(str::to_owned)
+          .into_iter()
+          .collect(),
+        exclude: taken
+          .value("--exclude")
+          .map(str::to_owned)
+          .into_iter()
+          .collect(),
+      };
+      Ok(client(
+        &taken,
+        Verb::Land {
+          volume: volume(id)?,
+          snapshot,
+          target: (*target).to_owned(),
+          filter,
+          grant,
+        },
+      ))
+    }
+    ["land", ..] => Err(ParseError::Missing("ID TARGET")),
+    ["grants"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Grants))
+    }
+    ["grant", landing, manifest] => {
+      taken.only(&Spec {
+        values: &["--term"],
+        switches: &["--session"],
+      })?;
+      let landing = landing.parse::<u64>().map_err(|e| ParseError::BadValue {
+        what: "LANDING",
+        reason: e.to_string(),
+      })?;
+      let manifest = manifest_hash(manifest)?;
+      let scope = if taken.switch("--session") {
+        GrantScope::Session
+      } else {
+        GrantScope::Once
+      };
+      let term_ns = match taken.value("--term") {
+        Some(seconds) => seconds
+          .parse::<u64>()
+          .map_err(|e| ParseError::BadValue {
+            what: "--term",
+            reason: e.to_string(),
+          })?
+          .saturating_mul(NANOS_PER_SECOND),
+        None => slates_api::GRANT_TERM_NS,
+      };
+      Ok(client(
+        &taken,
+        Verb::Grant {
+          landing,
+          manifest,
+          scope,
+          term_ns,
+        },
+      ))
+    }
+    ["grant", ..] => Err(ParseError::Missing("grant LANDING MANIFEST")),
+    ["audit"] => {
+      taken.only(&Spec {
+        values: &["--since"],
+        switches: &[],
+      })?;
+      let since = taken
+        .value("--since")
+        .map(|s| {
+          s.parse::<u64>().map_err(|e| ParseError::BadValue {
+            what: "--since",
+            reason: e.to_string(),
+          })
+        })
+        .transpose()?
+        .unwrap_or(0);
+      Ok(client(&taken, Verb::Audit { since }))
+    }
+    ["green", name] => parse_green(&taken, name),
+    ["advance", attachment, rest @ ..] if rest.len() <= 1 => {
+      parse_advance(&taken, attachment, rest.first().copied())
+    }
+    ["read", id, path] => parse_read(&taken, id, path),
+    ["read", ..] => Err(ParseError::Missing("VOLUME PATH")),
+    ["write", id, attachment, path] => parse_write(&taken, id, attachment, path),
+    ["write", ..] => Err(ParseError::Missing("VOLUME ATTACHMENT PATH")),
+    ["versions", id] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Versions { green: volume(id)? }))
+    }
+    ["changed-since", id, version] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::ChangedSince {
+          green: volume(id)?,
+          version: number(version)?,
+        },
+      ))
+    }
+    ["work", green, name] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Work {
+          green: volume(green)?,
+          name: (*name).to_owned(),
+        },
+      ))
+    }
+    ["edit", work, path, at, delete, text] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Edit {
+          work: volume(work)?,
+          path: (*path).to_owned(),
+          at: number(at)?,
+          delete_len: number(delete)?,
+          bytes: (*text).as_bytes().to_vec(),
+        },
+      ))
+    }
+    ["submit", work] => parse_submit(&taken, work),
+    ["rebase", work] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Rebase {
+          work: volume(work)?,
+        },
+      ))
+    }
+    ["checkout", green, base, attachment] => {
+      taken.only(&Spec {
+        values: &["--snapshot"],
+        switches: &[],
+      })?;
+      let Some(snap) = taken.value("--snapshot") else {
+        return Err(ParseError::Missing("--snapshot N"));
+      };
+      Ok(client(
+        &taken,
+        Verb::Checkout {
+          green: volume(green)?,
+          base: GreenBase {
+            volume: volume(base)?,
+            snapshot: snapshot(snap)?,
+          },
+          attachment: number(attachment)?,
+        },
+      ))
+    }
+    ["checkout", ..] => Err(ParseError::Missing("GREEN VOLUME ATTACHMENT --snapshot N")),
+    [verb, rest @ ..]
+      if matches!(
+        *verb,
+        "anchor"
+          | "daemon"
+          | "profile"
+          | "mcp"
+          | "attach"
+          | "detach"
+          | "status"
+          | "enroll"
+          | "version"
+      ) =>
+    {
+      Err(ParseError::Extra(
+        rest.last().map_or((*verb).to_owned(), |w| (*w).to_owned()),
+      ))
+    }
+    [other, ..] => Err(ParseError::UnknownCommand((*other).to_owned())),
+  }
+}
+
+fn parse_volume(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
+  match words {
+    [] => Err(ParseError::Missing("volume subcommand")),
+    ["create", name] => {
+      taken.only(&Spec {
+        values: &["--bounded", "--dynamic", "--base"],
+        switches: &["--fold", "--locked"],
+      })?;
+      let size = size_of(taken)?;
+      Ok(client(
+        taken,
+        Verb::Create {
+          name: (*name).to_owned(),
+          size,
+          names: if taken.switch("--fold") {
+            NamePolicy::Fold
+          } else {
+            NamePolicy::Exact
+          },
+          require_locked: taken.switch("--locked"),
+          base: taken.value("--base").map(str::to_owned),
+        },
+      ))
+    }
+    ["create"] => Err(ParseError::Missing("NAME")),
+    ["list"] => {
+      taken.only(&NONE)?;
+      Ok(client(taken, Verb::List))
+    }
+    ["stat", id] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        taken,
+        Verb::Status {
+          volume: volume(id)?,
+          drift: false,
+        },
+      ))
+    }
+    ["snapshot", id] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        taken,
+        Verb::Snapshot {
+          volume: volume(id)?,
+        },
+      ))
+    }
+    ["destroy-snapshot", id, snap] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        taken,
+        Verb::DestroySnapshot {
+          volume: volume(id)?,
+          snapshot: snapshot(snap)?,
+        },
+      ))
+    }
+    ["destroy-snapshot", ..] => Err(ParseError::Missing("ID SNAPSHOT")),
+    ["clone", id, snap, name] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        taken,
+        Verb::Clone {
+          volume: volume(id)?,
+          snapshot: snapshot(snap)?,
+          name: (*name).to_owned(),
+        },
+      ))
+    }
+    ["resize", id] => {
+      taken.only(&Spec {
+        values: &["--bounded", "--dynamic"],
+        switches: &[],
+      })?;
+      let size = size_of(taken)?;
+      Ok(client(
+        taken,
+        Verb::Resize {
+          volume: volume(id)?,
+          size,
+        },
+      ))
+    }
+    ["placed", id] => {
+      taken.only(&Spec {
+        values: &["--snapshot"],
+        switches: &["--mirror"],
+      })?;
+      let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
+      let scope = if taken.switch("--mirror") {
+        slates_client::Scope::Mirror
+      } else {
+        slates_client::Scope::Region
+      };
+      Ok(client(
+        taken,
+        Verb::Placed {
+          volume: volume(id)?,
+          snapshot,
+          scope,
+        },
+      ))
+    }
+    ["destroy", id] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        taken,
+        Verb::Destroy {
+          volume: volume(id)?,
+        },
+      ))
+    }
+    ["stat" | "snapshot" | "resize" | "destroy" | "placed"] => {
+      Err(ParseError::Missing("volume ID"))
+    }
+    ["clone", ..] => Err(ParseError::Missing("ID SNAPSHOT NAME")),
+    [sub, rest @ ..]
+      if matches!(
+        *sub,
+        "create" | "list" | "stat" | "snapshot" | "resize" | "destroy" | "placed"
+      ) =>
+    {
+      Err(ParseError::Extra(
+        rest.last().map_or((*sub).to_owned(), |w| (*w).to_owned()),
+      ))
+    }
+    [other, ..] => Err(ParseError::UnknownCommand(format!("volume {other}"))),
+  }
+}
+
+/// `image build ID SNAPSHOT NAME --capacity SIZE` and `image merge IMAGE NAME` (A-160).
+fn parse_image(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
+  match words {
+    ["build", id, snap, name] => {
+      taken.only(&Spec {
+        values: &["--capacity"],
+        switches: &[],
+      })?;
+      let capacity = taken
+        .value("--capacity")
+        .ok_or(ParseError::Missing("--capacity SIZE"))?;
+      let capacity = parse_size(capacity).map_err(|reason| ParseError::BadValue {
+        what: "--capacity",
+        reason,
+      })?;
+      Ok(client(
+        taken,
+        Verb::ImageBuild {
+          volume: volume(id)?,
+          snapshot: snapshot(snap)?,
+          name: (*name).to_owned(),
+          capacity,
+        },
+      ))
+    }
+    ["build", ..] => Err(ParseError::Missing("ID SNAPSHOT NAME --capacity SIZE")),
+    ["merge", image, name] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        taken,
+        Verb::ImageMerge {
+          image: volume(image)?,
+          name: (*name).to_owned(),
+        },
+      ))
+    }
+    ["merge", ..] => Err(ParseError::Missing("IMAGE NAME")),
+    _ => Err(ParseError::Missing("image (build | merge)")),
+  }
+}
+
+fn parse_base(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
+  taken.only(&NONE)?;
+  match words {
+    ["read", id, path] => Ok(client(
+      taken,
+      Verb::ReadBase {
+        volume: volume(id)?,
+        path: (*path).to_owned(),
+      },
+    )),
+    ["digest", id, path] => Ok(client(
+      taken,
+      Verb::Digest {
+        volume: volume(id)?,
+        path: (*path).to_owned(),
+      },
+    )),
+    ["rewitness", id, rest @ ..] => Ok(client(
+      taken,
+      Verb::Rewitness {
+        volume: volume(id)?,
+        paths: paths(&rest.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>()),
+      },
+    )),
+    ["pin", id, rest @ ..] => Ok(client(
+      taken,
+      Verb::Pin {
+        volume: volume(id)?,
+        paths: paths(&rest.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>()),
+      },
+    )),
+    [] => Err(ParseError::Missing("base subcommand")),
+    ["read" | "digest", ..] => Err(ParseError::Missing("ID PATH")),
+    ["rewitness" | "pin"] => Err(ParseError::Missing("volume ID")),
+    [other, ..] => Err(ParseError::UnknownCommand(format!("base {other}"))),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn args(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_owned).collect()
+  }
+
+  /// AC-8.1, §4.8: recovery requires an exact plan and both explicit acknowledgements;
+  /// a read-only plan needs neither, and a join always names its replacement group.
+  #[test]
+  fn recovery_requires_a_reviewed_plan_fencing_and_acceptance_of_possible_loss() {
+    let digest = "01".repeat(32);
+    for scope in ["root", "region"] {
+      assert!(
+        parse(&args(&format!(
+          "recovery-plan {scope} --join-group {digest}"
+        )))
+        .is_ok()
+      );
+      assert!(
+        parse(&args(&format!(
+          "recover {scope} --confirm {digest} --fenced --accept-loss"
+        )))
+        .is_ok()
+      );
+      for missing in ["--fenced", "--accept-loss"] {
+        let command =
+          format!("recover {scope} --confirm {digest} --fenced --accept-loss").replace(missing, "");
+        assert!(parse(&args(&command)).is_err());
+      }
+      assert!(parse(&args(&format!("recover {scope} --fenced --accept-loss"))).is_err());
+    }
+    assert!(parse(&args("recover root --confirm wrong --fenced --accept-loss")).is_err());
+  }
+
+  /// §4.6 (AUD-29-75): `export` names one volume, optionally read-only and scoped to a subtree; anything else is
+  /// refused rather than guessed.
+  #[test]
+  fn export_names_a_volume_and_its_options() {
+    let id = "ab".repeat(16);
+    let Command::Client(request) =
+      parse(&args(&format!("export {id} --read-only --subtree /data"))).unwrap()
+    else {
+      panic!("export is a client request");
+    };
+    let Verb::Export {
+      read_only, subtree, ..
+    } = request.verb
+    else {
+      panic!("export parses to the export verb");
+    };
+    assert!(read_only);
+    assert_eq!(subtree.as_deref(), Some("/data"));
+    // A-115: `--uid` binds the export to one identity; a value that is not a uid is refused, never guessed.
+    let Command::Client(request) = parse(&args(&format!("export {id} --uid 1000"))).unwrap() else {
+      panic!("export is a client request");
+    };
+    let Verb::Export { uid, .. } = request.verb else {
+      panic!("export parses to the export verb");
+    };
+    assert_eq!(uid, Some(1000));
+    assert!(parse(&args(&format!("export {id} --uid tester"))).is_err());
+    assert!(parse(&args("export")).is_err(), "a volume is required");
+    assert!(
+      parse(&args(&format!("export {id} --shared"))).is_err(),
+      "no FUSE flag on an export"
+    );
+  }
+
+  /// AC-8.1: bootstrap is an explicit local client verb; it is never a daemon startup flag.
+  #[test]
+  fn bootstrap_names_the_group_to_create() {
+    for (scope, root) in [("root", true), ("region", false)] {
+      let Command::Client(request) =
+        parse(&args(&format!("--instance fixture bootstrap {scope}"))).unwrap()
+      else {
+        panic!("bootstrap is a client request");
+      };
+      assert_eq!(request.verb, Verb::Bootstrap { root });
+    }
+    assert!(parse(&args("daemon --bootstrap")).is_err());
+    assert!(parse(&args("bootstrap")).is_err());
+  }
+
+  /// The grammar: a create with its flags in any order, a global instance before or after
+  /// the verb, the process verbs' options.
+  #[test]
+  fn the_grammar_parses_the_documented_forms() {
+    let Command::Client(request) = parse(&args(
+      "volume create scratch --bounded 4GiB --fold --instance x",
+    ))
+    .unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(request.instance, "x");
+    assert_eq!(
+      request.verb,
+      Verb::Create {
+        name: "scratch".into(),
+        size: SizeClass::Bounded { limit: 4 << 30 },
+        names: NamePolicy::Fold,
+        require_locked: false,
+        base: None,
+      }
+    );
+    let Command::Client(request) = parse(&args("--instance y volume list")).unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(request.instance, "y");
+    assert_eq!(request.verb, Verb::List);
+    let Command::Client(request) = parse(&args(
+      "attach 00000000000000000000000000000001 --write --snapshot 3",
+    ))
+    .unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::Attach {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        snapshot: Some(slates_client::SnapshotId { value: 3 }),
+        intent: Intent::Write,
+        form: slates_client::AttachRequest::Termed,
+      }
+    );
+    assert_eq!(
+      parse(&args("anchor --quick --shards 2 --instance z")),
+      Ok(Command::Anchor(ProcessOptions {
+        instance: "z".into(),
+        quick: true,
+        shards: Some(2),
+        fleet: None,
+      }))
+    );
+    assert_eq!(
+      parse(&args("mcp --instance m")),
+      Ok(Command::Mcp(McpOptions {
+        instance: "m".into(),
+        http: None,
+      }))
+    );
+    assert_eq!(
+      parse(&args("mcp --instance m --http 8787")),
+      Ok(Command::Mcp(McpOptions {
+        instance: "m".into(),
+        http: Some(8787),
+      }))
+    );
+  }
+
+  /// The container bind form of `attach` (§4.6 A-9): both paths make the form; one alone is a usage
+  /// refusal naming the missing flag.
+  #[test]
+  fn the_attach_grammar_takes_the_container_bind_flags_together() {
+    let Ok(Command::Client(request)) = parse(&args(
+      "attach 00000000000000000000000000000001 --write --oci-source /Users/me/mnt --oci-destination /work",
+    )) else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::Attach {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        snapshot: None,
+        intent: Intent::Write,
+        form: slates_client::AttachRequest::Oci {
+          source: "/Users/me/mnt".to_owned(),
+          destination: "/work".to_owned(),
+        },
+      }
+    );
+    assert_eq!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --oci-source /Users/me/mnt"
+      )),
+      Err(ParseError::Missing("--oci-destination CONTAINER_PATH"))
+    );
+    assert_eq!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --oci-destination /work"
+      )),
+      Err(ParseError::Missing("--oci-source HOST_PATH"))
+    );
+  }
+
+  /// `base digest ID PATH` parses to the clean-file digest verb (§4.15); the path is required.
+  #[test]
+  fn the_grammar_parses_base_digest() {
+    let Command::Client(request) = parse(&args(
+      "base digest 00000000000000000000000000000001 /src/lib.rs --json",
+    ))
+    .unwrap() else {
+      panic!("client");
+    };
+    assert!(request.json);
+    assert_eq!(
+      request.verb,
+      Verb::Digest {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        path: "/src/lib.rs".into(),
+      }
+    );
+    assert_eq!(
+      parse(&args("base digest 00000000000000000000000000000001")),
+      Err(ParseError::Missing("ID PATH"))
+    );
+  }
+
+  /// `promote-region N` parses to the operator's region-loss promotion (§4.8, D-14 — "the operator issues it
+  /// (a CLI verb over this)"); a non-integer region is a usage error naming the bad value.
+  #[test]
+  fn the_grammar_parses_promote_region() {
+    let Command::Client(request) = parse(&args("promote-region 1 --instance a")).unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(request.instance, "a");
+    assert_eq!(request.verb, Verb::PromoteRegion { region: 1 });
+    assert!(matches!(
+      parse(&args("promote-region notaregion")),
+      Err(ParseError::BadValue { what: "region", .. })
+    ));
+  }
+
+  /// A fleet node (§2.6 boot step 6): `--fleet PATH --node NAME` on the daemon or the anchor, both or
+  /// neither — one without the other is a usage error naming the missing one.
+  #[test]
+  fn the_grammar_parses_a_fleet_node() {
+    assert_eq!(
+      parse(&args(
+        "daemon --instance a --fleet /etc/slates/fleet.json --node a"
+      )),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: Some(FleetSelection {
+          manifest: "/etc/slates/fleet.json".into(),
+          node: "a".into(),
+        }),
+      }))
+    );
+    assert!(matches!(
+      parse(&args("daemon --fleet fleet.json")),
+      Err(ParseError::Missing(_))
+    ));
+    assert!(matches!(
+      parse(&args("anchor --node a")),
+      Err(ParseError::Missing(_))
+    ));
+  }
+
+  /// The merge service's grammar (§4.16 as a service): a green over a complete immutable base with
+  /// evidence required (one of the base pair alone is a usage refusal), an advance to the head or a
+  /// version, a read at the head, a version or an attachment, and a submit carrying evidence.
+  #[test]
+  fn the_grammar_parses_the_base_reader_and_evidence_forms() {
+    let verb = |text: &str| -> Verb {
+      let Command::Client(request) = parse(&args(text)).unwrap() else {
+        panic!("client");
+      };
+      request.verb
+    };
+    let id = "00000000000000000000000000000001";
+    let vid = parse_volume_id(id).unwrap();
+    assert_eq!(
+      verb(&format!(
+        "green over --require-evidence --base {id} --snapshot 3"
+      )),
+      Verb::Green {
+        name: "over".into(),
+        evidence: true,
+        base: Some(GreenBase {
+          volume: vid,
+          snapshot: slates_client::SnapshotId { value: 3 },
+        }),
+      }
+    );
+    assert!(matches!(
+      parse(&args(&format!("green half --base {id}"))),
+      Err(ParseError::BadValue { .. })
+    ));
+    assert_eq!(
+      verb("advance 7"),
+      Verb::Advance {
+        attachment: 7,
+        version: None,
+      }
+    );
+    assert_eq!(
+      verb("advance 7 2"),
+      Verb::Advance {
+        attachment: 7,
+        version: Some(2),
+      }
+    );
+    assert_eq!(
+      verb(&format!("read {id} /f --attachment 7")),
+      Verb::Read {
+        volume: vid,
+        path: "/f".into(),
+        at: ReadAt::Attachment { attachment: 7 },
+      }
+    );
+    assert_eq!(
+      verb(&format!("read {id} f --version 2")),
+      Verb::Read {
+        volume: vid,
+        path: "f".into(),
+        at: ReadAt::Version { version: 2 },
+      }
+    );
+    assert_eq!(
+      verb(&format!("submit {id} --evidence {}", "ab".repeat(32))),
+      Verb::Submit {
+        work: vid,
+        evidence: vec![[0xab; 32]],
+      }
+    );
+  }
+
+  /// The merge grammar (§4.16): green, work, edit, submit, versions and changed-since parse to
+  /// their verbs.
+  #[test]
+  fn the_grammar_parses_the_merge_verbs() {
+    let verb = |text: &str| -> Verb {
+      let Command::Client(request) = parse(&args(text)).unwrap() else {
+        panic!("client");
+      };
+      request.verb
+    };
+    let id = "00000000000000000000000000000001";
+    let vid = parse_volume_id(id).unwrap();
+    assert_eq!(
+      verb("green shared"),
+      Verb::Green {
+        name: "shared".into(),
+        evidence: false,
+        base: None,
+      }
+    );
+    assert_eq!(
+      verb(&format!("versions {id}")),
+      Verb::Versions { green: vid }
+    );
+    assert_eq!(
+      verb(&format!("changed-since {id} 2")),
+      Verb::ChangedSince {
+        green: vid,
+        version: 2,
+      }
+    );
+    assert_eq!(
+      verb(&format!("work {id} w")),
+      Verb::Work {
+        green: vid,
+        name: "w".into(),
+      }
+    );
+    assert_eq!(
+      verb(&format!("edit {id} f 0 5 hello")),
+      Verb::Edit {
+        work: vid,
+        path: "f".into(),
+        at: 0,
+        delete_len: 5,
+        bytes: b"hello".to_vec(),
+      }
+    );
+    assert_eq!(
+      verb(&format!("submit {id}")),
+      Verb::Submit {
+        work: vid,
+        evidence: Vec::new(),
+      }
+    );
+    assert_eq!(verb(&format!("rebase {id}")), Verb::Rebase { work: vid });
+  }
+
+  /// The refusals: a size without a binary unit, an unknown flag, a missing size, an extra
+  /// argument, nothing at all (help).
+  #[test]
+  fn the_grammar_refuses_what_it_does_not_document() {
+    assert!(matches!(
+      parse(&args("volume create a --bounded 4GB")),
+      Err(ParseError::BadValue { .. })
+    ));
+    assert_eq!(
+      parse(&args("volume list --colour")),
+      Err(ParseError::UnknownFlag("--colour".into()))
+    );
+    assert_eq!(
+      parse(&args("volume create a")),
+      Err(ParseError::Missing("--bounded SIZE or --dynamic MAX"))
+    );
+    assert_eq!(
+      parse(&args("volume list extra")),
+      Err(ParseError::Extra("extra".into()))
+    );
+    assert_eq!(parse(&[]), Err(ParseError::Help));
+  }
+
+  /// The verb a client-verb text parses to.
+  fn client_verb(text: &str) -> Verb {
+    let Command::Client(request) = parse(&args(text)).unwrap() else {
+      panic!("client");
+    };
+    request.verb
+  }
+
+  /// The enrollment surface (§4.13): `enroll` with or without an account, `revoke`, and `share` with
+  /// a principal in each of its three forms and any rights; a bad principal and a missing consumer
+  /// are refused.
+  #[test]
+  fn the_grammar_parses_the_enrollment_verbs() {
+    assert_eq!(client_verb("enroll"), Verb::Enroll { account: None });
+    assert_eq!(
+      client_verb("enroll --account 501 --json"),
+      Verb::Enroll { account: Some(501) }
+    );
+    assert_eq!(client_verb("revoke 7"), Verb::Revoke { consumer: 7 });
+    let id = "00000000000000000000000000000001";
+    let vid = parse_volume_id(id).unwrap();
+    let share = |principal: SharePrincipal, rights: Rights| Verb::Share {
+      volume: vid,
+      principal,
+      rights,
+    };
+    assert_eq!(
+      client_verb(&format!("share {id} consumer:7 --read")),
+      share(
+        SharePrincipal::Consumer {
+          account: None,
+          consumer: 7,
+          host: None,
+        },
+        Rights {
+          read: true,
+          write: false,
+          admin: false,
+        },
+      )
+    );
+    assert_eq!(
+      client_verb(&format!("share {id} consumer:501/7 --write --admin")),
+      share(
+        SharePrincipal::Consumer {
+          account: Some(501),
+          consumer: 7,
+          host: None,
+        },
+        Rights {
+          read: false,
+          write: true,
+          admin: true,
+        },
+      )
+    );
+    assert_eq!(
+      client_verb(&format!("share {id} uid:501")),
+      share(
+        SharePrincipal::Uid {
+          uid: 501,
+          host: None
+        },
+        Rights::default()
+      )
+    );
+    assert!(matches!(
+      parse(&args(&format!("share {id} nobody:1"))),
+      Err(ParseError::BadValue {
+        what: "PRINCIPAL",
+        ..
+      })
+    ));
+    assert_eq!(parse(&args("revoke")), Err(ParseError::Missing("CONSUMER")));
+  }
+
+  /// A-237: a share names another host's account by the anchor that host's `slates status` prints (`@ANCHOR`), and
+  /// without one this daemon's own host.
+  #[test]
+  fn a_share_names_another_hosts_account_by_its_anchor() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let vid = parse_volume_id(id).unwrap();
+    let share = |principal: SharePrincipal, rights: Rights| Verb::Share {
+      volume: vid,
+      principal,
+      rights,
+    };
+    assert_eq!(
+      client_verb(&format!("share {id} uid:501@12345 --read")),
+      share(
+        SharePrincipal::Uid {
+          uid: 501,
+          host: Some(12345)
+        },
+        Rights {
+          read: true,
+          write: false,
+          admin: false,
+        },
+      )
+    );
+    assert_eq!(
+      client_verb(&format!("share {id} consumer:501/7@12345")),
+      share(
+        SharePrincipal::Consumer {
+          account: Some(501),
+          consumer: 7,
+          host: Some(12345),
+        },
+        Rights::default()
+      )
+    );
+  }
+
+  /// `run` splits at `--` with its switches before it; a missing `--` or an empty command is refused.
+  #[test]
+  fn run_splits_the_switches_from_the_command() {
+    assert_eq!(
+      parse(&args("run --instance x --keep --json -- sh -c true")),
+      Ok(Command::Run(RunRequest {
+        instance: "x".into(),
+        keep: true,
+        json: true,
+        command: vec!["sh".into(), "-c".into(), "true".into()],
+      }))
+    );
+    assert!(matches!(
+      parse(&args("run -- ")),
+      Err(ParseError::Missing("a command after `--`"))
+    ));
+    assert!(matches!(
+      parse(&args("run sh")),
+      Err(ParseError::Missing("`--` then the command"))
+    ));
+  }
+
+  /// §4.12/§4.13: global flags may precede the harness verb; everything after `--` belongs
+  /// to the child, including flags that are also meaningful to slates.
+  #[test]
+  fn global_flags_before_run_preserve_the_child_arguments() {
+    for arguments in [
+      "--instance outer run --keep --json -- child --instance inner --json --help --",
+      "--json --instance=outer run --keep -- child --instance inner --json --help --",
+      "run --instance outer --keep --json -- child --instance inner --json --help --",
+    ] {
+      assert_eq!(
+        parse(&args(arguments)),
+        Ok(Command::Run(RunRequest {
+          instance: "outer".into(),
+          keep: true,
+          json: true,
+          command: args("child --instance inner --json --help --"),
+        }))
+      );
+    }
+    assert_eq!(
+      parse(&args("--instance run status")),
+      Ok(Command::Client(ClientRequest {
+        instance: "run".into(),
+        json: false,
+        verb: Verb::DaemonStatus,
+      }))
+    );
+  }
+
+  /// §4.12: exec has the same command boundary as run, with global options before the verb.
+  #[test]
+  fn global_flags_before_exec_preserve_the_child_arguments() {
+    assert_eq!(
+      parse(&args(
+        "--instance outer exec --volume scratch --at /p -- child --volume inner --help"
+      )),
+      Ok(Command::Exec(ExecRequest {
+        volume: "scratch".into(),
+        at: "/p".into(),
+        command: args("child --volume inner --help"),
+      }))
+    );
+  }
+
+  /// §4.12: the command boundary belongs only to harness verbs; stray words and flags on
+  /// their slates side remain usage errors instead of being silently discarded.
+  #[test]
+  fn harness_boundaries_refuse_extra_words_and_foreign_flags() {
+    for verb in ["run", "exec --volume scratch --at /p"] {
+      assert_eq!(
+        parse(&args(&format!("--instance outer {verb} stray -- child"))),
+        Err(ParseError::Extra("stray".into()))
+      );
+      assert_eq!(
+        parse(&args(&format!("--instance outer {verb} --quick -- child"))),
+        Err(ParseError::UnknownFlag("--quick".into()))
+      );
+    }
+    assert_eq!(
+      parse(&args("status -- child")),
+      Err(ParseError::UnknownFlag("--".into()))
+    );
+  }
+
+  /// `exec` splits at `--`: the flags before it, the command after; a missing `--` or an empty
+  /// command is refused.
+  #[test]
+  fn exec_splits_the_flags_from_the_command() {
+    let Command::Exec(request) = parse(&args(
+      "exec --volume scratch --at /home/u/build -- cargo build --release",
+    ))
+    .unwrap() else {
+      panic!("exec");
+    };
+    assert_eq!(request.volume, "scratch");
+    assert_eq!(request.at, "/home/u/build");
+    assert_eq!(request.command, vec!["cargo", "build", "--release"]);
+    assert!(matches!(
+      parse(&args("exec --volume v --at /p cargo build")),
+      Err(ParseError::Missing("`--` then the command"))
+    ));
+    assert!(matches!(
+      parse(&args("exec --volume v --at /p --")),
+      Err(ParseError::Missing("a command after `--`"))
+    ));
+    assert!(matches!(
+      parse(&args("exec --at /p -- cmd")),
+      Err(ParseError::Missing("--volume"))
+    ));
+  }
+
+  /// A-161 (Shards part 1 step 4). Do: parse `shards` as Unix hands its end, with every flag and with the fewest.
+  /// Expect the instance, the volume, the subtree, the intent, the number, the JSON switch and the command after `--`
+  /// untouched.
+  #[test]
+  fn shards_takes_one_volume_a_number_and_the_untouched_command() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let unix = |line: &str| parse_on(&args(line), HandOffKind::Descriptor);
+    let Command::Shards(request) = unix(&format!(
+      "--instance outer shards {id} --subtree work --read-only --fd 5 --json -- shards run --slates-fs-fd 5 --help"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (request.instance.as_str(), request.volume, request.handed),
+      ("outer", volume(id).unwrap(), HandOff::Descriptor(5))
+    );
+    assert_eq!(
+      (request.subtree.as_deref(), request.read_only, request.json),
+      (Some("work"), true, true)
+    );
+    assert_eq!(request.command, args("shards run --slates-fs-fd 5 --help"));
+    let Command::Shards(fewest) = unix(&format!("shards {id} --fd 3 -- reader")).unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (fewest.subtree, fewest.read_only, fewest.json),
+      (None, false, false)
+    );
+  }
+
+  /// A-179 (G-shards-windows step 2). Do: parse `shards` as Windows hands its end, with every flag and with the fewest.
+  /// Expect the instance, the volume, the subtree, the intent, the hand-off by handle, the JSON switch, and the command
+  /// after `--` untouched, `{handle}` still in it for the spawn to replace.
+  #[test]
+  fn shards_on_windows_takes_one_volume_and_a_command_naming_its_handle() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let windows = |line: &str| parse_on(&args(line), HandOffKind::Handle);
+    let Command::Shards(request) = windows(&format!(
+      "--instance outer shards {id} --subtree work --read-only --json -- shards run vm --slates-fs-handle {{handle}}"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (request.instance.as_str(), request.volume, request.handed),
+      ("outer", volume(id).unwrap(), HandOff::Handle)
+    );
+    assert_eq!(
+      (request.subtree.as_deref(), request.read_only, request.json),
+      (Some("work"), true, true)
+    );
+    assert_eq!(
+      request.command,
+      args("shards run vm --slates-fs-handle {handle}")
+    );
+    let Command::Shards(fewest) =
+      windows(&format!("shards {id} -- reader handle={{handle}}")).unwrap()
+    else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (fewest.subtree, fewest.read_only, fewest.json, fewest.handed),
+      (None, false, false, HandOff::Handle)
+    );
+  }
+
+  /// A-179. Do: parse `shards` as Windows hands its end with each thing wrong in turn. Expect each refused as usage, for
+  /// its own reason: a descriptor number, which Windows does not take; no `{handle}` in the command's arguments, or only
+  /// as the program itself; no volume; no command.
+  #[test]
+  fn shards_on_windows_refuses_a_number_or_a_command_that_never_names_its_handle() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let refusal = |line: &str| match parse_on(&args(line), HandOffKind::Handle) {
+      Err(ParseError::BadValue { what, .. }) => format!("bad {what}"),
+      Err(e) => e.to_string(),
+      Ok(command) => format!("parsed {command:?}"),
+    };
+    let unnamed = "missing {handle} in the command's arguments, where the stream end's handle goes (e.g. --slates-fs-handle {handle})";
+    for (line, expected) in [
+      (
+        format!("shards {id} --fd 5 -- reader {{handle}}"),
+        "bad --fd",
+      ),
+      (format!("shards {id} -- reader"), unnamed),
+      (format!("shards {id} -- {{handle}} reader"), unnamed),
+      ("shards -- reader {handle}".to_owned(), "missing volume ID"),
+      (format!("shards {id} --"), "missing a command after `--`"),
+    ] {
+      assert_eq!(refusal(&line), expected, "{line}");
+    }
+  }
+
+  /// G-vhost. Do: parse `vhost-user` with every flag, with the fewest, and with QEMU's form of the end. Expect the
+  /// instance, the volume, the tag (the default when none is named), the subtree, the intent, the DAX window in bytes,
+  /// the JSON switch and the VMM after `--` untouched, `{socket}` or `{fd}` still in it.
+  #[test]
+  fn vhost_user_takes_one_volume_and_the_untouched_vmm_with_its_socket_placeholder() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let Command::VhostUser(request) = parse(&args(&format!(
+      "--instance outer vhost-user {id} --tag work --subtree src --read-only --dax-window 8MiB --json -- \
+       crosvm run --vhost-user type=fs,socket={{socket}} vmlinuz"
+    )))
+    .unwrap() else {
+      panic!("vhost-user");
+    };
+    assert_eq!(
+      (
+        request.instance.as_str(),
+        request.volume,
+        request.tag.as_str()
+      ),
+      ("outer", volume(id).unwrap(), "work")
+    );
+    assert_eq!(
+      (
+        request.subtree.as_deref(),
+        request.read_only,
+        request.dax_window,
+        request.json
+      ),
+      (Some("src"), true, Some(8 << 20), true)
+    );
+    assert_eq!(
+      request.command,
+      args("crosvm run --vhost-user type=fs,socket={socket} vmlinuz")
+    );
+    let Command::VhostUser(fewest) = parse(&args(&format!(
+      "vhost-user {id} -- vmm --socket={{socket}}"
+    )))
+    .unwrap() else {
+      panic!("vhost-user");
+    };
+    assert_eq!(
+      (
+        fewest.tag.as_str(),
+        fewest.subtree,
+        fewest.read_only,
+        fewest.dax_window,
+        fewest.json
+      ),
+      (DEFAULT_GUEST_TAG, None, false, None, false)
+    );
+    let qemu = "qemu-system-x86_64 -chardev socket,id=fs,fd={fd} -device vhost-user-test-device-pci,chardev=fs";
+    let Command::VhostUser(by_number) = parse(&args(&format!(
+      "vhost-user {id} --dax-window 8MiB -- {qemu}"
+    )))
+    .unwrap() else {
+      panic!("vhost-user");
+    };
+    assert_eq!(
+      (by_number.dax_window, by_number.command),
+      (Some(8 << 20), args(qemu))
+    );
+  }
+
+  /// G-vhost. Do: parse `vhost-user` with each thing wrong in turn. Expect each refused as usage, for its own reason: no
+  /// `{socket}` or `{fd}` among the VMM's arguments (the VMM's own name does not count); a DAX window that is no size; no
+  /// volume, or a second word; a foreign flag; no VMM.
+  #[test]
+  fn vhost_user_refuses_a_missing_placeholder_bad_window_volume_flag_or_vmm_as_usage() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let refusal = |line: &str| match parse(&args(line)) {
+      Err(ParseError::BadValue { what, .. }) => format!("bad {what}"),
+      Err(e) => e.to_string(),
+      Ok(command) => format!("parsed {command:?}"),
+    };
+    for (line, mentions) in [
+      (format!("vhost-user {id} -- crosvm run vmlinuz"), "{socket}"),
+      (format!("vhost-user {id} -- {{socket}} run"), "{socket}"),
+      (format!("vhost-user {id} -- {{fd}} run"), "{fd}"),
+      (
+        format!("vhost-user {id} --dax-window lots -- vmm socket={{socket}}"),
+        "bad --dax-window",
+      ),
+      ("vhost-user -- vmm socket={socket}".to_owned(), "volume ID"),
+      (
+        format!("vhost-user {id} extra -- vmm socket={{socket}}"),
+        "unexpected argument `extra`",
+      ),
+      (
+        format!("vhost-user {id} --fd 3 -- vmm socket={{socket}}"),
+        "unknown flag `--fd`",
+      ),
+      (format!("vhost-user {id} --"), "a command after `--`"),
+    ] {
+      let refused = refusal(&line);
+      assert!(refused.contains(mentions), "{line}: {refused}");
+    }
+  }
+
+  /// A-161. Do: parse `shards` with each thing wrong in turn. Expect each refused as usage, for its own reason: a number
+  /// below 3, negative or not a number; no number; no volume, or a malformed one; a second word; a foreign flag; no
+  /// command.
+  #[test]
+  fn shards_refuses_a_bad_number_volume_word_flag_or_command_as_usage() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let refusal = |line: &str| match parse_on(&args(line), HandOffKind::Descriptor) {
+      Err(ParseError::BadValue { what, .. }) => format!("bad {what}"),
+      Err(e) => e.to_string(),
+      Ok(command) => format!("parsed {command:?}"),
+    };
+    for (line, expected) in [
+      (format!("shards {id} --fd 2 -- reader"), "bad --fd"),
+      (format!("shards {id} --fd -1 -- reader"), "bad --fd"),
+      (format!("shards {id} --fd five -- reader"), "bad --fd"),
+      (
+        format!("shards {id} -- reader"),
+        "missing --fd N (the descriptor number the command finds what it is handed at: a stream end, a pmem copy)",
+      ),
+      ("shards --fd 5 -- reader".to_owned(), "missing volume ID"),
+      (
+        "shards not-an-id --fd 5 -- reader".to_owned(),
+        "bad volume ID",
+      ),
+      (
+        format!("shards {id} stray --fd 5 -- reader"),
+        "unexpected argument `stray`",
+      ),
+      (
+        format!("shards {id} --fd 5 --keep -- reader"),
+        "unknown flag `--keep`",
+      ),
+      (
+        format!("shards {id} --fd 5"),
+        "missing `--` then the command",
+      ),
+      (
+        format!("shards {id} --fd 5 --"),
+        "missing a command after `--`",
+      ),
+    ] {
+      assert_eq!(refusal(&line), expected, "{line}");
+    }
+  }
+}

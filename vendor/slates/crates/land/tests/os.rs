@@ -1,0 +1,782 @@
+//! The landing over the operating system (Phase 1 task 11; §4.15 step 6, §4.13): a real
+//! directory on the host's disk in the build output (`CARGO_TARGET_TMPDIR`, under `target/`),
+//! on every host (A-50: never `/tmp`, never a RAM directory). Nothing is written outside that
+//! directory; each test works in its own subdirectory named with the process id and removes it.
+//!
+//! Covered: the worked example's shape against the disk (bytes, modes, mtimes, symlinks,
+//! removals, a directory rename), containment refusals (a symlink component, `..`), idempotent
+//! re-run by hash, and T-1.15's real `kill -9` on the host's disk: a child process lands round after
+//! round until killed; every file is then a whole round, never torn; the parent resumes with
+//! the child's last landing id, sweeps its siblings and reaches the reference.
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
+#![cfg(unix)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use slates_land::engine::{Degradation, LandingState, Outcome};
+use slates_land::os::{OsLand, TargetRefusal};
+use slates_vfs::base::BaseConfig;
+use slates_vfs::host::{HostError, HostFs, LandFs};
+use slates_vfs::volume::{Store, Volume};
+use slates_vfs::xattr::XattrSet;
+
+mod common;
+use common::{
+  LARGE, Session, Setup, config, mkdir, mkdir_with_mode, read_through, rename, request, rm_r,
+  scratch, store, symlink, unlink, write_file,
+};
+
+/// Format: the environment variable that turns this binary into the kill test's child.
+const CHILD_DIR: &str = "SLATES_LAND_CHILD_DIR";
+/// Shape: files per round of the kill test.
+const KILL_FILES: usize = 64;
+/// Shape: how long the parent lets the child land before the kill, milliseconds; long enough
+/// for several rounds (a round of 64 files measured under 5 ms on tmpfs; the parent waits for
+/// the first round before the clock starts, so a slower disk only lands fewer rounds).
+const KILL_AFTER_MS: u64 = 40;
+/// Shape: the parent waits at most this long for the child's first round.
+const CHILD_START_MS: u64 = 5_000;
+
+/// The build output (`CARGO_TARGET_TMPDIR`, under `target/`): the real host directory this test lands into
+/// and reads from (A-50: a landing writes the host's disk and a base is read from it, so tests exercise both
+/// for real — never under `/tmp` and never in a RAM directory).
+fn build_output() -> PathBuf {
+  PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
+
+/// A fresh working directory for one test, named with the process id, and its removal.
+struct Workspace {
+  path: PathBuf,
+}
+
+impl Workspace {
+  fn new(base: &Path, test: &str) -> Self {
+    let path = base.join(format!("slates-land-{}-{test}", std::process::id()));
+    // The test harness is the one place a test writes a host path outside a landing: the
+    // build-output directory it removes at the end (CLAUDE.md §4).
+    #[allow(clippy::disallowed_methods)]
+    std::fs::create_dir_all(&path).unwrap();
+    Self { path }
+  }
+}
+
+impl Drop for Workspace {
+  fn drop(&mut self) {
+    #[allow(clippy::disallowed_methods)]
+    let _ = std::fs::remove_dir_all(&self.path);
+  }
+}
+
+#[allow(clippy::disallowed_methods)]
+fn seed_file(path: &Path, bytes: &[u8]) {
+  std::fs::write(path, bytes).unwrap();
+}
+
+#[allow(clippy::disallowed_methods)]
+fn seed_dir(path: &Path) {
+  std::fs::create_dir_all(path).unwrap();
+}
+
+#[allow(clippy::disallowed_methods)]
+fn read(path: &Path) -> Option<Vec<u8>> {
+  std::fs::read(path).ok()
+}
+
+#[allow(clippy::disallowed_methods)]
+fn names_in(path: &Path) -> Vec<String> {
+  let mut names: Vec<String> = std::fs::read_dir(path)
+    .unwrap()
+    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+    .collect();
+  names.sort();
+  names
+}
+
+fn overlay_over(host: &mut OsLand, root: slates_vfs::host::HostDir, store: &mut Store) -> Volume {
+  let facts = host.facts(root).unwrap();
+  Volume::create_overlay(
+    store,
+    config(),
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: LARGE,
+    },
+  )
+  .unwrap()
+}
+
+/// The base of the worked example on the disk.
+fn seed_example(root: &Path) {
+  seed_dir(&root.join("src"));
+  seed_file(&root.join("src/lib.rs"), b"base lib");
+  seed_file(&root.join("src/gone.rs"), b"gone");
+  seed_dir(&root.join("tree/deep"));
+  seed_file(&root.join("tree/deep/leaf"), b"leaf");
+  seed_dir(&root.join("moved"));
+  seed_file(&root.join("moved/m"), b"m");
+}
+
+/// The overlay's edits: a replacement, a create, a delete, a mkdir with a file, a symlink, a
+/// directory rename and a tree removal.
+fn edit_example(vol: &mut Volume, host: &mut OsLand, store: &mut Store) {
+  write_file(vol, host, store, "/src/lib.rs", b"edited lib");
+  write_file(vol, host, store, "/src/new.rs", b"new");
+  unlink(vol, host, store, "/src/gone.rs");
+  mkdir(vol, host, store, "/out");
+  write_file(vol, host, store, "/out/inner", b"inner");
+  symlink(vol, host, store, "/link", "src/lib.rs");
+  rename(vol, host, store, "/moved", "/moved2");
+  rm_r(vol, host, store, "/tree");
+}
+
+/// The disk after the worked example landed.
+fn assert_example_on_disk(root: &Path) {
+  assert_eq!(read(&root.join("src/lib.rs")).unwrap(), b"edited lib");
+  assert_eq!(read(&root.join("src/new.rs")).unwrap(), b"new");
+  assert!(read(&root.join("src/gone.rs")).is_none());
+  assert_eq!(read(&root.join("out/inner")).unwrap(), b"inner");
+  assert_eq!(read(&root.join("moved2/m")).unwrap(), b"m");
+  assert!(!root.join("moved").exists());
+  assert!(!root.join("tree").exists());
+  #[allow(clippy::disallowed_methods)]
+  let link = std::fs::read_link(root.join("link")).unwrap();
+  assert_eq!(link, Path::new("src/lib.rs"));
+  assert!(
+    !names_in(root).iter().any(|n| n.starts_with(".slates-")),
+    "{:?}",
+    names_in(root)
+  );
+}
+
+/// The worked example against a real directory, then an idempotent re-run.
+#[test]
+fn the_worked_example_lands_on_a_real_directory() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "example");
+  seed_example(&ws.path);
+  let (mut host, target) = OsLand::open_target(&ws.path).unwrap();
+  let mut store = store();
+  let mut vol = overlay_over(&mut host, target.dir, &mut store);
+  edit_example(&mut vol, &mut host, &mut store);
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert!(
+    report
+      .entries
+      .iter()
+      .all(|e| e.outcome == Some(Outcome::Written)),
+    "{report:?}"
+  );
+  assert!(report.durability.data_synced && report.durability.dirs_synced);
+  assert_example_on_disk(&ws.path);
+  // The volume reads the landed bytes from the disk now.
+  assert_eq!(
+    read_through(setup.vol, setup.host, setup.store, "/src/lib.rs"),
+    b"edited lib"
+  );
+  // Idempotent: nothing left to plan.
+  let presented = setup.present(&request(1));
+  assert!(
+    presented.manifest.entries.is_empty(),
+    "{:?}",
+    presented.manifest.entries
+  );
+}
+
+/// Containment: a symlink component and `..` are refused before the lease; a relative path too.
+#[test]
+fn a_target_path_that_escapes_is_refused() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "escape");
+  seed_dir(&ws.path.join("real"));
+  #[allow(clippy::disallowed_methods)]
+  std::os::unix::fs::symlink(ws.path.join("real"), ws.path.join("alias")).unwrap();
+  assert_eq!(
+    OsLand::open_target(&ws.path.join("alias"))
+      .err()
+      .map(|e| format!("{e:?}")),
+    Some(format!("{:?}", TargetRefusal::EscapesTarget))
+  );
+  assert_eq!(
+    OsLand::open_target(&ws.path.join("real/../real"))
+      .err()
+      .map(|e| format!("{e:?}")),
+    Some(format!("{:?}", TargetRefusal::EscapesTarget))
+  );
+  assert_eq!(
+    OsLand::open_target(Path::new("relative/path"))
+      .err()
+      .map(|e| format!("{e:?}")),
+    Some(format!("{:?}", TargetRefusal::NotAbsolute))
+  );
+  assert!(OsLand::open_target(&ws.path.join("real")).is_ok());
+  seed_file(&ws.path.join("file"), b"ordinary file");
+  assert_eq!(
+    OsLand::open_target(&ws.path.join("file")).err(),
+    Some(TargetRefusal::Unavailable(
+      slates_vfs::host::HostError::NotDirectory
+    ))
+  );
+  assert_eq!(
+    OsLand::open_target(&ws.path.join("alias/child")).err(),
+    Some(TargetRefusal::EscapesTarget)
+  );
+}
+
+/// Containment *during* a landing, not only of the target root (`a_target_path_that_escapes_is_refused`
+/// covers the root the human names). The engine resolves every manifest entry's path one component at a
+/// time through the host's `open_dir` (`engine::open_dir_path`, which splits on the last separator and
+/// opens each component), so a component that would leave the target is refused at that seam. The merge
+/// service keys a path by only trimming a leading slash (`merge_service::canonical_path`), never rejecting
+/// a `..`, so a green could hold an entry keyed `"../escape"`; the containment that makes such a key
+/// harmless is the host seam's, proven here on a real directory. Every traversal seam the landing walk
+/// steps through refuses `..` (the parent that holds the secret), `.`, and an embedded separator as a
+/// single component, and the leaf write seam refuses `..` too, so the directory beside the target keeps
+/// its file and its bytes and gains no entry — the landing opens, creates and writes only beneath the
+/// target it was granted (R1, §4.15 containment).
+#[test]
+fn a_landing_component_never_steps_out_of_the_target() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "contain");
+  seed_dir(&ws.path.join("target"));
+  seed_file(&ws.path.join("SECRET"), b"outside the target");
+  let (mut host, target) = OsLand::open_target(&ws.path.join("target")).unwrap();
+  let root = target.dir;
+  // The one seam the landing walk steps through refuses every component that would leave the target.
+  assert_eq!(
+    host.open_dir(root, "..").err(),
+    Some(HostError::NotFound),
+    "open_dir .."
+  );
+  assert_eq!(
+    host.open_dir(root, ".").err(),
+    Some(HostError::NotFound),
+    "open_dir ."
+  );
+  assert_eq!(
+    host.open_dir(root, "mid/escape").err(),
+    Some(HostError::NotFound),
+    "open_dir embedded separator"
+  );
+  assert_eq!(
+    host.open_file(root, "..").err(),
+    Some(HostError::NotFound),
+    "open_file .."
+  );
+  // The leaf write seam never creates in the parent either. How it refuses to differs by host and both are
+  // containment: where an unnamed create exists (Linux `O_TMPFILE` on the directory's own `"."`) the name is never
+  // consulted at all and the file is inside the target by construction, so the call succeeds and reaches nothing
+  // outside; where it does not (macOS), the named fallback is an exclusive create of `..`, which already exists,
+  // and is refused. What must hold on every host is that nothing appeared outside the target — asserted below.
+  #[cfg(target_os = "linux")]
+  assert!(
+    host.create_temp(root, "..").is_ok(),
+    "create_temp .. (the unnamed create ignores the name and lands inside the target)"
+  );
+  #[cfg(not(target_os = "linux"))]
+  assert!(
+    host.create_temp(root, "..").is_err(),
+    "create_temp .. (the named fallback must refuse)"
+  );
+  // Beside the target: the secret keeps its bytes and the parent gained no entry (only SECRET and target).
+  assert_eq!(
+    read(&ws.path.join("SECRET")).unwrap(),
+    b"outside the target"
+  );
+  assert_eq!(names_in(&ws.path).len(), 2, "{:?}", names_in(&ws.path));
+}
+
+/// CVE-2026-17106 (moby/go-archive) and the CVE-2025-9566 (Podman) / CVE-2026-23954 (LXD) class: an
+/// archive or manifest carries a symlink entry, then a *later* entry is written *through* it, and because
+/// the extractor's check was lexical (the link target "looked local") while the OS resolved the link, the
+/// later write landed outside the destination. slates never does a lexical check: a landing resolves every
+/// manifest component with `O_DIRECTORY|O_NOFOLLOW` (`os.rs dir_flags`, base `open_dir`/`open_file`), so a
+/// component that is a symlink is refused at that seam rather than followed — whatever a green keyed as the
+/// parent of a later entry (a green is a flat map of path strings, so it *can* hold both `"through"` and
+/// `"through/evil"`). Proven on a real directory with a symlink aimed at the parent that holds the secret:
+/// the walk step (open as a directory) and the leaf step (open as a file) both refuse, so a sibling entry
+/// keyed through it can never be created outside, and the secret keeps its bytes (R1, §4.15 containment).
+#[test]
+fn a_landing_never_walks_a_manifest_path_through_a_symlink() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "symthrough");
+  seed_dir(&ws.path.join("target"));
+  seed_file(&ws.path.join("SECRET"), b"outside the target");
+  // A symlink inside the target aimed at the parent that holds the secret, as a malicious manifest's
+  // symlink entry would leave it before a later entry tried to write `through/<name>`.
+  #[allow(clippy::disallowed_methods)]
+  std::os::unix::fs::symlink(&ws.path, ws.path.join("target/through")).unwrap();
+  let (mut host, target) = OsLand::open_target(&ws.path.join("target")).unwrap();
+  let root = target.dir;
+  // The walk step — descending into the symlink to create a child under it — is refused (NOFOLLOW).
+  assert!(
+    host.open_dir(root, "through").is_err(),
+    "a symlink is never descended as a directory"
+  );
+  // The leaf step — opening the symlink itself as a file — is refused too (never the outside target).
+  assert!(
+    host.open_file(root, "through").is_err(),
+    "a symlink is never opened as a file"
+  );
+  // The secret beside the target keeps its bytes and the parent gained no entry.
+  assert_eq!(
+    read(&ws.path.join("SECRET")).unwrap(),
+    b"outside the target"
+  );
+  assert_eq!(names_in(&ws.path).len(), 2, "{:?}", names_in(&ws.path));
+}
+
+/// AC-1.10 / R1: a scratch landing preserves the real target directory and writes its tree
+/// beneath that directory, without leaving a sibling outside the grant.
+#[test]
+fn a_scratch_volume_into_an_empty_real_directory_preserves_the_target() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "stage");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  for d in 0..4 {
+    mkdir(&mut vol, &mut host, &mut store, &format!("/d{d}"));
+    for f in 0..25 {
+      write_file(
+        &mut vol,
+        &mut host,
+        &mut store,
+        &format!("/d{d}/f{f}"),
+        format!("{d}/{f}").as_bytes(),
+      );
+    }
+  }
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(2)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  let (mut reopened, current) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  assert_eq!(
+    host.fingerprint_dir(target.dir).unwrap().ino,
+    reopened.fingerprint_dir(current.dir).unwrap().ino
+  );
+  assert_eq!(report.written, 104);
+  assert_eq!(read(&ws.path.join("out/d2/f3")).unwrap(), b"2/3");
+  assert!(!names_in(&ws.path).iter().any(|n| n.starts_with(".slates-")));
+  assert!(vol.is_overlay());
+  assert_eq!(
+    read_through(&mut vol, &mut host, &mut store, "/d2/f3"),
+    b"2/3"
+  );
+}
+
+/// §4.15 step 6 (a directory's mode lands as recorded). Do: under the conventional umask 022, land a scratch
+/// volume holding `/shared` (0775), `/private` (0700) and a file in each into an empty real directory. Expect:
+/// each directory on the disk has exactly its recorded mode. Before 2026-10-01 the landed directory was made
+/// with `mkdirat(mode)` and nothing after it, so the process umask cleared bits the volume held: 0775 landed
+/// 0755 (found by the Linux container lane's hermeticity run, whose harness made its directories under umask 002).
+#[test]
+fn a_landed_directory_keeps_its_mode_whatever_the_umask() {
+  // The conventional umask, so the test means the same on every host; the landing must not depend on it.
+  let _previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "modes");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  for (path, mode) in [("/shared", 0o775), ("/private", 0o700)] {
+    mkdir_with_mode(&mut vol, &mut host, &mut store, path, mode);
+    write_file(&mut vol, &mut host, &mut store, &format!("{path}/f"), b"x");
+  }
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(2)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  use std::os::unix::fs::PermissionsExt;
+  for (name, mode) in [("shared", 0o775), ("private", 0o700)] {
+    #[allow(clippy::disallowed_methods)] // the test's own landed directory, read back
+    let landed = std::fs::metadata(ws.path.join("out").join(name))
+      .unwrap()
+      .permissions()
+      .mode()
+      & 0o7777;
+    assert_eq!(landed, mode, "{name} landed {landed:o}, recorded {mode:o}");
+  }
+}
+
+/// §4.13, §4.15 step 6, A-94, R10 — the privilege-escalation boundary of the one disk-write path. A setuid file
+/// whose *volume* owner is root (uid 0) lands as a file owned by the daemon's own euid, never root, so it is
+/// setuid to an unprivileged self — not a setuid-root binary. On a loopback mount AUTH_NONE maps the caller to
+/// root (§4.13), so an agent can create a uid-0, setuid file inside its own volume; the containment is that
+/// `land` creates every file with `openat(O_CREAT)` as its own euid and has no `fchown` (R10: no privilege is
+/// ever required or taken), so a recorded owner cannot reach the disk. A-94 keeps the setuid *bit* — root-fs
+/// images stay buildable through slates — inert here because the owner is the unprivileged daemon. Do: record a
+/// file owned by a uid that is not this process's euid (uid 0 when unprivileged, else a nonzero uid) with mode
+/// `04755`, land it, and read the disk file. Expect: owned by the process's euid, never the recorded uid; the
+/// setuid bit present. A regression against a future `fchown` added to `land` for "ownership fidelity", which
+/// would turn a recorded uid-0 setuid file into a setuid-root binary on disk.
+#[test]
+fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
+  use std::os::unix::fs::MetadataExt;
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "setuid");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+
+  // A real binary an agent would plant: a shell script, owner-executable and world-readable, setuid.
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/exploit",
+    b"#!/bin/sh\nid\n",
+  );
+  let no = {
+    let (dir, name) = common::split("/exploit");
+    let d = common::dir_of(&mut vol, &mut host, &mut store, dir);
+    vol
+      .with_host(&mut host)
+      .lookup(&mut store, d, name)
+      .unwrap()
+      .inode
+  };
+  // Record an owner that is NOT this process's euid, so the assertion proves land used its own euid and ignored
+  // the recorded one. uid 0 (root) is the escalation case when the daemon is unprivileged; when the test itself
+  // runs as root (a container lane), a nonzero uid keeps the claim non-vacuous either way.
+  let euid = rustix::process::geteuid().as_raw();
+  let recorded_uid = if euid == 0 { 65_534 } else { 0 };
+  vol
+    .chown(&mut store, no, recorded_uid, recorded_uid)
+    .unwrap();
+  vol.chmod(&mut store, no, 0o104_755).unwrap();
+
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(2)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+
+  #[allow(clippy::disallowed_methods)] // the test's own landed file, read back
+  let meta = std::fs::metadata(ws.path.join("out").join("exploit")).unwrap();
+  // The escalation boundary: the disk file is owned by this process's euid, never the volume-recorded uid.
+  assert_eq!(
+    meta.uid(),
+    euid,
+    "land created the file as recorded uid {recorded_uid} rather than its own euid {euid}: a chown reached disk"
+  );
+  assert_ne!(
+    meta.uid(),
+    recorded_uid,
+    "the volume-recorded owner {recorded_uid} reached the disk — a setuid-to-that-uid binary"
+  );
+  // A-94: the setuid bit lands as recorded (root-fs images stay buildable); inert because the owner above is the
+  // unprivileged daemon, not root.
+  assert_eq!(
+    meta.mode() & 0o7777,
+    0o4755,
+    "the setuid file landed {:o}, not 04755 (A-94: the bit lands as recorded)",
+    meta.mode() & 0o7777
+  );
+}
+
+/// A landing materializes no extended attribute, so a file an agent marks with `security.capability` (a Linux
+/// file capability) reaches the human's disk carrying no such attribute — the capability analog of the setuid
+/// guard above. The volume is a faithful byte store and holds any attribute name (`check_name` filters only NUL
+/// and length, never the `security`/`trusted`/`system` namespaces, as it should for an in-memory store); the
+/// host-safety boundary is the landing, whose write seam (`HostFs`) has no set-xattr verb and whose landing
+/// manifest carries no attribute, so every one is dropped. Without this, a future "xattr fidelity" verb added to
+/// `land` would turn a recorded `security.capability = cap_setuid+ep` into a real file capability on a binary an
+/// agent planted — privilege on the host from inside the sandbox, exactly the shape of CVE-2023-0386's capability
+/// cousins. Do: write a file, set `security.capability` on it in the volume (asserting the volume holds it), land
+/// it, read the disk file back. Expect: the file's bytes land (non-vacuity: the landing ran to completion), and
+/// `security.capability` is absent on disk (reading it fails: no such attribute).
+#[test]
+fn a_landing_never_materializes_a_security_capability_xattr() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "capxattr");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+
+  // A real binary an agent would plant, then mark with a Linux file capability.
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/exploit",
+    b"#!/bin/sh\nid\n",
+  );
+  let no = {
+    let (dir, name) = common::split("/exploit");
+    let d = common::dir_of(&mut vol, &mut host, &mut store, dir);
+    vol
+      .with_host(&mut host)
+      .lookup(&mut store, d, name)
+      .unwrap()
+      .inode
+  };
+  // VFS_CAP_DATA for cap_setuid, effective: revision-2 magic with the effective flag, CAP_SETUID (bit 7) in the
+  // permitted set. The exact bits are immaterial to the guard — the point is this attribute never reaches disk.
+  let cap_name: &[u8] = b"security.capability";
+  let cap_value: [u8; 20] = [
+    0x00, 0x80, 0x00,
+    0x02, // magic_etc: VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE (little-endian)
+    0x80, 0x00, 0x00, 0x00, // permitted[0]: CAP_SETUID (bit 7)
+    0x80, 0x00, 0x00, 0x00, // inheritable[0]: CAP_SETUID (bit 7)
+    0x00, 0x00, 0x00, 0x00, // permitted[1]
+    0x00, 0x00, 0x00, 0x00, // inheritable[1]
+  ];
+  vol
+    .xattr_set(&mut store, no, cap_name, &cap_value, XattrSet::Create)
+    .unwrap();
+  // Non-vacuity: the volume really holds the attribute, so "absent on disk" means the landing dropped it.
+  assert!(
+    vol
+      .xattr_names(&store, no)
+      .unwrap()
+      .iter()
+      .any(|n| &**n == cap_name),
+    "the volume must hold security.capability before landing, or the disk check is vacuous"
+  );
+
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(2)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+
+  let landed = ws.path.join("out").join("exploit");
+  // Non-vacuity: the file itself landed with its bytes — the landing ran, so an absent attribute is a drop,
+  // not a failed landing.
+  #[allow(clippy::disallowed_methods)] // the test's own landed file, read back
+  let bytes = std::fs::read(&landed).unwrap();
+  assert_eq!(bytes, b"#!/bin/sh\nid\n", "the planted file did not land");
+
+  // The escalation boundary: the landed file carries no security.capability — reading the attribute fails (no
+  // such attribute) because the landing materialized no extended attribute at all.
+  let mut buf = [0u8; 64];
+  let read = rustix::fs::getxattr(&landed, "security.capability", &mut buf[..]);
+  assert!(
+    read.is_err(),
+    "security.capability reached the disk ({read:?}) — a file capability landed from inside the sandbox"
+  );
+}
+
+// ---------------------------------------------------------------- kill -9
+
+/// The bytes of file `f` in round `r`.
+fn round_bytes(round: u64, file: usize) -> Vec<u8> {
+  format!("round {round} file {file}").into_bytes()
+}
+
+/// The child: lands round after round into `dir` until killed, printing each landing id
+/// before it starts (the parent resumes with the last one printed).
+#[test]
+fn kill_child_landing_loop() {
+  let Some(dir) = std::env::var_os(CHILD_DIR) else {
+    return;
+  };
+  let dir = PathBuf::from(dir);
+  let (mut host, target) = OsLand::open_target(&dir).unwrap();
+  let mut store = store();
+  let mut vol = overlay_over(&mut host, target.dir, &mut store);
+  let mut session = Session::new();
+  for round in 1u64.. {
+    for f in 0..KILL_FILES {
+      write_file(
+        &mut vol,
+        &mut host,
+        &mut store,
+        &format!("/f{f}"),
+        &round_bytes(round, f),
+      );
+    }
+    println!("landing {round}");
+    let report = Setup {
+      host: &mut host,
+      target: &target,
+      vol: &mut vol,
+      store: &mut store,
+      session: &mut session,
+    }
+    .land(request(round))
+    .unwrap();
+    assert_eq!(report.state, LandingState::Done, "{report:?}");
+    println!("landed {round}");
+  }
+}
+
+/// Spawns the child landing loop and returns its stdout after the first round landed and the
+/// kill: the parent lets it run `KILL_AFTER_MS` past its first round.
+fn run_child_until_killed(dir: &Path) -> String {
+  use std::io::Read;
+  let exe = std::env::current_exe().unwrap();
+  let mut child = Command::new(exe)
+    .args(["--exact", "kill_child_landing_loop", "--nocapture"])
+    .env(CHILD_DIR, dir)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+  let started = Instant::now();
+  let mut stdout = child.stdout.take().unwrap();
+  let mut seen = String::new();
+  let mut buf = [0u8; 4096];
+  while !seen.contains("landed 1") && started.elapsed() < Duration::from_millis(CHILD_START_MS) {
+    let n = stdout.read(&mut buf).unwrap();
+    if n == 0 {
+      break;
+    }
+    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+  }
+  // The test harness times the kill; shipped code never sleeps (D-9).
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(Duration::from_millis(KILL_AFTER_MS));
+  child.kill().unwrap();
+  let _ = child.wait();
+  let mut rest = String::new();
+  let _ = stdout.read_to_string(&mut rest);
+  seen.push_str(&rest);
+  seen
+}
+
+/// The last landing id the child printed before the kill.
+fn last_landing_started(seen: &str) -> u64 {
+  seen
+    .lines()
+    .filter_map(|l| l.strip_prefix("landing "))
+    .filter_map(|n| n.trim().parse().ok())
+    .max()
+    .unwrap_or(0)
+}
+
+/// Every file is a whole round up to `last`, never torn.
+fn assert_whole_rounds(root: &Path, last: u64) {
+  for f in 0..KILL_FILES {
+    let bytes = read(&root.join(format!("f{f}"))).unwrap();
+    let whole = (0..=last).any(|r| bytes == round_bytes(r, f));
+    assert!(
+      whole,
+      "f{f} is torn after kill -9: {:?}",
+      String::from_utf8_lossy(&bytes)
+    );
+  }
+}
+
+/// T-1.15 on a real filesystem: `kill -9` mid-landing; every file is a whole round; the resume
+/// with the child's landing id sweeps the siblings and lands the round in full.
+#[test]
+fn t_1_15_kill_9_on_the_disk_leaves_every_file_old_or_new() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "kill");
+  for f in 0..KILL_FILES {
+    seed_file(&ws.path.join(format!("f{f}")), &round_bytes(0, f));
+  }
+  let seen = run_child_until_killed(&ws.path);
+  let last = last_landing_started(&seen);
+  assert!(last >= 1, "the child never started a landing: {seen}");
+  assert_whole_rounds(&ws.path, last);
+  // Resume with the child's last landing id: sweep, then land the round in full.
+  let (mut host, target) = OsLand::open_target(&ws.path).unwrap();
+  let mut store = store();
+  let mut vol = overlay_over(&mut host, target.dir, &mut store);
+  for f in 0..KILL_FILES {
+    write_file(
+      &mut vol,
+      &mut host,
+      &mut store,
+      &format!("/f{f}"),
+      &round_bytes(last, f),
+    );
+  }
+  let mut session = Session::new();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land(request(last))
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  for f in 0..KILL_FILES {
+    assert_eq!(
+      read(&ws.path.join(format!("f{f}"))).unwrap(),
+      round_bytes(last, f)
+    );
+  }
+  assert_siblings_swept_or_kept(&ws.path, &report.degraded, last);
+}
+
+/// The resume's siblings (A-43): each one is swept, or kept beside its name and reported (`Kept`) when the
+/// resume cannot verify it as the entry the crashed attempt displaced — never removed unverified — and a
+/// kept one holds a whole round, never torn bytes. This resume's overlay is built from the disk after the
+/// kill, so it lacks the attempt's witnesses: an exchange the kill caught before its check leaves the
+/// displaced file unverifiable (CI run 36666172500 kept one). Before A-43 every sibling was a temporary and
+/// was swept.
+fn assert_siblings_swept_or_kept(root: &Path, degraded: &[Degradation], last: u64) {
+  let kept: Vec<String> = degraded
+    .iter()
+    .filter_map(|cell| match cell {
+      Degradation::Kept { kept, .. } => kept.rsplit('/').next().map(str::to_owned),
+      _ => None,
+    })
+    .collect();
+  for name in names_in(root)
+    .into_iter()
+    .filter(|n| n.starts_with(".slates-"))
+  {
+    assert!(
+      kept.contains(&name),
+      "an unreported sibling {name}; kept: {kept:?}"
+    );
+    let bytes = read(&root.join(&name)).unwrap();
+    assert!(
+      (0..=last).any(|r| (0..KILL_FILES).any(|f| bytes == round_bytes(r, f))),
+      "the kept {name} is torn: {:?}",
+      String::from_utf8_lossy(&bytes)
+    );
+    eprintln!("t_1_15: kept {name}, reported, holding a whole round");
+  }
+}

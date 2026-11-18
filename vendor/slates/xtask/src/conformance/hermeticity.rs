@@ -1,0 +1,1231 @@
+//! The hermeticity tracer run (R1; Part 6 example 8; AC-4.5, AC-9.4; the dynamic half of the
+//! structural test): a whole lifecycle — anchor, daemon, a volume, a kernel mount, files written
+//! through the mount, a snapshot, a landing planned, granted by the human surface and executed —
+//! runs under a filesystem-write tracer, and every write-capable call the slates processes made
+//! must fall inside the granted target (matched to what the landing reports written), on a
+//! RAM-only kernel object, or on the processes' own standard streams. On Linux the tracer is
+//! `strace -f -y` wrapping the anchor, so the anchor, the daemon and every child are in the log;
+//! on macOS it is `sudo eslogger` (Apple's Endpoint Security events, each file named by its full kernel
+//! path), kept to the events of the slates binary — anchor, daemon and every CLI call — from before the
+//! anchor starts until after it stops. It needs root and Full Disk Access for whatever runs it. DTrace's
+//! syscall provider is absent under SIP, and fs_usage could not attribute descriptors it saw duplicated
+//! (92 of 93 calls unresolved on CI, 2026-09-26).
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use slates_conformance::Suite;
+use slates_conformance::capability::HostOs;
+use slates_conformance::record::{Outcome, Transport};
+use slates_conformance::trace::{
+  Landing, Policy, SocketNode, eslogger_has_activity, judge, judge_hidden, parse_eslogger,
+  parse_strace_with_cwd, strace_unnamed_paths,
+};
+use slates_conformance::workload::Manifest;
+
+use super::slates::{MOUNT_WAIT, Session, SlatesBinary, grant};
+use super::trace_process::{StopSignal, TraceProcess};
+use super::workloads::manifest_of;
+use super::{Run, SuiteResult, write_file};
+use crate::Failure;
+
+/// Format: the system calls strace traces: every call taking a path (`%file`), the descriptor-based
+/// writes the structural test's syscall list names, and `clone`/`clone3` — not writes, but their returns
+/// name the threads the daemon spawns, so a thread A-130's barrier starts for a landing and joins within
+/// it (`crates/land/src/os.rs`) is attributed to the daemon and not read as a stranger (see
+/// [`slates_conformance::trace::strace_thread_group`]).
+const STRACE_TRACE: &str = "trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice,clone,clone3";
+// `futimens` is glibc's wrapper over `utimensat` (a %file syscall), not a syscall name: strace refused the
+// whole run with `invalid system call 'futimens'` and the daemon never came up under it (the Linux lane,
+// 2026-09-16).
+/// Format: the prefix of the landing engine's hidden siblings inside the target (`slates-land`).
+const HIDDEN_PREFIX: &str = ".slates-";
+/// Format: the files the traced workload leaves in the volume, relative paths, after its moves —
+/// what a complete landing must write.
+const LANDED_ENTRIES: &[&str] = &["d", "d/f2", "f3", "link"];
+/// Format: the workload driven through the mount: create, write, mkdir, symlink, rename, chmod, remove.
+const MOUNT_WORKLOAD: &str = "printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp";
+
+/// The daemon's own socket node for `instance` as the tracer prints it, on macOS: the Shards stream's socket route (A-161),
+/// named by the route's own path function, in the user's temporary directory, which eslogger names by its canonical
+/// path (`/private/var/…`, not `/var/…`). The node is gone once the daemon stops, so its directory is what is resolved.
+#[cfg(target_os = "macos")]
+fn socket_node_path(instance: &str) -> Result<Option<String>, Failure> {
+  let path = slates_ipc::route::path(instance)
+    .map_err(|e| Failure(format!("the route's socket path for {instance}: {e}")))?;
+  let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+    return Err(Failure(format!(
+      "the route's socket path {} names no directory and file",
+      path.display()
+    )));
+  };
+  Ok(Some(
+    std::fs::canonicalize(directory)?
+      .join(name)
+      .display()
+      .to_string(),
+  ))
+}
+
+/// No daemon socket node elsewhere: Linux hands a Shards stream's end over the client's control socket, which has no
+/// node, and Windows has no route yet.
+#[cfg(not(target_os = "macos"))]
+fn socket_node_path(_instance: &str) -> Result<Option<String>, Failure> {
+  Ok(None)
+}
+
+/// The tracer's command prefix for the anchor on Linux.
+pub(super) fn strace_prefix(log: &Path) -> Vec<String> {
+  vec![
+    "strace".to_owned(),
+    // Select ptrace stops as well as output: stopping at every allocator syscall starved the
+    // first heartbeat in CI. The traced write set below remains unchanged (strace(1)).
+    "--seccomp-bpf".to_owned(),
+    // Anchor owns this tracer child. Its exit must end the anchor and daemon it supervises,
+    // including if the kernel cannot install the syscall filter (strace(1), PTRACE_O_EXITKILL).
+    "--kill-on-exit".to_owned(),
+    "-f".to_owned(),
+    "-y".to_owned(),
+    // Each call stamped with the wall clock (seconds.microseconds), so a write inside the target is
+    // placed in, or outside, the granted landing's interval (AUD-29-42).
+    "-ttt".to_owned(),
+    "-qq".to_owned(),
+    "-s".to_owned(),
+    "0".to_owned(),
+    "-o".to_owned(),
+    log.display().to_string(),
+    "-e".to_owned(),
+    STRACE_TRACE.to_owned(),
+    "--".to_owned(),
+  ]
+}
+
+/// The tracer as root over the lifecycle run as `user` (`sudo strace -u USER …`): the Linux container transport's.
+/// Its daemon mounts through `fusermount3`, a setuid helper, and the kernel withholds a setuid program's privilege
+/// from a process an unprivileged tracer follows: under the plain prefix the shared mount was refused
+/// (`fusermount3: mount failed: Operation not permitted`, 2026-10-01). A tracer holding `CAP_SYS_PTRACE` keeps it,
+/// and the daemon still runs as the user.
+pub(super) fn root_strace_prefix(log: &Path, user: &str) -> Vec<String> {
+  let mut prefix = vec![
+    "sudo".to_owned(),
+    "-n".to_owned(),
+    "strace".to_owned(),
+    "-u".to_owned(),
+    user.to_owned(),
+  ];
+  prefix.extend(strace_prefix(log).into_iter().skip(1));
+  prefix
+}
+
+/// Format: the Endpoint Security events the macOS tracer asks `eslogger` for: every event that can
+/// create, write, move, remove or re-attribute a file (`eslogger --list-events`), and `open`/`close`,
+/// whose write flag and modified bit the parser reads.
+const ES_EVENTS: &[&str] = &[
+  "open",
+  "close",
+  "create",
+  "write",
+  "truncate",
+  "rename",
+  "unlink",
+  "link",
+  "clone",
+  "copyfile",
+  "exchangedata",
+  "setextattr",
+  "deleteextattr",
+  "setmode",
+  "setowner",
+  "setflags",
+  "utimes",
+  "setattrlist",
+  "setacl",
+];
+
+/// A running `sudo eslogger` over the whole machine, its events kept only when a slates process made
+/// them (the event's `process.executable.path` is the built binary: the anchor, the daemon and every CLI
+/// invocation), written to a log; stopped on drop. The filter runs as the events arrive, on a thread
+/// this value owns and joins, so the log holds the lifecycle's own events, not the machine's.
+struct EsLogger {
+  process: TraceProcess,
+  filter: Option<std::thread::JoinHandle<Result<Filtered, Failure>>>,
+  /// Dropped once the tracer has stopped: the filter then drains what the stream still holds and ends,
+  /// never waiting for the stream's end, which a process that outlived the stop can hold back.
+  stop: Option<std::sync::mpsc::Sender<()>>,
+  errors: PathBuf,
+}
+
+impl EsLogger {
+  fn start(binary: &Path, log: &Path) -> Result<EsLogger, Failure> {
+    let errors = log.with_extension("stderr.log");
+    #[allow(clippy::disallowed_methods)] // the development tool's own scratch diagnostics
+    let stderr = std::fs::File::create(&errors)?;
+    let mut command = Command::new("sudo");
+    command
+      .arg("-n")
+      .arg("eslogger")
+      .args(ES_EVENTS)
+      .stdin(Stdio::null())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::from(stderr));
+    isolate_tracer(&mut command);
+    let mut child = command
+      .spawn()
+      .map_err(|e| Failure(format!("starting eslogger: {e}")))?;
+    let stdout = child
+      .stdout
+      .take()
+      .ok_or_else(|| Failure("eslogger has no stdout".to_owned()))?;
+    #[allow(clippy::disallowed_methods)] // the development tool's own scratch log
+    let file = std::fs::File::create(log)
+      .map_err(|e| Failure(format!("creating {}: {e}", log.display())))?;
+    let binary = binary.display().to_string();
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let filter = std::thread::Builder::new()
+      .name("eslogger-filter".to_owned())
+      .spawn(move || keep_slates_events(stdout, file, &binary, &stopped))
+      .map_err(|e| Failure(format!("starting the eslogger filter: {e}")))?;
+    Ok(EsLogger {
+      process: TraceProcess::new(child, signal_eslogger, MOUNT_WAIT),
+      filter: Some(filter),
+      stop: Some(stop),
+      errors,
+    })
+  }
+
+  /// Waits until a slates process's event reached the log: `run` executes the binary, whose own
+  /// loading and reads are events.
+  fn wait_ready(
+    &mut self,
+    log: &Path,
+    mut run: impl FnMut() -> Result<(), Failure>,
+  ) -> Result<(), Failure> {
+    let ready = self.process.wait_ready(|| {
+      run()?;
+      Ok(eslogger_has_activity(&std::fs::read_to_string(log)?))
+    });
+    self.check(ready)
+  }
+
+  /// Stops eslogger once the stream is known to be caught up. The binary at `marker` runs once more, as a
+  /// child whose process id is known, and the stop waits until an event *of that process* is in the log.
+  /// Endpoint Security hands this client its events in `global_seq_num` order, and the filter fails the
+  /// run on any gap, so once the marker's event is logged every event before it (the landing and the
+  /// daemon's teardown included) was delivered and filtered. Waiting for the log merely to grow was a
+  /// race: a lagging older event grew it, eslogger was stopped at once, and the events it had not yet
+  /// written were lost (CI run 36275755772: the kept trace ended 11 ms after the landing plan, and none
+  /// of the landing's six creates was in it; docs/bugs/2026-09-26-the-eslogger-stop-raced-its-own-stream.md).
+  /// Fails when the kernel dropped any event for this client.
+  fn stop(mut self, log: &Path, marker: &Path) -> Result<Filtered, Failure> {
+    let marked = run_marker(marker);
+    let caught_up = marked.and_then(|pid| {
+      self
+        .process
+        .wait_ready(|| Ok(has_event_of_process(&std::fs::read_to_string(log)?, pid)))
+    });
+    self.shut_down(caught_up)
+  }
+
+  /// Stops the tracer once `caught_up` holds, then ends and joins the filter: the filter's verdict and
+  /// the tracer's exit together.
+  fn shut_down(mut self, caught_up: Result<(), Failure>) -> Result<Filtered, Failure> {
+    let stopped = caught_up.and_then(|()| self.process.stop_accepting(terminated_by_term));
+    // The tracer has stopped, or failed to (then this value's drop cancels it): the filter drains what
+    // the stream still holds and ends. Joining it on the stream's end instead hung CI run 36655388624's
+    // macOS job for 74 minutes after a complete trace; nothing past the marker is evidence.
+    drop(self.stop.take());
+    let filtered = self
+      .filter
+      .take()
+      .map_or(Ok(Filtered::default()), |filter| match filter.join() {
+        Ok(result) => result,
+        Err(_) => Err(Failure("the eslogger filter panicked".to_owned())),
+      });
+    let result = stopped.and(filtered).and_then(|filtered| {
+      if filtered.dropped > 0 {
+        return Err(Failure(format!(
+          "Endpoint Security dropped {} events for this client (gaps in global_seq_num); a partial trace is not judged",
+          filtered.dropped
+        )));
+      }
+      Ok(filtered)
+    });
+    result.map_err(|error| self.annotate(error))
+  }
+
+  fn check(&self, result: Result<(), Failure>) -> Result<(), Failure> {
+    result.map_err(|error| self.annotate(error))
+  }
+
+  /// The failure with eslogger's own diagnostic attached.
+  fn annotate(&self, error: Failure) -> Failure {
+    let diagnostic = std::fs::read_to_string(&self.errors).unwrap_or_default();
+    Failure(format!(
+      "{error}; eslogger: {} (it needs root and Full Disk Access for the terminal that runs it)",
+      diagnostic.trim()
+    ))
+  }
+}
+
+/// Runs the binary once (`--help`, which touches nothing but its own loading) as the stream's drain
+/// marker, and returns its process id once it has exited.
+fn run_marker(marker: &Path) -> Result<u32, Failure> {
+  let mut child = Command::new(marker)
+    .arg("--help")
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|e| Failure(format!("running the eslogger drain marker: {e}")))?;
+  let pid = child.id();
+  let status = child.wait()?;
+  if !status.success() {
+    return Err(Failure(format!(
+      "the eslogger drain marker ({} --help) exited {status}",
+      marker.display()
+    )));
+  }
+  Ok(pid)
+}
+
+/// Whether the eslogger log holds an event made by process `pid` (its `process.audit_token.pid`). Lines
+/// that are not events, and events of any other process, do not count.
+fn has_event_of_process(log: &str, pid: u32) -> bool {
+  log.lines().any(|line| {
+    serde_json::from_str::<serde_json::Value>(line)
+      .is_ok_and(|event| event["process"]["audit_token"]["pid"].as_u64() == Some(u64::from(pid)))
+  })
+}
+
+/// What the filter saw of the stream: the lines kept, and the events Endpoint Security dropped.
+#[derive(Clone, Copy, Debug, Default)]
+struct Filtered {
+  kept: u64,
+  dropped: u64,
+}
+
+/// Copies to `out` every event line whose process is `binary`, and every line that is not a complete
+/// event (the parser records it unresolved, so a torn line cannot hide a write). Machine-wide events
+/// are thousands a second (16,705 in the first 1.9 s of the 2026-09-26 run, after which that run's
+/// live filter kept nothing more), so a line is first tested for the binary's path as a substring —
+/// a byte search — and parsed only when it names it. Every line's `global_seq_num`, the client's own
+/// sequence across all event types, is checked for continuity: a gap is events the kernel dropped for
+/// this client, counted so the run fails rather than judging a partial trace.
+fn keep_slates_events(
+  events: std::process::ChildStdout,
+  mut out: impl std::io::Write,
+  binary: &str,
+  stopped: &std::sync::mpsc::Receiver<()>,
+) -> Result<Filtered, Failure> {
+  use std::io::Read;
+  let mut events = events;
+  set_nonblocking(&events)?;
+  let mut stream = Stream::default();
+  let mut chunk = vec![0u8; STREAM_CHUNK];
+  // Bytes still to drain once the tracer has stopped: `None` until then.
+  let mut draining: Option<usize> = None;
+  loop {
+    match events.read(&mut chunk) {
+      Ok(0) => {
+        // The stream's end: its last line counts, whole or not, as a line read to the end does.
+        stream.finish(&mut out, binary)?;
+        break;
+      }
+      Ok(read) => {
+        stream.take(chunk.get(..read).unwrap_or_default(), &mut out, binary)?;
+        if let Some(left) = draining.as_mut() {
+          *left = left.saturating_sub(read);
+          if *left == 0 {
+            break;
+          }
+        }
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        if draining.is_some() {
+          break;
+        }
+        if matches!(
+          stopped.try_recv(),
+          Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ) {
+          draining = Some(STREAM_DRAIN);
+        } else {
+          wait_readable(&events)?;
+        }
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+      Err(error) => return Err(error.into()),
+    }
+  }
+  // A line torn at a stop is past the drain marker (the stop follows the marker's own event), so it is
+  // not evidence and is not judged.
+  out.flush()?;
+  Ok(stream.filtered)
+}
+
+/// Makes the tracer's stream answer `WouldBlock` rather than wait, so the filter sees the stop.
+#[cfg(unix)]
+fn set_nonblocking(events: &std::process::ChildStdout) -> Result<(), Failure> {
+  let flags = rustix::fs::fcntl_getfl(events).map_err(std::io::Error::from)?;
+  rustix::fs::fcntl_setfl(events, flags | rustix::fs::OFlags::NONBLOCK)
+    .map_err(std::io::Error::from)?;
+  Ok(())
+}
+
+/// Windows has no stream tracer (the capability table's hermeticity cell is owed there), so a stream is refused.
+#[cfg(windows)]
+fn set_nonblocking(_events: &std::process::ChildStdout) -> Result<(), Failure> {
+  Err(Failure(
+    "the hermeticity tracer's stream has no Windows form: no ETW filesystem-write tracer is wired"
+      .to_owned(),
+  ))
+}
+
+/// Windows has no stream tracer; [`set_nonblocking`] refuses the stream before a wait is asked.
+#[cfg(windows)]
+fn wait_readable(_events: &std::process::ChildStdout) -> Result<(), Failure> {
+  Err(Failure(
+    "the hermeticity tracer's stream has no Windows form: no ETW filesystem-write tracer is wired"
+      .to_owned(),
+  ))
+}
+
+/// Waits until the tracer's stream is readable, or one stop-check interval has passed: the filter wakes
+/// the moment an event arrives, as a blocking read does, and still sees the stop. Sleeping on an empty
+/// pipe instead let the filter fall behind a machine-wide stream (CI run 36663502686: twelve readiness
+/// probes where two had sufficed, then nothing of the lifecycle kept, and the drain marker never seen).
+#[cfg(unix)]
+fn wait_readable(events: &std::process::ChildStdout) -> Result<(), Failure> {
+  let mut ready = [rustix::event::PollFd::new(
+    events,
+    rustix::event::PollFlags::IN,
+  )];
+  let interval = rustix::event::Timespec {
+    tv_sec: 0,
+    tv_nsec: STOP_CHECK_NS,
+  };
+  match rustix::event::poll(&mut ready, Some(&interval)) {
+    Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+    Err(error) => Err(std::io::Error::from(error).into()),
+  }
+}
+
+/// Shape: how often an idle filter looks for the stop, in nanoseconds: the harness's poll pause (20 ms).
+#[cfg(unix)]
+const STOP_CHECK_NS: i64 = 20_000_000;
+
+/// Shape: one read of the tracer's stream: 64 KiB, the default pipe buffer on Linux (pipe(7): sixteen
+/// pages) and the most macOS buffers for a large write, so one read can empty a full pipe.
+const STREAM_CHUNK: usize = 64 * 1024;
+/// Shape: what the filter still reads once the tracer has stopped: one pipe buffer, the most a stopped
+/// writer can have left unread, so a writer that outlived the stop cannot keep the drain going.
+const STREAM_DRAIN: usize = STREAM_CHUNK;
+
+/// The filter's position in the tracer's stream: the partial line waiting for its end, the last
+/// sequence number seen, and what has been kept and counted dropped.
+#[derive(Default)]
+struct Stream {
+  partial: Vec<u8>,
+  last_seq: Option<u64>,
+  filtered: Filtered,
+}
+
+impl Stream {
+  /// Takes bytes from the stream and handles every line they complete.
+  fn take(
+    &mut self,
+    bytes: &[u8],
+    out: &mut impl std::io::Write,
+    binary: &str,
+  ) -> Result<(), Failure> {
+    self.partial.extend_from_slice(bytes);
+    while let Some(end) = self.partial.iter().position(|&byte| byte == b'\n') {
+      let line: Vec<u8> = self.partial.drain(..=end).collect();
+      self.line(&line, out, binary)?;
+    }
+    Ok(())
+  }
+
+  /// Handles the stream's last line, which no newline ended.
+  fn finish(&mut self, out: &mut impl std::io::Write, binary: &str) -> Result<(), Failure> {
+    let last = std::mem::take(&mut self.partial);
+    if last.is_empty() {
+      return Ok(());
+    }
+    self.line(&last, out, binary)
+  }
+
+  /// One line of the stream: counted against the sequence, and kept when it is a slates event or not
+  /// an event at all.
+  fn line(
+    &mut self,
+    bytes: &[u8],
+    out: &mut impl std::io::Write,
+    binary: &str,
+  ) -> Result<(), Failure> {
+    let text = std::str::from_utf8(bytes)
+      .map_err(|error| Failure(format!("the tracer's stream is not UTF-8: {error}")))?;
+    let line = text.trim_end_matches(['\n', '\r']);
+    if line.trim().is_empty() {
+      return Ok(());
+    }
+    match global_seq(line) {
+      Some(seq) => {
+        if let Some(last) = self.last_seq {
+          self.filtered.dropped += seq.saturating_sub(last).saturating_sub(1);
+        }
+        self.last_seq = Some(seq);
+      }
+      None => {
+        // Not an event at all: kept, so the parser counts it unresolved.
+        writeln!(out, "{line}")?;
+        self.filtered.kept += 1;
+        return Ok(());
+      }
+    }
+    if !names_binary(line, binary) {
+      return Ok(());
+    }
+    let keep = serde_json::from_str::<serde_json::Value>(line).map_or(true, |event| {
+      event["process"]["executable"]["path"].as_str() == Some(binary)
+    });
+    if keep {
+      writeln!(out, "{line}")?;
+      self.filtered.kept += 1;
+    }
+    Ok(())
+  }
+}
+
+/// Whether a raw eslogger line names `binary` anywhere, by byte search. eslogger's JSON escapes every
+/// `/` as `\/` (all 866 lines of the 2026-09-26 run), so the escaped spelling is the one searched, the
+/// plain one too for an encoder that does not escape.
+fn names_binary(line: &str, binary: &str) -> bool {
+  let plain = format!("\"{binary}\"");
+  let escaped = plain.replace('/', "\\/");
+  line.contains(&escaped) || line.contains(&plain)
+}
+
+/// The `global_seq_num` of an Endpoint Security JSON line, read without parsing the line.
+fn global_seq(line: &str) -> Option<u64> {
+  let (_, rest) = line.split_once("\"global_seq_num\":")?;
+  let digits: String = rest
+    .trim_start()
+    .chars()
+    .take_while(char::is_ascii_digit)
+    .collect();
+  digits.parse().ok()
+}
+
+/// `eslogger` ends on `SIGTERM` (it ignored `SIGINT` in the 2026-09-26 probe), so its terminal status is
+/// that signal's, which `sudo` reports as an exit of 128 + 15.
+fn terminated_by_term(status: std::process::ExitStatus) -> bool {
+  /// Format: `SIGTERM`, and the exit code a shell or `sudo` reports for a child it ended (128 + 15).
+  const SIGTERM: i32 = 15;
+  const EXIT_ON_SIGTERM: i32 = 128 + SIGTERM;
+  #[cfg(unix)]
+  {
+    use std::os::unix::process::ExitStatusExt;
+    if status.signal() == Some(SIGTERM) {
+      return true;
+    }
+  }
+  status.success() || status.code() == Some(EXIT_ON_SIGTERM)
+}
+
+/// Signals the `sudo eslogger` process group: its graceful stop is `SIGTERM`.
+fn signal_eslogger(pid: u32, signal: StopSignal) -> Result<(), Failure> {
+  signal_group(
+    pid,
+    match signal {
+      StopSignal::Interrupt => "TERM",
+      StopSignal::Kill => "KILL",
+    },
+  )
+}
+
+#[cfg(unix)]
+fn isolate_tracer(command: &mut Command) {
+  use std::os::unix::process::CommandExt;
+  command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_tracer(_command: &mut Command) {}
+
+/// sudo may supervise a distinct tracer child. Signal their owned process group so an early return
+/// cannot leave the privileged descendant tracing after its target is gone.
+fn signal_group(pid: u32, signal: &str) -> Result<(), Failure> {
+  let output = Command::new("sudo")
+    .args(["-n", "/bin/kill", "-s", signal, "--", &format!("-{pid}")])
+    .output()?;
+  if !output.status.success() {
+    return Err(Failure(format!(
+      "signalling tracer group {pid}: {}: {}",
+      output.status,
+      String::from_utf8_lossy(&output.stderr).trim(),
+    )));
+  }
+  Ok(())
+}
+
+/// The landing flow through the CLI: snapshot, plan, grant, land; returns the written count.
+/// A granted landing as the judge needs it: what it reports written, its id, the interval it ran in
+/// (wall-clock nanoseconds since the epoch, the tracers' clock) and the daemon that executed it.
+struct Landed {
+  written: u64,
+  landing: u64,
+  from_ns: u64,
+  until_ns: u64,
+  /// The seed of the ids the daemon's writes are traced under: its threads on Linux (strace `-f` names
+  /// each event by its thread), read from `/proc/<pid>/task` — its long-lived shard threads. A-130's
+  /// barrier spawns and joins further threads within the landing, gone before this is read;
+  /// [`slates_conformance::trace::strace_thread_group`] grows this seed with them from the trace. The
+  /// process alone elsewhere (eslogger names processes, not threads).
+  writers: Vec<u32>,
+}
+
+/// The record's account of the calls set aside as an OS mount broker's: how many, and each distinct call
+/// and path, so a reader sees exactly what the judgement did not weigh.
+fn broker_note(set_aside: &[slates_conformance::trace::WriteEvent]) -> String {
+  let mut calls: Vec<String> = set_aside
+    .iter()
+    .map(|event| format!("{} {}", event.call, event.path))
+    .collect();
+  calls.sort();
+  calls.dedup();
+  format!(
+    "{} calls by an OS mount broker ({}) set aside, not judged (R10; macOS's eslogger leg keeps only the slates executable's): {calls:?}",
+    set_aside.len(),
+    slates_conformance::trace::OS_MOUNT_BROKERS.join(", ")
+  )
+}
+
+/// The wall clock in nanoseconds since the Unix epoch: the clock strace `-ttt` and eslogger stamp with.
+fn wall_ns() -> Result<u64, Failure> {
+  let since = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_err(|e| Failure(format!("the wall clock is before the epoch: {e}")))?;
+  u64::try_from(since.as_nanos()).map_err(|_| Failure("the wall clock overflows".to_owned()))
+}
+
+fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<Landed, Failure> {
+  let snapshot = session
+    .binary
+    .run(
+      &session.instance,
+      &["volume", "snapshot", &session.volume_id],
+    )?
+    .expect_ok("volume snapshot")?
+    .value_of("snapshot")?;
+  let target_text = target.display().to_string();
+  let presented = session
+    .binary
+    .run(
+      &session.instance,
+      &[
+        "land",
+        &session.volume_id,
+        &target_text,
+        "--snapshot",
+        &snapshot,
+        "--json",
+      ],
+    )?
+    .expect_ok("land (plan)")?
+    .json()?;
+  if presented["grant_required"] != true {
+    return Err(Failure(format!(
+      "the landing was not presented for a grant: {presented}"
+    )));
+  }
+  let landing = presented["landing"]
+    .as_u64()
+    .ok_or_else(|| Failure(format!("no landing id: {presented}")))?;
+  let manifest = presented["manifest"]
+    .as_str()
+    .ok_or_else(|| Failure(format!("no manifest: {presented}")))?
+    .to_owned();
+  let daemon_pid = session.anchor.daemon_pid()?;
+  let grant_id = grant(
+    run,
+    &session.binary,
+    &session.instance,
+    daemon_pid,
+    landing,
+    &manifest,
+  )?;
+  let from_ns = wall_ns()?;
+  let landed = session
+    .binary
+    .run(
+      &session.instance,
+      &[
+        "land",
+        &session.volume_id,
+        &target_text,
+        "--snapshot",
+        &snapshot,
+        "--grant",
+        &grant_id.to_string(),
+        "--json",
+      ],
+    )?
+    .expect_ok("land (granted)")?
+    .json()?;
+  let until_ns = wall_ns()?;
+  let writers = threads_of(run.os, daemon_pid)?;
+  let written = landed["outcome"]["written"].as_u64().ok_or_else(|| {
+    Failure(format!(
+      "the granted landing reports no written count: {landed}"
+    ))
+  })?;
+  Ok(Landed {
+    written,
+    landing,
+    from_ns,
+    until_ns,
+    writers,
+  })
+}
+
+/// The seed of the ids `pid`'s events are traced under: on Linux the threads `/proc/<pid>/task` lists
+/// while the daemon lives — its long-lived shard threads. A-130's barrier spawns and joins further
+/// threads within the landing (`crates/land/src/os.rs`), gone before this reads `/proc`; the caller grows
+/// this seed with them from the trace's clone/clone3 (`strace_thread_group`). Elsewhere (eslogger names
+/// processes, not threads) the process alone.
+fn threads_of(os: HostOs, pid: u32) -> Result<Vec<u32>, Failure> {
+  if os != HostOs::Linux {
+    return Ok(vec![pid]);
+  }
+  let task = format!("/proc/{pid}/task");
+  let mut threads = Vec::new();
+  for entry in std::fs::read_dir(&task).map_err(|e| Failure(format!("reading {task}: {e}")))? {
+    let entry = entry.map_err(|e| Failure(format!("reading {task}: {e}")))?;
+    if let Ok(thread) = entry.file_name().to_string_lossy().parse::<u32>() {
+      threads.push(thread);
+    }
+  }
+  if !threads.contains(&pid) {
+    return Err(Failure(format!(
+      "{task} does not list the process itself: {threads:?}"
+    )));
+  }
+  Ok(threads)
+}
+
+/// Every path under `target`, relative to it: what is on disk after the landing.
+fn tree_under(target: &Path) -> Result<Vec<String>, Failure> {
+  let mut out = Vec::new();
+  let mut stack = vec![target.to_path_buf()];
+  while let Some(dir) = stack.pop() {
+    for entry in std::fs::read_dir(&dir)? {
+      let path = entry?.path();
+      if let Ok(relative) = path.strip_prefix(target) {
+        out.push(relative.display().to_string());
+      }
+      if std::fs::symlink_metadata(&path)?.is_dir() {
+        stack.push(path);
+      }
+    }
+  }
+  Ok(out)
+}
+
+/// The mounted workload must reach disk, including its scratch-volume parents. A trace with
+/// no outside writes proves nothing if the landing silently skipped every entry (AC-4.5).
+fn verify_landing(target: &Path, work: &str) -> Result<(), Failure> {
+  let directory = target.join(work);
+  for relative in ["", "d"] {
+    let path = directory.join(relative);
+    if !std::fs::symlink_metadata(&path)?.is_dir() {
+      return Err(Failure(format!(
+        "landed directory has the wrong kind: {}",
+        path.display()
+      )));
+    }
+  }
+  for (relative, expected) in [("f3", b"one\n"), ("d/f2", b"two\n")] {
+    let path = directory.join(relative);
+    if !std::fs::symlink_metadata(&path)?.is_file() || std::fs::read(&path)? != expected {
+      return Err(Failure(format!(
+        "landed file has the wrong kind or bytes: {}",
+        path.display()
+      )));
+    }
+  }
+  if std::fs::read_link(directory.join("link"))? != Path::new("f3") {
+    return Err(Failure("landed symlink does not name f3".to_owned()));
+  }
+  Ok(())
+}
+
+/// The complete mounted namespace is the independent oracle for what the landing must write.
+fn verify_manifest(mounted: &Manifest, landed: &Manifest) -> Result<(), Failure> {
+  if mounted != landed {
+    return Err(Failure(format!(
+      "the landed tree differs from the complete mounted tree: mounted={mounted:?}; landed={landed:?}"
+    )));
+  }
+  Ok(())
+}
+
+/// Runs the traced lifecycle and judges the log.
+pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
+  let log = run.scratch.path().join("trace.log");
+  let tracer = match run.os {
+    HostOs::Linux if run.transport == Transport::OciLinux => {
+      Some(root_strace_prefix(&log, &super::stdout_of("id", &["-un"])))
+    }
+    HostOs::Linux => Some(strace_prefix(&log)),
+    HostOs::Macos => None,
+    HostOs::Windows => return Err(Failure("no Windows tracer".to_owned())),
+  };
+  // Derived: one queried host page per peak workload entry. The macOS NFS client adds a
+  // 4096-byte AppleDouble file to each name; on the measured 16-KiB-page host, six surviving
+  // sidecars cost 98304 bytes (§4.2's allocated-page charge), plus eight inline workload bytes.
+  // Counting only Rust inodes admitted 2112 bytes and refused both the metadata and d/f2.
+  // Keep this fixture small enough to leave the shard's unpromised versions for its snapshot.
+  let inode_count = LANDED_ENTRIES.len() + 2 + 1 + 1;
+  let page = slates_machine::facts::Facts::query().page.base;
+  if page == 0 {
+    return Err(Failure("the OS did not report its page size".to_owned()));
+  }
+  let size = u64::try_from(inode_count)
+    .ok()
+    .and_then(|count| count.checked_mul(page))
+    .ok_or_else(|| Failure("hermeticity workload quota overflow".to_owned()))?
+    .to_string();
+  // macOS: eslogger watches the whole lifecycle from before the anchor starts (daemon start-up
+  // included), attached once the binary's own events reach the log.
+  let binary_for_trace = match run.os {
+    HostOs::Macos => Some(SlatesBinary::build(run.root)?),
+    _ => None,
+  };
+  let eslogger = match &binary_for_trace {
+    Some(binary) => {
+      let mut tracer = EsLogger::start(binary.path(), &log)?;
+      tracer.wait_ready(&log, || {
+        binary.run("eslogger-readiness", &["--help"]).map(|_| ())
+      })?;
+      eprintln!("hermeticity: eslogger recorded the binary's events");
+      Some(tracer)
+    }
+    None => None,
+  };
+  let session = Session::open(run, "hermeticity", &size, false, tracer.as_deref())?;
+  let work = session.workdir("traced")?;
+  let workload_notes = drive_workload(run, &session, &work, (&size, inode_count, page))?;
+  let parent = format!("conformance-{}", std::process::id());
+  let work = format!("{parent}/traced");
+  // The known workload bytes/kinds must be correct independently of the observed manifest.
+  // The manifest then adds every client-created entry; it has no filename exclusions.
+  verify_landing(session.mount.path(), &work)?;
+  let mounted_tree = manifest_of(session.mount.path())?;
+  let expected = mounted_tree
+    .entries
+    .iter()
+    .map(|entry| entry.path.clone())
+    .collect::<Vec<_>>();
+  let target = run.scratch.fresh("land-target")?;
+  let target = std::fs::canonicalize(&target)?;
+  let landed = land_under_grant(run, &session, &target)?;
+  let written = landed.written;
+  let verified = verify_landing(&target, &work)
+    .and_then(|()| verify_manifest(&mounted_tree, &manifest_of(&target)?));
+  let socket_node = socket_node_path(&session.instance)?;
+  let Session { mount, anchor, .. } = session;
+  let anchor_log = anchor.log_path().display().to_string();
+  drop(mount);
+  // Readiness is already established: keep observing through daemon teardown as well.
+  anchor.stop()?;
+  let mut trace_note = None;
+  if let (Some(tracer), Some(binary)) = (eslogger, &binary_for_trace) {
+    let filtered = tracer.stop(&log, binary.path())?;
+    trace_note = Some(format!(
+      "eslogger: {} slates events kept, 0 dropped (global_seq_num continuous); stopped after a drain marker",
+      filtered.kept
+    ));
+  }
+  let text = std::fs::read_to_string(&log)
+    .map_err(|e| Failure(format!("reading {}: {e}", log.display())))?;
+  let cwd = run.scratch.path().display().to_string();
+  // The OS mount brokers' own calls are set aside on Linux, as the eslogger leg keeps only the slates
+  // executable's events on macOS; the note below counts and names every one (R10).
+  let (events, set_aside) = match run.os {
+    HostOs::Linux => slates_conformance::trace::strace_split_broker_events(
+      &text,
+      parse_strace_with_cwd(&text, &cwd),
+    ),
+    _ => (parse_eslogger(&text), Vec::new()),
+  };
+  // strace names every event by its thread, and A-130's barrier runs each file's `fdatasync` on a scoped
+  // thread the daemon spawns and joins within the landing (`crates/land/src/os.rs`), gone before
+  // `threads_of` read `/proc/<pid>/task`. Grow the daemon's seed with the threads the trace's own
+  // `clone`/`clone3` returns name, so a transient barrier thread's write of a staged file is the
+  // landing's and not a stranger's; elsewhere (eslogger names processes, not threads) the seed stands.
+  let writers = match run.os {
+    HostOs::Linux => slates_conformance::trace::strace_thread_group(&text, &landed.writers),
+    _ => landed.writers.clone(),
+  };
+  // The tracer's namespace's mounts (Linux): a write's backing filesystem is known by what is mounted at
+  // its path, never by its spelling (the dump exclusion writes `/proc/self/coredump_filter`; AUD-29-41).
+  let mount_table = match run.os {
+    HostOs::Linux => slates_conformance::trace::parse_mountinfo(
+      &std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| Failure(format!("reading /proc/self/mountinfo: {e}")))?,
+    ),
+    _ => Vec::new(),
+  };
+  let mounts: Vec<slates_conformance::trace::Mount<'_>> = mount_table
+    .iter()
+    .map(|(point, fstype)| slates_conformance::trace::Mount { point, fstype })
+    .collect();
+  let policy = Policy {
+    target: &target.display().to_string(),
+    working_directory: &cwd,
+    landing: Some(Landing {
+      writers: &writers,
+      from_ns: landed.from_ns,
+      until_ns: landed.until_ns,
+    }),
+    mounts: &mounts,
+    // The daemon that lands is the daemon that bound its socket node at start: one process, one lifecycle.
+    socket_node: socket_node.as_deref().map(|path| SocketNode {
+      path,
+      owners: &writers,
+    }),
+  };
+  let judged = judge(&events, &policy);
+  // The anchor's log is the harness's own file: the slates processes write their stderr to a pipe the
+  // harness drains (AUD-29-42), so the log is named here only for a failure's diagnosis.
+  let _ = &anchor_log;
+  let hidden_verdict = judge_hidden(
+    &judged.written_inside,
+    &tree_under(&target)?,
+    landed.landing,
+  );
+  let unnamed = strace_unnamed_paths(&text);
+  let mut matched = 0u32;
+  let mut unmatched = Vec::new();
+  let mut hidden = 0u32;
+  for path in &judged.written_inside {
+    if unnamed
+      .iter()
+      .any(|unnamed| unnamed == &format!("{}/{path}", target.display()))
+      || path
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(HIDDEN_PREFIX))
+    {
+      hidden += 1;
+    } else if expected.contains(path) {
+      matched += 1;
+    } else {
+      unmatched.push(path.clone());
+    }
+  }
+  let complete = usize::try_from(written).ok() == Some(expected.len())
+    && usize::try_from(matched).ok() == Some(expected.len())
+    && verified.is_ok();
+  let ok = complete
+    && judged.outside == 0
+    && judged.unresolved == 0
+    && unmatched.is_empty()
+    && hidden_verdict.is_ok();
+  let mut notes = vec![
+    format!(
+      "tracer: {}; {} events parsed from {} log lines; landing reported {written} written; {hidden} hidden siblings ({HIDDEN_PREFIX}*) seen inside the target",
+      match run.os {
+        HostOs::Linux => format!("strace -f -y -qq -s 0 -e {STRACE_TRACE} -- <anchor>"),
+        _ => format!(
+          "sudo eslogger {} (kept: events of the slates binary)",
+          ES_EVENTS.join(" ")
+        ),
+      },
+      events.len(),
+      text.lines().count()
+    ),
+    broker_note(&set_aside),
+    format!("the granted target: {}", target.display()),
+    format!(
+      "the granted landing {:016x}: the daemon's traced thread ids {:?} (its live threads at the landing, grown by the trace's clone/clone3 with any it spawned for the landing), {} ns to {} ns (wall clock); hidden names: {hidden_verdict:?}",
+      landed.landing, writers, landed.from_ns, landed.until_ns
+    ),
+    format!(
+      "volume quota: {size} bytes, derived from {inode_count} peak workload entries × {page}-byte host page"
+    ),
+    format!(
+      "landing completeness: {written}/{} entries reported; disk verification: {verified:?}",
+      expected.len()
+    ),
+  ];
+  notes.extend(session.size_note.clone());
+  notes.extend(trace_note);
+  notes.extend(workload_notes);
+  if !unmatched.is_empty() {
+    notes.push(format!(
+      "inside-target paths not among the landed entries: {}",
+      unmatched.join(", ")
+    ));
+  }
+  for violation in &judged.violations {
+    notes.push(format!(
+      "VIOLATION line {}: {} {} (pid {:?}, at {:?} ns): {}",
+      violation.event.line,
+      violation.event.call,
+      violation.event.path,
+      violation.event.pid,
+      violation.event.at_ns,
+      violation.reason
+    ));
+  }
+  if !judged.unresolved_sample.is_empty() {
+    notes.push(format!(
+      "unresolved sample: {}",
+      judged
+        .unresolved_sample
+        .iter()
+        .map(|e| format!("{}:{} {}", e.line, e.call, e.path))
+        .collect::<Vec<_>>()
+        .join("; ")
+    ));
+  }
+  let kept = run.scratch.path().join("trace-judgement.txt");
+  write_file(&kept, format!("{judged:#?}").as_bytes())?;
+  let counts = judged.counts(matched, u32::try_from(unmatched.len()).unwrap_or(u32::MAX));
+  Ok(SuiteResult {
+    privilege: super::suites::this_user().privilege(),
+    outcome: match run.adapter(Suite::Hermeticity) {
+      Some((adapter, not_covered)) => Outcome::Limited {
+        adapter,
+        not_covered,
+        counts,
+      },
+      None => Outcome::Ran { counts },
+    },
+    command: match run.os {
+      HostOs::Linux if run.transport == Transport::OciLinux => format!(
+        "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e {STRACE_TRACE} -- slates --instance <i> anchor --quick --shards 2; then create, mount --shared, attach --oci, oci-check, `docker run --mount <the binding> sh -c '{MOUNT_WORKLOAD}'` inside the bind, snapshot, land, grant, land --grant"
+      ),
+      HostOs::Linux => format!(
+        "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e {STRACE_TRACE} -- slates --instance <i> anchor --quick --shards 2; then create, mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"
+      ),
+      _ => format!(
+        "sudo eslogger {} (events of the slates binary); slates anchor/volume create/mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant",
+        ES_EVENTS.join(" ")
+      ),
+    },
+    bound: "one lifecycle: one volume, one mount; known workload bytes/kinds and the entire mounted tree, including client metadata, landed and verified".to_owned(),
+    expected_failure_list: None,
+    notes,
+    ok,
+  })
+}
+
+/// Drives the traced workload: on the Linux container transport inside a container over the session's bind (the
+/// container's own processes are the runtime's, not traced; every write the slates processes make for them is),
+/// else on the mount directly. The notes the record carries for it.
+fn drive_workload(
+  run: &Run<'_>,
+  session: &Session,
+  work: &Path,
+  (size, inode_count, page): (&str, usize, u64),
+) -> Result<Vec<String>, Failure> {
+  if run.transport == Transport::OciLinux {
+    let (profile, command) = super::container::run_in_bind(session, "traced", MOUNT_WORKLOAD)?;
+    return Ok(vec![
+      format!("the runtime's profile (`slates oci-runtime docker`): {profile}"),
+      format!("the workload ran inside a container: {command}"),
+    ]);
+  }
+  let workload = Command::new("sh")
+    .args(["-c", MOUNT_WORKLOAD])
+    .current_dir(work)
+    .output()?;
+  if workload.status.success() {
+    return Ok(Vec::new());
+  }
+  let inspection = match Command::new("ls").arg("-laR").arg(work).output() {
+    Ok(output) => format!(
+      "{}\n{}\n{}",
+      output.status,
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr),
+    ),
+    Err(error) => format!("listing the failed workload: {error}"),
+  };
+  Err(Failure(format!(
+    "the mount workload failed (quota {size} bytes, {inode_count} peak entries × {page}-byte page): {}\nmounted tree: {inspection}",
+    String::from_utf8_lossy(&workload.stderr),
+  )))
+}
+
+/// The log path a run used (for a caller that keeps the scratch).
+#[allow(dead_code)]
+pub(crate) fn log_path(scratch: &Path) -> PathBuf {
+  scratch.join("trace.log")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// AC-4.5: the eslogger pre-filter finds the binary in a line as eslogger prints it, every `/`
+  /// escaped (the 2026-09-26 run's raw lines), and reads the client sequence without parsing.
+  #[test]
+  fn an_escaped_eslogger_line_names_its_binary_and_its_sequence() {
+    let line = r#"{"global_seq_num":16705,"process":{"executable":{"path":"\/Users\/u\/target\/debug\/slates"}},"event":{"close":{"modified":false}}}"#;
+    assert!(names_binary(line, "/Users/u/target/debug/slates"));
+    assert!(!names_binary(line, "/Users/u/target/debug/slat"));
+    assert!(names_binary(
+      r#"{"path":"/Users/u/target/debug/slates"}"#,
+      "/Users/u/target/debug/slates"
+    ));
+    assert_eq!(global_seq(line), Some(16705));
+    assert_eq!(global_seq("not json"), None);
+    let parsed: serde_json::Value = serde_json::from_str(line).expect("the line is JSON");
+    assert_eq!(
+      parsed["process"]["executable"]["path"].as_str(),
+      Some("/Users/u/target/debug/slates"),
+      "the exact check after the byte search sees the unescaped path"
+    );
+  }
+
+  /// AC-9.7 (the hermeticity tracer): the stop waits for the drain marker's own event, not for the log
+  /// to grow. Do: a log whose newest line is a lagging event of the daemon (CI run 36275755772's last
+  /// kept line, the landing plan's close), then the same log with the marker's event appended. Expect:
+  /// the first is not caught up for the marker's pid, the second is; a line that is not an event never
+  /// counts.
+  #[test]
+  fn the_eslogger_stop_waits_for_the_markers_own_event() {
+    let daemon_close = r#"{"global_seq_num":9325,"process":{"audit_token":{"pid":76534},"executable":{"path":"\/w\/slates"}},"event":{"close":{"modified":false}}}"#;
+    let marker_open = r#"{"global_seq_num":9340,"process":{"audit_token":{"pid":76710},"executable":{"path":"\/w\/slates"}},"event":{"open":{}}}"#;
+    let lagging = format!("{daemon_close}\n");
+    assert!(
+      !has_event_of_process(&lagging, 76710),
+      "a lagging event of another process is not the marker's arrival"
+    );
+    let caught_up = format!("{daemon_close}\n{marker_open}\n");
+    assert!(has_event_of_process(&caught_up, 76710));
+    assert!(!has_event_of_process(
+      "torn {\"process\":{\"audit_token\":{\"pid\":76710",
+      76710
+    ));
+  }
+
+  /// Shape: how long the stop may take in the held-stream history: the tracer's own exit bound
+  /// ([`MOUNT_WAIT`]) twice over, far past a stop that does not wait on the stream's end.
+  #[cfg(unix)]
+  const STOP_BOUND: std::time::Duration = MOUNT_WAIT.saturating_mul(2);
+
+  /// Signals the fixture's process group directly (the tests run no privileged tracer).
+  #[cfg(unix)]
+  fn fixture_signal(pid: u32, signal: StopSignal) -> Result<(), Failure> {
+    let group = rustix::process::Pid::from_raw(i32::try_from(pid).expect("fixture pid"))
+      .expect("positive fixture pid");
+    let signal = match signal {
+      StopSignal::Interrupt => rustix::process::Signal::TERM,
+      StopSignal::Kill => rustix::process::Signal::KILL,
+    };
+    rustix::process::kill_process_group(group, signal)
+      .map_err(|error| Failure(format!("signalling the fixture: {error}")))
+  }
+
+  /// AC-9.7 (the hermeticity tracer): the stop returns once the tracer itself has stopped, even when a
+  /// descendant that outlives the stop signal keeps the tracer's stream open. Do: a stand-in tracer that
+  /// writes one event, leaves a descendant ignoring the stop signal and holding its stdout, and exits on
+  /// the stop signal; stop it through the tracer's own shutdown. Expect: the shutdown returns within
+  /// twice the tracer's exit bound, successfully. Until 2026-09-30 the filter ended only at the stream's
+  /// end and the shutdown joined it unbounded: CI run 36655388624's macOS conformance job hung 74
+  /// minutes in that join, after the trace was complete.
+  #[cfg(unix)]
+  #[test]
+  fn the_tracer_shutdown_returns_while_a_descendant_holds_its_stream_open() {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    // The descendant says on stderr once it ignores the stop signal, so the stop cannot race its trap.
+    let mut child = Command::new("sh")
+      .args([
+        "-c",
+        r#"(trap '' TERM; echo held >&2; exec sleep 600) & trap 'exit 0' TERM; printf '{"global_seq_num":1}\n'; while :; do sleep 1; done"#,
+      ])
+      .stdin(Stdio::null())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .process_group(0)
+      .spawn()
+      .expect("spawn the stand-in tracer");
+    let group = child.id();
+    let stdout = child.stdout.take().expect("the stand-in's stdout");
+    // The stand-in's stderr stays open to the end, as the real tracer's (a file) does: the shell reports
+    // its foreground child's death there on the stop (dash: `Terminated`), and a closed pipe would kill
+    // it with SIGPIPE instead of letting it exit on the stop signal (20 of 20 runs as a non-root user).
+    let mut report = std::io::BufReader::new(child.stderr.take().expect("the stand-in's stderr"));
+    let mut held = String::new();
+    report.read_line(&mut held).expect("the descendant reports");
+    assert_eq!(held, "held\n", "the descendant holds the stream");
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let filter = std::thread::spawn(move || {
+      keep_slates_events(stdout, std::io::sink(), "/the/slates/binary", &stopped)
+    });
+    let logger = EsLogger {
+      process: TraceProcess::new(child, fixture_signal, MOUNT_WAIT),
+      filter: Some(filter),
+      stop: Some(stop),
+      errors: PathBuf::new(),
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+      let _ = done.send(
+        logger
+          .shut_down(Ok(()))
+          .map(|_| ())
+          .map_err(|error| error.0),
+      );
+    });
+    let outcome = finished.recv_timeout(STOP_BOUND);
+    // The descendant ignores the stop signal: end it (and with it the stream) whatever happened.
+    let _ = fixture_signal(group, StopSignal::Kill);
+    shutdown
+      .join()
+      .expect("the shutdown thread ends once the stream closes");
+    assert_eq!(
+      outcome,
+      Ok(Ok(())),
+      "the shutdown must return, successfully, while the descendant holds the stream open"
+    );
+    drop(report);
+  }
+
+  use slates_conformance::workload::{Entry, EntryKind};
+
+  /// AC-4.5: client-generated entries must land with the same names, kinds, modes and bytes.
+  #[test]
+  fn landing_cannot_drop_add_or_change_a_client_metadata_file() {
+    let mounted = Manifest {
+      entries: vec![Entry {
+        path: "._file".to_owned(),
+        kind: EntryKind::File,
+        mode: 0o600,
+        size: 4,
+        digest: blake3::hash(b"meta").to_hex().to_string(),
+      }],
+    };
+    assert!(verify_manifest(&mounted, &mounted).is_ok());
+    assert!(
+      verify_manifest(&mounted, &Manifest::default()).is_err(),
+      "missing metadata"
+    );
+    assert!(
+      verify_manifest(&Manifest::default(), &mounted).is_err(),
+      "extra metadata"
+    );
+    let mut changed = mounted.clone();
+    changed.entries[0].digest = blake3::hash(b"lost").to_hex().to_string();
+    assert!(
+      verify_manifest(&mounted, &changed).is_err(),
+      "changed metadata bytes"
+    );
+  }
+}

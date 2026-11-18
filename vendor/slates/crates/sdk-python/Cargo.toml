@@ -1,0 +1,32 @@
+[package]
+name = "slates-sdk-python"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+# maturin copies the crate metadata into the wheel and the sdist (docs/publish.md).
+repository = "https://github.com/hyper-light/slates"
+description = "The Python SDK (§2.3, D-19; Phase 5): a PyO3 extension over the typed `slates-client`, exposing the lifecycle verbs as methods and mapping typed refusals to Python exceptions. Async-primary: `AsyncClient` resolves each verb on a real asyncio loop by the completion fd's readiness (`loop.add_reader`, no tokio/pyo3-asyncio); the sync `Client` is the thin blocking facade."
+
+[lib]
+# The Python extension module is a cdylib; `slates` is the imported name (the `#[pymodule]` and the
+# `module-name` in pyproject.toml say the same), and `slates` is the PyPI project (§2.4).
+name = "slates"
+crate-type = ["cdylib"]
+
+[features]
+# Forwards blake3's pure-Rust backend so the extension cross-lints for a Windows target from a host
+# with no MSVC assembler (the maturin build on the native Windows runner uses the SIMD C path). Off
+# by default.
+pure-hash = ["slates-client/pure-hash"]
+
+[dependencies]
+slates-client = { workspace = true }
+slates-wire = { workspace = true }
+# The PyO3 binding (D-19: "PyO3 SDK with fd completion"). abi3-py39 so one wheel serves every
+# CPython >= 3.9; `extension-module` so the build does not link libpython (the interpreter provides it).
+pyo3 = { version = "0.22", features = ["abi3-py39", "extension-module"] }
+
+[lints]
+workspace = true

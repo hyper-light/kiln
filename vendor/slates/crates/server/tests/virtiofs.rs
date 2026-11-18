@@ -1,0 +1,3693 @@
+//! The daemon serves a guest device on a volume it provisioned (§4.6 A-9, D-2, RQ-20 "host
+//! processes, OCI containers and Linux microVM guests can consume the same VFS"; AC-4.11/T-4.13's
+//! guest leg, AC-4.12): a single-shard daemon is started, a client provisions a volume through the
+//! real rendezvous, the harness attaches a guest device to it over an in-process seam whose
+//! doorbell is a pipe, and a simulated guest driver on the volume's owning shard creates a file,
+//! writes bytes and releases it through real virtqueues; then — over the daemon's own NFS loopback
+//! port, the host mount path — a client mounts the same volume and reads the guest's bytes back.
+//! One VFS, two transports, byte for byte. A second guest whose consumer is not on the volume's
+//! access list is admitted (authenticated) but every effect is refused by the seam (§4.13).
+// Test harness code: an unwrap here is a failed test.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
+// The guest transport rides the runtime's Unix descriptor readiness.
+#![cfg(unix)]
+
+use std::net::TcpStream;
+use std::sync::mpsc::channel;
+use std::time::{Duration, Instant};
+
+use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+use slates_bridge_fuse::reply::EntryOut;
+use slates_bridge_virtiofs::admission::GuestTransport;
+use slates_bridge_virtiofs::serve::EndReason;
+use slates_db::catalog::Principal;
+use slates_ipc::protocol::{
+  Direction, NamePolicy, ReplyBody, RequestBody, SizeClass, pack, unpack,
+};
+use slates_ipc::{ClientEnd, IpcError, connect};
+use slates_server::virtiofs::{GuestDeviceOutcome, guest_transport_capabilities};
+use slates_server::{Daemon, DaemonConfig, SegmentSource};
+use slates_wire::request::RequestId;
+
+mod common;
+use common::anchor::{held_anchor, source_of};
+use common::guest::{
+  create_body, flush_body, message, my_uid, release_body, reply_error, round_trip, run_guest,
+  run_guest_viewing, u64_at, write_body,
+};
+use common::nfs::{lookup, mount, read};
+
+/// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
+const DEADLINE_NS: u64 = 5_000_000_000;
+/// Shape: how long a client waits for the daemon or a full ring before giving up.
+const CREDIT_WAIT: Duration = Duration::from_secs(5);
+/// Format: `EPERM`.
+const EPERM: i32 = 1;
+/// Format: Linux `EROFS`, a read-only file system's answer to any change: a snapshot device's.
+const EROFS: i32 = 30;
+/// The bytes the guest writes and the host reads back.
+const PAYLOAD: &[u8] = b"written by a guest through virtqueues, read back by the host over NFS\n";
+
+// --- The client side of the daemon's own rendezvous (as in tests/nfs_mount.rs). ---
+
+struct Client {
+  end: ClientEnd,
+  client: u32,
+  sequence: u32,
+}
+
+impl Client {
+  fn connect(instance: &str) -> Client {
+    let started = Instant::now();
+    loop {
+      match connect(instance) {
+        Ok(connected) => {
+          let client = connected.region.client_id();
+          return Client {
+            end: ClientEnd::connected(connected),
+            client,
+            sequence: 0,
+          };
+        }
+        Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
+          std::hint::spin_loop();
+        }
+        Err(e) => panic!("{e}"),
+      }
+    }
+  }
+
+  fn call(&mut self, body: &RequestBody) -> ReplyBody {
+    self.sequence += 1;
+    let id = RequestId {
+      client: self.client,
+      sequence: self.sequence,
+    };
+    let index = self.end.next_request_index();
+    let slot = pack(
+      self.end.region_mut(),
+      Direction::Request,
+      index,
+      id.word(),
+      body,
+    )
+    .unwrap();
+    let started = Instant::now();
+    loop {
+      match self.end.send(&slot) {
+        Ok(()) => break,
+        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::hint::spin_loop(),
+        Err(e) => panic!("{e}"),
+      }
+    }
+    let reply = self.end.wait(Some(DEADLINE_NS)).unwrap();
+    unpack(self.end.region(), reply.kind, &reply.payload).unwrap()
+  }
+}
+
+fn single_shard_daemon(name: &str) -> (Daemon, String) {
+  let profile = common::machine_profile();
+  let instance = format!("srv-{name}-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", name),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  (daemon, instance)
+}
+
+fn scratch(name: &str) -> RequestBody {
+  RequestBody::Create {
+    name: name.to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }
+}
+
+/// RQ-20 by use: a guest creates, writes and releases a file through virtqueues on a
+/// daemon-provisioned volume; the host reads the same bytes back over the daemon's NFS mount path;
+/// the device loop ended through the terminal step when the guest hung up; the daemon's
+/// capability report offers the in-process transport and never DAX.
+#[test]
+fn a_guest_writes_a_file_into_a_daemon_volume_that_the_host_reads_back_over_nfs() {
+  let (daemon, instance) = single_shard_daemon("virtiofs");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("guest")) else {
+    panic!("the volume was not created");
+  };
+
+  let (outcome, errors) = run_guest(
+    &daemon,
+    id,
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
+    |kick_write, call_read| {
+      Box::pin(async move {
+        let created = round_trip(
+          &kick_write,
+          &call_read,
+          &message(
+            Opcode::Create.to_wire(),
+            1,
+            1,
+            &create_body("from-guest.txt"),
+          ),
+        )
+        .await;
+        let ino = u64_at(&created, OUT_HEADER_LEN);
+        let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+        let written = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Write.to_wire(), 2, ino, &write_body(fh, PAYLOAD)),
+        )
+        .await;
+        let released = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Release.to_wire(), 3, ino, &release_body(fh)),
+        )
+        .await;
+        drop(kick_write);
+        (
+          reply_error(&created),
+          reply_error(&written),
+          reply_error(&released),
+        )
+      })
+    },
+  );
+  assert_eq!(
+    errors,
+    (0, 0, 0),
+    "create, write and release succeeded in the guest"
+  );
+  let GuestDeviceOutcome::Ended(end) = outcome else {
+    panic!("the device did not serve: {outcome:?}");
+  };
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  assert!(
+    end.passes >= 3,
+    "one pass per request at least: {}",
+    end.passes
+  );
+  assert!(
+    end
+      .reclaimed
+      .expect("the terminal step ran")
+      .references_swept
+  );
+
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  // Every mount presents a capability (AUD-01); the daemon mints the owner's for the test.
+  let capability = daemon
+    .mount_capability("guest")
+    .expect("the owner shard answers")
+    .expect("the guest volume is served");
+  let root = mount(&mut stream, &capability, 1);
+  let file = lookup(&mut stream, &root, "from-guest.txt", 2);
+  let got = read(&mut stream, &file, 3);
+  assert_eq!(
+    got, PAYLOAD,
+    "the host reads back over NFS the bytes the guest wrote through virtqueues"
+  );
+
+  let capabilities = guest_transport_capabilities();
+  assert!(
+    capabilities
+      .iter()
+      .any(|c| c.transport == GuestTransport::InProcess && c.supported)
+  );
+  assert!(
+    capabilities.iter().all(|c| c.dax.advertised
+      == (c.transport == GuestTransport::InheritedDescriptor && cfg!(target_os = "linux"))),
+    "DAX is offered by the vhost-user binding where it is built, and by nothing else"
+  );
+
+  drop(stream);
+  drop(client);
+  drop(daemon);
+}
+
+/// §4.13: a guest whose enrolled consumer is not on the volume's access list is authenticated and
+/// admitted with no rights, so its every effect is refused at the seam — a CREATE through the
+/// device is answered `EPERM`, and nothing lands in the volume.
+#[test]
+fn a_guest_whose_consumer_has_no_rights_is_refused_every_effect() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-foreign");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("guest")) else {
+    panic!("the volume was not created");
+  };
+  let foreign = Principal::Uid {
+    host: slates_db::HostId(common::this_host()),
+    uid: my_uid().wrapping_add(1),
+  };
+  let (outcome, error) = run_guest(&daemon, id, foreign, |kick_write, call_read| {
+    Box::pin(async move {
+      let created = round_trip(
+        &kick_write,
+        &call_read,
+        &message(Opcode::Create.to_wire(), 1, 1, &create_body("intruder.txt")),
+      )
+      .await;
+      drop(kick_write);
+      reply_error(&created)
+    })
+  });
+  assert_eq!(
+    error, -EPERM,
+    "the access list refused the foreign consumer's create"
+  );
+  assert!(matches!(outcome, GuestDeviceOutcome::Ended(_)));
+  drop(client);
+  drop(daemon);
+}
+
+/// AUD-29-82 (D-18, §4.8). Do: under a daemon whose anchor segment the test holds, a guest creates a file,
+/// writes bytes and closes it (FLUSH, then RELEASE) through virtqueues, every reply a success; stop the daemon
+/// — a stop publishes nothing — and start a second one over the same segment. Expect: the second daemon reads
+/// back the guest's bytes over NFS, because the guest learned of the CREATE and the FLUSH only after the
+/// owner's barrier captured the volume; the first daemon refused no barrier. Before, the guest path never
+/// published, so the acknowledged file was lost at the restart.
+#[test]
+fn a_guests_acknowledged_close_survives_a_daemon_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-guest-durable-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("guest-durable", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("durable")) else {
+    panic!("the volume was not created");
+  };
+  let (outcome, errors) = run_guest(
+    &first,
+    id,
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
+    |kick_write, call_read| {
+      Box::pin(async move {
+        let created = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Create.to_wire(), 1, 1, &create_body("kept.txt")),
+        )
+        .await;
+        let ino = u64_at(&created, OUT_HEADER_LEN);
+        let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+        let mut errors = vec![reply_error(&created)];
+        for (unique, opcode, body) in [
+          (2, Opcode::Write, write_body(fh, PAYLOAD)),
+          (3, Opcode::Flush, flush_body(fh)),
+          (4, Opcode::Release, release_body(fh)),
+        ] {
+          let reply = round_trip(
+            &kick_write,
+            &call_read,
+            &message(opcode.to_wire(), unique, ino, &body),
+          )
+          .await;
+          errors.push(reply_error(&reply));
+        }
+        drop(kick_write);
+        errors
+      })
+    },
+  );
+  assert_eq!(
+    errors,
+    [0, 0, 0, 0],
+    "create, write, flush and release succeeded"
+  );
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::Ended(_)),
+    "{outcome:?}"
+  );
+  let refusals = first.refusals_on_every_shard().unwrap();
+  assert_eq!(
+    refusals.get("virtiofs.barrier_refused"),
+    None,
+    "{refusals:?}"
+  );
+  drop(client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let capability = second
+    .mount_capability("durable")
+    .expect("the owner shard answers")
+    .expect("the volume was recovered");
+  let port = second.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let file = lookup(&mut stream, &root, "kept.txt", 2);
+  assert_eq!(
+    read(&mut stream, &file, 3),
+    PAYLOAD,
+    "the bytes the guest closed survived the restart"
+  );
+  drop(stream);
+  second.stop();
+  drop(anchor);
+}
+
+/// Shape: heartbeats the guest watches its requests after the revocation — several of the loop's pass
+/// boundaries, so a loop that went on serving would have answered them.
+const REVOKED_WATCH_HEARTBEATS: u64 = 5;
+
+/// AUD-29-73 (§4.13 "every later effect"). Do: the human enrolls a consumer and shares a volume with it; a
+/// guest authenticated as that consumer reads through its device; the human revokes the consumer; the guest
+/// then submits a read and a create and watches them for several heartbeats. Expect: the first read answered;
+/// `Revoked` acknowledged; neither later request answered; the device loop ended `Revoked` through its terminal
+/// step, its references swept. Before, the revocation marked only the consumer's channels, and the device went
+/// on serving.
+#[test]
+fn a_consumers_revocation_stops_its_guest_device() {
+  let (daemon, instance) = single_shard_daemon("guest-revoke");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = my_uid();
+  let mut owner = Client::connect(&instance);
+  let ReplyBody::Enrolled { consumer, .. } = owner.call(&RequestBody::Enroll {
+    account,
+    proof: slates_server::landing::enroll_proof(&secret, account),
+  }) else {
+    panic!("the consumer was not enrolled");
+  };
+  let ReplyBody::Created { id } = owner.call(&scratch("guest-revoked")) else {
+    panic!("the volume was not created");
+  };
+  assert!(matches!(
+    owner.call(&RequestBody::Share {
+      volume: id,
+      principal: slates_ipc::protocol::Principal::Consumer {
+        host: common::this_host(),
+        account,
+        consumer,
+      },
+      rights: slates_ipc::protocol::Rights {
+        read: true,
+        write: true,
+        admin: false
+      },
+    }),
+    ReplyBody::Shared
+  ));
+  let (first_tx, first_rx) = channel::<i32>();
+  let (revoked_tx, revoked_rx) = channel::<()>();
+  let guest = common::guest::start_guest(
+    &daemon,
+    id,
+    Principal::Consumer {
+      host: slates_db::HostId(common::this_host()),
+      account,
+      consumer,
+    },
+    slates_server::virtiofs::GuestView::default(),
+    move |kick_write, call_read| {
+      Box::pin(async move {
+        let first = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::GetAttr.to_wire(), 1, 1, &[0u8; 16]),
+        )
+        .await;
+        let _ = first_tx.send(reply_error(&first));
+        while revoked_rx.try_recv().is_err() {
+          slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS)
+            .await
+            .unwrap();
+        }
+        common::guest::with_guest(|g| {
+          g.submit(
+            &message(Opcode::GetAttr.to_wire(), 2, 1, &[0u8; 16]),
+            common::guest::REPLY_CAP,
+          );
+          g.submit(
+            &message(Opcode::Create.to_wire(), 3, 1, &create_body("after-revoke")),
+            common::guest::REPLY_CAP,
+          );
+        });
+        let _ = rustix::io::write(&kick_write, &[1u8]);
+        slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS * REVOKED_WATCH_HEARTBEATS)
+          .await
+          .unwrap();
+        let answered = common::guest::with_guest(|g| g.reap()).is_some();
+        drop(kick_write);
+        answered
+      })
+    },
+  );
+  let first = first_rx.recv_timeout(common::guest::WAIT);
+  let revoked = owner.call(&RequestBody::Revoke {
+    consumer,
+    proof: slates_server::landing::revoke_proof(&secret, consumer),
+  });
+  let _ = revoked_tx.send(());
+  let answered = guest.script.recv_timeout(common::guest::WAIT);
+  let outcome = guest.end.recv_timeout(common::guest::WAIT);
+  drop(owner);
+  drop(daemon);
+  assert_eq!(
+    first,
+    Ok(0),
+    "the consumer's guest read before the revocation"
+  );
+  assert_eq!(revoked, ReplyBody::Revoked);
+  assert_eq!(
+    answered,
+    Ok(false),
+    "no request answered after the revocation"
+  );
+  let Ok(GuestDeviceOutcome::Ended(end)) = outcome else {
+    panic!("the device loop did not end: {outcome:?}");
+  };
+  assert_eq!(end.why, EndReason::Revoked);
+  assert!(
+    end.reclaimed.as_ref().is_ok_and(|r| r.references_swept),
+    "{end:?}"
+  );
+}
+
+/// Format: `ENOENT`.
+const ENOENT: i32 = 2;
+
+/// A LOOKUP of `name` in node `parent`: the request bytes.
+fn lookup_message(unique: u64, parent: u64, name: &str) -> Vec<u8> {
+  let mut body = name.as_bytes().to_vec();
+  body.push(0);
+  message(Opcode::Lookup.to_wire(), unique, parent, &body)
+}
+
+/// A GETATTR of node `node` (`fuse_getattr_in`: flags, a padding word, fh — all zero).
+fn getattr_message(unique: u64, node: u64) -> Vec<u8> {
+  message(Opcode::GetAttr.to_wire(), unique, node, &[0u8; 16])
+}
+
+/// The inode an NFS handle names.
+fn inode_of(fh: &[u8]) -> u64 {
+  use slates_bridge_nfs::handle::FileHandle;
+  FileHandle::from_fh(&slates_bridge_nfs::nfs::Nfsfh3(fh.to_vec()))
+    .unwrap()
+    .inode
+}
+
+/// Through the owner's NFS mount of volume `name`: `shared/g` and `private/secret`, `f` holding `before`;
+/// a snapshot taken; then `f` rewritten `after!!`. The snapshot and `private`'s inode.
+fn shared_private_and_a_snapshot(
+  daemon: &Daemon,
+  client: &mut Client,
+  id: slates_ipc::protocol::VolumeId,
+  name: &str,
+) -> (slates_ipc::protocol::SnapshotId, u64) {
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability(name).unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let shared = common::nfs::mkdir(&mut stream, &root, "shared", 2);
+  let private = common::nfs::mkdir(&mut stream, &root, "private", 3);
+  common::nfs::create(&mut stream, &shared, "g", 4);
+  common::nfs::create(&mut stream, &private, "secret", 5);
+  let file = common::nfs::create(&mut stream, &root, "f", 6);
+  common::nfs::write(&mut stream, &file, b"before", 7);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot");
+  };
+  common::nfs::write(&mut stream, &file, b"after!!", 8);
+  (snapshot, inode_of(&private))
+}
+
+/// The errors a scoped guest meets: LOOKUP `g` at its root, LOOKUP `private` there, GETATTR of `private`'s
+/// inode named directly.
+async fn scoped_guest_script(
+  kick_write: std::os::fd::OwnedFd,
+  call_read: std::os::fd::OwnedFd,
+  private: u64,
+) -> (i32, i32, i32) {
+  let inside = round_trip(&kick_write, &call_read, &lookup_message(1, 1, "g")).await;
+  let sibling = round_trip(&kick_write, &call_read, &lookup_message(2, 1, "private")).await;
+  let forged = round_trip(&kick_write, &call_read, &getattr_message(3, private)).await;
+  drop(kick_write);
+  (
+    reply_error(&inside),
+    reply_error(&sibling),
+    reply_error(&forged),
+  )
+}
+
+/// What a snapshot guest meets: `f`'s size at its root, and the error of a CREATE.
+async fn snapshot_guest_script(
+  kick_write: std::os::fd::OwnedFd,
+  call_read: std::os::fd::OwnedFd,
+) -> (i32, u64, i32) {
+  let found = round_trip(&kick_write, &call_read, &lookup_message(1, 1, "f")).await;
+  let created = round_trip(
+    &kick_write,
+    &call_read,
+    &message(Opcode::Create.to_wire(), 2, 1, &create_body("new")),
+  )
+  .await;
+  drop(kick_write);
+  // EntryOut: nodeid, generation, two validities, two nanosecond words (40 bytes), then fuse_attr: ino, size.
+  let size = u64_at(&found, OUT_HEADER_LEN + 48);
+  (reply_error(&found), size, reply_error(&created))
+}
+
+/// AUD-29-76 (a guest's view). Do: make `shared/g`, `private/secret` and `f` (`before`), snapshot, rewrite `f`
+/// `after!!`; attach one guest device presenting `/shared` and another presenting the snapshot. Through the
+/// scoped device look up `g` and `private` at its root and GETATTR `private`'s inode directly; through the
+/// snapshot device look up `f` and CREATE a file; ask for a subtree of a snapshot. Expect: the scoped device
+/// finds `g` and answers `ENOENT` for `private` both ways; the snapshot device sees `f` at the snapshot's six
+/// bytes, not the head's seven, and refuses the CREATE (`EROFS`, a read-only file system's); a subtree of a snapshot is refused typed with
+/// nothing admitted. Before 2026-10-01 a guest device presented only the volume's head, whole.
+#[test]
+fn a_guest_device_presents_a_subtree_or_a_snapshot_and_nothing_else() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-view");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("viewed")) else {
+    panic!("the volume was not created");
+  };
+  let (snapshot, private) = shared_private_and_a_snapshot(&daemon, &mut client, id, "viewed");
+  let me = Principal::Uid {
+    host: slates_db::HostId(common::this_host()),
+    uid: my_uid(),
+  };
+  let subtree = slates_server::virtiofs::GuestView {
+    subtree: Some("/shared".to_owned()),
+    snapshot: None,
+  };
+  let (outcome, errors) = run_guest_viewing(&daemon, id, me.clone(), subtree, move |kick, call| {
+    Box::pin(scoped_guest_script(kick, call, private))
+  });
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::Ended(_)),
+    "{outcome:?}"
+  );
+  assert_eq!(errors, (0, -ENOENT, -ENOENT), "g found; private nowhere");
+  assert_the_snapshot_device_is_read_only(&daemon, id, me.clone(), snapshot);
+  let both = slates_server::virtiofs::GuestView {
+    subtree: Some("/shared".to_owned()),
+    snapshot: Some(snapshot),
+  };
+  let (outcome, ()) = run_guest_viewing(&daemon, id, me, both, |kick, _call| {
+    Box::pin(async move { drop(kick) })
+  });
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::ViewRefused(_)),
+    "{outcome:?}"
+  );
+  assert!(
+    matches!(
+      client.call(&RequestBody::DestroySnapshot {
+        volume: id,
+        snapshot
+      }),
+      ReplyBody::SnapshotDestroyed
+    ),
+    "every guest view closed with its device, unpinning the snapshot"
+  );
+  drop(client);
+  drop(daemon);
+}
+
+/// A guest device presenting `snapshot` of volume `id` finds `f` at the snapshot's six bytes, not the head's
+/// seven, and its CREATE is refused `EROFS`.
+fn assert_the_snapshot_device_is_read_only(
+  daemon: &Daemon,
+  id: slates_ipc::protocol::VolumeId,
+  me: Principal,
+  snapshot: slates_ipc::protocol::SnapshotId,
+) {
+  let pinned = slates_server::virtiofs::GuestView {
+    subtree: None,
+    snapshot: Some(snapshot),
+  };
+  let (outcome, (found, size, created)) =
+    run_guest_viewing(daemon, id, me, pinned, |kick, call| {
+      Box::pin(snapshot_guest_script(kick, call))
+    });
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::Ended(_)),
+    "{outcome:?}"
+  );
+  assert_eq!(
+    (found, size),
+    (0, 6),
+    "the snapshot's `before`, not the head"
+  );
+  assert_eq!(
+    created, -EROFS,
+    "a snapshot device writes nothing, as a read-only file system"
+  );
+}
+
+/// The vhost-user front end the tests below speak (`common/vhost_front_end.rs`). Linux only.
+#[cfg(target_os = "linux")]
+use common::vhost_front_end;
+
+/// Shape: the test front end's handshake bound: it configures the rings at once, so its own reply wait.
+#[cfg(target_os = "linux")]
+const HANDSHAKE_NS: u64 = 10_000_000_000;
+
+/// One FUSE request through the vhost-user guest: submitted on the request queue, kicked, its interrupt
+/// awaited, its reply read back.
+#[cfg(target_os = "linux")]
+fn through_vhost(
+  front: &vhost_front_end::FrontEnd,
+  guest: &mut common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  request: &[u8],
+) -> Vec<u8> {
+  let head = guest.submit(request, common::guest::REPLY_CAP);
+  front.kick_and_wait(1);
+  vhost_reply(guest, head)
+}
+
+/// Reaps the expected used chain after its interrupt and reads that chain's reply bytes.
+#[cfg(target_os = "linux")]
+fn vhost_reply(
+  guest: &mut common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  head: u16,
+) -> Vec<u8> {
+  let (id, len) = guest.reap().expect("a used element after the interrupt");
+  assert_eq!(id, head);
+  guest.reply_of(head, len)
+}
+
+/// Attaches a vhost-user device on `id` over `socket`; the receiver of its outcome.
+#[cfg(target_os = "linux")]
+fn attach_vhost(
+  daemon: &Daemon,
+  id: slates_ipc::protocol::VolumeId,
+  (socket, handshake_ns): (std::os::fd::OwnedFd, u64),
+) -> std::sync::mpsc::Receiver<GuestDeviceOutcome> {
+  let (end_tx, end_rx) = channel();
+  daemon
+    .attach_vhost_user_device(
+      id,
+      slates_bridge_virtiofs::device::FsTag::new("slates").unwrap(),
+      slates_server::virtiofs::GuestView::default(),
+      (socket, handshake_ns),
+      slates_server::virtiofs::GuestHarness {
+        on_admitted: Box::new(|_| {}),
+        on_end: Box::new(move |outcome| {
+          let _ = end_tx.send(outcome);
+        }),
+      },
+    )
+    .unwrap();
+  end_rx
+}
+
+/// AUD-29-68 (the inherited-descriptor binding). Do: provision a volume; hand the daemon one end of a
+/// socketpair as a vhost-user device; as the VMM, negotiate features, send a sealed memory object as the
+/// guest's RAM and configure both queues with eventfd kicks and calls; as the guest, CREATE, WRITE and RELEASE
+/// a file through the request queue, each kicked and its interrupt awaited; stop both rings (`GET_VRING_BASE`);
+/// read the file back over the daemon's NFS port. Expect: every acknowledgement reports success; each request
+/// is answered through guest memory and its interrupt raised on the call eventfd; the stopped ring reports
+/// positions 0 and 3 (three requests consumed); control messages still work with both rings stopped; only closing
+/// the front end ends the device with the doorbell hung up; the host reads the guest's bytes (A-169).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_user_front_end_drives_a_guest_whose_file_the_host_reads_back() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-vhost");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("vhosted")) else {
+    panic!("the volume was not created");
+  };
+  let (front, socket) = vhost_front_end::pair();
+  let ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
+  let ram = vhost_front_end::guest_ram(true);
+  let mut guest = vhost_front_end::guest_over(&ram);
+  assert_eq!(
+    front.negotiate_memory(&ram),
+    0,
+    "the memory table is accepted"
+  );
+  front.configure_queues(&guest);
+  let created = through_vhost(
+    &front,
+    &mut guest,
+    &message(
+      Opcode::Create.to_wire(),
+      1,
+      1,
+      &create_body("from-vhost.txt"),
+    ),
+  );
+  assert_eq!(reply_error(&created), 0);
+  let ino = u64_at(&created, OUT_HEADER_LEN);
+  let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+  let written = through_vhost(
+    &front,
+    &mut guest,
+    &message(Opcode::Write.to_wire(), 2, ino, &write_body(fh, PAYLOAD)),
+  );
+  assert_eq!(reply_error(&written), 0);
+  let released = through_vhost(
+    &front,
+    &mut guest,
+    &message(Opcode::Release.to_wire(), 3, ino, &release_body(fh)),
+  );
+  assert_eq!(reply_error(&released), 0);
+  front.assert_suspended(&[0, 3]);
+  assert!(ended.try_recv().is_err(), "a stopped ring is not a hangup");
+  drop(front);
+  let outcome = ended
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device ended");
+  let GuestDeviceOutcome::Ended(end) = outcome else {
+    panic!("the device did not serve: {outcome:?}");
+  };
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  assert!(
+    end
+      .reclaimed
+      .expect("the terminal step ran")
+      .references_swept
+  );
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("vhosted").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let file = lookup(&mut stream, &root, "from-vhost.txt", 2);
+  assert_eq!(read(&mut stream, &file, 3), PAYLOAD);
+  drop(client);
+  drop(daemon);
+}
+
+/// Shape: where the reset guest's driver puts its new rings: past the first rings, below the buffers.
+#[cfg(target_os = "linux")]
+const RESET_RING_BASE: u64 = 0x21000;
+
+/// A vhost-user device admitted over a configured front end with the request queue at one consumed request: what a
+/// guest reset or a hostile front end meets. The daemon, the client, the front end, the guest and the device's end.
+#[cfg(target_os = "linux")]
+fn vhost_device_after_one_request(
+  name: &str,
+) -> (
+  Daemon,
+  Client,
+  vhost_front_end::FrontEnd,
+  common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  std::sync::mpsc::Receiver<GuestDeviceOutcome>,
+  std::os::fd::OwnedFd,
+) {
+  let (daemon, instance) = single_shard_daemon(name);
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("the volume was not created");
+  };
+  let (front, socket) = vhost_front_end::pair();
+  let ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
+  let ram = vhost_front_end::guest_ram(true);
+  let mut guest = vhost_front_end::guest_over(&ram);
+  assert_eq!(front.negotiate_memory(&ram), 0);
+  front.configure_queues(&guest);
+  let created = through_vhost(
+    &front,
+    &mut guest,
+    &message(Opcode::Create.to_wire(), 1, 1, &create_body("before.txt")),
+  );
+  assert_eq!(reply_error(&created), 0);
+  (daemon, client, front, guest, ended, ram)
+}
+
+/// The device's end after a refusal: it ended faulted (a protocol refusal), and its terminal step ran.
+#[cfg(target_os = "linux")]
+fn assert_ended_faulted(ended: &std::sync::mpsc::Receiver<GuestDeviceOutcome>) {
+  let outcome = ended
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device ended");
+  let GuestDeviceOutcome::Ended(end) = outcome else {
+    panic!("the device did not serve: {outcome:?}");
+  };
+  assert!(
+    matches!(end.why, EndReason::Faulted(_)),
+    "a protocol refusal ends the device faulted, not {:?}",
+    end.why
+  );
+  assert!(
+    end
+      .reclaimed
+      .expect("the terminal step ran")
+      .references_swept
+  );
+}
+
+/// A-169 (vhost-user "Ring states"; QEMU's `vhost_virtqueue_start`). Do: serve one request, stop both rings, then let
+/// the guest's driver start over on new rings and restart each ring as QEMU does after a guest reset (size, base
+/// zero, the new addresses, kick), posting a request on the new request ring. Expect: the stopped rings take the new
+/// settings, but the restart is refused (its kick's acknowledgement fails) and the device ends faulted; the request on
+/// the new ring is never consumed. A reset starts a new FUSE session the device cannot yet take over in place (the old
+/// session's references and windows would be left behind), so it is a new device. Before this, the restart was
+/// accepted and the device went on serving the ring it was admitted with, at its old position.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_ring_restarted_after_a_guest_reset_is_refused_not_served_from_its_old_ring() {
+  let (daemon, client, front, mut guest, ended, _ram) =
+    vhost_device_after_one_request("vhost-reset");
+  front.assert_suspended(&[0, 1]);
+  guest.start_over_at(RESET_RING_BASE);
+  let layouts = guest.layouts().to_vec();
+  let head = guest.submit(
+    &message(Opcode::Lookup.to_wire(), 2, 1, b"before.txt\0"),
+    common::guest::REPLY_CAP,
+  );
+  assert_ne!(
+    front.restart_after_reset(0, &layouts[0]),
+    0,
+    "a ring restarted over a reset driver is refused"
+  );
+  front.kick(1);
+  assert_ended_faulted(&ended);
+  assert!(
+    guest.reap().is_none(),
+    "the new ring's request {head} was never consumed"
+  );
+  drop(front);
+  drop(client);
+  drop(daemon);
+}
+
+/// A-169 (vhost-user: a ring is moved only while stopped). Do: as a hostile front end, readdress the running request
+/// ring to the rings a reset driver would use. Expect: refused (the acknowledgement fails) and the device ends
+/// faulted. Before this, the new addresses were taken into the seam's record silently while the device kept serving
+/// the old ring.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_vhost_ring_cannot_be_readdressed() {
+  let (daemon, client, front, mut guest, ended, _ram) =
+    vhost_device_after_one_request("vhost-readdress");
+  guest.start_over_at(RESET_RING_BASE);
+  let layouts = guest.layouts().to_vec();
+  assert_ne!(
+    front.readdress(1, &layouts[1]),
+    0,
+    "a running ring is not readdressed"
+  );
+  assert_ended_faulted(&ended);
+  drop(front);
+  drop(client);
+  drop(daemon);
+}
+
+/// AUD-29-68 (hostile front ends). Do: offer a memory object that is not sealed against shrinking; in a second
+/// connection, close the front end before configuring any queue. Expect: the unsealed table is refused (its ack
+/// reports failure) and the handshake ends refused with the memory rule named; the closed one ends refused as
+/// closed; nothing is admitted either time.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_user_front_end_that_offers_unsealed_memory_or_leaves_is_refused() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-vhost-hostile");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("hostile")) else {
+    panic!("the volume was not created");
+  };
+  let (front, socket) = vhost_front_end::pair();
+  let ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
+  let unsealed = vhost_front_end::guest_ram(false);
+  assert_ne!(
+    front.negotiate_memory(&unsealed),
+    0,
+    "an unsealed table is refused"
+  );
+  let outcome = ended.recv_timeout(common::guest::WAIT).unwrap();
+  assert!(
+    matches!(
+      outcome,
+      GuestDeviceOutcome::HandshakeRefused(Some(
+        slates_bridge_virtiofs::vhost_user::VhostError::Memory { .. }
+      ))
+    ),
+    "{outcome:?}"
+  );
+  let (front, socket) = vhost_front_end::pair();
+  let ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
+  drop(front);
+  let outcome = ended.recv_timeout(common::guest::WAIT).unwrap();
+  assert!(
+    matches!(
+      outcome,
+      GuestDeviceOutcome::HandshakeRefused(Some(
+        slates_bridge_virtiofs::vhost_user::VhostError::Closed
+      ))
+    ),
+    "{outcome:?}"
+  );
+  drop(client);
+  drop(daemon);
+}
+
+/// G-vhost, step 2: the attach verb's vhost-user form by use over the wire. A client attaches a volume in the form and
+/// receives the socket end the daemon's device serves, as `slates vhost-user` does before it runs a VMM, and the test
+/// plays the VMM's front end over that end. Linux only, where vhost-user is built.
+#[cfg(target_os = "linux")]
+mod vhost_form {
+  use slates_bridge_virtiofs::backed;
+  use slates_client::{
+    Client as Typed, ClientError, CreateSpec, Deadlines, Intent, ReadAt, Refusal, VolumeId,
+  };
+
+  use super::*;
+
+  /// Shape: shards of the test daemon: two, so a client's shard and a volume's owner may differ, and a forwarded
+  /// attach carries its end home.
+  const TEST_SHARDS: u16 = 2;
+  /// Shape: a volume's bounded quota.
+  const QUOTA: u64 = 4 << 20;
+  /// Shape: names tried before a volume lands on the other shard: the chance all of them land on one is 2^-63.
+  const MOST_NAMES: usize = 64;
+  /// Shape: how long the client retries the rendezvous while its daemon starts, and how long an attachment's end may
+  /// take to show.
+  const WAIT: Duration = Duration::from_secs(20);
+  /// Shape: a DAX window the form offers: four 2 MiB ranges, a power of two.
+  const WINDOW: u64 = 8 << 20;
+  /// Format: the longest tag the device publishes (`TAG_LEN`, virtio 1.2 §5.11.4), and one byte past it.
+  const PAST_THE_TAG: usize = slates_bridge_virtiofs::device::TAG_LEN + 1;
+
+  /// A daemon of [`TEST_SHARDS`] shards named `tag`, its consensus group made, and a typed client of it.
+  fn daemon_and_client(tag: &str) -> (Daemon, Typed) {
+    let profile = common::machine_profile();
+    let instance = format!("srv-{tag}-{}", std::process::id());
+    let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+    let daemon = Daemon::start(
+      &profile,
+      config,
+      SegmentSource::Create {
+        name: common::fixture_object("slates-seg", tag),
+      },
+    )
+    .unwrap();
+    daemon
+      .bootstrap(true)
+      .expect("the fixture explicitly creates its local consensus group");
+    let deadlines = Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get();
+    let started = Instant::now();
+    let client = loop {
+      match Typed::connect(&instance, deadlines) {
+        Ok(client) => break client,
+        Err(ClientError::Ipc(IpcError::DaemonUnavailable { .. })) if started.elapsed() < WAIT => {
+          std::thread::yield_now();
+        }
+        Err(e) => panic!("{e}"),
+      }
+    };
+    (daemon, client)
+  }
+
+  /// A scratch volume named `name`.
+  fn volume(client: &mut Typed, name: &str) -> VolumeId {
+    client
+      .create(&CreateSpec {
+        name: name.to_owned(),
+        size: SizeClass::Bounded { limit: QUOTA },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap()
+  }
+
+  /// Two volumes, owned by different shards.
+  fn on_both_shards(client: &mut Typed) -> [VolumeId; 2] {
+    let first = volume(client, "vhost-0");
+    let owner = slates_server::verbs::owner_of(first);
+    for at in 1..MOST_NAMES {
+      let next = volume(client, &format!("vhost-{at}"));
+      if slates_server::verbs::owner_of(next) != owner {
+        return [first, next];
+      }
+    }
+    panic!("{MOST_NAMES} names all landed on shard {owner}");
+  }
+
+  /// Waits until `volume`'s status counts `count` attachments.
+  fn wait_for_attachments(client: &mut Typed, volume: VolumeId, count: u32) {
+    let started = Instant::now();
+    while client.status(volume).unwrap().attachments != count {
+      assert!(
+        started.elapsed() < WAIT,
+        "the attachments never came to {count}"
+      );
+      std::thread::yield_now();
+    }
+  }
+
+  /// Shape: the bytes of the file the guest maps in the DAX test: one 4 KiB page.
+  const MAPPED_FILE_BYTES: usize = 4096;
+  /// Format: Linux `FUSE_DAX_SZ`, the range a guest's SETUPMAPPING maps.
+  const DAX_RANGE: u64 = 2 << 20;
+
+  /// One SHMEM_MAP of a window as the front end received it: the object it maps, where in the window it goes (from the
+  /// window's start), its length, and where in the object it maps from.
+  struct WindowPiece {
+    object: std::os::fd::OwnedFd,
+    in_window: u64,
+    len: u64,
+    fd_offset: u64,
+  }
+
+  /// A window as the front end placed it: every SHMEM_MAP the device sent for it (two under the device's guarded layout,
+  /// A-194, one under the identity) mapped at its place in one region, as crosvm maps each into the guest's window
+  /// (`MAP_SHARED | MAP_FIXED`), writable when the maps asked so.
+  struct WindowMap {
+    pieces: Vec<WindowPiece>,
+    at: *mut std::ffi::c_void,
+    len: usize,
+  }
+
+  impl WindowMap {
+    /// The window's pieces as a front end that puts each placed map in its memory table names them (QEMU, A-189): each at
+    /// its place from `guest_phys` in the guest, at its own address in the front end, from its offset in the object.
+    fn regions_at(&self, guest_phys: u64) -> Vec<slates_bridge_virtiofs::vhost_user::RegionEntry> {
+      self
+        .pieces
+        .iter()
+        .map(|piece| slates_bridge_virtiofs::vhost_user::RegionEntry {
+          guest_phys: guest_phys + piece.in_window,
+          size: piece.len,
+          user_addr: self.at as u64 + piece.in_window,
+          offset: piece.fd_offset,
+        })
+        .collect()
+    }
+
+    /// `len` bytes from `at`, as the guest reads its window.
+    fn read(&self, at: usize, len: usize) -> Vec<u8> {
+      assert!(at + len <= self.len);
+      // SAFETY: `self.at` is this value's live mapping of `self.len` bytes, and `[at, at + len)` lies inside it.
+      unsafe { std::slice::from_raw_parts(self.at.cast::<u8>().add(at), len) }.to_vec()
+    }
+
+    /// Stores `bytes` at `at`, as the guest stores through its window.
+    fn store(&mut self, at: usize, bytes: &[u8]) {
+      assert!(at + bytes.len() <= self.len);
+      // SAFETY: as `read`, on a mapping made writable (the device maps every window writable for a writable
+      // attachment); nothing else borrows it during the copy.
+      unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at.cast::<u8>().add(at), bytes.len())
+      };
+    }
+  }
+
+  impl Drop for WindowMap {
+    fn drop(&mut self) {
+      // SAFETY: unmapping exactly the region this value reserved and placed its pieces in, with its own address and
+      // length.
+      unsafe { rustix::mm::munmap(self.at, self.len) }.unwrap();
+    }
+  }
+
+  /// Takes one SHMEM_MAP on the back-end-request channel `backend`, waiting for it, bounded: its `VhostUserMMap` body's
+  /// file offset, window offset, length and flags, and its descriptor.
+  fn take_map(backend: &std::os::fd::OwnedFd) -> ((u64, u64, u64, u64), std::os::fd::OwnedFd) {
+    use slates_bridge_virtiofs::vhost_user::{HEADER_LEN, MAP_FDS, MMAP_LEN, backend_request};
+    let mut fds = [rustix::event::PollFd::new(
+      backend,
+      rustix::event::PollFlags::IN,
+    )];
+    let wait = rustix::event::Timespec {
+      tv_sec: i64::try_from(WAIT.as_secs()).unwrap(),
+      tv_nsec: 0,
+    };
+    assert_eq!(
+      rustix::event::poll(&mut fds, Some(&wait)).unwrap(),
+      1,
+      "the device asks for its map in time"
+    );
+    let mut buf = [0u8; HEADER_LEN + MMAP_LEN];
+    let mut space =
+      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAP_FDS))];
+    let mut control = rustix::net::RecvAncillaryBuffer::new(&mut space);
+    let got = rustix::net::recvmsg(
+      backend,
+      &mut [std::io::IoSliceMut::new(&mut buf)],
+      &mut control,
+      rustix::net::RecvFlags::CMSG_CLOEXEC,
+    )
+    .unwrap();
+    assert_eq!(got.bytes, buf.len(), "a whole SHMEM_MAP");
+    assert_eq!(
+      u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+      backend_request::SHMEM_MAP
+    );
+    let mut received: Vec<std::os::fd::OwnedFd> = Vec::new();
+    for message in control.drain() {
+      if let rustix::net::RecvAncillaryMessage::ScmRights(iter) = message {
+        received.extend(iter);
+      }
+    }
+    let object = received
+      .pop()
+      .expect("SHMEM_MAP carries the file's backing");
+    let field = |at: usize| {
+      u64::from_le_bytes(
+        buf[HEADER_LEN + at..HEADER_LEN + at + 8]
+          .try_into()
+          .unwrap(),
+      )
+    };
+    ((field(8), field(16), field(24), field(32)), object)
+  }
+
+  /// Takes every SHMEM_MAP of the window `[0, len)` of the file the device maps (one a piece of the device's layout,
+  /// A-194) on the back-end-request channel `backend`, places each at its offset in one region reserved for the window,
+  /// as the front end does, and then acknowledges each, as a front end does once a map is placed.
+  fn take_and_place_window(backend: &std::os::fd::OwnedFd, len: u64) -> WindowMap {
+    take_and_place_window_before_ack(backend, len, || {})
+  }
+
+  /// Places every piece, calls `before_ack` while the guest's SETUPMAPPING is still in flight, then acknowledges them.
+  fn take_and_place_window_before_ack(
+    backend: &std::os::fd::OwnedFd,
+    len: u64,
+    before_ack: impl FnOnce(),
+  ) -> WindowMap {
+    let window = place_window_unacknowledged(backend, len);
+    before_ack();
+    ack_window_maps(backend, &window);
+    window
+  }
+
+  /// Takes the device's map requests for a `len`-byte range from `backend` and places each piece over a fresh
+  /// reservation, as a front end does, acknowledging none: the device's chain stays taken until `ack_window_maps`.
+  fn place_window_unacknowledged(backend: &std::os::fd::OwnedFd, len: u64) -> WindowMap {
+    use slates_bridge_virtiofs::vhost_user::MMAP_FLAG_MAP_RW;
+    let pieces = slates_bridge_core::dax_backing::guarded_layout()
+      .pieces(0, len)
+      .count();
+    let maps: Vec<_> = (0..pieces).map(|_| take_map(backend)).collect();
+    let start = maps
+      .iter()
+      .map(|((_, shm_offset, _, _), _)| *shm_offset)
+      .min()
+      .unwrap();
+    let window_len = usize::try_from(len).unwrap();
+    // SAFETY: a fresh private reservation with no access at an address the kernel chooses, which nothing else uses;
+    // each piece replaces its part below, and `WindowMap` unmaps the whole of it.
+    let at = unsafe {
+      rustix::mm::mmap_anonymous(
+        std::ptr::null_mut(),
+        window_len,
+        rustix::mm::ProtFlags::empty(),
+        rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::NORESERVE,
+      )
+    }
+    .unwrap();
+    let mut placed = Vec::new();
+    for ((fd_offset, shm_offset, piece_len, flags), object) in maps {
+      let prot = if flags & MMAP_FLAG_MAP_RW != 0 {
+        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE
+      } else {
+        rustix::mm::ProtFlags::READ
+      };
+      let in_window = shm_offset - start;
+      assert!(
+        in_window + piece_len <= len,
+        "the piece lies inside the window"
+      );
+      // SAFETY: `[at + in_window, at + in_window + piece_len)` lies inside the reservation just made; `MAP_FIXED`
+      // replaces that part of it with the piece's bytes of a descriptor this test owns, from a page-aligned offset.
+      unsafe {
+        rustix::mm::mmap(
+          at.cast::<u8>()
+            .add(usize::try_from(in_window).unwrap())
+            .cast(),
+          usize::try_from(piece_len).unwrap(),
+          prot,
+          rustix::mm::MapFlags::SHARED | rustix::mm::MapFlags::FIXED,
+          &object,
+          fd_offset,
+        )
+      }
+      .expect("the front end places what it was sent");
+      placed.push(WindowPiece {
+        object,
+        in_window,
+        len: piece_len,
+        fd_offset,
+      });
+    }
+    assert_eq!(
+      placed.iter().map(|piece| piece.len).sum::<u64>(),
+      len,
+      "the pieces cover the window once"
+    );
+    WindowMap {
+      pieces: placed,
+      at,
+      len: window_len,
+    }
+  }
+
+  /// Acknowledges each placed piece of `window` on `backend`, as a front end does once it has mapped them.
+  fn ack_window_maps(backend: &std::os::fd::OwnedFd, window: &WindowMap) {
+    use slates_bridge_virtiofs::vhost_user::{
+      ACK_LEN, FLAG_REPLY, HEADER_AT_FLAGS, HEADER_AT_SIZE, HEADER_LEN, VERSION, backend_request,
+    };
+    for _ in &window.pieces {
+      let mut ack = [0u8; HEADER_LEN + ACK_LEN];
+      ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
+      ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
+        .copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+      ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
+        .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
+      rustix::net::sendmsg(
+        backend,
+        &[std::io::IoSlice::new(&ack)],
+        &mut rustix::net::SendAncillaryBuffer::default(),
+        rustix::net::SendFlags::NOSIGNAL,
+      )
+      .unwrap();
+    }
+  }
+
+  /// A `fuse_setupmapping_in`: fh, the file offset, the length, the flags (write when `writable`), the window offset.
+  fn setup_body(foffset: u64, len: u64, writable: bool, moffset: u64) -> Vec<u8> {
+    let flags = if writable {
+      slates_bridge_fuse::request::SETUPMAPPING_FLAG_WRITE
+    } else {
+      0
+    };
+    let mut body = Vec::new();
+    for word in [0u64, foffset, len, flags, moffset] {
+      body.extend_from_slice(&word.to_le_bytes());
+    }
+    body
+  }
+
+  /// Whether the back-end-request channel `backend` holds a message now.
+  fn backend_pending(backend: &std::os::fd::OwnedFd) -> bool {
+    let mut fds = [rustix::event::PollFd::new(
+      backend,
+      rustix::event::PollFlags::IN,
+    )];
+    let now = rustix::event::Timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+    };
+    rustix::event::poll(&mut fds, Some(&now)).unwrap() > 0
+  }
+
+  /// The guest's lookup of `mapped.bin` and its read-only map of the file's first range at window offset zero, each
+  /// piece of the map placed and acknowledged as the front end does, the SETUPMAPPING answered only after the last ack:
+  /// the node and the window, which shows the file.
+  fn map_the_file(
+    front: &vhost_front_end::FrontEnd,
+    guest: &mut common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+    backend: &std::os::fd::OwnedFd,
+  ) -> (u64, WindowMap) {
+    let found = through_vhost(
+      front,
+      guest,
+      &message(Opcode::Lookup.to_wire(), 1, 1, b"mapped.bin\0"),
+    );
+    assert_eq!(reply_error(&found), 0, "the guest finds the file");
+    let node = u64_at(&found, OUT_HEADER_LEN);
+    let head = guest.submit(
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        2,
+        node,
+        &setup_body(0, DAX_RANGE, false, 0),
+      ),
+      common::guest::REPLY_CAP,
+    );
+    front.kick(1);
+    let window = take_and_place_window(backend, DAX_RANGE);
+    front.wait_call(1);
+    let (id, len) = guest
+      .reap()
+      .expect("the SETUPMAPPING is answered after the ack");
+    assert_eq!(id, head);
+    assert_eq!(reply_error(&guest.reply_of(head, len)), 0);
+    assert_eq!(
+      window.read(0, 16),
+      vec![0x41; 16],
+      "the window shows the file"
+    );
+    (node, window)
+  }
+
+  /// Audit plan 01a1a34bf7e973069e94f773afdea44a, step 2 (A-169). Do: hold a SETUPMAPPING taken on the request queue
+  /// at its map acknowledgements, stop that ring (its stop now waits for the chain), then readdress the ring to the rings
+  /// a reset driver would use. Expect: the move is refused (its acknowledgement fails), the device ends (its socket
+  /// closes) and its terminal step releases its attachment, leaving the client's own. A ring whose stop awaits its chain
+  /// is still being served; before the fix the move was taken into the seam's record silently.
+  #[test]
+  fn a_vhost_ring_whose_stop_awaits_its_chain_cannot_be_moved() {
+    use slates_bridge_virtiofs::vhost_user::request;
+
+    let (daemon, mut client) = daemon_and_client("vhost-stop-move");
+    let volume = volume(&mut client, "stopmove");
+    let own = client
+      .attach(volume, None, Intent::Write)
+      .unwrap()
+      .attachment;
+    client
+      .fs_write(
+        (volume, own),
+        "/mapped.bin",
+        &vec![0x41; MAPPED_FILE_BYTES],
+        0o644,
+      )
+      .unwrap();
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    let ram = vhost_front_end::guest_ram(true);
+    let mut guest = vhost_front_end::guest_over(&ram);
+    let backend = front.negotiate_dax(&ram, WINDOW);
+    front.configure_queues(&guest);
+    wait_for_attachments(&mut client, volume, 2);
+    let found = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Lookup.to_wire(), 1, 1, b"mapped.bin\0"),
+    );
+    assert_eq!(reply_error(&found), 0);
+    let node = u64_at(&found, OUT_HEADER_LEN);
+    guest.submit(
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        2,
+        node,
+        &setup_body(0, DAX_RANGE, false, 0),
+      ),
+      common::guest::REPLY_CAP,
+    );
+    front.kick(1);
+    let window = place_window_unacknowledged(&backend, DAX_RANGE);
+    front.send(
+      request::GET_VRING_BASE,
+      0,
+      &vhost_front_end::FrontEnd::state(1, 0),
+      &[],
+    );
+    guest.start_over_at(super::RESET_RING_BASE);
+    let moved = guest.layouts()[1];
+    assert_ne!(
+      front.readdress(1, &moved),
+      0,
+      "a ring whose stop awaits its chain is not moved"
+    );
+    assert!(front.closed(), "the refused device closed its end");
+    wait_for_attachments(&mut client, volume, 1);
+    drop(window);
+    drop(front);
+    drop(backend);
+    client.detach(own).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// A-169 / AC-4.12: stop a request queue while its SETUPMAPPING awaits map acknowledgements. Expect: control still
+  /// answers, the stop waits for the guest's completion and reports two taken chains, a posted third request remains
+  /// untouched while stopped, and SET_VRING_KICK alone restarts it. Stopping both queues keeps control alive until close.
+  #[test]
+  fn stopping_a_vhost_ring_drains_its_taken_request_and_leaves_new_work_until_restart() {
+    use slates_bridge_virtiofs::vhost_user::request;
+
+    let (daemon, mut client) = daemon_and_client("vhost-stop");
+    let volume = volume(&mut client, "stop");
+    let own = client
+      .attach(volume, None, Intent::Write)
+      .unwrap()
+      .attachment;
+    client
+      .fs_write(
+        (volume, own),
+        "/mapped.bin",
+        &vec![0x41; MAPPED_FILE_BYTES],
+        0o644,
+      )
+      .unwrap();
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    let ram = vhost_front_end::guest_ram(true);
+    let mut guest = vhost_front_end::guest_over(&ram);
+    let backend = front.negotiate_dax(&ram, WINDOW);
+    front.configure_queues(&guest);
+    let found = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Lookup.to_wire(), 1, 1, b"mapped.bin\0"),
+    );
+    assert_eq!(reply_error(&found), 0);
+    let node = u64_at(&found, OUT_HEADER_LEN);
+    let head = guest.submit(
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        2,
+        node,
+        &setup_body(0, DAX_RANGE, false, 0),
+      ),
+      common::guest::REPLY_CAP,
+    );
+    front.kick(1);
+    let window = take_and_place_window_before_ack(&backend, DAX_RANGE, || {
+      front.send(
+        request::GET_VRING_BASE,
+        0,
+        &vhost_front_end::FrontEnd::state(1, 0),
+        &[],
+      );
+      assert_eq!(
+        front.get(request::GET_QUEUE_NUM),
+        2,
+        "control works while the stop awaits its chain"
+      );
+      assert!(
+        guest.reap().is_none(),
+        "the map is not completed before its acknowledgements"
+      );
+    });
+    front.wait_call(1);
+    assert_eq!(reply_error(&vhost_reply(&mut guest, head)), 0);
+    let stopped = front
+      .reply()
+      .expect("the drained ring reports its position");
+    assert_eq!(u32::from_le_bytes(stopped[0..4].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(stopped[4..8].try_into().unwrap()), 2);
+    let next = guest.submit(
+      &message(Opcode::Lookup.to_wire(), 3, 1, b"mapped.bin\0"),
+      common::guest::REPLY_CAP,
+    );
+    front.kick(1);
+    assert_eq!(front.get(request::GET_QUEUE_NUM), 2);
+    assert!(
+      guest.reap().is_none(),
+      "a stopped queue consumes no newly posted chain"
+    );
+    front.restart(1);
+    front.wait_call(1);
+    assert_eq!(reply_error(&vhost_reply(&mut guest, next)), 0);
+    front.assert_suspended(&[0, 3]);
+    drop(window);
+    drop(front);
+    drop(backend);
+    client.detach(own).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// G-vhost, the route by use through the daemon's real serve loop, with no VM: the client attaches the vhost-user form
+  /// with a DAX window; as the VMM, the test negotiates the shared-memory features, reads the window's size, and hands
+  /// over the back-end-request channel; as the guest, it looks a file up and maps its first 2 MiB range for reading.
+  /// Do: place the map the device asks for and acknowledge it; read the window; rewrite the file through the client;
+  /// upgrade the range to writable as a guest's write fault does (`fuse_upgrade_dax_mapping`), store through the window
+  /// and FSYNC; close the front end. Expect: the SETUPMAPPING answered only after the ack, the window showing the file;
+  /// the rewrite in the window with no guest request, the old tail zero; the upgrade answered with no message to the
+  /// front end; the guest's store in the volume by the FSYNC's answer; the device's attachment gone once its end
+  /// closes. The daemon's status counters show each step while the device runs (a map sent, the upgrade answered with
+  /// no message, the FSYNC held for its ingest, a run ingested), and its backing let go once it ends.
+  #[test]
+  fn a_guests_dax_window_shows_another_paths_write_and_its_store_reaches_the_volume_at_fsync() {
+    let (daemon, mut client) = daemon_and_client("vhost-dax");
+    let volume = volume(&mut client, "dax");
+    let own = client
+      .attach(volume, None, Intent::Write)
+      .unwrap()
+      .attachment;
+    client
+      .fs_write(
+        (volume, own),
+        "/mapped.bin",
+        &vec![0x41; MAPPED_FILE_BYTES],
+        0o644,
+      )
+      .unwrap();
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    let ram = vhost_front_end::guest_ram(true);
+    let mut guest = vhost_front_end::guest_over(&ram);
+    let backend = front.negotiate_dax(&ram, WINDOW);
+    front.configure_queues(&guest);
+    let (node, mut window) = map_the_file(&front, &mut guest, &backend);
+    client
+      .fs_write((volume, own), "/mapped.bin", b"another path", 0o644)
+      .unwrap();
+    assert_eq!(
+      window.read(0, 12),
+      b"another path".to_vec(),
+      "the rewrite shows in the window with no guest request"
+    );
+    assert_eq!(window.read(12, 16), vec![0; 16], "the cut tail reads zero");
+    let upgraded = through_vhost(
+      &front,
+      &mut guest,
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        3,
+        node,
+        &setup_body(0, DAX_RANGE, true, 0),
+      ),
+    );
+    assert_eq!(
+      reply_error(&upgraded),
+      0,
+      "the writable upgrade is answered"
+    );
+    assert!(
+      !backend_pending(&backend),
+      "the upgrade sent the front end nothing: it maps the window writable already"
+    );
+    window.store(0, b"STORE");
+    let mut fsync = 0u64.to_le_bytes().to_vec();
+    fsync.extend_from_slice(&[0u8; 8]);
+    let synced = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::FSync.to_wire(), 4, node, &fsync),
+    );
+    assert_eq!(reply_error(&synced), 0, "FSYNC answered");
+    assert_eq!(
+      client.read(volume, "/mapped.bin", ReadAt::Head).unwrap(),
+      b"STOREer path".to_vec(),
+      "the guest's store is in the volume by the FSYNC's answer"
+    );
+    for (name, what) in [
+      (backed::MAPS_SENT, "the map sent to the front end"),
+      (backed::MAPS_KEPT, "the upgrade answered with no message"),
+      (backed::INGESTS_HELD, "the FSYNC held for its ingest"),
+      (backed::INGESTED, "the guest's store ingested"),
+    ] {
+      assert_eq!(
+        counted(&daemon, name),
+        1,
+        "{what} shows in the daemon's status while the device runs ({name})"
+      );
+    }
+    drop(window);
+    drop(front);
+    drop(backend);
+    client.detach(own).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    assert_eq!(
+      counted(&daemon, backed::RELEASED),
+      1,
+      "the file's backing is let go when the device ends"
+    );
+    drop(client);
+    drop(daemon);
+  }
+
+  /// Shape: where the test front end places the DAX window in guest-physical space: past the guest's RAM, as a PCI
+  /// BAR lies past a VM's RAM.
+  const WINDOW_GUEST_BASE: u64 = 1 << 32;
+  /// Shape: the bytes the guest writes to `copy.bin` from the window: one page, all of it the mapped file's.
+  const COPIED_BYTES: usize = 4096;
+
+  /// A-189, QEMU's form of the window (11.1): QEMU puts every shared memory section that has a descriptor in the
+  /// memory table it sends the back end (`hw/virtio/vhost.c`, `vhost_section`), so each map it places for the device
+  /// comes back as a new `SET_MEM_TABLE` under running queues, and each unmap as one without it. Its first run on CI
+  /// ended the device at the first map (`vhost_set_mem_table failed`, diagnostics run 40874255591). Do: map the file's
+  /// first range as the guest does and place the map; send the table with the map's range added (the RAM unchanged,
+  /// the range at the window's guest address and at the front end's own address of the map); as the guest, create
+  /// `copy.bin` and write to it from the window, a WRITE whose payload descriptor lies in the window's range, as a
+  /// guest's `O_DIRECT` write from a mapped file's pages is; send the table without the range, as after an unmap, and
+  /// look the file up; then send a table that moves the RAM the rings lie in.
+  ///
+  /// Expect: both tables that keep the RAM taken (ack 0) and the device serving after each; `copy.bin` holding the
+  /// window's bytes, which the device read through the range the table added; the table that moves the RAM refused,
+  /// which ends the device and its attachment.
+  #[test]
+  fn a_front_end_that_puts_each_placed_map_in_its_memory_table_keeps_its_device() {
+    use std::os::fd::AsFd;
+
+    use slates_bridge_virtiofs::memory::{GuestAddr, GuestRange};
+    use slates_bridge_virtiofs::vhost_user::{FLAG_NEED_REPLY, RegionEntry, request};
+    let (daemon, mut client) = daemon_and_client("vhost-qemu-table");
+    let volume = volume(&mut client, "dax");
+    let own = client
+      .attach(volume, None, Intent::Write)
+      .unwrap()
+      .attachment;
+    client
+      .fs_write(
+        (volume, own),
+        "/mapped.bin",
+        &vec![0x41; MAPPED_FILE_BYTES],
+        0o644,
+      )
+      .unwrap();
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    let ram = vhost_front_end::guest_ram(true);
+    let mut guest = vhost_front_end::guest_over(&ram);
+    let backend = front.negotiate_dax(&ram, WINDOW);
+    front.configure_queues(&guest);
+    let (_node, window) = map_the_file(&front, &mut guest, &backend);
+
+    let ram_region = vhost_front_end::region_entry();
+    let mut regions = vec![ram_region];
+    regions.extend(window.regions_at(WINDOW_GUEST_BASE));
+    let mut objects = vec![ram.as_fd()];
+    objects.extend(window.pieces.iter().map(|piece| piece.object.as_fd()));
+    assert_eq!(
+      front.set(
+        request::SET_MEM_TABLE,
+        &vhost_front_end::memory_table_of(&regions),
+        &objects
+      ),
+      0,
+      "the table with every placed piece's range is taken under running queues"
+    );
+    let created = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Create.to_wire(), 5, 1, &create_body("copy.bin")),
+    );
+    assert_eq!(
+      reply_error(&created),
+      0,
+      "the device serves after the table"
+    );
+    let copy = u64_at(&created, OUT_HEADER_LEN);
+    let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+    let whole = message(
+      Opcode::Write.to_wire(),
+      6,
+      copy,
+      &write_body(fh, &[0; COPIED_BYTES]),
+    );
+    let head_bytes = &whole[..whole.len() - COPIED_BYTES];
+    let payload = GuestRange::new(
+      GuestAddr(WINDOW_GUEST_BASE),
+      u64::try_from(COPIED_BYTES).unwrap(),
+    )
+    .unwrap();
+    let head = guest.submit_with_payload_at(head_bytes, payload, common::guest::REPLY_CAP);
+    front.kick_and_wait(1);
+    let (id, len) = guest.reap().expect("the write from the window is answered");
+    assert_eq!(id, head);
+    assert_eq!(
+      reply_error(&guest.reply_of(head, len)),
+      0,
+      "the write from the window succeeds"
+    );
+    let released = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Release.to_wire(), 7, copy, &release_body(fh)),
+    );
+    assert_eq!(reply_error(&released), 0);
+    assert_eq!(
+      client.read(volume, "/copy.bin", ReadAt::Head).unwrap(),
+      vec![0x41; COPIED_BYTES],
+      "copy.bin holds the window's bytes, read through the range the table added"
+    );
+
+    assert_eq!(
+      front.set(
+        request::SET_MEM_TABLE,
+        &vhost_front_end::memory_table_of(&[ram_region]),
+        &[ram.as_fd()]
+      ),
+      0,
+      "the table without the range, as after an unmap, is taken"
+    );
+    let found = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Lookup.to_wire(), 8, 1, b"copy.bin\0"),
+    );
+    assert_eq!(
+      reply_error(&found),
+      0,
+      "the device serves after the range left its table"
+    );
+
+    let moved = RegionEntry {
+      guest_phys: WINDOW_GUEST_BASE,
+      ..ram_region
+    };
+    front.send(
+      request::SET_MEM_TABLE,
+      FLAG_NEED_REPLY,
+      &vhost_front_end::memory_table_of(&[moved]),
+      &[ram.as_fd()],
+    );
+    wait_for_attachments(&mut client, volume, 1);
+    drop(window);
+    drop(front);
+    drop(backend);
+    client.detach(own).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// The daemon's status counter `name`, summed over its shards.
+  fn counted(daemon: &Daemon, name: &str) -> u64 {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  }
+
+  /// A second client bound to a consumer the human surface enrolled under this process's account, with whom the owner
+  /// shares `volume` for reading only (§4.13).
+  fn a_reader_of(daemon: &Daemon, owner: &mut Typed, volume: VolumeId) -> Typed {
+    let account = rustix::process::getuid().as_raw();
+    let secret = daemon.segment().issuer_secret().unwrap();
+    let (consumer, capability) = owner
+      .enroll(
+        account,
+        slates_server::landing::enroll_proof(&secret, account),
+      )
+      .unwrap();
+    owner
+      .share(
+        volume,
+        slates_client::Principal::Consumer {
+          host: common::this_host(),
+          account,
+          consumer,
+        },
+        slates_client::Rights {
+          read: true,
+          write: false,
+          admin: false,
+        },
+      )
+      .unwrap();
+    let deadlines = Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get();
+    let mut reader = Typed::connect(daemon.instance(), deadlines).unwrap();
+    reader.attest(consumer, &capability).unwrap();
+    reader
+  }
+
+  /// The guest's history through a negotiated front end: it creates, writes and releases a file named `name`.
+  fn guest_writes(front: &vhost_front_end::FrontEnd, ram: &std::os::fd::OwnedFd, name: &str) {
+    let mut guest = vhost_front_end::guest_over(ram);
+    assert_eq!(
+      front.negotiate_memory(ram),
+      0,
+      "the memory table is accepted"
+    );
+    front.configure_queues(&guest);
+    let created = through_vhost(
+      front,
+      &mut guest,
+      &message(Opcode::Create.to_wire(), 1, 1, &create_body(name)),
+    );
+    assert_eq!(reply_error(&created), 0);
+    let ino = u64_at(&created, OUT_HEADER_LEN);
+    let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+    let written = through_vhost(
+      front,
+      &mut guest,
+      &message(Opcode::Write.to_wire(), 2, ino, &write_body(fh, PAYLOAD)),
+    );
+    assert_eq!(reply_error(&written), 0);
+    let released = through_vhost(
+      front,
+      &mut guest,
+      &message(Opcode::Release.to_wire(), 3, ino, &release_body(fh)),
+    );
+    assert_eq!(reply_error(&released), 0);
+  }
+
+  /// G-vhost, step 2, by use: on each of two volumes, one on the client's shard and one on the other, the client
+  /// attaches the vhost-user form and receives the device's socket end over its control socket. Do: check the record
+  /// before any front end speaks; as the VMM, negotiate over the end; as the guest, write a file; read it through the
+  /// client; close the end. Expect: the attachment recorded at once, with the write lease; the guest's file read back;
+  /// the attachment gone once the end closes, a `detach` then finding nothing.
+  #[test]
+  fn the_vhost_user_form_hands_the_client_a_socket_end_that_drives_a_guest_on_either_shard() {
+    let (daemon, mut client) = daemon_and_client("vhost-form");
+    for volume in on_both_shards(&mut client) {
+      let device = client
+        .attach_vhost_user(volume, Intent::Write, ("slates", None), None)
+        .unwrap();
+      let attachment = device.attachment.attachment;
+      assert!(
+        device.attachment.lease_epoch.is_some(),
+        "the write lease is taken"
+      );
+      assert!(device.attachment.capability.supported);
+      assert_eq!(
+        client.status(volume).unwrap().attachments,
+        1,
+        "the device is recorded before its front end speaks"
+      );
+      let front = vhost_front_end::FrontEnd::over(device.end);
+      let ram = vhost_front_end::guest_ram(true);
+      guest_writes(&front, &ram, "from-the-verb.txt");
+      assert_eq!(
+        client
+          .read(volume, "/from-the-verb.txt", ReadAt::Head)
+          .unwrap(),
+        PAYLOAD,
+        "the client reads what the guest wrote through the device"
+      );
+      drop(front);
+      wait_for_attachments(&mut client, volume, 0);
+      assert!(matches!(
+        client.detach(attachment),
+        Err(ClientError::Refused(Refusal::NotFound))
+      ));
+    }
+    drop(client);
+    drop(daemon);
+  }
+
+  /// G-vhost, step 2, the device's end before its front end speaks. Do: attach the form, then detach it before any
+  /// message on the end; wait for the end. Expect: the attachment gone at once; the daemon's end closes (the front end
+  /// reads its end of file), so a VMM handed it fails its handshake rather than serving a detached volume; the volume
+  /// then attaches for writing again (the lease went with the record).
+  #[test]
+  fn a_vhost_user_device_detached_before_its_front_end_speaks_closes_its_end() {
+    let (daemon, mut client) = daemon_and_client("vhost-detach");
+    let volume = volume(&mut client, "detached");
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), None)
+      .unwrap();
+    client.detach(device.attachment.attachment).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    assert!(
+      front.reply().is_none(),
+      "the daemon's end closed with the detach"
+    );
+    let again = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), None)
+      .unwrap();
+    assert!(again.attachment.lease_epoch.is_some());
+    drop(again);
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// G-vhost, step 2, the form's refusals. Do: attach a volume that does not exist; with an empty tag and one a byte
+  /// past the field; with DAX windows below one range and not a power of two; a green; and, as a consumer the owner
+  /// shared the volume with for reading only, for writing. Then, as that consumer, attach for reading, and as the owner
+  /// for writing with a DAX window. Expect: each refused by its own kind (`NotFound`, `BadRequest`, `Unsupported` for the
+  /// green, `Forbidden` for the reader's write), the volume's attachments still none after them all; the reader's
+  /// attach answered read-only and with no lease; the owner's answered, its capability saying the window is offered;
+  /// each attachment gone once its end closes.
+  #[test]
+  fn the_vhost_user_forms_refusals_are_typed_and_leave_nothing_behind() {
+    let (daemon, mut client) = daemon_and_client("vhost-refusals");
+    let volume = volume(&mut client, "refusals");
+    let mut reader = a_reader_of(&daemon, &mut client, volume);
+    assert_eq!(
+      refused(&mut client, VolumeId { bytes: [0xEE; 16] }, "slates", None),
+      Refusal::NotFound
+    );
+    malformed_asks_are_bad_requests(&mut client, volume);
+    let green = a_green(&mut client);
+    assert!(matches!(
+      refused(&mut client, green, "slates", None),
+      Refusal::Unsupported { .. }
+    ));
+    assert!(matches!(
+      refused(&mut reader, volume, "slates", None),
+      Refusal::Forbidden { .. }
+    ));
+    assert_eq!(client.status(volume).unwrap().attachments, 0);
+    let read_only = reader
+      .attach_vhost_user(volume, Intent::Read, ("slates", None), None)
+      .unwrap();
+    assert_eq!(
+      read_only.attachment.capability.read_write,
+      slates_client::ReadWritePolicy::ReadOnly
+    );
+    assert!(
+      read_only.attachment.lease_epoch.is_none(),
+      "a reader takes no lease"
+    );
+    drop(read_only);
+    wait_for_attachments(&mut client, volume, 0);
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    assert_eq!(
+      device.attachment.capability.residency,
+      slates_client::Residency::DaemonRamAndGuestPageCache { dax_mapped: true },
+      "the window is offered"
+    );
+    drop(device);
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// The refusal of a write attach of `volume` in the form with `tag` and `window`; it attaching fails the test.
+  fn refused(client: &mut Typed, volume: VolumeId, tag: &str, window: Option<u64>) -> Refusal {
+    match client.attach_vhost_user(volume, Intent::Write, (tag, None), window) {
+      Err(ClientError::Refused(refusal)) => refusal,
+      Ok(device) => panic!("attached {}", device.attachment.attachment),
+      Err(e) => panic!("{e}"),
+    }
+  }
+
+  /// An empty tag, a tag a byte past the field, and DAX windows below one range and not a power of two: each a bad
+  /// request.
+  fn malformed_asks_are_bad_requests(client: &mut Typed, volume: VolumeId) {
+    let long_tag = "t".repeat(PAST_THE_TAG);
+    for (tag, window) in [
+      ("", None),
+      (long_tag.as_str(), None),
+      ("slates", Some(1 << 20)),
+      ("slates", Some(3 << 20)),
+    ] {
+      assert!(
+        matches!(
+          refused(client, volume, tag, window),
+          Refusal::BadRequest { .. }
+        ),
+        "tag {tag:?}, window {window:?}"
+      );
+    }
+  }
+
+  /// A green volume, made from scratch.
+  fn a_green(client: &mut Typed) -> VolumeId {
+    let started = client.create_green_begin("green", false).unwrap();
+    loop {
+      if let Some(id) = client.create_green_spin(started, DEADLINE_NS).unwrap() {
+        return id;
+      }
+    }
+  }
+}
+
+/// G-vhost, step 2, elsewhere: vhost-user is Linux's, so the form is refused by kind before any effect. Do: attach a
+/// volume in the form. Expect `AttachmentUnsupported` for the inherited-descriptor transport with `BindingNotBuilt`,
+/// and the volume's attachments still none.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn the_vhost_user_form_is_refused_by_kind_where_vhost_user_is_not_built() {
+  let (daemon, instance) = single_shard_daemon("vhost-elsewhere");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("elsewhere")) else {
+    panic!("the volume was not created");
+  };
+  let reply = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: slates_ipc::protocol::Intent::Write,
+    form: slates_ipc::protocol::AttachRequest::VhostUserFs {
+      tag: "slates".to_owned(),
+      subtree: None,
+      dax_window: None,
+    },
+  });
+  assert_eq!(
+    reply,
+    ReplyBody::Refused {
+      refusal: slates_ipc::protocol::Refusal::AttachmentUnsupported {
+        transport: slates_ipc::protocol::AttachTransport::VirtioFsInheritedDescriptor,
+        reason: slates_ipc::protocol::UnsupportedReason::BindingNotBuilt,
+      }
+    }
+  );
+  let ReplyBody::Status { report } = client.call(&RequestBody::Status { volume: id }) else {
+    panic!("status");
+  };
+  assert_eq!(report.attachments, 0);
+  drop(client);
+  drop(daemon);
+}
+
+/// Shape: how long the live guest may take from QEMU's start to its power-off — the boot, the mount, a few
+/// file calls — under software emulation; measured at about 2 s on an Apple Silicon Docker Desktop VM
+/// (2026-10-01), so a hundredfold margin that still fails a hung guest in bounded time.
+#[cfg(target_os = "linux")]
+const GUEST_RUN: Duration = Duration::from_secs(200);
+
+/// Shape: the live guest's RAM in kibibytes (`-m 256M`), the size by which its mapping is found in this
+/// process's `smaps`.
+#[cfg(target_os = "linux")]
+const GUEST_RAM_KIB: u64 = 256 * 1024;
+
+/// One mapping of the guest's memory object in this process (the daemon's device maps it here), as the kernel
+/// accounts it: resident and locked kibibytes.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default)]
+struct GuestMapping {
+  rss_kib: u64,
+  locked_kib: u64,
+}
+
+/// Every mapping of a memory object the size of the guest's RAM in this process (`/proc/self/smaps`: a header
+/// naming `memfd:`, then its `Size`, `Rss` and `Locked` lines).
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // procfs: the kernel's account of this process, not a host path (R1).
+fn guest_memory_mappings() -> Vec<GuestMapping> {
+  let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
+  let field = |line: &str, name: &str| {
+    line
+      .strip_prefix(name)
+      .and_then(|rest| rest.trim().strip_suffix("kB"))
+      .and_then(|kib| kib.trim().parse::<u64>().ok())
+  };
+  // A mapping's header begins with its address range (`start-end`, hex); its fields follow until the next.
+  let is_header = |line: &str| {
+    line.split_whitespace().next().is_some_and(|range| {
+      range.contains('-') && range.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    })
+  };
+  let mut found = Vec::new();
+  let mut current: Option<(u64, GuestMapping)> = None;
+  let mut finish = |current: &mut Option<(u64, GuestMapping)>| {
+    if let Some((size, mapping)) = current.take()
+      && size == GUEST_RAM_KIB
+    {
+      found.push(mapping);
+    }
+  };
+  for line in smaps.lines() {
+    if is_header(line) {
+      finish(&mut current);
+      current = line
+        .contains("memfd:")
+        .then(|| (0, GuestMapping::default()));
+      continue;
+    }
+    let Some((size, mapping)) = current.as_mut() else {
+      continue;
+    };
+    if let Some(kib) = field(line, "Size:") {
+      *size = kib;
+    } else if let Some(kib) = field(line, "Rss:") {
+      mapping.rss_kib = kib;
+    } else if let Some(kib) = field(line, "Locked:") {
+      mapping.locked_kib = kib;
+    }
+  }
+  finish(&mut current);
+  found
+}
+
+/// The live guest's paths, from the environment: QEMU, the guest kernel and its initramfs (whose init mounts
+/// the tag `slates`, reads `from-host.txt`, writes `from-guest.txt`, makes `guest-dir`, unmounts and powers
+/// off), or a loud skip.
+#[cfg(target_os = "linux")]
+fn live_guest() -> Option<(String, String, String)> {
+  let read = |name| std::env::var(name).ok();
+  match (
+    read("SLATES_GUEST_QEMU"),
+    read("SLATES_GUEST_KERNEL"),
+    read("SLATES_GUEST_INITRD"),
+  ) {
+    (Some(qemu), Some(kernel), Some(initrd)) => Some((qemu, kernel, initrd)),
+    _ => {
+      eprintln!(
+        "SKIP: the live guest needs SLATES_GUEST_QEMU, SLATES_GUEST_KERNEL and SLATES_GUEST_INITRD"
+      );
+      None
+    }
+  }
+}
+
+/// Runs QEMU with a `vhost-user-fs-pci` device whose front end speaks over `socket` (inherited at its own
+/// number), the guest's RAM a sealed memfd; its console output once it exits, or the run's failure.
+#[cfg(target_os = "linux")]
+fn run_qemu(
+  guest: &(String, String, String),
+  socket: &std::os::fd::OwnedFd,
+  sample: &mut dyn FnMut(&[GuestMapping]),
+) -> String {
+  run_qemu_with(guest, socket, (GUEST_RUN, "", false), sample)
+}
+
+/// The QEMU machine a live guest runs on this host's architecture, and whether KVM accelerates it.
+#[cfg(target_os = "linux")]
+struct GuestMachine {
+  /// The machine type, with the memory backend the vhost-user device needs shared.
+  machine: &'static str,
+  /// The guest kernel's console device.
+  console: &'static str,
+  /// Whether `/dev/kvm` is usable here (the CI runner; Docker Desktop on Apple Silicon has none).
+  kvm: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl GuestMachine {
+  fn of_this_host() -> GuestMachine {
+    let kvm = rustix::fs::access(
+      "/dev/kvm",
+      rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
+    )
+    .is_ok();
+    if cfg!(target_arch = "x86_64") {
+      GuestMachine {
+        machine: "q35,memory-backend=mem",
+        console: "ttyS0",
+        kvm,
+      }
+    } else {
+      GuestMachine {
+        machine: "virt,memory-backend=mem",
+        console: "ttyAMA0",
+        kvm,
+      }
+    }
+  }
+}
+
+/// [`run_qemu`] within `bound`, with `extra` appended to the guest's command line and, with `host_root`, the
+/// host container's root shared read-only over 9p as `hostroot`.
+#[cfg(target_os = "linux")]
+fn run_qemu_with(
+  (qemu, kernel, initrd): &(String, String, String),
+  socket: &std::os::fd::OwnedFd,
+  (bound, extra, host_root): (Duration, &str, bool),
+  sample: &mut dyn FnMut(&[GuestMapping]),
+) -> String {
+  use std::os::fd::AsRawFd;
+  let chardev = format!("socket,id=vfs,fd={}", socket.as_raw_fd());
+  let machine = GuestMachine::of_this_host();
+  let append = format!(
+    "console={} rdinit=/init panic=-1 quiet{extra}",
+    machine.console
+  );
+  // The workload guest compiles with rustc, which needs more than the mount guest's RAM.
+  let memory = if host_root {
+    WORKLOAD_GUEST_RAM
+  } else {
+    "256M"
+  };
+  let backend = format!("memory-backend-memfd,id=mem,size={memory},share=on");
+  let mut command = std::process::Command::new(qemu);
+  if machine.kvm {
+    command.args(["-accel", "kvm"]);
+  }
+  if host_root {
+    command.args([
+      "-virtfs",
+      "local,path=/,mount_tag=hostroot,security_model=none,readonly=on",
+    ]);
+  }
+  command
+    .args([
+      "-machine",
+      machine.machine,
+      "-cpu",
+      if machine.kvm { "host" } else { "max" },
+      "-smp",
+      "1",
+      "-m",
+      memory,
+      "-object",
+      &backend,
+      "-nographic",
+      "-nic",
+      "none",
+      "-no-reboot",
+      "-kernel",
+      kernel,
+      "-initrd",
+      initrd,
+      "-append",
+      &append,
+      "-chardev",
+      &chardev,
+      "-device",
+      "vhost-user-fs-pci,chardev=vfs,tag=slates",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+  let mut child = spawn_vm_command(command, socket);
+  let started = Instant::now();
+  let mut timed_out = false;
+  while child.try_wait().unwrap().is_none() {
+    sample(&guest_memory_mappings());
+    if started.elapsed() > bound {
+      let _ = child.kill();
+      timed_out = true;
+      break;
+    }
+    // The test thread polls its child QEMU process; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  let output = child.wait_with_output().unwrap();
+  let console = format!(
+    "{}{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  if timed_out {
+    format!("(the guest did not power off within {bound:?})\n{console}")
+  } else {
+    console
+  }
+}
+
+/// Starts the VM with its socket inherited at its existing number, the number in QEMU's `fd=` argument.
+#[cfg(target_os = "linux")]
+fn spawn_vm_command(
+  mut command: std::process::Command,
+  socket: &std::os::fd::OwnedFd,
+) -> std::process::Child {
+  use std::os::fd::{AsRawFd, BorrowedFd};
+  use std::os::unix::process::CommandExt;
+
+  let raw = socket.as_raw_fd();
+  // SAFETY: `socket` stays owned and borrowed until spawn returns; the command is consumed here. Only the child
+  // clears CLOEXEC, using the async-signal-safe fcntl syscall and an allocation-free errno conversion after fork.
+  unsafe {
+    command.pre_exec(move || {
+      let socket = BorrowedFd::borrow_raw(raw);
+      rustix::io::fcntl_setfd(socket, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)
+    });
+  }
+  command.spawn().unwrap()
+}
+
+/// A-169 / AC-4.12: real execs prove each VM inherits its own socket without keeping a sibling's volume attached.
+#[cfg(target_os = "linux")]
+mod vm_descriptor {
+  use std::io::Write;
+  use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+  use std::process::{Child, Command, Stdio};
+
+  use super::*;
+
+  /// Format: the child identifies its inherited socket through this role-only environment key.
+  const SOCKET_ENV: &str = "SLATES_TEST_VM_SOCKET";
+  /// Format: the child's single readiness byte proves exec completed and the intended descriptor survived.
+  const READY: u8 = b'R';
+
+  /// Owns the role until it exits or is killed and reaped, including an assertion's unwind.
+  struct Role(Child);
+
+  impl Drop for Role {
+    fn drop(&mut self) {
+      if self.0.try_wait().unwrap().is_none() {
+        self.0.kill().expect("kill the owned socket fixture");
+      }
+      self.0.wait().expect("reap the owned socket fixture");
+    }
+  }
+
+  impl Role {
+    fn finish(&mut self) {
+      self.0.stdin.as_mut().unwrap().write_all(b"quit\n").unwrap();
+      let started = Instant::now();
+      loop {
+        if let Some(status) = self.0.try_wait().unwrap() {
+          assert!(status.success(), "{status}");
+          break;
+        }
+        assert!(
+          started.elapsed() < common::guest::WAIT,
+          "the role did not exit"
+        );
+        std::thread::yield_now();
+      }
+    }
+  }
+
+  fn pair() -> (OwnedFd, OwnedFd) {
+    rustix::net::socketpair(
+      rustix::net::AddressFamily::UNIX,
+      rustix::net::SocketType::STREAM,
+      rustix::net::SocketFlags::CLOEXEC,
+      None,
+    )
+    .unwrap()
+  }
+
+  fn start(socket: &OwnedFd) -> Role {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+      .args([
+        "--ignored",
+        "--exact",
+        "vm_descriptor::socket_role",
+        "--nocapture",
+      ])
+      .env(SOCKET_ENV, socket.as_raw_fd().to_string())
+      .stdin(Stdio::piped())
+      .stdout(Stdio::null())
+      .stderr(Stdio::inherit());
+    Role(spawn_vm_command(command, socket))
+  }
+
+  /// A byte from the socket within the existing guest-test bound, or EOF while its peer belongs to no child.
+  fn next(socket: &OwnedFd) -> Option<u8> {
+    let mut fds = [rustix::event::PollFd::new(
+      socket,
+      rustix::event::PollFlags::IN,
+    )];
+    let bound = rustix::event::Timespec {
+      tv_sec: i64::try_from(common::guest::WAIT.as_secs()).unwrap(),
+      tv_nsec: 0,
+    };
+    assert_eq!(
+      rustix::event::poll(&mut fds, Some(&bound)).unwrap(),
+      1,
+      "the owning VM exited but a sibling kept its socket open"
+    );
+    let mut byte = [0u8; 1];
+    (rustix::io::read(socket, &mut byte).unwrap() != 0).then_some(byte[0])
+  }
+
+  /// A-169: start two VMs while the parent still holds both socket capabilities, then close the first VM and its
+  /// parent end. Expect EOF on that backend while the second VM still runs, and its own socket remains usable.
+  #[test]
+  fn a_vm_exiting_closes_its_socket_while_a_sibling_vm_keeps_running() {
+    let (first_backend, first_frontend) = pair();
+    let mut first = start(&first_frontend);
+    assert_eq!(next(&first_backend), Some(READY));
+    let (second_backend, second_frontend) = pair();
+    let mut second = start(&second_frontend);
+    assert_eq!(next(&second_backend), Some(READY));
+    drop(first_frontend);
+    first.finish();
+    assert_eq!(
+      next(&first_backend),
+      None,
+      "only the first VM owned its socket"
+    );
+    second.finish();
+    drop(second_frontend);
+    assert_eq!(next(&second_backend), None);
+  }
+
+  /// A-169: the parent's owned child. Its readiness travels on the inherited capability, not libtest's stdout banner.
+  #[test]
+  #[ignore]
+  fn socket_role() {
+    let raw = std::env::var(SOCKET_ENV).unwrap().parse().unwrap();
+    // SAFETY: the parent keeps this role's socket open across spawn and hands exactly this descriptor through exec.
+    let socket = unsafe { BorrowedFd::borrow_raw(raw) };
+    rustix::io::write(socket, &[READY]).unwrap();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).unwrap();
+    assert_eq!(line, "quit\n");
+  }
+}
+
+/// AUD-29-68 (a live guest). Do: provision a volume and write `from-host.txt` into it over NFS; hand the daemon
+/// one end of a socketpair as a vhost-user device and QEMU the other (`-chardev socket,fd=N`, never a socket on
+/// disk), its guest's RAM a sealed memfd; boot a Linux guest whose init mounts the tag over virtio-fs, reads the
+/// host's file, writes `from-guest.txt`, makes `guest-dir`, unmounts and powers off; then read the volume over
+/// NFS. Expect: the guest reports the host's bytes, lists its own entries, unmounts and finishes; the device
+/// ends when QEMU goes; the host reads the guest's bytes and sees its directory. Gated on the live-guest
+/// environment (QEMU, a kernel with virtio-fs, the initramfs); skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_guest_mounts_the_volume_through_qemu_over_vhost_user() {
+  let Some(guest) = live_guest() else {
+    return;
+  };
+  let (daemon, instance) = single_shard_daemon("virtiofs-qemu");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("guestvol")) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("guestvol").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let host_file = common::nfs::create(&mut stream, &root, "from-host.txt", 2);
+  common::nfs::write(&mut stream, &host_file, b"from the host", 3);
+  let (ours, theirs) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let boot_ns = u64::try_from(GUEST_RUN.as_nanos()).unwrap();
+  let ended = attach_vhost(&daemon, id, (ours, boot_ns));
+  let console = run_and_measure(&guest, theirs);
+  if !console.contains("SLATES-GUEST-OK") {
+    let outcome = ended.recv_timeout(common::guest::WAIT);
+    panic!("the guest did not finish; the device: {outcome:?}\n{console}");
+  }
+  assert!(
+    console.contains("SLATES-HOST-SAYS: from the host"),
+    "{console}"
+  );
+  assert!(console.contains("SLATES-GUEST-UNMOUNTED"), "{console}");
+  assert!(console.contains("SLATES-GUEST-OK"), "{console}");
+  let outcome = ended
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device ended");
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::Ended(_)),
+    "{outcome:?}"
+  );
+  let guest_file = lookup(&mut stream, &root, "from-guest.txt", 4);
+  assert_eq!(read(&mut stream, &guest_file, 5), b"written by the guest\n");
+  assert!(common::nfs::lookup_status(&mut stream, &root, "guest-dir", 6).is_ok());
+  drop(client);
+  drop(daemon);
+}
+
+/// AUD-29-68 (messages queued back to back). Do: as the front end, queue `SET_FEATURES`,
+/// `SET_PROTOCOL_FEATURES`, `SET_OWNER` and `SET_MEM_TABLE` (the last carrying the memory object, asking a
+/// reply-ack) before the daemon adopts the socket, so its first reads find them all waiting — what QEMU sends
+/// before it waits. Expect: the table is accepted (ack 0). Before the fix one receive took several messages,
+/// the table's descriptor arrived while an earlier message was served and was closed with it, and the table
+/// was refused (`a memory table whose descriptors do not match its regions`; QEMU: `vhost_set_mem_table failed`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_user_front_end_sending_back_to_back_has_each_descriptor_kept_with_its_message() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-vhost-queued");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("queued")) else {
+    panic!("the volume was not created");
+  };
+  let (front, socket) = vhost_front_end::pair();
+  let ram = vhost_front_end::guest_ram(true);
+  front.queue_settings_and_memory(&ram);
+  let _ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
+  let reply = front.reply().expect("the table's ack");
+  assert_eq!(
+    vhost_front_end::status(&reply),
+    0,
+    "the memory table is accepted"
+  );
+  drop(front);
+  drop(client);
+  drop(daemon);
+}
+
+/// The volume's attachment count as `status` reports it.
+fn attachments_of(client: &mut Client, volume: slates_ipc::protocol::VolumeId) -> u32 {
+  let ReplyBody::Status { report } = client.call(&RequestBody::Status { volume }) else {
+    panic!("status");
+  };
+  report.attachments
+}
+
+/// Through the owner's NFS mount of volume `name`: `f` holding three bytes, a snapshot, five bytes, a snapshot,
+/// seven bytes. The two snapshots.
+fn three_versions_of_f(
+  daemon: &Daemon,
+  client: &mut Client,
+  id: slates_ipc::protocol::VolumeId,
+  name: &str,
+) -> [slates_ipc::protocol::SnapshotId; 2] {
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability(name).unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let file = common::nfs::create(&mut stream, &root, "f", 2);
+  let mut snapshots = Vec::new();
+  for (xid, bytes) in [(3, &b"one"[..]), (4, b"three")] {
+    common::nfs::write(&mut stream, &file, bytes, xid);
+    let ReplyBody::Snapshotted { id: snapshot, .. } =
+      client.call(&RequestBody::Snapshot { volume: id })
+    else {
+      panic!("snapshot");
+    };
+    snapshots.push(snapshot);
+  }
+  common::nfs::write(&mut stream, &file, b"seven!!", 5);
+  snapshots.try_into().unwrap()
+}
+
+/// Waits on the guest's side (the owning shard's thread) until `signal` arrives, a heartbeat at a time.
+async fn until(signal: std::sync::mpsc::Receiver<()>) {
+  while signal.try_recv().is_err() {
+    slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS)
+      .await
+      .unwrap();
+  }
+}
+
+/// The guest's script: `f`'s size at its root, reported; after `advanced`, the size again, reported; after
+/// `detached`, a GETATTR submitted and kicked, and whether it was answered within five heartbeats.
+fn advance_and_detach_script(
+  sizes: std::sync::mpsc::Sender<u64>,
+  advanced: std::sync::mpsc::Receiver<()>,
+  detached: std::sync::mpsc::Receiver<()>,
+) -> impl FnOnce(
+  std::os::fd::OwnedFd,
+  std::os::fd::OwnedFd,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+  move |kick_write, call_read| {
+    Box::pin(async move {
+      // EntryOut: nodeid, generation, two validities, two nanosecond words, then fuse_attr: ino, size.
+      let size_at = |reply: &[u8]| u64_at(reply, OUT_HEADER_LEN + 48);
+      let first = round_trip(&kick_write, &call_read, &lookup_message(1, 1, "f")).await;
+      let _ = sizes.send(size_at(&first));
+      until(advanced).await;
+      let second = round_trip(&kick_write, &call_read, &lookup_message(2, 1, "f")).await;
+      let _ = sizes.send(size_at(&second));
+      until(detached).await;
+      common::guest::with_guest(|g| {
+        g.submit(&getattr_message(3, 1), common::guest::REPLY_CAP);
+      });
+      let _ = rustix::io::write(&kick_write, &[1u8]);
+      slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS * REVOKED_WATCH_HEARTBEATS)
+        .await
+        .unwrap();
+      let answered = common::guest::with_guest(|g| g.reap()).is_some();
+      drop(kick_write);
+      answered
+    })
+  }
+}
+
+/// AUD-29-68 (the guest's durable record). Do: write `f` at three, five and seven bytes with a snapshot after the
+/// first two; attach a guest device presenting the first snapshot; read `status`; look `f` up in the guest;
+/// `advance` the device's attachment to the second snapshot and look `f` up again; `detach` the attachment and
+/// send the guest one more request; destroy both snapshots. Expect: the harness learns the device's record id;
+/// `status` counts it while it lives; the guest sees three bytes, then five after the advance, which names
+/// `/f`; the detach ends the device (`Revoked`, references swept) and its request goes unanswered; `status`
+/// counts it no longer; both snapshots are then destroyable (no view pins them). Before 2026-10-01 a guest
+/// device had no record: `status` could not see it, `detach` could not end it and its view could not move.
+#[test]
+fn a_guest_device_is_recorded_its_snapshot_view_advances_and_its_detach_ends_it() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-recorded");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("recorded")) else {
+    panic!("the volume was not created");
+  };
+  let [first, second] = three_versions_of_f(&daemon, &mut client, id, "recorded");
+  let before = attachments_of(&mut client, id);
+  let (sizes_tx, sizes) = channel::<u64>();
+  let (advanced_tx, advanced_rx) = channel::<()>();
+  let (detached_tx, detached_rx) = channel::<()>();
+  let guest = common::guest::start_guest(
+    &daemon,
+    id,
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
+    slates_server::virtiofs::GuestView {
+      subtree: None,
+      snapshot: Some(first),
+    },
+    advance_and_detach_script(sizes_tx, advanced_rx, detached_rx),
+  );
+  let attachment = guest
+    .admitted
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device was admitted");
+  assert_eq!(
+    attachments_of(&mut client, id),
+    before + 1,
+    "the device is recorded"
+  );
+  assert_the_view_advances(&mut client, attachment, second, (&sizes, advanced_tx));
+  assert_the_detach_ends_the_device(&mut client, attachment, &guest, detached_tx);
+  assert_eq!(attachments_of(&mut client, id), before);
+  for snapshot in [first, second] {
+    assert!(matches!(
+      client.call(&RequestBody::DestroySnapshot {
+        volume: id,
+        snapshot
+      }),
+      ReplyBody::SnapshotDestroyed
+    ));
+  }
+  drop(client);
+  drop(daemon);
+}
+
+/// AUD-29-68 (a guest's record outlives a dead daemon only until recovery). Do: under a daemon whose anchor
+/// segment the test holds, attach a guest device and wait for its record; stop the daemon with the device still
+/// attached (its loop is dropped unended, as a crash drops it; a stop publishes nothing); start a second daemon
+/// over the same segment and read `status`. Expect: the first daemon counts the device; the second counts it no
+/// longer — its device and seam were the dead process's own, so recovery ended the record rather than leaving
+/// an attachment nothing serves.
+#[test]
+fn a_dead_daemons_guest_record_is_ended_by_recovery() {
+  use common::anchor::{held_anchor, source_of};
+  let profile = common::machine_profile();
+  let instance = format!("srv-guest-recorded-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let anchor = held_anchor("guest-recorded", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("orphaned")) else {
+    panic!("the volume was not created");
+  };
+  let before = attachments_of(&mut client, id);
+  let (_never, waits) = channel::<()>();
+  let guest = common::guest::start_guest(
+    &first,
+    id,
+    Principal::Uid {
+      host: slates_db::HostId(common::this_host()),
+      uid: my_uid(),
+    },
+    slates_server::virtiofs::GuestView::default(),
+    move |kick_write, _call_read| {
+      Box::pin(async move {
+        until(waits).await;
+        drop(kick_write);
+      })
+    },
+  );
+  guest
+    .admitted
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device was admitted");
+  assert_eq!(attachments_of(&mut client, id), before + 1);
+  drop(client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  let mut client = Client::connect(&instance);
+  assert_eq!(
+    attachments_of(&mut client, id),
+    before,
+    "recovery ended the dead device's record"
+  );
+  drop(client);
+  second.stop();
+  drop(anchor);
+}
+
+/// The guest reads three bytes at the first snapshot; `advance` to `second` names `/f` alone; the guest then
+/// reads five.
+fn assert_the_view_advances(
+  client: &mut Client,
+  attachment: u64,
+  second: slates_ipc::protocol::SnapshotId,
+  (sizes, advanced): (&std::sync::mpsc::Receiver<u64>, std::sync::mpsc::Sender<()>),
+) {
+  assert_eq!(sizes.recv_timeout(common::guest::WAIT), Ok(3));
+  let moved = client.call(&RequestBody::Advance {
+    attachment,
+    version: Some(second.value),
+  });
+  assert_eq!(
+    moved,
+    ReplyBody::Advanced {
+      version: second.value,
+      invalidated: vec!["/f".to_owned()],
+    }
+  );
+  let _ = advanced.send(());
+  assert_eq!(
+    sizes.recv_timeout(common::guest::WAIT),
+    Ok(5),
+    "the view moved"
+  );
+}
+
+/// `detach` of the device's record ends the device: its next request goes unanswered and its loop ends
+/// `Revoked` with its references swept.
+fn assert_the_detach_ends_the_device(
+  client: &mut Client,
+  attachment: u64,
+  guest: &common::guest::StartedGuest<bool>,
+  detached: std::sync::mpsc::Sender<()>,
+) {
+  assert_eq!(
+    client.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached
+  );
+  let _ = detached.send(());
+  assert_eq!(
+    guest.script.recv_timeout(common::guest::WAIT),
+    Ok(false),
+    "no request answered after the detach"
+  );
+  let Ok(GuestDeviceOutcome::Ended(end)) = guest.end.recv_timeout(common::guest::WAIT) else {
+    panic!("the device did not end");
+  };
+  assert_eq!(end.why, EndReason::Revoked);
+  assert!(end.reclaimed.as_ref().is_ok_and(|r| r.references_swept));
+}
+
+/// Runs the live guest over `theirs` while sampling this process's mappings of its memory (AUD-29-77): the device
+/// must have mapped it and locked none of it; the peak resident size is printed for the record. The console.
+#[cfg(target_os = "linux")]
+fn run_and_measure(guest: &(String, String, String), theirs: std::os::fd::OwnedFd) -> String {
+  let mut peak = GuestMapping::default();
+  let mut mapped = false;
+  let console = run_qemu(guest, &theirs, &mut |mappings: &[GuestMapping]| {
+    for mapping in mappings {
+      mapped = true;
+      peak.rss_kib = peak.rss_kib.max(mapping.rss_kib);
+      peak.locked_kib = peak.locked_kib.max(mapping.locked_kib);
+    }
+  });
+  drop(theirs);
+  // AUD-29-77, measured: the device mapped the VMM's guest memory and locked none of it; what it touched is
+  // printed for the record.
+  eprintln!(
+    "guest memory mapped by the device: peak resident {} KiB of {GUEST_RAM_KIB} KiB, locked {} KiB",
+    peak.rss_kib, peak.locked_kib
+  );
+  assert!(
+    mapped,
+    "the device's mapping of the guest's memory was seen"
+  );
+  assert_eq!(
+    peak.locked_kib, 0,
+    "slates locks none of the guest's memory"
+  );
+  console
+}
+
+/// The guest's script for a destroy: one GETATTR answered, then, after `destroyed`, a second submitted and
+/// kicked, and whether it was answered within five heartbeats.
+fn destroy_script(
+  answered_first: std::sync::mpsc::Sender<i32>,
+  destroyed: std::sync::mpsc::Receiver<()>,
+) -> impl FnOnce(
+  std::os::fd::OwnedFd,
+  std::os::fd::OwnedFd,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+  move |kick_write, call_read| {
+    Box::pin(async move {
+      let first = round_trip(&kick_write, &call_read, &getattr_message(1, 1)).await;
+      let _ = answered_first.send(reply_error(&first));
+      until(destroyed).await;
+      common::guest::with_guest(|g| {
+        g.submit(&getattr_message(2, 1), common::guest::REPLY_CAP);
+      });
+      let _ = rustix::io::write(&kick_write, &[1u8]);
+      slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS * REVOKED_WATCH_HEARTBEATS)
+        .await
+        .unwrap();
+      let answered = common::guest::with_guest(|g| g.reap()).is_some();
+      drop(kick_write);
+      answered
+    })
+  }
+}
+
+/// AUD-29-68–70 (a volume destroyed under its guest devices). Do: attach a guest device presenting the head, and
+/// in a second daemon run one presenting a snapshot; let each answer one request; destroy the volume; send each
+/// guest one more request. Expect: the destroy ends each device as a revocation — its terminal step sweeps its
+/// references under its still-live attachment (through its view, for the snapshot) — so no later request is
+/// answered, no reclaim is counted incomplete, and the device's record leaves with the volume.
+#[test]
+fn a_volume_destroyed_under_its_guest_devices_ends_them_cleanly() {
+  for presents_snapshot in [false, true] {
+    let (daemon, instance) = single_shard_daemon(if presents_snapshot {
+      "virtiofs-destroy-snapshot"
+    } else {
+      "virtiofs-destroy-head"
+    });
+    let mut client = Client::connect(&instance);
+    let ReplyBody::Created { id } = client.call(&scratch("destroyed")) else {
+      panic!("the volume was not created");
+    };
+    let snapshot = presents_snapshot.then(|| {
+      let ReplyBody::Snapshotted { id: snapshot, .. } =
+        client.call(&RequestBody::Snapshot { volume: id })
+      else {
+        panic!("snapshot");
+      };
+      snapshot
+    });
+    let (first_tx, first_rx) = channel::<i32>();
+    let (destroyed_tx, destroyed_rx) = channel::<()>();
+    let guest = common::guest::start_guest(
+      &daemon,
+      id,
+      Principal::Uid {
+        host: slates_db::HostId(common::this_host()),
+        uid: my_uid(),
+      },
+      slates_server::virtiofs::GuestView {
+        subtree: None,
+        snapshot,
+      },
+      destroy_script(first_tx, destroyed_rx),
+    );
+    assert_eq!(first_rx.recv_timeout(common::guest::WAIT), Ok(0));
+    assert_eq!(
+      client.call(&RequestBody::Destroy { volume: id }),
+      ReplyBody::Destroyed
+    );
+    let _ = destroyed_tx.send(());
+    assert_eq!(
+      guest.script.recv_timeout(common::guest::WAIT),
+      Ok(false),
+      "no request answered after the destroy (snapshot: {presents_snapshot})"
+    );
+    let outcome = guest.end.recv_timeout(common::guest::WAIT);
+    let Ok(GuestDeviceOutcome::Ended(end)) = &outcome else {
+      panic!("the device did not end: {outcome:?}");
+    };
+    assert_eq!(end.why, EndReason::Revoked, "snapshot: {presents_snapshot}");
+    assert!(
+      end
+        .reclaimed
+        .as_ref()
+        .is_ok_and(|r| r.references_swept && r.sweep_refused.is_none()),
+      "{end:?}"
+    );
+    let refusals = daemon.refusals_on_every_shard().unwrap();
+    assert_eq!(
+      refusals.get("virtiofs.reclaim_incomplete"),
+      None,
+      "{refusals:?}"
+    );
+    assert!(
+      the_volume_goes(&mut client, id),
+      "the deferred destroy completed once the device ended"
+    );
+    drop(client);
+    drop(daemon);
+  }
+}
+
+/// Whether `volume`'s destroy completes within the test's wait: `status` then refuses it.
+fn the_volume_goes(client: &mut Client, volume: slates_ipc::protocol::VolumeId) -> bool {
+  let deadline = Instant::now() + common::guest::WAIT;
+  while Instant::now() < deadline {
+    if matches!(
+      client.call(&RequestBody::Status { volume }),
+      ReplyBody::Refused { .. }
+    ) {
+      return true;
+    }
+    // The test thread polls the daemon over the ring; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  false
+}
+
+/// Shape: the workload guest's RAM: rustc's working set for a one-file crate with room to spare (the mount
+/// guest's 256 MiB is measured in AUD-29-77 and stays the residency figure).
+#[cfg(target_os = "linux")]
+const WORKLOAD_GUEST_RAM: &str = "1G";
+
+/// Shape: how long the workload guest may run — the boot, then each roster tool twice (nine on Linux, a cargo
+/// build of a one-file crate among them) under software emulation. Measured at 364 s and 317 s on Docker
+/// Desktop's Apple Silicon VM (2026-10-01), so about four times that, still failing a hung guest in bounded time.
+#[cfg(target_os = "linux")]
+const WORKLOAD_RUN: Duration = Duration::from_secs(1500);
+
+/// Format: the guest's script, run inside the host container's root (`/` over 9p, read-only) with the slates tag
+/// at `/mnt` and a RAM `/tmp`. For each roster tool the guest holds, the workload runs on the guest's RAM and on
+/// the slates mount under one fixed environment, and each run's output and resulting tree are printed between
+/// markers: kind, permission bits, size, SHA-256 (or link target) and path per entry.
+#[cfg(target_os = "linux")]
+const GUEST_WORKLOADS: &str = r#"
+export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/tmp/home CARGO_HOME=/tmp/cargo-home RUSTUP_HOME=/usr/local/rustup
+export GIT_AUTHOR_NAME=slates GIT_AUTHOR_EMAIL=slates@example.invalid
+export GIT_COMMITTER_NAME=slates GIT_COMMITTER_EMAIL=slates@example.invalid
+export GIT_AUTHOR_DATE=2026-09-14T00:00:00Z GIT_COMMITTER_DATE=2026-09-14T00:00:00Z
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 TZ=UTC LC_ALL=C
+mkdir -p "$HOME" "$CARGO_HOME"
+while read -r name tool; do
+  if ! command -v "$tool" >/dev/null 2>&1; then echo "=== SKIP $name $tool"; continue; fi
+  for side in ram mount; do
+    if [ "$side" = ram ]; then dir=/tmp/w/$name; else dir=/mnt/w/$name; fi
+    mkdir -p "$dir"
+    ( cd "$dir" && sh -e /mnt/scripts/$name.sh ) > /tmp/out.$side 2>&1
+    code=$?
+    echo "=== RUN $name $side $code $dir"
+    cat /tmp/out.$side
+    echo "=== MANIFEST"
+    ( cd "$dir" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r p; do
+        kind=$(stat -c %F "$p"); mode=$(stat -c %a "$p")
+        case "$kind" in
+          "regular file"|"regular empty file")
+            printf 'f\t%s\t%s\t%s\t%s\n' "$mode" "$(stat -c %s "$p")" "$(sha256sum < "$p" | cut -d' ' -f1)" "${p#./}" ;;
+          directory) printf 'd\t%s\t0\t-\t%s\n' "$mode" "${p#./}" ;;
+          "symbolic link") printf 'l\t0\t0\t%s\t%s\n' "$(readlink "$p")" "${p#./}" ;;
+          *) printf 'o\t%s\t0\t-\t%s\n' "$mode" "${p#./}" ;;
+        esac
+      done )
+    echo "=== END"
+  done
+done < /mnt/roster
+"#;
+
+/// The roster workloads a Linux guest runs: the whole roster but the macOS watcher (`fswatch`).
+#[cfg(target_os = "linux")]
+fn guest_roster() -> Vec<&'static slates_conformance::workload::Workload> {
+  slates_conformance::workload::ROSTER
+    .iter()
+    .filter(|workload| workload.tool != "fswatch")
+    .collect()
+}
+
+/// Writes `bytes` as `name` in directory `dir` over NFS.
+#[cfg(target_os = "linux")]
+fn put(stream: &mut TcpStream, dir: &[u8], name: &str, bytes: &[u8], xid: u32) {
+  let file = common::nfs::create(stream, dir, name, xid);
+  common::nfs::write(stream, &file, bytes, xid.wrapping_add(1));
+}
+
+/// Places the guest's script, the roster and each workload's script in the volume behind `root`.
+#[cfg(target_os = "linux")]
+fn place_workloads(stream: &mut TcpStream, root: &[u8]) {
+  // The roster's bounds, the very values every other leg runs it under.
+  let script = format!(
+    "export {}={} {}={}\n{GUEST_WORKLOADS}",
+    slates_conformance::workload::ENV_SQLITE_BUSY_MS,
+    slates_conformance::workload::SQLITE_BUSY_MS,
+    slates_conformance::workload::ENV_WATCH_SECONDS,
+    slates_conformance::workload::WATCH_SECONDS,
+  );
+  put(stream, root, "run.sh", script.as_bytes(), 10);
+  let roster: String = guest_roster()
+    .iter()
+    .map(|workload| format!("{} {}\n", workload.name, workload.tool))
+    .collect();
+  put(stream, root, "roster", roster.as_bytes(), 12);
+  let scripts = common::nfs::mkdir(stream, root, "scripts", 14);
+  for (position, workload) in guest_roster().iter().enumerate() {
+    let xid = 20 + 2 * u32::try_from(position).unwrap();
+    put(
+      stream,
+      &scripts,
+      &format!("{}.sh", workload.name),
+      workload.script.as_bytes(),
+      xid,
+    );
+  }
+}
+
+/// The runs the guest printed, by workload name and side (`ram`, `mount`), and the tools it lacked.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct GuestRuns {
+  runs: std::collections::BTreeMap<(String, String), slates_conformance::workload::Run>,
+  skipped: Vec<String>,
+}
+
+/// One manifest line the guest printed: kind, permission bits (octal), size, digest or link target, path.
+#[cfg(target_os = "linux")]
+fn manifest_entry(line: &str) -> Option<slates_conformance::workload::Entry> {
+  use slates_conformance::workload::{Entry, EntryKind};
+  let mut fields = line.splitn(5, '\t');
+  let (kind, mode, size, digest, path) = (
+    fields.next()?,
+    fields.next()?,
+    fields.next()?,
+    fields.next()?,
+    fields.next()?,
+  );
+  let (kind, digest) = match kind {
+    "f" => (EntryKind::File, digest.to_owned()),
+    "d" => (EntryKind::Directory, String::new()),
+    "l" => (
+      EntryKind::Symlink {
+        target: digest.to_owned(),
+      },
+      String::new(),
+    ),
+    _ => (EntryKind::Other, String::new()),
+  };
+  Some(Entry {
+    path: path.to_owned(),
+    kind,
+    mode: u32::from_str_radix(mode, 8).ok()?,
+    size: size.parse().ok()?,
+    digest,
+  })
+}
+
+/// The console parser reads a marker the firmware's own output shares a line with. Do: parse a console whose
+/// first `=== RUN` line is exactly what the x86 serial console delivered on CI (2026-10-02, where git's RAM run went
+/// missing): the firmware's `Booting from ROM..`, its reset and clear-screen sequences (`ESC c`, `ESC [ ? 7 l`,
+/// `ESC [ 2 J`, `ESC [ 0 m`), a bare carriage return, then the marker; and a marker line ending in `\r` as serial lines
+/// do. Expect: the run is read, with its manifest, as a clean line would be — a carriage return followed by text
+/// returns to column 0, as on the terminal, and a trailing one ends the line.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_console_marker_behind_terminal_controls_is_still_read() {
+  let console = "Booting from ROM..\u{1b}c\u{1b}[?7l\u{1b}[2J\u{1b}[0m.\r=== RUN git ram 0 /tmp/w/git\r\nout\r\n=== MANIFEST\r\nd\t755\t0\t-\t.git\r\n=== END\r\n";
+  let parsed = guest_runs(console);
+  let run = parsed
+    .runs
+    .get(&("git".to_owned(), "ram".to_owned()))
+    .expect("the run behind the controls is read");
+  assert_eq!(run.exit_code, 0);
+  assert_eq!(run.directory, "/tmp/w/git");
+  assert_eq!(run.manifest.entries.len(), 1);
+}
+
+/// The console parser reads a marker that follows the firmware's screen reset with no carriage return between. Do:
+/// parse the first console line CI run 37176411038 delivered (2026-10-04, git's RAM run read as missing again): the
+/// firmware's `Booting from ROM..`, its reset (`ESC c`), `ESC [ ? 7 l` and erase-display (`ESC [ 2 J`), then the marker
+/// at once. Expect: the run is read — a reset or an erase of the display leaves nothing before it on the screen.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_console_marker_right_after_a_screen_reset_is_still_read() {
+  let console = "Booting from ROM..\u{1b}c\u{1b}[?7l\u{1b}[2J=== RUN git ram 0 /tmp/w/git\r\nout\r\n=== MANIFEST\r\nd\t755\t0\t-\t.git\r\n=== END\r\n";
+  let parsed = guest_runs(console);
+  let run = parsed
+    .runs
+    .get(&("git".to_owned(), "ram".to_owned()))
+    .expect("the run after the screen reset is read");
+  assert_eq!(run.exit_code, 0);
+  assert_eq!(run.directory, "/tmp/w/git");
+  assert_eq!(run.manifest.entries.len(), 1);
+}
+
+/// `line` as a terminal would leave it: without the control sequences a serial console interleaves (CSI
+/// `ESC [ … final`, a two-byte `ESC x`, and other C0 controls but the tab the manifest separates fields with), and
+/// with a carriage return followed by more text returning to column 0, so what came before it is overwritten. A
+/// reset (`ESC c`) or a whole-screen erase (`ESC [ 2 J`, `ESC [ 3 J`) clears what came before it too: the firmware's
+/// `Booting from ROM..` preceded the first marker behind those alone on CI run 37176411038 (2026-10-04). The
+/// firmware's `Booting from ROM..` shared the first marker's line behind a bare `\r` on CI's x86 console
+/// (2026-10-02); a trailing `\r`, as serial lines end, leaves the line as it is.
+#[cfg(target_os = "linux")]
+fn without_terminal_controls(line: &str) -> String {
+  /// Format: the escape character that opens a terminal control sequence (ECMA-48).
+  const ESCAPE: char = '\u{1b}';
+  let mut out = String::with_capacity(line.len());
+  let mut chars = line.chars();
+  while let Some(c) = chars.next() {
+    if c == ESCAPE {
+      if escape_clears_the_screen(&mut chars) {
+        out.clear();
+      }
+    } else if c == '\r' {
+      if chars.clone().next().is_some() {
+        out.clear();
+      }
+    } else if c == '\t' || !c.is_control() {
+      out.push(c);
+    }
+  }
+  out
+}
+
+/// Consumes the escape sequence `chars` holds after its `ESC` and says whether it clears the screen: a reset (`ESC c`,
+/// RIS) or an erase of the whole display (`ESC [ 2 J`, `ESC [ 3 J`). Any other sequence is dropped and clears nothing.
+#[cfg(target_os = "linux")]
+fn escape_clears_the_screen(chars: &mut std::str::Chars<'_>) -> bool {
+  /// Format: the byte after `ESC` that opens a control sequence (CSI) running to a final byte in `@..=~`.
+  const CSI: char = '[';
+  /// Format: the byte after `ESC` that resets the terminal (RIS, ECMA-48 §8.3.105), clearing the screen.
+  const RESET: char = 'c';
+  match chars.next() {
+    Some(CSI) => {
+      let mut parameters = String::new();
+      for next in chars.by_ref() {
+        if ('@'..='~').contains(&next) {
+          return next == 'J' && matches!(parameters.as_str(), "2" | "3");
+        }
+        parameters.push(next);
+      }
+      false
+    }
+    Some(RESET) => true,
+    _ => false,
+  }
+}
+
+/// Parses the guest's console into its runs.
+#[cfg(target_os = "linux")]
+fn guest_runs(console: &str) -> GuestRuns {
+  let mut parsed = GuestRuns::default();
+  let cleaned: Vec<String> = console.lines().map(without_terminal_controls).collect();
+  let mut lines = cleaned.iter().map(String::as_str);
+  while let Some(line) = lines.next() {
+    if let Some(rest) = line.strip_prefix("=== SKIP ") {
+      parsed.skipped.push(rest.to_owned());
+      continue;
+    }
+    let Some(rest) = line.strip_prefix("=== RUN ") else {
+      continue;
+    };
+    let mut words = rest.splitn(4, ' ');
+    let (Some(name), Some(side), Some(code), Some(directory)) =
+      (words.next(), words.next(), words.next(), words.next())
+    else {
+      continue;
+    };
+    let mut output = String::new();
+    for line in lines.by_ref() {
+      if line == "=== MANIFEST" {
+        break;
+      }
+      output.push_str(line);
+      output.push('\n');
+    }
+    let mut entries = Vec::new();
+    for line in lines.by_ref() {
+      if line == "=== END" {
+        break;
+      }
+      entries.extend(manifest_entry(line));
+    }
+    parsed.runs.insert(
+      (name.to_owned(), side.to_owned()),
+      slates_conformance::workload::Run {
+        directory: directory.to_owned(),
+        exit_code: code.parse().unwrap_or(-1),
+        output,
+        manifest: slates_conformance::workload::Manifest { entries },
+      },
+    );
+  }
+  parsed
+}
+
+/// Shape: how long the exerciser guest may run — the boot, then fsx and fsstress under the harness's bounds — under
+/// software emulation; the workload guest's bound, which this run is far shorter than (measured below).
+#[cfg(target_os = "linux")]
+const EXERCISER_RUN: Duration = WORKLOAD_RUN;
+
+/// The guest's exerciser script (AC-9.7, AUD-29-78: the guest's fsx and fsstress legs), run inside the host
+/// container's root with the slates tag at `/mnt` and a RAM `/tmp`: fsx and fsstress over the tag under the very
+/// bounds the harness runs them with (`slates_conformance::exerciser`), each run's exit code and output printed
+/// between markers. fsx keeps its `.fsxlog`/`.fsxgood` files in the guest's RAM (`-P`), as the harness keeps
+/// them outside the mount. fsstress's `-v` log is counted in the guest and only its tail printed: its 2,000 lines
+/// over the emulated serial console outran the guest's whole bound (measured 2026-10-03, cut off at line 1,812).
+#[cfg(target_os = "linux")]
+fn guest_exercisers() -> String {
+  use slates_conformance::exerciser::{
+    FSSTRESS_OPERATIONS, FSSTRESS_PROCESSES, FSSTRESS_SEED, FSX_FILE_LENGTH, FSX_OPERATIONS,
+    FSX_SEED,
+  };
+  format!(
+    r#"export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p /mnt/fsx /mnt/fsstress /tmp/fsx-logs
+( cd /mnt/fsx && fsx -N {FSX_OPERATIONS} -S {FSX_SEED} -l {FSX_FILE_LENGTH} -q -P /tmp/fsx-logs fsx.bin ) > /tmp/fsx.out 2>&1
+echo "=== EXERCISER fsx $?"
+cat /tmp/fsx.out
+echo "=== END"
+fsstress -d /mnt/fsstress -n {FSSTRESS_OPERATIONS} -p {FSSTRESS_PROCESSES} -s {FSSTRESS_SEED} -v > /tmp/fsstress.out 2>&1
+echo "=== EXERCISER fsstress $?"
+echo "operations logged: $(grep -cE '^[0-9]+/[0-9]+: ' /tmp/fsstress.out)"
+tail -n 20 /tmp/fsstress.out
+echo "=== END"
+"#
+  )
+}
+
+/// Each exerciser's exit code and output from the guest's console, by name.
+#[cfg(target_os = "linux")]
+fn exerciser_runs(console: &str) -> std::collections::BTreeMap<String, (i32, String)> {
+  let mut runs = std::collections::BTreeMap::new();
+  let mut current: Option<(String, i32, String)> = None;
+  for raw in console.lines() {
+    // Per line, as `guest_runs` reads it: the control stripping treats a carriage return followed by text as a
+    // return to column 0, so over the whole console it would keep only the last line.
+    let cleaned = without_terminal_controls(raw);
+    // The x86 firmware's text can share the first marker's line with no carriage return between them (CI run
+    // 37153360648: `Booting from ROM..` then reset and clear sequences then the marker), so a marker is found
+    // wherever it sits in the line.
+    let line = cleaned
+      .find("=== ")
+      .and_then(|at| cleaned.get(at..))
+      .unwrap_or(&cleaned)
+      .trim_end();
+    if let Some(rest) = line.strip_prefix("=== EXERCISER ") {
+      let mut fields = rest.split_whitespace();
+      let name = fields.next().unwrap_or_default().to_owned();
+      let code = fields
+        .next()
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(-1);
+      current = Some((name, code, String::new()));
+    } else if line == "=== END" {
+      if let Some((name, code, output)) = current.take() {
+        runs.insert(name, (code, output));
+      }
+    } else if let Some((_, _, output)) = current.as_mut() {
+      output.push_str(line);
+      output.push('\n');
+    }
+  }
+  runs
+}
+
+/// AUD-29-78 (the exerciser console parser). Do: parse the console CI's x86 guest delivered, the firmware's text, a
+/// reset and clear-screen sequence and the first marker on one line with no carriage return (run 37153360648).
+/// Expect: both exercisers' codes and outputs are read.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_exerciser_marker_behind_the_firmware_text_is_still_read() {
+  let console = "Booting from ROM..\u{1b}c\u{1b}[?7l\u{1b}[2J=== EXERCISER fsx 0\r\nAll operations completed A-OK!\r\n=== END\r\n=== EXERCISER fsstress 0\r\noperations logged: 2000\r\n=== END\r\n";
+  let runs = exerciser_runs(console);
+  assert_eq!(runs.get("fsx").map(|(code, _)| *code), Some(0));
+  assert!(
+    runs
+      .get("fsx")
+      .is_some_and(|(_, output)| output.contains("A-OK"))
+  );
+  assert_eq!(runs.get("fsstress").map(|(code, _)| *code), Some(0));
+}
+
+/// AC-9.7 / AUD-29-78 (the guest's fsx and fsstress legs). Do: boot the live guest in workload mode with the
+/// exerciser script in the volume, so fsx and fsstress run over the slates tag inside the guest under the
+/// harness's bounds; judge each by the harness's own rule (`slates_conformance::exerciser`). Expect: fsx passes its
+/// operations with no mismatch, and fsstress completes with every process's operations logged and no failure;
+/// the guest unmounts the tag cleanly. Gated on the live guest's environment; skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_guest_runs_fsx_and_fsstress_over_the_tag() {
+  let Some((qemu, kernel, initrd)) = live_guest() else {
+    return;
+  };
+  let (daemon, instance) = single_shard_daemon("virtiofs-exercisers");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "exercisers".to_owned(),
+    size: SizeClass::Bounded { limit: 512 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("exercisers").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  put(
+    &mut stream,
+    &root,
+    "run.sh",
+    guest_exercisers().as_bytes(),
+    10,
+  );
+  let (ours, theirs) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let boot_ns = u64::try_from(EXERCISER_RUN.as_nanos()).unwrap();
+  let _ended = attach_vhost(&daemon, id, (ours, boot_ns));
+  let started = Instant::now();
+  let console = run_qemu_with(
+    &(qemu, kernel, initrd),
+    &theirs,
+    (EXERCISER_RUN, " slates.workloads", true),
+    &mut |_| {},
+  );
+  eprintln!("the exerciser guest ran {:?}", started.elapsed());
+  drop(theirs);
+  assert!(console.contains("SLATES-WORKLOADS-DONE"), "{console}");
+  assert!(
+    console.contains("SLATES-GUEST-UNMOUNTED"),
+    "the guest unmounted the tag: {console}"
+  );
+  let runs = exerciser_runs(&console);
+  let Some((fsx_code, fsx_output)) = runs.get("fsx") else {
+    panic!("fsx did not run in the guest: {console}");
+  };
+  let fsx = slates_conformance::exerciser::judge_fsx(*fsx_code == 0, fsx_output);
+  eprintln!("guest suite fsx: {}", if fsx.ok { "ok" } else { "failed" });
+  assert!(fsx.ok, "fsx in the guest: {}", fsx.detail);
+  let Some((fsstress_code, fsstress_output)) = runs.get("fsstress") else {
+    panic!("fsstress did not run in the guest: {console}");
+  };
+  let fsstress =
+    slates_conformance::exerciser::judge_fsstress(*fsstress_code == 0, fsstress_output);
+  let logged: u64 = fsstress_output
+    .lines()
+    .find_map(|line| line.strip_prefix("operations logged: "))
+    .and_then(|count| count.trim().parse().ok())
+    .unwrap_or(0);
+  eprintln!(
+    "guest suite fsstress: {} ({logged} operations logged)",
+    if fsstress.ok { "ok" } else { "failed" }
+  );
+  assert!(fsstress.ok, "fsstress in the guest: {}", fsstress.detail);
+  let expected = u64::from(slates_conformance::exerciser::FSSTRESS_PROCESSES)
+    * slates_conformance::exerciser::FSSTRESS_OPERATIONS;
+  assert_eq!(logged, expected, "every process logged every operation");
+  drop(daemon);
+}
+
+/// Shape: how long the pjdfstest guest may run — the boot, building pjdfstest from the probes, then every test file
+/// under its bound — under software emulation. Measured below; the CI runner has KVM.
+#[cfg(target_os = "linux")]
+const PJDFSTEST_RUN: Duration = Duration::from_secs(5400);
+
+/// Format: the line the guest writes before each test file's output, then the file's path (the oci-linux lane's mark).
+#[cfg(target_os = "linux")]
+const PJD_MARK: &str = "@@@slates-pjdfstest ";
+
+/// The guest's pjdfstest script (AC-9.7, AUD-29-78: the guest's pjdfstest leg), as the oci-linux container builds and
+/// runs it: the pinned tree copied from the image into the guest's RAM, `config.h` answered by the guest's compiler
+/// from the harness's probes (placed in the volume at `pjd/probes`), pjdfstest built, then every test file run as
+/// root in a directory on the tag under the per-file bound. The outputs gather in the guest's RAM, each behind
+/// [`PJD_MARK`], and are copied to `pjd/results.txt` on the tag in one write at the end, for the test to read back.
+#[cfg(target_os = "linux")]
+fn guest_pjdfstest() -> String {
+  let tree = format!("/guest/pjdfstest-{}", slates_conformance::pjdfstest::COMMIT);
+  let bound = slates_conformance::pjdfstest::FILE_BOUND_SECONDS;
+  format!(
+    r#"export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+P=/mnt/pjd/probes
+cp -R {tree} /tmp/p && cd /tmp/p && cat $P/head.h > config.h
+for c in $P/*.c; do b=${{c%.c}}; cc -std=gnu17 -w $(cat $b.flags) -o /tmp/probe.out $c >/dev/null 2>&1 && cat $b.define >> config.h; done
+if cc -O2 -w -I. -o pjdfstest pjdfstest.c; then echo "=== PJD BUILT"; else echo "=== PJD BUILD FAILED"; fi
+mkdir -p /mnt/pjd/work && cd /mnt/pjd/work
+for f in $(cd /tmp/p && find tests -name '*.t' | sort); do
+  echo '{PJD_MARK}'$f >> /tmp/results
+  timeout {bound} sh /tmp/p/$f >> /tmp/results 2>/dev/null
+  [ $? -eq 124 ] && echo 'TIMED OUT' >> /tmp/results
+done
+cp /tmp/results /mnt/pjd/results.txt
+echo "=== PJD DONE"
+"#
+  )
+}
+
+/// Places the harness's pjdfstest probes in `dir` (each `NNN.c`, its `config.h` line in `NNN.define`, and `-c` in
+/// `NNN.flags` when it need only compile, with the head in `head.h`), as the oci-linux lane writes them.
+#[cfg(target_os = "linux")]
+fn place_probes(stream: &mut TcpStream, dir: &[u8]) {
+  let mut xid = 100u32;
+  let mut next = || {
+    xid = xid.wrapping_add(2);
+    xid
+  };
+  put(
+    stream,
+    dir,
+    "head.h",
+    slates_conformance::pjdfstest::config_head().as_bytes(),
+    next(),
+  );
+  for (n, probe) in slates_conformance::pjdfstest::probes().iter().enumerate() {
+    put(
+      stream,
+      dir,
+      &format!("{n:03}.c"),
+      probe.source.as_bytes(),
+      next(),
+    );
+    put(
+      stream,
+      dir,
+      &format!("{n:03}.define"),
+      probe.define.as_bytes(),
+      next(),
+    );
+    let flags: &[u8] = if probe.compile_only { b"-c" } else { b"" };
+    put(stream, dir, &format!("{n:03}.flags"), flags, next());
+  }
+}
+
+/// Each test file's output from the gathered results, split at [`PJD_MARK`]: (the file's path under the tree, its
+/// output).
+#[cfg(target_os = "linux")]
+fn split_pjdfstest(results: &str) -> Vec<(String, String)> {
+  let mut files: Vec<(String, String)> = Vec::new();
+  for line in results.lines() {
+    if let Some(path) = line.strip_prefix(PJD_MARK) {
+      files.push((path.trim().to_owned(), String::new()));
+    } else if let Some((_, text)) = files.last_mut() {
+      text.push_str(line);
+      text.push('\n');
+    }
+  }
+  files
+}
+
+/// AC-9.7 / AUD-29-78 (the guest's pjdfstest leg). Do: place the harness's probes in a volume, boot the live guest in
+/// workload mode so it builds the pinned pjdfstest from them and runs every test file as root over the slates tag;
+/// read the gathered results back over NFS, parse each file and judge the whole against the guest's reviewed list
+/// (`docs/wip/conformance/expected-failures/virtio-fs.pjdfstest.txt`) by the harness's own rule. Expect: pjdfstest
+/// built; every test file of the pinned tree ran to a complete plan, none past its bound; no failure the list does
+/// not name, and no listed case passing. Gated on the live guest's environment; skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_guest_runs_pjdfstest_over_the_tag() {
+  let Some((qemu, kernel, initrd)) = live_guest() else {
+    return;
+  };
+  let (daemon, instance) = single_shard_daemon("virtiofs-pjdfstest");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "pjdfstest".to_owned(),
+    size: SizeClass::Bounded { limit: 512 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("pjdfstest").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  put(
+    &mut stream,
+    &root,
+    "run.sh",
+    guest_pjdfstest().as_bytes(),
+    10,
+  );
+  let pjd = common::nfs::mkdir(&mut stream, &root, "pjd", 12);
+  let probes = common::nfs::mkdir(&mut stream, &pjd, "probes", 14);
+  place_probes(&mut stream, &probes);
+  let (ours, theirs) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let boot_ns = u64::try_from(PJDFSTEST_RUN.as_nanos()).unwrap();
+  let _ended = attach_vhost(&daemon, id, (ours, boot_ns));
+  let started = Instant::now();
+  let console = run_qemu_with(
+    &(qemu, kernel, initrd),
+    &theirs,
+    (PJDFSTEST_RUN, " slates.workloads", true),
+    &mut |_| {},
+  );
+  eprintln!("the pjdfstest guest ran {:?}", started.elapsed());
+  drop(theirs);
+  assert!(
+    console.contains("=== PJD BUILT"),
+    "pjdfstest built in the guest: {console}"
+  );
+  assert!(
+    console.contains("=== PJD DONE"),
+    "every file ran: {console}"
+  );
+  let results_fh = common::nfs::lookup(&mut stream, &pjd, "results.txt", 9000);
+  let results =
+    String::from_utf8_lossy(&common::nfs::read_whole(&mut stream, &results_fh, 9002)).into_owned();
+  judge_guest_pjdfstest(&results);
+  drop(daemon);
+}
+
+/// Judges the guest's gathered pjdfstest results as the harness judges a root run against its reviewed list.
+#[cfg(target_os = "linux")]
+fn judge_guest_pjdfstest(results: &str) {
+  use slates_conformance::tap::{Runner, parse_file};
+  let tree = format!(
+    "/guest/pjdfstest-{}/tests",
+    slates_conformance::pjdfstest::COMMIT
+  );
+  let listing = std::process::Command::new("find")
+    .args([tree.as_str(), "-name", "*.t"])
+    .output()
+    .unwrap();
+  let expected_files = String::from_utf8_lossy(&listing.stdout).lines().count();
+  let files = split_pjdfstest(results);
+  let timed_out: Vec<&str> = files
+    .iter()
+    .filter(|(_, output)| output.contains("TIMED OUT"))
+    .map(|(path, _)| path.as_str())
+    .collect();
+  let parsed: Vec<_> = files
+    .iter()
+    .map(|(path, output)| parse_file(path, output, &Runner::Root))
+    .collect();
+  let incomplete: Vec<&str> = parsed
+    .iter()
+    .filter(|file| !file.complete())
+    .map(|file| file.file.as_str())
+    .collect();
+  let cases: Vec<_> = parsed
+    .iter()
+    .flat_map(|file| file.cases.iter().cloned())
+    .collect();
+  let list = slates_conformance::expected::ExpectedFailures::parse(include_str!(
+    "../../../docs/wip/conformance/expected-failures/virtio-fs.pjdfstest.txt"
+  ))
+  .unwrap();
+  let judgement = slates_conformance::expected::judge(&list, &cases);
+  eprintln!(
+    "guest suite pjdfstest: {} files, {} cases; {}",
+    files.len(),
+    cases.len(),
+    judgement.describe()
+  );
+  for id in &judgement.unlisted_failures {
+    eprintln!("pjdfstest: unlisted failure {id}");
+  }
+  for id in &judgement.listed_now_passing {
+    eprintln!("pjdfstest: listed but now passing {id}");
+  }
+  assert_eq!(
+    files.len(),
+    expected_files,
+    "every test file of the pinned tree ran"
+  );
+  assert!(
+    timed_out.is_empty(),
+    "files past their bound: {timed_out:?}"
+  );
+  assert!(
+    incomplete.is_empty(),
+    "files without a complete plan: {incomplete:?}"
+  );
+  assert!(judgement.acceptable(), "{}", judgement.describe());
+  eprintln!("guest suite pjdfstest: ok");
+}
+
+/// AC-9.7 / AUD-29-68 (§6's workloads in a live guest). Do: provision a volume and place in it the conformance
+/// roster's scripts; boot the live guest in workload mode — the host container's root over 9p, the slates tag at
+/// its `/mnt`, RAM at `/tmp` — so for each roster tool it holds, the workload runs on the guest's RAM and on the
+/// slates mount; judge each pair by the harness's own rule (`slates_conformance::workload::compare`: exit code,
+/// output with the directory normalized, tree manifest under the roster's reviewed exclusions). Expect: every
+/// workload the guest ran is `Identical`; the tools it lacks are named as skipped. Gated on the live guest's
+/// environment; skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram() {
+  let Some((qemu, kernel, initrd)) = live_guest() else {
+    return;
+  };
+  let (daemon, instance) = single_shard_daemon("virtiofs-workloads");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "workloads".to_owned(),
+    size: SizeClass::Bounded { limit: 256 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("workloads").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  place_workloads(&mut stream, &root);
+  let (ours, theirs) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let boot_ns = u64::try_from(WORKLOAD_RUN.as_nanos()).unwrap();
+  let _ended = attach_vhost(&daemon, id, (ours, boot_ns));
+  let started = Instant::now();
+  let console = run_qemu_with(
+    &(qemu, kernel, initrd),
+    &theirs,
+    (WORKLOAD_RUN, " slates.workloads", true),
+    &mut |_| {},
+  );
+  eprintln!("the workload guest ran {:?}", started.elapsed());
+  drop(theirs);
+  assert!(console.contains("SLATES-WORKLOADS-DONE"), "{console}");
+  let parsed = guest_runs(&console);
+  eprintln!("skipped in the guest: {:?}", parsed.skipped);
+  let mut judged = 0;
+  for workload in guest_roster() {
+    let ram = parsed
+      .runs
+      .get(&(workload.name.to_owned(), "ram".to_owned()));
+    let slates = parsed
+      .runs
+      .get(&(workload.name.to_owned(), "mount".to_owned()));
+    let (Some(ram), Some(slates)) = (ram, slates) else {
+      continue;
+    };
+    let status = slates_conformance::workload::compare(workload, ram, slates);
+    eprintln!("guest workload {}: {status:?}", workload.name);
+    assert_eq!(
+      status,
+      slates_conformance::record::WorkloadStatus::Identical,
+      "{}: ram {ram:?}\nslates {slates:?}",
+      workload.name
+    );
+    judged += 1;
+  }
+  assert!(judged > 0, "no workload ran in the guest: {console}");
+  // A roster workload the guest neither reported skipped nor ran on both sides is a failure, never a silent
+  // pass (CI 2026-10-02: git vanished from a passing run). The console lines naming each such workload are
+  // the evidence of where its run went.
+  let missing: Vec<&str> = guest_roster()
+    .iter()
+    .map(|workload| workload.name)
+    .filter(|name| {
+      !parsed
+        .skipped
+        .iter()
+        .any(|skipped| skipped.split(' ').next() == Some(*name))
+        && !(parsed
+          .runs
+          .contains_key(&((*name).to_owned(), "ram".to_owned()))
+          && parsed
+            .runs
+            .contains_key(&((*name).to_owned(), "mount".to_owned())))
+    })
+    .collect();
+  let evidence: Vec<&str> = console
+    .lines()
+    .filter(|line| missing.iter().any(|name| line.contains(name)))
+    .take(GUEST_EVIDENCE_LINES)
+    .collect();
+  assert!(
+    missing.is_empty(),
+    "workloads neither skipped nor run on both sides: {missing:?}; console lines naming them:\n{}",
+    evidence.join("\n")
+  );
+}
+
+/// Shape: the console lines kept as evidence for a workload that went missing in the guest.
+#[cfg(target_os = "linux")]
+const GUEST_EVIDENCE_LINES: usize = 60;

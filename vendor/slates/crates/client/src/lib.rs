@@ -1,0 +1,66 @@
+//! `slates-client`: the Rust client of the daemon (§4.7 "Protocol" and "Wake strategy", §4.9
+//! "Exactly-once", §4.4's lifecycle verbs; Phase 2 task 5). The SDKs of Phase 5, the CLI and
+//! the MCP server all speak through it, so the ring protocol has one client implementation.
+//!
+//! What it holds: the rendezvous (`slates_ipc::connect`, with the client id the daemon
+//! assigned), the region's two rings, and a request sequence. A call is one request in flight:
+//! the body is framed into a slot (inline, or through the bulk chunk the slot's ring index
+//! owns), the client spins for the daemon's published window and then parks on the wake word
+//! (`ClientEnd::wait`), and the reply is decoded and typed.
+//!
+//! Exactly-once (§4.9): request ids are `(client id, sequence)`; the daemon records every
+//! reply before sending it, so a retry under the same id returns the original reply without
+//! executing again. The client uses that in two places: a reply that stalls past the deadline
+//! while the daemon is gone (§4.7 "Failure matrix": the control channel reset) makes the
+//! client reconnect under its old id, which the daemon honours when no live client holds it,
+//! and resend the same request; and a session (`Session`) can be resumed by a later client
+//! (a process that restarted) to retry what it had in flight.
+//!
+//! Deadlines are derived (`Deadlines::derive`): a reply is waited for as long as the anchor
+//! waits for the daemon's heartbeat, since a daemon silent longer than that is being
+//! restarted; a reconnect is tried for the recovery budget the restart is bounded by.
+//!
+//! The synchronous form is the base; an async form over the completion descriptor (Linux) or
+//! the wake word is Phase 5's, thin over this one (R6: sync facades are thin wrappers; here the
+//! sync form is the primitive because a parked wait is a single word wait).
+
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
+pub mod client;
+pub mod driver;
+pub mod error;
+
+pub use client::{
+  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
+  LAST_SEQUENCE, Landing, Rebased, SESSION_KEY_BYTES, Session, ShardsStream, StreamEnd, Submitted,
+  VhostUserDevice,
+};
+/// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
+/// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
+#[cfg(any(unix, windows))]
+pub use client::{MappedRead, MappedWrite, page_bytes};
+pub use error::ClientError;
+/// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a
+/// workload on an inherited descriptor, and the typed faults of a delivery a consumer cannot take.
+pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};
+pub use slates_ipc::protocol::{
+  AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability, AuditEntry,
+  CauseRecord, CheckoutReport, ChokepointReport, Conformance, DaemonReport, DeleteWhileOpen,
+  DetectorPeerReport, DetectorPoolReport, DetectorRelayReport, DirEntry, EntryKind, Established,
+  Filter, FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer,
+  HostMountEvidence, HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport,
+  KernelCache, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
+  LearnerReport, NamePolicy, OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy,
+  RecoveryCause, Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport,
+  ShardReport, SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId,
+  SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
+  UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+};
+/// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
+/// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).
+pub use slates_wire::request::RequestId;

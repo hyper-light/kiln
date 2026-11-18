@@ -1,0 +1,568 @@
+//! What a FUSE creation makes (§4.6; AUD-29-80, AUD-29-81): the real dispatch over a real volume, as the kernel
+//! sends it — the creating process's uid and gid in the request header, and its umask beside the mode (the
+//! kernel negotiates `FUSE_DONT_MASK`, so the mode arrives unmasked). Every host: the dispatch is pure.
+// Test harness code: an unwrap here is a failed test.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
+
+use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View};
+use slates_bridge_fuse::abi::{IN_HEADER_LEN, Opcode};
+use slates_bridge_fuse::volume_bridge::VolumeBridge;
+use slates_db::catalog::{Principal, VolumeId};
+
+mod common;
+use common::{store, volume_for_owner};
+
+/// Shape: the volume, the enrolled account the context is admitted for, and the account's group.
+const VOLUME: VolumeId = VolumeId { bytes: [5; 16] };
+const ENROLLED: u32 = 501;
+const ENROLLED_GROUP: u32 = 20;
+/// Shape: the creating process — another user and group than the enrolled account (§7.6's 1000:100).
+const CREATOR_UID: u32 = 1000;
+const CREATOR_GID: u32 = 100;
+/// Format: the kernel's root node id.
+const ROOT: u64 = 1;
+/// Format: file type bits as the kernel sends a mode (`S_IFREG`, `S_IFIFO`) and the set-group-ID bit.
+const S_IFREG: u32 = 0o100_000;
+const S_IFIFO: u32 = 0o010_000;
+const S_ISGID: u32 = 0o2000;
+/// Format: the reply buffer — far above any entry reply.
+const REPLY_BYTES: usize = 4096;
+
+/// A request as the kernel sends it: the header with the creating process's uid and gid, then `body`.
+fn message(opcode: Opcode, unique: u64, body: &[u8]) -> Vec<u8> {
+  let total = IN_HEADER_LEN + body.len();
+  let mut m = vec![0u8; total];
+  m[0..4].copy_from_slice(&u32::try_from(total).unwrap().to_le_bytes());
+  m[4..8].copy_from_slice(&(opcode as u32).to_le_bytes());
+  m[8..16].copy_from_slice(&unique.to_le_bytes());
+  m[16..24].copy_from_slice(&ROOT.to_le_bytes());
+  m[24..28].copy_from_slice(&CREATOR_UID.to_le_bytes());
+  m[28..32].copy_from_slice(&CREATOR_GID.to_le_bytes());
+  m[IN_HEADER_LEN..].copy_from_slice(body);
+  m
+}
+
+fn with_name(mut head: Vec<u8>, name: &str) -> Vec<u8> {
+  head.extend_from_slice(name.as_bytes());
+  head.push(0);
+  head
+}
+
+/// `fuse_create_in`: flags, mode, umask, open_flags, then the name.
+fn create(mode: u32, umask: u32, name: &str) -> Vec<u8> {
+  let mut head = vec![0u8; 16];
+  head[4..8].copy_from_slice(&mode.to_le_bytes());
+  head[8..12].copy_from_slice(&umask.to_le_bytes());
+  with_name(head, name)
+}
+
+/// `fuse_mkdir_in`: mode, umask, then the name.
+fn mkdir(mode: u32, umask: u32, name: &str) -> Vec<u8> {
+  let mut head = vec![0u8; 8];
+  head[0..4].copy_from_slice(&mode.to_le_bytes());
+  head[4..8].copy_from_slice(&umask.to_le_bytes());
+  with_name(head, name)
+}
+
+/// `fuse_mknod_in`: mode, rdev, umask, padding, then the name.
+fn mknod(mode: u32, umask: u32, name: &str) -> Vec<u8> {
+  let mut head = vec![0u8; 16];
+  head[0..4].copy_from_slice(&mode.to_le_bytes());
+  head[8..12].copy_from_slice(&umask.to_le_bytes());
+  with_name(head, name)
+}
+
+/// What `name` under the root is: its permission bits (with set-group-ID), owner and group.
+fn made(bridge: &mut VolumeBridge<'_>, cx: &OpContext, name: &str) -> (u32, u32, u32) {
+  let root = ObjectId::new(bridge.root(cx).unwrap(), 0);
+  let node = bridge.lookup(root, cx, name).unwrap();
+  (node.mode, node.uid, node.gid)
+}
+
+/// AUD-29-80 and AUD-29-81. Do: under a context enrolled as uid 501, dispatch creations from a 1000:100
+/// process — a file (0666, umask 077), a directory (0777, umask 022) and a FIFO (0666, umask 027) — then mark
+/// the root set-group-ID and create a file and a directory in it. Expect: each mode is the request's less its
+/// umask (0600, 0755, 0640; before, 0666 and 0777 survived); each object belongs to the creating process,
+/// 1000:100 (before, 501 and the parent's group); and under the set-group-ID parent both take the parent's
+/// group, the directory taking the bit too.
+#[test]
+fn a_creation_takes_the_creators_umask_and_ids_and_the_setgid_parents_group() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+  let mut out = vec![0u8; REPLY_BYTES];
+  let mut send = |bridge: &mut VolumeBridge<'_>, opcode, unique, body: Vec<u8>| {
+    let n =
+      slates_bridge_fuse::bridge::dispatch(&message(opcode, unique, &body), bridge, &cx, &mut out);
+    let error = i32::from_le_bytes(out[4..8].try_into().unwrap());
+    assert!(n > 0 && error == 0, "{opcode:?} answered {error}");
+  };
+  send(
+    &mut bridge,
+    Opcode::Create,
+    1,
+    create(S_IFREG | 0o666, 0o077, "private"),
+  );
+  send(&mut bridge, Opcode::MkDir, 2, mkdir(0o777, 0o022, "dir"));
+  send(
+    &mut bridge,
+    Opcode::MkNod,
+    3,
+    mknod(S_IFIFO | 0o666, 0o027, "pipe"),
+  );
+  assert_eq!(
+    made(&mut bridge, &cx, "private"),
+    (0o600, CREATOR_UID, CREATOR_GID)
+  );
+  assert_eq!(
+    made(&mut bridge, &cx, "dir"),
+    (0o755, CREATOR_UID, CREATOR_GID)
+  );
+  assert_eq!(
+    made(&mut bridge, &cx, "pipe"),
+    (0o640, CREATOR_UID, CREATOR_GID)
+  );
+
+  let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+  bridge
+    .setattr(
+      root,
+      &cx,
+      slates_bridge_core::SetAttr {
+        mode: Some(0o775 | S_ISGID),
+        ..slates_bridge_core::SetAttr::default()
+      },
+    )
+    .unwrap();
+  send(
+    &mut bridge,
+    Opcode::Create,
+    4,
+    create(S_IFREG | 0o644, 0o022, "shared"),
+  );
+  send(&mut bridge, Opcode::MkDir, 5, mkdir(0o775, 0o002, "team"));
+  assert_eq!(
+    made(&mut bridge, &cx, "shared"),
+    (0o644, CREATOR_UID, ENROLLED_GROUP)
+  );
+  assert_eq!(
+    made(&mut bridge, &cx, "team"),
+    (0o775 | S_ISGID, CREATOR_UID, ENROLLED_GROUP)
+  );
+}
+
+/// Dispatches one FUSE request and returns the reply's errno (0 is success, negative is `-errno`).
+fn fuse_errno(
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  opcode: Opcode,
+  unique: u64,
+  body: Vec<u8>,
+) -> i32 {
+  let mut out = vec![0u8; REPLY_BYTES];
+  slates_bridge_fuse::bridge::dispatch(&message(opcode, unique, &body), bridge, cx, &mut out);
+  i32::from_le_bytes(out[4..8].try_into().unwrap())
+}
+
+/// §4.6, the sibling of the NFS CREATE dot-name fix. A virtio-fs guest can send raw FUSE opcodes, bypassing its
+/// own kernel's handling of `.` and `..`. Unlike NFSv3's UNCHECKED CREATE (which looked the name up first and
+/// echoed the directory), FUSE_CREATE and FUSE_MKDIR go straight to `bridge.create`/`mkdir` → the volume core's
+/// name check (`slates_vfs::names::check`), so `.` and `..` are refused, never echoed. A normal name still
+/// creates. Driven by dispatching real FUSE messages against a VolumeBridge.
+#[test]
+fn fuse_create_and_mkdir_refuse_dot_names() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  assert_ne!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      1,
+      create(S_IFREG | 0o644, 0, ".")
+    ),
+    0,
+    "FUSE_CREATE '.' is refused, not echoed"
+  );
+  assert_ne!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      2,
+      create(S_IFREG | 0o644, 0, "..")
+    ),
+    0,
+    "FUSE_CREATE '..' is refused"
+  );
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::MkDir, 3, mkdir(0o755, 0, ".")),
+    0,
+    "FUSE_MKDIR '.' is refused"
+  );
+  assert_eq!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      4,
+      create(S_IFREG | 0o644, 0, "real")
+    ),
+    0,
+    "a normal name still creates"
+  );
+}
+
+/// `fuse_symlink_in`: the body is `name\0 target\0`.
+fn symlink_body(name: &str, target: &str) -> Vec<u8> {
+  with_name(with_name(Vec::new(), name), target)
+}
+
+/// Replicates CVE-2026-47243 (the Kata Containers virtio-fs guest-root → host-root escape) against slates. There,
+/// a guest took over the virtio-fs device and submitted a raw `FUSE_SYMLINK` whose *name* was an absolute host
+/// path (e.g. `/etc/cron.d/...`), which `virtiofsd` honored *outside* the shared directory, planting a root-owned
+/// symlink on the host. slates refuses it two ways: a name is one path component (`slates_vfs::names::check`
+/// rejects `/`), and a slates write never reaches the host at all (R1 — it lands in the in-RAM volume). So a
+/// create whose name is an absolute path or a `..` traversal is refused across CREATE, MKDIR and SYMLINK; the
+/// target string (resolved by the guest, never the server) is free to be anything.
+#[test]
+fn fuse_create_family_refuses_a_path_or_absolute_name() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  assert_ne!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      1,
+      create(S_IFREG | 0o644, 0, "/etc/cron.d/evil")
+    ),
+    0,
+    "an absolute-path CREATE name is refused"
+  );
+  assert_ne!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::MkDir,
+      2,
+      mkdir(0o755, 0, "../../escape")
+    ),
+    0,
+    "a '..' traversal MKDIR name is refused"
+  );
+  assert_ne!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::SymLink,
+      3,
+      symlink_body("/etc/cron.d/evil", "payload")
+    ),
+    0,
+    "an absolute-path SYMLINK name is refused (CVE-2026-47243's exact vector)"
+  );
+  assert_ne!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::SymLink,
+      4,
+      symlink_body("../escape", "payload")
+    ),
+    0,
+    "a '..' traversal SYMLINK name is refused"
+  );
+}
+
+/// A guest-controlled symlink target must never be an unbounded allocation or a panic (§4.6; CLAUDE.md #8). A
+/// FUSE_SYMLINK with a 70 KiB target is handled gracefully — accepted-and-bounded or refused typed — and the
+/// bridge still serves afterwards, so a guest cannot wedge or OOM the daemon with an outsized target.
+#[test]
+fn a_huge_symlink_target_is_handled_without_a_panic() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  let long_target = "a".repeat(70_000);
+  let symlink = fuse_errno(
+    &mut bridge,
+    &cx,
+    Opcode::SymLink,
+    1,
+    symlink_body("link", &long_target),
+  );
+  eprintln!("PROBE huge symlink target (70 KiB): symlink_errno={symlink}");
+
+  // Whatever the policy on an outsized target, the bridge did not panic and still serves a normal create.
+  assert_eq!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      2,
+      create(S_IFREG | 0o644, 0, "after")
+    ),
+    0,
+    "the bridge still serves after a huge symlink target"
+  );
+}
+
+/// §4.6, A-26 (and double defense with A-94 `nodev`). A character or block device node is a window onto a host
+/// device; slates creates no real device, so MKNOD of `S_IFCHR`/`S_IFBLK` is refused — only a FIFO or socket
+/// (which carry no stream or listener) are made. A guest cannot plant a `/dev/mem`-style node in its volume.
+#[test]
+fn fuse_mknod_refuses_a_character_or_block_device() {
+  /// Format: `S_IFCHR`, a character device.
+  const S_IFCHR: u32 = 0o020_000;
+  /// Format: `S_IFBLK`, a block device.
+  const S_IFBLK: u32 = 0o060_000;
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  assert_ne!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::MkNod,
+      1,
+      mknod(S_IFCHR | 0o644, 0, "chr")
+    ),
+    0,
+    "a character device node is refused (no host-device window)"
+  );
+  assert_ne!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::MkNod,
+      2,
+      mknod(S_IFBLK | 0o644, 0, "blk")
+    ),
+    0,
+    "a block device node is refused"
+  );
+  // Non-vacuity: a FIFO (no stream) is allowed (A-26).
+  assert_eq!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::MkNod,
+      3,
+      mknod(S_IFIFO | 0o644, 0, "fifo")
+    ),
+    0,
+    "a FIFO is allowed"
+  );
+}
+
+/// A FUSE message framed with a custom `nodeid` (the `message` helper uses the root).
+fn message_nodeid(opcode: Opcode, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
+  let total = IN_HEADER_LEN + body.len();
+  let mut m = vec![0u8; total];
+  m[0..4].copy_from_slice(&u32::try_from(total).unwrap().to_le_bytes());
+  m[4..8].copy_from_slice(&(opcode as u32).to_le_bytes());
+  m[8..16].copy_from_slice(&unique.to_le_bytes());
+  m[16..24].copy_from_slice(&nodeid.to_le_bytes());
+  m[24..28].copy_from_slice(&CREATOR_UID.to_le_bytes());
+  m[28..32].copy_from_slice(&CREATOR_GID.to_le_bytes());
+  m[IN_HEADER_LEN..].copy_from_slice(body);
+  m
+}
+
+/// §4.6, the FUSE analog of NFS handle forgery (a guest sends a raw opcode with a crafted `nodeid`). A node id is
+/// resolved within this mount's own volume (counter-keyed `inode_root`), so a forged one is this volume's own
+/// inode (which the guest owns) or a typed miss — never another volume's object and never a panic. Here a wildly
+/// forged node id GETATTR is refused typed, and the bridge still serves.
+#[test]
+fn a_fuse_getattr_with_a_forged_node_id_is_refused_without_a_panic() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  // fuse_getattr_in: getattr_flags, dummy, fh (16 bytes), all zero.
+  let getattr = vec![0u8; 16];
+  let mut out = vec![0u8; REPLY_BYTES];
+  slates_bridge_fuse::bridge::dispatch(
+    &message_nodeid(Opcode::GetAttr, 1, 0xDEAD_BEEF_DEAD_BEEF, &getattr),
+    &mut bridge,
+    &cx,
+    &mut out,
+  );
+  let errno = i32::from_le_bytes(out[4..8].try_into().unwrap());
+  assert_ne!(
+    errno, 0,
+    "a forged node id is refused, never served or paniced"
+  );
+
+  // The bridge still serves a real operation afterwards.
+  assert_eq!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      2,
+      create(S_IFREG | 0o644, 0, "real")
+    ),
+    0,
+    "the bridge survives a forged node id"
+  );
+}
+
+/// A truncated or malformed FUSE body is a typed error, never a panic or out-of-bounds read (§4.6; the device
+/// loop's `req.body.len() < HEAD` guards and the `?`-propagating parsers). A guest cannot wedge the bridge with a
+/// short message: a body shorter than the opcode's fixed header is refused, a header with no name is refused, and
+/// the bridge still serves a well-formed request.
+#[test]
+fn a_truncated_fuse_body_is_a_typed_error_not_a_panic() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: ENROLLED,
+      },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  // A CREATE body far shorter than its fixed header (flags, mode, umask, open_flags).
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 1, vec![0u8; 2]),
+    0,
+    "a CREATE body shorter than its header is a typed error"
+  );
+  // A CREATE with the header present but no name after it.
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 2, vec![0u8; 16]),
+    0,
+    "a CREATE with no name is refused"
+  );
+  // The bridge still serves a well-formed request.
+  assert_eq!(
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      3,
+      create(S_IFREG | 0o644, 0, "real")
+    ),
+    0,
+    "the bridge survives a truncated body"
+  );
+}

@@ -1,0 +1,1043 @@
+//! `cargo xtask conformance` — the I/O half of the conformance evidence surface (AC-9.7/T-9.1,
+//! GAP-A9-15; the pure half is `crates/conformance`). It drives the real `slates` binary the way
+//! `crates/cli/tests/cli.rs` does — an anchor supervising a daemon, a volume provisioned through
+//! the CLI, a real kernel mount — runs one named suite inside a bounded scratch directory in the
+//! mount, tears everything down, and writes one typed record per (transport × suite) into the
+//! records directory `docs/wip/conformance.md` is regenerated from. Every cell it cannot run on
+//! this host gets a `SKIPPED` record with the typed reason from the capability table, so the
+//! matrix never claims what did not run.
+//!
+//! Subcommands: `plan` (write the skip records for every cell this host cannot run), `run
+//! --suite S` (run one suite over this host's native transport), `all` (plan, then every runnable
+//! suite, continuing past failures), `matrix [--write]` (render the matrix from the records;
+//! `--write` rewrites the document's generated block), `tally --outputs DIR [--privilege
+//! root|unprivileged]` (re-read a kept `pjdfstest-output` directory — a `--keep` scratch here, or
+//! the CI lane's uploaded artifact — and print the counts, the judgement, and the failures by
+//! shape and by file, so a run that happened elsewhere is reviewed by a command). Scratch lives
+//! in the build output (`--scratch`, else `<target>/conformance-scratch-<pid>`; A-50: never `/tmp`
+//! and never a RAM directory) and is removed at the end unless `--keep`.
+//!
+//! This is a development tool, not shipped code: it writes its scratch and its records with
+//! `std::fs`, each such site allowed in place with the reason, exactly as the ratchet task does.
+//! The daemon it drives stays unprivileged (R10); where a suite itself needs root (a Linux NFS
+//! client mount, pjdfstest's uid switches, macOS `fs_usage`) the harness asks `sudo -n` and
+//! records a privilege skip when it is refused, never a prompt.
+
+mod bench;
+mod container;
+mod fetch;
+mod hermeticity;
+mod live_fleet;
+mod mount;
+mod slates;
+mod suites;
+mod trace_process;
+mod winfstest;
+mod workloads;
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use slates_conformance::capability::{Availability, HostOs, RootNeed, availability};
+use slates_conformance::civil::CivilDate;
+use slates_conformance::record::{
+  Host, ListDigest, Outcome, Privilege, Record, SCHEMA, SkipReason,
+};
+use slates_conformance::{Suite, Transport, matrix};
+
+use crate::Failure;
+
+// The roster's bounds are the conformance crate's, shared with every leg that runs it (the live guest's too).
+use slates_conformance::workload::{SQLITE_BUSY_MS, WATCH_SECONDS};
+// The exercisers' bounds are the conformance crate's too, so the live guest runs fsx and fsstress under the
+// very values this harness does.
+use slates_conformance::exerciser::{
+  FSSTRESS_OPERATIONS, FSSTRESS_PROCESSES, FSSTRESS_SEED, FSX_FILE_LENGTH, FSX_OPERATIONS, FSX_SEED,
+};
+/// Shape: the bounded size of the volume a suite runs in — room for fsstress's tree, a cargo
+/// target directory and pjdfstest's scratch, well under a CI runner's RAM.
+const VOLUME_SIZE: &str = "512MiB";
+/// Shape: a `sudo -n true` probe's wait (it answers at once or refuses at once).
+#[cfg(unix)]
+const SUDO_PROBE: Duration = Duration::from_secs(5);
+
+/// The parsed command line.
+#[derive(Debug)]
+pub(crate) struct Options {
+  /// `plan`, `run`, `all`, `matrix` or `tally`.
+  command: String,
+  /// The records directory.
+  records: PathBuf,
+  /// The scratch directory, or a fresh one.
+  scratch: Option<PathBuf>,
+  /// Keep the scratch directory.
+  keep: bool,
+  /// Run each suite over a live-shipped volume on an `f = 1` fleet (A-200; `live_fleet.rs`), not one daemon's.
+  live_ship: bool,
+  /// `--read-only`: the suite's mount is a read attachment under a writable kernel mount, so each change reaches
+  /// slates and is answered as a read-only file system is (`EROFS`, slabs' change); its work directories are made through
+  /// a second, writable mount of the same volume. A diagnostic: the reviewed lists judge writable runs.
+  read_only: bool,
+  /// `run`: the suite.
+  suite: Option<Suite>,
+  /// `run`: only this one of the host's transports (every one when absent).
+  transport: Option<Transport>,
+  /// `matrix`: rewrite the document.
+  write: bool,
+  /// `tally`: the kept `pjdfstest-output` directory to re-read.
+  outputs: Option<PathBuf>,
+  /// `compare`: the plain run's directory and the live-shipped run's, each holding the `records` and `scratch` its
+  /// harness wrote (`--records DIR/records --scratch DIR/scratch --keep`).
+  compared: Option<(PathBuf, PathBuf)>,
+  /// `tally`: who ran the outputs (`root` or `unprivileged`); this process's own identity when
+  /// absent.
+  privilege: Option<Privilege>,
+  /// `bench`: the rounds each phase runs over each transport.
+  rounds: u64,
+  /// The exerciser bounds.
+  bounds: Bounds,
+}
+
+/// The recorded bounds of the exerciser runs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bounds {
+  fsx_operations: u64,
+  fsx_seed: u64,
+  fsx_file_length: u64,
+  fsstress_operations: u64,
+  fsstress_processes: u32,
+  fsstress_seed: u64,
+}
+
+impl Default for Bounds {
+  fn default() -> Self {
+    Bounds {
+      fsx_operations: FSX_OPERATIONS,
+      fsx_seed: FSX_SEED,
+      fsx_file_length: FSX_FILE_LENGTH,
+      fsstress_operations: FSSTRESS_OPERATIONS,
+      fsstress_processes: FSSTRESS_PROCESSES,
+      fsstress_seed: FSSTRESS_SEED,
+    }
+  }
+}
+
+fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+  args
+    .iter()
+    .position(|a| a == flag)
+    .and_then(|i| args.get(i + 1))
+    .map(String::as_str)
+}
+
+fn number<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Result<T, Failure> {
+  match value_after(args, flag) {
+    Some(text) => text
+      .parse()
+      .map_err(|_| Failure(format!("{flag} takes a number, got `{text}`"))),
+    None => Ok(default),
+  }
+}
+
+/// Parses the arguments after `conformance`.
+pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
+  let command = args.first().cloned().ok_or_else(|| {
+    Failure(
+      "conformance: a subcommand is needed: plan, run, all, matrix, tally, compare, bench"
+        .to_owned(),
+    )
+  })?;
+  let privilege = match value_after(args, "--privilege") {
+    Some("root") => Some(Privilege::Root),
+    Some("unprivileged") => Some(Privilege::Unprivileged),
+    Some(other) => {
+      return Err(Failure(format!(
+        "--privilege takes root or unprivileged, got `{other}`"
+      )));
+    }
+    None => None,
+  };
+  let defaults = Bounds::default();
+  let suite = match value_after(args, "--suite") {
+    Some(slug) => Some(Suite::parse(slug).ok_or_else(|| {
+      Failure(format!(
+        "unknown suite `{slug}`; suites: {}",
+        Suite::ALL.map(Suite::slug).join(", ")
+      ))
+    })?),
+    None => None,
+  };
+  let transport = match value_after(args, "--transport") {
+    Some(slug) => Some(Transport::parse(slug).ok_or_else(|| {
+      Failure(format!(
+        "unknown transport `{slug}`; transports: {}",
+        Transport::ALL.map(Transport::slug).join(", ")
+      ))
+    })?),
+    None => None,
+  };
+  Ok(Options {
+    command,
+    transport,
+    records: value_after(args, "--records")
+      .map_or_else(|| root.join("docs/wip/conformance/records"), PathBuf::from),
+    scratch: value_after(args, "--scratch").map(PathBuf::from),
+    keep: args.iter().any(|a| a == "--keep"),
+    live_ship: args.iter().any(|a| a == "--live-ship"),
+    read_only: args.iter().any(|a| a == "--read-only"),
+    suite,
+    write: args.iter().any(|a| a == "--write"),
+    outputs: value_after(args, "--outputs").map(PathBuf::from),
+    compared: value_after(args, "--plain")
+      .zip(value_after(args, "--live"))
+      .map(|(plain, live)| (PathBuf::from(plain), PathBuf::from(live))),
+    privilege,
+    rounds: number(args, "--rounds", bench::DEFAULT_ROUNDS)?,
+    bounds: Bounds {
+      fsx_operations: number(args, "--fsx-ops", defaults.fsx_operations)?,
+      fsx_seed: number(args, "--fsx-seed", defaults.fsx_seed)?,
+      fsx_file_length: number(args, "--fsx-length", defaults.fsx_file_length)?,
+      fsstress_operations: number(args, "--fsstress-ops", defaults.fsstress_operations)?,
+      fsstress_processes: number(args, "--fsstress-procs", defaults.fsstress_processes)?,
+      fsstress_seed: number(args, "--fsstress-seed", defaults.fsstress_seed)?,
+    },
+  })
+}
+
+/// Runs the subcommand.
+pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
+  match options.command.as_str() {
+    "plan" => plan(options),
+    "run" => {
+      let suite = options
+        .suite
+        .ok_or_else(|| Failure("conformance run: --suite is needed".to_owned()))?;
+      run_suite(root, options, suite)
+    }
+    "all" => all(root, options),
+    "matrix" => render_matrix(root, options),
+    "tally" => tally(root, options),
+    "compare" => compare(options),
+    "bench" => bench::run_bench(root, options, host_os()?),
+    other => Err(Failure(format!(
+      "conformance: unknown subcommand `{other}`; plan, run, all, matrix, tally, compare, bench"
+    ))),
+  }
+}
+
+/// The kept TAP outputs under a run's scratch, by transport and suite: pjdfstest's (`<a__b.t>.txt`) and winfstest's
+/// (`t_base_00.t.out`), each parsed as its judgement parses it.
+fn kept_cases(
+  scratch: &Path,
+) -> Result<std::collections::BTreeMap<String, Vec<slates_conformance::tap::TapCase>>, Failure> {
+  let runner = suites::this_user();
+  let mut kept = std::collections::BTreeMap::new();
+  let Ok(transports) = std::fs::read_dir(scratch) else {
+    return Ok(kept);
+  };
+  for transport in transports.filter_map(Result::ok) {
+    for (suite, extension) in [("pjdfstest-output", "txt"), ("winfstest-output", "out")] {
+      let dir = transport.path().join(suite);
+      let Ok(files) = std::fs::read_dir(&dir) else {
+        continue;
+      };
+      let mut cases = Vec::new();
+      for file in files.filter_map(Result::ok).map(|entry| entry.path()) {
+        if file.extension().is_none_or(|x| x != extension) {
+          continue;
+        }
+        let name = file
+          .file_name()
+          .and_then(|n| n.to_str())
+          .unwrap_or_default();
+        let relative = if extension == "txt" {
+          name.trim_end_matches(".txt").replace("__", "/")
+        } else {
+          name.trim_end_matches(".out").replacen('_', "/", 2)
+        };
+        let output = std::fs::read_to_string(&file)
+          .map_err(|e| Failure(format!("{}: {e}", file.display())))?;
+        cases.extend(slates_conformance::tap::parse_file(&relative, &output, &runner).cases);
+      }
+      kept.insert(
+        format!("{} {suite}", transport.file_name().to_string_lossy()),
+        cases,
+      );
+    }
+  }
+  Ok(kept)
+}
+
+/// The outcome of every record in a directory, by file name: what two runs' records must agree on.
+fn outcomes(
+  records: &Path,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, Failure> {
+  let mut out = std::collections::BTreeMap::new();
+  for record in load_records(records)? {
+    let outcome = serde_json::to_value(&record.outcome).map_err(|e| Failure(e.to_string()))?;
+    out.insert(record.file_name(), outcome);
+  }
+  Ok(out)
+}
+
+/// `compare --plain DIR --live DIR`: the plain run and the live-shipped one, compared (A-200): every kept pjdfstest and
+/// winfstest case by its verdict's kind, and every record's outcome (fsx's and fsstress's verdicts, the suites' counts).
+/// Exits non-zero on any difference, naming each.
+fn compare(options: &Options) -> Result<(), Failure> {
+  let (plain, live) = options
+    .compared
+    .as_ref()
+    .ok_or_else(|| Failure("conformance compare: --plain DIR --live DIR are needed".to_owned()))?;
+  let mut differences = Vec::new();
+  let (plain_cases, live_cases) = (
+    kept_cases(&plain.join("scratch"))?,
+    kept_cases(&live.join("scratch"))?,
+  );
+  let mut suites: Vec<&String> = plain_cases.keys().chain(live_cases.keys()).collect();
+  suites.sort_unstable();
+  suites.dedup();
+  for suite in suites {
+    let (a, b) = (
+      plain_cases
+        .get(suite)
+        .map(Vec::as_slice)
+        .unwrap_or_default(),
+      live_cases.get(suite).map(Vec::as_slice).unwrap_or_default(),
+    );
+    let found = slates_conformance::differential::compare(a, b);
+    println!(
+      "compare: {suite}: {} cases plain, {} live, {} differing",
+      a.len(),
+      b.len(),
+      found.len()
+    );
+    differences.extend(found.into_iter().map(|d| format!("{suite} {d}")));
+  }
+  let (plain_records, live_records) = (
+    outcomes(&plain.join("records"))?,
+    outcomes(&live.join("records"))?,
+  );
+  let mut names: Vec<&String> = plain_records.keys().chain(live_records.keys()).collect();
+  names.sort_unstable();
+  names.dedup();
+  for name in names {
+    let (a, b) = (plain_records.get(name), live_records.get(name));
+    let same = a == b;
+    println!(
+      "compare: record {name}: {}",
+      if same { "the same outcome" } else { "DIFFERS" }
+    );
+    if !same {
+      differences.push(format!("record {name}: plain {a:?}, live {b:?}"));
+    }
+  }
+  if differences.is_empty() {
+    println!("compare: the live-shipped run conforms exactly as the plain one does");
+    Ok(())
+  } else {
+    for difference in &differences {
+      println!("compare: DIFFERENCE {difference}");
+    }
+    Err(Failure(format!(
+      "{} differences between the plain and the live-shipped run",
+      differences.len()
+    )))
+  }
+}
+
+/// `tally --outputs DIR [--privilege root|unprivileged] [--transport SLUG]`: review kept pjdfstest outputs.
+fn tally(root: &Path, options: &Options) -> Result<(), Failure> {
+  let outputs = options
+    .outputs
+    .as_deref()
+    .ok_or_else(|| Failure("conformance tally: --outputs DIR is needed".to_owned()))?;
+  let runner = match options.privilege {
+    Some(Privilege::Root) => suites::Runner::Root,
+    Some(Privilege::Unprivileged) => match suites::this_user() {
+      suites::Runner::Root => {
+        return Err(Failure(
+          "conformance tally: --privilege unprivileged, but this process is root; the classifier \
+           needs the uid and groups the run had"
+            .to_owned(),
+        ));
+      }
+      user => user,
+    },
+    None => suites::this_user(),
+  };
+  // `--transport` names the list to judge against (a container lane's outputs reviewed on another host); without
+  // it, this host's native transport's.
+  let transport = match options.transport {
+    Some(transport) => transport,
+    None => native_transport(host_os()?),
+  };
+  suites::tally_outputs(root, transport, outputs, &runner)
+}
+
+// --- the host ---------------------------------------------------------------------------------
+
+/// This host's operating system.
+fn host_os() -> Result<HostOs, Failure> {
+  if cfg!(target_os = "macos") {
+    Ok(HostOs::Macos)
+  } else if cfg!(target_os = "linux") {
+    Ok(HostOs::Linux)
+  } else if cfg!(target_os = "windows") {
+    Ok(HostOs::Windows)
+  } else {
+    Err(Failure(
+      "conformance: this operating system has no lane".to_owned(),
+    ))
+  }
+}
+
+/// The native transport this host offers first (the one a tally of kept outputs reviews).
+fn native_transport(os: HostOs) -> Transport {
+  native_transports(os)[0]
+}
+
+/// Every native transport this host offers: on Linux the NFSv3 adapter and the daemon's NFSv4.2
+/// server, both through the kernel's own client.
+fn native_transports(os: HostOs) -> &'static [Transport] {
+  match os {
+    // The container form rides the macOS host mount (AUD-29-78): its cells run where a container
+    // runtime's handshake holds evidence, and are skipped typed elsewhere.
+    HostOs::Macos => &[Transport::NativeMacosNfs, Transport::Oci],
+    // The Linux container form binds the daemon's shared FUSE mount (AUD-29-67/74).
+    HostOs::Linux => &[
+      Transport::NativeLinuxFuse,
+      Transport::NativeLinuxNfs4,
+      Transport::OciLinux,
+    ],
+    HostOs::Windows => &[Transport::NativeWindowsWinfsp],
+  }
+}
+
+/// The trimmed stdout of a command, or empty when it cannot run.
+pub(crate) fn stdout_of(program: &str, args: &[&str]) -> String {
+  Command::new(program)
+    .args(args)
+    .output()
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    .unwrap_or_default()
+}
+
+/// The host facts a record carries.
+fn host_facts(privilege: Privilege) -> Host {
+  let os = match host_os() {
+    Ok(HostOs::Macos) => format!(
+      "macOS {} ({})",
+      stdout_of("sw_vers", &["-productVersion"]),
+      stdout_of("sw_vers", &["-buildVersion"])
+    ),
+    Ok(HostOs::Linux) => std::fs::read_to_string("/etc/os-release")
+      .ok()
+      .and_then(|text| {
+        text.lines().find_map(|l| {
+          l.strip_prefix("PRETTY_NAME=")
+            .map(|v| v.trim_matches('"').to_owned())
+        })
+      })
+      .unwrap_or_else(|| "Linux".to_owned()),
+    Ok(HostOs::Windows) => stdout_of("cmd", &["/c", "ver"]),
+    Err(_) => std::env::consts::OS.to_owned(),
+  };
+  Host {
+    os,
+    kernel: kernel_name(),
+    arch: machine_name(),
+    privilege,
+  }
+}
+
+/// The kernel's name and release, as `uname -sr` prints them.
+#[cfg(unix)]
+fn kernel_name() -> String {
+  stdout_of("uname", &["-sr"])
+}
+
+/// The kernel's name and release on Windows: `ver`'s line names the NT kernel's version (`10.0.26100.6584`).
+#[cfg(windows)]
+fn kernel_name() -> String {
+  stdout_of("cmd", &["/c", "ver"])
+}
+
+/// The machine's architecture, as `uname -m` prints it.
+#[cfg(unix)]
+fn machine_name() -> String {
+  stdout_of("uname", &["-m"])
+}
+
+/// The machine's architecture on Windows: this process's own, which the lanes build natively (`x86_64`, `aarch64`).
+#[cfg(windows)]
+fn machine_name() -> String {
+  std::env::consts::ARCH.to_owned()
+}
+
+/// Whether `name` is an executable on the `PATH`.
+#[cfg(unix)]
+pub(crate) fn tool_on_path(name: &str) -> bool {
+  Command::new("sh")
+    .args(["-c", &format!("command -v {name}")])
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+/// Whether `name` is a file on the `PATH` (`where`, which finds a library such as WinFsp's DLL as well as a program).
+#[cfg(windows)]
+pub(crate) fn tool_on_path(name: &str) -> bool {
+  Command::new("where")
+    .arg("/q")
+    .arg(name)
+    .status()
+    .is_ok_and(|status| status.success())
+}
+
+/// Whether this process is root.
+#[cfg(unix)]
+pub(crate) fn is_root() -> bool {
+  stdout_of("id", &["-u"]) == "0"
+}
+
+/// Whether this process runs elevated, Windows' counterpart of root: `net session` answers only an elevated
+/// administrator (GitHub's Windows runners run elevated; a developer's prompt usually does not).
+#[cfg(windows)]
+pub(crate) fn is_root() -> bool {
+  Command::new("net")
+    .arg("session")
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status()
+    .is_ok_and(|status| status.success())
+}
+
+/// Windows has no `sudo -n` the harness may ask (Windows 11's `sudo` raises a consent prompt): no suite there asks
+/// for more than the runner's own rights.
+#[cfg(windows)]
+pub(crate) fn sudo_without_prompt() -> bool {
+  false
+}
+
+/// Whether `sudo -n` works without a prompt (the CI runners; never this laptop).
+#[cfg(unix)]
+pub(crate) fn sudo_without_prompt() -> bool {
+  let Ok(mut child) = Command::new("sudo")
+    .args(["-n", "true"])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+  else {
+    return false;
+  };
+  let started = std::time::Instant::now();
+  loop {
+    match child.try_wait() {
+      Ok(Some(status)) => return status.success(),
+      Ok(None) if started.elapsed() < SUDO_PROBE => pause(),
+      _ => {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+      }
+    }
+  }
+}
+
+/// Shape: the pause between polls of a child process.
+const POLL: Duration = Duration::from_millis(20);
+
+/// Paces the harness's polls of its child processes; shipped code parks on its driver (D-9).
+pub(crate) fn pause() {
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(POLL);
+}
+
+/// A path as a C program's `open` takes it. On Windows, `canonicalize` answers the verbatim form (`\\?\C:\a\b`), which
+/// the C runtime's `open` refuses when a program appends `/name` to it (the WinFsp fsx port answered `Invalid argument`
+/// for its `-P` directory, diagnostics run 41982130174), so a verbatim drive path loses its prefix; elsewhere a path is
+/// already plain.
+pub(crate) fn plain_path(path: &Path) -> String {
+  let text = path.display().to_string();
+  match text.strip_prefix(r"\\?\") {
+    Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+    _ => text,
+  }
+}
+
+/// Today's civil date (UTC), for the record.
+fn today() -> String {
+  let seconds = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    .unwrap_or(0);
+  CivilDate::from_unix(seconds).iso()
+}
+
+// --- files (the development tool's own writes) -----------------------------------------------
+
+/// Writes a file in the scratch or records directory. xtask is a development tool writing its
+/// own outputs outside the shipped code paths, like the ratchet task; shipped code never reaches this.
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
+  #[allow(clippy::disallowed_methods)]
+  std::fs::write(path, bytes).map_err(|e| Failure(format!("writing {}: {e}", path.display())))
+}
+
+/// Creates a directory (and its parents) in the scratch or records tree; same reason as [`write_file`].
+pub(crate) fn create_dir(path: &Path) -> Result<(), Failure> {
+  #[allow(clippy::disallowed_methods)]
+  std::fs::create_dir_all(path).map_err(|e| Failure(format!("creating {}: {e}", path.display())))
+}
+
+/// Removes a scratch tree; same reason as [`write_file`]. Best effort: a leftover scratch is reported.
+pub(crate) fn remove_tree(path: &Path) {
+  #[allow(clippy::disallowed_methods)]
+  if let Err(e) = std::fs::remove_dir_all(path) {
+    eprintln!("conformance: scratch {} not removed: {e}", path.display());
+  }
+}
+
+/// A directory named `name` in the build output — `CARGO_TARGET_DIR`, else the workspace's `target/` —
+/// created if absent and canonical. The harness's scratch, mount points and landing targets are real
+/// host directories there (A-50: a landing writes the host's disk and a base is read from it, so the
+/// suites exercise both for real — never under `/tmp` and never in a RAM directory).
+pub(crate) fn build_output(name: &str) -> Result<PathBuf, Failure> {
+  let root = crate::workspace_root()?;
+  let target = std::env::var_os("CARGO_TARGET_DIR")
+    .map_or_else(|| root.join("target"), |dir| root.join(PathBuf::from(dir)));
+  let path = target.join(name);
+  create_dir(&path)?;
+  std::fs::canonicalize(&path).map_err(|e| Failure(format!("build output {}: {e}", path.display())))
+}
+
+/// A fresh scratch directory in the build output (`--scratch DIR`, else [`build_output`]), removed on
+/// drop unless kept.
+pub(crate) struct Scratch {
+  path: PathBuf,
+  keep: bool,
+}
+
+impl Scratch {
+  /// The scratch of one transport's suites: `--scratch DIR`'s subdirectory named by the transport, so
+  /// two transports run on one host never share a host reference tree, a landing target or a trace (a
+  /// shared one let the second transport's host references start from the first's leftovers).
+  fn open(options: &Options, transport: Transport) -> Result<Scratch, Failure> {
+    let path = match &options.scratch {
+      Some(dir) => {
+        let dir = dir.join(transport.slug());
+        create_dir(&dir)?;
+        dir
+      }
+      None => build_output(&format!(
+        "conformance-scratch-{}/{}",
+        std::process::id(),
+        transport.slug()
+      ))?,
+    };
+    let path = std::fs::canonicalize(&path)
+      .map_err(|e| Failure(format!("scratch {}: {e}", path.display())))?;
+    Ok(Scratch {
+      path,
+      keep: options.keep,
+    })
+  }
+
+  /// The scratch directory.
+  pub(crate) fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// A subdirectory the suites share and a rerun reuses: the tool builds (`tools`), keyed by their
+  /// pinned sources, so a kept scratch saves the build and never changes a verdict.
+  pub(crate) fn shared(&self, name: &str) -> Result<PathBuf, Failure> {
+    let path = self.path.join(name);
+    create_dir(&path)?;
+    Ok(path)
+  }
+
+  /// An empty subdirectory for one suite's run: a host reference tree, a landing target, a suite's
+  /// outputs. A `--scratch` directory outlives its run (CI's cache restored the last run's, and a
+  /// developer reruns over a kept one), so a leftover tree is removed first, and a removal that fails is
+  /// a refusal, because a verdict judged over the last run's files is false (2026-09-30: git found the
+  /// last run's repository and exited 1; rsync's destination held the last run's copy).
+  pub(crate) fn fresh(&self, name: &str) -> Result<PathBuf, Failure> {
+    let path = self.path.join(name);
+    #[allow(clippy::disallowed_methods)]
+    match std::fs::remove_dir_all(&path) {
+      Ok(()) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => {
+        return Err(Failure(format!(
+          "emptying the kept scratch {}: {error}",
+          path.display()
+        )));
+      }
+    }
+    create_dir(&path)?;
+    Ok(path)
+  }
+}
+
+impl Drop for Scratch {
+  fn drop(&mut self) {
+    if self.keep {
+      eprintln!("conformance: scratch kept at {}", self.path.display());
+    } else {
+      remove_tree(&self.path);
+    }
+  }
+}
+
+// --- records ----------------------------------------------------------------------------------
+
+/// Every record in the directory (a file that is not a record is reported and skipped).
+pub(crate) fn load_records(dir: &Path) -> Result<Vec<Record>, Failure> {
+  let mut records = Vec::new();
+  let Ok(entries) = std::fs::read_dir(dir) else {
+    return Ok(records);
+  };
+  let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+  paths.sort();
+  for path in paths {
+    if path.extension().is_none_or(|x| x != "json") {
+      continue;
+    }
+    let bytes =
+      std::fs::read(&path).map_err(|e| Failure(format!("reading {}: {e}", path.display())))?;
+    match Record::parse(&bytes) {
+      Ok(record) => records.push(record),
+      Err(e) => eprintln!("conformance: {} skipped: {e}", path.display()),
+    }
+  }
+  Ok(records)
+}
+
+/// Stores a record unless it would downgrade evidence already recorded for its cell.
+fn store_record(dir: &Path, record: &Record) -> Result<(), Failure> {
+  create_dir(dir)?;
+  let path = dir.join(record.file_name());
+  if let Ok(bytes) = std::fs::read(&path)
+    && let Ok(existing) = Record::parse(&bytes)
+    && let Err(reason) = record.may_replace(&existing)
+  {
+    println!("conformance: kept {}: {reason}", record.file_name());
+    return Ok(());
+  }
+  let json = record.to_json().map_err(|e| Failure(e.to_string()))?;
+  write_file(&path, json.as_bytes())?;
+  println!("conformance: wrote {}", path.display());
+  Ok(())
+}
+
+/// A skip record for a cell.
+fn skip_record(transport: Transport, suite: Suite, reason: SkipReason) -> Record {
+  Record {
+    schema: SCHEMA,
+    suite,
+    transport,
+    host: host_facts(if is_root() {
+      Privilege::Root
+    } else {
+      Privilege::Unprivileged
+    }),
+    date: today(),
+    command: String::new(),
+    bound: String::new(),
+    outcome: Outcome::Skipped { reason },
+    expected_failure_list: None,
+    duration_ms: 0,
+    notes: Vec::new(),
+  }
+}
+
+/// What this host can do with a cell right now.
+enum Readiness {
+  /// Runnable here; root available as stated.
+  Ready { root: bool },
+  /// Not runnable here, for this typed reason.
+  Skip(SkipReason),
+}
+
+/// Decides a cell for this host from the capability table and the host's tools and privilege.
+fn readiness(os: HostOs, transport: Transport, suite: Suite) -> Readiness {
+  match availability(transport, suite) {
+    Availability::Owed(reason) => Readiness::Skip(SkipReason::Owed(reason.to_owned())),
+    Availability::NotApplicable(reason) => {
+      Readiness::Skip(SkipReason::NotApplicable(reason.to_owned()))
+    }
+    Availability::Runnable { on, .. } if on != os => Readiness::Skip(SkipReason::Lane(format!(
+      "runs in the {} lane, not on {}",
+      on.lane(),
+      os.lane()
+    ))),
+    Availability::Runnable { tools, root, .. } => {
+      if let Some(missing) = tools.iter().find(|t| !tool_on_path(t)) {
+        return Readiness::Skip(SkipReason::Tool(format!(
+          "`{missing}` is not on the PATH of this host"
+        )));
+      }
+      // A container cell needs an engine that answers, not only its CLI; the handshake then judges the
+      // engine's profile and fails the lane for an untested one.
+      if transport.is_container()
+        && stdout_of("docker", &["info", "--format", "{{.ServerVersion}}"]).is_empty()
+      {
+        return Readiness::Skip(SkipReason::Tool(
+          "the `docker` engine does not answer on this host".to_owned(),
+        ));
+      }
+      let root_available = is_root() || sudo_without_prompt();
+      match root {
+        RootNeed::Required(reason) if !root_available => Readiness::Skip(SkipReason::Privilege(
+          format!("{reason}; this host has no passwordless sudo (`sudo -n true` was refused)"),
+        )),
+        _ => Readiness::Ready {
+          root: root_available,
+        },
+      }
+    }
+  }
+}
+
+/// `plan`: a skip record for every cell this host cannot run; the runnable ones are listed.
+fn plan(options: &Options) -> Result<(), Failure> {
+  let os = host_os()?;
+  let mut runnable = Vec::new();
+  for transport in Transport::ALL {
+    for suite in Suite::ALL {
+      match readiness(os, transport, suite) {
+        Readiness::Ready { root } => runnable.push(format!(
+          "{} × {}{}",
+          transport.slug(),
+          suite.slug(),
+          if root {
+            " (root available)"
+          } else {
+            " (no root)"
+          }
+        )),
+        Readiness::Skip(reason) => {
+          store_record(&options.records, &skip_record(transport, suite, reason))?
+        }
+      }
+    }
+  }
+  println!(
+    "conformance: runnable here: {}",
+    if runnable.is_empty() {
+      "nothing".to_owned()
+    } else {
+      runnable.join("; ")
+    }
+  );
+  Ok(())
+}
+
+/// The context one suite runs in.
+pub(crate) struct Run<'a> {
+  pub(crate) root: &'a Path,
+  pub(crate) options: &'a Options,
+  pub(crate) os: HostOs,
+  pub(crate) transport: Transport,
+  pub(crate) root_available: bool,
+  pub(crate) scratch: Scratch,
+}
+
+impl Run<'_> {
+  /// The recorded bounds.
+  pub(crate) fn bounds(&self) -> Bounds {
+    self.options.bounds
+  }
+
+  /// The adapter this lane must use, if any (recorded `LIMITED`).
+  pub(crate) fn adapter(&self, suite: Suite) -> Option<(String, String)> {
+    match availability(self.transport, suite) {
+      Availability::Runnable {
+        adapter: Some(adapter),
+        ..
+      } => Some((adapter.name.to_owned(), adapter.not_covered.to_owned())),
+      _ => None,
+    }
+  }
+}
+
+/// What a suite run hands back for its record.
+pub(crate) struct SuiteResult {
+  /// The identity executing the tested workload, distinct from authority available to a mount broker
+  /// or tracer. Each suite derives this from the command it actually dispatches.
+  pub(crate) privilege: Privilege,
+  pub(crate) outcome: Outcome,
+  pub(crate) command: String,
+  pub(crate) bound: String,
+  pub(crate) expected_failure_list: Option<ListDigest>,
+  pub(crate) notes: Vec<String>,
+  /// Whether the run met its verdict (the process exit code).
+  pub(crate) ok: bool,
+}
+
+/// `run --suite S`: one suite over each of this host's native transports, continuing past a failed one.
+fn run_suite(root: &Path, options: &Options, suite: Suite) -> Result<(), Failure> {
+  let os = host_os()?;
+  let mut failures = Vec::new();
+  for &transport in native_transports(os) {
+    if options.transport.is_some_and(|only| only != transport) {
+      continue;
+    }
+    if let Err(failure) = run_suite_on(root, options, os, transport, suite) {
+      failures.push(failure.0);
+    }
+  }
+  if failures.is_empty() {
+    Ok(())
+  } else {
+    Err(Failure(failures.join("; ")))
+  }
+}
+
+/// One suite over one transport.
+fn run_suite_on(
+  root: &Path,
+  options: &Options,
+  os: HostOs,
+  transport: Transport,
+  suite: Suite,
+) -> Result<(), Failure> {
+  let root_available = match readiness(os, transport, suite) {
+    Readiness::Ready { root } => root,
+    Readiness::Skip(reason) => {
+      println!(
+        "conformance: {} × {} skipped: {}: {}",
+        transport.slug(),
+        suite.slug(),
+        reason.class(),
+        reason.text()
+      );
+      return store_record(&options.records, &skip_record(transport, suite, reason));
+    }
+  };
+  let run = Run {
+    root,
+    options,
+    os,
+    transport,
+    root_available,
+    scratch: Scratch::open(options, transport)?,
+  };
+  let started = std::time::Instant::now();
+  let result = match suite {
+    Suite::Fsx if transport.is_container() => container::run_fsx(&run)?,
+    Suite::Fsx => suites::run_fsx(&run)?,
+    Suite::Fsstress if transport.is_container() => container::run_fsstress(&run)?,
+    Suite::Fsstress => suites::run_fsstress(&run)?,
+    Suite::Pjdfstest if transport.is_container() => container::run_pjdfstest(&run)?,
+    Suite::Pjdfstest => suites::run_pjdfstest(&run)?,
+    Suite::Workloads if transport.is_container() => container::run_workloads(&run)?,
+    Suite::Workloads => workloads::run_workloads(&run)?,
+    Suite::Hermeticity => hermeticity::run_hermeticity(&run)?,
+    Suite::Winfstest => winfstest::run_winfstest(&run)?,
+    Suite::Pressure | Suite::Failure => {
+      return Err(Failure(format!(
+        "{} has no runnable form yet",
+        suite.slug()
+      )));
+    }
+  };
+  // The scratch directory is a temporary path; the recorded command names it as `<scratch>` so the
+  // contract of the number reads the same on every host.
+  let scratch_text = run.scratch.path().display().to_string();
+  let record = Record {
+    schema: SCHEMA,
+    suite,
+    transport,
+    host: host_facts(result.privilege),
+    date: today(),
+    command: result.command.replace(&scratch_text, "<scratch>"),
+    bound: result.bound,
+    outcome: result.outcome,
+    expected_failure_list: result.expected_failure_list,
+    duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    notes: result.notes,
+  };
+  store_record(&options.records, &record)?;
+  println!(
+    "conformance: {} × {}: {}",
+    transport.slug(),
+    suite.slug(),
+    matrix::cell(Some(&record))
+  );
+  if result.ok {
+    Ok(())
+  } else {
+    Err(Failure(format!(
+      "{} over {} did not meet its verdict (the record was written)",
+      suite.slug(),
+      transport.slug()
+    )))
+  }
+}
+
+/// `all`: plan, then every runnable suite, continuing past failures.
+fn all(root: &Path, options: &Options) -> Result<(), Failure> {
+  plan(options)?;
+  let mut failures = Vec::new();
+  for suite in [
+    Suite::Fsx,
+    Suite::Fsstress,
+    Suite::Pjdfstest,
+    Suite::Winfstest,
+    Suite::Workloads,
+    Suite::Hermeticity,
+  ] {
+    if let Err(e) = run_suite(root, options, suite) {
+      eprintln!("conformance: {}: {e}", suite.slug());
+      failures.push(suite.slug());
+    }
+  }
+  if failures.is_empty() {
+    Ok(())
+  } else {
+    Err(Failure(format!(
+      "suites that did not meet their verdict: {}",
+      failures.join(", ")
+    )))
+  }
+}
+
+/// `matrix [--write]`: render from the records; rewrite the document's block on request.
+fn render_matrix(root: &Path, options: &Options) -> Result<(), Failure> {
+  let records = load_records(&options.records)?;
+  let rendered = matrix::render(&records);
+  if options.write {
+    let document_path = root.join("docs/wip/conformance.md");
+    let document = std::fs::read_to_string(&document_path)
+      .map_err(|e| Failure(format!("reading {}: {e}", document_path.display())))?;
+    let rewritten = matrix::rewrite(&document, &rendered).map_err(|e| Failure(e.to_owned()))?;
+    write_file(&document_path, rewritten.as_bytes())?;
+    println!(
+      "conformance: wrote the matrix into {}",
+      document_path.display()
+    );
+  } else {
+    print!("{rendered}");
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod plain_path_tests {
+  use super::plain_path;
+  use std::path::Path;
+
+  /// A verbatim drive path loses its prefix; a verbatim UNC path, a plain path and a Unix path are kept whole.
+  #[test]
+  fn a_verbatim_drive_path_becomes_plain_and_nothing_else_changes() {
+    assert_eq!(plain_path(Path::new(r"\\?\C:\a\b")), r"C:\a\b");
+    assert_eq!(
+      plain_path(Path::new(r"\\?\UNC\host\share")),
+      r"\\?\UNC\host\share"
+    );
+    assert_eq!(plain_path(Path::new(r"C:\a")), r"C:\a");
+    assert_eq!(plain_path(Path::new("/home/a")), "/home/a");
+  }
+}

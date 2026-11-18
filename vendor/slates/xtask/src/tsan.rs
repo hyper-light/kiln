@@ -1,0 +1,238 @@
+//! `cargo xtask tsan`: the ThreadSanitizer lane (Part 6 "Concurrency": "TSan nightly"; AUD-29-32; Ada
+//! authorized the lane and the nightly schedule 2026-10-03). loom explores the cores' interleavings within a
+//! bound and Miri checks their memory model one interleaving at a time; ThreadSanitizer watches the real
+//! threads of whole tests — the runtime's shards, the IPC rings and doorbells between a client and a daemon,
+//! the client's reply park — and reports any two accesses to one location, one a write, that nothing orders.
+//!
+//! The task runs in two steps, and fails if either fails:
+//!
+//! 1. **The canary.** `slates-mem`'s `race_canary` test races two writers on purpose. The task requires
+//!    ThreadSanitizer's data-race report from it. Without that, a clean run of the suites could mean the
+//!    instrumentation was missing (a toolchain or flag change), and the lane would pass vacuously.
+//! 2. **The suites.** Every library and integration test of [`CRATES`], instrumented, with `--no-fail-fast`.
+//!    A report makes the test binary exit non-zero (ThreadSanitizer's `exitcode`, 66 by default), so any
+//!    race fails the task. Only the tests in [`SKIPPED`] are left out, each with its measured reason.
+//! 3. **The server.** Its library and in-process daemon suites ([`SERVER_TARGETS`]), the same way.
+//!
+//! ThreadSanitizer needs the nightly toolchain (`-Zsanitizer=thread`) and the standard library rebuilt with
+//! the same instrumentation (`-Zbuild-std`, so a race through std's own code is seen and std's
+//! synchronization is understood). It needs an explicit target, which is the host's. Doctests are not run:
+//! two compile-fail doctests in `slates-rt` fail to compile for a different reason under `-Zbuild-std`, and a
+//! doctest exercises no threads (measured 2026-10-03).
+
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use crate::Failure;
+
+/// Shape: the crates whose tests run real threads against shared state — the memory primitives (rings,
+/// the shared object), the runtime (shards, wakes, the drivers), the IPC between a client and a daemon
+/// (rings, doorbells, rendezvous) and the client (reply park, reconnect). Measured clean on 2026-10-03
+/// (aarch64 Linux container, nightly 2026-10-02): 68 + 100 + 38 + 14 tests, no report.
+const CRATES: [&str; 4] = ["slates-mem", "slates-rt", "slates-ipc", "slates-client"];
+
+/// Shape: the server's targets the lane runs, named rather than whole: its library and the in-process daemon
+/// suites — the runtime's shards serving a whole daemon's state, recovery and attachment forms. Its other suites
+/// are left to their lanes (the fleet suite must run alone; the mount suites need a kernel mount). Measured clean
+/// on 2026-10-03 (aarch64 Linux container, nightly 2026-10-02): 155 + 18 + 14 + 8 tests, no report, about a
+/// minute with the build cached.
+const SERVER_TARGETS: [&str; 4] = [
+  "--lib",
+  "--test=daemon",
+  "--test=recovery",
+  "--test=attach_forms",
+];
+
+/// Shape: the tests the lane leaves out, each with why. A skipped test still runs in every other lane;
+/// only its assertion is one the instrumentation itself falsifies.
+const SKIPPED: [(&str, &str); 5] = [
+  (
+    "region::tests::locking_a_small_region_is_reported_by_the_os_within_one_page",
+    "ThreadSanitizer ignores mlock (its runtime prints `ThreadSanitizer ignores mlock/mlockall/munlock/\
+     munlockall` at verbosity 1), so the locked delta is 0; it passes uninstrumented in the same container",
+  ),
+  (
+    "the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours",
+    "the same mlock interception as the entry above, which this lane only started to see when \
+     `--cfg=rustix_use_libc` was added: before that rustix's `linux_raw` backend issued `mlock` by inline \
+     assembly and walked straight past the interceptor, so the arena really locked and the kernel's count \
+     really moved. Through libc it does not — run 39540020206 read VmLck move by 0 where the test wants \
+     16384 — while `ChunkArena::locked_bytes`, which is slates' own accounting of a call that returned Ok, \
+     still says 16384. Only the assertions against the *kernel's* count are falsified, which is why this \
+     test is skipped and the rest of the file is not. `lock_on_fault`'s two tests read the same counter and \
+     are not listed: they lock 256 MiB, which this runner's memlock capacity refuses, so they take their own \
+     loud skip first. On a host that allowed that lock they would need this entry too",
+  ),
+  (
+    "driver::tests::a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps",
+    "it asserts that 256 zero-timeout waits never switch the thread out, and the instrumented runtime's own \
+     locking does: the whole library failed it 3 times in 12 instrumented runs and 0 in 10 plain runs \
+     (2026-10-03, 18-core container); alone it passed 20 of 20 either way",
+  ),
+  (
+    "a_poll_busy_on_the_cpu_past_the_quantum_is_its_tasks",
+    "it classifies each step by its measured CPU time against the quantum; under instrumentation one CI run \
+     (37153112465, x86, 2026-10-03) judged an extra step unattributed (2, not 1). Not reproduced here (0 of 10 \
+     instrumented, 0 of 10 plain); that the slower instrumented step crossed the quantum is the hypothesis",
+  ),
+  (
+    "a_client_learns_its_wake_from_the_parks_a_reply_ended",
+    "it counts parks whose wake was confirmed against a measured sleep; under instrumentation one CI run \
+     (37142294661, 2026-10-03) counted 12 of 32 where it needs 16. Not reproduced here (0 of 40 across plain, \
+     instrumented, alone and at 4 CPUs); that the slower instrumented client was not yet asleep is the hypothesis",
+  ),
+];
+
+/// Format: the canary test target and the test it holds (`crates/mem/tests/race_canary.rs`).
+const CANARY: (&str, &str) = (
+  "race_canary",
+  "two_unsynchronized_writers_on_one_word_are_reported_as_a_race",
+);
+/// Format: the line ThreadSanitizer prints for a data race.
+const RACE_REPORT: &str = "WARNING: ThreadSanitizer: data race";
+/// Format: the instrumentation flags, for code and for the rebuilt standard library.
+///
+/// `--cfg=rustix_use_libc` is not instrumentation; it is what makes the instrumentation able to see slates.
+/// ThreadSanitizer learns about memory by intercepting libc, and rustix's default backend on Linux is
+/// `linux_raw`, which issues syscalls by inline assembly and never enters libc at all. So every `mmap` and
+/// `munmap` slates makes — `crates/mem/src/shared.rs` — is invisible to it, and the shadow memory for an
+/// unmapped range is never cleared. The kernel then hands the same address to the next mapping and
+/// ThreadSanitizer reports the new mapping's writes as racing the *old* mapping's reads.
+///
+/// Measured, not assumed: run 39538566246 reported a race at `0x7f2ff993b000` between `Ring::init`'s atomic
+/// store in one daemon's `ClientRegion::create` and a `copy_out` read in another client's
+/// `ClientRegion::open`. Two shared objects cannot be live at one address, so one had been unmapped and the
+/// shadow had outlived it. Run 39527867650 reported the same shape at `0x7f07b1029000` between two
+/// `ipc/tests/rings.rs` tests whose regions carry different names. rustix's own `build.rs` documents this cfg
+/// as the way to "enable the libc backend even if rustix is depended on transitively".
+///
+/// The cost is that the lane exercises rustix's libc backend rather than its raw one, which is a deviation
+/// from the shipped build — but a smaller one than `-Zbuild-std` already is, and the alternative is a lane
+/// whose reports cannot be trusted and whose real races would be lost among them.
+const SANITIZER_FLAGS: &str = "-Zsanitizer=thread --cfg=rustix_use_libc";
+/// Format: report every race in a binary rather than stop at the first, so one run names them all.
+const TSAN_OPTIONS: &str = "halt_on_error=0";
+
+/// The host's target triple, from the nightly compiler (`-Zbuild-std` needs an explicit target).
+fn host_target() -> Result<String, Failure> {
+  let output = Command::new("rustc")
+    .args(["+nightly", "-vV"])
+    .stdin(Stdio::null())
+    .output()
+    .map_err(|e| Failure(format!("tsan: running `rustc +nightly -vV`: {e}")))?;
+  String::from_utf8_lossy(&output.stdout)
+    .lines()
+    .find_map(|line| line.strip_prefix("host: "))
+    .map(str::to_owned)
+    .ok_or_else(|| {
+      Failure(
+        "tsan: `rustc +nightly -vV` named no host; install the nightly toolchain with `rust-src`"
+          .to_owned(),
+      )
+    })
+}
+
+/// An instrumented `cargo +nightly test` for `target`, run at the workspace root.
+fn instrumented(root: &Path, target: &str) -> Command {
+  let mut command = Command::new("cargo");
+  command
+    .current_dir(root)
+    .stdin(Stdio::null())
+    .env("RUSTFLAGS", SANITIZER_FLAGS)
+    .env("RUSTDOCFLAGS", SANITIZER_FLAGS)
+    .env("TSAN_OPTIONS", TSAN_OPTIONS)
+    .args(["+nightly", "test", "-Zbuild-std", "--target", target]);
+  command
+}
+
+/// Step 1: the canary must be reported as a race.
+fn canary(root: &Path, target: &str) -> Result<(), Failure> {
+  let (test_target, test) = CANARY;
+  eprintln!("tsan: the canary ({test_target}::{test}) must be reported");
+  let output = instrumented(root, target)
+    .args([
+      "-p",
+      "slates-mem",
+      "--test",
+      test_target,
+      "--",
+      "--ignored",
+      "--exact",
+      test,
+    ])
+    .output()
+    .map_err(|e| Failure(format!("tsan: running the canary: {e}")))?;
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let reported = stderr.contains(RACE_REPORT) || stdout.contains(RACE_REPORT);
+  let ran = stdout.contains(test);
+  if reported && ran && !output.status.success() {
+    eprintln!("tsan: the canary was reported as a data race, so the instrumentation is live");
+    Ok(())
+  } else {
+    Err(Failure(format!(
+      "tsan: the canary was not reported as a race (ran: {ran}, reported: {reported}, exit: {}); a clean run of \
+       the suites would prove nothing\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+      output.status.code().unwrap_or(-1)
+    )))
+  }
+}
+
+/// Step 2: every test of [`CRATES`] but [`SKIPPED`], instrumented; any report fails.
+fn suites(root: &Path, target: &str) -> Result<(), Failure> {
+  let mut command = instrumented(root, target);
+  command.args(["--no-fail-fast", "--lib", "--tests"]);
+  for krate in CRATES {
+    command.args(["-p", krate]);
+  }
+  command.arg("--");
+  for (test, reason) in SKIPPED {
+    eprintln!("tsan: skipping {test}: {reason}");
+    command.args(["--skip", test]);
+  }
+  eprintln!(
+    "tsan: the suites of {} under ThreadSanitizer",
+    CRATES.join(", ")
+  );
+  let status = command
+    .status()
+    .map_err(|e| Failure(format!("tsan: running the suites: {e}")))?;
+  if status.success() {
+    Ok(())
+  } else {
+    Err(Failure(format!(
+      "tsan: the instrumented suites failed (exit {}); a ThreadSanitizer report above names the race",
+      status.code().unwrap_or(-1)
+    )))
+  }
+}
+
+/// Step 3: the server's [`SERVER_TARGETS`], instrumented; any report fails.
+fn server(root: &Path, target: &str) -> Result<(), Failure> {
+  let mut command = instrumented(root, target);
+  command.args(["--no-fail-fast", "-p", "slates-server"]);
+  command.args(SERVER_TARGETS);
+  eprintln!(
+    "tsan: the server's {} under ThreadSanitizer",
+    SERVER_TARGETS.join(" ")
+  );
+  let status = command
+    .status()
+    .map_err(|e| Failure(format!("tsan: running the server's suites: {e}")))?;
+  if status.success() {
+    Ok(())
+  } else {
+    Err(Failure(format!(
+      "tsan: the server's instrumented suites failed (exit {}); a ThreadSanitizer report above names the race",
+      status.code().unwrap_or(-1)
+    )))
+  }
+}
+
+/// Runs the lane: the canary, then the threaded crates' suites, then the server's.
+pub fn run(root: &Path) -> Result<(), Failure> {
+  let target = host_target()?;
+  canary(root, &target)?;
+  suites(root, &target)?;
+  server(root, &target)
+}

@@ -1,0 +1,154 @@
+//! `slates-server` — the daemon (design §2.5, §2.6 "Boot order", §4.4 "Operations", §4.7,
+//! §4.8, §4.13; Phase 2 task 4): N shards on the runtime, each owning its volumes, its
+//! partition of the database (recovered from the anchor segment at start) and the clients
+//! pinned to it; the control shard running the rendezvous; the lifecycle verbs of §4.4 served
+//! from each client's command ring with exactly-once completion records, leases with epochs,
+//! client-form attachments, and quotas fed by the shard reserve and the host's live memory.
+//!
+//! Shape: every shard's state lives in a thread-local cell on that shard's thread
+//! ([`state`]); the server task of the shard is a registered poller of the runtime, woken
+//! when any of its clients' rings holds a request, and it serves each request inline on the
+//! shard (one step, no awaits inside, as §4.8 "Transactions" says); a new client reaches its
+//! shard as a spawned task that moves the daemon end into that state (sharing by move, D-8).
+//! The control shard drains Linux rendezvous connections through its driver's one-shot
+//! readiness; other platforms use the shared-memory word watcher ([`doorbell`]). Nothing here touches a host path but
+//! the read-only base of an overlay volume; nothing writes a disk.
+//!
+//! Modules: [`config`] (the daemon's derivations from the profile), [`state`] (the shard's
+//! state and the client and volume records), [`verbs`] (the dispatcher), [`daemon`] (start,
+//! recovery, the control shard, shutdown), [`doorbell`] (the thread that turns a client's
+//! ring into the driver's kick), [`fleet`] (the membership loop and the record plane a fleet node
+//! runs), [`deploy`] (a node's socket map and member ids from the operator's one shared manifest),
+//! [`telemetry`] (the chokepoint spans' per-shard rings and the bounded `Telemetry` drain the status
+//! surfaces read, §4.14), [`error`].
+
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
+pub mod catalog;
+pub mod config;
+mod consensus;
+mod consensus_recovery;
+mod content_cipher;
+mod content_holder;
+mod content_pool;
+pub mod content_retention;
+pub use consensus_recovery::{RecoveryKey, recovery_proof};
+pub mod daemon;
+pub mod deploy;
+mod direct_map;
+pub mod discovery;
+mod retention;
+// Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
+// A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.
+// The daemon's end of the anchor's hold (A-61, A-113): paired per platform, one API; Windows' answers that no anchor
+// holds (docs/wip/platforms.md, gap 2).
+#[cfg(unix)]
+mod anchor_hold;
+#[cfg(windows)]
+#[path = "anchor_hold_windows.rs"]
+mod anchor_hold;
+pub mod dns;
+pub mod doorbell;
+pub mod error;
+pub mod fleet;
+mod forward_lane;
+mod fs_verbs;
+#[cfg(target_os = "linux")]
+mod fuse;
+#[cfg(target_os = "linux")]
+mod fuse_hold;
+// The macOS NFS mounts this daemon serves, recorded as its own (A-227).
+#[cfg(target_os = "macos")]
+mod own_nfs;
+// A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
+mod checkout;
+pub mod head;
+#[cfg(target_os = "linux")]
+mod held_copy;
+pub mod histogram;
+mod image;
+pub mod landing;
+pub mod lease;
+mod lease_wait;
+mod live_ship;
+mod member_task;
+pub mod merge_service;
+mod mirror;
+mod remote_attach;
+#[cfg(target_os = "linux")]
+mod write_log;
+// The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
+#[cfg(windows)]
+mod winfsp;
+// The NFS server: the macOS mount's loopback transport, and on every platform the network export (a fleet node's
+// export, `slates export`) that remote and virtual-machine clients mount (Windows mounts locally through WinFsp). It
+// rides the runtime's TCP, which every platform has since A-182.
+mod callback;
+mod delegation;
+mod listing;
+mod lock_ledger;
+pub mod nfs;
+// A stale page an NFS client writes back over another path's newer change is refused (A-192).
+mod nfs_replay;
+mod nfs_state;
+pub mod nfs_tls;
+mod nfs_writeback;
+pub mod observe;
+mod owner_location;
+mod staging;
+mod work_charge;
+pub mod work_files;
+mod work_log;
+// The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
+// table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
+pub mod oci;
+pub mod peer;
+mod reap;
+// Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
+pub mod local_dumps;
+mod recovery_slices;
+pub mod seal_keys;
+// A client's session key (GAP-A9-9's threat model): what a client resuming under its id proves before its seat is served.
+pub mod session_key;
+mod snapshot_view;
+// The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
+// stream, on the volume's owning shard: a socket pair on Unix, a duplex named pipe on Windows served by the runtime's
+// completion driver (A-179).
+pub mod shards;
+// The Shards stream's socket route (A-161): macOS hands a client its stream end through it, having no control socket.
+#[cfg(target_os = "macos")]
+mod shards_route;
+pub mod state;
+mod status_pages;
+pub mod takeover;
+pub mod telemetry;
+// A writer outside FUSE answered once every FUSE mount of its volume was told (AC-3.3).
+mod told;
+pub mod tombstone;
+// The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
+// on this host); pure over one platform seam, so it compiles and tests everywhere.
+pub mod transports;
+pub mod verbs;
+pub mod watchdog;
+// The virtio-fs guest transport (§4.6 A-9): a guest device served on the volume's owning shard; its
+// loop rides the runtime's Unix descriptor readiness, so it is gated like the NFS transport.
+#[cfg(unix)]
+pub mod virtiofs;
+pub mod xshard;
+
+pub use config::{BootFault, BootFaultKind, DaemonConfig, DurabilityBound, FleetMembership};
+pub use daemon::{
+  Daemon, DrainReport, HeldRecordView, LeadershipHandoff, LinkAfter, SegmentSource, SessionHold,
+};
+pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress};
+pub use dns::Resolver;
+pub use fleet::{
+  FleetPeer, FleetTransport, ServeAddresses, ServeBindError, ServeFault, ServeSockets,
+};
+
+pub use error::ServerError;
