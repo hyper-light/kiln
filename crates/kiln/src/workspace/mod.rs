@@ -266,6 +266,18 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
         spec.env = rehomed(&spec.env, &over.to_string_lossy(), &top.to_string_lossy());
         let here = if sub.is_empty() { top } else { top.join(&sub) };
         spec.cwd = Some(here.to_string_lossy().into_owned());
+        // A conversation taken up goes on from the mount's folder: its harness's record of it moved where the harness
+        // looks from there, or copied for a branch of it, whose original goes on where it was (I12).
+        if let Some(session) = spec.resume.clone() {
+            let (kind, dirs, cwd, branch) = (spec.kind.clone(), crate::harness::homes::Dirs::here(&spec.env), here.to_string_lossy().into_owned(), spec.fork);
+            let moved = crate::rt::blocking(move || if branch { crate::harness::homes::rehome_branch(&kind, &dirs, &session, &cwd) } else { crate::harness::homes::rehome(&kind, &dirs, &session, &cwd) }).await?;
+            if let Err(why) = moved {
+                if let Err(gone) = slates::remove(&made, std::time::Duration::ZERO).await {
+                    tracing::warn!(volume = %made.volume, error = %format!("{gone:#}"), "the workspace of a conversation that couldn't be taken up stayed");
+                }
+                anyhow::bail!("its conversation's record couldn't be moved onto its volume: {why}");
+            }
+        }
     }
     spec.workspace = Some(Workspace { kind: w.kind, over: Some(over.to_string_lossy().into_owned()), sub, made: Some(made), ..Workspace::default() });
     Ok(())
