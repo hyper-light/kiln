@@ -8,6 +8,7 @@
 //! - [`change`]: an agent's change request, from its work to review (C1, C6).
 //! - [`follow`]: what happens to it, back to the agent (C2, C3).
 //! - [`slates`]: a workspace of its own, a Slates volume over its folder (W1–W4).
+//! - [`slates_fleet`]: a runner's identity as a node of kiln's Slates fleet, its key and kiln's certificate for it.
 //! - [`place`]: where a workspace's volume is mounted on its machine (a folder, or a drive letter on Windows).
 //! - [`ignored`]: what git ignores in one with no mount, from its volume's own `.gitignore` files.
 //! - [`review`]: an agent's work in one with no mount, from its volume's landing entries (A-287).
@@ -22,6 +23,7 @@ pub mod measure;
 pub mod place;
 pub mod review;
 pub mod slates;
+pub mod slates_fleet;
 
 #[cfg(test)]
 mod bare_metal_tests;

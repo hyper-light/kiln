@@ -359,8 +359,11 @@ unasked lands at once, its plan as it stands or the manifest it names; one in a 
 its plan, and its writing waits on its person's click (`crate::confirms`: asked in their chat turn, 428
 until they confirm, then the same call runs once as theirs; outside a turn there's no one to ask, and
 it's refused); one that only plans lands nothing (403). Its answer names the outcome (`outcome`:
-`written` with Slates' outcome, or `approval_required` with the plan to approve by its manifest),
-beside the fields the UI reads. A volume lands whole, so an agent working in another agent's volume
+`written` with Slates' outcome, `approval_required` with the plan to approve by its manifest,
+`conflicted` with each conflict typed, or `refused` with the policy's refusal), beside the fields
+the UI reads. A landing whose plan meets conflicts (a file the agent changed that a person changed on
+disk since) writes nothing whoever asks, a mode that edits unasked included: a conflict never writes
+over the person's bytes, and there is no manifest to approve until a person settles it. A volume lands whole, so an agent working in another agent's volume
 lands nothing of its own while that one works (409, naming whose it is). Setting a policy and
 approving are the launcher's acts, proven by a secret of kiln's own: made once, kept 0600 in its
 state (`slates-launcher.key`), and handed to the anchor at every start on its standard input, so
@@ -380,6 +383,13 @@ kiln's policies and approvals until it starts again.
 machine's restart loses it: Slates keeps volumes in memory. An agent with a volume doesn't move to
 another machine yet (refused, saying why); that waits on a snapshot of an overlay that can be
 cloned, or shipped, elsewhere.
+Built toward it (kiln goal 95101ef3…, its first piece, 2026-11-18): each runner's identity as a node
+of kiln's Slates fleet (`workspace::slates_fleet`): its key made on the runner and never sent, its
+certificate from kiln's CA (`POST /api/agents/slates-fleet`, the machine's proof as a second runner
+process gives it) for the fleet's name and the runner's own failure domain alone, kept as Slates'
+fleet manifest reads it, with kiln's CA as the fleet's enrollment root. Still owed: the runners'
+discovery and manifest, the operator's choice of which runners join, starting a runner's Slates
+with the fleet, and the move itself.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.
