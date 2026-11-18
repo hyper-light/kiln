@@ -4411,6 +4411,29 @@ impl Registry {
             crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
         }
         let loc = Location::of_target(target);
+        // Where it works, on its machine's host (the person's decision, 2026-11-18, kiln goal
+        // 01a1ec34599974448aed2672bafaf9a2; docs/agentic.md W2): one whose folder lies in a workspace an agent there
+        // works in now works in that one; one whose start named none gets a volume of its own, and a machine that can't
+        // make one refuses the start, naming what it lacks (`lineage::NoWorkspace`), rather than run it in its plain
+        // folder: no second path (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
+        // its boundary's sharing decides; a conversation taken up stays in the folder its harness keeps it by
+        // (`resume`); and an agent started in a person's shell (`shell`) works beside them in the shell's folder, as the
+        // composer shows it, since it takes the shell's environment, whose `PWD` names that folder.
+        if spec.isolation.is_none() && spec.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
+            let here = loc.target();
+            let live: Vec<(String, crate::workspace::Workspace)> = self.list().into_iter().filter(|i| Location::of_target(&i.target).target() == here).filter_map(|i| i.workspace.filter(|w| w.made.is_some()).map(|w| (i.id, w))).collect();
+            if let Some(shared) = spec.cwd.as_deref().and_then(|cwd| crate::workspace::sharing(cwd, &live)) {
+                spec.workspace = Some(shared);
+            } else if spec.workspace.is_none() && spec.resume.is_none() && spec.shell.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
+                crate::harness::lineage::workspaces_on(hub, target).await?;
+                spec.workspace = Some(crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() });
+            }
+        }
+        // How much its launcher lets it do unasked, kept as given whatever it or its harness says later (the person's
+        // rule, 2026-11-18: an agent never raises its own permission; docs/agentic.md W6): what its permissions are
+        // judged by beside its mode now. One restarted, moved or taken up keeps the one it was first given; a start
+        // asked of kiln arrives with none (`api::as_asked`), so it is its mode's.
+        spec.launched = Some(spec.launched_level());
         // A machine whose kiln is to be upgraded takes no new agent (`crate::skew`).
         if let Location::Machine(m) = &loc
             && let Some(why) = hub.skew_holds(m)
@@ -4454,13 +4477,14 @@ impl Registry {
                     // A workspace of its own first: a volume over its folder, mounted, its folder in it.
                     let id = ids.get(i).cloned().unwrap_or_else(crate::util::new_id);
                     crate::workspace::prepare(&mut spec, &id).await.map_err(|e| e.context("its workspace"))?;
-                    let made = spec.workspace.as_ref().and_then(|w| w.made.clone());
+                    let made = crate::workspace::made_alone(&spec);
                     let s = match self.local.open(Some(id), spec) {
                         Ok(s) => s,
                         Err(e) => {
                             // What was made for it goes with it: asked again under its id, it's made anew.
+                            // Nothing ran in it, so nothing of it is on its way out: asked to go once.
                             if let Some(m) = made
-                                && let Err(gone) = crate::workspace::slates::remove(&m).await
+                                && let Err(gone) = crate::workspace::slates::remove(&m, std::time::Duration::ZERO).await
                             {
                                 tracing::warn!(volume = %m.volume, error = %format!("{gone:#}"), "the workspace of an agent that couldn't start stayed");
                             }
@@ -4552,6 +4576,7 @@ impl Registry {
                         subagent: spec.subagent,
                         variant_of: spec.variant_of.clone(),
                         no_bypass: !spec.allow_bypass,
+                        launched: spec.launched,
                         workspace: spec.workspace.clone(),
                         isolation: spec.isolation.clone(),
                         runs: None,

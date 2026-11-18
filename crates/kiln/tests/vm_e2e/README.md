@@ -80,9 +80,16 @@ No wait has a time of its own (`vm_e2e::Pace`; docs/research/s35-every-harness/w
 drive is judged by another's: each harness's image, stand-in and build are its own, so another drive's
 answers bound none of its waits (r707: claude's first turn bounded codex's, refused while codex's image was
 still building). Until a harness gives its first answer in a drive, and while it works on a turn the drive
-asked to be long, a wait follows its own parties' liveness and progress alone. After that, the slowest
-answer the harness has given in the drive bounds how long it may go without progress. What progresses is
-kiln's word on the session and its timeline, and, while the session starts (kiln's word on it unmoving as
+asked to be long, a wait follows its own parties' liveness and progress alone. After that, the tail of the
+answers of its own kind the harness has given in the drive bounds how long it may go without progress
+(`vm_e2e::tail`: an upper prediction bound of a log-normal fitted to them, with Student's t for their count,
+at a chance of one in ten thousand that a healthy answer outlasts it; none from fewer than two): a first
+turn, a turn that only answers, a landing's turn (`Asked::Landing`, which writes a workspace to disk), a
+stop and kiln's own work each by their own, never by the slowest single answer, which ordinary load
+outlasts (the coordinator's proofs of 2026-11-18: a landing's turn refused at 373 ms, the slowest earlier
+turn's 372 ms). What progresses is kiln's word on the session and its timeline, what the work under way
+reports of itself where the drive reads that (`Pace::reporting`: a landing's records in Slates' audit), and,
+while the session starts (kiln's word on it unmoving as
 its image builds and its microVM boots), the drive's own processes on the host (`vm_e2e::Own`: those its
 runner's trees gained since the drive began, its build's and its microVM's) and the CPU they use. A wait
 ends at once, typed and saying why, where kiln's own word says no answer can come, or where the fixture's
@@ -101,7 +108,7 @@ for a run (`PUT /api/runners/<machine>/headroom` with `{"enabled": false}`) and 
 | Name | Client end | Server end | Owed by |
 |---|---|---|---|
 | `server-runner` | the runner's own view of its link to the server | the server's view of that runner's connection | kiln plan 01a1d2c1ef09707daafe3fe9b77754e6 step 2 (AES-256-GCM alone there, each end on kiln's API, read from step 16's `Endpoint::negotiated`) |
-| `agent-control` | Shards' `control::controller` in kiln | the agent-control endpoint's own report | Built: Hex's `Runtime::link` reports a box's agent-control link and kiln's `HexRun::link` maps it, served as `/runs/control` (100b707e9; owed item 1). The drive fails the links by `vm_e2e::LinkGap`'s name only where kiln has no `/runs/control` for the run |
+| `agent-control` | Shards' `control::controller` in kiln | the agent-control endpoint's own report | Hex's `Runtime::link`, which kiln's `HexRun::link` maps (kiln 100b707e9; owed item 1); a run whose session reports no `/runs/control` fails the links by that name (`vm_e2e::LinkGap`) |
 | `mcp` | the harness's client | kiln's MCP as the microVM reaches it | Decided (2026-11-13, Shards D254) and built: kiln's MCP rides the agent-control link as its own `mcp:<member>` lane (step 11 with step 18), so no network grant names it. Its suite and its lane are read from the agent-control link's report, owed as that link's are |
 
 No `kiln-hex` link (2026-11-16): the plan drew one, kiln to a Hex node, but kiln's runner holds Hex's image
@@ -193,9 +200,10 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    `check_no_host_pid` and `check_starts`. On a Hex-held run the link's ends and lanes are Hex's report
    of it (`Runtime::link`, on Shards' `Linked::report`, 8c9c03cc4; in the Hex kiln vendors since
    992c5a33a), which `HexRun::link` maps; that link carries none of its stdio, which Hex takes from the
-   image channel. `in_microvm` checks the links after every other check, and fails them by
-   `vm_e2e::LinkGap`'s name only where kiln has no `/runs/control` for the run: gaps.json's `link_report`
-   holds for every harness (100b707e9), seen live on WHP (r41) and not yet on HVF or KVM. Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
+   image channel. `in_microvm` checks the links after every other check and fails missing ones by that
+   name (`vm_e2e::LinkGap`); gaps.json lists no `link_report` gap since `HexRun::link` maps Hex's report,
+   seen live on WHP (r41) and not yet on HVF or KVM.
+   Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
    `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch
    (`p/s17-launch-seam-v1`, 64dfab21f) reads its process's `host_pid()` inside (`session.rs` 4328 and
    4724) and says none of it; Shards' `control::Controller` (`crates/remote/src/control/drive.rs`)

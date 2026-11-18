@@ -336,18 +336,23 @@ impl std::fmt::Debug for Doorbell {
 }
 
 impl Doorbell {
-  /// Rings.
-  pub fn ring(&self) -> Result<(), IpcError> {
+  /// Rings for the client of `shard`, the shard its region names (A-381): only that shard is woken. On Linux the
+  /// descriptor is that shard's own kick, so the name is already in it; on macOS and Windows the ring marks the shard
+  /// in the bootstrap object before it wakes the daemon's doorbell thread, which kicks the shards marked and no other.
+  pub fn ring(&self, shard: u16) -> Result<(), IpcError> {
     match self {
       #[cfg(target_os = "linux")]
-      Doorbell::Eventfd(fd) => rustix::io::write(fd, &1u64.to_ne_bytes())
-        .map(|_| ())
-        .map_err(|e| IpcError::OsRefused {
-          call: "eventfd write",
-          code: Some(e.raw_os_error()),
-        }),
+      Doorbell::Eventfd(fd) => {
+        let _ = shard;
+        rustix::io::write(fd, &1u64.to_ne_bytes())
+          .map(|_| ())
+          .map_err(|e| IpcError::OsRefused {
+            call: "eventfd write",
+            code: Some(e.raw_os_error()),
+          })
+      }
       #[cfg(any(target_os = "macos", windows))]
-      Doorbell::Word(bell) => bell.ring(),
+      Doorbell::Word(bell) => bell.ring_for(shard),
       #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
       _ => Err(IpcError::Unsupported {
         feature: "the doorbell",
@@ -382,11 +387,26 @@ impl DoorbellWaiter {
     self.inner.wait(seen, timeout_ns)
   }
 
-  /// Rings the doorbell as a client does: bumps the word and wakes the waiting thread (the daemon
-  /// rings it to stop its own thread).
+  /// Rings the doorbell with nothing marked: bumps the word and wakes the waiting thread, which kicks no shard (the
+  /// daemon rings it to stop its own thread).
   pub fn ring(&self) -> Result<(), IpcError> {
     self.inner.ring()
   }
+
+  /// What the rings since the last call asked for, taken (A-381): whether a claim rang, and each shard a client rang
+  /// for, each once however often it rang. The thread calls it once the word has moved.
+  pub fn take_pending(&self) -> Result<Pending, IpcError> {
+    self.inner.take_pending()
+  }
+}
+
+/// What the doorbell's rings asked of the daemon since its thread last looked (A-381).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pending {
+  /// A client's claim rang: the control shard, which answers claims, is to be kicked.
+  pub claim: bool,
+  /// The shards a client rang for, each once, in ascending order: the shard each client's region names.
+  pub shards: Vec<u16>,
 }
 
 /// Shape: how long a client waits for the daemon to answer a claim before reporting it unavailable
@@ -557,16 +577,32 @@ pub struct StreamDelivery {
   pub request_id: u64,
   /// The attachment the daemon serves on the stream.
   pub attachment: u64,
+  /// Whether the stream's resync end follows this delivery, as the next one for the same request (A-316).
+  pub resync_follows: bool,
 }
 
-/// A descriptor the daemon delivered over the control socket, with what it is for: a content map (A-135) or a
-/// stream end (A-161). Each names the request it answers, so a client takes only its own.
+/// The device's end of a Shards stream's resync channel (A-316), delivered right after the stream's own end: the
+/// channel a successor daemon hands the device a fresh stream on (`slates_bridge_fuse::shards_resync`).
+#[cfg(unix)]
+pub struct ResyncDelivery {
+  /// The channel's end.
+  pub end: std::os::fd::OwnedFd,
+  /// The request this delivery answers (the attach's id).
+  pub request_id: u64,
+  /// The attachment the channel resyncs.
+  pub attachment: u64,
+}
+
+/// A descriptor the daemon delivered over the control socket, with what it is for: a content map (A-135), a stream
+/// end (A-161) or a stream's resync end (A-316). Each names the request it answers, so a client takes only its own.
 #[cfg(unix)]
 pub enum ControlDelivery {
   /// A read-only content map.
   Mapping(MappingDelivery),
   /// A Shards fs stream's other end.
   Stream(StreamDelivery),
+  /// A Shards fs stream's resync end.
+  Resync(ResyncDelivery),
 }
 
 #[cfg(unix)]
@@ -576,6 +612,7 @@ impl ControlDelivery {
     match self {
       Self::Mapping(mapping) => mapping.request_id,
       Self::Stream(stream) => stream.request_id,
+      Self::Resync(resync) => resync.request_id,
     }
   }
 }
@@ -743,6 +780,10 @@ pub mod platform {
     pub(super) fn ring(&self) -> Result<(), IpcError> {
       match *self {}
     }
+
+    pub(super) fn take_pending(&self) -> Result<super::Pending, IpcError> {
+      match *self {}
+    }
   }
 
   /// Format: the handoff message: client id (4), region length (8).
@@ -768,6 +809,8 @@ pub mod platform {
   const KIND_MAPPING: u64 = 1;
   /// Format: the kind of a stream-end delivery.
   const KIND_STREAM: u64 = 2;
+  /// Format: the kind of a stream's resync-end delivery (A-316).
+  const KIND_RESYNC: u64 = 3;
   /// Format: a mapping delivery's body after its kind (§4.6, A-135): request id (8), mapping id (8), the block's
   /// offset in its backing object (8), the file's authorized length (8), the block length (8).
   const MAPPING_MSG_BYTES: usize = 40;
@@ -781,10 +824,13 @@ pub mod platform {
   const MAPPING_AT_FILE_LEN: usize = 24;
   /// Format: the block length's offset.
   const MAPPING_AT_BLOCK_LEN: usize = 32;
-  /// Format: a stream delivery's body after its kind (A-161): request id (8), attachment id (8).
-  const STREAM_MSG_BYTES: usize = 16;
+  /// Format: a stream delivery's body after its kind (A-161): request id (8), attachment id (8), and whether the
+  /// stream's resync end follows (8, one or zero; A-316). A resync delivery's body is the same, its third word zero.
+  const STREAM_MSG_BYTES: usize = 24;
   /// Format: the attachment id's offset in a stream delivery.
   const STREAM_AT_ATTACHMENT: usize = 8;
+  /// Format: the resync-follows word's offset in a stream delivery.
+  const STREAM_AT_RESYNC_FOLLOWS: usize = 16;
   /// Derived: the longest delivery, a kind word and a mapping's body; every receive reads into this much.
   const DELIVERY_MAX_BYTES: usize = KIND_BYTES + MAPPING_MSG_BYTES;
   /// Format: the one descriptor every delivery carries: an arena block's backing object, or a stream end.
@@ -910,6 +956,7 @@ pub mod platform {
       stream: std::os::fd::BorrowedFd<'_>,
       request_id: u64,
       attachment: u64,
+      resync_follows: bool,
     ) -> Result<(), IpcError> {
       let mut body = [0u8; KIND_BYTES + STREAM_MSG_BYTES];
       put_words(
@@ -918,9 +965,35 @@ pub mod platform {
           (0, KIND_STREAM),
           (KIND_BYTES + AT_REQUEST, request_id),
           (KIND_BYTES + STREAM_AT_ATTACHMENT, attachment),
+          (
+            KIND_BYTES + STREAM_AT_RESYNC_FOLLOWS,
+            u64::from(resync_follows),
+          ),
         ],
       );
       self.send_delivery(&body, stream, "sendmsg stream")
+    }
+
+    /// Sends the client that attached a Shards fs stream the device's end of its resync channel (A-316), right after
+    /// the stream's own end ([`Self::send_stream`] with `resync_follows`), with the request it answers and the
+    /// attachment it resyncs. No confinement check, as for the stream: the channel carries only what the daemon sends
+    /// that one attachment's device.
+    pub fn send_resync(
+      &self,
+      end: std::os::fd::BorrowedFd<'_>,
+      request_id: u64,
+      attachment: u64,
+    ) -> Result<(), IpcError> {
+      let mut body = [0u8; KIND_BYTES + STREAM_MSG_BYTES];
+      put_words(
+        &mut body,
+        &[
+          (0, KIND_RESYNC),
+          (KIND_BYTES + AT_REQUEST, request_id),
+          (KIND_BYTES + STREAM_AT_ATTACHMENT, attachment),
+        ],
+      );
+      self.send_delivery(&body, end, "sendmsg resync")
     }
 
     /// One delivery, `body` padded to the longest kind's and sealed, with `descriptor` by `SCM_RIGHTS`, in one
@@ -1066,7 +1139,7 @@ pub mod platform {
         })?
         .open(Class::Delivery, &sealed)?;
       let kind = word_at(&body, 0);
-      if kind != KIND_MAPPING && kind != KIND_STREAM {
+      if ![KIND_MAPPING, KIND_STREAM, KIND_RESYNC].contains(&kind) {
         return Err(IpcError::Layout {
           reason: "a delivery of an unknown kind",
         });
@@ -1083,6 +1156,13 @@ pub mod platform {
       Ok(Some(if kind == KIND_STREAM {
         super::ControlDelivery::Stream(super::StreamDelivery {
           stream: descriptor,
+          request_id: field(AT_REQUEST),
+          attachment: field(STREAM_AT_ATTACHMENT),
+          resync_follows: field(STREAM_AT_RESYNC_FOLLOWS) != 0,
+        })
+      } else if kind == KIND_RESYNC {
+        super::ControlDelivery::Resync(super::ResyncDelivery {
+          end: descriptor,
           request_id: field(AT_REQUEST),
           attachment: field(STREAM_AT_ATTACHMENT),
         })
@@ -2212,8 +2292,10 @@ pub mod platform {
     ) -> Result<super::super::MappingDelivery, IpcError> {
       match delivery {
         Some(super::super::ControlDelivery::Mapping(mapping)) => Ok(mapping),
-        Some(super::super::ControlDelivery::Stream(_)) => Err(IpcError::Layout {
-          reason: "a stream end arrived where a mapping was sent",
+        Some(
+          super::super::ControlDelivery::Stream(_) | super::super::ControlDelivery::Resync(_),
+        ) => Err(IpcError::Layout {
+          reason: "a stream's end arrived where a mapping was sent",
         }),
         None => Err(IpcError::Layout {
           reason: "a delivery was waiting but recv returned None",
@@ -2269,9 +2351,9 @@ pub mod platform {
       )
       .map_err(|e| super::refused("add seals", e))?;
 
-      control.send_stream(handed.as_fd(), 5, 501)?;
+      control.send_stream(handed.as_fd(), 5, 501, false)?;
       control.send_mapping(block.as_fd(), read_only(6, 12, (0, 4096, 4096)))?;
-      control.send_stream(other_handed.as_fd(), 7, 502)?;
+      control.send_stream(other_handed.as_fd(), 7, 502, false)?;
       drop(handed);
 
       let first = match liveness.recv_delivery()? {
@@ -2316,6 +2398,72 @@ pub mod platform {
       Ok(())
     }
 
+    /// The three deliveries [`a_streams_resync_end_follows_its_end_on_the_control_socket`] sends, read in order off
+    /// `liveness`: a stream end, a resync end and another stream end, each refused `Layout` if it is another kind.
+    fn stream_resync_and_plain(
+      liveness: &Liveness,
+    ) -> Result<
+      (
+        super::super::StreamDelivery,
+        super::super::ResyncDelivery,
+        super::super::StreamDelivery,
+      ),
+      IpcError,
+    > {
+      let Some(super::super::ControlDelivery::Stream(stream)) = liveness.recv_delivery()? else {
+        return Err(IpcError::Layout {
+          reason: "the first delivery was not the stream end",
+        });
+      };
+      let Some(super::super::ControlDelivery::Resync(resync)) = liveness.recv_delivery()? else {
+        return Err(IpcError::Layout {
+          reason: "the second delivery was not the resync end",
+        });
+      };
+      let Some(super::super::ControlDelivery::Stream(plain)) = liveness.recv_delivery()? else {
+        return Err(IpcError::Layout {
+          reason: "the third delivery was not the plain stream end",
+        });
+      };
+      Ok((stream, resync, plain))
+    }
+
+    /// A-316: a stream whose resync channel the daemon made is delivered with it. Do: send a stream end saying its
+    /// resync end follows, then that resync end, then a plain stream end; read all three, and send a message on the
+    /// daemon's end of the resync pair. Expect the first to say a resync end follows and the third not; the second to be
+    /// the resync end for the same request and attachment; and the message read whole on the delivered end, which is
+    /// the channel's other end, not a copy.
+    #[test]
+    fn a_streams_resync_end_follows_its_end_on_the_control_socket() -> Result<(), IpcError> {
+      let (control, liveness) = channel()?;
+      let (_daemon_end, handed) = crate::stream::pair()?;
+      let (daemon_resync, handed_resync) = crate::stream::message_pair()?;
+      let (_plain_daemon_end, plain_handed) = crate::stream::pair()?;
+      control.send_stream(handed.as_fd(), 9, 901, true)?;
+      control.send_resync(handed_resync.as_fd(), 9, 901)?;
+      control.send_stream(plain_handed.as_fd(), 10, 902, false)?;
+      drop(handed_resync);
+      let (stream, resync, plain) = stream_resync_and_plain(&liveness)?;
+      let told = (stream.resync_follows, plain.resync_follows);
+      let named = (resync.request_id, resync.attachment);
+      if told != (true, false) || named != (9, 901) {
+        return Err(IpcError::Layout {
+          reason: "a resync end was not told, or named another request",
+        });
+      }
+      crate::stream::send(daemon_resync.as_fd(), b"attached")
+        .map_err(|e| super::refused("send", e))?;
+      let mut got = [0u8; 16];
+      let (read, descriptors) = crate::stream::recv_message(resync.end.as_fd(), &mut got)
+        .map_err(|e| super::refused("recv_message", e))?;
+      if got.get(..read) != Some(&b"attached"[..]) || !descriptors.is_empty() {
+        return Err(IpcError::Layout {
+          reason: "the delivered resync end is not the channel's other end",
+        });
+      }
+      Ok(())
+    }
+
     /// One way a hostile writer on the control socket might hand the client a delivery.
     #[derive(Clone, Copy, Debug)]
     enum Hostile {
@@ -2337,6 +2485,9 @@ pub mod platform {
     #[test]
     fn an_unsealed_forged_unknown_or_dropped_delivery_is_refused_and_its_descriptor_closed()
     -> Result<(), IpcError> {
+      // The zero read waits on the handed end's last close, which a child another test spawns would hold until its
+      // exec ([`crate::descriptor_test_gate`]).
+      let _gate = crate::descriptor_test_gate();
       for case in [
         Hostile::Unsealed,
         Hostile::Forged,
@@ -2365,8 +2516,8 @@ pub mod platform {
           }
           Hostile::AfterADropped => {
             let (_first_end, first) = crate::stream::pair()?;
-            control.send_stream(first.as_fd(), 1, 1)?;
-            control.send_stream(handed.as_fd(), 2, 2)?;
+            control.send_stream(first.as_fd(), 1, 1, false)?;
+            control.send_stream(handed.as_fd(), 2, 2, false)?;
             drop_one(&liveness)?;
           }
         }
@@ -2604,7 +2755,7 @@ pub mod platform {
 pub mod platform {
   //! macOS and Windows: the bootstrap object with claim slots.
 
-  use std::sync::atomic::{AtomicU32, Ordering};
+  use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
   use slates_mem::{Handoff, SharedObject, Width, WordRun, Words};
 
@@ -2614,17 +2765,22 @@ pub mod platform {
   #[cfg(not(windows))]
   use crate::wake;
 
-  /// Format: the bootstrap object's magic, `SLBT` in little-endian ASCII.
-  const MAGIC: u32 = 0x5442_4C53;
-  /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4),
-  /// padding (4), the daemon's start stamp (8), padding (4), the holding anchor's process id (4),
-  /// padding to a cache line. The padding after the stamp held the daemon's process id until A-159: a client judges the
-  /// daemon that answered its claim by the pid in the answer (A-143), so the header's copy had no reader left.
+  /// Format: the bootstrap object's magic, `SLB2` in little-endian ASCII: the layout with the rings' marks (A-381). The
+  /// layout before it, `SLBT`, had no marks, and a client of it rings without naming its shard, so an object or a client
+  /// of either layout is refused by the other as another layout, never served with its rings unheard.
+  const MAGIC: u32 = 0x3242_4C53;
+  /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4), the claim's mark (4,
+  /// A-381), the daemon's start stamp (8), padding (4), the holding anchor's process id (4), padding to a cache line.
+  /// The padding after the stamp held the daemon's process id until A-159: a client judges the daemon that answered its
+  /// claim by the pid in the answer (A-143), so the header's copy had no reader left.
   const HEADER_BYTES: usize = 64;
   /// Format: the slot count's offset in the header (after the magic).
   const AT_SLOT_COUNT: usize = 4;
   /// Format: the doorbell word's offset in the header.
   pub const AT_DOORBELL: usize = 8;
+  /// Format: the claim's mark in the header (A-381): a client's claim sets it before it rings, and the doorbell thread
+  /// kicks the control shard, which answers claims, only when it finds it set.
+  const AT_CLAIM_RUNG: usize = 12;
   /// Format: the start stamp's offset in the header: the wall clock in nanoseconds when the
   /// daemon opened the object, so a client that remembers it tells a restarted daemon (a new
   /// stamp) from a slow one (the same stamp).
@@ -2719,9 +2875,22 @@ pub mod platform {
       _stream: std::os::fd::BorrowedFd<'_>,
       _request_id: u64,
       _attachment: u64,
+      _resync_follows: bool,
     ) -> Result<(), IpcError> {
       Err(IpcError::Unsupported {
         feature: "a stream end over the control socket (macOS has the socket route)",
+      })
+    }
+
+    /// No control socket here (A-316): a macOS stream is handed no resync end yet.
+    pub fn send_resync(
+      &self,
+      _end: std::os::fd::BorrowedFd<'_>,
+      _request_id: u64,
+      _attachment: u64,
+    ) -> Result<(), IpcError> {
+      Err(IpcError::Unsupported {
+        feature: "a resync end over the control socket (macOS hands none yet)",
       })
     }
   }
@@ -2869,6 +3038,44 @@ pub mod platform {
       Ok(self.object.atomic_u32(AT_DOORBELL)?)
     }
 
+    /// Rings for the client of `shard` (A-381): marks the shard pending, its pending word in the summary, then rings.
+    /// The marks come before the word moves, so the thread that sees the word move finds them.
+    pub(super) fn ring_for(&self, shard: u16) -> Result<(), IpcError> {
+      let (word, bit) = word_and_bit(usize::from(shard));
+      mark(&self.object, AT_PENDING, word)?.fetch_or(bit, Ordering::Release);
+      let (summary, summary_bit) = word_and_bit(word);
+      mark(&self.object, AT_SUMMARY, summary)?.fetch_or(summary_bit, Ordering::Release);
+      self.ring()
+    }
+
+    /// Rings for a claim (A-381): marks the claim, then rings.
+    pub(super) fn ring_claim(&self) -> Result<(), IpcError> {
+      self
+        .object
+        .atomic_u32(AT_CLAIM_RUNG)?
+        .store(1, Ordering::Release);
+      self.ring()
+    }
+
+    /// What the rings since the last call marked, taken (A-381): the claim's mark, and each shard marked, found
+    /// through the summary words, so only a pending word a ring touched is read.
+    pub(super) fn take_pending(&self) -> Result<super::Pending, IpcError> {
+      let claim = self
+        .object
+        .atomic_u32(AT_CLAIM_RUNG)?
+        .swap(0, Ordering::AcqRel)
+        != 0;
+      let mut shards = Vec::new();
+      for summary in 0..SUMMARY_WORDS {
+        let touched = mark(&self.object, AT_SUMMARY, summary)?.swap(0, Ordering::AcqRel);
+        for word in set_bits(summary, touched) {
+          let bits = mark(&self.object, AT_PENDING, word)?.swap(0, Ordering::AcqRel);
+          shards.extend(set_bits(word, bits).filter_map(|shard| u16::try_from(shard).ok()));
+        }
+      }
+      Ok(super::Pending { claim, shards })
+    }
+
     /// Rings: bumps the word, then wakes the waiting thread.
     pub(super) fn ring(&self) -> Result<(), IpcError> {
       let word = self.word()?;
@@ -2903,15 +3110,32 @@ pub mod platform {
   /// The daemon's doorbell waiter is the bell itself.
   pub type DoorbellWaiter = Bell;
 
-  /// Format: the bootstrap object's length: the header and the claim slots.
-  const OBJECT_BYTES: usize = HEADER_BYTES + SLOTS * SLOT_BYTES;
+  /// Format: the bits one mark word, a `u64`, holds.
+  const MARK_BITS: usize = 64;
+  /// Format: a mark word's bytes.
+  const MARK_BYTES: usize = size_of::<u64>();
+  /// Format: the shard ids a ring can mark (A-381): a region names its shard as a `u16` (`crate::region`), so every id
+  /// has a bit and no shard a ring names is ever left unmarked.
+  const SHARD_IDS: usize = 1 << u16::BITS;
+  /// Format: the pending words, a bit a shard id (A-381).
+  const PENDING_WORDS: usize = SHARD_IDS / MARK_BITS;
+  /// Format: the summary words, a bit a pending word, so the doorbell thread takes only the pending words a ring
+  /// touched and not all of them at every ring.
+  const SUMMARY_WORDS: usize = PENDING_WORDS / MARK_BITS;
+  /// Format: the summary's offset, after the claim slots.
+  const AT_SUMMARY: usize = HEADER_BYTES + SLOTS * SLOT_BYTES;
+  /// Format: the pending words' offset, after the summary.
+  const AT_PENDING: usize = AT_SUMMARY + SUMMARY_WORDS * MARK_BYTES;
+  /// Format: the bootstrap object's length: the header, the claim slots, the summary and the pending words.
+  const OBJECT_BYTES: usize = AT_PENDING + PENDING_WORDS * MARK_BYTES;
 
-  /// The bootstrap object's declared atomic words (AUD-29-09): the doorbell, the start stamp (the
-  /// header's publication word) and every claim slot's state word; the rest is plain, owned by whichever
-  /// side the slot's state names.
+  /// The bootstrap object's declared atomic words (AUD-29-09): the doorbell, the claim's mark, the start stamp (the
+  /// header's publication word), every claim slot's state word, and the rings' marks (A-381); the rest is plain, owned
+  /// by whichever side the slot's state names.
   fn bootstrap_words() -> Words {
     Words::new()
       .with(WordRun::one(AT_DOORBELL, Width::U32))
+      .with(WordRun::one(AT_CLAIM_RUNG, Width::U32))
       .with(WordRun::one(AT_GENERATION, Width::U64))
       .with(WordRun::strided(
         HEADER_BYTES + AT_STATE,
@@ -2919,6 +3143,53 @@ pub mod platform {
         SLOTS,
         Width::U32,
       ))
+      .with(WordRun::strided(
+        AT_SUMMARY,
+        MARK_BYTES,
+        SUMMARY_WORDS,
+        Width::U64,
+      ))
+      .with(WordRun::strided(
+        AT_PENDING,
+        MARK_BYTES,
+        PENDING_WORDS,
+        Width::U64,
+      ))
+  }
+
+  /// The mark word at `index` of the run at `first`.
+  fn mark(object: &SharedObject, first: usize, index: usize) -> Result<&AtomicU64, IpcError> {
+    let offset = index
+      .checked_mul(MARK_BYTES)
+      .and_then(|bytes| bytes.checked_add(first))
+      .ok_or(IpcError::Layout {
+        reason: "a ring's mark past the bootstrap object",
+      })?;
+    Ok(object.atomic_u64(offset)?)
+  }
+
+  /// The word and the bit within it that stand for `index` among words of [`MARK_BITS`] bits.
+  fn word_and_bit(index: usize) -> (usize, u64) {
+    let word = index.checked_div(MARK_BITS).unwrap_or(0);
+    let bit = index.checked_rem(MARK_BITS).unwrap_or(0);
+    (
+      word,
+      1u64
+        .checked_shl(u32::try_from(bit).unwrap_or(0))
+        .unwrap_or(0),
+    )
+  }
+
+  /// Each index whose bit is set in `bits`, the word's `word`th, ascending.
+  fn set_bits(word: usize, mut bits: u64) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+      if bits == 0 {
+        return None;
+      }
+      let low = usize::try_from(bits.trailing_zeros()).unwrap_or(0);
+      bits &= bits.wrapping_sub(1);
+      word.checked_mul(MARK_BITS)?.checked_add(low)
+    })
   }
 
   fn slot_at(index: usize) -> usize {
@@ -3580,7 +3851,7 @@ pub mod platform {
     let bell = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())
       .map_err(IpcError::from)
       .and_then(|mapping| Bell::new(mapping, instance));
-    let bell = match bell.and_then(|bell| bell.ring().map(|()| bell)) {
+    let bell = match bell.and_then(|bell| bell.ring_claim().map(|()| bell)) {
       Ok(bell) => bell,
       Err(error) => {
         // The claim cannot be announced: give the slot back rather than leave it claimed.
@@ -3792,6 +4063,35 @@ pub mod platform {
       SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()).unwrap()
     }
 
+    /// A-381 (§4.7, D-10). Do: clients ring for shards 3, 64, 3 again and 65,535, the last id a region can name, then a
+    /// claim rings; the daemon's thread takes what the rings marked, then takes again. Expect: the word moved once a
+    /// ring, so the thread is woken for each; the first take holds the claim and exactly shards 3, 64 and 65,535, each
+    /// once, in order; the second holds nothing. Before A-381 a ring marked nothing, and the thread kicked every shard.
+    #[test]
+    fn a_ring_marks_only_the_shard_it_names_and_a_claim_marks_the_claim() {
+      let name = instance("marks");
+      let listener = Listener::open(&name, None).unwrap();
+      let waiter = listener.doorbell_waiter().unwrap().unwrap();
+      let before = waiter.current().unwrap();
+      let bell = Bell::new(client_mapping(&name), &name).unwrap();
+      for shard in [3u16, 64, 3, u16::MAX] {
+        bell.ring_for(shard).unwrap();
+      }
+      bell.ring_claim().unwrap();
+      assert_eq!(waiter.current().unwrap(), before.wrapping_add(5));
+      assert_eq!(
+        waiter.take_pending().unwrap(),
+        crate::rendezvous::Pending {
+          claim: true,
+          shards: vec![3, 64, u16::MAX],
+        }
+      );
+      assert_eq!(
+        waiter.take_pending().unwrap(),
+        crate::rendezvous::Pending::default()
+      );
+    }
+
     /// AUD-29-09 (the claim protocol). Do: a client takes slot 0 `CLAIMING` and has not written its
     /// fields; the daemon accepts; the client writes its wanted id and publishes `CLAIMED`; the daemon
     /// accepts again. Expect: nothing answered while the fields were unwritten (before 2026-09-30 a claim
@@ -3954,6 +4254,10 @@ pub mod platform {
     }
 
     pub(super) fn ring(&self) -> Result<(), IpcError> {
+      match *self {}
+    }
+
+    pub(super) fn take_pending(&self) -> Result<super::Pending, IpcError> {
       match *self {}
     }
   }

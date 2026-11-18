@@ -414,7 +414,7 @@ placeholder), so each implementation supplies its own.
 
 A sandbox says what it holds its runs to (`holds`): a memory limit, a process limit, shares other
 than an even one, no egress at all, egress to named hosts alone, folders shared at another path or
-read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another, components laid over its image's own, warm pools kept for its launches, volumes of its boundary's store given to a launch. What it holds it enforces; a launch that
+read-only, signals, credentials filled in at its egress, changes to a run while it runs, a run's member swapped for another, components laid over its image's own, warm pools kept for its launches, volumes of its boundary's store given to a launch, folders another server serves a launch. What it holds it enforces; a launch that
 asks for what it doesn't hold is refused `Unsupported`, never taken and ignored, and the suite checks
 both halves.
 
@@ -459,6 +459,14 @@ for: `Volume(InUse)` while a run holds it, its files kept; `Volume(Unknown)` whe
 of that name; and `Volume(Clearing)`, which a launch is refused too, while a clearing holds it. A
 sandbox that keeps none refuses a launch given one, a listing and a clearing `Unsupported`.
 
+A sandbox that holds them gives a launch folders another server serves (`Launch::served`; kiln goal
+01a1ec34599974448f6b7663ddb07001, through Hex's `ShardsImage::served` for Shards' D286): each by its source in that
+server's own words (for kiln's agents, a Slates volume's id), at its place, read-only or not, given to the members it
+names; its boundary asks the server for it as the run starts, and the server answers the run's file requests itself,
+with no folder of the machine and no mount between them (Slates over its own virtio-fs device). A served folder has a
+source and an absolute place, at no share's or other served folder's place, or it's refused `Invalid`. A sandbox that
+holds none refuses a launch given one `Unsupported`.
+
 - **Implementations:** `host` (today's launch, which holds none of it: `kiln::sandbox::host`), the
   microVMs kiln's isolated harnesses run in (`kiln::sandbox`: Shards' members, through Hex, kiln plan
   01a1cd8e862e7169a074db3d5fa33f3d step 17; docs/isolation.md), then Hex's classes: `process`, `oci`,
@@ -467,7 +475,8 @@ sandbox that keeps none refuses a launch given one, a listing and a clearing `Un
   holding everything unless made to hold less, 1000 runs at once, 10,000 outputs unread a run (past
   it, the run is killed), keeping pools as names alone, none holding a host, one at most for each run
   it may hold (past them, a keep is refused `Full`), and volumes as names alone too, none holding a
-  file, one at most for each run it may hold (past them, a launch making one is refused `Full`).
+  file, one at most for each run it may hold (past them, a launch making one is refused `Full`), and served folders
+  answered by a built-in program (`served <place>`) with their source and mode as given.
 - **Used by:** every isolated harness kiln launches (step 17), and its CI legs once CP-T7.1 lands
   them.
 - **Passed by:** the simulator, every clause, holding everything and holding nothing; `host`
@@ -541,6 +550,7 @@ Methods of Run: `stdin`, `close_stdin`, `next`, `signal`, `kill`, `id`, `link`, 
 - **SANDBOX-16** a launch's components are laid for it, and a run takes a component swapped in and its image's own given back while it runs, and one after its end is refused Ended; a sandbox that holds no components refuses both Unsupported, and its run goes on
 - **SANDBOX-17** a sandbox keeps a warm pool it's asked to keep, once however often it's asked, and lists it until it's let go; a pool it doesn't keep is let go already; a sandbox that keeps no pools refuses one Unsupported, and lists none
 - **SANDBOX-18** a launch's volume is made where its store has none and held by its run: listed with its bound, refused Volume(Bound) to a launch asking another bound while the run holds it, kept past the run, and cleared only once no run holds it, a clearing refused Volume(InUse) while one does and Volume(Unknown) once it's gone; a sandbox that keeps no volumes refuses one Unsupported, and lists and clears none
+- **SANDBOX-19** a folder another server serves a run is that server's at its place, its source's, writable or read-only as given; one with no source, at a relative place or at another's place is refused Invalid; a sandbox that holds none refuses one Unsupported
 
 ## Placement
 

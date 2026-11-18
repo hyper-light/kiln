@@ -3,11 +3,12 @@
 import type { Made } from "./Made";
 
 /**
- * Where an agent works when not in its folder itself (`Spec::workspace`).
+ * Where an agent works (`Spec::workspace`): a Slates volume laid over its folder, or the folder itself.
  */
 export type Workspace = { 
 /**
- * `volume`: a Slates volume of its own, laid over its folder.
+ * `volume`: a Slates volume laid over its folder (its own, or another agent's it works in: `owner`); `folder`:
+ * the folder itself, as a person asked.
  */
 kind: string, 
 /**
@@ -21,4 +22,10 @@ sub?: string,
 /**
  * The volume, once made.
  */
-made?: Made, };
+made?: Made, 
+/**
+ * The agent whose volume it works in, when it isn't its own: it was started in another agent's workspace on its
+ * machine (a child in its parent's folder), so it works there, as two agents in one folder do ([`sharing`]). The
+ * volume goes when the last agent working in it ends, and only its owner's change request takes everything in it.
+ */
+owner?: string, };

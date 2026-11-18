@@ -6370,6 +6370,28 @@ mod tests {
         Ok(())
     }
 
+    /// The person's rule of 2026-11-18 (docs/agentic.md W6; kiln goal 01a1ec34599974448aed2672bafaf9a2): a person's
+    /// choice of Codex's approvals and sandbox is a grant as a mode they set is: the grant is kiln's own mode for the
+    /// pair, which the adapter computes as it takes the control (Codex's word on it unread), so a raise from read-only to
+    /// the auto pair grants auto and a lowering grants what it lowers to; a control that sets no permission grants
+    /// nothing. Without it, a person's raise through these controls left the agent's landings asking.
+    #[test]
+    fn w6_a_persons_codex_permission_controls_are_its_grant() -> anyhow::Result<()> {
+        use super::super::lineage::Level;
+        let codex = super::super::kinds::Kind::get("codex").ok_or_else(|| anyhow::anyhow!("no codex kind"))?;
+        let grant = |core: &Core, id: &str, v: &str| super::super::session::control_grant(codex, core, id, Some(&json!(v)));
+        let (mut c, mut core, _) = opened();
+        c.command(&mut core, Command::SetMode { mode: "read-only".into() });
+        assert_eq!(core.state.mode, "read-only");
+        c.command(&mut core, Command::Control { id: "sandbox".into(), value: Some(json!("workspace-write")) });
+        assert_eq!(core.state.mode, "auto", "the auto pair");
+        assert_eq!(grant(&core, "sandbox", "workspace-write"), Some(Level::Auto), "raised through the sandbox: auto granted");
+        c.command(&mut core, Command::Control { id: "sandbox".into(), value: Some(json!("read-only")) });
+        assert_eq!(grant(&core, "sandbox", "read-only"), Some(Level::Plan), "lowered: what it was lowered to");
+        assert_eq!(grant(&core, "reasoning_summary", "auto"), None, "a control that sets no permission");
+        Ok(())
+    }
+
     #[test]
     fn an_idle_mode_change_sets_the_next_turns_policies_and_persists_bypass() -> anyhow::Result<()> {
         let (mut c, mut core, _) = opened();

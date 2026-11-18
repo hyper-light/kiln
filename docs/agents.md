@@ -1037,7 +1037,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
 | `agents.refs` | `GET /api/harness/agents/:id/refs` | → `{refs: {branches, tags, commits: [{sha, subject, at, ...}], trunk}}` ("Compare", below) |
 | `agents.compare` | `GET /api/harness/agents/:id/compare?from=&to=&split=&path=` | → `{compared: {files: [FileChange], counts_only, split, changed_by: {path: [who]}}}`; a point is `now`, `began`, `agent:<who>` or a branch, tag or commit ("Compare", below) |
-| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}`; `{manifest}` (that plan's; a person only) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more |
+| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}` (an agent whose granted mode edits unasked: written at once); `{manifest}` (that plan's: a person's, or an agent's as its granted mode lets it) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more; each answer names its `outcome` (`written` or `approval_required`) |
 | `agents.credential` | `POST /api/harness/agents/:id/credential` | → `{token, expires_at}`: the agent's own token for git, for a day, so its pushes to kiln's repositories go as the agent, for its person (ci.md W27-R03). Only that very agent is given it, as its runner asks when its git needs it: never a person or another agent, and it's no tool of an agent's |
 
 Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
@@ -1058,10 +1058,14 @@ they run, and refused and noted the same way.
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
 lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
 as are the goal stack's operations (`goals.*`); what ends, stops or steers an agent always names it.
-kiln's MCP server tells each agent its id. `workspace` is `folder` (the folder itself, the
-default) or `volume` (a Slates volume of its own, where its machine can make one); in a result it
-is `null` for an agent in its folder, and `branch` and `change_request` are `null` until it has a
-change request.
+kiln's MCP server tells each agent its id. `workspace` is `volume` (a Slates volume of its own:
+what it gets when it names none; a machine that can't make one refuses the start, 409, naming what
+it lacks) or `folder` (the folder itself, a person's explicit choice); in a result it is
+`{kind, over, sub, volume, mount, owner}`: `owner` when it works in another agent's volume,
+and `null` for one isolated in a microVM, a conversation taken up (`resume`), one started in a person's shell
+(`shell`), or one started before
+volumes were the default; `branch` and
+`change_request` are `null` until it has a change request.
 
 An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,
 files_changed, lines_added, lines_removed, cost_usd, doing?, parent?, plan_run?, last_turn?,
@@ -1263,8 +1267,10 @@ permissions low and how to merge their work.
 
 ## Workspaces of their own
 
-An agent can work in **its own Slates volume** instead of the folder itself (Mission control's
-composer → More options → Workspace → Own volume; `agents.start` with `workspace: "volume"`) (docs/agentic.md, W):
+Every agent works in **its own Slates volume** wherever its machine can make one, unless a person
+chooses its folder itself (Mission control's composer → More options → Workspace → This folder;
+`agents.start` with `workspace: "folder"`) or the server's `[agents] workspace` is `folder` (docs/agentic.md, W2). An agent started in another
+agent's folder on that agent's machine works in that agent's volume:
 
 - **What it is.** On the agent's machine, before its harness starts, kiln lays an overlay volume
   over the folder's repository and mounts it under the runner's state directory
@@ -1276,20 +1282,35 @@ composer → More options → Workspace → Own volume; `agents.start` with `wor
   request**, `agents.change`: everything that changed there), or back into the folder:
   **Write to disk…** shows what it would create, replace and delete (git's own directory stays
   out), and any file changed in the folder since the agent changed it, in which
-  case nothing is written until they agree. Only a person writes it: an agent's `agents.land` with
-  a plan is refused. Slates takes a person's go-ahead from kiln on macOS and Windows; not on Linux
-  yet (Slates can't take a grant from outside its anchor's own session there), and the plan says so.
-  kiln leaves out `.git` and writes only what git sees changed: when the agent's build output or
-  dependencies would be written too, the plan says to put the work up for review instead.
+  case nothing is written until they agree. A person writes it; an agent writes it as its mode
+  lets it (the lower of its own and that of the agent whose work it is, each as far as it was
+  granted: the lower of its mode now and the one its launcher started it in or a person set since,
+  which kiln alone records, so an agent or a harness that raises its own mode gains nothing; and no
+  agent can raise its own mode or set a permission control, its own or a child's past its own grant,
+  by any way in):
+  at once in a mode that edits
+  unasked (accept edits, auto, bypass); after its person's click in one that asks (asked in their
+  chat turn: 428 until they confirm, then the same call again; refused outside one); never in one that
+  only plans (403). The answer names its `outcome`: `written` (Slates' outcome) or
+  `approval_required` (`approval`: the manifest to approve, its summary and conflicts). An agent
+  working in another's volume lands nothing of its own while that one works: the volume lands whole,
+  from its owner. kiln approves it with a secret of its own that it hands Slates at every start,
+  on every system. kiln leaves out what git ignores in the workspace (the agent's build output
+  and dependencies) and `.git`, and writes only what git sees changed: when more would be written (a
+  build still running made it since), the plan says to put the work up for review instead.
 - **How long it lasts.** As long as the agent: ended for good, its volume goes with it. It outlives
-  the runner's restarts and upgrades (Slates' anchor runs apart from the runner: its own systemd
-  user unit on Linux), but not the machine's (Slates keeps volumes in memory). An agent in one
+  the runner's restarts and upgrades (Slates' anchor runs apart from the runner: a systemd user
+  scope of its own on Linux, its own process group elsewhere), but not the machine's (Slates keeps
+  volumes in memory). An agent in one
   doesn't move to another machine yet.
 - **Where it can.** Any machine with a mount it can make: FUSE through `fusermount3` on Linux, NFS
-  on loopback on macOS. Nothing needs installing: Slates is built into kiln (vendored, and driven
-  through its library, never a `slates` command), and kiln's own executable runs its anchor and
-  daemon (`kiln slates-role`). `GET /api/harness/workspaces` says which machines can, and why each
-  other can't. kiln keeps one Slates instance, `kiln`, per machine (two shards).
+  on loopback on macOS, WinFsp on Windows (each workspace at a drive letter of its own, the highest
+  free: Slates mounts a WinFsp volume at a drive letter alone). Nothing needs installing but WinFsp:
+  Slates is built into kiln (vendored, and driven through its library, never a `slates` command),
+  and kiln's own executable runs its anchor and daemon (`kiln slates-role`). `GET
+  /api/harness/workspaces` says which machines can, and why each other can't (`why_not`, and
+  `missing`: what it lacks, typed); an agent's start there is refused, naming it. kiln keeps one Slates
+  instance, `kiln`, per machine (two shards).
 
 ## From an Agentfile, in a microVM of its own
 

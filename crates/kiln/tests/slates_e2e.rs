@@ -5,14 +5,16 @@
 //!
 //! Each drive starts two agents through kiln's REST API, the stand-in harness behind each (`tests/fixtures/vm-stub/
 //! harness/stub`: no model), each in a workspace of its own (`"workspace": {"kind": "volume"}`) over a git project of its
-//! own with a bare remote: one in Claude Code's mode that asks nothing (`bypassPermissions`), one in its mode that asks
-//! (`default`) ([`Mode`]). Each one's first turn writes a new file, appends a line to a tracked one and removes another,
-//! then asks kiln itself, as the agent, to write its work to disk (the stand-in's `LAND`). What each drive reads, all of
-//! it what a person or an agent could observe:
+//! own with a bare remote: one in Claude Code's mode that asks (`default`), then one in its mode that asks nothing
+//! (`bypassPermissions`) ([`Mode`]). Each one's first turn writes a new file, appends a line to a tracked one and removes
+//! another, then asks kiln itself, as the agent, to write its work to disk (the stand-in's `LAND`). What each drive
+//! reads, all of it what a person or an agent could observe, each step said (`PROVEN: ...`) as it holds, so a drive that
+//! fails shows how far the rest went:
 //!
-//! 1. **Slates through its library alone.** The runner finds no `slates` executable (its PATH holds none and `KILN_SLATES`
-//!    is empty), so a workspace made at all was made without Slates' command line; and no `slates` process of the drive's
-//!    own instance runs at any of its looks ([`cli_of_instance`]).
+//! 1. **Slates through its library alone, at kiln's pin.** The runner finds no `slates` executable (its PATH holds none
+//!    and `KILN_SLATES` is empty), so a workspace made at all was made without Slates' command line; no `slates` process
+//!    of the drive's own instance runs at any of its looks ([`cli_of_instance`]); and the runner's facts name the Slates
+//!    it links as the revision this checkout's `vendor/MANIFEST.toml` pins ([`links_the_pin`]).
 //! 2. **The volume.** kiln's word on the session names its volume over the project ([`workspace_of`]). On the host
 //!    (`bare_metal`), its mount is in the host's table as Slates' (NFS on loopback on macOS, FUSE on Linux; WinFsp keeps
 //!    no table to read) and the harness works in it. In a microVM (`microvm`), no host mount: kiln names none, the host's
@@ -437,8 +439,9 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Both, in the order a drive starts them.
-    pub const ALL: [Mode; 2] = [Mode::Bypass, Mode::Ask];
+    /// Both, in the order a drive starts them: the agent that asks first, since its review needs no landing, so a drive
+    /// on a kiln whose landing falls short still shows how far the rest goes.
+    pub const ALL: [Mode; 2] = [Mode::Ask, Mode::Bypass];
 
     /// The mode as Claude Code names it (`--permission-mode`), as a session's spec gives it to kiln.
     pub fn claude(self) -> &'static str {
@@ -463,25 +466,39 @@ pub fn is_manifest(word: &str) -> bool {
     word.len() == 64 && word.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// The paths kiln's word on a workspace (`agents.workspace`) lists as drifted: each entry of its `drift` as Slates
+/// words it, a line (`/README.md (Modified)`) or a typed drift (`{"path": "/README.md", "kind": ...}`, slates-api's
+/// `Drift`).
+pub fn drifted(workspace: &Value) -> Vec<String> {
+    let entries = workspace.get("drift").and_then(Value::as_array).into_iter().flatten();
+    entries.filter_map(|d| d.as_str().or_else(|| d.get("path").and_then(Value::as_str))).map(str::to_owned).collect()
+}
+
 /// The manifest of the approval request kiln answered the agent's own landing with, as the stand-in said it
 /// (`LAND_APPROVAL <manifest>`).
 pub fn approval_said(lines: &[String]) -> Option<String> {
     lines.iter().find_map(|l| l.strip_prefix("LAND_APPROVAL ")).map(str::trim).filter(|m| is_manifest(m)).map(str::to_owned)
 }
 
-/// What the stand-in's turn said it did, as [`prompt`] asked: its three changes made, then its own landing, as kiln
-/// answered it by its `mode` (docs/agentic.md W6): written at once where it asks nothing; where it asks, its ask to
-/// raise its own mode answered by kiln (refused, or taken without effect on its landing), then its landing held as an
-/// approval request naming its manifest, and its own approval of that refused. Never failed for want of a kiln to
-/// ask, never refused outright (neither mode forbids writing).
-pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), String> {
+/// The stand-in's turn made the three changes [`prompt`] asked for, as it said: `probe` written, [`APPENDED`] appended
+/// to, [`REMOVED`] removed.
+pub fn check_edits(lines: &[String], probe: &str) -> Result<(), String> {
     for want in [format!("WROTE {probe}"), format!("APPENDED {}", APPENDED.0), format!("REMOVED {}", REMOVED.0)] {
         if !lines.contains(&want) {
             return Err(format!("the harness never said {want:?}: {lines:?}"));
         }
     }
+    Ok(())
+}
+
+/// What the stand-in's turn said of its own landing, as kiln answered it by its `mode` (docs/agentic.md W6): written
+/// at once where it asks nothing; where it asks, its ask to raise its own mode answered by kiln (refused, or taken
+/// without effect on its landing), then its landing held as an approval request naming its manifest, and its own
+/// approval of that refused. Never failed for want of a kiln to ask, never refused outright (neither mode forbids
+/// writing).
+pub fn check_landing(lines: &[String], mode: Mode) -> Result<(), String> {
     let said = |tag: &str| lines.iter().find(|l| l.starts_with(tag));
-    for (tag, what) in [("LAND_FAIL ", "its own landing reached no answer"), ("LAND_REFUSED ", "its own landing was refused")] {
+    for (tag, what) in [("LAND_FAIL ", "its own landing reached no answer"), ("LAND_REFUSED ", "its own landing was refused"), ("LAND_CONFLICTED ", "its own landing met conflicts")] {
         if let Some(l) = said(tag) {
             return Err(format!("{what} ({mode:?}): {l}"));
         }
@@ -511,6 +528,12 @@ pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), Strin
     }
 }
 
+/// The whole turn: its changes ([`check_edits`]), then its own landing ([`check_landing`]).
+pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), String> {
+    check_edits(lines, probe)?;
+    check_landing(lines, mode)
+}
+
 // =================================================================================================
 // kiln's word: workspaces, a session's volume, a landing's plan
 // =================================================================================================
@@ -523,6 +546,31 @@ pub fn workspaces_said(all: &Value, machine: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(entry.get("why_not").and_then(Value::as_str).unwrap_or("kiln says no, and not why").to_owned())
+}
+
+/// The Slates revision a kiln vendor manifest (`vendor/MANIFEST.toml`) pins: its `[projects.slates]`'s `commit`.
+pub fn vendored_slates(manifest: &str) -> Option<String> {
+    let table = toml::from_str::<toml::Table>(manifest).ok()?;
+    table.get("projects")?.get("slates")?.get("commit")?.as_str().map(str::to_owned)
+}
+
+/// What runner `machine`'s facts, in kiln's list of its runners (`GET /api/agents`), say of the Slates it links
+/// (`facts.workspaces.slates`).
+pub fn linked_slates(runners: &Value, machine: &str) -> Option<String> {
+    let list = runners.as_array().or_else(|| runners.get("agents").and_then(Value::as_array))?;
+    let runner = list.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(machine))?;
+    runner.pointer("/facts/workspaces/slates").and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Whether the Slates a runner says it links (`said`) is the one this checkout of kiln vendors at its pinned commit
+/// (`vendored`), as kiln names it (`slates <commit>`): kiln links its vendored Slates, at the revision its manifest pins.
+pub fn links_the_pin(said: Option<&str>, vendored: Option<&str>) -> Result<(), String> {
+    let vendored = vendored.ok_or("this checkout's vendor/MANIFEST.toml pins no Slates: kiln vendors none")?;
+    match said {
+        Some(s) if s == format!("slates {vendored}") => Ok(()),
+        Some(s) => Err(format!("the runner links {s:?}, not the Slates this kiln pins (slates {vendored})")),
+        None => Err(format!("the runner names no Slates it links; this kiln pins slates {vendored}")),
+    }
 }
 
 /// A session's volume, as kiln's word on it names it (`workspace.made`): the volume, its name, its mount where it has
@@ -548,13 +596,16 @@ pub fn workspace_of(info: &Value) -> Result<Made, String> {
 }
 
 /// A landing's outcome, as kiln answers `agents.land` (the contract's draft 3): one of Slates' typed outcomes
-/// (slates-api, g262), named by the answer's `outcome`.
+/// (slates-api's `LandOutcome`, g262: `Written`, `ApprovalRequired`, `Conflicted`, `Refused`), named by the answer's
+/// `outcome` in snake case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Written to the folder: Slates' landing outcome rides in `written`.
+    /// Written to the folder: Slates' landing report rides in `written`.
     Written,
     /// Held for a person's approval: Slates' presentation in `approval`, naming the manifest an approval binds.
     ApprovalRequired { manifest: String },
+    /// Its presentation met conflicts (a path changed on disk since the volume read it): each typed in `conflicts`.
+    Conflicted { conflicts: Value },
     /// Refused, a closed reason in `refusal`.
     Refused { refusal: Value },
 }
@@ -568,6 +619,7 @@ pub fn outcome_of(answer: &Value) -> Result<Outcome, String> {
             let manifest = answer.pointer("/approval/manifest").and_then(Value::as_str).filter(|m| is_manifest(m));
             manifest.map(|m| Outcome::ApprovalRequired { manifest: m.to_owned() }).ok_or_else(|| format!("its approval request names no manifest: {answer}"))
         }
+        Some("conflicted") => Ok(Outcome::Conflicted { conflicts: answer.get("conflicts").cloned().unwrap_or(Value::Null) }),
         Some("refused") => Ok(Outcome::Refused { refusal: answer.get("refusal").cloned().unwrap_or(Value::Null) }),
         _ => Err(format!("kiln's answer names no landing outcome: {answer}")),
     }
@@ -598,7 +650,7 @@ pub fn written(answer: &Value) -> Result<(), String> {
 /// said refusing it.
 pub fn op(f: &vm_e2e::Fixture, name: &str, input: &Value) -> anyhow::Result<Value> {
     let (code, body) = common::http_within(f.port, "POST", &format!("/api/ops/{name}"), &f.admin, Some(input), OP_WITHIN)?;
-    anyhow::ensure!(code == 200, "{name} {input}: {code} {body}\n{}", f.runner_log());
+    anyhow::ensure!(code == 200, "{name} {input}: {code} {body}\n{}\n{}", f.runner_log(), slates_log(&f.dir));
     Ok(serde_json::from_str(&body)?)
 }
 
@@ -689,22 +741,39 @@ impl Looks {
     }
 }
 
-/// Drives both agents ([`Mode::ALL`]) on `engine` (`image`: the microVM's), each in its own volume over a project of its
-/// own under `dir`, through kiln's REST API, and checks them end to end (the module's 1 to 5). `dir`: the drive's
-/// folder, where its runner keeps its state.
-pub fn drive(f: &vm_e2e::Fixture, dir: &Path, instance: &Instance, engine: Engine, image: Option<&str>) -> anyhow::Result<()> {
-    let mut looks = Looks::default();
-    for mode in Mode::ALL {
-        let project = Project::new(&dir.join(mode.word()))?;
-        drive_agent(f, dir, &project, instance, engine, image, mode, &mut looks)?;
-    }
-    looks.check().map_err(|e| anyhow::anyhow!("{engine:?}: {e}\n{}", f.runner_log()))
+/// Where a drive runs: its fixture (its server and runner), its folder (where its runner keeps its state, and its
+/// projects), its own Slates instance, the engine its agents run on, and in a microVM the image they boot.
+pub struct Drive<'a> {
+    pub f: &'a vm_e2e::Fixture,
+    pub dir: &'a Path,
+    pub instance: &'a Instance,
+    pub engine: Engine,
+    pub image: Option<&'a str>,
 }
 
-/// Drives one agent in `mode` on `engine`, in its own volume over `project`, and checks it end to end; `looks`
-/// gathers what the drive saw at the host.
-#[allow(clippy::too_many_arguments, reason = "a drive's parts, each its own: kept apart rather than bundled for one caller")]
-pub fn drive_agent(f: &vm_e2e::Fixture, dir: &Path, project: &Project, instance: &Instance, engine: Engine, image: Option<&str>, mode: Mode, looks: &mut Looks) -> anyhow::Result<()> {
+/// Drives both agents ([`Mode::ALL`]) on the drive's engine, each in its own volume over a project of its own under
+/// the drive's folder, through kiln's REST API, and checks them end to end (the module's 1 to 5).
+pub fn drive(d: &Drive<'_>) -> anyhow::Result<()> {
+    links_pinned(d.f)?;
+    let mut looks = Looks::default();
+    for mode in Mode::ALL {
+        let project = Project::new(&d.dir.join(mode.word()))?;
+        drive_agent(d, &project, mode, &mut looks)?;
+    }
+    looks.check().map_err(|e| anyhow::anyhow!("{:?}: {e}\n{}\n{}", d.engine, d.f.runner_log(), slates_log(d.dir)))
+}
+
+/// The runner links the Slates this checkout vendors, at its pinned commit ([`links_the_pin`]).
+pub fn links_pinned(f: &vm_e2e::Fixture) -> anyhow::Result<()> {
+    let manifest = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/MANIFEST.toml"))?;
+    let said = linked_slates(&f.get("/api/agents")?, &f.machine);
+    links_the_pin(said.as_deref(), vendored_slates(&manifest).as_deref()).map_err(|e| anyhow::anyhow!("{e}\n{}", f.runner_log()))
+}
+
+/// Drives one agent in `mode` on the drive's engine, in its own volume over `project`, and checks it end to end;
+/// `looks` gathers what the drive saw at the host.
+pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Looks) -> anyhow::Result<()> {
+    let Drive { f, dir, instance, engine, image } = *d;
     let before = tree(&project.path())?;
     let git_before = project.git_state()?;
     let probe = vm_e2e::probe_name();
@@ -714,13 +783,16 @@ pub fn drive_agent(f: &vm_e2e::Fixture, dir: &Path, project: &Project, instance:
     }
     eprintln!("DRIVE: {engine:?}, an agent in mode {}, on {}, instance {}", mode.claude(), f.machine, instance.name);
     let id = vm_e2e::open(f, &spec)?;
-    let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?;
+    let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?.reporting(landing_reports(&instance.name));
     let (info, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
     let lines = vm_e2e::said(&events);
     let what = format!("{engine:?} session {id} ({mode:?})");
-    let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}", f.runner_log());
-    check_turn(&lines, &probe, mode).map_err(fail)?;
+    let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}", f.runner_log(), slates_log(dir));
+    check_edits(&lines, &probe).map_err(fail)?;
     let made = workspace_of(&info).map_err(fail)?;
+    // From here a failure says what Slates says of the volume and its shards, and so does a kiln operation refused.
+    let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}\n{}", f.runner_log(), slates_log(dir), slates_state(&instance.name, &made.volume));
+    let op = |name: &str, input: &Value| op(f, name, input).map_err(|e| anyhow::anyhow!("{e:#}\n{}", slates_state(&instance.name, &made.volume)));
     anyhow::ensure!(canonical(Path::new(&made.over)) == project.path(), "{what}: its volume lies over {}, not its project {}", made.over, project.dir);
     let said_cwd = vm_e2e::cwd_said(&lines).ok_or_else(|| fail(format!("its harness never said its folder: {lines:?}")))?;
     let mounts_of = match engine {
@@ -743,26 +815,36 @@ pub fn drive_agent(f: &vm_e2e::Fixture, dir: &Path, project: &Project, instance:
         }
     };
     looks.look(instance, mounts_of)?;
+    looks.check().map_err(fail)?;
+    eprintln!("PROVEN: {what}: its three edits made in volume {} over {} ({}), its harness at {said_cwd}", made.volume, made.over, made.mount.as_deref().map_or_else(|| "no host mount".to_owned(), |m| format!("mounted at {m}")));
     if mode == Mode::Ask {
         // Its work, and its own landing held for a person's approval, left the project's folder as it was.
         anyhow::ensure!(tree(&project.path())? == before, "{what}: the project's folder changed before any approval: {:?}", changes(&before, &tree(&project.path())?));
-        // Review: its change request holds exactly its changes.
-        let changed = op(f, "agents.change", &json!({"agent": id, "title": "g266 end to end"}))?;
+        // Review, which needs no landing: its change request holds exactly its changes.
+        let changed = op("agents.change", &json!({"agent": id, "title": "g266 end to end"}))?;
         let branch = changed.pointer("/change_request/branch").and_then(Value::as_str).ok_or_else(|| fail(format!("its change request names no branch: {changed}")))?.to_owned();
         let proposed = changes(&project.tree_at("main")?, &project.tree_at(&branch)?);
         anyhow::ensure!(proposed == expected(&probe), "{what}: its change request {branch} holds {proposed:?}, not its harness's changes {:?}", expected(&probe));
         looks.look(instance, mounts_of)?;
+        looks.check().map_err(fail)?;
+        eprintln!("PROVEN: {what}: its folder untouched; its change request {branch} holds exactly its changes");
+    }
+    check_landing(&lines, mode).map_err(fail)?;
+    eprintln!("PROVEN: {what}: its own landing answered as its mode says: {:?}", lines.iter().filter(|l| l.starts_with("LAND") || l.starts_with("RAISE")).collect::<Vec<_>>());
+    if mode == Mode::Ask {
         // The person is shown the request its agent was answered, which writes nothing, and approves it.
         let asked = approval_said(&lines).ok_or_else(|| fail(format!("its harness never said the manifest it was held for: {lines:?}")))?;
-        let shown = approval_manifest(&op(f, "agents.land", &json!({"agent": id}))?).map_err(fail)?;
+        let shown = approval_manifest(&op("agents.land", &json!({"agent": id}))?).map_err(fail)?;
         anyhow::ensure!(shown == asked, "{what}: the person was shown request {shown}, not the one its agent was answered, {asked}");
         anyhow::ensure!(tree(&project.path())? == before, "{what}: showing a person the approval request wrote to the project's folder");
-        written(&op(f, "agents.land", &json!({"agent": id, "manifest": shown}))?).map_err(fail)?;
+        eprintln!("PROVEN: {what}: the person was shown request {shown}, the one its agent was answered");
+        written(&op("agents.land", &json!({"agent": id, "manifest": shown}))?).map_err(fail)?;
     }
     // Its landing written: at once where its mode asks nothing, as its turn said; on the person's approval where it asks.
     let after = tree(&project.path())?;
     anyhow::ensure!(changes(&before, &after) == expected(&probe), "{what}: its landing changed {:?}, not its harness's changes {:?}", changes(&before, &after), expected(&probe));
     anyhow::ensure!(project.git_state()? == git_before, "{what}: its landing changed the project's git HEAD or index");
+    eprintln!("PROVEN: {what}: its folder holds exactly its changes, git's HEAD and index as they were");
     looks.look(instance, mounts_of)?;
     pace.stop(f, &id)?;
     if engine == Engine::BareMetal
@@ -772,6 +854,72 @@ pub fn drive_agent(f: &vm_e2e::Fixture, dir: &Path, project: &Project, instance:
         mount_gone(&canonical(Path::new(mount))).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
     }
     Ok(())
+}
+
+/// How many of the end lines of each Slates log a failed drive says.
+pub const SLATES_LOG_LINES: usize = 80;
+
+/// The end of each Slates instance's own log under the drive's folder `dir` (kiln's `<state>/slates-anchor.log`: its
+/// anchor's and its daemon's words, a runner's state folder each), so a drive that fails says what Slates said.
+pub fn slates_log(dir: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(dir) else { return String::new() };
+    let logs = entries.flatten().map(|e| e.path().join("slates-anchor.log")).filter(|p| p.is_file());
+    logs.map(|p| format!("--- the end of {} ---\n{}", p.display(), common::tail(&p, SLATES_LOG_LINES))).collect::<Vec<_>>().join("\n")
+}
+
+/// What Slates itself says of the drive's own instance `instance` and a session's volume `volume` when a step fails,
+/// asked through its library as an operator would (attached to the instance by name): the volume's status, and each
+/// shard's reserve, charges, maps, version slots and refusals, so a refusal names the bound that fired.
+pub fn slates_state(instance: &str, volume: &str) -> String {
+    let mut i = match slates_api::Instance::attach(instance) {
+        Ok(i) => i,
+        Err(e) => return format!("--- Slates' own state: attaching to instance {instance}: {e}"),
+    };
+    let status = match kiln::workspace::slates::volume_id(volume) {
+        Ok(v) => i.status(v).map_or_else(|e| format!("status of {volume}: {e}"), |s| format!("status of {volume}: referenced {} B, unique {} B, attachments {}, snapshots {}", s.referenced_bytes, s.unique_bytes, s.attachments, s.snapshots)),
+        Err(e) => format!("status of {volume}: {e:#}"),
+    };
+    let shards = match i.daemon_status() {
+        Ok(d) => d
+            .shards
+            .iter()
+            .map(|s| {
+                format!(
+                    "shard {}: volumes {}, reserve {} B, committed {} B, version slots {}, committed versions {}, retained {} B / {} versions, metadata {} B, committed metadata {} B, mapped {} B, locked {} B, refusals {:?}",
+                    s.partition, s.volumes, s.reserve_bytes, s.committed_bytes, s.version_slots, s.committed_versions, s.retained_bytes, s.retained_versions, s.metadata_bytes, s.committed_metadata, s.mapped_bytes, s.locked_bytes, s.refusals
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("daemon status: {e}"),
+    };
+    format!("--- Slates' own state ---\n{status}\n{shards}")
+}
+
+/// What a landing in the drive's own instance `instance` reports of itself, for a wait's progress (`vm_e2e::Pace::reporting`):
+/// the sequence of the last record of Slates' audit, which a landing moves at each step (presented, granted, validated,
+/// each entry written, finished), asked through its library as an operator would. What kept it from saying, where it
+/// couldn't, which doesn't move.
+fn landing_reports(instance: &str) -> impl FnMut() -> Value + 'static {
+    let name = instance.to_owned();
+    let mut attached: Option<slates_api::Instance> = None;
+    let mut seen = 0u64;
+    move || {
+        if attached.is_none() {
+            attached = slates_api::Instance::attach(&name).ok();
+        }
+        let Some(i) = attached.as_mut() else { return json!({"audit": "not attached"}) };
+        match i.audit(seen) {
+            Ok(records) => {
+                seen = records.iter().map(|r| r.seq).max().unwrap_or(seen).max(seen);
+                json!({"audit": seen})
+            }
+            Err(e) => {
+                attached = None;
+                json!({"audit": format!("{e}")})
+            }
+        }
+    }
 }
 
 /// Waits, a bounded while ([`OP_WITHIN`]), for the Slates mount at `at` to leave the host's table, as an ended session's
@@ -929,6 +1077,8 @@ mod checks {
         assert!(check_turn(&with(&ok, "LAND_WRITTEN", Some("LAND_REFUSED a mode that forbids writing")), "p.txt", Mode::Bypass).is_err(), "a landing refused");
         assert!(check_turn(&with(&ok, "LAND_WRITTEN", Some("LAND_FAIL no kiln MCP server was given to this harness")), "p.txt", Mode::Bypass).is_err(), "an ask that reached no kiln");
         assert!(check_turn(&with(&ok, "LAND_WRITTEN", None), "p.txt", Mode::Bypass).is_err(), "a landing never said");
+        let conflicted = with(&ok, "LAND_WRITTEN", Some(r#"LAND_CONFLICTED {"outcome": "conflicted"}"#));
+        assert!(check_turn(&conflicted, "p.txt", Mode::Bypass).is_err_and(|e| e.contains("conflicts")), "a landing that met conflicts");
     }
 
     /// An agent whose mode asks passes only with its ask to raise its own mode answered, its own landing held as an
@@ -955,10 +1105,52 @@ mod checks {
         assert!(check_turn(&with(&ok, "LAND_APPROVAL", Some("LAND_REFUSED plan mode")), "p.txt", Mode::Ask).is_err(), "refused outright");
     }
 
+    /// The Slates a runner links is read from its facts and held to the commit this checkout's manifest pins; another
+    /// revision, none, or a manifest that pins no Slates fails, saying which.
+    #[test]
+    fn g266_a_runner_links_the_slates_this_kiln_pins() {
+        let manifest = "[projects.hyper-raft]\ncommit = \"aa\"\n\n[projects.slates]\nkind = \"git\"\ncommit = \"dbf53afa21bf0e88f7099247c00c2c252ff96b1b\"\npath = \"vendor/slates\"\n";
+        assert_eq!(vendored_slates(manifest).as_deref(), Some("dbf53afa21bf0e88f7099247c00c2c252ff96b1b"));
+        assert_eq!(vendored_slates("[projects.hex]\ncommit = \"bb\"\n"), None);
+        assert_eq!(vendored_slates("not toml ["), None);
+        let runners = json!([{"name": "m0", "facts": {}}, {"name": "m1", "facts": {"workspaces": {"available": true, "slates": "slates dbf53afa21bf0e88f7099247c00c2c252ff96b1b", "mount": "nfs"}}}]);
+        let said = linked_slates(&runners, "m1");
+        assert_eq!(links_the_pin(said.as_deref(), vendored_slates(manifest).as_deref()), Ok(()));
+        assert!(links_the_pin(linked_slates(&runners, "m0").as_deref(), Some("dbf53")).is_err_and(|e| e.contains("names no Slates")));
+        assert!(links_the_pin(Some("slates 0b850153f"), Some("dbf53afa2")).is_err_and(|e| e.contains("not the Slates this kiln pins")));
+        assert!(links_the_pin(said.as_deref(), None).is_err_and(|e| e.contains("vendors none")));
+        assert_eq!(linked_slates(&json!({"agents": [{"name": "m1", "facts": {"workspaces": {"slates": "slates x"}}}]}), "m1").as_deref(), Some("slates x"));
+    }
+
+    /// A failed drive says the end of each Slates log under its folder, a runner's state folder each, and nothing where
+    /// none is.
+    #[test]
+    fn g266_a_failed_drive_says_the_end_of_each_slates_log_under_its_folder() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert_eq!(slates_log(dir.path()), "", "no runner state, no log");
+        std::fs::create_dir_all(dir.path().join("slatesvm-state"))?;
+        std::fs::create_dir_all(dir.path().join("project"))?;
+        let lines: Vec<String> = (0..SLATES_LOG_LINES + 20).map(|n| format!("anchor line {n}")).collect();
+        std::fs::write(dir.path().join("slatesvm-state").join("slates-anchor.log"), lines.join("\n"))?;
+        let said = slates_log(dir.path());
+        assert!(said.starts_with("--- the end of ") && said.contains("slatesvm-state"), "{said}");
+        assert!(said.contains(&format!("anchor line {}", SLATES_LOG_LINES + 19)) && !said.contains("anchor line 19\n"), "only its end: {said}");
+        assert_eq!(said.lines().count(), SLATES_LOG_LINES + 1, "a header and the end lines");
+        Ok(())
+    }
+
+    /// Drift is read whether kiln lists it as Slates' lines or as its typed drifts.
+    #[test]
+    fn g266_a_workspaces_drift_is_read_as_lines_or_typed_drifts() {
+        assert_eq!(drifted(&json!({"drift": ["/README.md (Modified)"]})), ["/README.md (Modified)"]);
+        assert_eq!(drifted(&json!({"drift": [{"path": "/README.md", "kind": "modified"}, {"kind": "gone"}]})), ["/README.md"]);
+        assert!(drifted(&json!({"drift": []})).is_empty() && drifted(&json!({"workspace": null})).is_empty());
+    }
+
     #[test]
     fn g266_claudes_modes_name_the_drives_two_agents() {
-        assert_eq!(Mode::ALL.map(Mode::claude), ["bypassPermissions", "default"]);
-        assert_eq!(Mode::ALL.map(Mode::word), ["bypass", "ask"]);
+        assert_eq!(Mode::ALL.map(Mode::claude), ["default", "bypassPermissions"]);
+        assert_eq!(Mode::ALL.map(Mode::word), ["ask", "bypass"]);
         assert!(is_manifest(MANIFEST) && is_manifest(&"AB".repeat(32)));
         assert!(!is_manifest(&"ab".repeat(31)) && !is_manifest(&"ab".repeat(33)) && !is_manifest(&MANIFEST.replace('a', "g")) && !is_manifest(""));
     }
@@ -989,7 +1181,10 @@ mod checks {
         let written_answer = json!({"outcome": "written", "written": {"landing": 7, "written": 3, "conflicts": 0}});
         let held = json!({"outcome": "approval_required", "approval": {"manifest": MANIFEST, "summary": {"bytes": 12}, "entries": [], "conflicts": []}});
         let refused = json!({"outcome": "refused", "refusal": {"reason": "mode_forbids_writing"}});
+        let conflicted = json!({"outcome": "conflicted", "conflicts": [{"path": "/README.md", "class": "changed_on_disk"}]});
         assert_eq!(outcome_of(&written_answer), Ok(Outcome::Written));
+        assert_eq!(outcome_of(&conflicted), Ok(Outcome::Conflicted { conflicts: json!([{"path": "/README.md", "class": "changed_on_disk"}]) }));
+        assert!(approval_manifest(&conflicted).is_err() && written(&conflicted).is_err(), "conflicts are neither a request nor a write");
         assert_eq!(outcome_of(&held), Ok(Outcome::ApprovalRequired { manifest: MANIFEST.to_owned() }));
         assert_eq!(outcome_of(&refused), Ok(Outcome::Refused { refusal: json!({"reason": "mode_forbids_writing"}) }));
         assert!(outcome_of(&json!({"outcome": "approval_required", "approval": {"manifest": "ab12"}})).is_err(), "a manifest no hash");
@@ -1077,8 +1272,8 @@ mod stand_in {
     /// A kiln MCP server of the test's own (stdio, a JSON-RPC message a line): its answer to initialize names the agent
     /// it serves (`a1`), and it answers `agents_land` as kiln does for an agent in the landing permission `FAKE_POLICY`
     /// names (the contract's draft 3): `write`, written at once, its approval too; `ask`, an approval request naming the
-    /// manifest `ab` 32 times, the agent's own approval refused as the tool's error; `refuse`, refused as a JSON-RPC
-    /// error. An agent's raise of its own mode (`agents_broadcast`'s `set_mode`) is refused as the tool's error, and any
+    /// manifest `ab` 32 times, the agent's own approval refused as the tool's error; `conflict`, its presentation's
+    /// conflicts; `refuse`, refused as a JSON-RPC error. An agent's raise of its own mode (`agents_broadcast`'s `set_mode`) is refused as the tool's error, and any
     /// call naming an agent other than `a1` is refused. Each call is written to `FAKE_LOG` as `{"tool", "arguments"}`, a
     /// line each.
     const FAKE_KILN: &str = r#"
@@ -1115,6 +1310,8 @@ for line in sys.stdin:
         say({"id": m["id"], "result": tool({"outcome": "approval_required", "approval": {"manifest": MANIFEST, "summary": {}, "entries": [], "conflicts": []}})})
     elif POLICY == "ask":
         say({"id": m["id"], "result": tool("approving its own landing is its person's to do", True)})
+    elif POLICY == "conflict":
+        say({"id": m["id"], "result": tool({"outcome": "conflicted", "conflicts": [{"path": "/README.md", "class": "changed_on_disk"}]})})
     else:
         say({"id": m["id"], "error": {"code": -32000, "message": "agents_land: a mode that forbids writing"}})
 "#;
@@ -1168,6 +1365,10 @@ for line in sys.stdin:
         anyhow::ensure!(said.iter().any(|l| l.starts_with("LAND_SELF_REFUSED ") && l.contains("person")), "{said:?}");
         crate::check_turn(&said, "p.txt", crate::Mode::Ask).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(crate::check_turn(&said, "p.txt", crate::Mode::Bypass).is_err(), "held for a person is no bypass agent's turn");
+
+        let (said, _) = landing_turn("conflict", crate::Mode::Bypass)?;
+        anyhow::ensure!(said.iter().any(|l| l.starts_with("LAND_CONFLICTED ") && l.contains("README.md")), "{said:?}");
+        anyhow::ensure!(crate::Mode::ALL.iter().all(|m| crate::check_turn(&said, "p.txt", *m).is_err()), "a landing that met conflicts passes for neither mode: {said:?}");
 
         let (said, asked) = landing_turn("refuse", crate::Mode::Bypass)?;
         anyhow::ensure!(asked == [call("agents_land", json!({"agent": "a1"}))], "refused, nothing more asked: {asked:?}");
@@ -1272,7 +1473,8 @@ mod bare_metal {
         if !workspaces_ready(&f)? {
             return Ok(());
         }
-        drive(&f, &canonical(dir.path()), &instance, Engine::BareMetal, None)
+        let dir = canonical(dir.path());
+        drive(&Drive { f: &f, dir: &dir, instance: &instance, engine: Engine::BareMetal, image: None })
     }
 
     /// W6's drift, in either mode: a file the agent changed in its volume, then changed on disk by a person, is drift
@@ -1292,7 +1494,7 @@ mod bare_metal {
         }
         for mode in Mode::ALL {
             let project = Project::new(&dir.path().join(mode.word()))?;
-            drift_kept(&f, &project, mode).map_err(|e| anyhow::anyhow!("{mode:?}: {e:#}"))?;
+            drift_kept(&f, &instance, &project, mode).map_err(|e| anyhow::anyhow!("{mode:?}: {e:#}"))?;
         }
         Ok(())
     }
@@ -1300,23 +1502,22 @@ mod bare_metal {
     /// One agent in `mode` over `project`: its append, the person's change of the same file on disk, its drift, then
     /// its landing (asked by the agent in its next turn where its mode asks nothing; approved by the person where it
     /// asks), which keeps the person's bytes.
-    fn drift_kept(f: &vm_e2e::Fixture, project: &Project, mode: Mode) -> anyhow::Result<()> {
+    fn drift_kept(f: &vm_e2e::Fixture, instance: &Instance, project: &Project, mode: Mode) -> anyhow::Result<()> {
         let spec = json!({"kind": "claude", "mode": mode.claude(), "cwd": project.dir, "prompt": format!("APPEND={} do the task", APPENDED.0), "workspace": {"kind": "volume"}});
         let id = vm_e2e::open(f, &spec)?;
-        let mut pace = vm_e2e::Pace::default();
+        let mut pace = vm_e2e::Pace::default().reporting(landing_reports(&instance.name));
         let (_, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
         anyhow::ensure!(vm_e2e::said(&events).iter().any(|l| *l == format!("APPENDED {}", APPENDED.0)), "{:?}", vm_e2e::said(&events));
         let persons = b"the person's\n".to_vec();
         std::fs::write(project.path().join(APPENDED.0), &persons)?;
         let ws = op(f, "agents.workspace", &json!({"agent": id}))?;
-        let drift: Vec<&str> = ws.get("drift").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-        anyhow::ensure!(drift.iter().any(|d| d.contains(APPENDED.0)), "its drift doesn't name {}: {ws}", APPENDED.0);
+        anyhow::ensure!(drifted(&ws).iter().any(|d| d.contains(APPENDED.0)), "its drift doesn't name {}: {ws}", APPENDED.0);
         // Its landing, written or not as kiln and Slates judge it: what each said is kept for the failure's words.
         let said = match mode {
             Mode::Bypass => {
                 let client = format!("land-{}", nonce());
                 vm_e2e::command(f, &id, &json!({"type": "send", "id": client, "text": "LAND do the task", "mode": "queue"}))?;
-                let (_, events) = pace.until(f, &id, vm_e2e::Asked::Message(&client), "its landing's turn", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, &client), vm_e2e::STUB_DONE))?;
+                let (_, events) = pace.until(f, &id, vm_e2e::Asked::Landing(&client), "its landing's turn", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, &client), vm_e2e::STUB_DONE))?;
                 let lines = vm_e2e::said_after(&events, &client);
                 anyhow::ensure!(!lines.iter().any(|l| l.starts_with("LAND_FAIL ")), "its landing reached no answer: {lines:?}");
                 format!("{lines:?}")
@@ -1357,6 +1558,7 @@ mod microvm {
         }
         let kept = vm_e2e::keep_stub(&f, "claude")?;
         let image = format!("agentfile:{}", kept.id);
-        drive(&f, &canonical(dir.path()), &instance, Engine::MicroVm, Some(image.as_str()))
+        let dir = canonical(dir.path());
+        drive(&Drive { f: &f, dir: &dir, instance: &instance, engine: Engine::MicroVm, image: Some(image.as_str()) })
     }
 }

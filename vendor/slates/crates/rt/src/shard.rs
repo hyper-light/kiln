@@ -29,6 +29,8 @@ use slates_mem::{Encoded, Handle, Slab, ring};
 
 use slates_machine::wake::WakeEstimate;
 
+use crate::held_turn::{HeldTurn, hold_pays};
+
 use crate::attribution::{self, Attribution, Tracker};
 use crate::control::Control;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
@@ -101,6 +103,21 @@ pub struct Counters {
   pub wake_unslept: u64,
   /// The online wake estimate, nanoseconds (the step quantum while the shard tracks one).
   pub wake_cost_ns: u64,
+  /// The idle spin window now, nanoseconds: how long the shard spins after client activity before it parks
+  /// (§4.7), as its wake tracking derives it; its configured spin while it tracks no estimate.
+  pub idle_window_ns: u64,
+  /// Activities that held the idle window open past the shard's own ([`ShardContext::hold_idle_window`]): the daemon's
+  /// forwards for a client in R9's closed loop (A-326), a non-vacuity count.
+  pub idle_holds: u64,
+  /// Holds asked of the shard that it declined, since the idle turn a request would meet took at least as long as its
+  /// wake estimate (A-387, [`crate::held_turn::hold_pays`]): a non-vacuity count of the decline.
+  pub idle_holds_declined: u64,
+  /// The expected length of the idle turn a request lands in, nanoseconds, as the shard has learned it from its own
+  /// spins ([`crate::held_turn::HeldTurn::met_ns`]); 0 until its first measured turn or while it tracks no wake
+  /// estimate.
+  pub held_turn_ns: u64,
+  /// Idle turns the shard has measured (a non-vacuity count of [`Counters::held_turn_ns`]).
+  pub held_turns: u64,
   /// Tasks admitted.
   pub spawns: u64,
   /// Tasks whose future returned.
@@ -311,6 +328,17 @@ pub struct ShardContext {
   /// When the server last served a client's work on this shard (its clock), opening the idle window the
   /// shard spins in before it parks ([`ShardContext::note_activity`]); `None` until the first.
   activity_ns: Cell<Option<u64>>,
+  /// The end of the longest hold an activity asked for ([`ShardContext::hold_idle_window`]), shard clock: the idle
+  /// window stays open at least until it, whatever its own length. 0 before the first hold.
+  held_until_ns: Cell<u64>,
+  /// Holds kept ([`Counters::idle_holds`]).
+  idle_holds: Cell<u64>,
+  /// Holds declined ([`Counters::idle_holds_declined`]).
+  idle_holds_declined: Cell<u64>,
+  /// What an idle turn costs a request that lands in it, learned from every turn of the shard's idle spins
+  /// ([`crate::held_turn`], A-387): the side of a hold's decision the wake estimate is weighed against. `None` while the
+  /// shard tracks no wake estimate, which then has nothing to weigh it against and holds as asked.
+  held_turn: Cell<Option<HeldTurn>>,
   pair_full_events: Cell<u64>,
   nested_borrows: Cell<u64>,
   /// The shard's readiness registrations, by descriptor and direction: which task waits on each, and whether
@@ -331,6 +359,10 @@ pub struct ShardContext {
   wake: Cell<Option<WakeEstimate>>,
   /// The idle spin window as a multiple of the wake estimate, while tracking.
   idle_ratio: u64,
+  /// The least idle spin window, while tracking (A-223).
+  idle_floor_ns: u64,
+  /// The longest one idle spin may run, window and holds alike, while tracking (A-361).
+  idle_ceiling_ns: u64,
   /// The configured step budget and idle spin, the quantum and the spin when not tracking.
   fixed_quantum_ns: u64,
   fixed_spin_ns: u64,
@@ -501,6 +533,14 @@ impl ShardContext {
       current_task: Cell::new(None),
       exited: Cell::new(false),
       activity_ns: Cell::new(None),
+      held_until_ns: Cell::new(0),
+      idle_holds: Cell::new(0),
+      idle_holds_declined: Cell::new(0),
+      held_turn: Cell::new(
+        config
+          .wake_tracking
+          .map(|tracking| HeldTurn::new(tracking.shift)),
+      ),
       pair_full_events: Cell::new(0),
       nested_borrows: Cell::new(0),
       interests: RefCell::new(Interests::default()),
@@ -514,6 +554,16 @@ impl ShardContext {
       idle_ratio: config
         .wake_tracking
         .map_or(1, |tracking| tracking.idle_ratio),
+      idle_floor_ns: config
+        .wake_tracking
+        .map_or(crate::runtime::NO_IDLE_FLOOR_NS, |tracking| {
+          tracking.idle_floor_ns
+        }),
+      idle_ceiling_ns: config
+        .wake_tracking
+        .map_or(crate::runtime::NO_IDLE_CEILING_NS, |tracking| {
+          tracking.idle_ceiling_ns
+        }),
       fixed_quantum_ns: config.step_budget_ns,
       fixed_spin_ns: config.spin_ns,
       real_time: driver.kind() != DriverKind::Simulation,
@@ -619,6 +669,31 @@ impl ShardContext {
     self.activity_ns.set(Some(self.now_ns()));
   }
 
+  /// Notes client work as [`note_activity`](Self::note_activity) does, and holds the idle window open until at least
+  /// `window_ns` from now, however long the shard's own window is (§4.7; A-326): the daemon's hold for a client in R9's
+  /// closed loop, whose next request may reach this shard only after the loop has gone round the others. The latest end
+  /// asked for stands; a later, shorter hold or a plain activity never cuts it short. No hold runs past the shard's
+  /// idle ceiling from now (A-361). The shard holds only while the idle turn a request would land in, as it has
+  /// measured its own, is shorter than its wake estimate, the kicked park the hold would save; otherwise it declines,
+  /// counted, and parks once its own window ends (A-387, [`crate::held_turn::hold_pays`]). Called on the shard's own
+  /// thread.
+  pub fn hold_idle_window(&self, window_ns: u64) {
+    let now = self.now_ns();
+    self.activity_ns.set(Some(now));
+    let met_turn = self.held_turn.get().and_then(|turns| turns.met_ns());
+    if !hold_pays(met_turn, self.wake_cost_ns()) {
+      self
+        .idle_holds_declined
+        .set(self.idle_holds_declined.get().saturating_add(1));
+      return;
+    }
+    let until = now.saturating_add(window_ns.min(self.idle_ceiling_ns));
+    if until > self.held_until_ns.get() {
+      self.held_until_ns.set(until);
+    }
+    self.idle_holds.set(self.idle_holds.get().saturating_add(1));
+  }
+
   /// Whether any inbound ring holds a word (a check without a syscall).
   pub fn has_inbound(&self) -> bool {
     if self
@@ -663,6 +738,12 @@ impl ShardContext {
       .try_borrow()
       .map_or(0, |interests| interests.unclaimed());
     c.wake_cost_ns = self.wake_cost_ns();
+    c.idle_window_ns = self.idle_window_ns();
+    c.idle_holds = self.idle_holds.get();
+    c.idle_holds_declined = self.idle_holds_declined.get();
+    let held_turn = self.held_turn.get();
+    c.held_turn_ns = held_turn.and_then(|turns| turns.met_ns()).unwrap_or(0);
+    c.held_turns = held_turn.map_or(0, |turns| turns.turns());
     c
   }
 
@@ -1243,7 +1324,8 @@ impl ShardContext {
   }
 
   /// Spins out the rest of the idle window the last client activity opened
-  /// ([`ShardContext::note_activity`]), watching the rings, the pollers and the driver; true when
+  /// ([`ShardContext::note_activity`]), or the longer hold an activity asked for
+  /// ([`ShardContext::hold_idle_window`]), watching the rings, the pollers and the driver; true when
   /// something arrived or a timer fell due during the spin (either is work for the next step), false
   /// when the window ran out, or had already, with nothing to do. The window is measured from the
   /// activity, not from this idle moment: timers that fire after a client has gone quiet do not open a
@@ -1252,12 +1334,20 @@ impl ShardContext {
     let Some(activity) = self.activity_ns.get() else {
       return false;
     };
-    let window_end = activity.saturating_add(self.spin_window_ns());
+    let window_end = activity
+      .saturating_add(self.idle_window_ns())
+      .max(self.held_until_ns.get());
     if self.now_ns() >= window_end {
       return false;
     }
     self.update_attribution(Tracker::wait_began);
     let found = self.spin_for_work(window_end, deadline_ns);
+    if let (Some(entry), Some(met)) = (
+      self.entry,
+      self.held_turn.get().and_then(|turns| turns.met_ns()),
+    ) {
+      entry.pulse.record_held_turn(met);
+    }
     if found {
       self.wait_ended();
     }
@@ -1269,6 +1359,7 @@ impl ShardContext {
   /// message, and no driver can tell it without a (non-blocking) poll — without one a request arriving
   /// on a socket waited until the window ended and the shard parked (`tests/tcp.rs`).
   fn spin_for_work(&self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
+    let mut turn_began = self.now_ns();
     loop {
       // A poller's question may consume its signal (the daemon's doorbell flag is swapped to false
       // when asked), so the spin wakes the pollers it finds ready rather than only reporting them:
@@ -1285,6 +1376,9 @@ impl ShardContext {
         return true;
       }
       let now = self.now_ns();
+      // A turn that found nothing: what a request landing in it waited for (A-387).
+      self.learn_turn(now.saturating_sub(turn_began));
+      turn_began = now;
       if let Some(deadline) = deadline_ns
         && now >= deadline
       {
@@ -1302,6 +1396,19 @@ impl ShardContext {
         return false;
       }
       std::hint::spin_loop();
+    }
+  }
+
+  /// Folds one idle turn's length into what a held turn costs (A-387): every turn of every idle spin, the window's and
+  /// the holds' alike, so the estimate keeps learning while the shard declines holds. Only a shard that tracks a wake
+  /// estimate on a real clock learns, as only it learns its wakes: the simulation's clock does not move with the host's.
+  fn learn_turn(&self, turn_ns: u64) {
+    if !self.real_time {
+      return;
+    }
+    if let Some(mut turns) = self.held_turn.get() {
+      turns.record(turn_ns);
+      self.held_turn.set(Some(turns));
     }
   }
 
@@ -1467,11 +1574,18 @@ impl ShardContext {
       .max(1)
   }
 
-  /// The idle spin window now: the online wake estimate times the configured idle ratio while the shard
-  /// tracks one (the 2-competitive spin, §4.3), else the configured spin.
-  fn spin_window_ns(&self) -> u64 {
+  /// The idle spin window now, while the shard tracks an estimate: the online wake estimate times the configured
+  /// idle ratio, at least the configured floor and at most the configured ceiling (§4.3, §4.7; A-223, A-361). The
+  /// runtime's own spin-then-park has ratio 1, no floor and no ceiling, the 2-competitive spin. The daemon's is R9's
+  /// provisioning floor alone (ratio 0, `slates_server::config::NO_ESTIMATE_MULTIPLE`), under its watchdog's window
+  /// (`slates_server::config::IDLE_SPIN_CEILING`). The configured spin while the shard tracks none.
+  pub fn idle_window_ns(&self) -> u64 {
     self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
-      estimate.mean_ns().saturating_mul(self.idle_ratio)
+      estimate
+        .mean_ns()
+        .saturating_mul(self.idle_ratio)
+        .max(self.idle_floor_ns)
+        .min(self.idle_ceiling_ns)
     })
   }
 
@@ -1482,9 +1596,9 @@ impl ShardContext {
 
   /// Folds a park's measured wake into the online estimate (§4.3): the kick-to-running latency of a park
   /// a kick ended asleep ([`Woken::latency_ns`]) — the event the boot probe times, a sleeper woken. A
-  /// stamp from before the park's announcement is counted stale; one from the park's setup, or (Linux) a
-  /// wait across which the thread never switched out (`switches_before_wait` against now), found the
-  /// shard awake and is counted unslept; both are dropped. A park a timer or a completion ended teaches
+  /// stamp from before the park's announcement is counted stale; one from the park's setup, or (Linux, and
+  /// Windows since A-223) a wait across which the thread never switched out (`switches_before_wait` against
+  /// now), found the shard awake and is counted unslept; both are dropped. A park a timer or a completion ended teaches
   /// nothing. Only a tracking shard on a real clock learns: the simulation's clock is not the kicker's.
   fn note_wake(&self, entry: &Entry, woken: Woken, switches_before_wait: Option<u64>) {
     let Some(mut estimate) = self.wake.get() else {
@@ -1526,6 +1640,7 @@ impl ShardContext {
       inner.counters.wake_cost_ns = mean;
     });
     entry.pulse.record_wake_cost(mean);
+    entry.pulse.record_idle_window(self.idle_window_ns());
   }
 
   /// Attributes a poll against the step quantum (§4.3's long-step count): within it by the wall clock it

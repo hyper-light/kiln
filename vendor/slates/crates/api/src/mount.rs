@@ -15,15 +15,15 @@
 //!
 //! Moved here from `crates/cli/src/mount.rs` on 2026-11-18 (A-278), so the CLI and an embedding host mount through
 //! one implementation. The shape is adapted from sylk's cgofuse mount (`core/purevfs`): a pure, injectable capability
-//! detection ([`classify`], tested on any host with no live mount), a probe that refuses with a message naming what is
-//! missing, and the mount/unmount lifecycle.
+//! detection (`classify`, the other BSDs' and tested on any host with no live mount), a probe that refuses with a message
+//! naming what is missing, and the mount/unmount lifecycle.
 
 #[cfg(not(windows))]
 use std::process::Command;
 
 use slates_ipc::protocol::{Intent, VolumeId};
 
-use crate::error::{Error, MountFault};
+use crate::error::{Error, Missing, MountFault, MountMissing};
 use crate::instance::Instance;
 
 /// How a volume is mounted.
@@ -45,6 +45,16 @@ pub struct Mounted {
   pub attachment: u64,
   /// The mount point, as the kernel records it (the real path; a drive letter on Windows).
   pub path: String,
+}
+
+/// A mount removed ([`Instance::unmount`]). On Windows the drive is found among the volumes' reported mounts, and a
+/// volume whose status the daemon refused (one recovery could not rebuild) cannot report its mounts: when another
+/// volume reported the drive and it was released, each such volume is named here, so the caller can say whose mounts
+/// are unknown. Empty on macOS and Linux, whose unmount is the OS's own and asks no volume.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Unmounted {
+  /// Each volume the scan could not ask, and its status's refusal.
+  pub unreported: Vec<crate::error::Unreported>,
 }
 
 /// Format: a mount capability as `attach` returns it — the attachment id and its 16-byte secret token (§4.13; AUD-01),
@@ -80,8 +90,8 @@ impl Instance {
 
   /// Removes the mount at `path`: on macOS and Linux the OS's own unmount ([`unmount`]), which needs no daemon; on
   /// Windows the drive is the daemon's own, so its attachment is found among the volumes' reported mounts and
-  /// detached.
-  pub fn unmount(&mut self, path: &str) -> Result<(), Error> {
+  /// detached. What was removed names each volume the Windows scan could not ask ([`Unmounted::unreported`]).
+  pub fn unmount(&mut self, path: &str) -> Result<Unmounted, Error> {
     self.unmount_platform(path)
   }
 
@@ -98,15 +108,19 @@ impl Instance {
     // runtime profile's identity rule), so nothing need be shared with other local users.
     if options.shared {
       return Err(Error::Mount(MountFault::Unsupported {
-        reason: "a shared mount is the Linux FUSE mount's allow_other; a macOS host mount reaches a container \
-                 through Docker Desktop's file sharing as the mounting user",
+        missing: MountMissing::SharedMount,
       }));
     }
     available().map_err(Error::Mount)?;
     // The mount point as the kernel records it (a read, never a write): the daemon finds the mount it binds and the
     // mounts it keeps across a restart in the kernel's table by exactly this path (A-227).
     let real = real_path(path)?;
-    let report = self.status(volume)?;
+    // The raw status: a mount needs only the volume's name and the daemon's port, so a base the status could not read
+    // now does not stop it.
+    let report = self
+      .client
+      .status(volume)
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     let port = report
       .nfs_port
       .ok_or(Error::Mount(MountFault::NoNfsListener))?;
@@ -114,7 +128,7 @@ impl Instance {
       Some(subtree) => self.client.attach_scoped_mount(volume, intent, subtree),
       None => self.client.attach_mount(volume, intent),
     }
-    .map_err(|e| Error::of(&self.name, e))?;
+    .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     let token = attachment
       .token
       .ok_or(Error::Mount(MountFault::NoCapability))?;
@@ -129,7 +143,12 @@ impl Instance {
     // shows it; a bind the daemon refuses takes the mount down again rather than leave a mount whose record says it
     // is bound nowhere.
     if let Err(error) = self.client.bind_mount(attachment.attachment, &real) {
-      let bind = Error::of(&self.name, error);
+      let bind = self.fail(
+        error,
+        Some(Missing::Attachment {
+          attachment: attachment.attachment,
+        }),
+      );
       return Err(match unmount(&real) {
         Ok(()) => bind,
         Err(fault) => Error::Mount(MountFault::Unbound {
@@ -165,7 +184,7 @@ impl Instance {
         .attach_scoped_fuse(volume, intent, &real, subtree),
       (None, false) => self.client.attach_fuse(volume, intent, &real),
     }
-    .map_err(|e| Error::of(&self.name, e))?;
+    .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     Ok(Mounted {
       attachment: attachment.attachment,
       path: attachment.path.unwrap_or(real),
@@ -184,14 +203,13 @@ impl Instance {
   ) -> Result<Mounted, Error> {
     if options.subtree.is_some() || options.shared {
       return Err(Error::Mount(MountFault::Unsupported {
-        reason: "a subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive \
-                 letter",
+        missing: MountMissing::WindowsSubtreeOrShared,
       }));
     }
     let attachment = self
       .client
       .attach_winfsp(volume, intent, path)
-      .map_err(|e| Error::of(&self.name, e))?;
+      .map_err(|e| self.fail(e, Some(Missing::Volume(volume))))?;
     Ok(Mounted {
       attachment: attachment.attachment,
       path: attachment.path.unwrap_or_else(|| path.to_owned()),
@@ -200,17 +218,20 @@ impl Instance {
 
   /// See [`Instance::unmount`]: the OS's own unmount.
   #[cfg(not(windows))]
-  fn unmount_platform(&mut self, path: &str) -> Result<(), Error> {
-    unmount(path).map_err(Error::Mount)
+  fn unmount_platform(&mut self, path: &str) -> Result<Unmounted, Error> {
+    unmount(path).map_err(Error::Mount)?;
+    Ok(Unmounted::default())
   }
 
   /// See [`Instance::unmount`]: the WinFsp drive at `path` is the daemon's own, so it is unmounted by detaching its
   /// attachment, found among the volumes' reported mounts; the daemon then removes the drive. Every volume is asked:
-  /// one whose status is refused (a volume recovery could not rebuild answers `NotFound`) cannot report its mounts, so
-  /// it is passed over and named in the refusal, and the drive is still released when another volume reports it. A
-  /// channel or daemon failure ends the scan, since no later volume can be asked either.
+  /// one whose status is refused (a volume recovery could not rebuild answers `NotRecovered`) cannot report its mounts,
+  /// so it is passed over and named, and the drive is still released when another volume reports it: named in the
+  /// answer then, in the refusal when no volume reported the drive. Until 2026-11-18 the answer dropped the names
+  /// (the integrator's Windows lane, run 44257181904). A channel or daemon failure ends the scan, since no later volume
+  /// can be asked either.
   #[cfg(windows)]
-  fn unmount_platform(&mut self, path: &str) -> Result<(), Error> {
+  fn unmount_platform(&mut self, path: &str) -> Result<Unmounted, Error> {
     let volumes = self.list()?;
     let mut found = None;
     let mut unreported = Vec::new();
@@ -225,16 +246,25 @@ impl Instance {
               .map(|mount| mount.attachment);
           }
         }
-        Err(slates_client::ClientError::Refused(refusal)) => unreported.push(format!(
-          "volume {} ({}) refused {refusal:?}",
-          summary.name,
-          crate::volume_id_text(summary.id)
-        )),
-        Err(other) => return Err(Error::of(&self.name, other)),
+        Err(slates_client::ClientError::Refused(refusal)) => {
+          unreported.push(crate::error::Unreported {
+            volume: summary.id,
+            name: summary.name,
+            refusal: Box::new(Error::of_refusal(
+              refusal,
+              Some(Missing::Volume(summary.id)),
+              self.client.retry_pause_ns(0),
+            )),
+          })
+        }
+        Err(other) => return Err(self.error(other)),
       }
     }
     match found {
-      Some(attachment) => self.detach(attachment),
+      Some(attachment) => {
+        self.detach(attachment)?;
+        Ok(Unmounted { unreported })
+      }
       None => Err(Error::Mount(MountFault::NotMounted {
         path: path.to_owned(),
         unreported,
@@ -330,7 +360,6 @@ pub(crate) fn backend() -> MountBackend {
 
 /// The host-mount mechanism a machine offers (§4.6), as [`available`] finds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum MountKind {
   /// The loopback NFS bridge: `mount(2)` on macOS (A-34), `mount_nfs` on the other BSDs.
   NfsLoopback,
@@ -340,18 +369,6 @@ pub enum MountKind {
   WinFsp,
 }
 
-/// Format: why a BSD other than macOS cannot mount: the program its loopback mount runs is missing.
-#[cfg(any(all(unix, not(target_os = "macos"), not(target_os = "linux")), test))]
-const NO_MOUNT_NFS: &str = "`mount_nfs` is not on the PATH — slates's loopback mount needs it (it is built into macOS \
-                            and the BSDs); no kernel extension, FUSE library, or Apple entitlement is required";
-/// Format: why a Linux machine cannot mount: the unprivileged mount helper is missing.
-#[cfg(any(target_os = "linux", test))]
-const NO_FUSERMOUNT: &str = "`fusermount3` is not on the PATH — the daemon mounts FUSE through it, unprivileged (R10); \
-                             the OS's fuse3 package ships it";
-/// Format: why a Linux machine cannot mount: the FUSE device is absent or not this user's to open.
-#[cfg(any(target_os = "linux", test))]
-const NO_FUSE_DEVICE: &str = "/dev/fuse is missing, or this user cannot read and write it — load the fuse module, or \
-                              pass the device into the container";
 /// Format: the FUSE device `fusermount3` opens for the daemon (Linux).
 #[cfg(target_os = "linux")]
 const FUSE_DEVICE: &str = "/dev/fuse";
@@ -389,8 +406,7 @@ pub fn available() -> Result<MountKind, MountFault> {
     Ok(MountKind::WinFsp)
   } else {
     Err(MountFault::Unsupported {
-      reason: "WinFsp is not installed: its library (winfsp-x64.dll, or winfsp-a64.dll on arm64) did not load; \
-               install WinFsp from winfsp.dev",
+      missing: MountMissing::WinFsp,
     })
   }
 }
@@ -401,7 +417,7 @@ fn nfs_available(backend: MountBackend) -> Result<MountKind, MountFault> {
   match backend {
     MountBackend::NfsLoopback => Ok(MountKind::NfsLoopback),
     MountBackend::Unsupported => Err(MountFault::Unsupported {
-      reason: NO_MOUNT_NFS,
+      missing: MountMissing::MountNfs,
     }),
   }
 }
@@ -413,10 +429,10 @@ fn fuse_available(helper_found: bool, device_usable: bool) -> Result<MountKind, 
   match (helper_found, device_usable) {
     (true, true) => Ok(MountKind::Fuse),
     (false, _) => Err(MountFault::Unsupported {
-      reason: NO_FUSERMOUNT,
+      missing: MountMissing::Fusermount3,
     }),
     (true, false) => Err(MountFault::Unsupported {
-      reason: NO_FUSE_DEVICE,
+      missing: MountMissing::FuseDevice,
     }),
   }
 }
@@ -584,21 +600,27 @@ pub fn unmount(path: &str) -> Result<(), MountFault> {
   run_unmount(UNMOUNT_ARGS, path)
 }
 
-/// Lets go of the mount at `path` even while processes still use it (Linux: `fusermount3 -u -z`): the kernel takes it
-/// out of the namespace now and finishes the unmount once its last user closes — what a host does for an ended agent
-/// whose leftover process still holds a file there, where [`unmount`] is refused busy. Like [`unmount`] it needs no
-/// daemon and no privilege. Elsewhere refused [`MountFault::Unsupported`]: macOS and the BSDs have no lazy unmount.
-#[cfg(target_os = "linux")]
-pub fn unmount_lazy(path: &str) -> Result<(), MountFault> {
-  run_unmount(LAZY_UNMOUNT_ARGS, path)
+/// How [`unmount_busy`] let go of a mount processes still used: the OS's way, by which a host knows what its leftover
+/// processes meet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LetGo {
+  /// Taken out of the namespace now; its users read and write on until they close, and the unmount finishes then
+  /// (Linux: `fusermount3 -u -z`, the kernel's `MNT_DETACH`).
+  Detached,
+  /// Unmounted now; its users' next calls on it fail (macOS and the BSDs: `umount -f`, the kernel's `MNT_FORCE`). The
+  /// loopback NFS mount is `hard`, so this is the only way off it for a holder whose daemon has gone.
+  Forced,
 }
 
-/// See the Linux arm: no lazy unmount here.
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn unmount_lazy(_path: &str) -> Result<(), MountFault> {
-  Err(MountFault::Unsupported {
-    reason: "a lazy unmount is Linux's (`fusermount3 -u -z`); here unmount the path once its users have closed it",
-  })
+/// Lets go of the mount at `path` even while processes still use it: what a host does for an ended agent whose
+/// leftover process still holds a file there, where [`unmount`] is refused busy. Linux detaches it (`fusermount3 -u
+/// -z`); macOS and the BSDs have no detaching unmount and force it (`umount -f`); the answer says which
+/// ([`LetGo`]). Like [`unmount`] it needs no daemon and no privilege: a user lets go only of a mount they made. Until
+/// 2026-11-18 this was Linux's `unmount_lazy`, refused `Unsupported` elsewhere, so a macOS host had no library route
+/// off a busy mount (found by g076a, whose conformance harness forces it).
+#[cfg(not(windows))]
+pub fn unmount_busy(path: &str) -> Result<LetGo, MountFault> {
+  run_unmount(BUSY_UNMOUNT_ARGS, path).map(|()| BUSY_UNMOUNT)
 }
 
 /// Runs [`UNMOUNT_PROGRAM`] with `args` on `path`: its exit status, or the error number of starting it, typed.
@@ -631,23 +653,31 @@ const UNMOUNT_PROGRAM: &str = "fusermount3";
 /// Format: see [`UNMOUNT_PROGRAM`].
 #[cfg(target_os = "linux")]
 const UNMOUNT_ARGS: &[&str] = &["-u"];
-/// Format: `fusermount3`'s lazy unmount (`-z`: the kernel's `MNT_DETACH`), for [`unmount_lazy`].
+/// Format: `fusermount3`'s lazy unmount (`-z`: the kernel's `MNT_DETACH`), for [`unmount_busy`].
 #[cfg(target_os = "linux")]
-const LAZY_UNMOUNT_ARGS: &[&str] = &["-u", "-z"];
+const BUSY_UNMOUNT_ARGS: &[&str] = &["-u", "-z"];
+/// Format: how [`BUSY_UNMOUNT_ARGS`] lets go.
+#[cfg(target_os = "linux")]
+const BUSY_UNMOUNT: LetGo = LetGo::Detached;
 /// Format: see the Linux form.
 #[cfg(all(unix, not(target_os = "linux")))]
 const UNMOUNT_PROGRAM: &str = "umount";
 /// Format: see the Linux form.
 #[cfg(all(unix, not(target_os = "linux")))]
 const UNMOUNT_ARGS: &[&str] = &[];
+/// Format: `umount`'s forced unmount (`-f`: the kernel's `MNT_FORCE`), for [`unmount_busy`].
+#[cfg(all(unix, not(target_os = "linux")))]
+const BUSY_UNMOUNT_ARGS: &[&str] = &["-f"];
+/// Format: how [`BUSY_UNMOUNT_ARGS`] lets go.
+#[cfg(all(unix, not(target_os = "linux")))]
+const BUSY_UNMOUNT: LetGo = LetGo::Forced;
 
 #[cfg(test)]
 mod tests {
   use super::{
-    MountBackend, MountKind, NO_FUSE_DEVICE, NO_FUSERMOUNT, NO_MOUNT_NFS, classify, export_path,
-    fuse_available, mount_args, nfs_available,
+    MountBackend, MountKind, classify, export_path, fuse_available, mount_args, nfs_available,
   };
-  use crate::error::MountFault;
+  use crate::error::{MountFault, MountMissing};
 
   /// §4.6 A-34 — a read-only mount asks the kernel for `rdonly` (with the daemon refusing writes under the read-only
   /// capability too); a writable mount does not.
@@ -756,20 +786,20 @@ mod tests {
     assert_eq!(
       fuse_available(false, true),
       Err(MountFault::Unsupported {
-        reason: NO_FUSERMOUNT
+        missing: MountMissing::Fusermount3
       })
     );
     assert_eq!(
       fuse_available(false, false),
       Err(MountFault::Unsupported {
-        reason: NO_FUSERMOUNT
+        missing: MountMissing::Fusermount3
       }),
       "the helper is named first: without it the device is never opened"
     );
     assert_eq!(
       fuse_available(true, false),
       Err(MountFault::Unsupported {
-        reason: NO_FUSE_DEVICE
+        missing: MountMissing::FuseDevice
       })
     );
     assert_eq!(
@@ -779,7 +809,7 @@ mod tests {
     assert_eq!(
       nfs_available(MountBackend::Unsupported),
       Err(MountFault::Unsupported {
-        reason: NO_MOUNT_NFS
+        missing: MountMissing::MountNfs
       })
     );
   }
@@ -792,29 +822,33 @@ mod tests {
     assert_eq!(super::available(), Ok(MountKind::NfsLoopback));
   }
 
-  /// A-278 — a lazy unmount is Linux's: elsewhere it is refused `Unsupported` before any program runs.
+  /// A-278 (g076a's report) — a busy unmount runs the OS's own: `umount -f` on macOS and the BSDs, which refuses a path
+  /// where nothing is mounted. Do: let go of this crate's own directory, never a mount. Expect the refusal typed with the
+  /// program's exit status, and nothing changed. Until 2026-11-18 macOS refused it `Unsupported` before any program ran,
+  /// so a host had no library route off a busy mount there.
   #[cfg(all(unix, not(target_os = "linux")))]
   #[test]
-  fn a_lazy_unmount_is_refused_where_the_os_has_none() {
+  fn a_busy_unmount_of_a_path_where_nothing_is_mounted_is_refused_with_the_programs_status() {
+    let path = env!("CARGO_MANIFEST_DIR");
     assert!(matches!(
-      super::unmount_lazy(env!("CARGO_MANIFEST_DIR")),
-      Err(MountFault::Unsupported { .. })
+      super::unmount_busy(path),
+      Err(MountFault::Unmount { path: refused, status: Some(_), errno: None }) if refused == path
     ));
   }
 
-  /// A-278 — a lazy unmount runs `fusermount3 -u -z`, which refuses a path where nothing is mounted: the refusal comes
-  /// back typed with the program's exit status, and nothing changes (this crate's own directory is never a mount).
-  /// Skips loudly where `fusermount3` is not installed.
+  /// A-278 — a busy unmount on Linux runs `fusermount3 -u -z`, which refuses a path where nothing is mounted. Do: let go
+  /// of this crate's own directory, never a mount. Expect the refusal typed with the program's exit status, and nothing
+  /// changed. Skips loudly where `fusermount3` is not installed.
   #[cfg(target_os = "linux")]
   #[test]
-  fn a_lazy_unmount_of_a_path_where_nothing_is_mounted_is_refused_with_the_programs_status() {
+  fn a_busy_unmount_of_a_path_where_nothing_is_mounted_is_refused_with_the_programs_status() {
     if !super::command_on_path("fusermount3") {
       eprintln!("SKIP: fusermount3 is not on the PATH");
       return;
     }
     let path = env!("CARGO_MANIFEST_DIR");
     assert!(matches!(
-      super::unmount_lazy(path),
+      super::unmount_busy(path),
       Err(MountFault::Unmount { path: refused, status: Some(_), errno: None }) if refused == path
     ));
   }

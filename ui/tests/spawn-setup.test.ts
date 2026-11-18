@@ -97,6 +97,10 @@ test("the spec: a shell's folder is its own, home is no folder, a volume only ov
   assert.equal(inShell.cwd, undefined);
   assert.equal(inShell.workspace, undefined);
   assert.equal(specOf({ ...base, cwd: "~" }).cwd, undefined);
+  // Its folder itself only as the person chose it: otherwise the server gives a volume where the machine can make one.
+  assert.deepEqual(specOf({ ...base, volume: false, folder: true }).workspace, { kind: "folder" });
+  assert.equal(specOf({ ...base, volume: false }).workspace, undefined);
+  assert.equal(specOf({ ...base, volume: false, folder: true, shell: "t1" }).workspace, undefined);
 });
 
 test("recent folders: the latest first, eight at most, home left out", () => {

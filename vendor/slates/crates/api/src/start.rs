@@ -15,17 +15,26 @@
 //! started anchor's exit ends the wait at once with its exit code ([`StartFault::AnchorExited`]); a wait without a
 //! child to watch ends at the host's deadline, as `Unavailable`.
 //!
-//! **The issuer is not handed over.** A started instance gives its starter no grant authority (§4.13, R10): under
-//! Ada's decision of 2026-11-18 a grant is proved by a key only the human holds, presented through
-//! [`Instance::grant`] whoever starts the instance.
+//! **Waiting while the anchor starts (A-366).** The anchor judges its starting daemon by the daemon's own CPU progress,
+//! never by a wall-clock second (A-232), and never gives an instance up once a daemon has served (A-119): a client may
+//! hold a mount on it. So a host that watches the anchor it started needs no deadline of its own: the wait lasts while
+//! the anchor lives. A host that has attached nothing yet asks [`StartSpec::until_served`]: an anchor none of whose
+//! daemons has reached its serving mark stops at their crash loop rather than looping on an instance no client could
+//! have held, and the wait ends [`StartFault::NeverServed`].
+//!
+//! **The launcher's authority (A-299).** Under Ada's rule of 2026-11-18 the launcher — whoever starts the instance —
+//! sets agents' write modes and approves what an ask mode holds, so the starter is to be handed the instance's issuer
+//! on every platform (owed, the A-299 row of GAPS): today it holds the issuer only where the anchor's handoff reaches it
+//! (the anchor's own children on Linux, the exported pairs elsewhere, [`crate::Issuer`]).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, StartFault};
 use crate::instance::Instance;
+use crate::launcher::{ENV_LAUNCHER, LAUNCHER_ON_STDIN, LauncherSecret, record_of};
 use crate::role::{FleetSelection, ProcessOptions, Role};
 
 /// What starts an instance: its name, the executable that serves the roles and the prefix before a role's arguments,
@@ -47,6 +56,25 @@ pub struct StartSpec {
   /// The fleet this node joins (§2.6 boot step 6); `None` for an instance run alone, whose group [`Instance::start`]
   /// makes.
   pub fleet: Option<FleetSelection>,
+  /// The launcher's secret (A-299, [`crate::launcher`]), handed to the anchor at the start so the host's authority
+  /// outlives its own restarts and the daemon's; `None` for an instance whose authority is the anchor segment's alone.
+  pub launcher: Option<LauncherSecret>,
+  /// Stop the anchor when its daemons crash-loop before any of them has served (A-366), rather than loop on them with
+  /// a backoff for good as an anchor does (A-119): the instance never answered, so no client can be waiting on it. For
+  /// a host that waits on the anchor it started ([`Instance::wait_for`] with the anchor's child), which then ends
+  /// [`StartFault::NeverServed`]. Once a daemon has served, the anchor never gives the instance up, opted in or not.
+  pub until_served: bool,
+}
+
+/// Format: the environment word that hands the anchor [`StartSpec::until_served`] (A-366), as [`ENV_LAUNCHER`] hands it
+/// the launcher's record: set on the anchor's command, read once by the anchor.
+pub(crate) const ENV_UNTIL_SERVED: &str = "SLATES_UNTIL_SERVED";
+/// Format: [`ENV_UNTIL_SERVED`]'s value when the starter asked for it.
+const UNTIL_SERVED_ASKED: &str = "1";
+
+/// Whether this process, an anchor, was started [`StartSpec::until_served`] (A-366).
+pub(crate) fn until_served_asked() -> bool {
+  std::env::var_os(ENV_UNTIL_SERVED).is_some_and(|value| value == UNTIL_SERVED_ASKED)
 }
 
 impl StartSpec {
@@ -59,7 +87,22 @@ impl StartSpec {
       shards: None,
       quick: false,
       fleet: None,
+      launcher: None,
+      until_served: false,
     }
+  }
+
+  /// This spec with [`StartSpec::until_served`]: an anchor whose daemons crash-loop before any of them has served stops,
+  /// and a wait on it ends [`StartFault::NeverServed`] (A-366).
+  pub fn until_served(mut self) -> StartSpec {
+    self.until_served = true;
+    self
+  }
+
+  /// This spec with the launcher's secret `secret`, which the host keeps and provides again at every start.
+  pub fn with_launcher(mut self, secret: LauncherSecret) -> StartSpec {
+    self.launcher = Some(secret);
+    self
   }
 
   /// The anchor role this spec starts.
@@ -73,19 +116,68 @@ impl StartSpec {
   }
 
   /// The anchor's command: `PROGRAM PREFIX... --instance NAME anchor [--quick] [--shards N] [--fleet PATH --node
-  /// NAME]`, with standard input closed (no role reads it). Standard output and error are the host's to direct: the
-  /// roles write their log lines to standard error. On Unix the anchor leads a process group of its own, so a signal
-  /// meant for the host's group (a terminal's interrupt) does not stop the instance; a host stops it through
-  /// [`Anchor::stop`], or by sending the anchor `SIGTERM` itself.
-  pub fn anchor_command(&self) -> Command {
-    let mut command = Command::new(&self.program);
+  /// NAME]`. Its standard input is closed, or, with a launcher's secret, a pipe holding the secret's record and then its
+  /// end ([`crate::launcher`]), so the anchor's read always ends; a host that wraps the command (`systemd-run --scope`)
+  /// keeps the command's standard input, which an exec passes unchanged. Standard output and error are the host's to
+  /// direct: the roles write their log lines to standard error. On Unix the anchor leads a process group of its own, so
+  /// a signal meant for the host's group (a terminal's interrupt) does not stop the instance; a host stops it through
+  /// [`Anchor::stop`], or by sending the anchor `SIGTERM` itself. Refused [`StartFault::Launcher`] when the pipe cannot
+  /// be made.
+  pub fn anchor_command(&self) -> Result<Command, Error> {
+    self.anchor_command_under(&[])
+  }
+
+  /// [`StartSpec::anchor_command`] run under `wrapper`, a command that execs what follows it in the same process
+  /// (`systemd-run --user --scope --unit=NAME --`, so the instance outlives the host's process): `WRAPPER... PROGRAM
+  /// PREFIX... --instance NAME anchor ...`, with the same standard input — the launcher's record, which an exec keeps —
+  /// the same environment and the same process group. An empty `wrapper` is [`StartSpec::anchor_command`] itself.
+  pub fn anchor_command_under(&self, wrapper: &[&OsStr]) -> Result<Command, Error> {
+    let mut command = match wrapper.split_first() {
+      Some((first, rest)) => {
+        let mut command = Command::new(first);
+        command.args(rest).arg(&self.program);
+        command
+      }
+      None => Command::new(&self.program),
+    };
     command
       .args(self.prefix.iter().map(OsString::from))
-      .args(self.role().args())
-      .stdin(Stdio::null());
+      .args(self.role().args());
+    match &self.launcher {
+      None => {
+        command.stdin(Stdio::null()).env_remove(ENV_LAUNCHER);
+      }
+      Some(secret) => {
+        command
+          .stdin(launcher_input(secret)?)
+          .env(ENV_LAUNCHER, LAUNCHER_ON_STDIN);
+      }
+    }
+    if self.until_served {
+      command.env(ENV_UNTIL_SERVED, UNTIL_SERVED_ASKED);
+    } else {
+      command.env_remove(ENV_UNTIL_SERVED);
+    }
     in_its_own_group(&mut command);
-    command
+    Ok(command)
   }
+}
+
+/// A pipe holding `secret`'s record, its write end closed: the anchor's standard input (A-299).
+fn launcher_input(secret: &LauncherSecret) -> Result<Stdio, Error> {
+  use std::io::Write;
+  let refused = |error: std::io::Error| {
+    Error::Start(StartFault::Launcher {
+      errno: error.raw_os_error(),
+    })
+  };
+  let (reader, mut writer) = std::io::pipe().map_err(refused)?;
+  let mut record = record_of(secret);
+  let written = writer.write_all(&record);
+  record.fill(0);
+  written.map_err(refused)?;
+  drop(writer);
+  Ok(Stdio::from(reader))
 }
 
 /// See [`StartSpec::anchor_command`]: a process group of the anchor's own (`setpgid(0, 0)` in the child).
@@ -200,7 +292,7 @@ impl Instance {
       Err(error) if error.is_unavailable() => {}
       Err(error) => return Err(error),
     }
-    let mut child = spec.anchor_command().spawn().map_err(|error| {
+    let mut child = spec.anchor_command()?.spawn().map_err(|error| {
       Error::Start(StartFault::Spawn {
         program: spec.program.to_string_lossy().into_owned(),
         errno: error.raw_os_error(),
@@ -223,9 +315,11 @@ impl Instance {
 
   /// Waits until the instance `name` answers, and attaches to it: a connect refused at once (no rendezvous yet: the
   /// anchor is still measuring the machine) is asked again a heartbeat later; a held rendezvous is waited on by the
-  /// connect itself. With `anchor`, the anchor's exit ends the wait ([`StartFault::AnchorExited`]); with `until`, the
-  /// deadline does, refused `Unavailable` as the last connect was. With neither, it waits as long as no daemon answers,
-  /// so a host that launched the anchor through a service manager passes a deadline.
+  /// connect itself. With `anchor`, the anchor's exit ends the wait ([`StartFault::AnchorExited`], or
+  /// [`StartFault::NeverServed`] for one started [`StartSpec::until_served`] whose daemons never served), and a host
+  /// needs no deadline of its own: the anchor judges its daemon's start by its progress (A-366, the module doc); with
+  /// `until`, the deadline does, refused `Unavailable` as the last connect was. With neither, it waits as long as no
+  /// daemon answers, so a host that launched the anchor through a service manager passes a deadline.
   pub fn wait_for(
     name: &str,
     mut anchor: Option<&mut Child>,
@@ -249,10 +343,14 @@ impl Instance {
   }
 }
 
-/// Refused [`StartFault::AnchorExited`] once `child` has exited.
+/// Refused [`StartFault::AnchorExited`] once `child` has exited, or [`StartFault::NeverServed`] when it stopped
+/// because none of its daemons served (A-366: the role's [`crate::role::EXIT_NEVER_SERVED`]).
 fn anchor_still_runs(child: &mut Child) -> Result<(), Error> {
   match child.try_wait() {
     Ok(None) => Ok(()),
+    Ok(Some(status)) if status.code() == Some(i32::from(crate::role::EXIT_NEVER_SERVED)) => {
+      Err(Error::Start(StartFault::NeverServed))
+    }
     Ok(Some(status)) => Err(Error::Start(StartFault::AnchorExited {
       code: status.code(),
     })),

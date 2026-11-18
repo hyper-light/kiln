@@ -177,7 +177,13 @@ variant_of?: string,
  */
 no_bypass?: boolean, 
 /**
- * Its workspace of its own, when it has one (as `Spec::workspace`).
+ * How much its launcher let it do unasked as it started (as `Spec::launched`), never what its harness reports
+ * since: what its permissions are judged by beside its mode now (`lineage::granted`). None: a session an older
+ * kiln began, held to its harness's own default.
+ */
+launched?: "plan" | "ask" | "accept_edits" | "auto" | "bypass", 
+/**
+ * Where it works, when its start decided (as `Spec::workspace`).
  */
 workspace?: Workspace, 
 /**

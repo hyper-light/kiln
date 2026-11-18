@@ -1333,6 +1333,11 @@ pub enum Asked<'a> {
     /// [`Asked::Message`] is. No earlier answer bounds a turn asked to take longer: it waits as a
     /// drive's first wait does, on its harness's liveness and progress alone.
     Steered(&'a str),
+    /// A message whose turn writes the session's workspace to disk (`agents_land`), told as an
+    /// [`Asked::Message`] is: work of another kind than a turn that only answers, so only the drive's
+    /// earlier landings bound it ([`Pace::window`]), and what the landing reports of itself is its
+    /// progress ([`Pace::reporting`]).
+    Landing(&'a str),
     /// The turn under way stopped (an interrupt), which idle answers. `said`: the lines the session
     /// had said as the stop was taken, where its turn says no more (the stand-in's held turn,
     /// [`stub_stopped_turn`]); none: not counted.
@@ -1383,11 +1388,11 @@ impl std::fmt::Display for Stuck {
 pub enum Stall {
     /// The session can't answer it.
     Stuck(Stuck),
-    /// No progress for a whole window as long as the slowest answer that bounds it ([`Pace::window`]).
-    Quiet { quiet: Duration, slowest: Duration },
+    /// No progress for longer than the tail of the drive's own answers of its kind bounds ([`Pace::window`]).
+    Quiet { quiet: Duration, bound: Duration },
     /// Its message waits in kiln's queue (its delivery `queued`, or in the queue) on an idle session for
-    /// a whole window, and no cause kiln states applies to it ([`holds`]): kiln never hands it over.
-    DeliveryStuck { message: String, quiet: Duration, slowest: Duration },
+    /// longer than its window, and no cause kiln states applies to it ([`holds`]): kiln never hands it over.
+    DeliveryStuck { message: String, quiet: Duration, bound: Duration },
     /// A process of the fixture's own ended ([`Fixture::ended`]): nothing of the session answers again.
     Party(SetupStuck),
 }
@@ -1396,10 +1401,10 @@ impl std::fmt::Display for Stall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stuck(s) => std::fmt::Display::fmt(s, f),
-            Self::Quiet { quiet, slowest } => write!(f, "no progress for {quiet:?}, a whole window as long as the slowest answer that bounds it ({slowest:?}: this drive's own)"),
-            Self::DeliveryStuck { message, quiet, slowest } => write!(
+            Self::Quiet { quiet, bound } => write!(f, "no progress for {quiet:?}, past {bound:?}: the tail of this drive's own answers of its kind"),
+            Self::DeliveryStuck { message, quiet, bound } => write!(
                 f,
-                "delivery stuck: {message} waits in kiln's queue on an idle session, and no cause kiln states applies to it (admission's own wait on it, a room wait, a pause, a freeze), for {quiet:?}, a whole window as long as the slowest answer that bounds it ({slowest:?})"
+                "delivery stuck: {message} waits in kiln's queue on an idle session, and no cause kiln states applies to it (admission's own wait on it, a room wait, a pause, a freeze), for {quiet:?}, past {bound:?}: the tail of this drive's own answers of its kind"
             ),
             Self::Party(s) => std::fmt::Display::fmt(s, f),
         }
@@ -1423,20 +1428,122 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// What a drive has learned of its harness's answers: the slowest so far, each one whole wait from the
-/// drive's ask to its answer; none before its first, the drive's cold start. Its waits are bounded by it
+/// What a drive has learned of its harness's answers: each kind's ([`AnswerKind`]) whole waits from the
+/// drive's ask to its answer; none before its first, the drive's cold start. Its waits are bounded by them
 /// alone: another drive's answers, of another harness from another image built for it (r707: claude's
 /// first turn bounded codex's, refused while codex's image was still building), bound none of this one's,
-/// and nothing is picked, seeded or carried over from another run.
+/// and nothing is picked, seeded or carried over from another run. A wait is bounded by the tail of its own
+/// kind's answers, never by one of them (the coordinator's proofs of 2026-11-18: a landing's turn, bounded by
+/// the slowest earlier turn's 372 ms, was refused at 373 ms of ordinary load).
 #[derive(Debug, Default)]
 pub struct Pace {
-    slowest: Option<Duration>,
+    answers: std::collections::BTreeMap<AnswerKind, Vec<Duration>>,
+    /// What the work under way reports of itself, read at each look ([`Pace::reporting`]): a change of it
+    /// is progress.
+    reports: Option<Reports>,
     /// Each session's feed ([`Wake::session`]), held from its first wait until it's ended: what kiln
     /// says of a message the drive sends between waits (admission's word on it) is heard by the next.
     feeds: std::collections::BTreeMap<String, Wake>,
     /// The drive's own processes on the host ([`Own`]), where it looks at them: a starting session's
     /// progress, while kiln's word on it can't move.
     own: Option<Own>,
+}
+
+/// A kind of answer a drive learns its pace of, apart from the others' ([`Pace::window`]): a first turn holds a cold
+/// start, a landing's turn writes a workspace, an end is kiln's own work. A turn asked to be long has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AnswerKind {
+    Opening,
+    Message,
+    Landing,
+    Stop,
+    Kiln,
+}
+
+impl AnswerKind {
+    /// The kind of answer `asked` waits for; none for a turn asked to be long, which no answer bounds.
+    pub fn of(asked: Asked<'_>) -> Option<AnswerKind> {
+        match asked {
+            Asked::Opening => Some(Self::Opening),
+            Asked::Message(_) => Some(Self::Message),
+            Asked::Landing(_) => Some(Self::Landing),
+            Asked::Stop { .. } => Some(Self::Stop),
+            Asked::Kiln => Some(Self::Kiln),
+            Asked::Steered(_) => None,
+        }
+    }
+}
+
+/// What the work under way reports of itself ([`Pace::reporting`]): a landing's records in Slates' audit, say.
+pub struct Reports(Box<dyn FnMut() -> Value>);
+
+impl std::fmt::Debug for Reports {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reports(..)")
+    }
+}
+
+/// Format: the chance a healthy answer outlasts the window its kind's tail gives ([`tail`]): a drive makes tens of
+/// waits (the slates drives about thirty, the harness drives fewer), so at one in ten thousand a whole drive is refused
+/// for no stall about once in three hundred runs or fewer.
+pub const FALSE_STALL: f64 = 1e-4;
+
+/// The window of answers that took `took`: an upper prediction bound for the next, at [`FALSE_STALL`], of a log-normal
+/// fitted to them (an answer's time is a product of many stretches, a busy machine's among them), with Student's t for
+/// their own count, so a few answers give a wide window and many a close one; never under the slowest of them. None
+/// below two answers: a spread isn't measured from one, so such a wait follows its parties' liveness and kiln's word
+/// alone, as a cold start does.
+pub fn tail(took: &[Duration]) -> Option<Duration> {
+    let logs: Vec<f64> = took.iter().map(|d| d.as_secs_f64().max(f64::MIN_POSITIVE).ln()).collect();
+    let n = u32::try_from(logs.len()).ok().filter(|n| *n >= 2)?;
+    let count = f64::from(n);
+    let mean = logs.iter().sum::<f64>() / count;
+    let spread = (logs.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / (count - 1.0)).sqrt();
+    let t = t_upper(FALSE_STALL, n - 1);
+    let bound = (mean + t * spread * (1.0 + 1.0 / count).sqrt()).exp();
+    let slowest = took.iter().max().copied().unwrap_or_default();
+    Some(Duration::try_from_secs_f64(bound).unwrap_or(Duration::MAX).max(slowest))
+}
+
+/// P(|T| <= `t`) for Student's t with `nu` degrees of freedom, by its closed form for whole degrees (Abramowitz and
+/// Stegun 26.7.3 for odd, 26.7.4 for even): no fitted coefficient.
+fn t_within(t: f64, nu: u32) -> f64 {
+    let theta = (t / f64::from(nu).sqrt()).atan();
+    let (sin, cos) = theta.sin_cos();
+    let cos2 = cos * cos;
+    if nu % 2 == 0 {
+        let (mut term, mut sum) = (1.0, 1.0);
+        for j in 1..=(nu - 2) / 2 {
+            term *= f64::from(2 * j - 1) / f64::from(2 * j) * cos2;
+            sum += term;
+        }
+        sin * sum
+    } else if nu == 1 {
+        2.0 * theta / std::f64::consts::PI
+    } else {
+        let (mut term, mut sum) = (cos, cos);
+        for j in 1..=(nu - 3) / 2 {
+            term *= f64::from(2 * j) / f64::from(2 * j + 1) * cos2;
+            sum += term;
+        }
+        2.0 / std::f64::consts::PI * (theta + sin * sum)
+    }
+}
+
+/// The `t` Student's t with `nu` degrees of freedom exceeds with chance `p`, found by halving between bounds of it:
+/// doubling from 1 until the chance is below `p`, then halving to the float's resolution.
+pub fn t_upper(p: f64, nu: u32) -> f64 {
+    let above = |t: f64| (1.0 - t_within(t, nu)) / 2.0;
+    let mut high = 1.0_f64;
+    while above(high) > p && high < f64::MAX / 2.0 {
+        high *= 2.0;
+    }
+    let mut low = 0.0_f64;
+    for _ in 0..f64::MANTISSA_DIGITS {
+        let mid = (low + high) / 2.0;
+        if above(mid) > p { low = mid } else { high = mid }
+    }
+    high
 }
 
 /// A drive's own processes on the host: those of its runner's trees (`roots`, [`host_roots`]) that
@@ -1595,7 +1702,7 @@ impl<'a> Watch<'a> {
     fn message(&self, info: &Value) -> Option<String> {
         match self.asked {
             Asked::Opening => Some(opening_id(info.get("id").and_then(Value::as_str).unwrap_or_default())),
-            Asked::Message(m) | Asked::Steered(m) => Some(m.to_owned()),
+            Asked::Message(m) | Asked::Steered(m) | Asked::Landing(m) => Some(m.to_owned()),
             Asked::Stop { .. } | Asked::Kiln => None,
         }
     }
@@ -1629,7 +1736,7 @@ impl<'a> Watch<'a> {
             self.seen = Some(now);
         }
         let quiet = at.saturating_sub(self.moved);
-        let Some(slowest) = self.window.filter(|w| quiet > *w) else { return Verdict::Wait };
+        let Some(bound) = self.window.filter(|w| quiet > *w) else { return Verdict::Wait };
         let message = self.message(info);
         // kiln holding it, for a cause it states of it, is kiln's progress on it: the window starts again.
         if let Some(why) = message.as_deref().and_then(|m| holds(info, events, state, &self.admission, m)) {
@@ -1637,8 +1744,8 @@ impl<'a> Watch<'a> {
             return Verdict::Held(why);
         }
         match message.map(|m| client_of(events, &m)).filter(|client| status(info) == "idle" && state.is_some_and(|s| in_queue(s, client))) {
-            Some(message) => Verdict::Refuse(Stall::DeliveryStuck { message, quiet, slowest }),
-            None => Verdict::Refuse(Stall::Quiet { quiet, slowest }),
+            Some(message) => Verdict::Refuse(Stall::DeliveryStuck { message, quiet, bound }),
+            None => Verdict::Refuse(Stall::Quiet { quiet, bound }),
         }
     }
 
@@ -1854,22 +1961,27 @@ fn party_ended(f: &Fixture, what: &str, stuck: SetupStuck) -> anyhow::Error {
 }
 
 impl Pace {
-    /// The slowest answer so far.
+    /// The slowest answer so far, of any kind.
     pub fn slowest(&self) -> Option<Duration> {
-        self.slowest
+        self.answers.values().flatten().max().copied()
     }
 
-    /// The longest a wait on `asked` may go without progress: the drive's own slowest answer. None before
-    /// its first (its cold start: its image built, its microVM booted, its harness's first answer), and none
-    /// for a turn asked to be long ([`Asked::Steered`]), which no shorter kind of answer bounds: such a wait
-    /// follows its own parties' liveness and progress and kiln's word alone, as the person ruled ("The cold
-    /// start, and every wait after a run-out, follows the party's liveness and progress. After that the bound
-    /// is the slowest answer seen."). Never another drive's.
+    /// The longest a wait on `asked` may go without progress: the tail of the drive's own answers of its kind
+    /// ([`tail`]). None before two of them (its cold start: its image built, its microVM booted, its harness's
+    /// first answer; a landing's first turn), and none for a turn asked to be long ([`Asked::Steered`]): such a
+    /// wait follows its own parties' liveness and progress and kiln's word alone, as the person ruled ("The cold
+    /// start, and every wait after a run-out, follows the party's liveness and progress."). Never another
+    /// drive's, nor another kind's.
     pub fn window(&self, asked: Asked<'_>) -> Option<Duration> {
-        match asked {
-            Asked::Steered(_) => None,
-            Asked::Opening | Asked::Message(_) | Asked::Stop { .. } | Asked::Kiln => self.slowest,
-        }
+        tail(self.answers.get(&AnswerKind::of(asked)?)?)
+    }
+
+    /// This pace with `reports`, what the work under way reports of itself (a landing's records in Slates' audit),
+    /// read at each look: a change of it is progress ([`moving`]).
+    #[must_use]
+    pub fn reporting(mut self, reports: impl FnMut() -> Value + 'static) -> Pace {
+        self.reports = Some(Reports(Box::new(reports)));
+        self
     }
 
     /// The drive's own processes on the host from now on ([`Own::from_now`]), whose progress a starting
@@ -1880,17 +1992,24 @@ impl Pace {
 
     /// What of the drive's own processes a look at a session kiln says `info` of takes: while it starts
     /// (its image building, its microVM booting, kiln's word on it unmoving), those processes and their
-    /// CPU ([`Own::read`]); else, and where the drive knows none, null.
-    fn parties(&self, info: &Value) -> anyhow::Result<Value> {
-        match &self.own {
-            Some(own) if status(info) == "starting" => own.read(),
-            _ => Ok(Value::Null),
-        }
+    /// CPU ([`Own::read`]); else, and where the drive knows none, null. With what the work under way
+    /// reports of itself beside them, where the drive reads that ([`Pace::reporting`]).
+    fn parties(&mut self, info: &Value) -> anyhow::Result<Value> {
+        let own = match &self.own {
+            Some(own) if status(info) == "starting" => own.read()?,
+            _ => Value::Null,
+        };
+        Ok(match self.reports.as_mut() {
+            Some(Reports(read)) => json!({"own": own, "reported": read()}),
+            None => own,
+        })
     }
 
-    /// An answer that took `took`.
-    pub fn answered(&mut self, took: Duration) {
-        self.slowest = Some(self.slowest.map_or(took, |s| s.max(took)));
+    /// An answer of the kind `asked` waits for that took `took` (a turn asked to be long teaches nothing).
+    pub fn answered(&mut self, asked: Asked<'_>, took: Duration) {
+        if let Some(kind) = AnswerKind::of(asked) {
+            self.answers.entry(kind).or_default().push(took);
+        }
     }
 
     /// Waits on session `id` until `done` holds of kiln's word on it and its timeline, following its
@@ -1930,7 +2049,7 @@ impl Pace {
             }
             match verdict {
                 Verdict::Done => {
-                    self.answered(began.elapsed());
+                    self.answered(asked, began.elapsed());
                     self.feeds.insert(id.to_owned(), wake);
                     return Ok((i, e));
                 }
@@ -1962,7 +2081,7 @@ impl Pace {
             let looked = Instant::now();
             let (code, body) = common::http(f.port, "GET", &format!("/api/harness/sessions/{id}"), &f.admin, None)?;
             if code == 404 {
-                self.answered(began.elapsed());
+                self.answered(Asked::Kiln, began.elapsed());
                 return Ok(());
             }
             anyhow::ensure!(code == 200, "{what}: GET its session: {code} {body}");
@@ -2110,8 +2229,8 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let nonce = nonce();
     let mut inventory = Inventory::new(programs);
     let look = |inv: &mut Inventory| if roots.is_empty() { Ok(()) } else { inv.look(roots) };
-    // Each wait follows the harness, and while its session starts the drive's own processes, bounded by its
-    // slowest answer in this drive once it gave one ([`Pace::window`]).
+    // Each wait follows the harness, and while its session starts the drive's own processes, bounded by the
+    // tail of its answers of the wait's kind in this drive once it gave two ([`Pace::window`]).
     let mut pace = Pace::owning(roots)?;
     let mut ends = Ends::new(f);
 

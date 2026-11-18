@@ -24,7 +24,7 @@ use crate::dirblocks::{BlockRef, BlockStore};
 use crate::dirtree::Retired;
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo, RefOwner, SnapshotId};
-use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind};
+use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind, SpecialNode};
 use crate::journal::{Op, OpLog};
 use crate::names::{self, NameEquivalence};
 use crate::quota::{Accounting, Quota};
@@ -64,6 +64,11 @@ const DESTROY_CLOCK_EVERY_UNITS: usize = 16;
 /// Format: `LINK_MAX` as Linux and macOS report it for ext4 and APFS (65,000 and 32,767); the
 /// smaller is the volume's bound so a landing never produces a file the target refuses.
 pub const LINK_MAX: u32 = 32_767;
+
+/// Format: the live inodes a volume is made with — its root directory, and nothing else. The version
+/// slots a dynamic volume holds from its admission (A-342), taken before it is made so a refusal leaves
+/// nothing allocated.
+pub const NEW_VOLUME_INODES: u64 = 1;
 
 /// Derived: the inode-version budget's operation headroom (§4.2) — the transient version a copy-up
 /// holds. `Volume::make_current_inode` inserts the new inode version and retires the old within one
@@ -489,6 +494,16 @@ pub struct Volume {
   /// admitting owner (the server derives it from the shard's inode capacity); a volume built without
   /// a set allowance is unbounded (`u64::MAX`), so tests and non-admitting callers are unaffected.
   pub(crate) inode_allowance: u64,
+  /// Whether this volume's inode slots are a version hold (§4.2 "Dynamic volumes"; A-342): set by the admitting owner
+  /// for a dynamic volume, whose allowance is a ceiling it reserves nothing of. Off for a bounded claim, whose whole
+  /// allowance its admission reserved, and for a volume built without an owner (tests, snapshot views), which the slab
+  /// alone bounds.
+  pub(crate) holds_versions: bool,
+  /// The version slots this volume holds for its live inodes while [`Volume::holds_versions`] is set: one taken from the
+  /// shard's unpromised version capacity for each inode issued past it, never given back while the volume lives (an
+  /// unlinked inode's slot backs the next one, as a dynamic volume's byte growth backs its next write), and returned
+  /// whole by the owner at teardown ([`Volume::version_hold`]).
+  pub(crate) version_hold: u64,
   /// Live directory entries the head reaches (§4.2 resource vector, the namespace dimension):
   /// incremented on `dir_insert`, decremented on `dir_remove`. Bounds hard-link fan-out and name
   /// churn, which neither the byte quota nor the inode allowance bounds (one inode, many names).
@@ -557,6 +572,9 @@ struct Needs {
   blocks: usize,
   /// Inode versions a snapshot pins that the copy-ups will retain (the retention charge).
   retained: u64,
+  /// Fresh inode numbers the verb issues: a dynamic volume's hold grows by those past it (A-342), from the same
+  /// unpromised version capacity the retention charge draws on.
+  fresh: u64,
 }
 
 /// A rename [`Volume::admit_rename`] admitted: its source and target as looked up, the spelling the
@@ -590,6 +608,38 @@ pub struct Observed {
   pub change: u64,
   /// The Windows attribute bits kept beside the mode (A-262).
   pub windows: crate::inode::WindowsAttributes,
+  /// A device node's number (A-294); `None` for every other kind.
+  pub device: Option<crate::inode::DeviceNumber>,
+}
+
+/// What a create of a leaf makes: a regular file, or a name with no content (A-26, A-294).
+#[derive(Clone, Copy, Debug)]
+enum Leaf {
+  /// An empty regular file.
+  File,
+  /// A FIFO or socket name, or a device node with its number.
+  Special(SpecialNode),
+}
+
+impl Leaf {
+  /// The kind of inode it makes.
+  const fn kind(self) -> Kind {
+    match self {
+      Leaf::File => Kind::File,
+      Leaf::Special(node) => node.kind(),
+    }
+  }
+
+  /// The directory entry naming the inode `no` it makes.
+  const fn child(self, no: InodeNo) -> Child {
+    match self {
+      Leaf::File => Child::File(no),
+      Leaf::Special(SpecialNode::Fifo) => Child::Fifo(no),
+      Leaf::Special(SpecialNode::Socket) => Child::Socket(no),
+      Leaf::Special(SpecialNode::BlockDevice(_)) => Child::BlockDevice(no),
+      Leaf::Special(SpecialNode::CharDevice(_)) => Child::CharDevice(no),
+    }
+  }
 }
 
 /// A `readdir` row.
@@ -637,8 +687,9 @@ pub(crate) struct VolumeSeed {
 }
 
 impl Volume {
-  /// The volume's inode-number prefix: the top bits of every inode number it issues, so an inode number names its
-  /// volume within a shard (what a write log's replay routes by, A-63).
+  /// The volume's inode-number prefix: the top bits of every inode number it issues. A clone keeps its origin's numbers
+  /// for every inode it inherits, so an inode number alone does not name its volume: a write log's replay goes by the
+  /// volume its record names (A-63; 2026-11-18).
   pub fn prefix(&self) -> u16 {
     self.prefix
   }
@@ -722,8 +773,10 @@ impl Volume {
       takeover_below: InodeNo(0),
       takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
-      live_inodes: 1,
+      live_inodes: NEW_VOLUME_INODES,
       inode_allowance: u64::MAX,
+      holds_versions: false,
+      version_hold: 0,
       live_entries: 0,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
@@ -739,12 +792,36 @@ impl Volume {
 
   /// Clones `snapshot` of `origin` into a new volume sharing its nodes: O(1) (D-5). The clone's
   /// policy is the origin's; its inode counter continues from the origin's so numbers stay
-  /// unique across both.
+  /// unique across both. An overlay's clone reads the origin's base directories as the origin does.
   pub fn clone_of(
     store: &Store,
     origin: &mut Volume,
     snapshot: SnapshotId,
+    config: VolumeConfig,
+  ) -> Result<Volume, VfsError> {
+    Volume::clone_inner(store, origin, snapshot, config, CloneBase::Inherit)
+  }
+
+  /// Clones `snapshot` of `origin` as [`Volume::clone_of`] does, with no base plane: for a snapshot captured as a
+  /// complete immutable base (§4.15 `capture_base`, A-291), whose tree holds every name, byte and attribute the base
+  /// directory gave it, so the clone reads nothing from a host and needs no base directory (and moves between fleet
+  /// members as a plain volume does). The caller has judged the snapshot complete; an entry it still left to the base
+  /// would read `BaseUnavailable` in the clone.
+  pub fn clone_without_base(
+    store: &Store,
+    origin: &mut Volume,
+    snapshot: SnapshotId,
+    config: VolumeConfig,
+  ) -> Result<Volume, VfsError> {
+    Volume::clone_inner(store, origin, snapshot, config, CloneBase::Drop)
+  }
+
+  fn clone_inner(
+    store: &Store,
+    origin: &mut Volume,
+    snapshot: SnapshotId,
     mut config: VolumeConfig,
+    base: CloneBase,
   ) -> Result<Volume, VfsError> {
     if config.names != origin.policy {
       return Err(VfsError::PolicyMismatch);
@@ -753,6 +830,14 @@ impl Volume {
       .snapshots
       .get_mut(snapshot_handle(snapshot))
       .map_err(|_| VfsError::StaleHandle)?;
+    // The clone's root directory is its snapshot's, which keeps the origin's root number: the number a base plane keys
+    // the root's listing by, and the one the clone's image records as its root. Read before the snapshot is pinned, so
+    // a refusal pins nothing.
+    let root_no = store
+      .dirs
+      .get(snap.root)
+      .map_err(|_| VfsError::StaleHandle)?
+      .inode;
     snap.clone_refs = snap.clone_refs.saturating_add(1);
     let (root, inode_root, epoch, referenced) = (
       snap.root,
@@ -779,10 +864,10 @@ impl Volume {
       last_snapshot: None,
       origin_epoch: Some(epoch),
       quota: config.quota,
-      base: origin
-        .base
-        .as_ref()
-        .map(|b| b.for_clone(InodeNo::compose(config.prefix, 1), epoch)),
+      base: match base {
+        CloneBase::Inherit => origin.base.as_ref().map(|b| b.for_clone(root_no, epoch)),
+        CloneBase::Drop => None,
+      },
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
       change: ChangeWaiters::default(),
@@ -808,6 +893,8 @@ impl Volume {
       dirty: crate::delta::Dirty::default(),
       live_inodes: origin.live_inodes,
       inode_allowance: u64::MAX,
+      holds_versions: false,
+      version_hold: 0,
       live_entries: origin.live_entries,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
@@ -909,8 +996,10 @@ impl Volume {
       takeover_below: InodeNo(0),
       takeover_kept: BTreeSet::new(),
       dirty: crate::delta::Dirty::default(),
-      live_inodes: 1,
+      live_inodes: NEW_VOLUME_INODES,
       inode_allowance: u64::MAX,
+      holds_versions: false,
+      version_hold: 0,
       live_entries: 0,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
@@ -1090,7 +1179,12 @@ impl Volume {
       .ok_or(VfsError::NotFound)?;
     let inode = match entry.child {
       Child::Dir(h) => store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => no,
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => no,
       Child::Whiteout => return Err(VfsError::NotFound),
     };
     Ok(Located {
@@ -1113,6 +1207,7 @@ impl Volume {
       attrs: inode.attrs,
       change: inode.version,
       windows: inode.windows,
+      device: inode.device(),
     })
   }
 
@@ -1155,6 +1250,8 @@ impl Volume {
         Child::Symlink(no) => (Kind::Symlink, no),
         Child::Fifo(no) => (Kind::Fifo, no),
         Child::Socket(no) => (Kind::Socket, no),
+        Child::BlockDevice(no) => (Kind::BlockDevice, no),
+        Child::CharDevice(no) => (Kind::CharDevice, no),
         Child::Whiteout => continue,
       };
       rows.push(DirRow {
@@ -1191,6 +1288,8 @@ impl Volume {
         Child::Symlink(no) => (Kind::Symlink, no),
         Child::Fifo(no) => (Kind::Fifo, no),
         Child::Socket(no) => (Kind::Socket, no),
+        Child::BlockDevice(no) => (Kind::BlockDevice, no),
+        Child::CharDevice(no) => (Kind::CharDevice, no),
         Child::Whiteout => continue,
       };
       if rows.len() >= limit
@@ -1580,7 +1679,7 @@ impl Volume {
           store.content.read_extent_into(e, off, out)?;
         }
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
+      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
     }
     Ok(want)
   }
@@ -1661,23 +1760,21 @@ impl Volume {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
-    self.create_leaf(store, dir, name, mode, Kind::File)
+    self.create_leaf(store, dir, name, mode, Leaf::File)
   }
 
-  /// Creates a FIFO/socket name without a stream or listener (A-26).
+  /// Creates a name with no content (A-26, A-294): a FIFO or socket name without a stream or listener, or a device
+  /// node whose number is metadata. Nothing in the volume opens the device a node names; its body is its number.
   pub fn mknod_no(
     &mut self,
     store: &mut Store,
     dir_no: InodeNo,
     name: &str,
     mode: u32,
-    kind: Kind,
+    node: SpecialNode,
   ) -> Result<InodeNo, VfsError> {
-    if !kind.is_special() {
-      return Err(VfsError::Invalid);
-    }
     let dir = self.entry_dir(store, dir_no)?;
-    self.create_leaf(store, dir, name, mode, kind)
+    self.create_leaf(store, dir, name, mode, Leaf::Special(node))
   }
 
   fn create_leaf(
@@ -1686,8 +1783,9 @@ impl Volume {
     dir: Handle<DirNode>,
     name: &str,
     mode: u32,
-    kind: Kind,
+    leaf: Leaf,
   ) -> Result<InodeNo, VfsError> {
+    let kind = leaf.kind();
     self.live()?;
     names::check(name)?;
     self.refuse_existing(store, dir, name)?;
@@ -1704,10 +1802,9 @@ impl Volume {
     let parent = store.dirs.get(dir)?.inode;
     let no = self.next_no(store)?;
     let now = self.clock.wall_ns();
-    let body = if kind.is_special() {
-      Body::None
-    } else {
-      Body::Inline(Vec::new())
+    let body = match leaf {
+      Leaf::Special(node) => node.body(),
+      Leaf::File => Body::Inline(Vec::new()),
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Home::new(parent, self.policy.hash(name));
@@ -1716,11 +1813,7 @@ impl Volume {
     }
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
-    let child = match kind {
-      Kind::Fifo => Child::Fifo(no),
-      Kind::Socket => Child::Socket(no),
-      _ => Child::File(no),
-    };
+    let child = leaf.child(no);
     // Publication: the name is the one step a client sees.
     if let Err(refusal) = self.dir_insert(store, dir, name, child) {
       return Err(refusal.after_undo(self.uninstall(store, no, handle)));
@@ -1892,20 +1985,13 @@ impl Volume {
     target: InodeNo,
   ) -> Result<(), VfsError> {
     let kind = self.admit_link(store, dir, name, target)?;
+    // `admit_link` refuses a directory, so every kind it admits names a leaf entry.
+    let child = Child::of_leaf(kind, target).ok_or(VfsError::NotPermitted)?;
     let dir = self.make_current_dir(store, dir)?;
     // The target's version made current before the name is published, so the link count and the
     // multi-path flag below change it in place and cannot be refused after the entry exists.
     self.make_current_inode(store, target)?;
     let now = self.clock.wall_ns();
-    let child = if kind == Kind::Symlink {
-      Child::Symlink(target)
-    } else if kind == Kind::Fifo {
-      Child::Fifo(target)
-    } else if kind == Kind::Socket {
-      Child::Socket(target)
-    } else {
-      Child::File(target)
-    };
     self.dir_insert(store, dir, name, child)?;
     self.adjust_nlink(store, target, 1)?;
     // From now on the inode has had more than one path; the deriver walks for them.
@@ -2113,7 +2199,12 @@ impl Volume {
       Some(t)
         if matches!(
           t.child,
-          Child::File(_) | Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_)
+          Child::File(_)
+            | Child::Symlink(_)
+            | Child::Fifo(_)
+            | Child::Socket(_)
+            | Child::BlockDevice(_)
+            | Child::CharDevice(_)
         ) =>
       {
         self.retention_of_drop(store, t.inode)?
@@ -2123,7 +2214,7 @@ impl Volume {
     // A preflight: the pool's claimable room counts (A-98); the charge that follows claims it.
     if retention > store.admittable() {
       self.retention_refusals = self.retention_refusals.saturating_add(1);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     // Replacing another entry keeps the replaced entry's spelling on a folding volume, as APFS does:
     // `d` renamed onto `a` where `A` exists leaves one entry, `A` (EQUIVALENCE §4). Under the exact
@@ -2189,7 +2280,12 @@ impl Volume {
     let to_dir = self.make_current_dir(store, to_dir)?;
     let moving = match source.child {
       Child::Dir(moving) => Some(self.make_current_dir_node(store, moving)?),
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => {
         self.make_current_inode(store, no)?;
         None
       }
@@ -2224,9 +2320,12 @@ impl Volume {
           self.drop_link(store, t.inode)?;
           self.adjust_nlink(store, store.dirs.get(to_dir)?.inode, -1)?;
         }
-        Child::File(_) | Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) => {
-          self.drop_link(store, t.inode)?
-        }
+        Child::File(_)
+        | Child::Symlink(_)
+        | Child::Fifo(_)
+        | Child::Socket(_)
+        | Child::BlockDevice(_)
+        | Child::CharDevice(_) => self.drop_link(store, t.inode)?,
         Child::Whiteout => {}
       }
     }
@@ -2241,7 +2340,12 @@ impl Volume {
           self.adjust_nlink(store, to_no, 1)?;
         }
       }
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => {
         // The file's home follows it.
         let handle = self.make_current_inode(store, no)?;
         store.inodes.get_mut(handle)?.home = Home::new(to_no, self.policy.hash(to_name));
@@ -2505,7 +2609,9 @@ impl Volume {
       Kind::File => Ok(()),
       Kind::Dir => Err(VfsError::IsDirectory),
       Kind::Symlink => Err(VfsError::Invalid),
-      Kind::Fifo | Kind::Socket => Err(VfsError::SpecialFileOperation),
+      Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
+        Err(VfsError::SpecialFileOperation)
+      }
     }
   }
 
@@ -2823,7 +2929,12 @@ impl Volume {
       .ok_or(VfsError::NotFound)?;
     let inode = match entry.child {
       Child::Dir(h) => store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => no,
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => no,
       Child::Whiteout => return Err(VfsError::NotFound),
     };
     Ok(Located {
@@ -2920,7 +3031,7 @@ impl Volume {
           store.content.read_extent_into(e, off, out)?;
         }
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
+      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
     }
     Ok(want)
   }
@@ -2945,6 +3056,20 @@ impl Volume {
       return Err(VfsError::NotFound);
     }
     Ok(inode.attrs)
+  }
+
+  /// A device node's number as a snapshot holds it (A-294); `None` for every other kind.
+  pub fn device_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<Option<crate::inode::DeviceNumber>, VfsError> {
+    let inode = self.inode_in(store, id, no)?;
+    if inode.attribute_of().is_some() {
+      return Err(VfsError::NotFound);
+    }
+    Ok(inode.device())
   }
 
   /// The inode record a snapshot holds for `no`.
@@ -3091,7 +3216,14 @@ impl Volume {
       for e in node.iter(&store.blocks) {
         match e.child {
           Child::Dir(h) => stack.push((format!("{prefix}/{}", e.name), h)),
-          Child::File(n) | Child::Symlink(n) | Child::Fifo(n) | Child::Socket(n) if n == no => {
+          Child::File(n)
+          | Child::Symlink(n)
+          | Child::Fifo(n)
+          | Child::Socket(n)
+          | Child::BlockDevice(n)
+          | Child::CharDevice(n)
+            if n == no =>
+          {
             out.push(format!("{prefix}/{}", e.name))
           }
           _ => {}
@@ -3398,6 +3530,8 @@ impl Volume {
         Child::Symlink(no) => (Kind::Symlink, no),
         Child::Fifo(no) => (Kind::Fifo, no),
         Child::Socket(no) => (Kind::Socket, no),
+        Child::BlockDevice(no) => (Kind::BlockDevice, no),
+        Child::CharDevice(no) => (Kind::CharDevice, no),
         Child::Whiteout => continue,
       };
       rows.push(DirRow {
@@ -3813,6 +3947,13 @@ impl Volume {
     if self.live_inodes >= self.inode_allowance || self.next_counter >= InodeNo::DERIVED_BIT {
       return Err(VfsError::NoSpace);
     }
+    // A dynamic volume's inode past its hold first takes a slot from the shard's unpromised version capacity (A-342),
+    // refused `NoSpace` once none is left, as its bytes' growth is.
+    let growth = self.hold_growth(1);
+    if growth > 0 {
+      let taken = store.versions.grow(growth).map_err(|_| VfsError::NoSpace)?;
+      self.version_hold = self.version_hold.saturating_add(taken.slots);
+    }
     let no = InodeNo::compose(self.prefix, self.next_counter);
     self.next_counter = self.next_counter.saturating_add(1);
     self.live_inodes = self.live_inodes.saturating_add(1);
@@ -3928,6 +4069,7 @@ impl Volume {
   fn need_new_inode(&self, store: &Store, needs: &mut Needs) -> Result<(), VfsError> {
     let no = InodeNo::compose(self.prefix, self.next_counter);
     needs.inodes = needs.inodes.saturating_add(1);
+    needs.fresh = needs.fresh.saturating_add(1);
     needs.tries = needs.tries.saturating_add(trie::nodes_to_set(
       &store.tries,
       self.inode_root,
@@ -4013,12 +4155,20 @@ impl Volume {
     if store.blocks.room() < needs.blocks {
       return Err(VfsError::Memory(store.blocks.refusal()));
     }
-    if needs.retained > 0 {
-      let over_allowance = self.retention_allowance != u64::MAX
-        && self.retained_versions().saturating_add(needs.retained) > self.retention_allowance;
-      if over_allowance || store.versions.admittable() < needs.retained {
-        return Err(VfsError::NoSpace);
-      }
+    let over_allowance = needs.retained > 0
+      && self.retention_allowance != u64::MAX
+      && self.retained_versions().saturating_add(needs.retained) > self.retention_allowance;
+    // The retention the copy-ups charge and the hold a dynamic volume's fresh inodes grow (A-342) both come from the
+    // shard's unpromised version capacity, so they are admitted together. A refusal names its bound: the retention
+    // when the copy-ups alone do not fit (§4.2 `RetentionBudgetExceeded`), else the growth, as a dynamic volume's
+    // refused bytes are named.
+    let admittable = store.versions.admittable();
+    if over_allowance || admittable < needs.retained {
+      return Err(VfsError::RetentionExceeded);
+    }
+    let versions = needs.retained.saturating_add(self.hold_growth(needs.fresh));
+    if versions > 0 && admittable < versions {
+      return Err(VfsError::NoSpace);
     }
     Ok(())
   }
@@ -4318,7 +4468,7 @@ impl Volume {
     store.make_room(bytes);
     if store.budget.charge_retention(bytes).is_err() {
       self.retention_refusals = self.retention_refusals.saturating_add(1);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     self.retention_prepaid = self.retention_prepaid.saturating_add(bytes);
     Ok(())
@@ -4393,10 +4543,10 @@ impl Volume {
     store
       .budget
       .charge_retention(all)
-      .map_err(|_| VfsError::NoSpace)?;
+      .map_err(|_| VfsError::RetentionExceeded)?;
     if store.versions.charge_retention(versions).is_err() {
       store.budget.credit_retention(all);
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     self.retention_charged = bytes;
     self.versions_charged = versions;
@@ -4436,6 +4586,53 @@ impl Volume {
     }
     self.inode_allowance = allowance;
     Ok(())
+  }
+
+  /// Makes this volume's inode slots a version hold (§4.2 "Dynamic volumes"; A-342) and takes the slots its live inodes
+  /// need now — a new volume's root, a clone's inherited inodes, a rebuilt volume's live ones — from the shard's
+  /// unpromised version capacity, whole or not at all: refused `BudgetExceeded` with nothing changed when that capacity
+  /// cannot back them. The admitting owner calls it for a dynamic volume in place of reserving its allowance, which
+  /// stays the ceiling [`Volume::next_no`] refuses at; from here each inode issued past the hold takes one slot more.
+  pub fn hold_versions(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    let growth = self.live_inodes.saturating_sub(self.version_hold);
+    if growth > 0 {
+      let taken = store.versions.grow(growth).map_err(VfsError::Memory)?;
+      self.version_hold = self.version_hold.saturating_add(taken.slots);
+    }
+    self.holds_versions = true;
+    Ok(())
+  }
+
+  /// Makes this volume's inode slots a version hold of `slots` its owner already took for it from the shard's unpromised
+  /// version capacity (A-342): a dynamic clone's inherited inodes, taken before the clone pinned its snapshot so that a
+  /// refusal had nothing to unpin. Each inode it issues past them grows the hold as any dynamic volume's does.
+  pub fn adopt_version_hold(&mut self, slots: u64) {
+    self.version_hold = self.version_hold.saturating_add(slots);
+    self.holds_versions = true;
+  }
+
+  /// The version slots this volume holds for its inodes (A-342): what its owner returns to the shard's version budget
+  /// at teardown. Zero for a volume whose slots its admission reserved (a bounded claim) or that no owner admitted.
+  pub fn version_hold(&self) -> u64 {
+    self.version_hold
+  }
+
+  /// Whether this volume's inode slots are a version hold (A-342): a dynamic volume its owner admitted, whose allowance
+  /// is a ceiling with nothing reserved of it.
+  pub fn holds_versions(&self) -> bool {
+    self.holds_versions
+  }
+
+  /// The slots issuing `fresh` more inodes would take into the hold (A-342): those past it, for a volume that holds
+  /// its versions; none for any other.
+  fn hold_growth(&self, fresh: u64) -> u64 {
+    if !self.holds_versions {
+      return 0;
+    }
+    self
+      .live_inodes
+      .saturating_add(fresh)
+      .saturating_sub(self.version_hold)
   }
 
   pub(crate) fn inode<'s>(&self, store: &'s Store, no: InodeNo) -> Result<&'s Inode, VfsError> {
@@ -4663,7 +4860,7 @@ impl Volume {
       && self.retains(born)
       && self.retained_versions() >= self.retention_allowance
     {
-      return Err(VfsError::NoSpace);
+      return Err(VfsError::RetentionExceeded);
     }
     // A retained version also draws a slot from the shard's version budget — from capacity not
     // promised to any volume's logical allowance or the copy-up headroom (§4.2: "a new retained
@@ -4683,7 +4880,7 @@ impl Volume {
       store
         .versions
         .charge_retention(1)
-        .map_err(|_| VfsError::NoSpace)?;
+        .map_err(|_| VfsError::RetentionExceeded)?;
       self.versions_charged = self.versions_charged.saturating_add(1);
     }
     let _ = kind;
@@ -5014,9 +5211,12 @@ impl Volume {
     self.need_current_dir(store, to_no, &mut needs, &mut counted)?;
     match source.child {
       Child::Dir(_) => self.need_current_dir(store, source.inode, &mut needs, &mut counted)?,
-      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
-        self.need_current_inode(store, no, &mut needs)?
-      }
+      Child::File(no)
+      | Child::Symlink(no)
+      | Child::Fifo(no)
+      | Child::Socket(no)
+      | Child::BlockDevice(no)
+      | Child::CharDevice(no) => self.need_current_inode(store, no, &mut needs)?,
       Child::Whiteout => {}
     }
     if let Some(t) = replaced {
@@ -5638,6 +5838,78 @@ impl Volume {
       // The image is what a further successor would restore until this daemon publishes (A-154).
       let committed = self.committed_opens.entry((holder, no)).or_insert(0);
       *committed = committed.saturating_add(opens);
+    }
+    Ok(())
+  }
+
+  /// What recorded attachment `attachment` holds now: its references by inode, each with how many of them are open
+  /// handles, in inode order (A-303: the tables a Shards stream hands its device at a VM's save, Shards' D176 part 5).
+  /// The same shape as the recovery image's ([`Volume::attachment_references`]), for one attachment. Empty for an
+  /// attachment holding nothing.
+  pub fn held_by(&self, attachment: u64) -> Vec<crate::recover::InodeReferences> {
+    self
+      .attachment_refs
+      .get(&RefOwner::Attachment(attachment))
+      .map(|inodes| {
+        inodes
+          .iter()
+          .map(|(no, count)| crate::recover::InodeReferences {
+            inode: no.0,
+            count: *count,
+            opens: self.attachment_open_count(attachment, *no),
+          })
+          .collect()
+      })
+      .unwrap_or_default()
+  }
+
+  /// Gives recorded attachment `attachment`, which holds nothing yet, the references and open handles `held` names
+  /// (A-303: a restored VM's stream takes what its saved stream held, on the volume saved or a clone of its cut, which
+  /// shares its numbers). The opens are restored as a takeover's are ([`Volume::restore_references`], A-152): a handle
+  /// the guest's kernel kept from the saved stream gives its open back at its release, as one issued before a takeover
+  /// does. Everything is checked before anything is given, so a refusal changes nothing: the attachment must hold
+  /// nothing, the entries must name each inode once in rising order, each with at least one reference and no more opens
+  /// than references, of an inode the volume holds, whose count can take them. A file the guest holds with no name left
+  /// is held again by these references, so it lasts until the guest lets it go.
+  pub fn adopt_held(
+    &mut self,
+    store: &Store,
+    attachment: u64,
+    held: &[crate::recover::InodeReferences],
+  ) -> Result<(), VfsError> {
+    if self
+      .attachment_refs
+      .get(&RefOwner::Attachment(attachment))
+      .is_some_and(|inodes| !inodes.is_empty())
+    {
+      return Err(VfsError::Invalid);
+    }
+    let rising = held.windows(2).all(|pair| match pair {
+      [before, after] => before.inode < after.inode,
+      _ => true,
+    });
+    if !rising {
+      return Err(VfsError::Invalid);
+    }
+    for entry in held {
+      let no = InodeNo(entry.inode);
+      if entry.count == 0 || entry.opens > entry.count {
+        return Err(VfsError::Invalid);
+      }
+      self.namespace_inode(store, no)?;
+      let global = self.references.get(&no).copied().unwrap_or(0);
+      if global.checked_add(entry.count).is_none() {
+        return Err(VfsError::TooManyLinks);
+      }
+    }
+    for entry in held {
+      self.restore_references(
+        store,
+        attachment,
+        InodeNo(entry.inode),
+        entry.count,
+        entry.opens,
+      )?;
     }
     Ok(())
   }
@@ -7267,7 +7539,7 @@ fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
       ranges.push((open.off, open.off.saturating_add(open.len)));
     }
     Body::Base(_) => ranges.push((0, size)),
-    Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
+    Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
   }
   ranges.sort_unstable();
   let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
@@ -7282,4 +7554,14 @@ fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
     }
   }
   merged
+}
+
+/// Whether a clone keeps its origin's base plane ([`Volume::clone_of`]) or has none
+/// ([`Volume::clone_without_base`], a clone of a captured base).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloneBase {
+  /// The clone reads the origin's base directories as the origin does.
+  Inherit,
+  /// The clone has no base plane.
+  Drop,
 }

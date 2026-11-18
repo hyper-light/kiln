@@ -36,7 +36,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
-  attach ID [--read | --write] [--snapshot N]
+  attach ID [--read | --write] [--snapshot N] [--hold]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
   detach ATTACHMENT [--volume ID] [--json]   (--volume: an attachment another host's owner holds)
   bootstrap (root | region) [--json]             explicitly create a new consensus group
@@ -50,7 +50,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   base digest ID PATH [--json]                     a clean base file's verified content digest
   base rewitness ID [PATH ...] [--json]
   base pin ID [PATH ...] [--json]
-  land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+  base capture ID [--json]                         capture an overlay's whole base: a snapshot whose clones move
+  land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
   image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
   image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
   grants [--json]
@@ -60,8 +61,12 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   revoke CONSUMER [--json]                         revoke a consumer's enrollment
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
-  exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
-  shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
+  exec --volume V --at PATH [--apparmor-profile] -- CMD [ARG ...]
+            run CMD with the volume at PATH (Linux); --apparmor-profile makes its namespace under slates'
+            AppArmor profile where the host restricts unprivileged user namespaces (off unless given)
+  apparmor profile [--executable PATH]            print slates' AppArmor profile for this binary (or PATH)
+  apparmor check [--json]                         can `exec` make its namespace here; how to load the profile
+  shards ID [--subtree DIR] [--read-only] --fd N [--resync-fd M] [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
   shards ID [--subtree DIR] [--read-only] [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume as a handle: {handle} in its arguments names its value,
@@ -380,6 +385,17 @@ pub(crate) enum Verb {
     /// `--oci-source` to `--oci-destination` (§4.6 A-9).
     form: slates_client::AttachRequest,
   },
+  /// Attach in the CLI's form and keep the attachment alive from this process until it ends (`slates attach --hold`,
+  /// A-384): a renewer of its own renews it at the cadence the daemon names; the process ending ends the renewals, and
+  /// the attachment lapses at its holder's pace.
+  Hold {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The intent.
+    intent: Intent,
+  },
   /// Detach.
   Detach {
     /// The attachment.
@@ -415,6 +431,12 @@ pub(crate) enum Verb {
     volume: slates_client::VolumeId,
     /// The paths, or the whole base.
     paths: Option<Vec<String>>,
+  },
+  /// Capture an overlay's whole base into a complete immutable snapshot (`base capture ID`, §4.15 `capture_base`,
+  /// A-291), whose clones need no base directory and move between fleet members.
+  CaptureBase {
+    /// The overlay.
+    volume: slates_client::VolumeId,
   },
   /// Build a snapshot's disk image (`image build`, A-160).
   ImageBuild {
@@ -493,6 +515,14 @@ pub(crate) enum Verb {
     /// Whether it is live-shipped from now on.
     live_shipped: bool,
   },
+  /// Move a volume to another fleet member (`move ID --to HOST`, §4.10, A-291): asks its owner until the configuration
+  /// names the member.
+  Move {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The member's host id, as `status` names the members.
+    to: u64,
+  },
 }
 
 /// A principal as `share` names it: a host account (`uid:N`), or a consumer — under the caller's own
@@ -530,15 +560,19 @@ pub(crate) struct ClientRequest {
   pub json: bool,
 }
 
-/// A `slates exec` request: the volume, the path to show it at, and the command to run.
+/// A `slates apparmor` request (A-370): print slates' AppArmor profile, or check whether `exec` can make its namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExecRequest {
-  /// The volume to make visible.
-  pub volume: String,
-  /// The path to make it visible at.
-  pub at: String,
-  /// The command and its arguments.
-  pub command: Vec<String>,
+pub(crate) enum AppArmorRequest {
+  /// Print the profile for `executable`, else for this binary's own path.
+  Profile {
+    /// The executable the profile attaches to, when not this binary.
+    executable: Option<String>,
+  },
+  /// Report the host's restriction, this binary's profile, and how to load it.
+  Check {
+    /// Emit machine-readable JSON.
+    json: bool,
+  },
 }
 
 /// A `slates run` request: the harness verb (§4.13) — enroll a consumer, deliver its capability to
@@ -570,6 +604,9 @@ pub(crate) struct ShardsRequest {
   pub read_only: bool,
   /// Where the command finds its end.
   pub handed: HandOff,
+  /// Where the command finds its stream's resync end (`--resync-fd M`, Unix; A-316), when it asked for one: the channel
+  /// a successor daemon hands it a fresh stream on (`slates_bridge_fuse::shards_resync`).
+  pub resync_at: Option<i32>,
   /// Announce the attachment as JSON.
   pub json: bool,
   /// The command and its arguments.
@@ -620,8 +657,10 @@ pub(crate) struct PmemRequest {
 /// The parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
-  /// The launcher.
-  Exec(ExecRequest),
+  /// The launcher (its request is every surface's, A-370).
+  Exec(slates_client::exec::ExecSpec),
+  /// slates' AppArmor profile for the launcher: print it, or check the host (A-370).
+  AppArmor(AppArmorRequest),
   /// The harness verb.
   Run(RunRequest),
   /// A command run with a Shards stream end.
@@ -691,8 +730,10 @@ const VALUES: &[&str] = &[
   "--account",
   "--uid",
   "--fd",
+  "--resync-fd",
   "--tag",
   "--dax-window",
+  "--executable",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -712,6 +753,8 @@ const SWITCHES: &[&str] = &[
   "--session",
   "--require-evidence",
   "--keep",
+  "--apparmor-profile",
+  "--hold",
 ];
 
 /// Takes the untouched command after `--` (`exec` and `run` share this boundary).
@@ -745,13 +788,14 @@ fn parse_run(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError>
   }))
 }
 
-/// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
+/// Parses `exec --volume V --at PATH [--apparmor-profile] -- CMD ...`: the flags before `--`, the command after it. The
+/// AppArmor option is off unless `--apparmor-profile` is given (A-370).
 fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
   let command = command_after(arguments)?;
   refuse_extra_command_words(taken)?;
   taken.only(&Spec {
     values: &["--volume", "--at"],
-    switches: &[],
+    switches: &["--apparmor-profile"],
   })?;
   let volume = taken
     .value("--volume")
@@ -761,11 +805,40 @@ fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError
     .value("--at")
     .ok_or(ParseError::Missing("--at"))?
     .to_owned();
-  Ok(Command::Exec(ExecRequest {
+  let apparmor = if taken.switch("--apparmor-profile") {
+    slates_client::exec::AppArmor::Profile
+  } else {
+    slates_client::exec::AppArmor::Off
+  };
+  Ok(Command::Exec(slates_client::exec::ExecSpec {
     volume,
     at,
     command,
+    apparmor,
   }))
+}
+
+/// Parses `apparmor profile [--executable PATH]` and `apparmor check [--json]` (A-370).
+fn parse_apparmor(taken: &Taken, rest: &[&str]) -> Result<Command, ParseError> {
+  match rest {
+    ["profile"] => {
+      taken.only(&Spec {
+        values: &["--executable"],
+        switches: &[],
+      })?;
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: taken.value("--executable").map(str::to_owned),
+      }))
+    }
+    ["check"] => {
+      taken.only(&NONE)?;
+      Ok(Command::AppArmor(AppArmorRequest::Check {
+        json: taken.json(),
+      }))
+    }
+    [] => Err(ParseError::Missing("`profile` or `check`")),
+    [other, ..] => Err(ParseError::UnknownCommand(format!("apparmor {other}"))),
+  }
 }
 
 /// Format: the lowest descriptor number `shards --fd` takes: standard input, output and error are 0, 1 and 2, which a
@@ -819,12 +892,18 @@ fn parse_shards(
   let handed = match kind {
     HandOffKind::Descriptor => {
       taken.only(&Spec {
-        values: &["--subtree", "--fd"],
+        values: &["--subtree", "--fd", "--resync-fd"],
         switches: &["--read-only"],
       })?;
       HandOff::Descriptor(handed_fd(taken)?)
     }
     HandOffKind::Handle => {
+      if taken.value("--resync-fd").is_some() {
+        return Err(ParseError::BadValue {
+          what: "--resync-fd",
+          reason: "Windows hands no resync end yet: Shards specifies its handle path".to_owned(),
+        });
+      }
       if taken.value("--fd").is_some() {
         return Err(ParseError::BadValue {
           what: "--fd",
@@ -855,15 +934,38 @@ fn parse_shards(
       "{handle} in the command's arguments, where the stream end's handle goes (e.g. --slates-fs-handle {handle})",
     ));
   }
+  let resync_at = resync_fd(taken, handed)?;
   Ok(Command::Shards(ShardsRequest {
     instance: taken.instance(),
     volume: volume(id)?,
     subtree: taken.value("--subtree").map(str::to_owned),
     read_only: taken.switch("--read-only"),
     handed,
+    resync_at,
     json: taken.json(),
     command,
   }))
+}
+
+/// The descriptor number `--resync-fd M` names, when given (A-316): past standard input, output and error, and not the
+/// stream's own number.
+fn resync_fd(taken: &Taken, handed: HandOff) -> Result<Option<i32>, ParseError> {
+  let Some(value) = taken.value("--resync-fd") else {
+    return Ok(None);
+  };
+  let fd = value.parse::<i32>().map_err(|e| ParseError::BadValue {
+    what: "--resync-fd",
+    reason: e.to_string(),
+  })?;
+  if fd < FIRST_HANDED_FD || handed == HandOff::Descriptor(fd) {
+    return Err(ParseError::BadValue {
+      what: "--resync-fd",
+      reason: format!(
+        "{fd} is standard input, output or error, or the stream's own number; the resync end needs a number of its own from {FIRST_HANDED_FD}"
+      ),
+    });
+  }
+  Ok(Some(fd))
 }
 
 /// The descriptor number `--fd N` names: required, and past standard input, output and error.
@@ -1003,16 +1105,27 @@ struct Spec {
   switches: &'static [&'static str],
 }
 
-/// The arguments with the flags taken out: the words in order, the flags by name.
+/// The arguments with the flags taken out: the words in order, the flags by name, each with every value it was given,
+/// in order.
 struct Taken {
   words: Vec<String>,
-  values: BTreeMap<&'static str, String>,
+  values: BTreeMap<&'static str, Vec<String>>,
   switches: BTreeMap<&'static str, bool>,
 }
 
 impl Taken {
+  /// The value of a flag that takes one: the last given.
   fn value(&self, flag: &str) -> Option<&str> {
-    self.values.get(flag).map(String::as_str)
+    self
+      .values
+      .get(flag)
+      .and_then(|given| given.last())
+      .map(String::as_str)
+  }
+
+  /// Every value of a flag that may be given again (a landing's `--include` and `--exclude`), in the order given.
+  fn every(&self, flag: &str) -> Vec<String> {
+    self.values.get(flag).cloned().unwrap_or_default()
   }
 
   fn switch(&self, flag: &str) -> bool {
@@ -1084,7 +1197,7 @@ fn take(arguments: &[String]) -> Result<Taken, ParseError> {
           .cloned()
           .ok_or_else(|| ParseError::MissingValue(full.clone()))?,
       };
-      taken.values.insert(key, value);
+      taken.values.entry(key).or_default().push(value);
     } else if let Some(key) = known(SWITCHES, &full) {
       if inline.is_some() {
         return Err(ParseError::BadValue {
@@ -1100,13 +1213,15 @@ fn take(arguments: &[String]) -> Result<Taken, ParseError> {
   Ok(taken)
 }
 
+/// `--shards N`, read as the roles read it (`slates_api::role::shard_count`): a count past the runtime's registry is
+/// refused as usage before anything starts.
 fn shards_of(taken: &Taken) -> Result<Option<u16>, ParseError> {
   taken
     .value("--shards")
     .map(|s| {
-      s.parse::<u16>().map_err(|e| ParseError::BadValue {
+      slates_api::role::shard_count(s).map_err(|reason| ParseError::BadValue {
         what: "--shards",
-        reason: e.to_string(),
+        reason,
       })
     })
     .transpose()
@@ -1295,9 +1410,31 @@ fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
         },
       )))
     }
+    ["move", id] => {
+      taken.only(&Spec {
+        values: &["--to"],
+        switches: &[],
+      })?;
+      let to = taken
+        .value("--to")
+        .ok_or(ParseError::Missing("move ID --to HOST"))?
+        .parse::<u64>()
+        .map_err(|e| ParseError::BadValue {
+          what: "--to",
+          reason: e.to_string(),
+        })?;
+      Ok(Some(client(
+        taken,
+        Verb::Move {
+          volume: volume(id)?,
+          to,
+        },
+      )))
+    }
     ["revoke"] => Err(ParseError::Missing("CONSUMER")),
     ["share", ..] => Err(ParseError::Missing("share ID PRINCIPAL")),
     ["live-ship", ..] => Err(ParseError::Missing("live-ship ID")),
+    ["move", ..] => Err(ParseError::Missing("move ID --to HOST")),
     _ => Ok(None),
   }
 }
@@ -1543,10 +1680,11 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       }))
     }
     ["volume", rest @ ..] => parse_volume(&taken, rest),
+    ["apparmor", rest @ ..] => parse_apparmor(&taken, rest),
     ["attach", id] => {
       taken.only(&Spec {
         values: &["--snapshot", "--oci-source", "--oci-destination"],
-        switches: &["--read", "--write"],
+        switches: &["--read", "--write", "--hold"],
       })?;
       let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
       let intent = if taken.switch("--write") {
@@ -1554,6 +1692,22 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       } else {
         Intent::Read
       };
+      // `--hold`: this process keeps the CLI attachment alive until it ends (A-384); a container bind has its own life.
+      if taken.switch("--hold") {
+        if taken.value("--oci-source").is_some() || taken.value("--oci-destination").is_some() {
+          return Err(ParseError::Missing(
+            "no --oci-source or --oci-destination with --hold: a container bind is not held",
+          ));
+        }
+        return Ok(client(
+          &taken,
+          Verb::Hold {
+            volume: volume(id)?,
+            snapshot,
+            intent,
+          },
+        ));
+      }
       let form = match (
         taken.value("--oci-source"),
         taken.value("--oci-destination"),
@@ -1739,17 +1893,11 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           })
         })
         .transpose()?;
+      // Each prefix as often as given (§4.15 step 1): the wire's filter takes several, and a harness leaves out more
+      // than one (git's own directory and what git ignores).
       let filter = slates_client::Filter {
-        include: taken
-          .value("--include")
-          .map(str::to_owned)
-          .into_iter()
-          .collect(),
-        exclude: taken
-          .value("--exclude")
-          .map(str::to_owned)
-          .into_iter()
-          .collect(),
+        include: taken.every("--include"),
+        exclude: taken.every("--exclude"),
       };
       Ok(client(
         &taken,
@@ -2121,9 +2269,15 @@ fn parse_base(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
         paths: paths(&rest.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>()),
       },
     )),
+    ["capture", id] => Ok(client(
+      taken,
+      Verb::CaptureBase {
+        volume: volume(id)?,
+      },
+    )),
     [] => Err(ParseError::Missing("base subcommand")),
     ["read" | "digest", ..] => Err(ParseError::Missing("ID PATH")),
-    ["rewitness" | "pin"] => Err(ParseError::Missing("volume ID")),
+    ["rewitness" | "pin" | "capture"] => Err(ParseError::Missing("volume ID")),
     [other, ..] => Err(ParseError::UnknownCommand(format!("base {other}"))),
   }
 }
@@ -2162,6 +2316,35 @@ mod tests {
       assert!(parse(&args(&format!("recover {scope} --fenced --accept-loss"))).is_err());
     }
     assert!(parse(&args("recover root --confirm wrong --fenced --accept-loss")).is_err());
+  }
+
+  /// §4.15 step 1 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a landing's `--include` and `--exclude` each keep
+  /// every prefix given, in order, as the wire's filter takes them; before, each kept its last value alone, so
+  /// `--exclude /.git --exclude /target` landed `/target`. A flag that takes one value keeps the last.
+  #[test]
+  fn a_landing_keeps_every_include_and_exclude_given() {
+    let id = "ab".repeat(16);
+    let Ok(Command::Client(request)) = parse(&args(&format!(
+      "land {id} /dir --exclude /.git --include /src --exclude /target --include /docs --grant 1 --grant 7"
+    ))) else {
+      panic!("land is a client request");
+    };
+    let Verb::Land { filter, grant, .. } = request.verb else {
+      panic!("land parses as a landing");
+    };
+    assert_eq!(filter.exclude, ["/.git", "/target"]);
+    assert_eq!(filter.include, ["/src", "/docs"]);
+    assert_eq!(grant, Some(7), "a flag that takes one value keeps the last");
+    let Ok(Command::Client(plain)) = parse(&args(&format!("land {id} /dir"))) else {
+      panic!("land is a client request");
+    };
+    let Verb::Land { filter, .. } = plain.verb else {
+      panic!("land parses as a landing");
+    };
+    assert!(
+      filter.include.is_empty() && filter.exclude.is_empty(),
+      "no filter keeps everything"
+    );
   }
 
   /// §4.6 (AUD-29-75): `export` names one volume, optionally read-only and scoped to a subtree; anything else is
@@ -2213,6 +2396,25 @@ mod tests {
     assert!(parse(&args("bootstrap")).is_err());
   }
 
+  /// A-291 (§4.15 `capture_base`): `base capture` names one overlay; a capture of nothing, or of paths (a capture is
+  /// always the whole base), is refused rather than guessed.
+  #[test]
+  fn base_capture_names_one_overlay_and_no_paths() {
+    let id = "ab".repeat(16);
+    let Command::Client(request) = parse(&args(&format!("base capture {id}"))).unwrap() else {
+      panic!("base capture is a client request");
+    };
+    assert!(matches!(request.verb, Verb::CaptureBase { .. }));
+    assert!(
+      parse(&args("base capture")).is_err(),
+      "an overlay is required"
+    );
+    assert!(
+      parse(&args(&format!("base capture {id} /src"))).is_err(),
+      "a capture is the whole base"
+    );
+  }
+
   /// The grammar: a create with its flags in any order, a global instance before or after
   /// the verb, the process verbs' options.
   #[test]
@@ -2253,6 +2455,28 @@ mod tests {
         intent: Intent::Write,
         form: slates_client::AttachRequest::Termed,
       }
+    );
+    // `--hold` keeps the CLI attachment alive from this process (A-384); a container bind is not held.
+    let Command::Client(request) = parse(&args(
+      "attach 00000000000000000000000000000001 --write --hold",
+    ))
+    .unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::Hold {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        snapshot: None,
+        intent: Intent::Write,
+      }
+    );
+    assert!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --hold --oci-source /a --oci-destination /b",
+      ))
+      .is_err(),
+      "a container bind is not held"
     );
     assert_eq!(
       parse(&args("anchor --quick --shards 2 --instance z")),
@@ -2702,10 +2926,11 @@ mod tests {
       parse(&args(
         "--instance outer exec --volume scratch --at /p -- child --volume inner --help"
       )),
-      Ok(Command::Exec(ExecRequest {
+      Ok(Command::Exec(slates_client::exec::ExecSpec {
         volume: "scratch".into(),
         at: "/p".into(),
         command: args("child --volume inner --help"),
+        apparmor: slates_client::exec::AppArmor::Off,
       }))
     );
   }
@@ -2757,6 +2982,84 @@ mod tests {
     ));
   }
 
+  /// A-370, the flag's plumbing in the CLI. Do: parse `exec` with and without `--apparmor-profile`, then parse the
+  /// arguments every other surface builds for a request (`ExecSpec::arguments`: slates-api's command, the SDKs') with the
+  /// option on and off. Expect: the option off unless the switch is given, on when it is, and every surface's arguments
+  /// read back by this grammar to the request they were built from, so the CLI and the library never disagree on it.
+  #[test]
+  fn exec_takes_the_apparmor_option_off_unless_named_and_reads_every_surfaces_arguments() {
+    use slates_client::exec::{AppArmor, ExecSpec};
+    let Command::Exec(plain) = parse(&args("exec --volume v --at /p -- true")).unwrap() else {
+      panic!("exec");
+    };
+    assert_eq!(plain.apparmor, AppArmor::Off, "off unless named");
+    let Command::Exec(asked) = parse(&args(
+      "--instance i exec --apparmor-profile --volume v --at /p -- true",
+    ))
+    .unwrap() else {
+      panic!("exec");
+    };
+    assert_eq!(asked.apparmor, AppArmor::Profile);
+    for apparmor in [AppArmor::Off, AppArmor::Profile] {
+      let spec = ExecSpec {
+        volume: "-scratch".into(),
+        at: "/home/u/build=1".into(),
+        command: args("cargo build -- --apparmor-profile --help"),
+        apparmor,
+      };
+      assert_eq!(parse(&spec.arguments()), Ok(Command::Exec(spec)));
+    }
+    assert_eq!(
+      parse(&args(
+        "exec --apparmor-profile=yes --volume v --at /p -- true"
+      )),
+      Err(ParseError::BadValue {
+        what: "switch",
+        reason: "`--apparmor-profile` takes no value".into()
+      })
+    );
+    assert_eq!(
+      parse(&args("volume list --apparmor-profile")),
+      Err(ParseError::UnknownFlag("--apparmor-profile".into())),
+      "the switch is exec's alone"
+    );
+  }
+
+  /// A-370. Do: parse `apparmor profile` with and without `--executable`, `apparmor check` with `--json`, and the verb
+  /// with no or an unknown word. Expect: the profile for the named path or this binary's own, the check's JSON switch,
+  /// and refusals naming the words it takes.
+  #[test]
+  fn apparmor_prints_the_profile_or_checks_the_host() {
+    assert_eq!(
+      parse(&args("apparmor profile")),
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: None
+      }))
+    );
+    assert_eq!(
+      parse(&args("apparmor profile --executable /usr/local/bin/slates")),
+      Ok(Command::AppArmor(AppArmorRequest::Profile {
+        executable: Some("/usr/local/bin/slates".into())
+      }))
+    );
+    assert_eq!(
+      parse(&args("apparmor check --json")),
+      Ok(Command::AppArmor(AppArmorRequest::Check { json: true }))
+    );
+    assert_eq!(
+      parse(&args("apparmor")),
+      Err(ParseError::Missing("`profile` or `check`"))
+    );
+    assert_eq!(
+      parse(&args("apparmor install")),
+      Err(ParseError::UnknownCommand("apparmor install".into()))
+    );
+    assert_eq!(
+      parse(&args("apparmor check --executable /x")),
+      Err(ParseError::UnknownFlag("--executable".into()))
+    );
+  }
+
   /// A-161 (Shards part 1 step 4). Do: parse `shards` as Unix hands its end, with every flag and with the fewest.
   /// Expect the instance, the volume, the subtree, the intent, the number, the JSON switch and the command after `--`
   /// untouched.
@@ -2786,6 +3089,55 @@ mod tests {
       (fewest.subtree, fewest.read_only, fewest.json),
       (None, false, false)
     );
+  }
+
+  /// A-316. Do: parse `shards` as Unix hands its end with a resync end at its own number, without one, at a number
+  /// below three, at the stream's own number, and not a number; and as Windows hands its end with one. Expect the
+  /// number taken, none when not asked, each wrong one refused as usage naming `--resync-fd`, and Windows refusing it.
+  #[test]
+  fn shards_takes_a_resync_end_at_a_number_of_its_own_on_unix_alone() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let unix = |line: &str| parse_on(&args(line), HandOffKind::Descriptor);
+    let Command::Shards(request) = unix(&format!(
+      "shards {id} --fd 5 --resync-fd 6 -- shards run --slates-fs-fd 5 --slates-resync-fd 6"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (request.handed, request.resync_at),
+      (HandOff::Descriptor(5), Some(6))
+    );
+    let Command::Shards(without) = unix(&format!("shards {id} --fd 5 -- reader")).unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(without.resync_at, None);
+    for line in [
+      format!("shards {id} --fd 5 --resync-fd 2 -- reader"),
+      format!("shards {id} --fd 5 --resync-fd 5 -- reader"),
+      format!("shards {id} --fd 5 --resync-fd six -- reader"),
+    ] {
+      assert!(
+        matches!(
+          unix(&line),
+          Err(ParseError::BadValue {
+            what: "--resync-fd",
+            ..
+          })
+        ),
+        "{line}"
+      );
+    }
+    assert!(matches!(
+      parse_on(
+        &args(&format!("shards {id} --resync-fd 6 -- reader {{handle}}")),
+        HandOffKind::Handle
+      ),
+      Err(ParseError::BadValue {
+        what: "--resync-fd",
+        ..
+      })
+    ));
   }
 
   /// A-179 (G-shards-windows step 2). Do: parse `shards` as Windows hands its end, with every flag and with the fewest.
@@ -2945,6 +3297,27 @@ mod tests {
     ] {
       let refused = refusal(&line);
       assert!(refused.contains(mentions), "{line}: {refused}");
+    }
+  }
+
+  /// The integrator's report of 2026-11-18 (CI runs 44298844583 and 44310013691). Do: parse `anchor` and `daemon` with
+  /// the runtime registry's most shards, and with one more. Expect: the most parses; one more is refused as a bad
+  /// `--shards` naming the bound, as the roles refuse it (`slates_api::role`), so no anchor starts a daemon its runtime
+  /// refuses at registration and restarts it for good.
+  #[test]
+  fn a_shard_count_past_the_runtimes_registry_is_refused_as_usage() {
+    let most = slates_rt::registry::MAX_SHARDS;
+    for role in ["anchor", "daemon"] {
+      let fits = parse(&args(&format!("{role} --shards {most} --instance z")));
+      assert!(
+        matches!(&fits, Ok(Command::Anchor(options) | Command::Daemon(options)) if options.shards.map(usize::from) == Some(most)),
+        "{role}: {fits:?}"
+      );
+      let past = parse(&args(&format!("{role} --shards {} --instance z", most + 1)));
+      assert!(
+        matches!(&past, Err(ParseError::BadValue { what: "--shards", reason }) if reason.contains(&most.to_string())),
+        "{role}: {past:?}"
+      );
     }
   }
 

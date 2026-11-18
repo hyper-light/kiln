@@ -12,29 +12,27 @@
 //! The engine and the manifest are `slates-land`'s (Phase 1); this module is the wiring: it
 //! holds the runtime grant, lease and audit structures per shard, mirrors their mutations into
 //! the database's durable records, and maps the engine's refusals to the wire taxonomy. The
-//! write path runs on Linux and macOS; its tests land into a real directory on the host's disk in
-//! the build output (`CARGO_TARGET_TMPDIR`; A-50: never `/tmp`, never a RAM directory), on every
-//! host, exactly as the Phase 1 landing tests do.
+//! write path runs on Linux, macOS and Windows (A-185: `slates-land`'s Windows seam, the same surface over NTFS
+//! handles); its tests land into a real directory on the host's disk in the build output (`CARGO_TARGET_TMPDIR`; A-50:
+//! never `/tmp`, never a RAM directory), on every host, exactly as the Phase 1 landing tests do.
 
 use slates_db::Op;
-#[cfg(unix)]
 use slates_db::catalog::LandingRecord;
 use slates_db::catalog::{
   AuditKind as DbAuditKind, AuditRecord as DbAuditRecord, GrantRecord as DbGrantRecord,
   GrantScope as DbGrantScope, GrantState as DbGrantState, GrantSurface,
   LandingState as DbLandingState, Principal, SnapshotId as DbSnapshotId, VolumeId as DbVolumeId,
 };
-#[cfg(unix)]
 use slates_ipc::protocol::{
   ActionCount, HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
+  WriteAct,
 };
 use slates_ipc::protocol::{
-  AuditEntry, GrantScope, GrantSummary, Refusal, ReplyBody, SnapshotId, VolumeId,
+  AuditEntry, GrantScope, GrantSummary, PolicySubject, Refusal, ReplyBody, SnapshotId, VolumeId,
+  WriteMode, WritePolicy,
 };
 use slates_land::engine::Audit;
-#[cfg(unix)]
 use slates_land::engine::{AuditKind, AuditRecord};
-#[cfg(unix)]
 use slates_land::engine::{
   Degradation, Durability, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingRun,
   Observer, settle_grant,
@@ -43,25 +41,17 @@ use slates_land::grant::{
   GrantBinding, GrantRecord as LandGrantRecord, GrantScope as LandScope,
   GrantState as LandGrantState, Grants, Surface, TargetIdentity,
 };
-#[cfg(unix)]
 use slates_land::grant::{GrantId, GrantRefusal, LandingLease};
-#[cfg(unix)]
 use slates_land::manifest::{Filter, LandingEntry, Manifest};
-#[cfg(unix)]
 use slates_land::os::{Away, OsLand, TargetRefusal};
-#[cfg(unix)]
 use slates_land::source::Source;
 use slates_vfs::clock::Clock;
-#[cfg(unix)]
 use slates_vfs::host::{Barrier, HostError, HostFs, LandFs};
-#[cfg(unix)]
 use slates_wire::observe::Chokepoint;
 
-#[cfg(unix)]
 use crate::error::refusal_of_vfs;
 use crate::state::ShardState;
 use crate::verbs::refused;
-#[cfg(unix)]
 use crate::verbs::{find, forbidden, rights_of, to_db_snapshot, to_db_volume};
 
 /// Shape: how many audit records the server keeps in memory before the ring trims them; the
@@ -78,6 +68,18 @@ pub struct LandingState {
   pub grants: Grants,
   /// The runtime audit log (mirrored to `AuditRecord`).
   pub audit: Audit,
+  /// Test support: while set, this shard sends the control partition none of what it owes the audit (A-265's crossing;
+  /// `Daemon::withhold_audit_crossing`), so a test holds a record between its atom's commit and its batch, where a
+  /// crash used to lose it. Never set from the wire.
+  pub crossing_withheld: bool,
+  /// Test support: while set, this shard records no acknowledgement of its appended audit records (A-265;
+  /// `Daemon::withhold_audit_acknowledgement`), as if each were lost, so its outbox keeps them and the reap tick sends
+  /// them again. Never set from the wire.
+  pub acknowledgement_withheld: bool,
+  /// The crossing sequence at the front of this partition's outbox when the reap tick last looked (A-265): a front that
+  /// has not moved over a whole tick is sent again ([`resend_stuck_audit`]), so a batch lost to a crash, a restart or an
+  /// unanswered call reaches the control partition. `None` until the first look, which sends whatever is owed.
+  pub outbox_front_seen: Option<u64>,
   /// The next landing id.
   pub next_landing: u64,
   /// A landing awaiting a grant: its id, the manifest it planned, the volume and the target,
@@ -196,6 +198,9 @@ impl Default for LandingState {
     LandingState {
       grants: Grants::default(),
       audit: Audit::new(AUDIT_RETAIN),
+      crossing_withheld: false,
+      acknowledgement_withheld: false,
+      outbox_front_seen: None,
       next_landing: 1,
       awaiting: std::collections::BTreeMap::new(),
       in_flight: std::collections::BTreeMap::new(),
@@ -210,7 +215,6 @@ impl Default for LandingState {
 }
 
 /// The identity of a landing: its id and what it lands where.
-#[cfg(unix)]
 struct LandingIds<'a> {
   landing_id: u64,
   /// Whether `landing_id` was allocated for this call (a presentation, or a granted landing no presentation
@@ -236,6 +240,11 @@ pub struct LandCall<'a> {
   pub filter: &'a slates_ipc::protocol::Filter,
   /// The grant, when one was issued.
   pub grant: Option<u64>,
+  /// Present only (`Present`, A-285): answer the presentation whatever the write policy, never land.
+  pub present_only: bool,
+  /// A signature over the landing's statement (signed work, A-321): judged against the manifest presented or landed,
+  /// recorded with the landing's audit records and answered; it permits nothing.
+  pub signature: Option<&'a [u8]>,
 }
 
 /// Lands `volume`'s snapshot into `target` (§4.15). Without a grant covering the planned
@@ -256,19 +265,7 @@ pub fn land_verb(
   ) {
     return reply;
   }
-  #[cfg(unix)]
-  {
-    land_verb_unix(state, client_id, principal, call)
-  }
-  #[cfg(not(unix))]
-  {
-    // The write path is the `os` module (Unix), the landing engine's only real writer; the
-    // Windows writer arrives with the Windows bridge (Phase 4). The verb refuses cleanly here.
-    let _ = (state, client_id, principal, call);
-    refused(Refusal::Unsupported {
-      feature: "landing".to_owned(),
-    })
-  }
+  land_verb_os(state, client_id, principal, call)
 }
 
 /// Takes the landing lease on the target whose canonical key is `key`, on this shard — the control shard,
@@ -280,7 +277,6 @@ pub fn land_verb(
 /// learned of would hold the target for a term. The generation is the take's log sequence on this
 /// partition, so it only grows, across releases and restarts: a release or a fence naming an older one
 /// names a lease that is gone.
-#[cfg(unix)]
 pub fn take_target_lease(
   state: &mut ShardState,
   key: String,
@@ -325,13 +321,11 @@ pub fn take_target_lease(
 
 /// Format: the landing-plane counter of a target-lease take that reached the control shard after its
 /// caller's deadline, and took nothing.
-#[cfg(unix)]
 const LEASE_TAKE_LATE: &str = "landing.lease_take_late";
 
 /// Releases every target lease whose term has ended, so the control partition holds no more records than
 /// the leases live at its last take (ban 8): a lease whose release never came — its attempt's compensation
 /// lost as well, or its daemon gone — would otherwise stay for good. Bounded by those records.
-#[cfg(unix)]
 fn release_expired_leases(state: &mut ShardState, now: u64) -> Result<(), Refusal> {
   let expired: Vec<String> = state
     .db
@@ -357,7 +351,6 @@ fn release_expired_leases(state: &mut ShardState, now: u64) -> Result<(), Refusa
 /// control) shard, and nothing otherwise: an attempt whose term ended, and whose target another has taken
 /// since, releases nothing of the new holder's. It is also the compensation for a take whose answer never
 /// came back: the attempt's own lease, if that take landed.
-#[cfg(unix)]
 pub fn release_target_lease(state: &mut ShardState, key: &str, holder: u64) -> Result<(), Refusal> {
   let held = state
     .db
@@ -415,14 +408,12 @@ pub fn abandon_presentations(state: &mut ShardState, client: u32) {
 /// a large landing never grows it without bound (ban 8): at capacity it sheds the oldest timing and
 /// counts the loss. It records only `(start, end)` — the land engine stays wire-free; the server builds
 /// the spans and assigns the shard's ids when it drains the observer ([`drain_land_spans`]).
-#[cfg(unix)]
 struct SpanObserver {
   entries: std::collections::VecDeque<(u64, u64)>,
   capacity: usize,
   dropped: u64,
 }
 
-#[cfg(unix)]
 impl SpanObserver {
   fn with_capacity(capacity: usize) -> SpanObserver {
     SpanObserver {
@@ -446,7 +437,6 @@ impl SpanObserver {
   }
 }
 
-#[cfg(unix)]
 impl<H: LandFs> Observer<H> for SpanObserver {
   fn before_write(&mut self, _host: &mut H, _entry: &LandingEntry) {}
 
@@ -459,7 +449,6 @@ impl<H: LandFs> Observer<H> for SpanObserver {
 /// (§4.14), each opened within the `shard.op` span of the verb that ran the landing — sharing its
 /// request and trace and naming it as the cause — and folds the observer's shed count into the ring's
 /// loss total. Called after `land` returns, so the ring is clear of the landing's borrows.
-#[cfg(unix)]
 fn drain_land_spans(state: &mut ShardState, observer: SpanObserver) {
   let cause = state.current_span;
   let dropped = observer.dropped;
@@ -481,9 +470,8 @@ fn drain_land_spans(state: &mut ShardState, observer: SpanObserver) {
   state.telemetry.record_dropped(dropped);
 }
 
-/// The Unix landing: open the target through `OsLand` and run the engine.
-#[cfg(unix)]
-fn land_verb_unix(
+/// The landing: open the target through `OsLand` (the Unix seam, or the Windows one since A-185) and run the engine.
+fn land_verb_os(
   state: &mut ShardState,
   client_id: u32,
   principal: &Principal,
@@ -495,6 +483,8 @@ fn land_verb_unix(
     target,
     filter,
     grant,
+    present_only,
+    signature,
   } = call;
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
@@ -503,6 +493,17 @@ fn land_verb_unix(
   if !rights_of(&record, principal).write {
     return forbidden("land");
   }
+  // The write policy (A-285): a forbidding mode refuses every landing, granted or not, before any host access; a
+  // bypass mode grants the landing the daemon presents and lands it in the same request.
+  let mode = land_mode(&record);
+  if mode == slates_db::catalog::WriteMode::Forbid && !present_only {
+    state.count(POLICY_FORBIDS_LAND, 1);
+    return refused(Refusal::PolicyForbids {
+      act: WriteAct::Land,
+      by: PolicySubject::Volume { volume },
+    });
+  }
+  let bypass = !present_only && grant.is_none() && mode == slates_db::catalog::WriteMode::Bypass;
   let db_volume = to_db_volume(volume);
   // A landing without a grant ends in a presentation, and the shard holds only so many: past the bound it
   // is refused before any host access, id or record (AUD-29-07).
@@ -538,6 +539,12 @@ fn land_verb_unix(
     principal: principal.clone(),
     client: client_id,
     grant,
+    bypass: bypass.then(|| Requested {
+      volume,
+      snapshot,
+      filter: filter.clone(),
+    }),
+    signature: signature.map(<[u8]>::to_vec),
   };
   match grant {
     // A presentation writes nothing and takes no lease; it is planned in slices and answered when planned.
@@ -547,8 +554,20 @@ fn land_verb_unix(
   }
 }
 
+/// Format: the counter of landings a forbidding write policy refused (A-285).
+const POLICY_FORBIDS_LAND: &str = "policy_forbids.land";
+/// Format: the counter of landings a bypass write policy granted (A-285).
+const POLICY_GRANTED_LAND: &str = "policy_granted.land";
+
+/// What a landing request named, kept by a bypass presentation (A-285) to land it under the grant the policy issues:
+/// the request's own volume, snapshot (the head when `None`) and filter.
+struct Requested {
+  volume: VolumeId,
+  snapshot: Option<SnapshotId>,
+  filter: slates_ipc::protocol::Filter,
+}
+
 /// A landing ready to run: its volume, its opened target and what its request and records name.
-#[cfg(unix)]
 struct Prepared {
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
   os: OsLand,
@@ -561,6 +580,11 @@ struct Prepared {
   principal: Principal,
   client: u32,
   grant: Option<u64>,
+  /// What to land under the grant a bypass policy issues once the presentation is planned (A-285); `None` for a
+  /// presentation that waits for an approval, and for a granted landing.
+  bypass: Option<Requested>,
+  /// The landing's signature, if the request carried one (A-321).
+  signature: Option<Vec<u8>>,
 }
 
 /// A presentation (§4.15 steps 1–3; AUD-29-07): the landing planned and its entries checked against the target without
@@ -570,7 +594,6 @@ struct Prepared {
 /// between its slices cannot tear its manifest, and the snapshot is dropped when it is answered. It was one call: 1,000
 /// files of 16 KiB held the shard for one poll of 6.77 s on a Mac, 6.20 s of it the plan, and every verb on the shard
 /// waited for it (`crates/server/tests/presentation_fairness.rs`).
-#[cfg(unix)]
 fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
   let Some(request_id) = state.current_request else {
     return refused(Refusal::Unsupported {
@@ -647,6 +670,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
       let presenter = Presenter {
         client: prepared.client,
         principal: &prepared.principal,
+        signature: prepared.signature.as_deref(),
       };
       return not_landed(state, presenter, &ids, refusal);
     }
@@ -671,13 +695,14 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     implicit,
     writer,
     beginning,
+    bypass: prepared.bypass,
+    signature: prepared.signature,
   };
   crate::image::defer(state, run_presentation(job))
 }
 
 /// A presentation's writer between its units: its own (a scratch volume's), or, an overlay's, lent back to the
 /// volume's slot with what the writer keeps of its own.
-#[cfg(unix)]
 enum Writer {
   Own(OsLand),
   Lent(slates_land::os::Away),
@@ -686,7 +711,6 @@ enum Writer {
 }
 
 /// A presentation between its units ([`defer_presentation`]).
-#[cfg(unix)]
 struct PresentJob {
   request_id: (u64, slates_wire::request::RequestId),
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
@@ -700,9 +724,11 @@ struct PresentJob {
   implicit: Option<slates_vfs::ids::SnapshotId>,
   writer: Writer,
   beginning: slates_land::engine::Beginning,
+  bypass: Option<Requested>,
+  /// The presentation's signature, if the request carried one (A-321).
+  signature: Option<Vec<u8>>,
 }
 
-#[cfg(unix)]
 impl PresentJob {
   /// One unit of the presentation's beginning ([`step_beginning`]); its end once it has one.
   fn step(
@@ -729,7 +755,6 @@ impl PresentJob {
 /// Plans the presentation a slice at a time, then records it with the request's completion as one atom and delivers
 /// the reply. With the shard's state unreachable (its shutdown) no completion is recorded, so the client's retry
 /// presents again on the shard that succeeds it.
-#[cfg(unix)]
 async fn run_presentation(mut job: PresentJob) {
   let ended = loop {
     match crate::image::with(|s| crate::image::sliced(s, |s| Ok(job.step(s)))) {
@@ -739,8 +764,17 @@ async fn run_presentation(mut job: PresentJob) {
     }
   };
   let request = job.request_id;
-  let _ = crate::state::with_state(|s| {
+  let Some(Some((reply, route, (shard, budget)))) = crate::state::with_state(|s| {
     job.settle(s);
+    // A bypass policy (A-285): a planned presentation is granted by the policy and landed in this same request. Its
+    // reply, when it is not the landing's to give, goes out as a presentation's does: after its audit (A-265).
+    let ended = match (job.bypass.take(), ended) {
+      (Some(requested), Some(Ok(slates_land::engine::Planned::Presented(plan)))) => {
+        let (reply, route) = land_under_policy(s, &job, request, requested, plan)?;
+        return Some((reply, route, (s.shard, s.config.failover_slo_ns)));
+      }
+      (_, ended) => ended,
+    };
     let (reply, route) = crate::image::complete(s, request, |s| {
       let ids = LandingIds {
         landing_id: job.landing_id,
@@ -753,6 +787,7 @@ async fn run_presentation(mut job: PresentJob) {
       let presenter = Presenter {
         client: job.client,
         principal: &job.principal,
+        signature: job.signature.as_deref(),
       };
       match ended {
         Some(Ok(slates_land::engine::Planned::Presented(plan))) => {
@@ -766,13 +801,109 @@ async fn run_presentation(mut job: PresentJob) {
         None => refused(Refusal::NotFound),
       }
     });
-    crate::image::deliver(s, reply, route);
-  });
+    Some((reply, route, (s.shard, s.config.failover_slo_ns)))
+  }) else {
+    return;
+  };
+  // The presentation's record reaches the audit before its reply does (A-265): what the shard owes is sent and waited
+  // for, and if the wait runs out the record stays owed, durable, for the next send.
+  append_owed_audit(shard, budget).await;
+  let _ = crate::state::with_state(|s| crate::image::deliver(s, reply, route));
+}
+
+/// Lands a planned presentation under a bypass policy (A-285): the presentation is recorded, the policy issues its
+/// grant (`Issuer::Policy`), and the landing runs under that grant in the request that presented it, as a granted
+/// landing's request does (`defer_granted_landing` takes the request and its reply route over). One transaction holds
+/// the presentation, the grant and, when the landing could not start, the request's completion: a landing that starts
+/// answers the request itself when it ends. The landing plans again under the grant, so a volume changed since the
+/// presentation lands what the grant bound or is refused `GrantMismatch`, never something no one planned.
+///
+/// The reply and its route once the transaction commits, for the caller to deliver after the audit records the atom
+/// owed the control partition (A-265); `None` when the landing took the request over, whose own completion answers it.
+/// Then the atom's owed records are sent at once, so none waits on this shard's next atom.
+fn land_under_policy(
+  s: &mut ShardState,
+  job: &PresentJob,
+  request: (u64, slates_wire::request::RequestId),
+  requested: Requested,
+  plan: Box<slates_land::engine::Presented>,
+) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
+  let route = crate::image::take_in_flight(s, request);
+  s.db.begin();
+  s.current_request = Some(request);
+  s.reply_route = route;
+  let ids = LandingIds {
+    landing_id: job.landing_id,
+    fresh: true,
+    volume: job.volume,
+    snapshot: job.snapshot,
+    target: &job.target,
+    rebased: false,
+  };
+  let presenter = Presenter {
+    client: job.client,
+    principal: &job.principal,
+    signature: job.signature.as_deref(),
+  };
+  let presented = present(s, presenter, &ids, plan);
+  let reply = if matches!(presented, ReplyBody::GrantRequired { .. }) {
+    // The grant needs to stand only until the landing that follows checks it: the operator's failover bound, the
+    // term the landing's own target lease runs under.
+    let term = s.config.failover_slo_ns;
+    match issue_grant(
+      s,
+      &job.principal,
+      job.landing_id,
+      (GrantScope::Once, term),
+      Issuer::Policy,
+    ) {
+      Ok(grant) => {
+        s.count(POLICY_GRANTED_LAND, 1);
+        land_verb_os(
+          s,
+          job.client,
+          &job.principal,
+          LandCall {
+            volume: requested.volume,
+            snapshot: requested.snapshot,
+            target: &job.target,
+            filter: &requested.filter,
+            grant: Some(grant),
+            present_only: false,
+            signature: job.signature.as_deref(),
+          },
+        )
+      }
+      Err(refusal) => refused(refusal),
+    }
+  } else {
+    presented
+  };
+  s.current_request = None;
+  let route = s.reply_route.take();
+  let (origin, id) = request;
+  if std::mem::take(&mut s.acceptance_deferred) {
+    // The granted landing took the request over and answers it when it ends; what led to it commits now, and the
+    // presentation's and the grant's audit records go to the control partition now (A-265).
+    if s.db.commit(&mut s.segment).is_err() {
+      crate::verbs::reconcile_unpublished_effects(s);
+    }
+    send_owed_audit(s);
+    return None;
+  }
+  let reply = crate::verbs::record_completion(s, origin, id, reply);
+  let reply = match s.db.commit(&mut s.segment) {
+    Ok(_) => reply,
+    Err(e) => {
+      crate::verbs::reconcile_unpublished_effects(s);
+      refused(crate::error::refusal_of_db(&e))
+    }
+  };
+  Some((reply, route))
 }
 
 /// The reply to a landing the engine did not land: its presentation when it needs a grant, else the typed
 /// refusal.
-#[cfg(unix)]
 fn not_landed(
   state: &mut ShardState,
   presenter: Presenter<'_>,
@@ -784,13 +915,23 @@ fn not_landed(
     // The engine hands back every entry's report; the refusal names the conflicting ones alone (§4.15: a conflict
     // refuses the whole landing, and the person resolving it needs only the entries in conflict). Before 2026-10-06
     // every entry was named, so an entry that would only have been created read as a conflict.
-    LandingRefusal::Conflict(entries) => refused(Refusal::LandingConflict {
-      entries: entries
+    LandingRefusal::Conflict(entries) => {
+      let conflicting: Vec<String> = entries
         .iter()
         .filter(|e| matches!(e.verdict, Some(slates_land::verdict::Verdict::Conflict(_))))
         .map(|e| e.path.to_string())
-        .collect(),
-    }),
+        .collect();
+      // As many as one reply holds, the rest counted (A-267): presenting again lists every one.
+      let room = crate::verbs::reply_room(&refused(Refusal::LandingConflict {
+        entries: Vec::new(),
+        entries_elided: 0,
+      }));
+      let (entries, entries_elided) = crate::verbs::carried(conflicting, room);
+      refused(Refusal::LandingConflict {
+        entries,
+        entries_elided,
+      })
+    }
     LandingRefusal::LeaseHeld(held) => refused(Refusal::LandingLeaseHeld {
       holder: held.holder,
     }),
@@ -804,9 +945,7 @@ fn not_landed(
       refused(Refusal::GrantMismatch)
     }
     LandingRefusal::Grant(_) => refused(Refusal::GrantInvalid),
-    LandingRefusal::Target(e) => refused(Refusal::TargetUnavailable {
-      reason: format!("{e:?}"),
-    }),
+    LandingRefusal::Target(e) => refused(crate::error::target(crate::error::target_of_host(&e))),
     LandingRefusal::Volume(e) => {
       state.count(LANDING_VOLUME_REFUSED, 1);
       refused(refusal_of_vfs(&e))
@@ -831,7 +970,6 @@ fn not_landed(
 /// and the request's completion committed as one atom, releases the lease, and then delivers the reply.
 /// Before 2026-09-29 the landing ran inside the verb and took a lease from its own shard's table, keyed by
 /// the target's path.
-#[cfg(unix)]
 fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> ReplyBody {
   let Some(request) = state.current_request else {
     return refused(Refusal::Unsupported {
@@ -845,9 +983,7 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
       inode: identity.ino,
     }),
     Err(e) => {
-      return refused(Refusal::TargetUnavailable {
-        reason: format!("{e:?}"),
-      });
+      return refused(crate::error::target(crate::error::target_of_host(&e)));
     }
   };
   // The attempt is numbered in the landing-id shape — its partition in the high bits — so attempts of two
@@ -893,6 +1029,10 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
     };
     let finished =
       drive_granted_landing(prepared, taken, request, cause, (renew, key.clone())).await;
+    // The landing's records reach the audit before its reply does (A-265); past the wait they stay owed, durable.
+    if finished.is_some() {
+      append_owed_audit(shard, term).await;
+    }
     // The lease goes before the reply, so the caller's next landing into the target finds it free.
     let released = !held
       || crate::xshard::call_within(
@@ -929,7 +1069,6 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
 /// what its reply and records need. The run owns its writer; an overlay volume's base host goes back to the
 /// volume's slot between slices (with the writer's own state kept `away`), so the volume serves its base
 /// while the landing waits.
-#[cfg(unix)]
 struct GrantedRun {
   run: LandingRun<'static, OsLand>,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
@@ -950,12 +1089,17 @@ struct GrantedRun {
   implicit: Option<slates_vfs::ids::SnapshotId>,
   /// When the landing last looked at its lease, on the shard's clock: at first when the lease was taken.
   lease_seen_ns: u64,
+  /// The landing's signature, if its request carried one (A-321): judged against what it wrote when it finishes.
+  signature: Option<Vec<u8>>,
+  /// The audit ring's sequence when this run began (`Audit::next_seq`): the ring's records of the landing from it on are
+  /// this run's, which its finish records; the ones before it are its presentation's, which the presentation recorded,
+  /// or an earlier attempt's, which that attempt's finish recorded (§4.15 "Audit").
+  audit_from: u64,
 }
 
-/// A granted landing that ended before running: what its reply needs.
-#[cfg(unix)]
+/// A granted landing that ended before running: what its reply and its trail need.
 struct NotRun {
-  refusal: LandingRefusal,
+  refusal: Unrun,
   landing_id: u64,
   fresh: bool,
   volume: DbVolumeId,
@@ -963,24 +1107,39 @@ struct NotRun {
   target: String,
   principal: Principal,
   client: u32,
+  /// The landing's signature, judged against a presentation its refusal answers with (A-321).
+  signature: Option<Vec<u8>>,
+  /// The grant it was to run under.
+  grant: Option<u64>,
+  /// The manifest its grant binds, when the shard held the grant as the attempt began: a granted landing, whose
+  /// refusal its trail and its landing record keep ([`record_refused`]). `None` for a grant the shard does not hold
+  /// (never issued, or ended): such a landing is not a granted one, and the engine presents it once planned.
+  granted: Option<[u8; 32]>,
+  /// The audit ring's sequence when it began ([`GrantedRun`]'s).
+  audit_from: u64,
+}
+
+/// Why a granted landing ended before its run.
+enum Unrun {
+  /// The engine's refusal: of its beginning, its plan, its grant or its run's start.
+  Engine(LandingRefusal),
+  /// The server's, before the engine began: its target's lease, its volume gone, the head's snapshot, its base host
+  /// away, its target unopened.
+  Server(Refusal),
 }
 
 /// Where beginning a granted landing left it.
-#[cfg(unix)]
 enum Begun {
   /// Being planned: stepped in slices until its run begins.
   Planning(Box<Planning>),
   /// Running: stepped in slices.
   Running(Box<GrantedRun>),
-  /// Refused before running (its lease, the volume, the target, the grant): the reply is built where its
+  /// Refused before running (its lease, the volume, the target, the grant): the reply and the trail are made where its
   /// completion is recorded.
   NotRun(Box<NotRun>),
-  /// Refused before anything about the landing was known (no lease, no volume): the reply itself.
-  Refused(ReplyBody),
 }
 
 /// What one slice left the run at.
-#[cfg(unix)]
 enum Stepped {
   /// More host work remains.
   More,
@@ -992,17 +1151,20 @@ enum Stepped {
   Ended(Box<Result<LandingReport, LandingRefusal>>),
 }
 
+/// A granted landing's completed reply and where it goes. The audit records its completion owed the control partition
+/// are in the partition's outbox, durable with the completion (A-265), and are sent before the reply.
+type Finished = (ReplyBody, Option<crate::merge_service::ReplyRoute>);
+
 /// Drives a granted landing under its lease: begins it, steps it one slice per turn of the shard (yielding
 /// between, so the shard serves its other clients, lease checks and shutdown while a large landing runs),
 /// and finishes it where its records and the request's completion commit as one atom.
-#[cfg(unix)]
 async fn drive_granted_landing(
   prepared: Prepared,
   lease: Result<LandingLease, Refusal>,
   request: (u64, slates_wire::request::RequestId),
   cause: Option<slates_wire::observe::SpanContext>,
   (renew, key): (LeaseAsk, String),
-) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
+) -> Option<Finished> {
   let mut granted = match start_granted(prepared, lease, renew, &key).await? {
     Begun::Running(granted) => granted,
     ended => return finish_unrun(request, cause, ended),
@@ -1043,7 +1205,6 @@ async fn drive_granted_landing(
 /// A granted landing's finish: its O(entries) advance stepped a quantum at a time (A-133), the shard serving its other
 /// clients between and the lease kept alive; the outcome its completion then commits as one atom. `None` when the
 /// shard's state is gone (its shutdown).
-#[cfg(unix)]
 async fn advance_granted(
   granted: &mut GrantedRun,
   renew: LeaseAsk,
@@ -1065,11 +1226,9 @@ async fn advance_granted(
 }
 
 /// The reply to a granted landing that did not reach its run: its refusal, or what its not running is answered with.
-#[cfg(unix)]
 fn answer_unrun(state: &mut ShardState, ended: Begun) -> ReplyBody {
   match ended {
     Begun::NotRun(not_run) => reply_not_run(state, *not_run),
-    Begun::Refused(reply) => reply,
     // `plan_granted` steps every plan to its end, so neither is left here: a defect, refused typed.
     Begun::Planning(_) | Begun::Running(_) => refused(Refusal::Unsupported {
       feature: "a granted landing answered before its plan or its run ended".to_owned(),
@@ -1078,12 +1237,11 @@ fn answer_unrun(state: &mut ShardState, ended: Begun) -> ReplyBody {
 }
 
 /// Completes a granted landing that did not reach its run, its reply recorded with the request's completion.
-#[cfg(unix)]
 fn finish_unrun(
   request: (u64, slates_wire::request::RequestId),
   cause: Option<slates_wire::observe::SpanContext>,
   ended: Begun,
-) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
+) -> Option<Finished> {
   crate::state::with_state(move |s| {
     complete_landing_with(s, request, cause, |s| answer_unrun(s, ended))
   })
@@ -1091,7 +1249,6 @@ fn finish_unrun(
 
 /// A granted landing begun ([`begin_granted`]) and its plan (§4.15 steps 1–3) stepped a slice at a time, its lease kept
 /// alive between slices as its writes' is; what it began. `None` when the shard's state is gone (its shutdown).
-#[cfg(unix)]
 async fn start_granted(
   prepared: Prepared,
   lease: Result<LandingLease, Refusal>,
@@ -1117,7 +1274,6 @@ async fn start_granted(
 /// the recall is revoked (§10.4.5), by the drain at the deadline, and the finish runs. Before 2026-10-05 the finish
 /// met the gate and the granted landing answered `Unpublished`, which `slates land` does not retry, and the recall it
 /// asked for was never sent, since nothing drained after a landing task's slices.
-#[cfg(unix)]
 async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &str) {
   let handle = granted.handle;
   let mut deadline: Option<u64> = None;
@@ -1165,20 +1321,17 @@ async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &s
 
 /// Counter: a granted landing that waited before its finish for delegations held on its volume's files (A-79).
 /// Format: a counter name in the daemon's status report.
-#[cfg(unix)]
 const LANDING_HELD_FOR_RECALL: &str = "landing.held_for_recall";
 
 /// Format: how much of its term a landing's lease has left when the landing renews it, in permille — half:
 /// the margin then covers a slice and the renewal's round trip to the control shard, each far shorter than
 /// the term, while a landing renews at most twice a term.
-#[cfg(unix)]
 const RENEW_AT_REMAINING_PERMILLE: u64 = 500;
 
 /// The keepalive between a landing's slices (AUD-29-25; the lease records waited for it): once half its
 /// lease's term has passed, the landing re-takes the lease on the control shard as its own holder and runs
 /// under the renewed term. A lease another attempt took meanwhile (this one's ended) is not renewed; the run's
 /// own per-entry fence then stops its writes, as before. Counted either way.
-#[cfg(unix)]
 async fn keep_lease_alive(held: &mut impl KeptLease, ask: LeaseAsk, key: &str) {
   let expires_ns = held.lease().expires_ns;
   let margin = ask.term.saturating_mul(RENEW_AT_REMAINING_PERMILLE) / PERMILLE;
@@ -1219,7 +1372,6 @@ async fn keep_lease_alive(held: &mut impl KeptLease, ask: LeaseAsk, key: &str) {
 
 /// A landing that holds its target's lease between its slices: a running one ([`GrantedRun`]), or one still being
 /// planned ([`Planning`]); what [`keep_lease_alive`] keeps.
-#[cfg(unix)]
 trait KeptLease {
   /// The lease it holds now.
   fn lease(&self) -> &LandingLease;
@@ -1229,7 +1381,6 @@ trait KeptLease {
   fn seen_ns(&mut self) -> &mut u64;
 }
 
-#[cfg(unix)]
 impl KeptLease for GrantedRun {
   fn lease(&self) -> &LandingLease {
     self.run.lease()
@@ -1244,7 +1395,6 @@ impl KeptLease for GrantedRun {
   }
 }
 
-#[cfg(unix)]
 impl KeptLease for Planning {
   fn lease(&self) -> &LandingLease {
     &self.lease
@@ -1264,37 +1414,31 @@ impl KeptLease for Planning {
 }
 
 /// Format: the landing-plane counter of a lease a running landing renewed between its slices.
-#[cfg(unix)]
 const LEASE_RENEWED: &str = "landing.lease_renewed";
 
 /// Format: the landing-plane counter of a lease a running landing could not renew (another attempt holds the
 /// target, or the control shard did not answer): its term then ends the landing's writes.
-#[cfg(unix)]
 const LEASE_NOT_RENEWED: &str = "landing.lease_not_renewed";
 
 /// Counter: a landing batch's barrier run on a thread of its own while the shard served on (A-132).
 /// Format: a counter name in the daemon's status report.
-#[cfg(unix)]
 const BARRIERS_AWAY: &str = "landing.barriers_away";
 
 /// Counter: a barrier thread the system refused to start (a process or cgroup thread limit): the batch's entries
 /// fail with the refusal and the landing stops writing, for its resume, as at any refused host step.
 /// Format: a counter name in the daemon's status report.
-#[cfg(unix)]
 const BARRIER_THREAD_REFUSED: &str = "landing.barrier_thread_refused";
 
 /// A landing batch's barrier on a thread of its own (A-132), owned by the landing's task: the thread sends the
 /// barrier's outcome over a channel of one and then wakes the task, so the wake always finds the outcome. Dropped
 /// before the outcome came (a shutdown while the barrier waits), it joins the thread first, so no thread outlives
 /// its owner; the join waits out the one barrier.
-#[cfg(unix)]
 struct BarrierThread {
   outcome: std::sync::mpsc::Receiver<Result<(), HostError>>,
   /// Joined on the landing's shard, which is marked as waiting on it meanwhile (A-228's transitive wait).
   thread: Option<slates_rt::registry::WaitedThread<()>>,
 }
 
-#[cfg(unix)]
 impl BarrierThread {
   /// Starts `barrier` on its own thread, `waker` woken once its outcome is sent; refused with the system's errno when
   /// no thread can start (the barrier is dropped unrun, its descriptors closed).
@@ -1318,14 +1462,13 @@ impl BarrierThread {
   }
 
   /// The barrier's outcome once it is back (its thread joined: it has only to exit), `None` while it runs. A thread
-  /// gone without an outcome (it cannot be: shipped code does not panic, and a panic aborts) reads as `EIO`.
+  /// gone without an outcome (it cannot be: shipped code does not panic, and a panic aborts) reads as the platform's
+  /// failed I/O ([`lost_barrier`]).
   fn returned(&mut self) -> Option<Result<(), HostError>> {
     let ran = match self.outcome.try_recv() {
       Ok(ran) => ran,
       Err(std::sync::mpsc::TryRecvError::Empty) => return None,
-      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-        Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()))
-      }
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(lost_barrier()),
     };
     self.join();
     Some(ran)
@@ -1340,7 +1483,23 @@ impl BarrierThread {
   }
 }
 
+/// What a barrier thread gone without its outcome reads as (it cannot be: shipped code does not panic, and a panic
+/// aborts): the platform's own number for a failed I/O, `EIO` on Unix.
 #[cfg(unix)]
+fn lost_barrier() -> HostError {
+  HostError::Unavailable(rustix::io::Errno::IO.raw_os_error())
+}
+
+/// What a barrier thread gone without its outcome reads as: Windows' own number for a failed I/O,
+/// `ERROR_IO_DEVICE`, since the Windows seam reports a refusal the engine does not tell apart in Win32's codes
+/// (`slates_land::os`, A-185).
+#[cfg(windows)]
+fn lost_barrier() -> HostError {
+  /// Format: `ERROR_IO_DEVICE` (winerror.h).
+  const ERROR_IO_DEVICE: i32 = 1117;
+  HostError::Unavailable(ERROR_IO_DEVICE)
+}
+
 impl Drop for BarrierThread {
   fn drop(&mut self) {
     self.join();
@@ -1352,7 +1511,6 @@ impl Drop for BarrierThread {
 /// them for its whole wait (1–160 ms a batch on a busy Linux machine, an `fsync` up to 206 ms a file on a busy Mac,
 /// 2026-10-10). The landing's lease is kept alive while the barrier lasts, as between slices. The outcome: the
 /// barrier's, or the refusal that no thread could start for it.
-#[cfg(unix)]
 async fn run_barrier_away(
   barrier: Box<dyn Barrier>,
   granted: &mut GrantedRun,
@@ -1393,7 +1551,6 @@ async fn run_barrier_away(
 
 /// How long until the landing's lease is due its renewal (`keep_lease_alive`, Unix's), `None` when it is due already (a
 /// renewal just refused leaves it so) or the shard's clock cannot be read.
-#[cfg(unix)]
 fn renewal_wait_ns(granted: &GrantedRun, ask: LeaseAsk) -> Option<u64> {
   let margin = ask.term.saturating_mul(RENEW_AT_REMAINING_PERMILLE) / PERMILLE;
   let due = granted.run.lease().expires_ns.saturating_sub(margin);
@@ -1403,37 +1560,23 @@ fn renewal_wait_ns(granted: &GrantedRun, ask: LeaseAsk) -> Option<u64> {
 
 /// Begins a granted landing on its owner shard: its id and request, the head's implicit snapshot for an
 /// unnamed landing, the writer (inside an overlay's own base host), and the engine's plan, grant and lease
-/// checks.
-#[cfg(unix)]
+/// checks. The attempt's id and where its records start in the engine's ring are decided first, so every refusal
+/// from here on, its target's lease included, ends as an attempt its trail names (§4.15 "Audit").
 fn begin_granted(
   state: &mut ShardState,
   prepared: Prepared,
   lease: Result<LandingLease, Refusal>,
 ) -> Begun {
-  let lease = match lease {
-    Ok(lease) => lease,
-    Err(refusal) => return Begun::Refused(refused(refusal)),
-  };
+  // Where this run's records will start in the engine's audit ring, before it pushes any (§4.15 "Audit").
+  let audit_from = state.landing.audit.next_seq();
   let presented = prepared.grant.and_then(|g| presentation_for(state, g));
   let landing_id = presented
     .unwrap_or_else(|| crate::verbs::landing_id(state.partition, state.landing.next_landing));
-  let Ok(slot) = state.volumes.get_mut(prepared.handle) else {
-    return Begun::Refused(refused(Refusal::NotFound));
-  };
-  // An unnamed landing lands the head as it is now: a snapshot of it, which the writers that go on
-  // between slices do not move.
-  let (source, implicit) = match prepared.source {
-    Source::Head => match slot.volume.snapshot(&mut state.store) {
-      Ok(id) => (Source::Snapshot(id), Some(id)),
-      Err(e) => {
-        state.count(LANDING_SNAPSHOT_REFUSED, 1);
-        return Begun::Refused(refused(refusal_of_vfs(&e)));
-      }
-    },
-    named => (named, None),
-  };
-  let was_overlay = slot.volume.is_overlay();
-  let not_run = |refusal: LandingRefusal, principal: Principal| {
+  let granted = prepared
+    .grant
+    .and_then(|grant| state.landing.grants.get(GrantId(grant)))
+    .map(|grant| grant.manifest);
+  let not_run = |refusal: Unrun, principal: Principal| {
     Begun::NotRun(Box::new(NotRun {
       refusal,
       landing_id,
@@ -1443,22 +1586,55 @@ fn begin_granted(
       target: prepared.target.clone(),
       principal,
       client: prepared.client,
+      signature: prepared.signature.clone(),
+      grant: prepared.grant,
+      granted,
+      audit_from,
     }))
   };
+  let lease = match lease {
+    Ok(lease) => lease,
+    Err(refusal) => return not_run(Unrun::Server(refusal), prepared.principal.clone()),
+  };
+  let Ok(slot) = state.volumes.get_mut(prepared.handle) else {
+    return not_run(Unrun::Server(Refusal::NotFound), prepared.principal.clone());
+  };
+  // An unnamed landing lands the head as it is now: a snapshot of it, which the writers that go on
+  // between slices do not move.
+  let (source, implicit) = match prepared.source {
+    Source::Head => match slot.volume.snapshot(&mut state.store) {
+      Ok(id) => (Source::Snapshot(id), Some(id)),
+      Err(e) => {
+        state.count(LANDING_SNAPSHOT_REFUSED, 1);
+        return not_run(
+          Unrun::Server(refusal_of_vfs(&e)),
+          prepared.principal.clone(),
+        );
+      }
+    },
+    named => (named, None),
+  };
+  let was_overlay = slot.volume.is_overlay();
   let (os, land_target) = if was_overlay {
     let Some(host) = slot.host.take() else {
       drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
-      return Begun::Refused(refused(Refusal::BaseUnavailable {
-        path: prepared.target.clone(),
-        errno: 0,
-      }));
+      return not_run(
+        Unrun::Server(Refusal::BaseUnavailable {
+          path: prepared.target.clone(),
+          errno: 0,
+        }),
+        prepared.principal.clone(),
+      );
     };
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
       Err((host, refusal)) => {
         slot.host = Some(host);
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
-        return Begun::Refused(refused(target_refusal(&refusal, &prepared.target)));
+        return not_run(
+          Unrun::Server(target_refusal(&refusal, &prepared.target)),
+          prepared.principal.clone(),
+        );
       }
     }
   } else {
@@ -1482,7 +1658,7 @@ fn begin_granted(
     Err(refusal) => {
       give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);
       drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
-      return not_run(refusal, prepared.principal.clone());
+      return not_run(Unrun::Engine(refusal), prepared.principal.clone());
     }
   };
   let writer = if was_overlay {
@@ -1511,12 +1687,14 @@ fn begin_granted(
     was_overlay,
     target_dir: land_target.dir,
     implicit,
+    signature: prepared.signature,
+    granted,
+    audit_from,
   }))
 }
 
 /// A granted landing being planned between its slices ([`begin_granted`]): its beginning, its writer, and its lease,
 /// kept alive between slices as a running landing's is.
-#[cfg(unix)]
 struct Planning {
   beginning: slates_land::engine::Beginning,
   writer: Writer,
@@ -1534,11 +1712,16 @@ struct Planning {
   was_overlay: bool,
   target_dir: slates_vfs::host::HostDir,
   implicit: Option<slates_vfs::ids::SnapshotId>,
+  /// The landing's signature, if its request carried one (A-321).
+  signature: Option<Vec<u8>>,
+  /// The manifest its grant binds, when the shard held the grant as it began ([`NotRun`]'s).
+  granted: Option<[u8; 32]>,
+  /// The audit ring's sequence when this run began ([`GrantedRun`]'s).
+  audit_from: u64,
 }
 
 /// One slice of a granted landing's plan (`image::sliced`); what it began once planned: its run, or the refusal it
 /// ended with (the volume's, the target's, the grant's, its lease's).
-#[cfg(unix)]
 fn step_planning(state: &mut ShardState, planning: &mut Planning) -> Option<Begun> {
   let ended = match crate::image::sliced(state, |s| {
     Ok(step_beginning(
@@ -1561,7 +1744,6 @@ fn step_planning(state: &mut ShardState, planning: &mut Planning) -> Option<Begu
 /// A granted landing's plan, ended: its run begun under its lease (`begin_planned`), the overlay's host lent back to
 /// its slot between the run's slices; or, refused, its host given back, its implicit snapshot dropped, and the
 /// refusal it is answered with.
-#[cfg(unix)]
 fn finish_planning(
   state: &mut ShardState,
   planning: &mut Planning,
@@ -1569,7 +1751,7 @@ fn finish_planning(
 ) -> Begun {
   let not_run = |planning: &Planning, refusal: LandingRefusal| {
     Begun::NotRun(Box::new(NotRun {
-      refusal,
+      refusal: Unrun::Engine(refusal),
       landing_id: planning.landing_id,
       fresh: planning.fresh,
       volume: planning.volume,
@@ -1577,6 +1759,10 @@ fn finish_planning(
       target: planning.target.clone(),
       principal: planning.principal.clone(),
       client: planning.client,
+      signature: planning.signature.clone(),
+      grant: planning.grant,
+      granted: planning.granted,
+      audit_from: planning.audit_from,
     }))
   };
   let Ok(slot) = state.volumes.get_mut(planning.handle) else {
@@ -1654,6 +1840,8 @@ fn finish_planning(
         away: None,
         implicit: planning.implicit,
         lease_seen_ns: planning.lease_seen_ns,
+        signature: planning.signature.clone(),
+        audit_from: planning.audit_from,
       };
       if planning.was_overlay {
         lend_back(slot, &mut granted);
@@ -1678,7 +1866,6 @@ fn finish_planning(
 /// its end once it has one: the plan, or the landing refusal that ended it (a volume destroyed meanwhile, an overlay
 /// whose host is away, the volume's or the target's own). A presentation's and a granted landing's plan both step
 /// here.
-#[cfg(unix)]
 fn step_beginning(
   state: &mut ShardState,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
@@ -1719,7 +1906,6 @@ fn step_beginning(
 }
 
 /// Gives an overlay's base host back to its volume's slot between slices, keeping the writer's own state.
-#[cfg(unix)]
 fn lend_back(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun) {
   if let Some(os) = granted.run.take_host() {
     let (host, away) = os.lend();
@@ -1729,7 +1915,6 @@ fn lend_back(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun) {
 }
 
 /// Takes an overlay's base host from its volume's slot back into the run for a slice; whether it could.
-#[cfg(unix)]
 fn take_for_slice(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun) -> bool {
   match (slot.host.take(), granted.away.take()) {
     (Some(host), Some(away)) => {
@@ -1746,7 +1931,6 @@ fn take_for_slice(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun)
 
 /// The writer's host after a landing that did not run: an overlay's own goes back to its slot, its walked
 /// target closed; a scratch volume's writer closes with it.
-#[cfg(unix)]
 fn give_host_back(
   slot: &mut crate::state::VolumeSlot,
   host: HostSlot<'static, OsLand>,
@@ -1762,7 +1946,6 @@ fn give_host_back(
 
 /// Destroys an unnamed landing's implicit snapshot of the head; a refusal is counted, never silent (the
 /// snapshot then stays as any snapshot does, until destroyed).
-#[cfg(unix)]
 fn drop_implicit(
   slot: &mut crate::state::VolumeSlot,
   store: &mut slates_vfs::volume::Store,
@@ -1778,33 +1961,26 @@ fn drop_implicit(
 }
 
 /// Format: the landing-plane counter of an unnamed landing's implicit snapshot whose destroy was refused.
-#[cfg(unix)]
 const IMPLICIT_SNAPSHOT_KEPT: &str = "landing.implicit_snapshot_kept";
 /// Format: the refusal-ledger names of a landing refused at each of its volume stages — the implicit snapshot
 /// of the head, the engine's read of the volume, the publication after it — so a refusal names its stage
 /// (a `NoSpace` seen only on the macOS runner, 2026-10-01, carried no stage).
-#[cfg(unix)]
 const LANDING_SNAPSHOT_REFUSED: &str = "landing.snapshot_refused";
 /// Format: see [`LANDING_SNAPSHOT_REFUSED`].
-#[cfg(unix)]
 const LANDING_VOLUME_REFUSED: &str = "landing.volume_refused";
 /// Format: see [`LANDING_SNAPSHOT_REFUSED`].
-#[cfg(unix)]
 const LANDING_PUBLISH_REFUSED: &str = "landing.publish_refused";
 
 /// Format: the share of the shard's step quantum one landing slice takes, in permille — half, as the
 /// archive walk's slice takes (`config::archive_slice_bytes`), so a slice leaves the rest of the shard's
 /// step to its other work.
-#[cfg(unix)]
 const LANDING_SLICE_PERMILLE: u64 = 500;
 /// Format: the permille scale.
-#[cfg(unix)]
 const PERMILLE: u64 = 1_000;
 
 /// One slice of a granted landing: the run stepped for its share of the shard's quantum, the base host lent
 /// back after. A volume gone meanwhile (destroyed) or whose base host is away ends the run, its entries left in
 /// the overlay as a crash leaves them.
-#[cfg(unix)]
 fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
   let budget_ns = state
     .config
@@ -1852,9 +2028,7 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
 /// Finishes a granted landing inside its completion's atom: the run's finish (unless it `ended` early), its
 /// once-grant consumed, its spans drained, the writer's host settled, the implicit snapshot destroyed, and
 /// the reply with the landing's records.
-#[cfg(unix)]
 /// Where one step of the sliced finish left the advance (A-133).
-#[cfg(unix)]
 enum FinishStepped {
   /// The advance has more entries; the caller yields and steps again.
   More,
@@ -1866,7 +2040,6 @@ enum FinishStepped {
 /// shard's quantum, the base host lent back after — the same shape as [`step_granted`], so the shard serves its other
 /// clients between the advance's steps rather than holding them for its whole O(entries) run. A volume gone or a host
 /// away ends the finish with that refusal.
-#[cfg(unix)]
 fn step_finish(state: &mut ShardState, granted: &mut GrantedRun) -> FinishStepped {
   let budget_ns = state
     .config
@@ -1910,7 +2083,6 @@ fn step_finish(state: &mut ShardState, granted: &mut GrantedRun) -> FinishSteppe
 /// settled back into the volume's slot, the implicit snapshot destroyed, and the reply with the landing's records (the
 /// completion commits as one atom around this, A-127). `outcome` is the finish's, or the refusal a run that ended early
 /// carried.
-#[cfg(unix)]
 fn complete_finish(
   state: &mut ShardState,
   mut granted: GrantedRun,
@@ -1949,15 +2121,45 @@ fn complete_finish(
   let presenter = Presenter {
     client: granted.client,
     principal: &granted.principal,
+    signature: granted.signature.as_deref(),
   };
   match outcome {
-    Ok(report) => finish(state, &granted.principal, &ids, &report, granted.grant),
-    Err(refusal) => not_landed(state, presenter, &ids, refusal),
+    Ok(report) => finish(
+      state,
+      FinishedRun {
+        principal: &granted.principal,
+        signature: granted.signature.as_deref(),
+        audit_from: granted.audit_from,
+      },
+      &ids,
+      &report,
+      granted.grant,
+    ),
+    Err(refusal) => {
+      if ends_refused(&refusal) {
+        let attempt = Attempt {
+          landing_id: granted.landing_id,
+          fresh: granted.fresh,
+          grant: granted.grant,
+          granted: granted.run.grant().manifest,
+          principal: &granted.principal,
+          volume: granted.volume,
+          snapshot: granted.snapshot,
+          target: &granted.target,
+          signature: granted.signature.as_deref(),
+          audit_from: granted.audit_from,
+          conflicts: conflicts_of(&refusal),
+        };
+        if let Err(e) = record_refused(state, &attempt) {
+          return refused(crate::error::refusal_of_db(&e));
+        }
+      }
+      not_landed(state, presenter, &ids, refusal)
+    }
   }
 }
 
-/// The reply to a granted landing refused before it ran.
-#[cfg(unix)]
+/// The reply to a granted landing refused before it ran, its trail recorded first ([`record_refused`]).
 fn reply_not_run(state: &mut ShardState, not_run: NotRun) -> ReplyBody {
   let ids = LandingIds {
     landing_id: not_run.landing_id,
@@ -1970,13 +2172,194 @@ fn reply_not_run(state: &mut ShardState, not_run: NotRun) -> ReplyBody {
   let presenter = Presenter {
     client: not_run.client,
     principal: &not_run.principal,
+    signature: not_run.signature.as_deref(),
   };
-  not_landed(state, presenter, &ids, not_run.refusal)
+  let (ended, conflicts) = match &not_run.refusal {
+    Unrun::Engine(refusal) => (ends_refused(refusal), conflicts_of(refusal)),
+    Unrun::Server(_) => (true, 0),
+  };
+  // Only a granted landing leaves a trail: one whose grant the shard held as it began. A landing under a grant the shard
+  // does not hold is presented once planned (the engine's `GrantRequired`), so refused before its plan it is a refused
+  // request, as an ungranted one is.
+  if let Some(granted) = not_run.granted
+    && ended
+  {
+    let attempt = Attempt {
+      landing_id: not_run.landing_id,
+      fresh: not_run.fresh,
+      grant: not_run.grant,
+      granted,
+      principal: &not_run.principal,
+      volume: not_run.volume,
+      snapshot: not_run.snapshot,
+      target: &not_run.target,
+      signature: not_run.signature.as_deref(),
+      audit_from: not_run.audit_from,
+      conflicts,
+    };
+    if let Err(e) = record_refused(state, &attempt) {
+      return refused(crate::error::refusal_of_db(&e));
+    }
+  }
+  match not_run.refusal {
+    Unrun::Engine(refusal) => not_landed(state, presenter, &ids, refusal),
+    Unrun::Server(refusal) => refused(refusal),
+  }
+}
+
+/// Whether the engine's `refusal` ends a granted landing's attempt refused, which its trail records ([`record_refused`]).
+/// A plan no grant covers ends in a presentation instead, which records itself.
+fn ends_refused(refusal: &LandingRefusal) -> bool {
+  !matches!(refusal, LandingRefusal::GrantRequired(_))
+}
+
+/// Who a granted landing's attempt was, as its trail and its landing record name it: its id, its grant and the
+/// manifest the grant binds, whom it ran for, what it would have landed where, its signature, where its records start
+/// in the engine's ring, and the entries its refusal found in conflict.
+struct Attempt<'a> {
+  landing_id: u64,
+  /// Whether the id is a fresh one rather than its presentation's.
+  fresh: bool,
+  grant: Option<u64>,
+  /// The manifest its grant binds: what it was approved to land, named when it planned nothing.
+  granted: [u8; 32],
+  principal: &'a Principal,
+  volume: DbVolumeId,
+  snapshot: DbSnapshotId,
+  target: &'a str,
+  signature: Option<&'a [u8]>,
+  /// The audit ring's sequence when the attempt began ([`GrantedRun`]'s `audit_from`).
+  audit_from: u64,
+  /// The entries a conflict refused it for; zero for any other refusal.
+  conflicts: u32,
+}
+
+/// The entries `refusal` names in conflict (§4.15 step 4): a conflict's entries whose verdict is a conflict, as its
+/// answer names them; zero for any other refusal.
+fn conflicts_of(refusal: &LandingRefusal) -> u32 {
+  match refusal {
+    LandingRefusal::Conflict(entries) => u32::try_from(
+      entries
+        .iter()
+        .filter(|entry| {
+          matches!(
+            entry.verdict,
+            Some(slates_land::verdict::Verdict::Conflict(_))
+          )
+        })
+        .count(),
+    )
+    .unwrap_or(u32::MAX),
+    _ => 0,
+  }
+}
+
+/// Records a refused granted landing's end (§4.15 "Audit", the state machine's `→ Refused` and `→ Aborted`), in its
+/// completion's atom. Two things are written:
+/// - **The trail.** The records the engine's ring holds of the attempt from its beginning on (its plan, its validation,
+///   each entry it wrote or refused), then a `LandingFinished`. That record names the terminal state
+///   ([`refused_state`]), the manifest the attempt planned, or its grant's when it planned none, and its signature
+///   judged against that manifest. An attempt whose ring records hold its end already adds none.
+/// - **The landing record, at the same terminal state.** Its presentation's record moves there, and a fresh id's is
+///   made, so the record and the audit cannot disagree. A fresh id is spent, as a finished landing's is, and the
+///   record keeps it spent across a restart (`verbs::next_landing_counter`).
+///
+/// Before 2026-11-18 a refused granted landing recorded none of this: its trail ended at its grant (found by g90
+/// reading the code; `docs/bugs/2026-11-18-a-refused-granted-landing-left-no-trail.md`). Until a later change the same
+/// day its record stayed as presented, or was never made, while its trail said it was refused.
+fn record_refused(state: &mut ShardState, attempt: &Attempt<'_>) -> Result<(), slates_db::DbError> {
+  let ring: Vec<AuditRecord> = state
+    .landing
+    .audit
+    .records()
+    .into_iter()
+    .filter(|record| record.landing == attempt.landing_id && record.seq >= attempt.audit_from)
+    .cloned()
+    .collect();
+  let manifest = ring
+    .iter()
+    .rev()
+    .find(|record| record.kind == AuditKind::LandingPlanned)
+    .map_or(attempt.granted, |record| record.manifest);
+  let (_, verification) = landing_verdict(
+    state,
+    (attempt.volume, attempt.target, &manifest),
+    attempt.signature,
+  );
+  let ended = refused_state(&ring);
+  let written = u32::try_from(
+    ring
+      .iter()
+      .filter(|record| record.kind == AuditKind::EntryWritten)
+      .count(),
+  )
+  .unwrap_or(u32::MAX);
+  let mut records: Vec<DbAuditRecord> = ring
+    .iter()
+    .map(|record| db_audit(record, attempt.principal, &verification))
+    .collect();
+  let now = state.clock.monotonic_ns();
+  if !ring
+    .iter()
+    .any(|record| record.kind == AuditKind::LandingFinished)
+  {
+    records.push(DbAuditRecord {
+      seq: 0,
+      at_ns: now,
+      kind: DbAuditKind::LandingFinished,
+      principal: attempt.principal.clone(),
+      grant: attempt.grant,
+      landing: Some(attempt.landing_id),
+      manifest: Some(manifest),
+      outcome: Some(ended),
+      signature: crate::signed_work::to_record(&verification),
+    });
+  }
+  let landing = if state.db.partition().landing(attempt.landing_id).is_some() {
+    Op::LandingStateChanged {
+      id: attempt.landing_id,
+      state: ended,
+      written,
+      conflicts: attempt.conflicts,
+    }
+  } else {
+    Op::LandingRecorded {
+      record: LandingRecord {
+        id: attempt.landing_id,
+        volume: attempt.volume,
+        snapshot: attempt.snapshot,
+        target: attempt.target.to_owned(),
+        manifest,
+        grant: attempt.grant,
+        state: ended,
+        written,
+        conflicts: attempt.conflicts,
+      },
+    }
+  };
+  state.db.mutate(&mut state.segment, &landing, now)?;
+  if attempt.fresh {
+    state.landing.next_landing = state.landing.next_landing.saturating_add(1);
+  }
+  write_audit(state, records, now)
+}
+
+/// The terminal state a refused granted landing's trail names (§4.15's state machine): `Aborted` once the attempt wrote
+/// an entry, whose bytes the disk now holds, each entry old or new, for a resume to continue; else `Refused`, nothing
+/// written.
+fn refused_state(ring: &[AuditRecord]) -> DbLandingState {
+  if ring
+    .iter()
+    .any(|record| record.kind == AuditKind::EntryWritten)
+  {
+    DbLandingState::Aborted
+  } else {
+    DbLandingState::Refused
+  }
 }
 
 /// Where a landing attempt asks for its target's lease: from this shard to the control shard, for the
 /// attempt `holder`, for `term` nanoseconds, answered by the monotonic `deadline`.
-#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct LeaseAsk {
   shard: u16,
@@ -1990,7 +2373,6 @@ struct LeaseAsk {
 /// take whose answer does not come back in that time is compensated — the attempt's own lease released,
 /// should the take have landed; a take still queued refuses itself past the deadline — so a lease outlives
 /// an attempt that never learned of it only when the compensation fails as well, and then by its term.
-#[cfg(unix)]
 async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease, Refusal> {
   let LeaseAsk {
     shard,
@@ -2028,12 +2410,10 @@ async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease
 }
 
 /// Format: the landing-plane counter of a target-lease take whose answer did not come back within its term.
-#[cfg(unix)]
 const LEASE_TAKE_UNANSWERED: &str = "landing.lease_take_unanswered";
 
 /// Format: the landing-plane counter of a target lease whose release did not reach the control shard (it
 /// ends by its term).
-#[cfg(unix)]
 const LEASE_UNRELEASED: &str = "landing.lease_unreleased";
 
 /// The placeholder a deferred landing's verb returns. It is never delivered: the verb deferred its reply, and
@@ -2058,6 +2438,9 @@ pub(crate) fn deferred_reply() -> ReplyBody {
       },
       degraded: Vec::new(),
       barriers: 0,
+      stage: slates_ipc::protocol::LandingStage::Planning,
+      verification: slates_ipc::protocol::Verification::Unsigned,
+      degraded_elided: 0,
     },
   }
 }
@@ -2065,7 +2448,6 @@ pub(crate) fn deferred_reply() -> ReplyBody {
 /// A granted landing's completion on its owner shard: the reply `produce` builds — the finished landing's
 /// records, or a refusal — and the request's completion committed as one atom. Returns the recorded reply
 /// and where it goes.
-#[cfg(unix)]
 fn complete_landing_with(
   state: &mut ShardState,
   (origin, id): (u64, slates_wire::request::RequestId),
@@ -2098,7 +2480,6 @@ fn complete_landing_with(
 
 /// Delivers a granted landing's reply to where its request waits, on its client's shard. A request with no
 /// route — a forward from another node — reads its completion record instead.
-#[cfg(unix)]
 fn deliver_landing(
   state: &mut ShardState,
   reply: ReplyBody,
@@ -2119,11 +2500,9 @@ fn deliver_landing(
 
 /// Format: the landing-plane counter of a granted landing's reply that could not be handed to its client's
 /// shard.
-#[cfg(unix)]
 const LANDING_UNDELIVERED: &str = "landing.reply_undelivered";
 
 /// The refusal-ledger name of a landing refused for a grant bound elsewhere, by the field that differed.
-#[cfg(unix)]
 fn unbound_refusal_name(field: slates_land::grant::BindingField) -> &'static str {
   use slates_land::grant::BindingField;
   match field {
@@ -2138,7 +2517,6 @@ fn unbound_refusal_name(field: slates_land::grant::BindingField) -> &'static str
 /// as it froze. A snapshot the catalog does not hold for this volume — never taken, destroyed, or another
 /// volume's — is `NotFound`, before any host access. Before 2026-09-30 the engine planned and wrote the head
 /// whatever snapshot was named, and a head changed since the snapshot was refused instead.
-#[cfg(unix)]
 fn named_snapshot_source(
   state: &ShardState,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
@@ -2170,15 +2548,15 @@ fn named_snapshot_source(
 /// Records the planned landing (AwaitingGrant) and its audit, and replies `GrantRequired`.
 /// Who presents a landing: the calling client (whose retirement abandons the presentation) and its
 /// principal.
-#[cfg(unix)]
 struct Presenter<'a> {
   client: u32,
   principal: &'a Principal,
+  /// The request's signature (A-321), judged against the presented manifest.
+  signature: Option<&'a [u8]>,
 }
 
 /// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: a client's
 /// re-presentation of the same volume and target replaces its own and never does (AUD-29-07).
-#[cfg(unix)]
 fn presentations_full(state: &ShardState, client: u32, volume: DbVolumeId, target: &str) -> bool {
   let replaces = state.landing.awaiting.values().any(|awaiting| {
     awaiting.client == client && awaiting.volume == volume && awaiting.target == target
@@ -2189,7 +2567,6 @@ fn presentations_full(state: &ShardState, client: u32, volume: DbVolumeId, targe
 /// The presentation a granted landing lands (AUD-29-07): the awaiting landing whose manifest and binding the
 /// grant was issued from. `None` for a grant covering a plan no presentation made (a session grant's later
 /// plans), which lands under a fresh id.
-#[cfg(unix)]
 fn presentation_for(state: &ShardState, grant: u64) -> Option<u64> {
   let granted = state.landing.grants.get(GrantId(grant))?;
   state
@@ -2202,7 +2579,6 @@ fn presentation_for(state: &ShardState, grant: u64) -> Option<u64> {
     .map(|(id, _)| *id)
 }
 
-#[cfg(unix)]
 fn present(
   state: &mut ShardState,
   presenter: Presenter<'_>,
@@ -2226,11 +2602,38 @@ fn present(
       _ => None,
     })
     .collect();
-  let Presenter { client, principal } = presenter;
+  let Presenter {
+    client,
+    principal,
+    signature,
+  } = presenter;
   state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   let hash = manifest.hash;
+  // Signed work (A-321): the request's signature judged against the manifest presented, the verdict on the presentation's
+  // audit record, the statement handed back for a signer.
+  let (statement, verification) =
+    landing_verdict(state, (ids.volume, ids.target, &hash), signature);
   let summary = summary_of(&manifest);
   let landing_id = ids.landing_id;
+  // The presentation's reply must fit one reply whatever it carries (A-267), and its statement names the target
+  // (A-321): a target too long to be answered beside this summary and verdict is refused here, before anything is
+  // recorded, with the longest this presentation's reply holds.
+  if let Some(longest) = presentation_overflow(
+    &ReplyBody::GrantRequired {
+      landing: landing_id,
+      manifest: hash,
+      summary: summary.clone(),
+      conflicts: Vec::new(),
+      statement: statement.clone(),
+      verification,
+      conflicts_elided: u32::MAX,
+    },
+    ids.target.len(),
+  ) {
+    return refused(Refusal::Target {
+      refusal: slates_ipc::protocol::TargetRefusal::TooLong { longest },
+    });
+  }
   // A client presenting the same volume and target again replaces its earlier presentation, whose id is no
   // longer grantable (AUD-29-07): re-planning costs no room.
   state.landing.awaiting.retain(|_, awaiting| {
@@ -2263,44 +2666,101 @@ fn present(
     written: 0,
     conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
   };
-  let ops = [
-    Op::LandingRecorded { record },
-    Op::AuditAppended {
-      record: DbAuditRecord {
-        seq: 0,
-        at_ns: now,
-        kind: DbAuditKind::LandingPlanned,
-        principal: principal.clone(),
-        grant: None,
-        landing: Some(landing_id),
-        manifest: Some(hash),
-        outcome: None,
-      },
-    },
-  ];
-  for op in &ops {
-    if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
-      return refused(crate::error::refusal_of_db(&e));
-    }
+  let planned = DbAuditRecord {
+    seq: 0,
+    at_ns: now,
+    kind: DbAuditKind::LandingPlanned,
+    principal: principal.clone(),
+    grant: None,
+    landing: Some(landing_id),
+    manifest: Some(hash),
+    outcome: None,
+    signature: crate::signed_work::to_record(&verification),
+  };
+  if let Err(e) = state
+    .db
+    .mutate(&mut state.segment, &Op::LandingRecorded { record }, now)
+    .and_then(|_| write_audit(state, vec![planned], now))
+  {
+    return refused(crate::error::refusal_of_db(&e));
   }
+  // The presentation is recorded, so its reply must always fit (A-267): the conflicts one reply holds beside the
+  // summary, the rest counted; every entry, its conflict among it, is read a page at a time (`LandingEntries`).
+  let room = crate::verbs::reply_room(&ReplyBody::GrantRequired {
+    landing: landing_id,
+    manifest: hash,
+    summary: summary.clone(),
+    conflicts: Vec::new(),
+    statement: statement.clone(),
+    verification,
+    conflicts_elided: 0,
+  });
+  let (conflicts, conflicts_elided) = crate::verbs::carried(conflicts, room);
   ReplyBody::GrantRequired {
     landing: landing_id,
     manifest: hash,
     summary,
     conflicts,
+    statement,
+    verification,
+    conflicts_elided,
   }
 }
 
+/// How a landing's signature is judged (signed work, A-321): over the landing's statement — the volume, the target as its
+/// request named it and `manifest` — under the volume's trusted signers, which this shard, the volume's owner, holds.
+/// Counted per verdict. The statement goes with the verdict, for a presentation's answer.
+fn landing_verdict(
+  state: &mut ShardState,
+  (volume, target, manifest): (DbVolumeId, &str, &[u8; 32]),
+  signature: Option<&[u8]>,
+) -> (Vec<u8>, slates_ipc::protocol::Verification) {
+  let statement = crate::signed_work::landing_statement(&volume.bytes, target, manifest);
+  let verification = match signature {
+    None => slates_ipc::protocol::Verification::Unsigned,
+    Some(signature) => {
+      let trusted = crate::signed_work::trusted_of(crate::verbs::signers_of(state, volume));
+      crate::signed_work::judge(Some(signature), &statement, &trusted)
+    }
+  };
+  if let Some(counter) = crate::signed_work::counter(&verification) {
+    state.count(counter, 1);
+  }
+  (statement, verification)
+}
+
+/// What a granted run's finish records with it: whom it ran for, its signature, and where its records start in the
+/// engine's audit ring.
+struct FinishedRun<'a> {
+  /// The principal the landing ran for.
+  principal: &'a Principal,
+  /// The landing's signature, if its request carried one (A-321).
+  signature: Option<&'a [u8]>,
+  /// The audit ring's sequence when the run began ([`GrantedRun`]'s `audit_from`).
+  audit_from: u64,
+}
+
 /// Persists a finished landing: the record, its terminal audit, and the consumed grant.
-#[cfg(unix)]
 fn finish(
   state: &mut ShardState,
-  principal: &Principal,
+  run: FinishedRun<'_>,
   ids: &LandingIds<'_>,
   report: &LandingReport,
   grant: Option<u64>,
 ) -> ReplyBody {
+  let FinishedRun {
+    principal,
+    signature,
+    audit_from,
+  } = run;
   let landing_id = ids.landing_id;
+  // Signed work (A-321): the landing's signature judged against the manifest it wrote, the verdict on its finished
+  // record and in its answer.
+  let (_, verification) = landing_verdict(
+    state,
+    (ids.volume, ids.target, &report.manifest_hash),
+    signature,
+  );
   if ids.fresh {
     state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   }
@@ -2337,27 +2797,37 @@ fn finish(
       conflicts: record.conflicts,
     }
   }];
-  // Mirror the engine's audit records for this landing into the durable log.
-  for audit in state.landing.audit.records() {
-    if audit.landing == landing_id {
-      ops.push(Op::AuditAppended {
-        record: db_audit(audit, principal),
-      });
-    }
-  }
   ops.extend(closing_ops(state, ids, grant));
+  // Mirror this run's audit records into the durable log, on the control partition (A-265), each once: the ring's
+  // records of the landing from the run's beginning on. Before 2026-11-18 every record the ring held for the landing's
+  // id was mirrored, so a presented landing's plan, which its presentation had recorded, was recorded again, and a
+  // resumed landing re-recorded its first attempt.
+  let records: Vec<DbAuditRecord> = state
+    .landing
+    .audit
+    .records()
+    .into_iter()
+    .filter(|audit| audit.landing == landing_id && audit.seq >= audit_from)
+    .map(|audit| db_audit(audit, principal, &verification))
+    .collect();
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       return refused(crate::error::refusal_of_db(&e));
     }
   }
+  if let Err(e) = write_audit(state, records, now) {
+    return refused(crate::error::refusal_of_db(&e));
+  }
+  // A grant whose consumption committed leaves the runtime table as it left the durable one (A-266).
+  end_grants_recorded_ended(state, &ops);
   if let Some(refusal) = publish_landed(state, ids, report) {
     return refusal;
   }
-  ReplyBody::Landed {
-    outcome: LandingOutcome {
+  landed_reply(
+    LandingOutcome {
       landing: landing_id,
       state: landing_state_name(db_state),
+      stage: wire_landing_stage(db_state),
       written: report.written as u64,
       skipped: report.skipped as u64,
       conflicts: report.conflicts as u64,
@@ -2365,15 +2835,115 @@ fn finish(
       bytes_written: report.bytes_written,
       held: u64::try_from(report.held).unwrap_or(u64::MAX),
       durability: durability_of(&report.durability),
-      degraded: report.degraded.iter().map(degradation_of).collect(),
+      degraded: Vec::new(),
       barriers: u64::try_from(report.barriers).unwrap_or(u64::MAX),
+      verification,
+      degraded_elided: 0,
+    },
+    report.degraded.iter().map(degradation_of).collect(),
+  )
+}
+
+/// A finished landing's reply (§4.15 step 9): `outcome` with as many of `degraded` as one reply holds beside it, the
+/// rest counted (A-267). The landing has run, so its reply must always fit: a host that refuses every directory's sync
+/// meets a degraded cell a directory, and a landing over hundreds of directories met more than a reply holds.
+pub(crate) fn landed_reply(
+  outcome: LandingOutcome,
+  degraded: Vec<slates_ipc::protocol::LandingDegradation>,
+) -> ReplyBody {
+  let room = crate::verbs::reply_room(&ReplyBody::Landed {
+    outcome: outcome.clone(),
+  });
+  let (degraded, degraded_elided) = crate::verbs::carried(degraded, room);
+  ReplyBody::Landed {
+    outcome: LandingOutcome {
+      degraded,
+      degraded_elided,
+      ..outcome
     },
   }
 }
 
+/// Ends in the runtime table every grant `ops` recorded at a terminal step (A-266), once those ops committed.
+fn end_grants_recorded_ended(state: &mut ShardState, ops: &[Op]) {
+  for op in ops {
+    if let Op::GrantStateChanged { id, state: ended } = op
+      && !matches!(ended, DbGrantState::Issued)
+    {
+      state.landing.grants.end(slates_land::grant::GrantId(*id));
+    }
+  }
+}
+
+/// The grants past their term end (A-266), once a reap tick: each is recorded `Expired`, which takes it out of the
+/// durable table, with its `grant_expired` audit record in the same atom ([`record_expiry`]), and then leaves the
+/// runtime one. A grant that cannot be recorded stays, and the next tick tries again; one in use by a running landing is
+/// unaffected, since the run holds its own copy of the grant it checked. On a shard other than the control shard each
+/// committed expiry's audit record is owed in its own atom (the partition's outbox), and what is owed goes to the control
+/// partition as one batch once the sweep is done.
+pub fn end_expired_grants(state: &mut ShardState) {
+  let now = state.clock.monotonic_ns();
+  for id in state.landing.grants.expired_at(now) {
+    if record_expiry(state, id.0, now) {
+      state.landing.grants.end(id);
+      state.count(GRANTS_EXPIRED, 1);
+    }
+  }
+  send_owed_audit(state);
+}
+
+/// Records grant `id`'s expiry and its audit record as one atom (A-266; AC-2.10, every grant's history in the audit):
+/// whether it committed. The record names the principal the grant was made for, since no one acted, and the manifest it
+/// bound. A grant the durable table does not hold is not recorded; a refused change applies nothing, so the atom
+/// commits nothing; and a refused commit rolls both back, the owed audit record with them. The audit record cannot be
+/// refused once the change applied: an `AuditAppended` is never refused and its apply cannot fail, and on another
+/// shard it is only owed.
+fn record_expiry(state: &mut ShardState, id: u64, now: u64) -> bool {
+  let Some((principal, manifest)) = state
+    .db
+    .partition()
+    .grant(id)
+    .map(|grant| (grant.principal.clone(), grant.manifest))
+  else {
+    return false;
+  };
+  let audit = DbAuditRecord {
+    seq: 0,
+    at_ns: now,
+    kind: DbAuditKind::GrantExpired,
+    principal,
+    grant: Some(id),
+    landing: None,
+    manifest: Some(manifest),
+    outcome: None,
+    // No landing judged here: a grant's end is no landing's record (A-321's signature is on those alone).
+    signature: None,
+  };
+  let op = Op::GrantStateChanged {
+    id,
+    state: DbGrantState::Expired,
+  };
+  state.db.begin();
+  let applied = state
+    .db
+    .mutate(&mut state.segment, &op, now)
+    .and_then(|_| write_audit(state, vec![audit], now));
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => applied.is_ok(),
+    Err(e) => {
+      let refusal = crate::error::refusal_of_db(&e);
+      state.count(crate::verbs::refusal_name(&refusal), 1);
+      crate::verbs::reconcile_unpublished_effects(state);
+      false
+    }
+  }
+}
+
+/// Counter: grants ended at their term by the reap tick's sweep (A-266).
+pub const GRANTS_EXPIRED: &str = "landing.grants_expired";
+
 /// The ops that close a finished landing's records: its grant's transition, and the volume's new base when
 /// the landing made a scratch volume an overlay.
-#[cfg(unix)]
 fn closing_ops(state: &ShardState, ids: &LandingIds<'_>, grant: Option<u64>) -> Vec<Op> {
   let mut ops = Vec::new();
   // The grant's transition as it happened (AUD-29-06): the engine consumes a single-use grant whose landing
@@ -2406,7 +2976,6 @@ fn closing_ops(state: &ShardState, ids: &LandingIds<'_>, grant: Option<u64>) -> 
 
 /// Publishes the shard's content images after a landing that advanced the volume (see the body); the refusal
 /// to reply with when the volume was not captured, else `None`.
-#[cfg(unix)]
 fn publish_landed(
   state: &mut ShardState,
   ids: &LandingIds<'_>,
@@ -2439,7 +3008,6 @@ fn publish_landed(
 }
 
 /// The engine's durability as the reply carries it (AUD-29-05: until 2026-09-29 the reply dropped it).
-#[cfg(unix)]
 fn durability_of(durability: &Durability) -> LandingDurability {
   LandingDurability {
     data_synced: durability.data_synced,
@@ -2452,7 +3020,6 @@ fn durability_of(durability: &Durability) -> LandingDurability {
 
 /// A Degraded cell the engine met, as the reply carries it (AUD-29-05: until 2026-09-29 the reply dropped
 /// every one).
-#[cfg(unix)]
 fn degradation_of(degradation: &Degradation) -> LandingDegradation {
   match degradation {
     Degradation::NoExchange { widest_window_ns } => LandingDegradation::NoExchange {
@@ -2483,7 +3050,6 @@ fn degradation_of(degradation: &Degradation) -> LandingDegradation {
 }
 
 /// A host refusal as the reply carries it.
-#[cfg(unix)]
 fn answer_of(error: HostError) -> HostAnswer {
   match error {
     HostError::NotFound => HostAnswer::NotFound,
@@ -2536,6 +3102,9 @@ pub fn grant_proof(
 /// a manifest other than the one presented (the plan changed under the approval), and `NotFound` for a
 /// landing not awaiting a grant (consumed, or never presented — a replay of a spent approval). The
 /// comparison of the proof is constant-time over its whole width so a wrong proof leaks nothing by timing.
+/// Refuses `Forbidden` — counted `grant_by_consumer` — on a channel bound to a consumer (an agent's session), before
+/// anything else and whatever its proof (A-285): an agent never approves its own landing, as it never approves its own
+/// merge (`submit_approved`) or sets a policy (`set_policy_verb`); the approval is the launcher's or its harness's.
 pub fn grant_verb(
   state: &mut ShardState,
   principal: &Principal,
@@ -2545,18 +3114,32 @@ pub fn grant_verb(
   term_ns: u64,
   proof: [u8; 32],
 ) -> ReplyBody {
+  // A-285: an agent never approves its own landing, even holding a genuine proof.
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("grant_by_consumer", 1);
+    return crate::verbs::forbidden("grant");
+  }
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
     return crate::verbs::refused(Refusal::NotFound);
   };
-  let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
-  if !constant_time_eq(&expected, &proof) {
+  if !proven_by_launcher(
+    state,
+    |secret| grant_proof(secret, landing_id, &manifest, scope, term_ns),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
   if awaiting.manifest != manifest {
     return crate::verbs::refused(Refusal::GrantMismatch);
   }
-  match issue_grant(state, principal, landing_id, scope, term_ns) {
+  match issue_grant(
+    state,
+    principal,
+    landing_id,
+    (scope, term_ns),
+    Issuer::Human,
+  ) {
     Ok(grant) => ReplyBody::Granted { grant },
     Err(refusal) => crate::verbs::refused(refusal),
   }
@@ -2614,17 +3197,297 @@ pub(crate) fn constant_time_eq<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool
   difference == 0
 }
 
-/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Reached only through
-/// [`grant_verb`], whose proof of issuer authority has verified, so a grant a human did not make cannot
-/// exist. The grant is issued into the runtime grants and persisted as a `GrantRecord`; the landing's
-/// record gains the grant. Returns the grant id.
+/// Who issues a grant (A-285, R10): the launcher's or the harness's approval, proven under the issuer secret
+/// ([`grant_verb`]), or the volume's bypass policy, which that same authority set ([`set_policy_verb`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Issuer {
+  /// An approval proven under the issuer secret, recorded as the command line's surface.
+  Human,
+  /// The daemon itself, under the volume's bypass policy, recorded as the policy's surface.
+  Policy,
+}
+
+/// Format: the domain tag of a policy proof, so it never verifies as a grant, enrollment or revocation proof.
+const POLICY_DOMAIN: &[u8] = b"slates.policy";
+
+/// The proof a `SetPolicy` request carries (A-285): the keyed hash, under the launcher's secret, of the policy domain
+/// tag, the subject and the policy in their wire encodings, and the policy version the setter read. Only the launcher
+/// or the harness can make one; an agent's consumer channel never holds the secret. The version makes a captured proof
+/// good for one change: once the policy has moved past it, the proof is refused `PolicyChanged`.
+pub fn policy_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  subject: &PolicySubject,
+  policy: &WritePolicy,
+  version: u64,
+) -> [u8; 32] {
+  let mut bytes = Vec::new();
+  slates_wire::Wire::encode(subject, &mut bytes);
+  slates_wire::Wire::encode(policy, &mut bytes);
+  bytes.extend_from_slice(&version.to_le_bytes());
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(POLICY_DOMAIN);
+  hasher.update(&bytes);
+  *hasher.finalize().as_bytes()
+}
+
+/// Whether `proof` is the launcher's (A-285, R10): `make`'s proof under the secret this daemon minted at its start (the
+/// issuer, held by the anchor's tree), or under the launcher secret its starter handed the anchor (kept by the launcher
+/// across its own restarts and the daemon's), compared in constant time. The same formula and domain under either:
+/// the launcher's authority is one, however it is held.
+pub(crate) fn proven_by_launcher(
+  state: &ShardState,
+  make: impl Fn(&[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> [u8; 32],
+  proof: &[u8; 32],
+) -> bool {
+  let by_issuer = constant_time_eq(&make(&state.issuer_secret), proof);
+  let by_launcher = state
+    .launcher_secret
+    .as_ref()
+    .is_some_and(|secret| constant_time_eq(&make(secret), proof));
+  by_issuer | by_launcher
+}
+
+/// Format: the domain tag of a merge approval's proof.
+const MERGE_APPROVAL_DOMAIN: &[u8] = b"slates.merge-approval";
+
+/// The proof a `SubmitApproved` request carries (A-285): the keyed hash, under the issuer secret, of the merge approval
+/// domain tag, the work volume and the approved increment's identity.
+pub fn merge_approval_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  work: VolumeId,
+  identity: &[u8; 32],
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(MERGE_APPROVAL_DOMAIN);
+  hasher.update(&work.bytes);
+  hasher.update(identity);
+  *hasher.finalize().as_bytes()
+}
+
+/// Serves `SetPolicy` (A-285): refused `Forbidden` on a consumer-bound channel, whatever its proof, so an agent never
+/// sets (and so never raises) its own policy, counted `policy_set_by_consumer`; `GrantIssuerUnverified` when the proof
+/// does not verify; a volume's policy recorded durably in its record. A consumer's policy is set on the channel
+/// (`verbs::set_consumer_policy_on_channel`), which reaches every shard's bound slots.
+pub fn set_policy_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  (subject, policy, version): (PolicySubject, WritePolicy, u64),
+  proof: [u8; 32],
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("policy_set_by_consumer", 1);
+    return crate::verbs::forbidden("set_policy");
+  }
+  if !proven_by_launcher(
+    state,
+    |secret| policy_proof(secret, &subject, &policy, version),
+    &proof,
+  ) {
+    state.count("grant_issuer_unverified", 1);
+    return crate::verbs::refused(Refusal::GrantIssuerUnverified);
+  }
+  let PolicySubject::Volume { volume } = subject else {
+    return crate::verbs::refused(Refusal::BadRequest {
+      reason: "a consumer's policy is set on its channel".to_owned(),
+    });
+  };
+  let current = match policy_record(state, volume) {
+    Ok(record) => record.policy.write_version,
+    Err(reply) => return *reply,
+  };
+  // The setter's version is the one the policy is at (A-285): a proof made for an earlier state of the policy, a
+  // replayed or a raced one, changes nothing.
+  if version != current {
+    state.count("policy_changed", 1);
+    return crate::verbs::refused(Refusal::PolicyChanged { current });
+  }
+  let now = state.clock.monotonic_ns();
+  let op = Op::VolumeWritePolicySet {
+    id: crate::verbs::to_db_volume(volume),
+    policy: db_policy(policy),
+  };
+  match state.db.mutate(&mut state.segment, &op, now) {
+    Ok(_) => ReplyBody::PolicySet,
+    Err(e) => crate::verbs::refused(crate::error::refusal_of_db(&e)),
+  }
+}
+
+/// Serves `Policy` (A-285): a volume's write policy and its version, `None` while none is set (merges at once, lands
+/// under approval). Any principal may read it: it holds only the modes the launcher set, which an agent meets anyway in
+/// its own merges' and landings' answers, and a launcher setting a policy on an agent's own volume must read the
+/// version it replaces. A consumer's policy is read on the channel (`verbs::consumer_policy_on_channel`).
+pub fn policy_verb(state: &mut ShardState, subject: PolicySubject) -> ReplyBody {
+  let PolicySubject::Volume { volume } = subject else {
+    return crate::verbs::refused(Refusal::BadRequest {
+      reason: "a consumer's policy is read on its channel".to_owned(),
+    });
+  };
+  let record = match policy_record(state, volume) {
+    Ok(record) => record,
+    Err(reply) => return *reply,
+  };
+  ReplyBody::Policy {
+    policy: record.policy.write.map(wire_policy),
+    version: record.policy.write_version,
+    signers: record.policy.signers,
+  }
+}
+
+/// Format: the domain tag of a signer set's proof (A-321).
+const SIGNERS_DOMAIN: &[u8] = b"slates.signers";
+
+/// The proof a `SetSigners` request carries (A-321): the keyed hash, under the launcher's secret, of the signers domain
+/// tag, the volume, the number of keys and each key with its length, and the policy version the setter read, so a
+/// captured proof sets that one set once.
+pub fn signers_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  volume: VolumeId,
+  keys: &[Vec<u8>],
+  version: u64,
+) -> [u8; 32] {
+  let length = |count: usize| u64::try_from(count).unwrap_or(u64::MAX).to_le_bytes();
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(SIGNERS_DOMAIN);
+  hasher.update(&volume.bytes);
+  hasher.update(&length(keys.len()));
+  for key in keys {
+    hasher.update(&length(key.len()));
+    hasher.update(key);
+  }
+  hasher.update(&version.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// Serves `SetSigners` (A-321): refused as `SetPolicy` is (`Forbidden` on a consumer-bound channel whatever its proof,
+/// counted `signers_set_by_consumer`; `GrantIssuerUnverified` without the launcher's proof; `PolicyChanged` from a
+/// version the policy has moved past), and `BadRequest` for a key slates does not verify; otherwise the set recorded
+/// durably in the volume's record, a key named twice kept once, and the policy's version moved.
+pub fn set_signers_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, keys, version): (VolumeId, Vec<Vec<u8>>, u64),
+  proof: [u8; 32],
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("signers_set_by_consumer", 1);
+    return crate::verbs::forbidden("set_signers");
+  }
+  if !proven_by_launcher(
+    state,
+    |secret| signers_proof(secret, volume, &keys, version),
+    &proof,
+  ) {
+    state.count("grant_issuer_unverified", 1);
+    return crate::verbs::refused(Refusal::GrantIssuerUnverified);
+  }
+  let mut set: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+  for key in keys {
+    if crate::signed_work::TrustedKey::from_wire(key.clone()).is_err() {
+      return crate::verbs::refused(Refusal::BadRequest {
+        reason:
+          "a trusted signer is an ssh-ed25519 or sk-ssh-ed25519@openssh.com key in SSH wire form"
+            .to_owned(),
+      });
+    }
+    if !set.contains(&key) {
+      set.push(key);
+    }
+  }
+  let current = match policy_record(state, volume) {
+    Ok(record) => record.policy.write_version,
+    Err(reply) => return *reply,
+  };
+  if version != current {
+    state.count("policy_changed", 1);
+    return crate::verbs::refused(Refusal::PolicyChanged { current });
+  }
+  let now = state.clock.monotonic_ns();
+  let op = Op::VolumeSignersSet {
+    id: crate::verbs::to_db_volume(volume),
+    keys: set,
+  };
+  match state.db.mutate(&mut state.segment, &op, now) {
+    Ok(_) => ReplyBody::SignersSet,
+    Err(e) => crate::verbs::refused(crate::error::refusal_of_db(&e)),
+  }
+}
+
+/// The catalog record a policy is set on or read from (A-285): any volume this shard holds — a store-backed volume, a
+/// green or a work, which holds no store slot — refused `NotFound` for one it does not and `Destroying` for one going.
+fn policy_record(
+  state: &ShardState,
+  volume: VolumeId,
+) -> Result<slates_db::catalog::VolumeRecord, Box<ReplyBody>> {
+  let record = state
+    .db
+    .partition()
+    .volume(crate::verbs::to_db_volume(volume))
+    .cloned()
+    .ok_or_else(|| Box::new(crate::verbs::refused(Refusal::NotFound)))?;
+  if matches!(
+    record.state,
+    slates_db::catalog::VolumeState::Destroying | slates_db::catalog::VolumeState::Destroyed
+  ) {
+    return Err(Box::new(crate::verbs::refused(Refusal::Destroying)));
+  }
+  Ok(record)
+}
+
+/// A volume's landing mode (A-285): its policy's, or ask while none is set.
+fn land_mode(record: &slates_db::catalog::VolumeRecord) -> slates_db::catalog::WriteMode {
+  record
+    .policy
+    .write
+    .map_or(slates_db::catalog::WriteMode::Ask, |policy| policy.land)
+}
+
+/// A wire policy as the catalog records it.
+pub(crate) fn db_policy(policy: WritePolicy) -> slates_db::catalog::WritePolicy {
+  slates_db::catalog::WritePolicy {
+    merge: db_mode(policy.merge),
+    land: db_mode(policy.land),
+    require_signed_merges: policy.require_signed_merges,
+  }
+}
+
+/// A wire mode as the catalog records it.
+fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
+  match mode {
+    WriteMode::Bypass => slates_db::catalog::WriteMode::Bypass,
+    WriteMode::Ask => slates_db::catalog::WriteMode::Ask,
+    WriteMode::Forbid => slates_db::catalog::WriteMode::Forbid,
+  }
+}
+
+/// A recorded policy as the wire carries it.
+pub(crate) fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
+  let mode = |mode| match mode {
+    slates_db::catalog::WriteMode::Bypass => WriteMode::Bypass,
+    slates_db::catalog::WriteMode::Ask => WriteMode::Ask,
+    slates_db::catalog::WriteMode::Forbid => WriteMode::Forbid,
+  };
+  WritePolicy {
+    merge: mode(policy.merge),
+    land: mode(policy.land),
+    require_signed_merges: policy.require_signed_merges,
+  }
+}
+
+/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Reached through [`grant_verb`],
+/// whose proof of the launcher's authority has verified, or a bypass presentation, under the policy that authority set
+/// (A-285); `issuer` says which, for the record. The grant is issued into the runtime grants and persisted as a
+/// `GrantRecord`; the landing's record gains the grant. Returns the grant id.
 pub fn issue_grant(
   state: &mut ShardState,
   principal: &Principal,
   landing_id: u64,
-  scope: GrantScope,
-  term_ns: u64,
+  (scope, term_ns): (GrantScope, u64),
+  issuer: Issuer,
 ) -> Result<u64, Refusal> {
+  let (surface, grant_surface) = match issuer {
+    Issuer::Human => (Surface::Cli, GrantSurface::Cli),
+    Issuer::Policy => (Surface::Policy, GrantSurface::Policy),
+  };
   let awaiting = state
     .landing
     .awaiting
@@ -2643,7 +3506,7 @@ pub fn issue_grant(
     .landing
     .grants
     .issue(
-      Surface::Cli,
+      surface,
       awaiting.manifest,
       awaiting.binding.clone(),
       land_scope,
@@ -2657,7 +3520,7 @@ pub fn issue_grant(
   let record = DbGrantRecord {
     id: id.0,
     principal: awaiting.principal.clone(),
-    surface: GrantSurface::Cli,
+    surface: grant_surface,
     volume: awaiting.volume,
     snapshot: awaiting.snapshot,
     target: awaiting.target.clone(),
@@ -2678,16 +3541,19 @@ pub fn issue_grant(
     landing: Some(landing_id),
     manifest: Some(awaiting.manifest),
     outcome: None,
+    signature: None,
   };
-  for op in [
-    Op::GrantIssued { record },
-    Op::AuditAppended { record: audit },
-  ] {
-    state
-      .db
-      .mutate(&mut state.segment, &op, now)
-      .map_err(|e| crate::error::refusal_of_db(&e))?;
+  if let Err(e) = state
+    .db
+    .mutate(&mut state.segment, &Op::GrantIssued { record }, now)
+  {
+    // The issue was refused durably and nothing was applied, so the grant leaves this shard's table too (A-266):
+    // nothing lands under a grant the caller was told was not made. A commit refused later in the atom rolls the
+    // record back, and `reconcile_unpublished_effects` takes the grant out then.
+    state.landing.grants.end(id);
+    return Err(crate::error::refusal_of_db(&e));
   }
+  write_audit(state, vec![audit], now).map_err(|e| crate::error::refusal_of_db(&e))?;
   Ok(id.0)
 }
 
@@ -2705,6 +3571,7 @@ pub fn restore_grants(state: &mut ShardState) {
       surface: match record.surface {
         GrantSurface::Cli => Surface::Cli,
         GrantSurface::Confirmation { .. } => Surface::Confirmation,
+        GrantSurface::Policy => Surface::Policy,
       },
       manifest: record.manifest,
       binding: GrantBinding {
@@ -2731,15 +3598,21 @@ pub fn restore_grants(state: &mut ShardState) {
       },
     });
   }
+  // The table holds live grants only (A-266): an ended grant's id is known by the partition's mark alone.
+  let issued_through = state.db.partition().grants_issued_through();
+  state.landing.grants.restore_issued_through(issued_through);
 }
 
 /// The caller's grants, from the durable records.
-pub fn grants_verb(state: &ShardState, principal: &Principal) -> ReplyBody {
+pub(crate) fn grants_part(
+  state: &ShardState,
+  principal: &Principal,
+  after: Option<u64>,
+) -> crate::verbs::PagePart<GrantSummary> {
   let grants = state
     .db
     .partition()
-    .grants_of(principal)
-    .into_iter()
+    .grants_of_after(principal, after)
     .map(|g| GrantSummary {
       id: g.id,
       volume: to_wire_volume(g.volume),
@@ -2747,31 +3620,318 @@ pub fn grants_verb(state: &ShardState, principal: &Principal) -> ReplyBody {
       manifest: g.manifest,
       scope: wire_grant_scope(&g.scope),
       state: grant_state_name(g.state),
-    })
-    .collect();
-  ReplyBody::Grants { grants }
+      grant_state: wire_grant_state(g.state),
+    });
+  // `grants_of_after` walks the partition's grants in id order from the cursor, lazily, so the first that fit are the
+  // page's and the walk stops there.
+  let (items, more) = crate::verbs::fitting(grants, grants_page_room());
+  crate::verbs::PagePart { items, more }
 }
 
-/// The audit log from `since`, from the durable records.
+/// The bytes a grants page's summaries may take: one reply chunk less the page's own framing, its cursor included.
+pub(crate) fn grants_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Grants {
+    grants: Vec::new(),
+    next: Some(u64::MAX),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// The longest target `skeleton`'s presentation could carry when it does not fit one reply chunk (§4.3; A-267): a
+/// presentation's reply carries the target in the statement a signature over it signs (A-321), so a reply past the
+/// chunk is short of exactly its overflow in target bytes. `None` when the reply fits, conflicts aside (they are
+/// carried as far as the room left holds and counted past it).
+fn presentation_overflow(skeleton: &ReplyBody, target_len: usize) -> Option<u64> {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let overflow = slates_ipc::protocol::framed_len(skeleton).checked_sub(chunk)?;
+  (overflow > 0).then(|| u64::try_from(target_len.saturating_sub(overflow)).unwrap_or(u64::MAX))
+}
+
+/// Derived: the longest landing target, in bytes, a grant's summary on one grants page holds alone (§4.15, §4.3): the
+/// page's room less a summary with an empty target in its longest state. A grant is issued for a presented landing and
+/// listed with its target, so a presentation past it is refused `TargetUnavailable` before anything is made. A `land`
+/// request carries a target of about 4,046 bytes, past what a page held beside a grant's other fields (2026-11-08).
+pub fn longest_grantable_target() -> usize {
+  let longest_state = [
+    DbGrantState::Issued,
+    DbGrantState::Consumed,
+    DbGrantState::Expired,
+    DbGrantState::Revoked,
+  ]
+  .into_iter()
+  .map(grant_state_name)
+  .max_by_key(String::len)
+  .unwrap_or_default();
+  let untargeted = GrantSummary {
+    id: u64::MAX,
+    volume: VolumeId::default(),
+    target: String::new(),
+    manifest: [u8::MAX; 32],
+    scope: slates_ipc::protocol::GrantScope::Session,
+    state: longest_state,
+    grant_state: slates_ipc::protocol::GrantState::Issued,
+  };
+  grants_page_room().saturating_sub(crate::verbs::encoded_len(&untargeted))
+}
+
+/// The grants page the shards' `parts` make: their grants in id order, as many as one reply chunk holds, and the
+/// cursor past the last when any part, or the merge, left more.
+pub(crate) fn grants_page(parts: Vec<crate::verbs::PagePart<GrantSummary>>) -> ReplyBody {
+  let (grants, more) = crate::verbs::merged_page(parts, grants_page_room(), |grant| grant.id);
+  let next = more.then(|| grants.last().map(|grant| grant.id)).flatten();
+  ReplyBody::Grants { grants, next }
+}
+
+/// One page of the audit (§4.15, A-265), answered on the control shard, whose partition holds every record: the
+/// retained records from sequence `since` on, as many as one reply chunk holds, and whether more follow.
 pub fn audit_verb(state: &ShardState, since: u64) -> ReplyBody {
-  let records = state
+  let room = audit_page_room();
+  let mut used = 0usize;
+  let mut records = Vec::new();
+  let mut more = false;
+  // A seek to `since`, so a page costs what it carries, never the retained window (A-267).
+  for record in state.db.partition().audit_from(since) {
+    let entry = AuditEntry {
+      seq: record.seq,
+      at_ns: record.at_ns,
+      kind: audit_kind_name(record.kind),
+      grant: record.grant,
+      landing: record.landing,
+      manifest: record.manifest,
+      outcome: record.outcome.map(landing_state_name),
+      audit_kind: wire_audit_kind(record.kind),
+      stage: record.outcome.map(wire_landing_stage),
+      // A record of a landing as a whole — its presentation, a granted run's plan, its finish — says how the landing's
+      // signature was judged (A-321), unsigned when it carried none; no other record judges one, nor one that names no
+      // manifest, which had no statement to judge. A verdict this build names no code for (a newer build's record) reads
+      // as none.
+      verification: (matches!(
+        record.kind,
+        slates_db::catalog::AuditKind::LandingPlanned
+          | slates_db::catalog::AuditKind::LandingFinished
+      ) && record.manifest.is_some())
+      .then(|| crate::signed_work::of_record(record.signature))
+      .flatten(),
+    };
+    let bytes = crate::verbs::encoded_len(&entry);
+    if !records.is_empty() && used.saturating_add(bytes) > room {
+      more = true;
+      break;
+    }
+    used = used.saturating_add(bytes);
+    records.push(entry);
+  }
+  ReplyBody::Audit { records, more }
+}
+
+/// The bytes an audit page's records may take: one reply chunk less the page's own framing (§4.3). A record is a fixed
+/// kind name, ids, a manifest hash and a terminal state's name, so every record fits a page alone.
+pub(crate) fn audit_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Audit {
+    records: Vec::new(),
+    more: true,
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// Format: the partition that holds the audit (§4.15 "written through the control shard", §4.8's one `AuditLog`):
+/// the control shard's, the first of the daemon's shards.
+pub(crate) const AUDIT_PARTITION: u16 = 0;
+
+/// Writes `records` to the audit (A-265): applied in the current atom when this shard is the control shard, else owed
+/// to it in the same atom (`Op::AuditOwed`, the partition's outbox), so a record is durable with the effect it records
+/// and a crash before its batch arrives loses nothing (AC-2.10). The atom's caller sends what is owed once the atom
+/// commits ([`send_owed_audit`], [`append_owed_audit`]); a refused atom's owed records roll back with it.
+fn write_audit(
+  state: &mut ShardState,
+  records: Vec<DbAuditRecord>,
+  now: u64,
+) -> Result<(), slates_db::DbError> {
+  let owed = state.partition != AUDIT_PARTITION;
+  for record in records {
+    let op = if owed {
+      Op::AuditOwed { record }
+    } else {
+      Op::AuditAppended { record }
+    };
+    state.db.mutate(&mut state.segment, &op, now)?;
+  }
+  Ok(())
+}
+
+/// What this shard's partition owes the control partition (A-265): the partition, the crossing sequence of its oldest
+/// owed record, and every owed record from it on, so a batch that was lost is carried by the next. `None` when nothing
+/// is owed, on the control shard, or while a test withholds the crossing.
+fn owed_batch(state: &ShardState) -> Option<(u16, u64, Vec<DbAuditRecord>)> {
+  if state.partition == AUDIT_PARTITION || state.landing.crossing_withheld {
+    return None;
+  }
+  let records: Vec<DbAuditRecord> = state.db.partition().audit_outbox().cloned().collect();
+  let first = records.first()?.seq;
+  Some((state.partition, first, records))
+}
+
+/// Appends `origin`'s batch of owed audit records on the control shard (A-265): the records past what `origin` has
+/// delivered, in one record (`Op::AuditBatchAppended`), whose apply passes over any it already holds, so a batch sent
+/// again after a crash or a lost acknowledgement appends nothing twice. The crossing sequence `origin` has delivered
+/// through when it committed, which the caller acknowledges; `None`, counted, when refused.
+fn append_audit_batch(
+  state: &mut ShardState,
+  (origin, first, records): (u16, u64, Vec<DbAuditRecord>),
+) -> Option<u64> {
+  let from = state.db.partition().audit_received(origin);
+  let end = first.saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX));
+  if end <= from {
+    return Some(from);
+  }
+  // The records the control partition holds already are not logged again.
+  let skip = usize::try_from(from.saturating_sub(first)).unwrap_or(usize::MAX);
+  let op = Op::AuditBatchAppended {
+    origin,
+    first: first.max(from),
+    records: records.into_iter().skip(skip).collect(),
+  };
+  let now = state.clock.monotonic_ns();
+  match state.db.mutate(&mut state.segment, &op, now) {
+    Ok(_) => Some(end),
+    Err(_) => {
+      state.count(AUDIT_UNAPPENDED, 1);
+      None
+    }
+  }
+}
+
+/// Records on this shard's partition that the control partition appended its owed records before crossing sequence
+/// `through` (A-265): they leave the outbox. Nothing when the outbox holds none of them (an older or a repeated
+/// acknowledgement). A refused record is counted, and the records stay owed: the next batch carries them, and the
+/// control partition appends none of them twice.
+fn record_delivered(state: &mut ShardState, through: u64) {
+  if state.landing.acknowledgement_withheld {
+    return;
+  }
+  let owed = state
     .db
     .partition()
-    .audit()
-    .iter()
-    .filter(|r| r.seq >= since)
-    .map(|r| AuditEntry {
-      seq: r.seq,
-      at_ns: r.at_ns,
-      kind: audit_kind_name(r.kind),
-      grant: r.grant,
-      landing: r.landing,
-      manifest: r.manifest,
-      outcome: r.outcome.map(landing_state_name),
-    })
-    .collect();
-  ReplyBody::Audit { records }
+    .audit_outbox()
+    .next()
+    .is_some_and(|record| record.seq < through);
+  if !owed {
+    return;
+  }
+  let now = state.clock.monotonic_ns();
+  if state
+    .db
+    .mutate(&mut state.segment, &Op::AuditDelivered { through }, now)
+    .is_err()
+  {
+    state.count(AUDIT_UNACKNOWLEDGED, 1);
+  }
 }
+
+/// Sends what this shard's partition owes the audit to the control shard (A-265), and the control shard's
+/// acknowledgement back, without waiting: after a sync verb's transaction (`verbs::run_recorded`), which cannot wait, and
+/// from the reap tick ([`resend_stuck_audit`]). Nothing when nothing is owed. A batch that cannot be sent, or is refused,
+/// is counted ([`AUDIT_UNAPPENDED`]) and stays owed, durable, for the next send.
+pub(crate) fn send_owed_audit(state: &mut ShardState) {
+  let Some(batch) = owed_batch(state) else {
+    return;
+  };
+  let Some(control) = crate::verbs::shard_of_partition(state, AUDIT_PARTITION) else {
+    state.count(AUDIT_UNAPPENDED, 1);
+    return;
+  };
+  let origin = state.shard;
+  crate::xshard::run_on_waiting(
+    origin,
+    control,
+    move |s| {
+      if let Some(through) = append_audit_batch(s, batch) {
+        crate::xshard::run_on_waiting(
+          control,
+          origin,
+          move |o| record_delivered(o, through),
+          AUDIT_UNACKNOWLEDGED,
+        );
+      }
+    },
+    AUDIT_UNAPPENDED,
+  );
+}
+
+/// Sends what this shard's partition owes the audit again when the reap tick finds the outbox's front where the last
+/// tick left it (A-265): its batch was lost (a crash or a restart between the owning atom's commit and the batch, an
+/// unanswered wait, a refused append) or is slow; the control partition appends nothing twice. The first tick after a
+/// start sends whatever the recovered outbox holds.
+pub(crate) fn resend_stuck_audit(state: &mut ShardState) {
+  let front = state
+    .db
+    .partition()
+    .audit_outbox()
+    .next()
+    .map(|record| record.seq);
+  let seen = state
+    .landing
+    .outbox_front_seen
+    .replace(front.unwrap_or(u64::MAX));
+  if front.is_some()
+    && seen.is_none_or(|seen| Some(seen) == front)
+    && !state.landing.crossing_withheld
+  {
+    state.count(AUDIT_RESENT, 1);
+    send_owed_audit(state);
+  }
+}
+
+/// Sends what this shard's partition owes the audit to the control shard and waits for it, at most `budget_ns` (A-265):
+/// a presentation's or a granted landing's completion owed it, and its reply waits on it, so the caller's next `audit`
+/// reads it. Whether everything owed when it was called is appended; counted when not, and then still owed, durable,
+/// for the next send.
+async fn append_owed_audit(shard: u16, budget_ns: u64) -> bool {
+  let Some(Some(batch)) = crate::state::with_state(|s| owed_batch(s)) else {
+    return true;
+  };
+  let control =
+    crate::state::with_state(|s| crate::verbs::shard_of_partition(s, AUDIT_PARTITION)).flatten();
+  let answered = match control {
+    Some(control) => {
+      crate::xshard::call_within(
+        shard,
+        control,
+        move |s| append_audit_batch(s, batch),
+        budget_ns,
+      )
+      .await
+    }
+    None => None,
+  };
+  match answered.flatten() {
+    Some(through) => {
+      let _ = crate::state::with_state(|s| record_delivered(s, through));
+      true
+    }
+    None => {
+      // A batch the control shard refused is counted there; one that never reached it, here.
+      if answered.is_none() {
+        let _ = crate::state::with_state(|s| s.count(AUDIT_UNAPPENDED, 1));
+      }
+      false
+    }
+  }
+}
+
+/// Format: the landing-plane counter of an acknowledgement of appended audit records that this shard could not record
+/// (A-265): the records stay owed, and the next batch carries them; the control partition appends none twice.
+pub(crate) const AUDIT_UNACKNOWLEDGED: &str = "landing.audit_unacknowledged";
+
+/// Format: the landing-plane counter of the reap tick's sends of owed audit records whose batch had not been
+/// acknowledged a tick later (A-265): a lost batch, a restart, or a slow control shard.
+pub const AUDIT_RESENT: &str = "landing.audit_resent";
+
+/// Format: the landing-plane counter of an audit batch that did not reach the control partition (A-265): refused at
+/// its channel, unanswered within its budget, or refused by its transaction.
+pub(crate) const AUDIT_UNAPPENDED: &str = "landing.audit_unappended";
 
 fn to_wire_volume(id: DbVolumeId) -> VolumeId {
   VolumeId { bytes: id.bytes }
@@ -2787,7 +3947,6 @@ fn session_of(principal: &Principal) -> u64 {
   }
 }
 
-#[cfg(unix)]
 fn to_land_filter(filter: &slates_ipc::protocol::Filter) -> Filter {
   Filter {
     include: filter.include.iter().map(|s| s.as_str().into()).collect(),
@@ -2795,7 +3954,6 @@ fn to_land_filter(filter: &slates_ipc::protocol::Filter) -> Filter {
   }
 }
 
-#[cfg(unix)]
 fn summary_of(manifest: &Manifest) -> LandingSummary {
   LandingSummary {
     by_action: manifest
@@ -2809,29 +3967,48 @@ fn summary_of(manifest: &Manifest) -> LandingSummary {
       .collect(),
     bytes: manifest.summary.bytes,
     filtered_out: manifest.summary.filtered_out as u64,
+    actions: tally_of(manifest),
   }
 }
 
-#[cfg(unix)]
-fn target_refusal(refusal: &TargetRefusal, target: &str) -> Refusal {
-  if matches!(refusal, TargetRefusal::OwnMount) {
-    return Refusal::OwnMount {
-      path: target.to_owned(),
-      used_as: slates_ipc::protocol::OwnMountUse::LandingTarget,
+/// A manifest's entries per action, typed (A-299): counted from its entries' actions, one exhaustive match, so a new
+/// action does not compile until it is counted.
+fn tally_of(manifest: &Manifest) -> slates_ipc::protocol::ActionTally {
+  use slates_land::manifest::Action;
+  let mut tally = slates_ipc::protocol::ActionTally::default();
+  for entry in &manifest.entries {
+    let count = match &entry.action {
+      Action::Create => &mut tally.create,
+      Action::Replace => &mut tally.replace,
+      Action::Delete => &mut tally.delete,
+      Action::Rename { .. } => &mut tally.rename,
+      Action::Mkdir => &mut tally.mkdir,
+      Action::Rmdir => &mut tally.rmdir,
+      Action::Symlink { .. } => &mut tally.symlink,
+      Action::Clear => &mut tally.clear,
     };
+    *count = count.saturating_add(1);
   }
-  Refusal::TargetUnavailable {
-    reason: match refusal {
-      TargetRefusal::NotAbsolute => "the target path is not absolute".to_owned(),
-      TargetRefusal::EscapesTarget => "a component escapes the target directory".to_owned(),
-      TargetRefusal::TargetNotOwned => "the target is owned by another user".to_owned(),
-      TargetRefusal::OwnMount => "a component lies on a mount this daemon serves".to_owned(),
-      TargetRefusal::Unavailable(e) => format!("{e:?}"),
-    },
-  }
+  tally
 }
 
-#[cfg(unix)]
+fn target_refusal(refusal: &TargetRefusal, target: &str) -> Refusal {
+  use slates_ipc::protocol::TargetRefusal as Typed;
+  let typed = match refusal {
+    TargetRefusal::OwnMount => {
+      return Refusal::OwnMount {
+        path: target.to_owned(),
+        used_as: slates_ipc::protocol::OwnMountUse::LandingTarget,
+      };
+    }
+    TargetRefusal::NotAbsolute => Typed::NotAbsolute,
+    TargetRefusal::EscapesTarget => Typed::Escapes,
+    TargetRefusal::TargetNotOwned => Typed::OwnedByAnother { owner: None },
+    TargetRefusal::Unavailable(e) => crate::error::target_of_host(e),
+  };
+  crate::error::target(typed)
+}
+
 fn db_landing_state(state: &slates_land::engine::LandingState) -> DbLandingState {
   use slates_land::engine::LandingState as L;
   match state {
@@ -2845,6 +4022,23 @@ fn db_landing_state(state: &slates_land::engine::LandingState) -> DbLandingState
     L::Partial => DbLandingState::Partial,
     L::Refused => DbLandingState::Refused,
     L::Aborted => DbLandingState::Aborted,
+  }
+}
+
+/// A landing's state on the wire, typed (A-299).
+fn wire_landing_stage(state: DbLandingState) -> slates_ipc::protocol::LandingStage {
+  use slates_ipc::protocol::LandingStage as Stage;
+  match state {
+    DbLandingState::Planning => Stage::Planning,
+    DbLandingState::AwaitingGrant => Stage::AwaitingGrant,
+    DbLandingState::Validating => Stage::Validating,
+    DbLandingState::Writing => Stage::Writing,
+    DbLandingState::Syncing => Stage::Syncing,
+    DbLandingState::Advancing => Stage::Advancing,
+    DbLandingState::Done => Stage::Done,
+    DbLandingState::Partial => Stage::Partial,
+    DbLandingState::Refused => Stage::Refused,
+    DbLandingState::Aborted => Stage::Aborted,
   }
 }
 
@@ -2864,8 +4058,14 @@ fn landing_state_name(state: DbLandingState) -> String {
   .to_owned()
 }
 
-#[cfg(unix)]
-fn db_audit(audit: &AuditRecord, principal: &Principal) -> DbAuditRecord {
+/// One of the engine's audit records as the durable log keeps it. A record of the landing as a whole — planned or
+/// finished — carries how its signature was judged (A-321), as `audit_verb` reads it back: a granted run's own planned
+/// record is mirrored here with its finished one, and read unsigned it would contradict the landing it planned.
+fn db_audit(
+  audit: &AuditRecord,
+  principal: &Principal,
+  verification: &slates_ipc::protocol::Verification,
+) -> DbAuditRecord {
   DbAuditRecord {
     seq: 0,
     at_ns: audit.at_ns,
@@ -2875,10 +4075,15 @@ fn db_audit(audit: &AuditRecord, principal: &Principal) -> DbAuditRecord {
     landing: Some(audit.landing),
     manifest: Some(audit.manifest),
     outcome: audit.outcome.map(|s| db_landing_state(&s)),
+    signature: matches!(
+      audit.kind,
+      AuditKind::LandingPlanned | AuditKind::LandingFinished
+    )
+    .then(|| crate::signed_work::to_record(verification))
+    .flatten(),
   }
 }
 
-#[cfg(unix)]
 fn db_audit_kind(kind: AuditKind) -> DbAuditKind {
   match kind {
     AuditKind::LandingPlanned => DbAuditKind::LandingPlanned,
@@ -2886,6 +4091,21 @@ fn db_audit_kind(kind: AuditKind) -> DbAuditKind {
     AuditKind::EntryWritten => DbAuditKind::EntryWritten,
     AuditKind::EntryRefused => DbAuditKind::EntryRefused,
     AuditKind::LandingFinished => DbAuditKind::LandingFinished,
+  }
+}
+
+/// An audit record's kind on the wire, typed (A-299).
+fn wire_audit_kind(kind: DbAuditKind) -> slates_ipc::protocol::AuditKind {
+  use slates_ipc::protocol::AuditKind as Kind;
+  match kind {
+    DbAuditKind::GrantIssued => Kind::GrantIssued,
+    DbAuditKind::GrantRevoked => Kind::GrantRevoked,
+    DbAuditKind::LandingPlanned => Kind::LandingPlanned,
+    DbAuditKind::LandingValidated => Kind::LandingValidated,
+    DbAuditKind::EntryWritten => Kind::EntryWritten,
+    DbAuditKind::EntryRefused => Kind::EntryRefused,
+    DbAuditKind::LandingFinished => Kind::LandingFinished,
+    DbAuditKind::GrantExpired => Kind::GrantExpired,
   }
 }
 
@@ -2898,6 +4118,7 @@ fn audit_kind_name(kind: DbAuditKind) -> String {
     DbAuditKind::EntryWritten => "entry_written",
     DbAuditKind::EntryRefused => "entry_refused",
     DbAuditKind::LandingFinished => "landing_finished",
+    DbAuditKind::GrantExpired => "grant_expired",
   }
   .to_owned()
 }
@@ -2916,6 +4137,17 @@ fn wire_grant_scope(scope: &DbGrantScope) -> GrantScope {
   }
 }
 
+/// A grant's state on the wire, typed (A-299).
+fn wire_grant_state(state: DbGrantState) -> slates_ipc::protocol::GrantState {
+  use slates_ipc::protocol::GrantState as Wire;
+  match state {
+    DbGrantState::Issued => Wire::Issued,
+    DbGrantState::Consumed => Wire::Consumed,
+    DbGrantState::Expired => Wire::Expired,
+    DbGrantState::Revoked => Wire::Revoked,
+  }
+}
+
 fn grant_state_name(state: DbGrantState) -> String {
   match state {
     DbGrantState::Issued => "issued",
@@ -2926,11 +4158,12 @@ fn grant_state_name(state: DbGrantState) -> String {
   .to_owned()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
   use super::{
-    ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver, attest_proof, enroll_proof, release_target_lease,
-    revoke_proof, take_target_lease,
+    AuditKind, AuditRecord, DbLandingState, ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver,
+    attest_proof, enroll_proof, refused_state, release_target_lease, revoke_proof,
+    take_target_lease,
   };
   use slates_ipc::protocol::Refusal;
   use slates_vfs::clock::Clock;
@@ -2961,6 +4194,36 @@ mod tests {
     // The paused holder: the test stands in for a descheduled landing attempt.
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(std::time::Duration::from_nanos(2 * SHORT_TERM_NS));
+  }
+
+  /// §4.15's state machine (`→ Refused`, `→ Aborted`): a refused granted landing's end names what it left on the disk.
+  /// Do: decide the end of an attempt whose ring records hold its plan, its validation and an entry it refused, and of
+  /// one whose records hold an entry it wrote as well. Expect `Refused` for the first, nothing written, and `Aborted` for
+  /// the second, its written entry on the disk for a resume to continue.
+  #[test]
+  fn a_refused_attempts_end_is_aborted_once_it_wrote_an_entry() {
+    let record = |kind| AuditRecord {
+      seq: 0,
+      at_ns: 0,
+      kind,
+      grant: None,
+      landing: 1,
+      manifest: [0; 32],
+      outcome: None,
+    };
+    let refused_whole = [
+      record(AuditKind::LandingPlanned),
+      record(AuditKind::LandingValidated),
+      record(AuditKind::EntryRefused),
+    ];
+    assert_eq!(refused_state(&refused_whole), DbLandingState::Refused);
+    let wrote_one = [
+      record(AuditKind::LandingPlanned),
+      record(AuditKind::LandingValidated),
+      record(AuditKind::EntryWritten),
+      record(AuditKind::EntryRefused),
+    ];
+    assert_eq!(refused_state(&wrote_one), DbLandingState::Aborted);
   }
 
   /// §4.15 step 4 (AUD-29-03): the control shard's target lease has one holder until it is released or its
@@ -3207,5 +4470,109 @@ mod tests {
       }),
       "the domain tag is part of the proof"
     );
+  }
+}
+
+#[cfg(test)]
+mod landed_reply_tests {
+  use slates_ipc::protocol::{
+    HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, ReplyBody, framed_len,
+  };
+
+  /// Shape: the degraded cells the test's landing met: one a directory, several replies' worth at these paths.
+  const CELLS: usize = 400;
+
+  /// A-267 (§4.15 step 9). Do: build a finished landing's reply that met 400 directory syncs the host refused (one a
+  /// directory, as a filesystem that refuses a directory's sync answers every one), each directory's path about eighty
+  /// bytes. Expect: the reply fits one reply chunk, carrying the first cells in the order met and counting the rest,
+  /// the two making 400. Before, every cell rode in the reply, and one this long was refused "reply too large for the
+  /// bulk area" after the landing had run.
+  #[test]
+  fn a_landing_that_met_more_degraded_cells_than_one_reply_holds_still_answers() {
+    let degraded: Vec<LandingDegradation> = (0..CELLS)
+      .map(|n| LandingDegradation::Unsynced {
+        dir: format!("/a-directory-whose-sync-the-host-refused-as-a-network-filesystem-may-{n:05}"),
+        answer: HostAnswer::Errno { errno: 22 },
+      })
+      .collect();
+    let outcome = LandingOutcome {
+      landing: 7,
+      state: "done".to_owned(),
+      written: 1,
+      skipped: 0,
+      conflicts: 0,
+      failed: 0,
+      bytes_written: 1,
+      held: 1,
+      durability: LandingDurability {
+        data_synced: true,
+        dirs_synced: false,
+        media: false,
+        media_requested: false,
+        dirs: 0,
+      },
+      degraded: Vec::new(),
+      barriers: 1,
+      stage: slates_ipc::protocol::LandingStage::Done,
+      verification: slates_ipc::protocol::Verification::Unsigned,
+      degraded_elided: 0,
+    };
+    let reply = super::landed_reply(outcome, degraded.clone());
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap();
+    assert!(framed_len(&reply) <= chunk, "the reply fits one chunk");
+    let ReplyBody::Landed { outcome } = reply else {
+      panic!("a landing's reply");
+    };
+    assert!(outcome.degraded_elided > 0, "the test outgrows one reply");
+    assert_eq!(
+      outcome.degraded.len() + outcome.degraded_elided as usize,
+      CELLS
+    );
+    assert_eq!(
+      outcome.degraded,
+      degraded[..outcome.degraded.len()],
+      "the first cells, in the order met"
+    );
+  }
+
+  /// A presentation's reply at `target`: its statement names the target (A-321), with no conflict, the summary and
+  /// verdict at their smallest, and the conflicts' count at its widest.
+  fn presentation(target: &str) -> ReplyBody {
+    ReplyBody::GrantRequired {
+      landing: u64::MAX,
+      manifest: [u8::MAX; 32],
+      summary: slates_ipc::protocol::LandingSummary {
+        by_action: Vec::new(),
+        bytes: u64::MAX,
+        filtered_out: u64::MAX,
+        actions: slates_ipc::protocol::ActionTally::default(),
+      },
+      conflicts: Vec::new(),
+      statement: crate::signed_work::landing_statement(&[u8::MAX; 16], target, &[u8::MAX; 32]),
+      verification: slates_ipc::protocol::Verification::Unsigned,
+      conflicts_elided: u32::MAX,
+    }
+  }
+
+  /// A-267 with A-321's statement (§4.15 step 2, §4.3). Do: size a presentation's reply whose statement names a target
+  /// as long as a grant's listing takes, then one as long as the guard names. Expect the first past one reply chunk,
+  /// the guard naming a longest shorter than its target, and the second within the chunk with the guard silent: a
+  /// presentation is answered whole or refused before anything is recorded. Since the statement joined the reply
+  /// (main's signed landings, 2026-11-18), a target the listing takes could make a reply no chunk holds, refused "reply
+  /// too large" after the presentation was recorded.
+  #[test]
+  fn a_presentation_too_long_for_one_reply_names_the_longest_that_fits() {
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap();
+    let listed = "t".repeat(super::longest_grantable_target());
+    let longest = super::presentation_overflow(&presentation(&listed), listed.len())
+      .expect("a grant's longest target overflows a presentation's reply");
+    let longest = usize::try_from(longest).unwrap();
+    assert!(longest < listed.len(), "{longest} of {}", listed.len());
+    let fitting = "t".repeat(longest);
+    assert!(
+      super::presentation_overflow(&presentation(&fitting), fitting.len()).is_none(),
+      "the longest named fits"
+    );
+    assert!(framed_len(&presentation(&fitting)) <= chunk);
   }
 }

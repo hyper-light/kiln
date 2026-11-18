@@ -20,6 +20,13 @@
 //! **The bound.** A value whose piece list would cost more than its bytes is stored as one chunk instead (compaction):
 //! a version never costs more than a whole copy, which is what every version cost before, and a file edited in many
 //! places is rewritten once its pieces outweigh it. No constant: the rule is the two sizes.
+//!
+//! **Replicas reading in place (A-273).** A replica of the green on another shard names these chunks rather than
+//! copying them (A-64: content once), so the owner's last piece leaving a chunk does not free it while a replica may
+//! still read it. Each such chunk is stamped with the feed position of the message that carries the change to the
+//! replicas, kept (its room unreused) until every holder has acknowledged that position or left, and charged to the
+//! green's retained bytes meanwhile. Positions, not versions: a fold of the history releases chunks with no new
+//! version. With no holder a free is immediate, as it always was.
 
 use crate::ops_doc::{Op, OpKind};
 
@@ -46,6 +53,20 @@ pub(crate) struct Chunks {
   free: Vec<usize>,
   /// The bytes the live chunks hold.
   bytes: usize,
+  /// The replicas reading these chunks in place (A-273), by holder id: each one's count of feed messages applied, so
+  /// it names no chunk released at a position below it.
+  holders: std::collections::BTreeMap<u64, u64>,
+  /// The next holder id.
+  next_holder: u64,
+  /// The feed position a release is stamped with now: the position of the next message the owner sends (A-273).
+  position: u64,
+  /// Chunks named by no piece of the owner's whose free waits for every holder to pass their release's position, in
+  /// release order: `(position, chunk)`. Their slots are not reused meanwhile.
+  held: std::collections::VecDeque<(u64, usize)>,
+  /// The bytes the held chunks keep.
+  held_bytes: usize,
+  /// The frees held for a holder since the arena was made (A-273's non-vacuity counter).
+  frees_held: u64,
 }
 
 impl Chunks {
@@ -103,9 +124,96 @@ impl Chunks {
       }
       None => None,
     };
-    if let Some(len) = freed {
+    let Some(len) = freed else {
+      return;
+    };
+    self.bytes = self.bytes.saturating_sub(len);
+    if self.holders.is_empty() {
       *slot = None;
-      self.bytes = self.bytes.saturating_sub(len);
+      self.free.push(chunk);
+      return;
+    }
+    // A replica may still name it: kept, its slot unreused, until every holder has passed this position (A-273).
+    self.held.push_back((self.position, chunk));
+    self.held_bytes = self.held_bytes.saturating_add(len);
+    self.frees_held = self.frees_held.saturating_add(1);
+  }
+
+  /// The feed position releases are stamped with now: the position the owner's next feed message carries (A-273).
+  pub(crate) fn position(&self) -> u64 {
+    self.position
+  }
+
+  /// The owner sent the feed message at [`Chunks::position`]; releases from now on belong to the next one.
+  pub(crate) fn advance(&mut self) {
+    self.position = self.position.saturating_add(1);
+  }
+
+  /// A replica built from the owner's state now begins reading these chunks in place: it names only chunks live now,
+  /// so it has passed every position before [`Chunks::position`]. Its id, for [`Chunks::acknowledge`] and
+  /// [`Chunks::leave`].
+  pub(crate) fn hold(&mut self) -> u64 {
+    let holder = self.next_holder;
+    self.next_holder = self.next_holder.saturating_add(1);
+    self.holders.insert(holder, self.position);
+    holder
+  }
+
+  /// `holder` has applied the feed message at `position` and dropped every piece it released: chunks every holder has
+  /// passed are freed. An acknowledgement never moves a holder back, and an unknown holder's is ignored.
+  pub(crate) fn acknowledge(&mut self, holder: u64, position: u64) {
+    if let Some(applied) = self.holders.get_mut(&holder) {
+      *applied = (*applied).max(position.saturating_add(1));
+    }
+    self.free_passed();
+  }
+
+  /// `holder` reads no more (dropped, rebuilt or ended): it holds no free from now on.
+  pub(crate) fn leave(&mut self, holder: u64) {
+    self.holders.remove(&holder);
+    self.free_passed();
+  }
+
+  /// The bytes of chunks kept only for holders (A-273): the owner's memory, charged with its own.
+  pub(crate) fn held_bytes(&self) -> usize {
+    self.held_bytes
+  }
+
+  /// The bytes of the held chunks **recounted** from the held list itself: the oracle [`Chunks::held_bytes`]'s running
+  /// total is checked against.
+  pub(crate) fn held_bytes_recounted(&self) -> usize {
+    self
+      .held
+      .iter()
+      .filter_map(|(_, chunk)| self.slots.get(*chunk).and_then(Option::as_ref))
+      .map(|(bytes, _)| bytes.len())
+      .sum()
+  }
+
+  /// The frees held for a holder since the arena was made (A-273's non-vacuity counter).
+  pub(crate) fn frees_held(&self) -> u64 {
+    self.frees_held
+  }
+
+  /// Frees each held chunk every holder has passed, oldest first (releases are in position order).
+  fn free_passed(&mut self) {
+    let passed = self.holders.values().copied().min().unwrap_or(u64::MAX);
+    while let Some(&(position, chunk)) = self.held.front() {
+      if position >= passed {
+        break;
+      }
+      self.held.pop_front();
+      let Some(slot) = self.slots.get_mut(chunk) else {
+        continue;
+      };
+      // Only a chunk still named by no piece: a held chunk is never retained again, but the guard keeps a slot that
+      // somehow was from being freed under its piece.
+      let len = match slot {
+        Some((bytes, 0)) => bytes.len(),
+        _ => continue,
+      };
+      self.held_bytes = self.held_bytes.saturating_sub(len);
+      *slot = None;
       self.free.push(chunk);
     }
   }
@@ -136,6 +244,61 @@ enum Pending {
   Shared(Piece),
   /// `len` bytes of `next` at `at`, to be copied into the new chunk.
   Added { at: usize, len: usize },
+}
+
+/// A run of the bytes the engine's `apply` writes ([`Value::applied_runs`]): a run of the value it keeps, or bytes of the
+/// increment's post-state.
+#[derive(Clone, Copy)]
+enum Applied {
+  /// A run of the value, by its piece.
+  Shared(Piece),
+  /// `len` bytes of the post-state at `src`.
+  Post { src: usize, len: usize },
+}
+
+impl Applied {
+  /// A kept run of the value, from what [`Value::share`] collected.
+  fn of_shared(run: Pending) -> Option<Applied> {
+    match run {
+      Pending::Shared(piece) => Some(Applied::Shared(piece)),
+      Pending::Added { .. } => None,
+    }
+  }
+
+  /// The post-state run `op` adds, clamped to the post-state's `post_len` bytes as `apply`'s `push_slice` clamps it.
+  fn post(op: &Op, post_len: usize) -> Option<Applied> {
+    let src = usize::try_from(op.src).unwrap_or(usize::MAX).min(post_len);
+    let end = src
+      .saturating_add(usize::try_from(op.len).ok()?)
+      .min(post_len);
+    Some(Applied::Post {
+      src,
+      len: end.saturating_sub(src),
+    })
+  }
+
+  /// Its length.
+  fn len(&self) -> usize {
+    match self {
+      Applied::Shared(piece) => piece.len,
+      Applied::Post { len, .. } => *len,
+    }
+  }
+
+  /// What is left of it past its first `step` bytes.
+  fn after(self, step: usize) -> Applied {
+    match self {
+      Applied::Shared(piece) => Applied::Shared(Piece {
+        chunk: piece.chunk,
+        at: piece.at.saturating_add(step),
+        len: piece.len.saturating_sub(step),
+      }),
+      Applied::Post { src, len } => Applied::Post {
+        src: src.saturating_add(step),
+        len: len.saturating_sub(step),
+      },
+    }
+  }
 }
 
 impl Value {
@@ -208,6 +371,98 @@ impl Value {
       at = end;
     }
     at == bytes.len()
+  }
+
+  /// Whether the bytes `ops` make of this value, their added bytes read from `post_state` as the engine's `apply` reads
+  /// them, are `other`'s bytes: compared run against run, so a stretch both name in the same chunk at the same offset
+  /// is equal unread, and only the runs the ops added and the runs the two values do not share are read. What the
+  /// verdict's whole-file identity check needs (`Green::lands_on_head`): it materialized this value, applied the ops
+  /// to a second copy and compared that with the head, the file's size three times over, where the two values share
+  /// every run neither changed.
+  pub(crate) fn applied_equals(
+    &self,
+    chunks: &Chunks,
+    (ops, post_state): (&[Op], &[u8]),
+    other: &Value,
+  ) -> bool {
+    let Some(runs) = self.applied_runs(ops, post_state.len()) else {
+      return false;
+    };
+    let len = runs
+      .iter()
+      .fold(0usize, |sum, run| sum.saturating_add(run.len()));
+    if len != other.len {
+      return false;
+    }
+    let mut theirs = other.pieces.iter().copied();
+    let mut current: Option<Piece> = None;
+    for run in runs {
+      let mut run = run;
+      while run.len() > 0 {
+        let piece = match current.take().filter(|piece| piece.len > 0) {
+          Some(piece) => piece,
+          None => match theirs.next() {
+            Some(piece) => piece,
+            None => return false,
+          },
+        };
+        let step = run.len().min(piece.len);
+        let same = match run {
+          Applied::Shared(mine) => {
+            (mine.chunk == piece.chunk && mine.at == piece.at)
+              || chunks.bytes_of(&Piece { len: step, ..mine })
+                == chunks.bytes_of(&Piece { len: step, ..piece })
+          }
+          Applied::Post { src, .. } => {
+            post_state.get(src..src.saturating_add(step))
+              == Some(chunks.bytes_of(&Piece { len: step, ..piece }))
+          }
+        };
+        if !same {
+          return false;
+        }
+        run = run.after(step);
+        current = Some(Piece {
+          chunk: piece.chunk,
+          at: piece.at.saturating_add(step),
+          len: piece.len.saturating_sub(step),
+        });
+      }
+    }
+    true
+  }
+
+  /// The runs the engine's `apply` writes when it applies `ops` to this value over a post-state of `post_len` bytes:
+  /// runs of this value it keeps and runs of the post-state it adds, each clamped as `apply` clamps them. `None` when
+  /// an offset does not fit a `usize`.
+  fn applied_runs(&self, ops: &[Op], post_len: usize) -> Option<Vec<Applied>> {
+    let base_len = u64::try_from(self.len).ok()?;
+    let mut runs = Vec::new();
+    let mut shared = Vec::new();
+    let mut pos = 0u64;
+    for op in ops {
+      if op.at > pos {
+        self.share(pos.min(base_len), op.at.min(base_len), 0, &mut shared)?;
+        pos = op.at;
+      }
+      runs.extend(shared.drain(..).filter_map(Applied::of_shared));
+      match op.kind {
+        OpKind::Delete => pos = pos.saturating_add(op.len),
+        OpKind::Truncate => pos = base_len,
+        OpKind::Overwrite => {
+          runs.push(Applied::post(op, post_len)?);
+          pos = pos.saturating_add(op.len);
+        }
+        OpKind::Insert | OpKind::Extend => runs.push(Applied::post(op, post_len)?),
+        _ => {}
+      }
+    }
+    if pos < base_len {
+      self.share(pos, base_len, 0, &mut shared)?;
+    }
+    runs.extend(shared.drain(..).filter_map(Applied::of_shared));
+    runs.retain(|run| run.len() > 0);
+    Some(runs)
   }
 
   /// Gives the value's chunks back: each piece's reference released.
@@ -447,6 +702,51 @@ mod tests {
     }
   }
 
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+    /// §4.16 "The verdict" (the whole-file identity check). Do: from a generated first value, build a head by a
+    /// generated chain of versions (each spliced from the one before, or, at a generated version, stored whole from
+    /// its bytes so it shares nothing); pick a generated base among the versions and generated ops over it, the
+    /// head's own last ops among them so the two converge. Expect: `applied_equals` answers exactly whether `apply`
+    /// of the ops to the base's bytes equals the head's bytes, for every pick.
+    #[test]
+    fn applied_equals_is_the_bytes_compared(
+      first in prop::collection::vec(any::<u8>(), 0..256),
+      chain in prop::collection::vec(prop::collection::vec((any::<u8>(), any::<u16>(), any::<u16>(), any::<u16>()), 0..5), 1..8),
+      whole_at in any::<u8>(),
+      pick in any::<u8>(),
+      raw in prop::collection::vec((any::<u8>(), any::<u16>(), any::<u16>(), any::<u16>()), 0..5),
+      converge in any::<bool>(),
+      post in prop::collection::vec(any::<u8>(), 0..300),
+    ) {
+      let mut chunks = Chunks::default();
+      let mut kept = vec![(first.clone(), Value::whole(&mut chunks, &first), Vec::new())];
+      for (n, step) in chain.iter().enumerate() {
+        let (bytes, value, _) = kept.last().unwrap();
+        let ops = ops_over(bytes.len() as u64, step);
+        let next = apply(bytes, &ops, &post);
+        let made = if n == usize::from(whole_at) % chain.len() {
+          Value::whole(&mut chunks, &next)
+        } else {
+          value.spliced(&mut chunks, &ops, &next)
+        };
+        kept.push((next, made, ops));
+      }
+      let (head_bytes, head, head_ops) = kept.last().unwrap();
+      // Converging: the version before the head, with the ops that made the head of it.
+      let at = if converge { kept.len() - 2 } else { usize::from(pick) % kept.len() };
+      let (base_bytes, base, _) = &kept[at];
+      let ops = if converge {
+        head_ops.clone()
+      } else {
+        ops_over(base_bytes.len() as u64, &raw)
+      };
+      let expected = apply(base_bytes, &ops, &post) == *head_bytes;
+      prop_assert_eq!(base.applied_equals(&chunks, (&ops, &post), head), expected);
+    }
+  }
+
   /// W2. Do: a 1 MiB value, then 64 versions each overwriting 64 bytes of its own range. Expect: the chunks hold the
   /// file once plus the 64 × 64 bytes the versions added, not 64 copies of the file.
   #[test]
@@ -468,5 +768,124 @@ mod tests {
     }
     assert_eq!(chunks.bytes(), FILE + EDITS * EDIT as usize);
     assert_eq!(values.last().unwrap().materialize(&chunks), bytes);
+  }
+
+  /// A-273 "Frees deferred until every replica has passed them". Do: an owner's value of 64 bytes; a replica begins
+  /// reading in place (its copy of the value names the owner's chunk); the owner releases its value and stores another
+  /// value of other bytes. Expect: the replica's copy still reads its 64 bytes, the free counted as held and its bytes
+  /// charged; once the replica acknowledges the release's feed message, the chunk is freed and nothing is held. With
+  /// the hold ignored, the new value takes the freed chunk's room and the replica reads its bytes.
+  #[test]
+  fn a_chunk_released_while_a_replica_reads_it_stays_until_the_replica_passes_its_release() {
+    let mut chunks = Chunks::default();
+    let first = vec![7u8; 64];
+    let owner = Value::whole(&mut chunks, &first);
+    let replica = owner.clone();
+    let holder = chunks.hold();
+    let released_at = chunks.position();
+    owner.release(&mut chunks);
+    let second = Value::whole(&mut chunks, &[9u8; 64]);
+    chunks.advance();
+    assert_eq!(
+      replica.materialize(&chunks),
+      first,
+      "the replica reads the bytes it named"
+    );
+    assert_eq!(chunks.frees_held(), 1);
+    assert_eq!(chunks.held_bytes(), first.len());
+    chunks.acknowledge(holder, released_at);
+    assert_eq!(chunks.held_bytes(), 0);
+    assert_eq!(chunks.held_bytes_recounted(), 0);
+    second.release(&mut chunks);
+    assert_eq!(chunks.bytes(), 0);
+  }
+
+  /// A-273. Do: as above, but the replica leaves (dropped, rebuilt or ended) instead of acknowledging. Expect: the
+  /// held chunk is freed at the leave, and a later release with no replica is freed at once, nothing held.
+  #[test]
+  fn a_replica_that_leaves_holds_no_free() {
+    let mut chunks = Chunks::default();
+    let owner = Value::whole(&mut chunks, &[1u8; 32]);
+    let holder = chunks.hold();
+    owner.release(&mut chunks);
+    assert_eq!(chunks.held_bytes(), 32);
+    chunks.leave(holder);
+    assert_eq!(chunks.held_bytes(), 0);
+    let later = Value::whole(&mut chunks, &[2u8; 32]);
+    later.release(&mut chunks);
+    assert_eq!(
+      (chunks.bytes(), chunks.held_bytes(), chunks.frees_held()),
+      (0, 0, 1)
+    );
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+
+    /// A-273, the lifetime rule over generated histories. Do: generated steps of an owner storing values, releasing
+    /// them (each stamped with the feed position then), sending feed messages, replicas joining, acknowledging a sent
+    /// message and leaving; each replica keeps a copy of every value the owner released after it joined and at or
+    /// after the position it has passed (a release before its join, even at the same position, it never named). Expect, after every step: every such copy reads exactly its bytes, every value the owner keeps
+    /// reads its bytes, and the held bytes' running total equals their recount; at the end, with every replica gone
+    /// and every value released, the arena holds nothing.
+    #[test]
+    fn no_replica_reads_a_chunk_freed_before_it_passed_the_release(
+      steps in prop::collection::vec((0u8..6, any::<u8>(), prop::collection::vec(any::<u8>(), 1..48)), 1..80),
+    ) {
+      let mut chunks = Chunks::default();
+      let mut kept: Vec<(Vec<u8>, Value)> = Vec::new();
+      let mut released: Vec<(u64, Vec<u8>, Value)> = Vec::new();
+      // Each replica's passed position, and how many releases came before it joined.
+      let mut replicas: std::collections::BTreeMap<u64, (u64, usize)> = std::collections::BTreeMap::new();
+      for (kind, pick, bytes) in steps {
+        match kind {
+          0 => {
+            let value = Value::whole(&mut chunks, &bytes);
+            kept.push((bytes, value));
+          }
+          1 if !kept.is_empty() => {
+            let (bytes, value) = kept.remove(usize::from(pick) % kept.len());
+            released.push((chunks.position(), bytes, value.clone()));
+            value.release(&mut chunks);
+          }
+          2 => chunks.advance(),
+          3 => {
+            let holder = chunks.hold();
+            replicas.insert(holder, (chunks.position(), released.len()));
+          }
+          4 if !replicas.is_empty() && chunks.position() > 0 => {
+            let holder = *replicas.keys().nth(usize::from(pick) % replicas.len()).unwrap();
+            let sent = u64::from(pick) % chunks.position();
+            chunks.acknowledge(holder, sent);
+            let (applied, _) = replicas.get_mut(&holder).unwrap();
+            *applied = (*applied).max(sent + 1);
+          }
+          5 if !replicas.is_empty() => {
+            let holder = *replicas.keys().nth(usize::from(pick) % replicas.len()).unwrap();
+            replicas.remove(&holder);
+            chunks.leave(holder);
+          }
+          _ => {}
+        }
+        for (applied, joined) in replicas.values() {
+          for (stamp, bytes, copy) in released.iter().skip(*joined) {
+            if stamp >= applied {
+              prop_assert_eq!(&copy.materialize(&chunks), bytes);
+            }
+          }
+        }
+        for (bytes, value) in &kept {
+          prop_assert_eq!(&value.materialize(&chunks), bytes);
+        }
+        prop_assert_eq!(chunks.held_bytes(), chunks.held_bytes_recounted());
+      }
+      for holder in replicas.into_keys() {
+        chunks.leave(holder);
+      }
+      for (_, value) in kept {
+        value.release(&mut chunks);
+      }
+      prop_assert_eq!((chunks.bytes(), chunks.held_bytes()), (0, 0));
+    }
   }
 }

@@ -205,23 +205,34 @@ fn mount_verb(
 
 /// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so the library finds
 /// its attachment among the volumes' reported mounts and detaches it; a volume whose status was refused cannot report
-/// its mounts and is named on standard error, and the drive is still released when another volume reports it.
+/// its mounts and is named on standard error, whether or not the drive is released (another volume reports it). The
+/// names went missing from a released drive's unmount when the CLI moved onto the library (A-278) and came back on
+/// 2026-11-18 (the integrator's Windows lane, run 44257181904).
 #[cfg(windows)]
 fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
   let mut attached = Instance::from_client(instance, connect(instance)?);
   match attached.unmount(path) {
-    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }))
-      if !unreported.is_empty() =>
-    {
-      for volume in &unreported {
-        slates_machine::log_line!("slates: {volume}: its mounts are unknown");
-      }
+    Ok(unmounted) => {
+      name_the_unasked(&unmounted.unreported);
+      Ok(())
+    }
+    Err(slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported })) => {
+      name_the_unasked(&unreported);
       Err(failure_of_api(
         slates_api::Error::Mount(slates_api::MountFault::NotMounted { path, unreported }),
         instance,
       ))
     }
-    other => other.map_err(|e| failure_of_api(e, instance)),
+    Err(refused) => Err(failure_of_api(refused, instance)),
+  }
+}
+
+/// Names on standard error each volume a Windows unmount could not ask, with its status's refusal: its mounts are
+/// unknown.
+#[cfg(windows)]
+fn name_the_unasked(unreported: &[slates_api::Unreported]) {
+  for volume in unreported {
+    slates_machine::log_line!("slates: {volume}: its mounts are unknown");
   }
 }
 
@@ -233,18 +244,35 @@ fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
     .map_err(|fault| failure_of_api(slates_api::Error::Mount(fault), instance))
 }
 
-/// A library refusal as the command's failure: the daemon's refusal (exit 1), no daemon (exit 3), or the command's own
-/// (exit 4), as [`failure_of`] maps the client's.
+/// A library refusal as the command's failure: a refusal (exit 1) for every class the daemon or the machine refused
+/// with, no daemon (exit 3), or the command's own (exit 4), as [`failure_of`] maps the client's (A-299's taxonomy). A
+/// missing issuer authority is the command's own: nothing was asked of the daemon, since the anchor's surface is not in
+/// this command's environment (`docs/cli.md`'s exit 4; until 2026-11-18 it exited 1, the integrator's CLI flow found it).
 fn failure_of_api(error: slates_api::Error, instance: &str) -> Failure {
+  use slates_api::Error as E;
   match error {
-    slates_api::Error::Refused(refusal) => failure_of(ClientError::Refused(refusal), instance),
-    slates_api::Error::Unavailable { cause, .. } | slates_api::Error::Channel(cause) => {
-      failure_of(cause, instance)
-    }
-    slates_api::Error::Mount(
+    E::Unavailable { cause, .. } => Failure::Unavailable {
+      instance: instance.to_owned(),
+      cause: cause.to_string(),
+    },
+    own @ E::Denied(slates_api::Denied::NoAuthority(_)) => Failure::Failed(own.to_string()),
+    E::Mount(
       fault @ (slates_api::MountFault::Unsupported { .. } | slates_api::MountFault::NoCapability),
     ) => Failure::Refused(fault.to_string()),
-    other => Failure::Failed(other.to_string()),
+    refused @ (E::NotFound(_)
+    | E::AlreadyExists(_)
+    | E::Denied(_)
+    | E::Exhausted(_)
+    | E::Busy(_)
+    | E::Stale(_)
+    | E::Retry { .. }
+    | E::Unsupported(_)
+    | E::Invalid(_)
+    | E::Unusable(_)
+    | E::Elsewhere(_)) => Failure::Refused(refused.to_string()),
+    other @ (E::Host(_) | E::Mount(_) | E::Start(_) | E::Protocol(_)) => {
+      Failure::Failed(other.to_string())
+    }
   }
 }
 
@@ -382,10 +410,55 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       destination: destination.clone(),
     };
     return emit_attach(&mut client, *volume, *snapshot, *intent, form, request.json)
+      .map(|_attachment| ())
       .map_err(|e| failure_of(e, &request.instance));
+  }
+  if let Verb::Hold {
+    volume,
+    snapshot,
+    intent,
+  } = &request.verb
+  {
+    return hold(
+      &mut client,
+      &request.instance,
+      (*volume, *snapshot, *intent),
+      request.json,
+    )
+    .map_err(|e| failure_of(e, &request.instance));
   }
   let outcome = serve(&mut client, &request.verb, request.json);
   outcome.map_err(|e| failure_of(e, &request.instance))
+}
+
+/// `slates attach VOLUME --hold` (A-384): attaches in the CLI's form and says so as `attach` does, then keeps the
+/// attachment alive from this process until it ends: a [`slates_client::Hold`] renews it at the cadence the daemon names,
+/// so other `slates` processes may name it however long they are idle. The process ending (an interrupt, a kill, any
+/// end) ends the renewals, and the attachment lapses at its holder's pace; a renewal the daemon refuses (the attachment
+/// detached elsewhere) ends the command with that refusal.
+fn hold(
+  client: &mut Client,
+  instance: &str,
+  (volume, snapshot, intent): (VolumeId, Option<SnapshotId>, Intent),
+  json: bool,
+) -> Result<(), ClientError> {
+  let attachment = emit_attach(
+    client,
+    volume,
+    snapshot,
+    intent,
+    AttachRequest::Termed,
+    json,
+  )?;
+  let held = slates_client::Hold::new(instance, slates_api::deadlines(), attachment)?;
+  slates_machine::log_line!(
+    "slates attach --hold: holding attachment {attachment} (its term {} ms); it lapses once this process ends",
+    held.term_ns() / NANOS_PER_MILLISECOND
+  );
+  match held.wait_lost() {
+    Some(refused) => Err(refused),
+    None => Ok(()),
+  }
 }
 
 /// Serves the MCP tools (§4.12): the merge/volume/attach/base/land tools mapped onto the client SDK,
@@ -552,7 +625,8 @@ fn merge_edit(
 }
 
 /// `advance ATTACHMENT [VERSION]`: the version now pinned and the invalidated paths, as text lines or
-/// a JSON `{ "version", "invalidated" }`.
+/// a JSON `{ "version", "invalidated", "invalidated_elided" }`: past what one reply holds the paths are counted
+/// (A-267), and a line says how many more changed.
 fn merge_advance(
   client: &mut Client,
   attachment: u64,
@@ -563,12 +637,22 @@ fn merge_advance(
   if json {
     slates_machine::out_line!(
       "{}",
-      serde_json::json!({ "version": advanced.version, "invalidated": advanced.invalidated })
+      serde_json::json!({
+        "version": advanced.version,
+        "invalidated": advanced.invalidated,
+        "invalidated_elided": advanced.invalidated_elided,
+      })
     );
   } else {
     slates_machine::out_line!("version: {}", advanced.version);
     for path in advanced.invalidated {
       slates_machine::out_line!("{path}");
+    }
+    if advanced.invalidated_elided > 0 {
+      slates_machine::out_line!(
+        "and {} more paths changed: every path counts as invalidated",
+        advanced.invalidated_elided
+      );
     }
   }
   Ok(())
@@ -627,6 +711,9 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
         match outcome {
           Submitted::Accepted(version) => slates_machine::out_line!("accepted: {version}"),
           Submitted::Conflict(windows) => print_windows(&windows),
+          Submitted::ApprovalRequired { identity, paths } => {
+            slates_machine::out_line!("approval required: {} ({paths} paths)", hex32(&identity))
+          }
         }
       }
     }
@@ -655,6 +742,12 @@ fn submit_json(outcome: &Submitted) -> serde_json::Value {
     Submitted::Conflict(windows) => {
       serde_json::json!({ "accepted": false, "conflicts": slates_mcp::windows_json(windows) })
     }
+    Submitted::ApprovalRequired { identity, paths } => serde_json::json!({
+      "accepted": false,
+      "approval_required": true,
+      "identity": hex32(identity),
+      "paths": paths,
+    }),
   }
 }
 
@@ -709,7 +802,9 @@ fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError
 }
 
 /// `status ID` / `volume stat ID`: the report as text, its drifted paths (`--drift`), or the whole
-/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form).
+/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form). `--drift` names every drifted
+/// entry: the report carries those that fit beside its other fields (A-267), so past them the paged read
+/// (`Client::drifted`) walks the rest; an entry too long for any page is counted on standard error.
 fn emit_status(
   client: &mut Client,
   volume: slates_client::VolumeId,
@@ -720,13 +815,44 @@ fn emit_status(
   if json {
     slates_machine::out_line!("{}", slates_mcp::status_json(&report));
   } else if drift {
-    for path in &report.drifted {
+    let (entries, oversized) = if report.drifted_elided > 0 {
+      let whole = client.drifted(volume)?;
+      let oversized = whole.oversized;
+      (drift_lines(whole), oversized)
+    } else {
+      (report.drifted, 0)
+    };
+    for path in &entries {
       slates_machine::out_line!("{path}");
+    }
+    if oversized > 0 {
+      slates_machine::log_line!(
+        "{oversized} drifted entries too long for a reply were passed over"
+      );
     }
   } else {
     slates_machine::out_text!("{}", status_text(&report));
   }
   Ok(())
+}
+
+/// A drift walked a page at a time, as text in path order: `PATH (KIND)` for an entry the disk changed, as a status
+/// names it, and `PATH (unverified)` for one whose re-check the host refused (a page carries no refusal's words).
+fn drift_lines(whole: slates_client::DriftedPage) -> Vec<String> {
+  let mut lines: Vec<(String, String)> = whole
+    .drifted
+    .into_iter()
+    .map(|entry| {
+      let line = format!("{} ({:?})", entry.path, entry.kind);
+      (entry.path, line)
+    })
+    .chain(whole.unverified.into_iter().map(|path| {
+      let line = format!("{path} (unverified)");
+      (path, line)
+    }))
+    .collect();
+  lines.sort();
+  lines.into_iter().map(|(_, line)| line).collect()
 }
 
 /// `volume create`: the new volume's id, as text (the id and its bridge path) or a JSON `{ "id" }`.
@@ -892,6 +1018,29 @@ fn emit_image_merge(
   Ok(())
 }
 
+/// `move ID --to HOST` (§4.10, A-291): one ask of the volume's owner to move it to the member. The move goes on between
+/// asks, so a caller asks again until it is done, as a client of the verb does. Prints `moving HOST` while it is under
+/// way and `moved HOST` once the configuration names the member, or `{ "moved": bool, "to": HOST }`.
+fn emit_moved(
+  client: &mut Client,
+  volume: VolumeId,
+  to: u64,
+  json: bool,
+) -> Result<(), ClientError> {
+  let (moved, to) = match client.move_volume(volume, to)? {
+    slates_client::MoveState::Moving { to } => (false, to),
+    slates_client::MoveState::Moved { to } => (true, to),
+  };
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "moved": moved, "to": to }));
+  } else if moved {
+    slates_machine::out_line!("moved {to}");
+  } else {
+    slates_machine::out_line!("moving {to}");
+  }
+  Ok(())
+}
+
 /// `volume placed`: whether the scope is durable and the mirror's age, as two text lines or a JSON
 /// `{ "placed", "mirror_age_ns" }` (a null `mirror_age_ns` when there is no mirror).
 fn emit_placed(
@@ -925,8 +1074,9 @@ fn emit_attach(
   intent: Intent,
   form: AttachRequest,
   json: bool,
-) -> Result<(), ClientError> {
+) -> Result<u64, ClientError> {
   let attached = client.attach_with(volume, snapshot, intent, form)?;
+  let attachment = attached.attachment;
   if json {
     slates_machine::out_line!("{}", slates_mcp::attachment_json(&attached));
   } else {
@@ -941,7 +1091,7 @@ fn emit_attach(
     slates_machine::out_text!("{}", established_text(&attached.established));
     slates_machine::out_text!("{}", capability_text(&attached.capability));
   }
-  Ok(())
+  Ok(attachment)
 }
 
 /// What an attach established, as `key: value` lines; a container bind shows its verified source,
@@ -1049,8 +1199,8 @@ fn capability_text(c: &slates_client::AttachmentCapability) -> String {
   )
 }
 
-/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths" }` (the key
-/// `changed-since` uses, so a script reads `.paths` from both).
+/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths", "paths_elided" }` (the key
+/// `changed-since` uses, so a script reads `.paths` from both): past what one reply holds they are counted (A-267).
 fn emit_rewitness(
   client: &mut Client,
   volume: VolumeId,
@@ -1059,10 +1209,16 @@ fn emit_rewitness(
 ) -> Result<(), ClientError> {
   let rewitnessed = client.rewitness(volume, paths)?;
   if json {
-    slates_machine::out_line!("{}", serde_json::json!({ "paths": rewitnessed }));
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "paths": rewitnessed.paths, "paths_elided": rewitnessed.paths_elided })
+    );
   } else {
-    for path in rewitnessed {
+    for path in rewitnessed.paths {
       slates_machine::out_line!("{path}");
+    }
+    if rewitnessed.paths_elided > 0 {
+      slates_machine::out_line!("and {} more paths rewitnessed", rewitnessed.paths_elided);
     }
   }
   Ok(())
@@ -1081,6 +1237,17 @@ fn emit_pin(
     slates_machine::out_line!("{}", serde_json::json!({ "pinned": pinned }));
   } else {
     slates_machine::out_line!("pinned: {pinned}");
+  }
+  Ok(())
+}
+
+/// `base capture`: the snapshot holding the overlay's whole base (A-291), as text or a JSON `{ "snapshot" }`.
+fn emit_captured(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
+  let snapshot = client.capture_base(volume)?;
+  if json {
+    slates_machine::out_line!("{}", serde_json::json!({ "snapshot": snapshot.value }));
+  } else {
+    slates_machine::out_line!("snapshot: {}", snapshot.value);
   }
   Ok(())
 }
@@ -1178,12 +1345,14 @@ fn landing_json(landing: &Landing) -> serde_json::Value {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => serde_json::json!({
       "grant_required": true,
       "landing": landing,
       "manifest": hex32(manifest),
       "summary": slates_mcp::landing_summary_json(summary),
       "conflicts": conflicts,
+      "conflicts_elided": conflicts_elided,
       "grant_with": format!("slates grant {landing}"),
     }),
   }
@@ -1268,8 +1437,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Status { volume, drift } => emit_status(client, *volume, *drift, json)?,
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
-    // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.
-    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } => {}
+    // `ClientError`), and `attach --hold` needs the instance for its own client, so [`run`] handles them before this
+    // dispatch; they never reach here.
+    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } | Verb::Hold { .. } => {}
     Verb::Snapshot { volume } => emit_snapshot(client, *volume, json)?,
     Verb::DestroySnapshot { volume, snapshot } => {
       client.destroy_snapshot(*volume, *snapshot)?;
@@ -1325,7 +1495,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       snapshot,
       intent,
       form,
-    } => emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?,
+    } => {
+      emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?;
+    }
     Verb::Detach { attachment, volume } => {
       match volume {
         Some(volume) => client.detach_of(*volume, *attachment)?,
@@ -1353,6 +1525,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Rewitness { volume, paths } => emit_rewitness(client, *volume, paths.clone(), json)?,
     Verb::Pin { volume, paths } => emit_pin(client, *volume, paths.clone(), json)?,
+    Verb::CaptureBase { volume } => emit_captured(client, *volume, json)?,
     Verb::Land {
       volume,
       snapshot,
@@ -1384,6 +1557,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
         json,
       );
     }
+    Verb::Move { volume, to } => emit_moved(client, *volume, *to, json)?,
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }
@@ -1635,6 +1809,8 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
     attachment: shards.attachment.attachment,
     stream: shards.stream,
     at: request.handed,
+    resync: shards.resync,
+    resync_at: request.resync_at,
   };
   hand_to(client, OsStr::new(program), args, handed)
 }
@@ -1652,6 +1828,12 @@ struct Handed {
   stream: slates_client::StreamEnd,
   /// Where the command finds it.
   at: crate::args::HandOff,
+  /// The stream's resync end, when the daemon handed one (A-316).
+  #[cfg_attr(windows, allow(dead_code))]
+  resync: Option<slates_client::StreamEnd>,
+  /// Where the command finds its resync end, when it asked for one (`--resync-fd`).
+  #[cfg_attr(windows, allow(dead_code))]
+  resync_at: Option<i32>,
 }
 
 /// Replaces this process with `program`, the stream end at the descriptor number `handed` names
@@ -1672,11 +1854,31 @@ fn hand_to(
     ));
   };
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-  let error = slates_ipc::stream::exec_with(program, &args, handed.stream, at);
+  let mut ends = vec![(handed.stream, at)];
+  if let Some(resync_at) = handed.resync_at {
+    ends.push((resync_end(handed.resync)?, resync_at));
+  }
+  let error = slates_ipc::stream::exec_with_ends(program, &args, ends);
   Err(Failure::Failed(format!(
     "shards: running {} with its end at descriptor {at}: {error}",
     program.to_string_lossy()
   )))
+}
+
+/// The resync end a command that asked for one is handed (A-316): the daemon's, or, where the daemon handed none (a
+/// platform with no resync yet, a stream served without one), a channel already ended, so the command reads its end at
+/// once and knows, as it would from the daemon's, that no resync will come.
+#[cfg(unix)]
+fn resync_end(
+  handed: Option<slates_client::StreamEnd>,
+) -> Result<slates_client::StreamEnd, Failure> {
+  if let Some(handed) = handed {
+    return Ok(handed);
+  }
+  let (ended, end) = slates_ipc::stream::message_pair()
+    .map_err(|e| Failure::Failed(format!("shards: an ended resync channel: {e}")))?;
+  drop(ended);
+  Ok(end)
 }
 
 /// Starts `program` holding the stream end as a handle named where `{handle}` stands in `args`
@@ -2120,6 +2322,12 @@ fn print_landing(landing: slates_client::Landing) {
       for degradation in &outcome.degraded {
         slates_machine::out_line!("degraded: {}", slates_mcp::degradation_json(degradation));
       }
+      if outcome.degraded_elided > 0 {
+        slates_machine::out_line!(
+          "and {} more degraded cells, past what one reply holds",
+          outcome.degraded_elided
+        );
+      }
       slates_machine::out_line!("barriers: {}", outcome.barriers);
     }
     slates_client::Landing::GrantRequired {
@@ -2127,6 +2335,7 @@ fn print_landing(landing: slates_client::Landing) {
       manifest,
       summary,
       conflicts,
+      conflicts_elided,
     } => {
       slates_machine::out_line!("landing: {landing}");
       slates_machine::out_line!("manifest: {}", hex32(&manifest));
@@ -2137,6 +2346,11 @@ fn print_landing(landing: slates_client::Landing) {
       slates_machine::out_line!("filtered_out: {}", summary.filtered_out);
       for path in &conflicts {
         slates_machine::out_line!("conflict: {path}");
+      }
+      if conflicts_elided > 0 {
+        slates_machine::out_line!(
+          "and {conflicts_elided} more conflicts, past what one reply holds"
+        );
       }
       slates_machine::out_line!("grant with: slates grant {landing}");
     }
@@ -2194,15 +2408,60 @@ fn status_text(report: &StatusReport) -> String {
     report.head.value,
     report.snapshots,
     report.watcher,
-    report.drifted.len()
+    // Every drifted entry, those the report carried and those it counted (A-267).
+    report
+      .drifted
+      .len()
+      .saturating_add(usize::try_from(report.drifted_elided).unwrap_or(usize::MAX))
   ) + &format!(
     "placed: {}\nmirror_age_ns: {}\nhost_epoch: {}\n",
     report.placed.region,
     option_text(report.placed.mirror_age_ns),
     report.placed.host_epoch
   ) + &mounts_text(report)
+    + &loss_text(report)
     + &journal_text(&report.journal)
     + &transports_text(&report.transports)
+}
+
+/// The volume's loss window (§4.10, AC-8.3): what an owner loss would lose now (`unknown` when the time is from another
+/// boot of the clock), the newest seal placed on another host by head sequence (`none` while there is none), whether
+/// the volume is live-shipped, and the takeover that made this node its owner.
+fn loss_text(report: &StatusReport) -> String {
+  let loss = &report.loss;
+  let mut out = format!(
+    "loss_at_risk_ns: {}\nloss_placed_sequence: {}\nloss_live_shipped: {}\n",
+    loss
+      .at_risk_ns
+      .map_or_else(|| "unknown".to_owned(), |ns| ns.to_string()),
+    loss
+      .placed_sequence
+      .map_or_else(|| "none".to_owned(), |sequence| sequence.to_string()),
+    loss.live_shipped
+  );
+  if let Some(taken) = &loss.taken_over {
+    out.push_str(&format!(
+      "taken_over: epoch {} head {} from_live_log {}\n",
+      taken.epoch, taken.head_sequence, taken.from_live_log
+    ));
+    if let Some(past) = &taken.past_tolerance {
+      out.push_str(&format!(
+        "taken_over_past_tolerance: registers {} live_log {}\n",
+        shortfall_text(past.registers.as_ref()),
+        shortfall_text(past.live_log.as_ref())
+      ));
+    }
+  }
+  out
+}
+
+/// One part of a takeover past tolerance in `status` (A-332): `<remaining>/<needed>` of the hosts its recovery counted
+/// on, or `within` when that part was recovered within tolerance.
+fn shortfall_text(shortfall: Option<&slates_ipc::protocol::Shortfall>) -> String {
+  shortfall.map_or_else(
+    || "within".to_owned(),
+    |short| format!("{}/{}", short.remaining, short.needed),
+  )
 }
 
 /// The volume's journal (§4.5): its budget and retention, and what its consuming rounds found waiting (the budget's
@@ -2417,6 +2676,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   // This node's certificate anchor (A-237): what a share from another host names this host's accounts by
   // (`slates share ID uid:N@ANCHOR`).
   out.push_str(&format!("anchor: {}\n", report.anchor));
+  // Whether the anchor has judged this daemon recovered (A-311): until then its exit counts toward a crash loop.
+  out.push_str(&format!("recovered: {}\n", report.recovered));
   let root: String = report
     .seal
     .root_id
@@ -2486,6 +2747,20 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       || "never".to_owned(),
       |ns| (ns / NANOS_PER_MILLISECOND).to_string()
     )
+  ));
+  // The failover delay as the daemon estimates it now (A-363): each term and the measurements behind it, so a term that
+  // is still its prior (zero samples) reads as one. Nothing sets it.
+  let failover = &report.fleet.failover;
+  out.push_str(&format!(
+    "fleet_failover: total_ns={} detection_ns={} (detector periods {}) confirmation_ns={} (coordinator periods {}) recovery_ns={} (takeovers {} volumes {})\n",
+    failover.total_ns,
+    failover.detection_ns,
+    failover.detection_samples,
+    failover.confirmation_ns,
+    failover.confirmation_samples,
+    failover.recovery_ns,
+    failover.takeovers_timed,
+    failover.volumes_timed
   ));
   for session in &report.fleet.sessions {
     out.push_str(&format!(
@@ -2867,8 +3142,29 @@ mod harness_tests {
 
 #[cfg(test)]
 mod tests {
-  use super::{chokepoint_value, digest_json, signal_value};
+  use super::{chokepoint_value, digest_json, failure_of_api, signal_value};
+  use crate::Failure;
   use slates_client::{AbsenceIs, ChokepointReport, Digest, Signal};
+
+  /// The integrator's report (2026-11-18, the CLI flow on d1323898: `slates enroll` with no anchor in the environment
+  /// exited 1 printing `denied: NoAuthority(NoHandoff)`). Do: map a missing issuer authority and a revoked consumer's
+  /// denial to the command's failure. Expect the first the command's own (exit 4) naming the anchor's surface it needs,
+  /// as `docs/cli.md` says, and the second the daemon's refusal (exit 1).
+  #[test]
+  fn a_missing_issuer_authority_fails_the_command_and_a_denial_is_a_refusal() {
+    let missing = failure_of_api(
+      slates_api::Error::Denied(slates_api::Denied::NoAuthority(
+        slates_api::IssuerFault::NoHandoff,
+      )),
+      "i",
+    );
+    assert!(
+      matches!(&missing, Failure::Failed(text) if text.contains("no anchor in this environment")),
+      "{missing:?}"
+    );
+    let revoked = failure_of_api(slates_api::Error::Denied(slates_api::Denied::Revoked), "i");
+    assert!(matches!(revoked, Failure::Refused(_)), "{revoked:?}");
+  }
 
   /// A chokepoint renders its activity when fresh, and `absent/<meaning>` when its newest span is past
   /// the horizon or it never reported — the stale age stated as a last sighting, never as a live value

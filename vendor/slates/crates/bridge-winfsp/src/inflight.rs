@@ -34,10 +34,24 @@ const SET_INFORMATION_KIND: u32 = 8;
 const RENAME_CLASS: u32 = 10;
 /// Format: see RENAME_CLASS.
 const RENAME_EX_CLASS: u32 = 65;
+/// Format: FILE_INFORMATION_CLASS FileLinkInformation and FileLinkInformationEx (ntifs.h; WinFsp's driver writes the
+/// RS5 class by its number). WinFsp's driver answers both itself, `STATUS_NOT_SUPPORTED` and `STATUS_INVALID_PARAMETER`
+/// (`src/sys/fileinfo.c`, v2.1 to v2.2): only a driver with `docs/wip/winfsp-patches` applied forwards them, to a volume
+/// that declares `HardLinks`, in the rename request's layout (A-360).
+const LINK_CLASS: u32 = 11;
+/// Format: see LINK_CLASS.
+const LINK_EX_CLASS: u32 = 72;
 /// Format: SetInformation's two context words precede its class; its aligned union starts eight bytes later.
 const INFORMATION_CLASS_AT: usize = 16 + size_of::<u64>() * 2;
+/// Format: SetInformation.UserContext2, the open's own context (`UmFileContextIsUserContext2`), follows UserContext.
+const SET_INFORMATION_CONTEXT_AT: usize = 16 + size_of::<u64>();
 /// Format: the first member of SetInformation.Info.Rename is its four-byte name descriptor.
 const NEW_NAME_AT: usize = INFORMATION_CLASS_AT + size_of::<u64>();
+/// Format: SetInformation.Info.RenameEx.Flags follows the name descriptor and the eight-byte-aligned AccessToken; the
+/// patched driver writes a link's flags there (`docs/wip/winfsp-patches`, A-360).
+const LINK_FLAGS_AT: usize = NEW_NAME_AT + size_of::<u64>() * 2;
+/// Format: ReplaceIfExists, bit 0 of a link's flags (FILE_LINK_REPLACE_IF_EXISTS, ntifs.h).
+const LINK_REPLACE_IF_EXISTS: u32 = 1;
 /// Format: the original FileName descriptor follows the fixed request union.
 const FILE_NAME_AT: usize = REQUEST_BASE - ALIGNMENT;
 /// Format: all request and response frames are rounded to FSP_FSCTL_DEFAULT_ALIGNMENT bytes.
@@ -50,6 +64,24 @@ const KIND_AT: usize = SIZE_AT + size_of::<u16>();
 const HINT_AT: usize = KIND_AT + size_of::<u32>();
 /// Format: the request union follows the common header; Create.AccessToken is 24 bytes into that union.
 const CREATE_TOKEN_AT: usize = HINT_AT + size_of::<u64>() + 24;
+/// Format: Create.CreateOptions opens the request union (`fsctl.h` v2.1: the disposition in its high 8 bits, the options
+/// in its low 24).
+const CREATE_OPTIONS_AT: usize = HINT_AT + size_of::<u64>();
+/// Format: Create's flag word (`UserMode:1` first) follows the token, `DesiredAccess`, `GrantedAccess`, `ShareAccess`
+/// (four bytes each) and the `Ea` buffer descriptor (four bytes) (`fsctl.h` v2.1).
+const CREATE_FLAGS_AT: usize = CREATE_TOKEN_AT + size_of::<u64>() + 4 * size_of::<u32>();
+/// Format: Create.DesiredAccess follows the token (`fsctl.h` v2.1).
+const CREATE_DESIRED_ACCESS_AT: usize = CREATE_TOKEN_AT + size_of::<u64>();
+/// Format: the access rights a symbolic link's `FSCTL_SET_REPARSE_POINT` needs one of (WinFsp's driver asks for
+/// `FILE_WRITE_DATA`, `FILE_APPEND_DATA` or `FILE_WRITE_ATTRIBUTES`, `src/sys/fsctl.c` v2.1), with the generic and maximum
+/// rights that grant them (`GENERIC_WRITE`, `GENERIC_ALL`, `MAXIMUM_ALLOWED`; `winnt.h`).
+const LINK_SETTING_ACCESS: u32 =
+  0x0000_0002 | 0x0000_0004 | 0x0000_0100 | 0x4000_0000 | 0x1000_0000 | 0x0200_0000;
+/// Format: `UserMode`, bit 0 of Create's flag word: the request came from user mode.
+const CREATE_USER_MODE: u32 = 1;
+/// Format: `FILE_OPEN_REPARSE_POINT` (`ntioapi.h`), the create option that opens a reparse point itself, as
+/// `CreateSymbolicLinkW` opens the object it makes a link.
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// Format: IoStatus.Information precedes IoStatus.Status after the response's common header.
 const STATUS_AT: usize = HINT_AT + size_of::<u64>() + size_of::<u32>();
 /// Format: Create.Opened.UserContext2 follows the common 24-byte header and its UserContext word.
@@ -145,6 +177,18 @@ pub fn finish_response(packet: &mut [u8], status: i32) -> Result<usize, Refusal>
   Ok(aligned)
 }
 
+/// A hard link a patched WinFsp driver forwards (A-360): the open it names, the new name, and whether a taken name may be
+/// replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+  /// The open's own context (`UserContext2`): the file that takes the new name.
+  pub context: u64,
+  /// The new name, a path from the volume's root (`\dir\name`).
+  pub path: String,
+  /// Whether a taken name may be replaced (ReplaceIfExists).
+  pub replace: bool,
+}
+
 /// One checked request in a retained batch. Its payload remains opaque unless a specific checked accessor reads it.
 pub struct Request<'a> {
   bytes: &'a [u8],
@@ -172,6 +216,21 @@ impl Request<'_> {
     }
     u32::try_from(read_u64(self.bytes, CREATE_TOKEN_AT)? >> u32::BITS).map_err(|_| Refusal::Length)
   }
+  /// Whether a Create or Open could become a symbolic link (A-275): from user mode, opening a reparse point itself
+  /// (`FILE_OPEN_REPARSE_POINT`, as `CreateSymbolicLinkW` opens what it makes a link) and asking an access a link's set
+  /// needs. Only for such an open does the receiver read the caller's privilege, so an ordinary open costs no token
+  /// query. False for every other request.
+  pub fn could_become_a_link(&self) -> Result<bool, Refusal> {
+    if self.kind != CREATE_KIND {
+      return Ok(false);
+    }
+    Ok(
+      read_u32(self.bytes, CREATE_OPTIONS_AT)? & FILE_OPEN_REPARSE_POINT != 0
+        && read_u32(self.bytes, CREATE_DESIRED_ACCESS_AT)? & LINK_SETTING_ACCESS != 0
+        && read_u32(self.bytes, CREATE_FLAGS_AT)? & CREATE_USER_MODE != 0,
+    )
+  }
+
   /// The borrowed Create token's process-local handle, valid only in the current receiver's fresh request.
   pub fn access_token(&self) -> Result<u32, Refusal> {
     if self.kind != CREATE_KIND {
@@ -179,6 +238,40 @@ impl Request<'_> {
     }
     u32::try_from(read_u64(self.bytes, CREATE_TOKEN_AT)? & u64::from(u32::MAX))
       .map_err(|_| Refusal::Length)
+  }
+
+  /// The hard link this request forwards (A-360), or `None` for any other request. WinFsp's DLL has no case for the class
+  /// (`src/dll/fsop.c` answers it `STATUS_INVALID_PARAMETER`), so the receive worker serves it before the DLL's operation.
+  pub fn link(&self) -> Result<Option<Link>, Refusal> {
+    if !self.is_link()? {
+      return Ok(None);
+    }
+    Ok(Some(Link {
+      context: read_u64(self.bytes, SET_INFORMATION_CONTEXT_AT)?,
+      path: self.path(NEW_NAME_AT)?,
+      replace: read_u32(self.bytes, LINK_FLAGS_AT)? & LINK_REPLACE_IF_EXISTS != 0,
+    }))
+  }
+
+  /// Whether this is a hard link whose saved response succeeded (A-360). Recovery answers it as saved, never cancelled:
+  /// the volume holds the new name, so a cancellation would tell the caller a name it can see was not made, and a copy it
+  /// fell back to would meet that name taken.
+  pub fn successful_link(&self, response: &[u8]) -> Result<bool, Refusal> {
+    capture::check_response(response)?;
+    if read_u32(response, KIND_AT)? != self.kind || read_u64(response, HINT_AT)? != self.hint {
+      return Err(Refusal::Hint);
+    }
+    Ok(read_u32(response, STATUS_AT)? == 0 && self.is_link()?)
+  }
+
+  fn is_link(&self) -> Result<bool, Refusal> {
+    Ok(
+      self.kind == SET_INFORMATION_KIND
+        && matches!(
+          read_u32(self.bytes, INFORMATION_CLASS_AT)?,
+          LINK_CLASS | LINK_EX_CLASS
+        ),
+    )
   }
 
   /// A saved successful rename has no old-process output buffer: the driver's completion uses its original
@@ -449,6 +542,176 @@ mod tests {
     assert_eq!(
       request.successful_rename(&response).unwrap(),
       Some((from, to))
+    );
+  }
+
+  /// A-360. Do: read the hard links a patched driver forwards, in both classes, with and without ReplaceIfExists, and a
+  /// rename and a Create. Expect: each link names its open's context, its new name whole and its replace bit; the
+  /// rename and the Create are no link.
+  #[test]
+  fn a_forwarded_link_names_its_open_its_new_name_and_whether_it_may_replace() {
+    for (class, flags, replace) in [
+      (LINK_CLASS, 0, false),
+      (LINK_CLASS, LINK_REPLACE_IF_EXISTS, true),
+      (LINK_EX_CLASS, LINK_REPLACE_IF_EXISTS | 0x2, true),
+    ] {
+      let bytes = link_request(class, 0x5a5a_0001, "\\objects\\pack\\p.pack", flags);
+      let pending = requests(&bytes).unwrap();
+      let link = pending.first().unwrap().link().unwrap();
+      assert_eq!(
+        link,
+        Some(Link {
+          context: 0x5a5a_0001,
+          path: "\\objects\\pack\\p.pack".to_owned(),
+          replace,
+        }),
+        "class {class}, flags {flags:#x}"
+      );
+    }
+    let rename = rename_request();
+    assert_eq!(
+      requests(&rename).unwrap().first().unwrap().link().unwrap(),
+      None
+    );
+    let create = create_request(0, 0, 0);
+    assert_eq!(
+      requests(&create).unwrap().first().unwrap().link().unwrap(),
+      None
+    );
+  }
+
+  /// A-360. Do: ask of a link's saved responses whether recovery answers them as saved: a success, a refusal, and a
+  /// success whose hint is not the request's. Expect: the success alone; the stranger refused as a rename's is.
+  #[test]
+  fn only_a_saved_successful_link_is_answered_as_saved() {
+    let bytes = link_request(LINK_CLASS, 7, "\\b", 0);
+    let pending = requests(&bytes).unwrap();
+    let request = pending.first().unwrap();
+    let mut response = request.cancelled_response().unwrap();
+    assert!(
+      !request.successful_link(&response).unwrap(),
+      "a refused link"
+    );
+    response[STATUS_AT..STATUS_AT + size_of::<u32>()].fill(0);
+    assert!(request.successful_link(&response).unwrap(), "a link made");
+    assert_eq!(
+      request.successful_rename(&response).unwrap(),
+      None,
+      "no rename"
+    );
+    response[HINT_AT] ^= 1;
+    assert!(matches!(
+      request.successful_link(&response),
+      Err(Refusal::Hint)
+    ));
+    let rename = rename_request();
+    let pending = requests(&rename).unwrap();
+    let request = pending.first().unwrap();
+    let mut response = request.cancelled_response().unwrap();
+    response[STATUS_AT..STATUS_AT + size_of::<u32>()].fill(0);
+    assert!(
+      !request.successful_link(&response).unwrap(),
+      "a rename is no link"
+    );
+  }
+
+  /// A-360 (hostile input). Do: corrupt a forwarded link's new-name descriptor (its offset, its length) and its name
+  /// (no terminator, a lone surrogate, a relative path). Expect: a typed refusal, never a name made from those bytes.
+  #[test]
+  fn a_hostile_link_request_names_nothing() {
+    // The new name follows the request's own name (`\old` and its terminator) in the payload: the link reads it alone.
+    let new_at = REQUEST_BASE + "\\old\0".encode_utf16().count() * size_of::<u16>();
+    for corrupt in 0..5 {
+      let mut bytes = link_request(LINK_CLASS, 1, "\\new", 0);
+      match corrupt {
+        0 => bytes[NEW_NAME_AT..NEW_NAME_AT + 2].copy_from_slice(&u16::MAX.to_le_bytes()),
+        1 => bytes[NEW_NAME_AT + 2..NEW_NAME_AT + 4].copy_from_slice(&u16::MAX.to_le_bytes()),
+        2 => bytes[new_at + 8..new_at + 10].copy_from_slice(&1u16.to_le_bytes()),
+        3 => bytes[new_at + 2..new_at + 4].copy_from_slice(&0xD800u16.to_le_bytes()),
+        _ => bytes[new_at..new_at + 2].copy_from_slice(&u16::from(b'n').to_le_bytes()),
+      }
+      let pending = requests(&bytes).unwrap();
+      assert!(
+        pending.first().unwrap().link().is_err(),
+        "corruption {corrupt}"
+      );
+    }
+  }
+
+  /// A SetInformation request of a link `class` for the open `context`, its new name `to` and its `flags` word, laid out
+  /// as the patched driver lays it out: the rename request's descriptor and flags (`docs/wip/winfsp-patches`, A-360).
+  fn link_request(class: u32, context: u64, to: &str, flags: u32) -> Vec<u8> {
+    let mut bytes = rename_request_of("\\old", to);
+    bytes[INFORMATION_CLASS_AT..INFORMATION_CLASS_AT + size_of::<u32>()]
+      .copy_from_slice(&class.to_le_bytes());
+    bytes[SET_INFORMATION_CONTEXT_AT..SET_INFORMATION_CONTEXT_AT + size_of::<u64>()]
+      .copy_from_slice(&context.to_le_bytes());
+    bytes[LINK_FLAGS_AT..LINK_FLAGS_AT + size_of::<u32>()].copy_from_slice(&flags.to_le_bytes());
+    bytes
+  }
+
+  /// A Create request with the given options, desired access and flag word, its kernel name `\\link`.
+  fn create_request(options: u32, access: u32, flags: u32) -> Vec<u8> {
+    let mut bytes = vec![0; BATCH_BYTES];
+    let name: Vec<u8> = "\\link\0"
+      .encode_utf16()
+      .flat_map(u16::to_le_bytes)
+      .collect();
+    let length = REQUEST_BASE + name.len();
+    bytes[SIZE_AT..SIZE_AT + size_of::<u16>()]
+      .copy_from_slice(&u16::try_from(length).unwrap().to_le_bytes());
+    bytes[KIND_AT..KIND_AT + size_of::<u32>()].copy_from_slice(&CREATE_KIND.to_le_bytes());
+    bytes[HINT_AT..HINT_AT + size_of::<u64>()].copy_from_slice(&0x2000u64.to_le_bytes());
+    bytes[CREATE_OPTIONS_AT..CREATE_OPTIONS_AT + 4].copy_from_slice(&options.to_le_bytes());
+    bytes[CREATE_DESIRED_ACCESS_AT..CREATE_DESIRED_ACCESS_AT + 4]
+      .copy_from_slice(&access.to_le_bytes());
+    bytes[CREATE_FLAGS_AT..CREATE_FLAGS_AT + 4].copy_from_slice(&flags.to_le_bytes());
+    bytes[REQUEST_BASE..length].copy_from_slice(&name);
+    bytes
+  }
+
+  /// A-275 (whose token the receiver reads). Do: ask of Create requests whether they could become a symbolic link: one
+  /// as `CreateSymbolicLinkW` makes it (user mode, `FILE_OPEN_REPARSE_POINT`, `GENERIC_WRITE`), and one each without
+  /// the option, without a write access (`FILE_READ_DATA`), and from kernel mode. Expect only the first: an ordinary open
+  /// costs no token query.
+  #[test]
+  fn only_a_user_mode_write_open_of_a_reparse_point_could_become_a_link() {
+    let could = |options, access, flags| {
+      let bytes = create_request(options, access, flags);
+      let pending = requests(&bytes).unwrap();
+      pending.first().unwrap().could_become_a_link().unwrap()
+    };
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+    assert!(could(
+      FILE_OPEN_REPARSE_POINT,
+      GENERIC_WRITE,
+      CREATE_USER_MODE
+    ));
+    assert!(
+      could(FILE_OPEN_REPARSE_POINT, 0x0000_0100, CREATE_USER_MODE),
+      "FILE_WRITE_ATTRIBUTES"
+    );
+    assert!(
+      !could(0, GENERIC_WRITE, CREATE_USER_MODE),
+      "an ordinary open"
+    );
+    assert!(
+      !could(FILE_OPEN_REPARSE_POINT, FILE_READ_DATA, CREATE_USER_MODE),
+      "a read"
+    );
+    assert!(
+      !could(FILE_OPEN_REPARSE_POINT, GENERIC_WRITE, 0),
+      "kernel mode"
+    );
+    let rename = rename_request();
+    assert!(
+      !requests(&rename)
+        .unwrap()
+        .first()
+        .unwrap()
+        .could_become_a_link()
+        .unwrap()
     );
   }
 

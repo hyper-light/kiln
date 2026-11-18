@@ -167,10 +167,93 @@ pub fn level(kind: &str, mode: &str) -> Option<Level> {
     }
 }
 
-/// Where an agent stands as a parent: its mode's level, an unplaceable one taken as ask (it asks
-/// a person, as most modes do).
+/// Where an agent stands as a parent: the level it was granted ([`granted`]), so a child never starts above the mode
+/// its parent's launcher gave it, whatever mode the parent works in now.
 pub fn ceiling(parent: &Info) -> Level {
-    level(&parent.kind, &parent.mode).unwrap_or(Level::Ask)
+    granted(parent)
+}
+
+/// The level agent `info` was granted: the lower of the level its launcher started it at (`Info::launched`, kiln's own
+/// record, never what its harness says; none recorded, as for a session an older kiln began, its harness's own
+/// default's) and its mode now. Its harness reports its mode now, and it may move itself (an ACP agent switching its own
+/// mode, a harness that says what it likes), so a mode higher than its launcher gave it grants nothing more: an agent
+/// never raises its own permission (the person's rule, 2026-11-18; docs/agentic.md W6). A mode lowered since, by anyone,
+/// holds. An unplaceable mode is taken as ask (it asks a person, as most modes do).
+pub fn granted(info: &Info) -> Level {
+    level(&info.kind, &info.mode).unwrap_or(Level::Ask).min(launched(info))
+}
+
+/// How much agent `info`'s launcher let it do unasked (`Info::launched`); none recorded (a session an older kiln began),
+/// its harness's own default's, a mode kiln can't place asking.
+pub fn launched(info: &Info) -> Level {
+    info.launched.unwrap_or_else(|| level(&info.kind, "").unwrap_or(Level::Ask))
+}
+
+/// What a command asks of an agent's permissions, when it asks anything ([`may_command`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionAsk<'a> {
+    /// Its permission mode set (`set_mode`).
+    Mode(&'a str),
+    /// One of its harness's controls set, by id: a permission control or not, as its harness lists it.
+    Control(&'a str),
+}
+
+/// What command `c` asks of an agent's permissions (a queue action's command too).
+fn permission_ask(c: &super::model::Command) -> Option<PermissionAsk<'_>> {
+    match c {
+        super::model::Command::SetMode { mode } => Some(PermissionAsk::Mode(mode)),
+        super::model::Command::Control { id, .. } => Some(PermissionAsk::Control(id)),
+        super::model::Command::AtState { command, .. } => permission_ask(command),
+        _ => None,
+    }
+}
+
+/// Whether control `control` of an agent whose harness describes itself as `meta` sets its permissions: one its harness
+/// lists under Permissions (Codex's approvals and sandbox, an ACP agent's mode options), or an ACP agent's option it
+/// doesn't list as a control at all (its mode, model and thinking selectors, set by their own commands; a control kiln
+/// can't see listed may be one of them).
+pub fn permission_control(meta: Option<&Value>, control: &str) -> bool {
+    let listed = meta.and_then(|m| m.get("controls")).and_then(Value::as_array).and_then(|cs| cs.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(control)));
+    match listed {
+        Some(c) => c.get("group").and_then(Value::as_str) == Some("Permissions"),
+        None => control.starts_with("acp:"),
+    }
+}
+
+/// Whether `caller` may send agent `id` command `c`, as far as its permissions go (the person's rule, 2026-11-18: an
+/// agent never raises its own permission; docs/agentic.md W6). A person sends any. An agent sets a mode, its own or that
+/// of an agent it started, no higher than the level it was granted itself ([`granted`]), as a child starts no higher than
+/// its parent ([`child_mode`]); and it sets no permission control ([`permission_control`]): a person does, and it lowers
+/// its own mode with `set_mode`. Every way a command comes in from a caller asks this first (the REST command, the
+/// console's socket, `agents.broadcast`, `agents.control`).
+pub fn may_command(hub: &Hub, caller: &crate::authz::Caller, id: &str, c: &super::model::Command) -> Result<(), Refused> {
+    let Some(ask) = permission_ask(c) else { return Ok(()) };
+    if caller.agent.is_none() && caller.kind != crate::authz::gate::Kind::Agent {
+        return Ok(());
+    }
+    let Some(asker) = caller.agent.as_deref().and_then(|me| hub.harness.info(me)) else {
+        return Err(refuse("an agent kiln doesn't run has no mode kiln knows, so it changes no agent's permissions: a person does"));
+    };
+    // One kiln doesn't run: the send itself answers for it.
+    let Some(target) = hub.harness.info(id) else { return Ok(()) };
+    match ask {
+        PermissionAsk::Mode(mode) => mode_within(&asker, &target, mode),
+        PermissionAsk::Control(control) if permission_control(hub.harness.meta(id).as_ref(), control) => Err(refuse(format!(
+            "{control} sets {}'s permissions, and an agent never raises its own or another's: a person sets it, and an agent lowers its own mode with set_mode",
+            target.name
+        ))),
+        PermissionAsk::Control(_) => Ok(()),
+    }
+}
+
+/// Whether agent `asker` may set agent `target`'s mode to `mode`: at most the level `asker` was granted ([`granted`]).
+fn mode_within(asker: &Info, target: &Info, mode: &str) -> Result<(), Refused> {
+    let most = granted(asker);
+    match level(&target.kind, mode) {
+        Some(wanted) if wanted <= most => Ok(()),
+        Some(wanted) => Err(refuse(format!("an agent never raises a mode past its own: {mode} is {}, above the {} {} was given", wanted.words(), most.words(), asker.name))),
+        None => Err(refuse(format!("kiln can't place the mode {mode:?}, so an agent can't set it: a person can"))),
+    }
 }
 
 /// The modes of harness `k` kiln knows before it starts, with their levels, in its own order
@@ -1230,24 +1313,47 @@ impl Kept {
     }
 }
 
-/// Whether agents on `target` (`local`, `agent:<machine>`) can have workspaces of their own: its
-/// kiln asks its machine about folders, and its machine has Slates and can mount a volume.
-pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
+/// Why agents can't have workspaces of their own on a machine: what it lacks, typed, and the machine's own words for it.
+/// A start there is refused for it, whether it asked for a volume or named no workspace (docs/agentic.md W2): every agent
+/// on a machine's host works in a volume of its own, and none runs in its plain folder instead (no second path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoWorkspace {
+    /// What the machine lacks.
+    pub missing: crate::workspace::slates::WorkspaceMissing,
+    /// What it said of it.
+    pub said: String,
+}
+
+impl std::fmt::Display for NoWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.said)
+    }
+}
+
+impl std::error::Error for NoWorkspace {}
+
+/// Whether agents on `target` can have workspaces of their own: refused, typed, saying what that machine lacks
+/// ([`NoWorkspace`]).
+pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), NoWorkspace> {
+    use crate::workspace::slates::WorkspaceMissing;
     let facts = match target.strip_prefix("agent:") {
         None => crate::workspace::slates::facts().await,
         Some(machine) => {
             let caps = hub.instances.load().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
             if !caps {
-                return Err(format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)));
+                return Err(NoWorkspace { missing: WorkspaceMissing::KilnUpgrade, said: format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)) });
             }
             let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone()));
             match said {
                 Some(f) => f,
-                None => return Err(format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine))),
+                None => return Err(NoWorkspace { missing: WorkspaceMissing::Facts, said: format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine)) }),
             }
         }
     };
-    if facts.available { Ok(()) } else { Err(facts.why_not.unwrap_or_else(|| "Slates isn't installed there".to_owned())) }
+    if facts.available {
+        return Ok(());
+    }
+    Err(NoWorkspace { missing: facts.missing.unwrap_or(WorkspaceMissing::Unnamed), said: facts.why_not.unwrap_or_else(|| "Slates isn't installed there".to_owned()) })
 }
 
 /// Whether `target` names the machine `info` runs on.
@@ -1492,9 +1598,10 @@ fn target_of(parent: &Info) -> String {
 
 /// What a subagent of `parent`'s is asked for where its own ask says nothing (`state`: its parent's
 /// live state, as the server last had it): its parent's harness and, in that harness, its model,
-/// effort and mode (a mode kiln can't place is left to the harness, within its parent's); its
-/// parent's machine; one of it. With the speed (in its parent's harness) and the Subagents setting
-/// it starts with, which only its spec takes.
+/// effort and mode (a mode kiln can't place, or one above what its parent was granted, is left to
+/// the harness, within its parent's grant: [`granted`]); its parent's machine; one of it. With the
+/// speed (in its parent's harness) and the Subagents setting it starts with, which only its spec
+/// takes.
 fn as_its_parent(mut ask: Ask, parent: &Info, state: Option<&super::model::State>) -> (Ask, Option<String>, Option<u32>) {
     let some = |s: &str| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
     let unset = |o: &Option<String>| o.as_deref().is_none_or(|s| s.trim().is_empty());
@@ -1511,7 +1618,7 @@ fn as_its_parent(mut ask: Ask, parent: &Info, state: Option<&super::model::State
             ask.effort = state.and_then(|s| some(&s.effort));
         }
         if unset(&ask.mode) {
-            ask.mode = state.and_then(|s| some(&s.mode)).or_else(|| some(&parent.mode)).filter(|m| level(&ask.kind, m).is_some());
+            ask.mode = state.and_then(|s| some(&s.mode)).or_else(|| some(&parent.mode)).filter(|m| level(&ask.kind, m).is_some_and(|l| l <= granted(parent)));
         }
         // Its speed, standard ("") too: the harness's own default may not be its parent's.
         speed = state.map(|s| s.speed.clone());
@@ -1627,11 +1734,14 @@ fn with_person(isolation: Option<Isolation>, person: Option<&str>) -> Option<Iso
 /// [`start`], the spec made for the ask then tuned by `tune` before anything starts.
 async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec) + Send) -> Result<Vec<Info>, Refused> {
     let kind = harness(&ask.kind)?;
-    let volume = match ask.workspace.as_deref().map(str::trim) {
-        None | Some("" | "folder") => false,
-        Some("volume") => true,
-        Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder), not {w:?}"))),
+    // What it asked to work in: nothing (a volume where its machine can make one: `Registry::open_as`), its folder
+    // itself, or a volume, which its machine must be able to make.
+    let workspace = match ask.workspace.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(asked @ ("folder" | "volume")) => Some(crate::workspace::Workspace { kind: asked.to_owned(), ..Default::default() }),
+        Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder, what it gets where it says nothing and its machine can make one), not {w:?}"))),
     };
+    let volume = workspace.as_ref().is_some_and(|w| w.kind == "volume");
     let count = ask.count.unwrap_or(1).clamp(1, 16);
     let resume = ask.resume.as_deref().map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned);
     if resume.is_some() && count > 1 {
@@ -1721,7 +1831,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
                 return Err(not_installed(hub, target, kind));
             }
             if volume {
-                workspaces_on(hub, target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+                workspaces_on(hub, target).await.map_err(|no| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
             }
             // Before anything starts, so its claims are let go: a fallback's pick is checked too.
             if isolated {
@@ -1770,7 +1880,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         parent: by.parent.as_ref().map(|p| p.id.clone()),
         plan_run: by.plan_run.clone(),
         helper: ask.helper.clone(),
-        workspace: volume.then(|| crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() }),
+        workspace,
         isolation: with_person(isolation.clone(), person.as_deref()),
         resume: resume.clone(),
         agentfile: kept.text,
@@ -2303,7 +2413,7 @@ mod tests {
     /// is left to the harness (within its parent's).
     #[test]
     fn a_subagent_goes_where_and_as_its_agent_does() {
-        let parent = Info { kind: "devin".into(), target: "agent:studio".into(), model: "opus-medium".into(), mode: "bypass".into(), max_subagents: Some(3), ..info("main", None, Status::Running) };
+        let parent = Info { kind: "devin".into(), target: "agent:studio".into(), model: "opus-medium".into(), mode: "bypass".into(), launched: Some(Level::Bypass), max_subagents: Some(3), ..info("main", None, Status::Running) };
         let state = super::super::model::State { model: "opus-medium".into(), mode: "bypass".into(), effort: "max".into(), speed: "fast".into(), ..Default::default() };
         let (ask, speed, most) = as_its_parent(Ask { name: Some("Step 2: API".into()), ..Ask::default() }, &parent, Some(&state));
         assert_eq!((ask.kind.as_str(), ask.on.as_deref(), ask.model.as_deref(), ask.effort.as_deref(), ask.mode.as_deref(), ask.count), ("devin", Some("agent:studio"), Some("opus-medium"), Some("max"), Some("bypass"), Some(1)));
@@ -2324,8 +2434,15 @@ mod tests {
         assert_eq!((ask.on.as_deref(), ask.model.as_deref(), ask.mode.as_deref(), ask.effort, speed), (Some("local"), Some("opus-medium"), Some("bypass"), None, None));
         // A mode kiln can't place isn't handed on: its harness's default within its parent's.
         let odd = Info { mode: "turbo".into(), ..parent.clone() };
-        let (ask, ..) = as_its_parent(Ask::default(), &odd, Some(&super::super::model::State { mode: "turbo".into(), ..state }));
+        let (ask, ..) = as_its_parent(Ask::default(), &odd, Some(&super::super::model::State { mode: "turbo".into(), ..state.clone() }));
         assert_eq!(ask.mode, None);
+        // Nor one above what its launcher let it do, though it works in it now (the person's rule, 2026-11-18: an agent
+        // never raises its own permission, nor through its subagents): its harness's default within its grant.
+        let raised = Info { launched: Some(Level::AcceptEdits), ..parent.clone() };
+        let (ask, ..) = as_its_parent(Ask::default(), &raised, Some(&state));
+        assert_eq!(ask.mode, None, "a parent granted accept edits, working in bypass, hands on no bypass");
+        let (ask, ..) = as_its_parent(Ask::default(), &raised, Some(&super::super::model::State { mode: "accept-edits".into(), ..state }));
+        assert_eq!(ask.mode.as_deref(), Some("accept-edits"), "its granted mode it hands on");
     }
 
     /// What a subagent is given of its agent's controls: its session settings (a select, a toggle,

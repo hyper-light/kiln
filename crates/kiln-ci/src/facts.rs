@@ -336,6 +336,37 @@ pub struct Workspaces {
     pub running: bool,
     /// Why agents here can't have them.
     pub why_not: Option<String>,
+    /// What this machine lacks to give agents workspaces of their own, typed (`why_not` says it in words): what a start
+    /// here is refused for, since every agent on a machine's host works in a volume of its own (docs/agentic.md W2).
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing: Option<WorkspaceMissing>,
+}
+
+/// What a machine lacks to give agents workspaces of their own ([`Workspaces::missing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMissing {
+    /// `fusermount3` (Linux: the OS's fuse3 package ships it).
+    Fusermount3,
+    /// `/dev/fuse`, or its user's right to read and write it (Linux).
+    FuseDevice,
+    /// WinFsp (Windows: winfsp.dev).
+    #[serde(rename = "winfsp")]
+    WinFsp,
+    /// `mount_nfs` on the PATH (a BSD).
+    MountNfs,
+    /// A mount Slates offers here that kiln makes.
+    Mount,
+    /// Workspaces kept by this kiln (one that keeps none).
+    Workspaces,
+    /// A kiln new enough for workspaces (its runner's is older).
+    KilnUpgrade,
+    /// Its machine's word on them (it hasn't said yet).
+    Facts,
+    /// A name for what it lacks: a runner from before kiln typed it said it in words alone (`why_not`).
+    Unnamed,
 }
 
 /// The kiln a runner runs, and where kiln's source is on its machine.

@@ -1,9 +1,12 @@
 //! kiln is its own Slates executable (docs/agentic.md, W1; kiln goal 01a1ec34599974448569750ac79093b6): kiln starts a
 //! Slates instance from its own binary in Slates' roles (`kiln slates-role --instance <name> anchor`, and the daemon
-//! its anchor starts the same way), with no Slates binary anywhere, and drives it through Slates' library alone: a
-//! volume laid over a folder, its plan for writing back, its drift, the go-ahead's authority, and its removal. Nothing
-//! is mounted, so it runs on any Unix machine. The test owns the instance it starts and stops exactly its processes,
-//! by the pid kiln kept of the anchor it started (its process group), never by a pattern.
+//! its anchor starts the same way), with no Slates binary anywhere, and drives it through Slates' library alone, in its
+//! typed contract: a volume laid over a folder, its plan for writing back, its drift, its write policy as kiln (its
+//! launcher) sets it under its own secret, the launcher's approval, and its removal. Nothing is mounted, so it runs on
+//! any Unix machine; on Linux under the user's service manager (a runner's user unit) its anchor runs in a systemd
+//! scope of its own, as a runner's does, and the secret reaches it through the scope. The test owns the instance it
+//! starts and stops exactly its processes, by the pid kiln kept of the anchor it started (its process group), never by
+//! a pattern.
 
 #![cfg(unix)]
 
@@ -19,6 +22,9 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 const GONE_WITHIN: Duration = Duration::from_secs(30);
 /// How often the process table is looked at while waited on.
 const LOOK_EVERY: Duration = Duration::from_millis(100);
+/// How long a destroyed volume may take to leave its instance's list: the daemon answers a destroy and tears the
+/// volume down in cooperative slices after (Slates' `Instance::destroy`), so it is listed until the last slice.
+const TORN_DOWN_WITHIN: Duration = Duration::from_secs(30);
 /// The most the test's volume holds: far more than its two small files.
 const ROOM: u64 = 64 << 20;
 /// A file's mode as the test writes it in the volume.
@@ -109,6 +115,16 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
     for (pid, exe, _) in &processes {
         assert!(Path::new(exe).file_stem().is_none_or(|s| s != "slates"), "process {pid} runs a Slates binary: {exe}");
     }
+    // Under the user's service manager (a runner's user unit) the anchor runs in a systemd scope of its own, named for
+    // the instance, so the runner's restart never takes it along; the policy and approvals below verify under the
+    // secret it was handed through the scope. Elsewhere it runs in its own process group.
+    if slates::starts_in_a_scope() {
+        let cgroup = std::fs::read_to_string(format!("/proc/{anchor}/cgroup"))?;
+        let scope = format!("/{instance}-slates.scope");
+        assert!(cgroup.lines().any(|l| l.strip_prefix("0::").is_some_and(|path| path.trim_end().ends_with(&scope))), "the anchor's cgroup isn't the scope {scope}: {cgroup}");
+    } else {
+        eprintln!("the anchor runs in its own process group here: this test doesn't run under the user's service manager on Linux");
+    }
     // A second start finds it up and starts nothing.
     kiln::rt::block_on(slates::ensure_up())?;
     assert_eq!(processes_of(&instance).len(), processes.len(), "a second anchor was started");
@@ -120,7 +136,7 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
     std::fs::create_dir_all(folder.path().join(".git"))?;
     std::fs::write(folder.path().join(".git/HEAD"), b"ref: refs/heads/main\n")?;
     let mut library = slates_api::Instance::attach(&instance)?;
-    let volume = library.create(&slates_api::overlay("kilnroles-work", folder.path(), ROOM)?)?;
+    let volume = library.provision(&slates_api::VolumeSpec::overlay("kilnroles-work", folder.path(), ROOM))?.volume();
     let attached = library.attach_volume(volume, slates_api::Intent::Write)?;
     library.client().fs_write((volume, attached.attachment), "/a.txt", b"a2\n", MODE)?;
     library.client().fs_write((volume, attached.attachment), "/n.txt", b"n\n", MODE)?;
@@ -132,10 +148,12 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
         async move { slates::drift(&made).await }
     })?;
     assert_eq!(drifted, Vec::<String>::new(), "nothing changed on disk under it");
-    let plan = kiln::rt::block_on({
+    let (plan, excludes) = kiln::rt::block_on({
         let (made, over) = (made.clone(), folder.text());
         async move { slates::plan_landing(&made, &over).await }
     })?;
+    // No mount to ask git in: what every landing leaves out, alone.
+    assert_eq!(excludes, slates::EXCLUDES, "{excludes:?}");
     let at = |pointer: &str| plan.pointer(pointer).cloned().unwrap_or_default();
     assert_eq!(at("/grant_required"), serde_json::json!(true), "{plan}");
     let manifest = at("/manifest").as_str().unwrap_or_default().to_owned();
@@ -145,40 +163,70 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
     assert_eq!((count("create"), count("replace")), (1, 1), "the new file and the changed one, .git left out: {plan}");
     assert_eq!(std::fs::read(folder.path().join("a.txt"))?, b"a\n", "the folder is as it was");
 
-    // The go-ahead's authority: the handoff the anchor kiln started printed (macOS, Windows), which grants exactly the
-    // plan's manifest and lands it; Linux's is a descriptor only the anchor's children hold (Slates' GAP-A9-10).
-    if cfg!(target_os = "linux") {
-        let refused = slates::can_take_grants().err().map(|e| format!("{e:#}")).unwrap_or_default();
-        assert!(refused.contains("GAP-A9-10"), "{refused}");
-    } else {
-        slates::can_take_grants().map_err(|e| anyhow::anyhow!("{e:#}\nthe anchor said:\n{}", log_of(state.path())))?;
-        let log = std::fs::read_to_string(state.path().join("slates-anchor.log"))?;
-        let exports = log.lines().rev().find_map(|l| l.split_once("issuer surface: export ").map(|(_, rest)| rest.to_owned())).unwrap_or_default();
-        let handoff: Vec<(String, String)> = exports.split_whitespace().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-        let issuer = slates_api::Issuer::from_handoff(&handoff)?;
-        let request = slates_api::LandingRequest {
-            volume,
-            snapshot: None,
-            target: folder.text(),
-            filter: slates_api::Filter { include: Vec::new(), exclude: slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect() },
-        };
-        let mut approved = [0u8; 32];
-        for (i, byte) in approved.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(manifest.get(i * 2..i * 2 + 2).unwrap_or_default(), 16)?;
-        }
-        let landed = library.land_approved(&issuer, &request, &approved, (slates_api::GrantScope::Once, slates_api::GRANT_TERM_NS))?;
-        assert!(matches!(&landed, slates_api::Approved::Landed(outcome) if outcome.state == "done"), "{landed:?}");
-        assert_eq!(std::fs::read(folder.path().join("a.txt"))?, b"a2\n");
-        assert_eq!(std::fs::read(folder.path().join("n.txt"))?, b"n\n");
-        assert_eq!(std::fs::read(folder.path().join(".git/HEAD"))?, b"ref: refs/heads/main\n", "git's own files left out");
+    // Unset, a volume's landing asks: Slates' typed approval request, the plan's manifest, nothing written.
+    let over = folder.text();
+    let by_policy = |made: &slates::Made| {
+        let (made, over) = (made.clone(), over.clone());
+        kiln::rt::block_on(async move { slates::land_by_policy(&made, &over).await })
+    };
+    let held = by_policy(&made)?;
+    let slates_api::LandOutcome::ApprovalRequired(approval) = held else { anyhow::bail!("an unset volume's landing didn't ask: {held:?}") };
+    assert_eq!(approval.manifest_text(), manifest);
+    assert_eq!(std::fs::read(folder.path().join("a.txt"))?, b"a\n", "asking wrote nothing");
+
+    // kiln's own authority, the launcher secret it handed the anchor it started (kept 0600 in its state), approves
+    // exactly the plan's manifest; another manifest approves nothing.
+    let approve = |manifest: String| {
+        let (made, over) = (made.clone(), over.clone());
+        kiln::rt::block_on(async move { slates::approve(&made, &over, &manifest).await })
+    };
+    let other = approve("00".repeat(32))?;
+    assert!(matches!(other, slates_api::LandOutcome::ApprovalRequired(_)), "another manifest's approval: {other:?}");
+    assert_eq!(std::fs::read(folder.path().join("a.txt"))?, b"a\n", "an approval of another manifest wrote nothing");
+    let landed = approve(manifest)?;
+    assert!(matches!(&landed, slates_api::LandOutcome::Written(report) if report.state == slates_api::LandingState::Done), "{landed:?}");
+    assert_eq!(std::fs::read(folder.path().join("a.txt"))?, b"a2\n");
+    assert_eq!(std::fs::read(folder.path().join("n.txt"))?, b"n\n");
+    assert_eq!(std::fs::read(folder.path().join(".git/HEAD"))?, b"ref: refs/heads/main\n", "git's own files left out");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(std::fs::metadata(state.path().join("slates-launcher.key"))?.permissions().mode() & 0o777, 0o600, "kiln's secret kept private");
     }
+
+    // The policy kiln sets as the launcher: bypass writes the next change at once, forbid refuses it, typed.
+    let set = |policy: slates_api::WritePolicy| {
+        let made = made.clone();
+        kiln::rt::block_on(async move { slates::set_policy(&made, policy).await })
+    };
+    let write = |path: &str, bytes: &[u8]| -> anyhow::Result<()> {
+        let mut library = slates_api::Instance::attach(&instance)?;
+        let attached = library.attach_volume(volume, slates_api::Intent::Write)?;
+        library.client().fs_write((volume, attached.attachment), path, bytes, MODE)?;
+        library.detach(attached.attachment)?;
+        Ok(())
+    };
+    set(slates_api::WritePolicy { land: slates_api::WriteMode::Bypass, ..slates_api::WritePolicy::UNSET })?;
+    write("/b.txt", b"b\n")?;
+    let written = by_policy(&made)?;
+    assert!(matches!(written, slates_api::LandOutcome::Written(_)), "a bypass volume's landing asked: {written:?}");
+    assert_eq!(std::fs::read(folder.path().join("b.txt"))?, b"b\n");
+    set(slates_api::WritePolicy { land: slates_api::WriteMode::Forbid, ..slates_api::WritePolicy::UNSET })?;
+    write("/c.txt", b"c\n")?;
+    let refused = by_policy(&made)?;
+    assert!(matches!(refused, slates_api::LandOutcome::Refused(slates_api::PolicyRefusal { reason: slates_api::PolicyReason::Forbidden, .. })), "{refused:?}");
+    assert!(!folder.path().join("c.txt").exists(), "a forbidden landing wrote nothing");
 
     // Removed: its volume is gone from the instance.
     kiln::rt::block_on({
         let made = made.clone();
-        async move { slates::remove(&made).await }
+        async move { slates::remove(&made, std::time::Duration::ZERO).await }
     })?;
-    assert!(library.list()?.iter().all(|v| v.id != volume), "the volume outlived its removal");
+    let until = Instant::now() + TORN_DOWN_WITHIN;
+    while library.list()?.iter().any(|v| v.id == volume) {
+        anyhow::ensure!(Instant::now() < until, "the volume outlived its removal by {}s", TORN_DOWN_WITHIN.as_secs());
+        std::thread::sleep(LOOK_EVERY);
+    }
     drop(library);
 
     // Stopped by its anchor's process group, every process of the instance goes.

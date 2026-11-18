@@ -297,6 +297,8 @@ fn remember(holders: &mut Vec<(u32, u64)>, holder: (u32, u64)) {
 /// mid-fill is answered and counted. Nothing pending, nothing done.
 pub(super) fn step(s: &mut ShardState, stream: &mut ShardsStream) {
   let slice = slice_bytes(s);
+  // The file the fill is for, which its answer names to what is kept for a successor (A-365).
+  let inode = stream.dax.pending_inode();
   let stepped = with_session(s, stream, |dax, bridge, cx| {
     dax.fill_step(bridge, cx, slice)
   });
@@ -306,17 +308,21 @@ pub(super) fn step(s: &mut ShardState, stream: &mut ShardsStream) {
       refuse(s, stream, &Refused::Unreachable(VfsError::NotFound));
     }
     Some(FillStep::Idle | FillStep::Filling) => {}
-    Some(FillStep::Done(handed)) => answer(s, stream, handed),
+    Some(FillStep::Done(handed)) => answer(s, stream, handed, inode),
     Some(FillStep::Refused(refused)) => refuse(s, stream, &refused),
   }
   forward_counts(s, stream);
 }
 
-/// Answers the filled ask with its descriptor, riding the answer by `SCM_RIGHTS` (Unix).
+/// Answers the filled ask of `inode` with its descriptor, riding the answer by `SCM_RIGHTS` (Unix). The guest's stores
+/// through the map then live in an object only the device maps once this daemon is gone, so a stream whose resync the
+/// anchor holds keeps what a successor needs to take it back: the anchor holds the object and the range table records
+/// the ranges answered (A-365); where either is refused, the stream gives its resync up (A-316, A-339).
 #[cfg(unix)]
-fn answer(_s: &mut ShardState, stream: &mut ShardsStream, handed: Descriptor) {
+fn answer(s: &mut ShardState, stream: &mut ShardsStream, handed: Descriptor, inode: Option<u64>) {
   owe(stream, &descriptor_answer());
   stream.owed_descriptor = Some(handed);
+  super::keep_resync_through_dax(s, stream, inode);
 }
 
 /// Answers the filled ask with the value of the section's duplicate in the claimant's process (Windows), and remembers
@@ -327,6 +333,7 @@ fn answer(
   s: &mut ShardState,
   stream: &mut ShardsStream,
   handed: slates_vfs::shards_backing::HandedObject,
+  _inode: Option<u64>,
 ) {
   use std::os::windows::io::AsHandle;
   let value = stream.claimant.take().and_then(|claimant| {
@@ -359,14 +366,20 @@ fn refuse(s: &mut ShardState, stream: &mut ShardsStream, refused: &Refused) {
   s.count(refused_counter(refused), 1);
 }
 
-/// Lets go of `inode`'s backing on `stream`, if it has one, and gives its charge back: the guest forgot the node.
+/// Lets go of `inode`'s backing on `stream`, if it has one, and gives its charge back: the guest forgot the node. What
+/// the anchor held of it for a successor goes too (A-365).
 pub(super) fn release(s: &mut ShardState, stream: &mut ShardsStream, inode: u64) {
   stream.dax.release(&mut s.store.shards_backings, inode);
+  #[cfg(unix)]
+  super::dax_hold::let_go(s, stream, inode);
 }
 
-/// Lets go of every backing on `stream`, and of its pending fill and ingest: the stream ended.
+/// Lets go of every backing on `stream`, and of its pending fill and ingest: the stream ended. What the anchor held of
+/// them for a successor goes too (A-365).
 pub(super) fn release_all(s: &mut ShardState, stream: &mut ShardsStream) {
   stream.dax.release_all(&mut s.store.shards_backings);
+  #[cfg(unix)]
+  super::dax_hold::let_go_all(s, stream);
 }
 
 /// Holds the request of `total` bytes at the head of `stream` for an ingest, where it is one that asks for the guest's
@@ -406,6 +419,20 @@ pub(super) fn hold_for_ingest(
   )
 }
 
+/// Holds the SAVE of `total` bytes at the head of `stream` for an ingest of every backing with writable ranges (A-303):
+/// the guest's stores through its maps reach the volume before the snapshot at the cut, as a `FSYNC`'s do before its
+/// answer. Whether there is one to wait for.
+pub(super) fn hold_save_for_ingest(
+  s: &ShardState,
+  stream: &mut ShardsStream,
+  total: usize,
+) -> bool {
+  stream.dax.begin_ingest_all(
+    &s.store.shards_backings,
+    slates_bridge_core::dax_backing::Then::Serve(u64::try_from(total).unwrap_or(u64::MAX)),
+  )
+}
+
 /// Starts the ingest every backing with writable ranges takes before the stream ends. Whether there is one.
 pub(super) fn ingest_before_end(s: &ShardState, stream: &mut ShardsStream) -> bool {
   stream.dax.ingest_before_end(&s.store.shards_backings)
@@ -434,6 +461,7 @@ pub(super) fn ingest_step(s: &mut ShardState, stream: &mut ShardsStream) -> Opti
         total: usize::try_from(total).unwrap_or(usize::MAX),
       },
       slates_bridge_core::dax_backing::Then::End => Then::End,
+      slates_bridge_core::dax_backing::Then::Resume => Then::Resume,
     },
     wrote,
     refused: refused.as_ref().map(dax_failure_errno),

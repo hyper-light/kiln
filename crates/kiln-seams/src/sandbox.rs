@@ -168,6 +168,34 @@ impl Share {
     }
 }
 
+/// A folder another server serves a run, seen at `at` (kiln goal 01a1ec34599974448f6b7663ddb07001; Shards' D286, through
+/// Hex's `ShardsImage::served`): its server answers the run's file requests itself, with no folder of the machine and no
+/// mount between them, as Slates serves an agent's volume to its microVM over Slates' own virtio-fs device. `source` is
+/// what that server serves, in its own words (for kiln's agents, a Slates volume's id); its boundary asks its server for
+/// it as the run starts. Read-only where it isn't `writable`; given to `members` as a share is ([`Share::members`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Served {
+    pub source: String,
+    pub at: String,
+    pub writable: bool,
+    pub members: Vec<Member>,
+}
+
+impl Served {
+    /// `Ok` where its server could be asked for it: a source, and an absolute place; else `Invalid`, naming it by its place
+    /// among its launch's served folders. The rest (whether its server serves that source) is its boundary's to refuse.
+    fn check(&self, at: usize) -> Result<(), Refusal> {
+        let invalid = |why: String| Err(Refusal::Invalid { what: "a served folder", why: format!("served[{at}] {why}") });
+        if self.source.is_empty() {
+            return invalid("names no source".into());
+        }
+        if !self.at.starts_with('/') {
+            return invalid(format!("is at {:?}, which isn't absolute", self.at));
+        }
+        Ok(())
+    }
+}
+
 /// A signal a run's program is sent: to its process group on the host, to a microVM's member
 /// through its boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,11 +260,14 @@ pub struct Holds {
     /// it, listed and cleared ([`Launch::volumes`], [`Sandbox::volumes`], [`Sandbox::clear_volume`]: kiln plan
     /// 01a1dd2e…, P6.2).
     pub volumes: bool,
+    /// Folders another server serves a launch's run, asked of that server as it starts ([`Launch::served`]; kiln goal
+    /// 01a1ec34599974448f6b7663ddb07001).
+    pub served: bool,
 }
 
 impl Holds {
     /// Everything (the simulator's).
-    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true, swaps: true, components: true, pools: true, volumes: true };
+    pub const ALL: Holds = Holds { memory: true, processes: true, weights: true, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: true, live: true, swaps: true, components: true, pools: true, volumes: true, served: true };
 
     /// `Ok` when `launch`'s weights are on their scale, its credential grants could each be filled
     /// in, and it asks only for what these hold; else its refusal, `Invalid` or `Unsupported`,
@@ -253,6 +284,13 @@ impl Holds {
         }
         for (at, volume) in launch.volumes.iter().enumerate() {
             volume.check(at)?;
+        }
+        for (at, served) in launch.served.iter().enumerate() {
+            served.check(at)?;
+            let taken = launch.shares.iter().map(|s| &s.at).chain(launch.served.get(..at).unwrap_or_default().iter().map(|s| &s.at)).any(|place| *place == served.at);
+            if taken {
+                return Err(Refusal::Invalid { what: "a served folder", why: format!("served[{at}] is at {:?}, a share's or another served folder's place", served.at) });
+            }
         }
         let refuse = |what: &str| Err(Refusal::Unsupported(what.to_owned()));
         if l.memory_bytes.is_some() && !self.memory {
@@ -281,6 +319,9 @@ impl Holds {
         }
         if !launch.volumes.is_empty() && !self.volumes {
             return refuse("volumes of its boundary's store given as it starts");
+        }
+        if !launch.served.is_empty() && !self.served {
+            return refuse("a folder another server serves");
         }
         Ok(())
     }
@@ -431,6 +472,10 @@ pub struct Launch {
     /// The volumes of its boundary's store its members are given as it starts (kiln plan 01a1dd2e…, P6.2): each held
     /// by its run until it ends, and kept past it. None by default.
     pub volumes: Vec<Volume>,
+    /// Folders another server serves it, each asked of that server as it starts, none at a share's place (kiln goal
+    /// 01a1ec34599974448f6b7663ddb07001: an agent's Slates volume in its microVM with no mount of the machine's). None by
+    /// default.
+    pub served: Vec<Served>,
 }
 
 impl Launch {
@@ -450,6 +495,7 @@ impl Launch {
             egress_ceiling: Vec::new(),
             components: Vec::new(),
             volumes: Vec::new(),
+            served: Vec::new(),
         }
     }
 }
@@ -1085,6 +1131,18 @@ impl Sandbox for SimSandbox {
                     st.say(Output::Stdout(launch.components.iter().map(|c| format!("{} {}\n", c.at, c.component.source)).collect::<String>().into_bytes()));
                     st.say(Output::Exited(Exit::Code(0)));
                 }
+                // What the folder served at its argument's place serves there: the simulator's server answers with its
+                // source, writable or read-only as it was given.
+                "served" => match launch.served.iter().find(|s| s.at == arg(0)) {
+                    Some(s) => {
+                        st.say(Output::Stdout(format!("{} {}\n", s.source, if s.writable { "rw" } else { "ro" }).into_bytes()));
+                        st.say(Output::Exited(Exit::Code(0)));
+                    }
+                    None => {
+                        st.say(Output::Stderr(format!("{}: no folder served there", arg(0)).into_bytes()));
+                        st.say(Output::Exited(Exit::Code(1)));
+                    }
+                },
                 other => return Err(Refusal::NoSuchProgram(other.to_owned())),
             }
             let mut n = self.runs.lock();
@@ -1194,6 +1252,10 @@ pub trait SandboxFixture: Send + Sync {
     fn pwd(&self, folder: &str) -> Launch;
     /// Writes the components laid for it, `laid`, one a line: `<at> <source>`.
     fn components(&self, laid: Vec<ComponentAt>) -> Launch;
+    /// Given the folders another server serves it, `served`, writes what the one at `at` serves there, a line: its
+    /// source and `rw` or `ro`, as that server says it (the suite's sources are its own, `conformance/...`, which the
+    /// fixture's server serves); exits nonzero where none is served at `at`.
+    fn served(&self, at: &str, served: Vec<Served>) -> Launch;
     /// A folder that exists for a run.
     fn folder(&self) -> String;
 }
@@ -1235,6 +1297,9 @@ impl SandboxFixture for SimSandboxFixture {
     }
     fn components(&self, laid: Vec<ComponentAt>) -> Launch {
         Launch { components: laid, ..Launch::of("components", &[]) }
+    }
+    fn served(&self, at: &str, served: Vec<Served>) -> Launch {
+        Launch { served, ..Launch::of("served", &[at]) }
     }
     fn folder(&self) -> String {
         "/work/conformance".into()
@@ -1663,6 +1728,44 @@ fn c18<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c19<F: SandboxFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let served = |source: &str, at: &str, writable: bool| Served { source: source.into(), at: at.into(), writable, members: Vec::new() };
+        let both = vec![served("conformance/one", "/srv/one", true), served("conformance/two", "/srv/two", false)];
+        if !f.sandbox().holds().served {
+            return match f.sandbox().launch(f.served("/srv/one", both)).await {
+                Err(Refusal::Unsupported(_)) => Ok(()),
+                Err(e) => Err(format!("a folder another server serves: refused as {e:?}, not Unsupported")),
+                Ok(run) => {
+                    run.kill();
+                    Err("a folder another server serves: taken, though the sandbox says it doesn't hold it".into())
+                }
+            };
+        }
+        for (at, said) in [("/srv/one", "conformance/one rw\n"), ("/srv/two", "conformance/two ro\n")] {
+            let run = fine("launch", f.sandbox().launch(f.served(at, both.clone())).await)?;
+            let outs = drain(run.as_ref()).await;
+            same(&format!("what is served at {at}"), String::from_utf8_lossy(&stdout(&outs)).into_owned(), said.to_owned())?;
+            same(&format!("its end, reading {at}"), end(&outs), Some(Exit::Code(0)))?;
+        }
+        for (bad, why) in [
+            (vec![served("", "/srv/one", true)], "a served folder with no source"),
+            (vec![served("conformance/one", "srv/one", true)], "a served folder at a relative place"),
+            (vec![served("conformance/one", "/srv/one", true), served("conformance/two", "/srv/one", true)], "two served folders at one place"),
+        ] {
+            match f.sandbox().launch(f.served("/srv/one", bad)).await {
+                Err(Refusal::Invalid { .. }) => {}
+                Err(e) => return Err(format!("{why}: refused as {e:?}, not Invalid")),
+                Ok(run) => {
+                    run.kill();
+                    return Err(format!("{why}: taken"));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 /// The `Sandbox` contract, clause by clause (docs/seams.md, "Sandbox").
 pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
     vec![
@@ -1731,6 +1834,11 @@ pub fn cases<F: SandboxFixture>() -> Vec<Case<F>> {
             id: "SANDBOX-18",
             says: "a launch's volume is made where its store has none and held by its run: listed with its bound, refused Volume(Bound) to a launch asking another bound while the run holds it, kept past the run, and cleared only once no run holds it, a clearing refused Volume(InUse) while one does and Volume(Unknown) once it's gone; a sandbox that keeps no volumes refuses one Unsupported, and lists and clears none",
             check: c18::<F>,
+        },
+        Case {
+            id: "SANDBOX-19",
+            says: "a folder another server serves a run is that server's at its place, its source's, writable or read-only as given; one with no source, at a relative place or at another's place is refused Invalid; a sandbox that holds none refuses one Unsupported",
+            check: c19::<F>,
         },
     ]
 }
@@ -1824,6 +1932,9 @@ mod tests {
         fn components(&self, laid: Vec<ComponentAt>) -> Launch {
             free(self.sim.components(laid))
         }
+        fn served(&self, at: &str, served: Vec<Served>) -> Launch {
+            free(self.sim.served(at, served))
+        }
         fn folder(&self) -> String {
             self.sim.folder()
         }
@@ -1844,7 +1955,7 @@ mod tests {
         let make = || async { Holding { sim: SimSandboxFixture::default(), lies: Some(Liar(SimSandbox::new())) } };
         let report = futures::executor::block_on(run("Sandbox", &cases::<Holding>(), make));
         let failed: Vec<&str> = report.failed.iter().map(|(id, _)| *id).collect();
-        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15", "SANDBOX-16", "SANDBOX-17", "SANDBOX-18"], "{:?}", report.failed);
+        assert_eq!(failed, ["SANDBOX-5", "SANDBOX-6", "SANDBOX-7", "SANDBOX-10", "SANDBOX-11", "SANDBOX-13", "SANDBOX-14", "SANDBOX-15", "SANDBOX-16", "SANDBOX-17", "SANDBOX-18", "SANDBOX-19"], "{:?}", report.failed);
         assert!(report.failed.iter().all(|(_, why)| why.contains("doesn't hold it")), "{:?}", report.failed);
     }
 
@@ -1950,6 +2061,9 @@ mod tests {
         }
         fn components(&self, laid: Vec<ComponentAt>) -> Launch {
             self.0.components(laid)
+        }
+        fn served(&self, at: &str, served: Vec<Served>) -> Launch {
+            self.0.served(at, served)
         }
         fn folder(&self) -> String {
             self.0.folder()

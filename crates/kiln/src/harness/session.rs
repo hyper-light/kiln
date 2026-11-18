@@ -359,6 +359,14 @@ pub struct Spec {
     /// On unless a session says otherwise, so a person can always choose it.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub allow_bypass: bool,
+    /// How much its launcher let it do unasked as kiln started it: its `mode` then, on kiln's one scale of modes
+    /// (`lineage::Level`), so it means the same in whichever harness it goes on in. Kiln's alone to set
+    /// (`Registry::open_as`, never what a start asks), set once and carried as it's restarted, moved, taken up or
+    /// switched to another harness: what its permissions are judged by beside its mode now, which its harness reports
+    /// and which neither it nor its harness can raise past this (the person's rule, 2026-11-18: an agent never raises its
+    /// own permission; docs/agentic.md W6). None: not set yet ([`Spec::launched_level`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched: Option<super::lineage::Level>,
     /// Run this executable instead of the harness's usual one (a custom install, tests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
@@ -414,8 +422,9 @@ pub struct Spec {
     /// environment and program into it as it opens ([`super::host::Host::open`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent: bool,
-    /// Where it works when not in its folder itself: a Slates volume of its own laid over the
-    /// folder (`crate::workspace`), made on its machine before it starts and kept with it.
+    /// Where it works (`crate::workspace`): a Slates volume laid over its folder, made on its machine before it
+    /// starts and kept with it (its own, or another agent's it works in), or its folder itself (`kind: folder`); none:
+    /// its folder, as it was before volumes were the default (docs/agentic.md W2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::workspace::Workspace>,
     /// How it's held when not as a process on its machine: in a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -495,6 +504,14 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+impl Spec {
+    /// How much its launcher lets it do unasked: `launched` where kiln set it, else its `mode`'s level (a start kiln
+    /// hasn't set it on yet, or one begun from a spec an older kiln kept), a mode kiln can't place asking.
+    pub fn launched_level(&self) -> super::lineage::Level {
+        self.launched.unwrap_or_else(|| super::lineage::level(&self.kind, self.mode.as_deref().unwrap_or_default()).unwrap_or(super::lineage::Level::Ask))
+    }
+}
+
 impl Default for Spec {
     fn default() -> Self {
         Self {
@@ -510,6 +527,7 @@ impl Default for Spec {
             shell: None,
             env: Vec::new(),
             allow_bypass: true,
+            launched: None,
             program: None,
             effort: None,
             speed: None,
@@ -866,7 +884,13 @@ pub struct Info {
     /// an agent it starts can't have it either.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_bypass: bool,
-    /// Its workspace of its own, when it has one (as `Spec::workspace`).
+    /// How much its launcher let it do unasked as it started (as `Spec::launched`), never what its harness reports
+    /// since: what its permissions are judged by beside its mode now (`lineage::granted`). None: a session an older
+    /// kiln began, held to its harness's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "\"plan\" | \"ask\" | \"accept_edits\" | \"auto\" | \"bypass\""))]
+    pub launched: Option<super::lineage::Level>,
+    /// Where it works, when its start decided (as `Spec::workspace`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub workspace: Option<crate::workspace::Workspace>,
@@ -920,6 +944,10 @@ impl Info {
         self.title.clone_from(&s.title);
         self.model.clone_from(&s.model);
         self.mode.clone_from(&s.mode);
+        // Kiln's own record of its grant, which a mode set by command moves (a runner from before it says none).
+        if s.launched.is_some() {
+            self.launched = s.launched;
+        }
         if !s.cwd.is_empty() {
             self.cwd.clone_from(&s.cwd);
         }
@@ -1026,7 +1054,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, workspace, isolation, runs, starts } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, runs, starts } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -1089,6 +1117,7 @@ impl Info {
             && *subagent == o.subagent
             && *variant_of == o.variant_of
             && *no_bypass == o.no_bypass
+            && *launched == o.launched
             && *workspace == o.workspace
             && *isolation == o.isolation
             && *runs == o.runs
@@ -2118,6 +2147,69 @@ fn read_state(core: &mut Core, client: String, read: super::state_view::Read) {
     core.reply(client, value);
 }
 
+/// The grant a command it takes gives it, when it gives one (the person's rule, 2026-11-18; docs/agentic.md W6): a mode
+/// set by command is how much it may do unasked from now, as kiln records it (`Spec::launched`, `State::launched`). Kiln
+/// sends it one only as a person asks (any mode) or as an agent may (no higher than its own grant, its own mode or a
+/// child's: `lineage::may_command` refuses the rest before it's sent), so a person's raise is a grant, and one lowered
+/// by anyone is the grant from then. What its harness reports of its mode never is. A mode kiln can't place asks.
+fn grant_of(kind: &Kind, c: &Command) -> Option<super::lineage::Level> {
+    let Command::SetMode { mode } = c else { return None };
+    Some(super::lineage::level(kind.id, mode).unwrap_or(super::lineage::Level::Ask))
+}
+
+/// The grant permission control `id`, set to `value`, gives session `core` once its adapter has taken it (the person's
+/// rule, 2026-11-18; docs/agentic.md W6): Codex's approvals and sandbox name kiln's own mode for the pair, which its
+/// adapter computes as it takes them (never Codex's word on it), and an ACP agent's mode option names its mode in its own
+/// words; a pair or a word kiln can't place asks. None for a control that sets no permission. Kiln sends one only as a
+/// person asks: an agent's is refused before it's sent (`lineage::may_command`), so it's a person's grant, as their
+/// `set_mode` is ([`grant_of`]).
+pub(super) fn control_grant(kind: &Kind, core: &Core, id: &str, value: Option<&serde_json::Value>) -> Option<super::lineage::Level> {
+    let meta = serde_json::to_value(&core.meta).ok();
+    if !super::lineage::permission_control(meta.as_ref(), id) {
+        return None;
+    }
+    let placed = match kind.protocol {
+        Protocol::CodexAppServer => super::lineage::level(kind.id, &core.state.mode),
+        Protocol::Acp(_) => value.and_then(serde_json::Value::as_str).and_then(|v| super::lineage::level(kind.id, v)),
+        _ => None,
+    };
+    Some(placed.unwrap_or(super::lineage::Level::Ask))
+}
+
+/// The id and value of the control command `c` sets, when it's one ([`control_grant`] judges it once it's taken).
+fn control_set(c: &Command) -> Option<(String, Option<serde_json::Value>)> {
+    match c {
+        Command::Control { id, value } => Some((id.clone(), value.clone())),
+        _ => None,
+    }
+}
+
+/// Records the grant command `c` gives session `s` ([`grant_of`]) ([`record_grant`]).
+fn granted_by(s: &Session, kind: &Kind, c: &Command) {
+    if let Some(level) = grant_of(kind, c) {
+        record_grant(s, level);
+    }
+}
+
+/// Records grant `level` in session `s`'s spec (carried as it's restarted, moved or taken up) and its state (which
+/// carries it to the server's copy: `Info::apply`), and has its workspace's write policy follow it
+/// (`workspace::follow_grant`).
+fn record_grant(s: &Session, level: super::lineage::Level) {
+    let workspace = {
+        let mut spec = s.spec.lock();
+        spec.launched = Some(level);
+        spec.workspace.clone()
+    };
+    {
+        let mut core = s.core.lock();
+        if core.state.launched != Some(level) {
+            core.state.launched = Some(level);
+            core.touch_state();
+        }
+    }
+    crate::workspace::follow_grant(workspace.as_ref(), level);
+}
+
 fn at_state(core: &mut Core, client: String, revision: &str, command: Command, apply: impl FnOnce(&mut Core, Command)) -> bool {
     use super::state_view::Error;
     let id = match &command {
@@ -2484,6 +2576,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
     let now = crate::util::now_ms();
     core.session_id.clone_from(&id);
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
+    // Its grant, as kiln records it (`State::launched`): its spec's, which every mode set by command since has moved.
+    core.state.launched = Some(spec.launched_level());
     // It goes to work only with room on its machine (`super::limit`).
     core.room = Some(Arc::clone(&files.room));
     let cwd = core.state.cwd.clone();
@@ -2554,6 +2648,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         subagent: spec.subagent,
         variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
+        launched: Some(spec.launched_level()),
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
         runs: None,
@@ -5534,6 +5629,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 on_change();
                             }
                             c => {
+                                granted_by(&s, kind, &c);
                                 // A model of its own harness: no switch after all.
                                 if matches!(c, Command::SetModel { .. }) && switching.take().is_some() {
                                     let mut core = s.core.lock();
@@ -5545,16 +5641,27 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                     }
                                 }
                                 let c = match prepare(&files, c).await { Ok(command) => command, Err(error) => { preparation_failed(&s, error).await; continue; } };
-                                let mut core = s.core.lock();
-                                // No room on its machine for it to go to work: a skill run waits
-                                // for room (`super::limit`).
-                                if matches!(c, Command::SkillRun { .. }) && !core.has_room() {
-                                    for_room.push(c);
-                                }
-                                // Paused (or at its stop point), or no room on its machine for it
-                                // to go to work: a message waits in the queue.
-                                else if let Some(c) = super::pause::let_through(&mut core, c) {
-                                    adapter.command(&mut core, c);
+                                let control = control_set(&c);
+                                let granted = {
+                                    let mut core = s.core.lock();
+                                    // No room on its machine for it to go to work: a skill run waits
+                                    // for room (`super::limit`).
+                                    if matches!(c, Command::SkillRun { .. }) && !core.has_room() {
+                                        for_room.push(c);
+                                        None
+                                    }
+                                    // Paused (or at its stop point), or no room on its machine for it
+                                    // to go to work: a message waits in the queue.
+                                    else if let Some(c) = super::pause::let_through(&mut core, c) {
+                                        adapter.command(&mut core, c);
+                                        // A permission control a person set is their grant, as it stands once taken.
+                                        control.and_then(|(id, value)| control_grant(kind, &core, &id, value.as_ref()))
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(level) = granted {
+                                    record_grant(&s, level);
                                 }
                             }
                         }
@@ -6155,7 +6262,18 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         let _ = take_override(&s, change, None, None, kind, &files).await;
                         on_change();
                     }
-                    c => adapter.command(&mut s.core.lock(), c),
+                    c => {
+                        granted_by(&s, kind, &c);
+                        let control = control_set(&c);
+                        let granted = {
+                            let mut core = s.core.lock();
+                            adapter.command(&mut core, c);
+                            control.and_then(|(id, value)| control_grant(kind, &core, &id, value.as_ref()))
+                        };
+                        if let Some(level) = granted {
+                            record_grant(&s, level);
+                        }
+                    }
                 },
                 }
                 },
@@ -6770,6 +6888,39 @@ mod tests {
         })
     }
 
+    /// The person's rule of 2026-11-18 (docs/agentic.md W6; kiln goal 01a1ec34599974448aed2672bafaf9a2): a mode set by
+    /// command is the session's grant from then, in its spec (which its restarts and moves carry) and its state (which
+    /// carries it to the server's copy), since kiln sends one only as a person asks or as an agent may; a mode kiln can't
+    /// place asks; nothing else a command says moves it. The server's copy follows the state's record, and a runner from
+    /// before it, saying none, leaves the copy's own. Without it a person's raise of an agent's mode would never be a
+    /// grant, and its landings would ask whatever the person chose.
+    #[test]
+    fn w6_a_mode_set_by_command_is_its_grant_and_the_servers_copy_follows() -> anyhow::Result<()> {
+        use super::super::lineage::Level;
+        let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude kind"))?;
+        let set = |m: &str| Command::SetMode { mode: m.into() };
+        assert_eq!(grant_of(claude, &set("bypassPermissions")), Some(Level::Bypass));
+        assert_eq!(grant_of(claude, &set("plan")), Some(Level::Plan));
+        assert_eq!(grant_of(claude, &set("turbo")), Some(Level::Ask), "a mode kiln can't place asks");
+        assert_eq!(grant_of(claude, &Command::Interrupt), None);
+        assert_eq!(grant_of(claude, &Command::Control { id: "acp:mode".into(), value: None }), None, "a control is no grant");
+        let (s, _rx) = idle("granted");
+        s.spec.lock().launched = Some(Level::Ask);
+        s.core.lock().state.launched = Some(Level::Ask);
+        granted_by(&s, claude, &set("bypassPermissions"));
+        anyhow::ensure!(s.spec.lock().launched == Some(Level::Bypass) && s.core.lock().state.launched == Some(Level::Bypass), "a person's raise is its grant");
+        granted_by(&s, claude, &set("plan"));
+        anyhow::ensure!(s.spec.lock().launched == Some(Level::Plan) && s.core.lock().state.launched == Some(Level::Plan), "lowered by anyone, the grant from then");
+        granted_by(&s, claude, &Command::Interrupt);
+        anyhow::ensure!(s.spec.lock().launched == Some(Level::Plan), "nothing else moves it");
+        let mut info = Info { kind: "claude".into(), launched: Some(Level::Ask), ..Info::default() };
+        info.apply(&State { mode: "bypassPermissions".into(), launched: Some(Level::Bypass), ..State::default() });
+        anyhow::ensure!(info.launched == Some(Level::Bypass) && super::super::lineage::granted(&info) == Level::Bypass, "{info:?}");
+        info.apply(&State { mode: "bypassPermissions".into(), launched: None, ..State::default() });
+        anyhow::ensure!(info.launched == Some(Level::Bypass), "a runner from before it says none: the copy keeps its own");
+        Ok(())
+    }
+
     /// Goal 4, plan 01a1a59c2a9c step 5: whether two infos differ in what lists show, compared field by
     /// field without copying either, is what comparing their copies with the activity time, the queue's
     /// words and what was said cleared said: every field changed alone, and those three changed together.
@@ -6792,6 +6943,7 @@ mod tests {
             ("context_pct", Info { context_pct: Some(40), ..base.clone() }),
             ("keep_off", Info { keep_off: true, ..base.clone() }),
             ("no_bypass", Info { no_bypass: true, ..base.clone() }),
+            ("launched", Info { launched: Some(super::super::lineage::Level::Bypass), ..base.clone() }),
             ("parent", Info { parent: Some("p".into()), ..base.clone() }),
             ("last_activity", Info { last_activity: 99, ..base.clone() }),
             ("queue", Info { queue: vec![super::super::queued::Queued::of("q1", "later")], ..base.clone() }),
@@ -8346,6 +8498,7 @@ sys.exit(1)
             helper: None,
             subagent: false,
             no_bypass: false,
+            launched: None,
             workspace: None,
             isolation: None,
             runs: None,

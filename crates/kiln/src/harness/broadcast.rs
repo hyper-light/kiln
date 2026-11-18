@@ -197,8 +197,10 @@ pub fn message_for(id: &str, agent: &str) -> String {
 /// (`lineage::reached`): every picked agent at once. `by`: whose it is (the agent and person it comes
 /// from, as `ops::key_scope` names a caller): a key is its caller's, so another caller's same key is
 /// another broadcast, and each message goes into custody as its sender's (kiln plan
-/// 01a1cd8e862e7169a074db3d5fa33f3d step 35: a person's held to no depth), never as kiln's own.
-pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> anyhow::Result<Report> {
+/// 01a1cd8e862e7169a074db3d5fa33f3d step 35: a person's held to no depth), never as kiln's own. A
+/// command that would raise an agent's permission past what `caller` may give is refused for that
+/// agent, sending it nothing (`lineage::may_command`: an agent never raises its own permission).
+pub async fn run(hub: &Arc<Hub>, b: &Broadcast, caller: &crate::authz::Caller, by: &str, among: &[Info]) -> anyhow::Result<Report> {
     let prompt = b.text.as_deref().is_some_and(|t| !t.trim().is_empty()) || !b.attachments.is_empty();
     let given = [prompt, b.command.is_some(), b.approvals.is_some()].into_iter().filter(|x| *x).count();
     anyhow::ensure!(given == 1, "send one of text (or attachments), command or approvals");
@@ -228,6 +230,10 @@ pub async fn run(hub: &Arc<Hub>, b: &Broadcast, by: &str, among: &[Info]) -> any
                 Ok(c) => c,
                 Err(why) => return outcome("skipped", Some(why)),
             };
+            // Every command it would be sent held to who sends it before any is sent, a slash command's too.
+            if let Some(Err((_, why))) = commands.iter().map(|c| super::lineage::may_command(hub, caller, &info.id, c)).find(Result::is_err) {
+                return outcome("failed", Some(format!("refused: {why}")));
+            }
             let mut retained = false;
             for c in commands {
                 match hub.harness.command_from(hub, &info.id, by, c).await {
@@ -363,7 +369,7 @@ mod tests {
             anyhow::ensure!(!super::super::mail_delivery::legacy_owner(&hub, "s1"), "its runner speaks mail-flow");
             for by in ["admin", "user:ada", "agent:a1"] {
                 let b = Broadcast { to: To { ids: vec!["s1".into()], ..To::default() }, text: Some("how far along is it?".into()), attachments: Vec::new(), mode: None, command: None, approvals: None, key: None };
-                let report = run(&hub, &b, by, std::slice::from_ref(&info)).await?;
+                let report = run(&hub, &b, &crate::authz::Caller::owner(), by, std::slice::from_ref(&info)).await?;
                 anyhow::ensure!(report.retained == 1, "{by}'s is taken into custody and waits: {report:?}");
             }
             let demand = super::super::mail::waiting_peers(&hub.store, "s1".into(), 0, super::super::state_view::FRAME).await?;

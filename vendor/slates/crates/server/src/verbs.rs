@@ -40,7 +40,7 @@ use slates_wire::Wire;
 use slates_wire::observe::{Chokepoint, SpanContext};
 use slates_wire::request::{RequestId, Seen};
 
-use crate::error::{refusal_of_db, refusal_of_vfs};
+use crate::error::{refusal_of_db, refusal_of_mem, refusal_of_vfs};
 use crate::state::{ClientSlot, Deferred, PendingForward, ShardState, VolumeSlot};
 
 /// Format: parts per thousand.
@@ -508,8 +508,7 @@ fn promote_region_on_root(
       } else {
         crate::xshard::send_reply_home(origin, move || {
           crate::state::deliver(client_index, request, reply, false);
-        })
-        .await;
+        });
       }
     }),
     None,
@@ -606,15 +605,6 @@ pub(crate) struct ForwardedRequest {
 /// wait instead) return `None` too.
 fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
   match body {
-    RequestBody::Read {
-      volume,
-      at: ReadAt::Head,
-      ..
-    } => Some(*volume),
-    RequestBody::Read {
-      at: ReadAt::Version { .. } | ReadAt::Attachment { .. },
-      ..
-    } => None,
     RequestBody::ReadRange {
       volume,
       at: ReadAt::Head,
@@ -631,7 +621,7 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
       ..
     } => Some(*volume),
     RequestBody::Versions { green } | RequestBody::ChangedSince { green, .. } => Some(*green),
-    RequestBody::Status { volume } => Some(*volume),
+    RequestBody::Status { volume } | RequestBody::Drifted { volume, .. } => Some(*volume),
     _ => None,
   }
 }
@@ -804,6 +794,11 @@ fn takeovers_pending(state: &ShardState) -> u64 {
 /// bounded startup allowance, and on a laptop (`f = 0`, no other candidate needed). Read by the verb gate
 /// ([`dispatch`]), the mount bridge (`crate::nfs`, which is Unix's) and the daemon's test observation.
 pub(crate) fn lease_verdict(state: &ShardState, object: ObjectId) -> crate::lease::LeaseVerdict {
+  // An object this node lost to a successor is the successor's: its copy here is never served as the latest state,
+  // however this host's lease stands (A-334, A-338).
+  if lost_to_a_successor(state, DbVolumeId { bytes: object.0 }) {
+    return crate::lease::LeaseVerdict::LostToSuccessor;
+  }
   let config = state.fleet.configuration();
   // The cohorts a successor's promotion quorum can be drawn from: the settled one, and — while this owner's
   // neighbourhood change is in flight and moved the object's cohort — the current one the council may settle
@@ -917,7 +912,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::xshard::call_in_shard_time(
       control,
       shard,
-      move |s| dispatch(s, FORWARDED_CLIENT, &principal, body),
+      move |s| serve_forwarded_read(s, &principal, body, volume),
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await
@@ -926,6 +921,10 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       control,
       shard,
       move |s| {
+        // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
+        if let Some(refusal) = forwarded_before_made(s, volume) {
+          return (Some(refusal), None);
+        }
         if let Some(up_to) = ack_up_to {
           prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
         }
@@ -942,6 +941,41 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// A read forwarded from another node, on its volume's owner shard: refused while this node owns the volume by its own
+/// routing but has not made it yet ([`forwarded_before_made`]), else dispatched as a local read is.
+fn serve_forwarded_read(
+  state: &mut ShardState,
+  principal: &Principal,
+  body: RequestBody,
+  volume: VolumeId,
+) -> ReplyBody {
+  forwarded_before_made(state, volume)
+    .unwrap_or_else(|| dispatch(state, FORWARDED_CLIENT, principal, body))
+}
+
+/// Format: the status count of verbs forwarded from another node to this one as `volume`'s owner by this node's routing
+/// (a takeover's successor) before it made the volume, refused `Overloaded` ([`forwarded_before_made`]).
+const FORWARD_BEFORE_MADE: &str = "fleet.forward.refused.before_made";
+
+/// The refusal a verb forwarded from another node meets on `volume`'s owner shard when this node owns the volume by its
+/// own routing (a takeover's successor) but its catalog does not hold it yet: `Overloaded`, retryable, the answer a local
+/// client's verb gets here ([`owned_unmaterialized`]). Dispatched, the verb found no volume and answered `NotFound`,
+/// telling a reader its acknowledged write did not exist (the chaos nemesis at seed 6876545201569229162, ReadSafety:
+/// reads through a holder during the owner's isolation, forwarded to the successor its routing named, `NotFound` five
+/// times a run), and a forwarded write had that `NotFound` recorded as its completion. A volume this shard records
+/// unrecovered is dispatched, so its typed refusal names why (A-394).
+fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<ReplyBody> {
+  let id = to_db_volume(volume);
+  if state.fleet.object_owner(ObjectId(volume.bytes)) != Some(state.fleet.host())
+    || state.db.partition().volume(id).is_some()
+    || state.unrecovered.contains_key(&id)
+  {
+    return None;
+  }
+  state.count(FORWARD_BEFORE_MADE, 1);
+  Some(refused(Refusal::Overloaded { shard: state.shard }))
 }
 
 /// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
@@ -1251,7 +1285,7 @@ fn forward_to_owner(
       crate::state::with_state_counted(|s| s.count(FORWARD_CLIENT_CONTROL_STARTED, 1));
       let (replies, route) = resolve_and_forward(volume, region, cached, requests).await;
       crate::state::with_state_counted(|s| s.count(FORWARD_CLIENT_RESOLVED, 1));
-      deliver_owner_forward(origin, control, (client, request), replies, (route, plan)).await;
+      deliver_owner_forward(origin, control, (client, request), replies, (route, plan));
     }),
     None,
   );
@@ -1691,9 +1725,8 @@ pub(crate) async fn resolve_and_forward(
   // which the owner's completion record answers exactly once (§4.9 RIFL); the client waits for a forwarded verb while
   // the daemon lives (`RequestBody::defers_reply`). Until 2026-10-09 one unanswered forward refused the client at once:
   // one cross-region read in nine was refused mid-file on a 200 ms path with 3% loss.
-  let began = slates_rt::futures::now_ns();
-  let bound = crate::state::with_state(|state| state.config.failover_slo_ns)
-    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
+  // The failover bound, from the first send: the SLO, or the floor of the path to the owner where that is longer (A-352).
+  let mut bound = crate::forward_lane::FailoverBound::from_now();
   let owner = match known {
     Some(owner) => {
       crate::state::with_state(|state| {
@@ -1722,8 +1755,13 @@ pub(crate) async fn resolve_and_forward(
       },
     },
   };
+  // Every resend keeps the place the first send had in the owner's lane (A-306), so forwards first queued after it
+  // never go ahead of it however often it is sent again. Every send is judged against the same failover bound, from
+  // the first: the lane's progress holds a forward still queued only until then (A-315), and the bound is held to the
+  // longest floor the path to the owner has measured, so no resend is refused below it (A-352).
+  let mut place = crate::forward_lane::Place::default();
   let (decoded, later) = loop {
-    let (decoded, later) = forward_once(owner, &requests).await;
+    let (decoded, later) = forward_once(owner, &requests, &mut bound, &mut place).await;
     // Unanswered (sent, no reply in time) or unsent (the session to the owner stayed with another task the whole
     // budget): on a lossy path both are transient while the owner lives (measured 2026-10-09 at 10% loss: contested
     // reads refused after forwards that never left, `fleet.owner_location.forward_unsent`).
@@ -1741,8 +1779,7 @@ pub(crate) async fn resolve_and_forward(
       })
       .unwrap_or(false)
     });
-    let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
-    if !unanswered || !alive || elapsed >= bound {
+    if !unanswered || !alive || slates_rt::futures::now_ns() >= bound.at_ns() {
       break (decoded, later);
     }
     crate::state::with_state_counted(|state| state.count(FORWARD_RETRIED, 1));
@@ -1765,11 +1802,15 @@ pub(crate) async fn resolve_and_forward(
 const FORWARD_RETRIED: &str = "fleet.forward.retried";
 
 /// One forward of `requests` to `owner`, within one liveness budget plus the measured round-trip tail of the path to
-/// it: the decoded reply to the first (`None` when nothing was sent, `Some(None)` when it went unanswered) and the
-/// decoded replies to the rest that came back, in order, up to the first that did not.
+/// it, queued at `place` in the owner's lane (the first send's, for a resend) and judged against `bound_at`, the
+/// failover bound on the wall from the first send (`crate::forward_lane`'s stall, A-315): the decoded reply to the
+/// first (`None` when nothing was sent, `Some(None)` when it went unanswered) and the decoded replies to the rest that
+/// came back, in order, up to the first that did not.
 async fn forward_once(
   owner: Option<HostId>,
   requests: &[Vec<u8>],
+  bound: &mut crate::forward_lane::FailoverBound,
+  place: &mut crate::forward_lane::Place,
 ) -> (Option<Option<ReplyBody>>, Vec<ReplyBody>) {
   let Some(owner) = owner else {
     return (None, Vec::new());
@@ -1788,6 +1829,8 @@ async fn forward_once(
     owner,
     requests,
     crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
+    bound,
+    place,
   )
   .await;
   if forwarded.is_none() {
@@ -1922,39 +1965,85 @@ enum WorkGreen {
 /// hold: refused `NotFound`, run nowhere (A-255).
 const WORK_GONE_HERE: &str = "fleet.owner_location.work_gone_here";
 
-/// The owner of `query`'s object, resolved again within the one liveness budget a forward allows for finding its owner:
-/// the direct route (the volume's creator while eligible) and then a location round, asked again every tenth of a
-/// heartbeat while the budget lasts. The requests are
-/// not sent until an owner is found, so a retry can never apply a verb twice. The owner can be briefly unfindable
-/// while it is live: the failure detector condemns a live member within its stated mistake allowance, the death is
-/// gossiped, and every node drops its routes and its link to that member until it refutes and is linked again
-/// (2026-10-08: a foreign node held a live successor dead that another node had condemned, 1 against an allowance of
-/// 4.9, and its client was refused `HomedElsewhere`). A takeover's adoption leaves the same window. Measured
+/// The owner of `query`'s object, resolved again for as long as the location budget allows: the direct route (the
+/// volume's creator while eligible) and then a location round, asked again every poll interval. The requests are not
+/// sent until an owner is found, so a retry can never apply a verb twice. The owner can be briefly unfindable while it
+/// is live: the failure detector condemns a live member within its stated mistake allowance, the death is gossiped,
+/// and every node drops its routes and its link to that member until it refutes and is linked again (2026-10-08: a
+/// foreign node held a live successor dead that another node had condemned, 1 against an allowance of 4.9, and its
+/// client was refused `HomedElsewhere`). A takeover's adoption leaves the same window. Measured
 /// (`a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, 10 false deaths per arm): without the
 /// retry every false death refused a call, and the next call 10 ms later was served after 22–217 ms; with location
 /// rounds alone, paced a heartbeat, 1 s and still refused; with the direct route first, paced a heartbeat, none refused
 /// and 111–224 ms; paced a tenth of a heartbeat, none refused and 21–218 ms. Each retry is counted
-/// (`fleet.owner_location.retried`); `None` once the budget is spent with no owner found.
+/// (`fleet.owner_location.retried`); `None` once the budget is spent with no owner found, counted by how it ended
+/// ([`LOCATION_SPENT`], [`LOCATION_SLO_ENDED`]) and in all ([`LOCATION_GAVE_UP`]).
+///
+/// The budget (A-317) is the membership horizon (`lease::horizon_ns`: the longest a live member can go unanswered
+/// before a detector declares it dead, the window in which a false death is gossiped and refuted; the supervisor's
+/// derivation of 2026-11-07), on the wall from the first look, and it ends only with a look begun after the horizon,
+/// which asks the direct route again once its round returns: a round waits on its peers while the shard runs its other
+/// work, so a refutation the shard read meanwhile is seen before the location gives up. Before, one liveness budget of
+/// wall time ran out on a control shard kept off its CPU while that gossip waited to be read (clients' runs, nice 19
+/// beside two spinners a CPU: 1 or 2 calls refused in every false death), and a single round waiting on silent peers
+/// spent it whole, so the location never looked again. Counted in polls (clients' `3c072f490`), a location whose
+/// rounds each wait a liveness budget on a silent peer ran to the failover SLO, ten times main's second; ended by the
+/// control shard's driver waits (A-292's rule), a busy shard, which rarely waits, held it to the SLO too (A-315 found
+/// the same on the forward lane). The operator's failover SLO caps the whole on the wall.
 async fn locate_within_budget(query: crate::owner_location::Query) -> Option<HostId> {
-  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
+  let located = locate_within_horizon(query).await;
+  if located.is_none() {
+    // Counted here, so any way the location gives up is seen; its budget's own two ends are counted within it.
+    crate::state::with_state(|state| state.count(LOCATION_GAVE_UP, 1));
+  }
+  located
+}
+
+/// [`locate_within_budget`]'s loop: a look every poll interval (the direct route, a round, and the direct route again,
+/// with what the shard read while the round waited), until an owner is found, a look begun after the membership
+/// horizon has found none, or the failover SLO has passed.
+async fn locate_within_horizon(query: crate::owner_location::Query) -> Option<HostId> {
+  let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+  let began = slates_rt::futures::now_ns();
+  let horizon = crate::lease::horizon_ns();
+  let ceiling = crate::state::with_state(|state| state.failover_ns).unwrap_or(horizon);
+  let known = || crate::state::with_state(|state| query.known_owner(state, None)).flatten();
   loop {
+    let look_began = slates_rt::futures::now_ns().saturating_sub(began);
     // The direct route first (the volume's creator, while eligible), as a fresh call would take it.
-    if let Some(owner) = crate::state::with_state(|state| query.known_owner(state, None)).flatten()
-    {
+    if let Some(owner) = known() {
       return Some(owner);
     }
     if let Ok(owner) = crate::owner_location::locate(query).await {
       return Some(owner);
     }
-    let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-    if slates_rt::futures::now_ns().saturating_add(pace) >= deadline
-      || slates_rt::futures::sleep(pace).await.is_err()
-    {
+    // The round waited on its peers while the shard ran its other work: a refutation read meanwhile is seen now.
+    if let Some(owner) = known() {
+      return Some(owner);
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= ceiling {
+      crate::state::with_state(|state| state.count(LOCATION_SLO_ENDED, 1));
+      return None;
+    }
+    if look_began >= horizon {
+      crate::state::with_state(|state| state.count(LOCATION_SPENT, 1));
+      return None;
+    }
+    if slates_rt::futures::sleep(pace).await.is_err() {
       return None;
     }
     crate::state::with_state(|state| state.count("fleet.owner_location.retried", 1));
   }
 }
+
+/// Counter: a forward's owner location ended by the operator's failover SLO, the owner still not found.
+const LOCATION_SLO_ENDED: &str = "fleet.owner_location.slo_ended";
+/// Counter: a forward's owner location spent its budget, a look begun past the membership horizon having found no
+/// owner.
+const LOCATION_SPENT: &str = "fleet.owner_location.budget_spent";
+/// Counter: a forward's owner location gave up with no owner found, for any reason: at most the budget's two ends,
+/// [`LOCATION_SLO_ENDED`] and [`LOCATION_SPENT`], when nothing gives up early (the shard stopping).
+const LOCATION_GAVE_UP: &str = "fleet.owner_location.gave_up";
 
 /// The refusal for a verb on a volume this node owns but has not materialized yet, asked on the control shard where
 /// the routing lives: the routing names this node the owner (it adopted the head in a takeover), yet the verb is being
@@ -1994,19 +2083,44 @@ impl OwnerReplies {
 
 /// The region and volume of a verb this node must send to another host of its own region (§4.8 "Lookup": a lookup
 /// by id routes to the volume's creator, or its successor after a takeover): a volume-scoped read or write that
-/// forwards safely, whose volume this shard's catalog does not hold, and whose id names another creator. Asked on
-/// the volume's owner shard — the one shard whose catalog would hold it — and only for a local client's verb, never
-/// one forwarded from another node, so a forward is one hop. A volume this node created and no longer holds stays
-/// `NotFound` (its successors after a same-id re-admission are GAP-A9-7's ledger transfer). A laptop never forwards:
-/// every volume it can name, it created.
+/// forwards safely, whose volume this node lost to a successor ([`lost_to_a_successor`]), or whose volume this shard's
+/// catalog does not hold and whose id names another creator. Asked on the volume's owner shard — the one shard whose
+/// catalog would hold it — and only for a local client's verb, never one forwarded from another node, so a forward is
+/// one hop. A volume this node created and holds no record of stays `NotFound`. A laptop never forwards: every volume it
+/// can name, it created.
 fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64, VolumeId)> {
   if !(is_forwardable_read(body) || is_forwardable_write(body)) {
     return None;
   }
   let volume = volume_of(body)?;
+  // A volume this shard records unrecovered is answered here, its refusal naming why: a boot recovery that could not
+  // rebuild it, or a takeover that gave it up (A-304, and the materialization's bounds). Forwarded, it met this node's
+  // own routing, which names this node its owner, and answered a retryable `Overloaded` for good on any fleet of more
+  // than one node (a lone node never forwards, which is where the give-ups were first proven).
+  if state.unrecovered.contains_key(&to_db_volume(volume)) {
+    return None;
+  }
   let host = state.fleet.host();
   let creator = ObjectId(volume.bytes).creator();
-  if creator == host || state.db.partition().volume(to_db_volume(volume)).is_some() {
+  let id = to_db_volume(volume);
+  let held = state.db.partition().volume(id).is_some();
+  // A volume a planned move took to another member (A-291) is that member's from the switch on, the routing following
+  // the configuration: its verbs go there, whether this node has let its copy go or still keeps it frozen until the
+  // move is adopted. A volume held here and not moving is served here, whatever the routing says.
+  // The move's own verb on a copy this node froze for it is answered here, from the move's own state (`Moved` once the
+  // routing follows the configuration to its target), whatever the target does after the switch: forwarded to a target
+  // that died before adopting, it was never answered at all.
+  let asks_its_own_move =
+    matches!(body, RequestBody::Move { .. }) && state.moves_out.contains_key(&id);
+  let moved_away = !asks_its_own_move
+    && state
+      .fleet
+      .object_owner(ObjectId(volume.bytes))
+      .is_some_and(|owner| owner != host)
+    && (!held || state.moves_out.contains_key(&id));
+  // A volume this node lost to a successor is the successor's, whoever created it and whatever this catalog still holds
+  // of it: its verbs go there, as any other node's do (`lost_to_a_successor`: A-338's fenced log, A-334's yield).
+  if !moved_away && !lost_to_a_successor(state, id) && (creator == host || held) {
     return None;
   }
   // Only another member can own it. A node alone (a laptop: the fleet of one) answers the verb here, `NotFound` for an
@@ -2023,11 +2137,19 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   Some((region.0, volume))
 }
 
+/// Whether this node lost volume `id` to a successor, so its verbs go to the successor and its copy here is never served
+/// as the volume (A-334, A-338): its live log was fenced at a later epoch by a holder that took a successor's takeover
+/// (`crate::live_ship::superseded`), or this shard yielded it when its host was admitted again under its id
+/// (`ShardState::yielded`, `crate::readmission`).
+pub(crate) fn lost_to_a_successor(state: &ShardState, id: DbVolumeId) -> bool {
+  state.yielded.contains(&id) || crate::live_ship::superseded(state, id)
+}
+
 /// A late lookup belongs to the original client generation. It cannot populate a reused slot's
 /// cache or deliver a predecessor's result to the client that now occupies that slot.
 /// Carries a forwarded verb's reply from the control shard to the client's shard `origin` and finishes it there
 /// ([`finish_owner_forward`]): at once on the same shard, else as a task sent home ([`crate::xshard::send_back`]).
-async fn deliver_owner_forward(
+fn deliver_owner_forward(
   origin: u16,
   control: u16,
   (client, request): (Handle<ClientSlot>, u64),
@@ -2043,8 +2165,7 @@ async fn deliver_owner_forward(
   }
   crate::xshard::send_reply_home(origin, move || {
     finish_owner_forward(client, request, reply, after);
-  })
-  .await;
+  });
 }
 
 fn finish_owner_forward(
@@ -2146,9 +2267,75 @@ fn serve_consensus_control(
   })
 }
 
+/// The verbs a client's channel answers itself, before any routing: its status, a consumer's attestation and revocation
+/// (§4.13), and a consumer's own write policy, set or read (A-285). `Break` with what was served; `Continue` with the
+/// request's body when it is none of them, for [`serve`] to route.
+fn serve_on_channel(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  request: &Request,
+  (client_id, principal): (u32, &Principal),
+  body: RequestBody,
+) -> std::ops::ControlFlow<Served, RequestBody> {
+  use std::ops::ControlFlow::{Break, Continue};
+  if let Some(reply) = status_on_channel(state, client, request.request, &body) {
+    return Break(reply);
+  }
+  if let RequestBody::Attest { consumer, proof } = body {
+    return Break(attest_on_channel(
+      state,
+      client.index(),
+      request.request,
+      client_id,
+      consumer,
+      proof,
+    ));
+  }
+  if let RequestBody::Revoke { consumer, proof } = body {
+    return Break(revoke_on_channel(
+      state,
+      (client.index(), request.request),
+      principal,
+      consumer,
+      proof,
+    ));
+  }
+  if let RequestBody::SetPolicy {
+    subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
+    policy,
+    version,
+    proof,
+  } = body
+  {
+    return Break(set_consumer_policy_on_channel(
+      state,
+      (client.index(), request.request),
+      principal,
+      (consumer, policy, version),
+      proof,
+    ));
+  }
+  if let RequestBody::Policy {
+    subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
+  } = body
+  {
+    return Break(consumer_policy_on_channel(
+      state,
+      (client.index(), request.request),
+      consumer,
+    ));
+  }
+  Continue(body)
+}
+
 /// Serves a client request: recover a previous completion or dispatch the operation to its owner
 /// shard. Scatter operations record their completion after every shard has answered.
-pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Request) -> Served {
+pub fn serve(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  request: &Request,
+  now: u64,
+) -> Served {
   let (client_id, principal) = match state.clients.get(client) {
     Ok(c) => (c.client_id, c.principal.clone()),
     Err(_) => return Served::Reply(refused(Refusal::NotFound)),
@@ -2164,6 +2351,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     shard: state.shard,
     client_index: client.index(),
     request: request.request,
+    through_work: false,
   });
   match state
     .db
@@ -2191,6 +2379,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
         || crate::lease_wait::join(state, origin, id)
+        || crate::work_home::join(state, origin, id)
       {
         return Served::Forwarded;
       }
@@ -2224,6 +2413,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       }
     }
   };
+  judge_loop_request(state, &body, now);
   // A channel bound to a consumer the human has since revoked refuses every effect (§4.13), before any
   // lookup or mutation, whatever the verb — one local read (the revocation was fanned to this slot).
   if state.clients.get(client).is_ok_and(|slot| slot.revoked) {
@@ -2235,27 +2425,21 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       refused(Refusal::ConsumerRevoked),
     ));
   }
-  if let Some(reply) = status_on_channel(state, client, request.request, &body) {
-    return reply;
+  let body = match serve_on_channel(state, client, request, (client_id, &principal), body) {
+    std::ops::ControlFlow::Continue(body) => body,
+    std::ops::ControlFlow::Break(served) => return served,
+  };
+  // A consumer's own write policy (A-285) holds its merges and landings here, before they are routed to the volume's
+  // owner, which then holds them to the volume's: the stricter of the two governs.
+  let body = match consumer_gate(state, client, body) {
+    Ok(body) => body,
+    Err(refusal) => return Served::Reply(record_completion(state, origin, id, refused(refusal))),
+  };
+  if let RequestBody::List { after } = body {
+    return scatter_list(state, client.index(), request.request, principal, after);
   }
-  if let RequestBody::Attest { consumer, proof } = body {
-    return attest_on_channel(
-      state,
-      client.index(),
-      request.request,
-      client_id,
-      consumer,
-      proof,
-    );
-  }
-  if let RequestBody::Revoke { consumer, proof } = body {
-    return revoke_on_channel(state, client.index(), request.request, consumer, proof);
-  }
-  if let RequestBody::List = body {
-    return scatter_list(state, client.index(), request.request, principal);
-  }
-  if let RequestBody::Grants = body {
-    return scatter_grants(state, client.index(), request.request, principal);
+  if let RequestBody::Grants { after } = body {
+    return scatter_grants(state, client.index(), request.request, principal, after);
   }
   if matches!(
     &body,
@@ -2315,9 +2499,14 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   }
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
+    // and answered there with no hop, and its name is held at the partition it hashes to, by an alias when that is
+    // another (A-236).
+    RequestBody::CreateWork { .. } => Some(state.partition),
     RequestBody::Detach { attachment }
     | RequestBody::Advance { attachment, .. }
-    | RequestBody::BindMount { attachment, .. } => Some(owner_of_attachment(*attachment)),
+    | RequestBody::BindMount { attachment, .. }
+    | RequestBody::Renew { attachment } => Some(owner_of_attachment(*attachment)),
     // A grant is served where its landing was presented: the volume's owner shard, which the landing id
     // names — not the client's shard, where nothing is awaiting. So is a presentation's entry list.
     RequestBody::Grant { landing, .. } | RequestBody::LandingEntries { landing, .. } => {
@@ -2325,6 +2514,8 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     }
     // A telemetry drain names its shard: it runs there, on that shard's own ring (§4.14).
     RequestBody::Telemetry { partition } => Some(*partition),
+    // The audit is one partition's, the control shard's (§4.15, A-265).
+    RequestBody::Audit { .. } => Some(crate::landing::AUDIT_PARTITION),
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -2366,7 +2557,7 @@ pub(crate) const FORWARDED_CLIENT: u32 = 0;
 /// flight on its ring, half its slots (the half `slates_client` acknowledges at), so a window replaces the round
 /// trips the client's own requests would have taken, and the origin's cache of it stays within what one client could
 /// already make it hold.
-fn read_window_bytes(state: &ShardState) -> u64 {
+pub(crate) fn read_window_bytes(state: &ShardState) -> u64 {
   crate::merge_service::page_room()
     .saturating_mul((u64::from(state.config.region.slots) / 2).max(1))
 }
@@ -2377,7 +2568,7 @@ fn read_window_bytes(state: &ShardState) -> u64 {
 /// `slots + slots / 2 + slots / 2`. Past it a new request is refused `AcknowledgementOwed`, never run or recorded,
 /// so a client that never acknowledges cannot grow a shard's records, and every snapshot that encodes them, without
 /// bound (RIFL, Lee et al., SOSP 2015, bounds its completion records the same way, by the client's acknowledgements).
-fn completion_bound(state: &ShardState) -> u64 {
+pub(crate) fn completion_bound(state: &ShardState) -> u64 {
   u64::from(state.config.region.slots).saturating_mul(2)
 }
 
@@ -2414,8 +2605,20 @@ fn serve_here(
   principal: Principal,
   body: RequestBody,
 ) -> Served {
+  // A mount of a volume this node lost to a successor is refused by its kind here, where the loss is known (A-334's
+  // sibling): the client's shard took the volume for this node's own, since this node created it.
+  if let Some(refusal) = crate::remote_attach::lost_attach(state, &body) {
+    return Served::Reply(record_completion(state, origin, id, refused(refusal)));
+  }
   // A volume another host of this region owns goes to it (§4.8 "Lookup"), before any completion is recorded here.
   if let Some((region, volume)) = owned_by_another_host(state, &body) {
+    // An attach of a volume this node lost is remembered with its client before it is sent, so the client's reap
+    // reaches the successor (A-222's rule, which the client's shard applies to another host's volume).
+    if crate::remote_attach::lost_record_attach(state, &body).is_some()
+      && let Err(refusal) = crate::remote_attach::remember_volume(state, client, volume)
+    {
+      return Served::Reply(record_completion(state, origin, id, refused(refusal)));
+    }
     return forward_to_owner(state, client, request, principal, region, volume, body);
   }
   if let Some(owed) = acknowledgement_owed(state, origin, id.client, &body) {
@@ -2433,6 +2636,24 @@ fn serve_here(
   }
 }
 
+/// The reply [`run_recorded`] gives, with its completion recorded in the verb's own transaction unless it has none yet:
+/// a `deferred` reply's completion follows the fleet commit or the live volume's durability it waits for, and a verb
+/// that never started (answered `Overloaded`) records none, so a resend under its id runs the verb.
+fn recorded_unless_deferred(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  deferred: bool,
+  reply: ReplyBody,
+) -> ReplyBody {
+  if deferred {
+    reply
+  } else if not_started(&reply) {
+    unrecorded_not_started(state, reply)
+  } else {
+    record_completion(state, origin, id, reply)
+  }
+}
+
 /// Runs a verb on this shard with its effects and its completion record in one durable step
 /// (`Db::begin` … `commit`: one log record, so a crash leaves both or neither, AC-2.3).
 fn run_recorded(
@@ -2443,6 +2664,11 @@ fn run_recorded(
   principal: &Principal,
   body: RequestBody,
 ) -> Option<ReplyBody> {
+  // A verb whose reply could be held for durability meets the held replies' bound before it runs, never after its
+  // effects commit (A-200; `live_ship::refuse_over_bound`).
+  if let Some(refusal) = crate::live_ship::refuse_over_bound(state, &body) {
+    return Some(refusal);
+  }
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
   // op-log record appended and published). Each opens *within* the span that caused it — `shard.op`
@@ -2491,11 +2717,7 @@ fn run_recorded(
   let (live_target, destroy_target) =
     replicated_waits(state, live_volume.filter(|_| !deferred), label, &reply);
   deferred |= live_target.is_some() || destroy_target.is_some();
-  let reply = if deferred {
-    reply
-  } else {
-    record_completion(state, origin, id, reply)
-  };
+  let reply = recorded_unless_deferred(state, (origin, id), deferred, reply);
   let append = state.tracer.open_within(
     &op.context(),
     Chokepoint::LogAppend,
@@ -2515,6 +2737,8 @@ fn run_recorded(
       refused(refusal)
     }
   };
+  // What the committed verb owed the audit goes to the control shard now, after its transaction (A-265).
+  crate::landing::send_owed_audit(state);
   let end_ns = state.clock.monotonic_ns();
   state.current_span = outer;
   let partition_label = u32::from(state.partition);
@@ -2528,7 +2752,8 @@ fn run_recorded(
   if let Some(destroy_target) = destroy_target
     && !matches!(reply, ReplyBody::Refused { .. })
   {
-    return crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+    crate::live_ship::defer_destroy(state, destroy_target, (origin, id), route, reply);
+    return None;
   }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
     return None;
@@ -2616,6 +2841,7 @@ fn run_forwarded(
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
         || crate::lease_wait::join(state, origin, id)
+        || crate::work_home::join(state, origin, id)
       {
         return None;
       }
@@ -2665,6 +2891,39 @@ fn status_on_channel(
   None
 }
 
+/// Format: the count of verbs answered `Overloaded` whose answer was left unrecorded, so a resend under the request's
+/// id runs the verb ([`not_started`]). Shown in `slates status`.
+const OVERLOADED_UNRECORDED: &str = "verb.overloaded_unrecorded";
+
+/// Whether `reply` says its verb was not started: `Overloaded`, which the protocol defines as "the request was not
+/// started and may be retried" under the same id (`slates_ipc::protocol::Refusal::Overloaded`; the client holds such an
+/// id for its resend, `slates_client::Client::begin_again`). Such a reply is never a completion (§4.9 RIFL): recorded,
+/// it was what every resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000
+/// clients"; `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`).
+fn not_started(reply: &ReplyBody) -> bool {
+  matches!(
+    reply,
+    ReplyBody::Refused {
+      refusal: Refusal::Overloaded { .. }
+    }
+  )
+}
+
+/// Answers a verb that was not started ([`not_started`]) without recording a completion, so the request's id stays
+/// unanswered and a resend under it runs the verb; counted by the refusal's name and [`OVERLOADED_UNRECORDED`]. Its
+/// transaction commits what the verb applied before refusing, which a resend meets as its own: nothing; the verb's
+/// undoing of what it began (`crate::shards::attach` ends the attachment it recorded when its stream's task cannot be
+/// spawned); or the write lease a FUSE or WinFsp mount took before its task, which the resend's attach renews as its
+/// holder's own ([`take_write_lease`]).
+fn unrecorded_not_started(state: &mut ShardState, reply: ReplyBody) -> ReplyBody {
+  state.served = state.served.saturating_add(1);
+  if let ReplyBody::Refused { refusal } = &reply {
+    state.count(refusal_name(refusal), 1);
+  }
+  state.count(OVERLOADED_UNRECORDED, 1);
+  reply
+}
+
 /// Records the completion (RIFL) and counts the refusal; the reply is then durable and may be
 /// sent. `origin` is the host whose client issued the request — this node's own host for a local client,
 /// the authenticated forwarding peer for a cross-node forwarded verb — so the completion key is globally
@@ -2675,6 +2934,17 @@ pub fn record_completion(
   id: RequestId,
   reply: ReplyBody,
 ) -> ReplyBody {
+  record_completion_routed(state, (origin, id), reply, None)
+}
+
+/// [`record_completion`], for a completion a green's successor adopted with `work`, the work whose submit it completes
+/// (A-288): the partition keeps the completion counted under the work while it retains it, which keeps the work's route.
+fn record_completion_routed(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  reply: ReplyBody,
+  work: Option<DbVolumeId>,
+) -> ReplyBody {
   let now = state.clock.monotonic_ns();
   let record = Op::CompletionRecorded {
     record: CompletionRecord {
@@ -2682,6 +2952,7 @@ pub fn record_completion(
       client: id.client,
       sequence: id.sequence,
       result: reply.to_bytes(),
+      work,
     },
   };
   if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
@@ -2702,6 +2973,52 @@ pub fn record_completion(
 
 /// Forwards a volume-bound request to its owner shard: a task there runs the verb on the
 /// owner's state and hands the reply back to this shard's queue (sharing by move both ways).
+/// Judges a request decoded at `now` against this shard's closed loop (§4.7; A-326). A request of the caller's own
+/// continues or ends the loop ([`loop_hold`]), its forward's hold set and its round's loop I/O marked. A client's
+/// acknowledgement, which it sends itself before a request every half ring of replies (§4.9), is the protocol's: it keeps
+/// a loop's clock running when it comes within F of the loop's last I/O and ends a loop it comes after a longer pause,
+/// but never lengthens a run or holds a shard. Skipped altogether, a debug build's acknowledgement ended the loop it
+/// sat in, the next create read more than F after the loop's last I/O (64 to 75 of a loop's 400 forwards unheld,
+/// against 20 to 31); counted as a request, it made a paced client's destroy the third request of a loop, which held
+/// its owner (closed_loop.rs, three runs each, the Mac Studio, 2026-11-18).
+fn judge_loop_request(state: &mut ShardState, body: &RequestBody, now: u64) {
+  if !matches!(body, RequestBody::Acknowledge { .. }) {
+    state.forward_hold_ns = loop_hold(state, now);
+    state.loop_io = true;
+  } else if now.saturating_sub(state.last_client_io_ns) <= crate::config::PROVISION_FLOOR_NS {
+    state.loop_io = true;
+  } else {
+    state.loop_run = 0;
+  }
+}
+
+/// Judges a ring request read at `now` (§4.7; A-326) and returns the idle window a forward made for it holds its owner
+/// open for. The request continues this shard's closed loop when it came within F of the end of the shard's last round
+/// of its clients' loop I/O (their requests read, the replies to them written, never an acknowledgement;
+/// `ShardState::last_client_io_ns`): its client sent it within F of its last reply, R9's closed loop (A-223's window
+/// rule). Its hold is the loop's revisit bound at
+/// R9's percentile (`DaemonConfig::closed_loop_hold_ns`), but never more cycles of 2F than the loop had already run
+/// before this request, so the spin a loop's end leaves on the shards it went round is at most what the loop itself
+/// took (the ski-rental bound, counted in the loop's own cycles). A request after a longer pause ends the loop and holds
+/// nothing, and neither does the first request after it: a paced client's create and its destroy hold no shard. The gap
+/// is read against the shard's client I/O, one clock read a round, so a shard busy with several clients counts their
+/// requests as one loop, and never against its background work, which kept going through a paced client's pause:
+/// judged against the shard's last work, a local destroy's slices made 1 to 3 of 24 paced cycles look like a loop's
+/// (`crates/server/tests/closed_loop.rs`, 2026-11-18). Stamped at a round's start instead of its client I/O's end, a
+/// debug build's round counted toward every think time and left 69 to 83 of a loop's 400 forwards unheld, against 22.
+/// A client's acknowledgement is judged apart ([`judge_loop_request`]).
+pub(crate) fn loop_hold(state: &mut ShardState, now: u64) -> u64 {
+  if now.saturating_sub(state.last_client_io_ns) > crate::config::PROVISION_FLOOR_NS {
+    state.loop_run = 0;
+    return 0;
+  }
+  let ran = state.loop_run;
+  state.loop_run = ran.saturating_add(1);
+  ran
+    .saturating_mul(crate::config::CLOSED_LOOP_CYCLE_NS)
+    .min(state.config.closed_loop_hold_ns)
+}
+
 fn forward(
   state: &mut ShardState,
   client_index: u32,
@@ -2714,6 +3031,8 @@ fn forward(
   // The `ring.request` span context of this slot read rides to the owner, so the verb's `shard.op` there
   // opens within it: one trace across the shard boundary, the cause named (§4.14).
   let cause = state.current_span;
+  // The idle window the owner holds open for the closed loop this request continues, 0 for none (A-326).
+  let hold_ns = state.forward_hold_ns;
   match send_forward(
     state.shard,
     client_index,
@@ -2722,7 +3041,7 @@ fn forward(
     &principal,
     &body,
     owner,
-    cause,
+    (cause, hold_ns),
   ) {
     Ok(()) => Served::Forwarded,
     Err(slates_rt::RtError::ControlFull { .. }) => {
@@ -2743,6 +3062,7 @@ fn forward(
         body,
         owner,
         cause,
+        hold_ns,
       });
       Served::Forwarded
     }
@@ -2751,7 +3071,8 @@ fn forward(
 }
 
 /// Spawns the owner's task for one forward; the reply comes back as a task on `origin`. `cause` is the
-/// origin's `ring.request` span context, the cause of the verb's `shard.op` on the owner (§4.14).
+/// origin's `ring.request` span context, the cause of the verb's `shard.op` on the owner (§4.14); `hold_ns` the idle
+/// window the owner holds open for the client's closed loop, 0 for none (`ShardState::forward_hold_ns`; A-326).
 #[allow(clippy::too_many_arguments)] // a forward's whole identity: where from, who, what, where to, and its cause
 fn send_forward(
   origin: u16,
@@ -2761,7 +3082,7 @@ fn send_forward(
   principal: &Principal,
   body: &RequestBody,
   owner: u16,
-  cause: Option<SpanContext>,
+  (cause, hold_ns): (Option<SpanContext>, u64),
 ) -> Result<(), slates_rt::RtError> {
   let principal = principal.clone();
   let body = body.clone();
@@ -2775,15 +3096,28 @@ fn send_forward(
   let task = SpawnRequest::new(
     Box::pin(async move {
       unstarted.started();
+      // The closed loop this forward was made for comes back to this shard only after going round the others: the
+      // owner holds its window for it (A-326).
+      if hold_ns > 0 {
+        slates_rt::registry::with_current(|ctx| ctx.hold_idle_window(hold_ns));
+      }
       let id = RequestId::from_word(request);
       let mut elsewhere = None;
+      let mut remember_first = None;
       let mut carried = None;
       let reply = crate::state::with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
+        // A mount of a volume this node lost to a successor is refused by its kind here, where the loss is known
+        // (A-334's sibling), its completion keyed as every same-node forward's is.
+        if let Some(refusal) = crate::remote_attach::lost_attach(s, &body) {
+          let anchor = s.origin_anchor.0;
+          return Some(record_completion(s, anchor, id, refused(refusal)));
+        }
         // A volume another host of this region owns goes to it (§4.8 "Lookup"), before any completion is
         // recorded here: from the control shard, which holds the fleet's sessions.
         if let Some((region, volume)) = owned_by_another_host(s, &body) {
           let control = s.shards.first().copied();
+          remember_first = crate::remote_attach::lost_record_attach(s, &body);
           elsewhere = Some((
             region,
             volume,
@@ -2797,6 +3131,7 @@ fn send_forward(
           shard: origin,
           client_index,
           request,
+          through_work: false,
         });
         // A same-node cross-shard forward serves a local client, so its completion keys on this node's stable
         // cert-anchor (the same id the local `serve` path uses — task #22), not the ephemeral member id.
@@ -2807,6 +3142,19 @@ fn send_forward(
       })
       .unwrap_or_else(|| Some(refused(Refusal::NotFound)));
       if let Some((region, volume, control, request_bytes)) = elsewhere {
+        // An attach of a volume this node lost is remembered with its client, on the client's shard where its slot is,
+        // and sent from there once it is, so the client's reap reaches the successor (A-222's rule; A-334's sibling).
+        if remember_first.is_some() {
+          crate::xshard::send_reply_home(origin, move || {
+            remember_then_forward(
+              (origin, control),
+              (client_index, client_id, request),
+              (region, volume),
+              request_bytes,
+            );
+          });
+          return;
+        }
         forward_for_local_client(
           origin,
           control,
@@ -2814,8 +3162,7 @@ fn send_forward(
           region,
           volume,
           request_bytes,
-        )
-        .await;
+        );
         return;
       }
       // A verb that deferred its reply to a fleet commit (AUD-11) answers through the merge plane, and one whose reply
@@ -2831,19 +3178,60 @@ fn send_forward(
           let _ = crate::state::with_state_counted(|s| keep_carried(s, request, carried));
         }
         crate::state::deliver(client_index, request, reply, true);
-      })
-      .await;
+      });
     }),
     None,
   );
   crate::xshard::send_owing(owner, task)
 }
 
+/// On the client's shard `origin`: remembers that the client at `client_index` (still the client `client_id`) attaches
+/// `volume`, a volume this node lost to a successor, at the successor (`remote_attach::remember_volume_at`), and then
+/// sends the attach there ([`forward_for_local_client`]), so it is never sent unremembered and the client's reap reaches
+/// it. Past the client's bound the attach is answered `RemoteAttachmentsFull`, recorded as its completion here, where
+/// the client's shard records A-222's own refusal of it; a shard whose state is out of reach answers it `Overloaded`,
+/// not started and not recorded.
+fn remember_then_forward(
+  (origin, control): (u16, Option<u16>),
+  (client_index, client_id, request): (u32, u32, u64),
+  (region, volume): (u64, VolumeId),
+  request_bytes: Vec<u8>,
+) {
+  let remembered = crate::state::with_state(|s| {
+    let refusal =
+      crate::remote_attach::remember_volume_at(s, (client_index, client_id), volume).err()?;
+    let anchor = s.origin_anchor.0;
+    Some(record_completion(
+      s,
+      anchor,
+      RequestId::from_word(request),
+      refused(refusal),
+    ))
+  });
+  match remembered {
+    Some(None) => forward_for_local_client(
+      origin,
+      control,
+      (client_index, request),
+      region,
+      volume,
+      request_bytes,
+    ),
+    Some(Some(reply)) => crate::state::deliver(client_index, request, reply, true),
+    None => crate::state::deliver(
+      client_index,
+      request,
+      refused(Refusal::Overloaded { shard: origin }),
+      true,
+    ),
+  }
+}
+
 /// Sends a local client's verb, run on its volume's owner shard here, to the volume's owner host over the fleet,
 /// from the control shard, and delivers the reply to the client's ring on `origin`. A control channel that refuses
 /// the task, or no control shard, answers `HomedElsewhere`, as an owner not found does. No route is cached: the
 /// client's slot lives on `origin`, and a cached route is only a hint.
-async fn forward_for_local_client(
+fn forward_for_local_client(
   origin: u16,
   control: Option<u16>,
   (client_index, request): (u32, u64),
@@ -2872,7 +3260,7 @@ async fn forward_for_local_client(
         let (replies, _) = resolve_and_forward(volume, region, None, vec![request_bytes]).await;
         crate::state::with_state_counted(|s| s.count(FORWARD_LOCAL_RESOLVED, 1));
         let reply = replies.first;
-        crate::xshard::send_reply_home(origin, deliver_home(reply)).await;
+        crate::xshard::send_reply_home(origin, deliver_home(reply));
       }),
       None,
     );
@@ -2884,7 +3272,7 @@ async fn forward_for_local_client(
     Some(Err((refusal, control))) => control_refusal(&refusal, control, region),
     None => Refusal::HomedElsewhere { region },
   };
-  crate::xshard::send_reply_home(origin, deliver_home(refused(refusal))).await;
+  crate::xshard::send_reply_home(origin, deliver_home(refused(refusal)));
 }
 
 /// Counts a local client's forward handed to the control shard (`handed`) or refused there.
@@ -2965,7 +3353,7 @@ fn retry_forwards(state: &mut ShardState) -> bool {
       &pending.principal,
       &pending.body,
       pending.owner,
-      pending.cause,
+      (pending.cause, pending.hold_ns),
     ) {
       Ok(()) => any = true,
       Err(slates_rt::RtError::ControlFull { .. }) => {
@@ -3036,6 +3424,7 @@ fn scatter_list(
   client_index: u32,
   request: u64,
   principal: Principal,
+  after: Option<VolumeId>,
 ) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -3043,29 +3432,23 @@ fn scatter_list(
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = match list(state, &principal) {
-    ReplyBody::Listed { volumes } => volumes,
-    other => return Served::Reply(other),
-  };
+  let mine = list_part(state, &principal, after);
   if others.is_empty() {
-    return Served::Reply(ReplyBody::Listed { volumes: mine });
+    return Served::Reply(list_page(vec![mine]));
   }
   state
     .scatters
-    .insert(request, (client_index, others.len(), mine));
+    .insert(request, (client_index, others.len(), vec![mine]));
   let origin = state.shard;
   for shard in others {
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = match crate::state::with_state(|s| list(s, &principal)) {
-          Some(ReplyBody::Listed { volumes }) => volumes,
-          _ => Vec::new(),
-        };
+        let part =
+          crate::state::with_state(|s| list_part(s, &principal, after)).unwrap_or_default();
         crate::xshard::send_reply_home(origin, move || {
           gather(request, part);
-        })
-        .await;
+        });
       }),
       None,
     );
@@ -3084,6 +3467,7 @@ fn scatter_grants(
   client_index: u32,
   request: u64,
   principal: Principal,
+  after: Option<u64>,
 ) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -3091,29 +3475,23 @@ fn scatter_grants(
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = match crate::landing::grants_verb(state, &principal) {
-    ReplyBody::Grants { grants } => grants,
-    other => return Served::Reply(other),
-  };
+  let mine = crate::landing::grants_part(state, &principal, after);
   if others.is_empty() {
-    return Served::Reply(ReplyBody::Grants { grants: mine });
+    return Served::Reply(crate::landing::grants_page(vec![mine]));
   }
   state
     .grant_scatters
-    .insert(request, (client_index, others.len(), mine));
+    .insert(request, (client_index, others.len(), vec![mine]));
   let origin = state.shard;
   for shard in others {
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = match crate::state::with_state(|s| crate::landing::grants_verb(s, &principal)) {
-          Some(ReplyBody::Grants { grants }) => grants,
-          _ => Vec::new(),
-        };
+        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after))
+          .unwrap_or_default();
         crate::xshard::send_reply_home(origin, move || {
           gather_grants(request, part);
-        })
-        .await;
+        });
       }),
       None,
     );
@@ -3124,12 +3502,11 @@ fn scatter_grants(
   Served::Forwarded
 }
 
-/// Folds one shard's part of a `grants` read into the scatter and, on the last part, delivers the merged
-/// grants in id order.
-fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
+/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page.
+fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary>) {
   let done = crate::state::with_state(|s| {
     let entry = s.grant_scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -3141,9 +3518,8 @@ fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
     }
   })
   .flatten();
-  if let Some(((client_index, _, mut grants), unsent)) = done {
-    grants.sort_by_key(|g| g.id);
-    let reply = unsent.unwrap_or(ReplyBody::Grants { grants });
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| crate::landing::grants_page(parts));
     crate::state::deliver(client_index, request, reply, false);
   }
 }
@@ -3171,8 +3547,7 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
         let part = crate::state::with_state(shard_report);
         crate::xshard::send_reply_home(origin, move || {
           gather_status(request, part);
-        })
-        .await;
+        });
       }),
       None,
     );
@@ -3304,7 +3679,7 @@ fn settle_gone(state: &mut ShardState, kind: ScatterKind, request: u64) {
 
 /// Counts one part of a scatter in `table` down; its client slot when that was the last part (the entry is gone).
 fn count_down<T>(
-  table: &mut std::collections::BTreeMap<u64, (u32, usize, Vec<T>)>,
+  table: &mut std::collections::BTreeMap<u64, (u32, usize, T)>,
   request: u64,
 ) -> Option<u32> {
   let entry = table.get_mut(&request)?;
@@ -3385,8 +3760,7 @@ fn scatter_acknowledge(
           .unwrap_or_else(|| refused(Refusal::NotFound));
         crate::xshard::send_reply_home(origin, move || {
           crate::state::with_state_counted(|s| release_part_back(s, request, &part));
-        })
-        .await;
+        });
       }),
       None,
     );
@@ -3549,6 +3923,19 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             crate::xshard::run_refused(),
           ),
           (
+            crate::xshard::ROOM_WAITS_STARTED,
+            crate::xshard::room_waits().started,
+          ),
+          (
+            crate::xshard::ROOM_WAITS_ENDED,
+            crate::xshard::room_waits().ended,
+          ),
+          (
+            crate::xshard::ROOM_WAITS_PEAK,
+            crate::xshard::room_waits().peak,
+          ),
+          (crate::xshard::KEEP_REFUSED, crate::xshard::keep_refused()),
+          (
             crate::fleet::SERVE_RECEIVE_EARLIER_SEND,
             demux_sum(state, |c| c.receive_refused_earlier_send),
           ),
@@ -3559,6 +3946,39 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
           (
             crate::fleet::SERVE_RECEIVE_OTHER,
             demux_sum(state, |c| c.receive_refused_other),
+          ),
+          (crate::fleet::SERVE_OPENED, demux_sum(state, |c| c.opened)),
+          (
+            crate::fleet::SERVE_SETUP_REFUSED,
+            demux_sum(state, |c| c.setup_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEER_SESSIONS_REFUSED,
+            demux_sum(state, |c| c.peer_sessions_refused),
+          ),
+          (
+            crate::fleet::SERVE_PEERS_REFUSED,
+            demux_sum(state, |c| c.peers_refused),
+          ),
+          (
+            crate::fleet::SERVE_HIGH_WATER,
+            demux_sum(state, |c| c.high_water),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_DIALING,
+            crate::fleet::record_dials_dialing(state),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_CALL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.call_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_LONGEST_ENROLL_MS,
+            crate::fleet::record_dials_longest_ms(state, |dial| dial.enroll_since_ns),
+          ),
+          (
+            crate::fleet::DIAL_RECORD_CALLS,
+            crate::fleet::record_dials_calls(state),
           ),
         ]
         .into_iter()
@@ -3635,6 +4055,24 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     } else {
       slates_ipc::protocol::LearnerReport::default()
     },
+    failover: failover_report(state),
+  }
+}
+
+/// This shard's failover estimate as the wire carries it (A-363): live on the control shard, which runs the
+/// coordinator that refreshes it; every other shard's, and a laptop's, is the recovery prior alone.
+fn failover_report(state: &ShardState) -> slates_ipc::protocol::FailoverReport {
+  let estimate = state.failover.estimate();
+  let recovery = state.failover.recovery();
+  slates_ipc::protocol::FailoverReport {
+    total_ns: estimate.total_ns(),
+    detection_ns: estimate.detection.map_or(0, |term| term.ns),
+    detection_samples: estimate.detection.map_or(0, |term| term.samples),
+    confirmation_ns: estimate.confirmation.map_or(0, |term| term.ns),
+    confirmation_samples: estimate.confirmation.map_or(0, |term| term.samples),
+    recovery_ns: estimate.recovery.ns,
+    takeovers_timed: recovery.takeovers().samples(),
+    volumes_timed: recovery.volumes().samples(),
   }
 }
 
@@ -3834,6 +4272,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
       .iter()
       .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_unmeshed)),
     learner: control.map_or_else(|| learner_report(state), |shard| shard.learner),
+    failover: control.map_or_else(|| failover_report(state), |shard| shard.failover),
   }
 }
 
@@ -3854,20 +4293,27 @@ fn demux_sum(
 /// every shard's part.
 fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody {
   let now = state.clock.monotonic_ns();
-  let (generation, restarts, heartbeat_age_ns, anchor_hold_refusals, anchor_log_lines_refused) =
-    state
-      .segment
-      .supervision()
-      .map(|s| {
-        (
-          s.generation(),
-          s.restarts(),
-          now.saturating_sub(s.heartbeat_ns()),
-          s.hold_refusals(),
-          s.log_refusals(),
-        )
-      })
-      .unwrap_or((0, 0, 0, 0, 0));
+  let (
+    generation,
+    restarts,
+    heartbeat_age_ns,
+    anchor_hold_refusals,
+    anchor_log_lines_refused,
+    recovered,
+  ) = state
+    .segment
+    .supervision()
+    .map(|s| {
+      (
+        s.generation(),
+        s.restarts(),
+        now.saturating_sub(s.heartbeat_ns()),
+        s.hold_refusals(),
+        s.log_refusals(),
+        s.recovered_since().is_some(),
+      )
+    })
+    .unwrap_or((0, 0, 0, 0, 0, false));
   let fleet = fleet_report(state, &shards);
   // The node's recipient lives on the control shard: its part carries the id, whichever shard answers.
   let control_recipient = shards
@@ -3891,6 +4337,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       anchor_log_lines_refused,
       dumps_local_full: crate::local_dumps::full(),
       anchor: state.origin_anchor.0,
+      recovered,
     }),
   }
 }
@@ -3909,10 +4356,10 @@ fn seal_report(state: &ShardState, recipient_id: Vec<u8>) -> slates_ipc::protoco
 }
 
 /// One shard's part of a listing arrives at the origin; the last part completes the reply.
-fn gather(request: u64, part: Vec<VolumeSummary>) {
+fn gather(request: u64, part: ListPart) {
   let done = crate::state::with_state(|s| {
     let entry = s.scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -3924,9 +4371,8 @@ fn gather(request: u64, part: Vec<VolumeSummary>) {
     }
   })
   .flatten();
-  if let Some(((client_index, _, mut volumes), unsent)) = done {
-    volumes.sort_by(|a, b| a.name.cmp(&b.name));
-    let reply = unsent.unwrap_or(ReplyBody::Listed { volumes });
+  if let Some(((client_index, _, parts), unsent)) = done {
+    let reply = unsent.unwrap_or_else(|| list_page(parts));
     crate::state::deliver(client_index, request, reply, false);
   }
 }
@@ -3973,6 +4419,15 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::TableAtCapacity { .. } => "table_at_capacity",
     Refusal::NotRecovered { .. } => "not_recovered",
     Refusal::NotShared { .. } => "not_shared",
+    Refusal::PolicyForbids { .. } => "policy_forbids",
+    Refusal::PolicyChanged { .. } => "policy_changed",
+    Refusal::SignatureRequired { .. } => "signature_required",
+    Refusal::Volume { .. } => "volume",
+    Refusal::Database { .. } => "database",
+    Refusal::Target { .. } => "target",
+    Refusal::DurabilityPending { .. } => "durability_pending",
+    Refusal::VerdictReplaced { .. } => "verdict_replaced",
+    Refusal::MoveRefused { .. } => "move_refused",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -4016,7 +4471,11 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::Clone { .. }
       | RequestBody::Snapshot { .. }
       | RequestBody::Submit { .. }
+      | RequestBody::SubmitApproved { .. }
       | RequestBody::EditSubmit { .. }
+      | RequestBody::EditSubmitHeld { .. }
+      | RequestBody::SubmitHeld { .. }
+      | RequestBody::SubmitSigned { .. }
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
   )
@@ -4060,6 +4519,69 @@ fn lease_gate(
   LeaseGate::Answer(refused(Refusal::LeaseUnconfirmed { version }))
 }
 
+/// Counter: verbs refused `Overloaded` because their volume is frozen for a planned move (A-291).
+/// Format: a counter name in the daemon's status report.
+const MOVE_FROZEN: &str = "fleet.move.frozen_refused";
+
+/// The answer to a verb on a volume frozen for a planned move (A-291), or none for any other: a frozen volume answers
+/// only its status and the move itself until it leaves or thaws; every other verb is told to come back (retryable,
+/// counted), and once the volume has left it forwards to its new owner.
+fn frozen_for_a_move(state: &mut ShardState, body: &RequestBody) -> Option<ReplyBody> {
+  let volume = volume_of(body)?;
+  if !crate::moves::frozen(state, volume)
+    || matches!(body, RequestBody::Status { .. } | RequestBody::Move { .. })
+  {
+    return None;
+  }
+  state.count(MOVE_FROZEN, 1);
+  Some(refused(Refusal::Overloaded { shard: state.shard }))
+}
+
+/// The gates a verb passes before it runs: its volume not frozen for a planned move (A-291), the owner's lease, and for
+/// a work whose green lives on another shard its owner for a base or a verdict (A-247): the verb is parked until the
+/// answer comes, and its later verbs park behind it (`crate::work_home`).
+fn gates(
+  state: &mut ShardState,
+  client_id: u32,
+  principal: &Principal,
+  body: RequestBody,
+) -> LeaseGate {
+  // A volume frozen for a planned move answers only its status and the move itself (A-291).
+  if let Some(come_back) = frozen_for_a_move(state, &body) {
+    return LeaseGate::Answer(come_back);
+  }
+  let body = match lease_gate(state, client_id, principal, body) {
+    LeaseGate::Run(body) => body,
+    answered @ LeaseGate::Answer(_) => return answered,
+  };
+  match crate::work_home::gate(state, client_id, principal, body) {
+    crate::work_home::Gate::Run(body) => LeaseGate::Run(body),
+    crate::work_home::Gate::Answer(reply) => LeaseGate::Answer(reply),
+  }
+}
+
+/// The gate a green's recovery puts on a verb that touches it: `Err` with the answer when the verb is not run, else `Ok`
+/// with the fenced green an admin's `Destroy` of it releases. A fenced green (AUD-29-18) is never served: its recovered
+/// history is not what was acknowledged. The one verb it takes is an admin's `Destroy` — the reviewed release; its
+/// durable log is the evidence until then. A green a restarted successor holds by adoption is not served until the boot
+/// has rebuilt its engine from this node's ledger (A-333): the request was not started and may be retried.
+fn green_recovery_gate(
+  state: &mut ShardState,
+  touched: Option<DbVolumeId>,
+  body: &RequestBody,
+) -> Result<Option<DbVolumeId>, ReplyBody> {
+  let fenced = touched.filter(|volume| state.fenced_greens.contains_key(volume));
+  if fenced.is_some() && !matches!(body, RequestBody::Destroy { .. }) {
+    state.count(GREEN_FENCED, 1);
+    return Err(refused(Refusal::ContentUnavailable));
+  }
+  if touched.is_some_and(|volume| state.merge.awaiting_adoption.contains_key(&volume)) {
+    state.count(GREEN_AWAITING_ADOPTION_REFUSED, 1);
+    return Err(refused(Refusal::Overloaded { shard: state.shard }));
+  }
+  Ok(fenced)
+}
+
 pub(crate) fn dispatch(
   state: &mut ShardState,
   client_id: u32,
@@ -4067,8 +4589,8 @@ pub(crate) fn dispatch(
   body: RequestBody,
 ) -> ReplyBody {
   let republish = mutates_shard_image(&body);
-  if republish && !state.consensus_ready {
-    return refused(Refusal::ConsensusNotInitialized);
+  if let Some(refusal) = refused_before_dispatch(state, &body, republish) {
+    return refused(refusal);
   }
   let touched = volume_of(&body).map(to_db_volume);
   // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): a read of an owned object's **latest state** —
@@ -4089,7 +4611,7 @@ pub(crate) fn dispatch(
   //
   // An unconfirmed lease is usually a confirmation in flight, so the verb is parked until it confirms or the
   // lease bound passes (`crate::lease_wait`), not refused at once; refused only when it cannot be parked.
-  let body = match lease_gate(state, client_id, principal, body) {
+  let body = match gates(state, client_id, principal, body) {
     LeaseGate::Run(body) => body,
     LeaseGate::Answer(reply) => return reply,
   };
@@ -4107,14 +4629,10 @@ pub(crate) fn dispatch(
       coincident_failures: shortfall.coincident_failures,
     });
   }
-  // A fenced green (AUD-29-18) is never served: its recovered history is not what was acknowledged. The one
-  // verb it takes is an admin's `Destroy` — the reviewed release; its durable log is the evidence until then.
-  let fenced = touched.filter(|volume| state.fenced_greens.contains_key(volume));
-  let destroying = matches!(body, RequestBody::Destroy { .. });
-  if fenced.is_some() && !destroying {
-    state.count(GREEN_FENCED, 1);
-    return refused(Refusal::ContentUnavailable);
-  }
+  let fenced = match green_recovery_gate(state, touched, &body) {
+    Ok(fenced) => fenced,
+    Err(reply) => return reply,
+  };
   let reply = dispatch_inner(state, client_id, principal, body);
   if let Some(volume) = fenced
     && matches!(reply, ReplyBody::Destroyed)
@@ -4168,6 +4686,8 @@ fn dispatch_inner(
       base.as_deref(),
     ),
     RequestBody::Snapshot { volume } => snapshot(state, principal, volume),
+    RequestBody::Move { volume, to } => crate::moves::move_verb(state, principal, volume, to),
+    RequestBody::CaptureBase { volume } => capture_base(state, principal, volume),
     RequestBody::DestroySnapshot { volume, snapshot } => {
       destroy_snapshot_verb(state, principal, volume, snapshot)
     }
@@ -4177,7 +4697,11 @@ fn dispatch_inner(
       base,
     } => create_green(state, principal, &name, require_evidence, base),
     RequestBody::Versions { green } => versions(state, principal, green),
-    RequestBody::ChangedSince { green, version } => changed_since(state, principal, green, version),
+    RequestBody::ChangedSince {
+      green,
+      version,
+      from,
+    } => changed_since(state, principal, green, version, from),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
     RequestBody::Edit {
       work,
@@ -4187,7 +4711,33 @@ fn dispatch_inner(
       bytes,
     } => edit(state, principal, work, &path, at, delete_len, &bytes),
     RequestBody::Declare { work, op } => declare(state, principal, work, op),
-    RequestBody::Submit { work, evidence } => submit(state, principal, work, evidence),
+    RequestBody::Submit { work, evidence } => {
+      submit(state, principal, work, (evidence, None), Approval::None)
+    }
+    RequestBody::SubmitSigned {
+      work,
+      evidence,
+      signature,
+    } => submit(
+      state,
+      principal,
+      work,
+      (evidence, Some(signature)),
+      Approval::None,
+    ),
+    RequestBody::SubmitApproved {
+      work,
+      evidence,
+      identity,
+      proof,
+      signature,
+    } => submit_approved(
+      state,
+      principal,
+      (work, evidence, signature),
+      identity,
+      proof,
+    ),
     RequestBody::EditSubmit {
       work,
       path,
@@ -4205,16 +4755,52 @@ fn dispatch_inner(
         delete_len,
         insert,
       },
-      evidence,
+      (evidence, false),
     ),
+    RequestBody::EditSubmitHeld {
+      work,
+      path,
+      at,
+      delete_len,
+      insert,
+      evidence,
+    } => edit_and_submit(
+      state,
+      principal,
+      work,
+      Splice {
+        path: &path,
+        at,
+        delete_len,
+        insert,
+      },
+      (evidence, true),
+    ),
+    RequestBody::SubmitHeld {
+      work,
+      evidence,
+      signature,
+    } => submit(
+      state,
+      principal,
+      work,
+      (evidence, signature),
+      Approval::Held,
+    ),
+    RequestBody::SetSigners {
+      volume,
+      keys,
+      version,
+      proof,
+    } => crate::landing::set_signers_verb(state, principal, (volume, keys, version), proof),
+    RequestBody::MergeRecord { green, version } => {
+      crate::merge_service::merge_record_verb(state, principal, green, version)
+    }
     RequestBody::Rebase { work } => rebase(state, principal, work),
     RequestBody::Advance {
       attachment,
       version,
     } => crate::merge_service::advance(state, principal, attachment, version),
-    RequestBody::Read { volume, path, at } => {
-      crate::merge_service::read(state, principal, volume, &path, at)
-    }
     RequestBody::MapRead { volume, path, at } => {
       crate::direct_map::map_read(state, client_id, principal, volume, &path, at)
     }
@@ -4242,6 +4828,10 @@ fn dispatch_inner(
       pid,
       handle,
     } => crate::shards::add_holder(state, to_db_volume(volume), attachment, (pid, handle)),
+    // Retired (A-267): a whole file in one reply; a file is read a page at a time.
+    RequestBody::Read { .. } => refused(Refusal::Unsupported {
+      feature: RETIRED_WHOLE_READ.to_owned(),
+    }),
     RequestBody::ReadRange {
       volume,
       path,
@@ -4313,6 +4903,7 @@ fn dispatch_inner(
       form,
     } => attach(state, client_id, principal, volume, snapshot, intent, form),
     RequestBody::Detach { attachment } => detach(state, principal, attachment),
+    RequestBody::Renew { attachment } => renew(state, principal, attachment),
     RequestBody::DetachOf { volume, attachment } => {
       detach_of(state, principal, Some(volume), attachment)
     }
@@ -4327,7 +4918,13 @@ fn dispatch_inner(
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
-    RequestBody::List => list(state, principal),
+    RequestBody::Drifted { volume, after } => drifted(state, principal, volume, after),
+    RequestBody::Conflicts {
+      work,
+      verdict,
+      from,
+    } => conflicts(state, principal, work, verdict, from),
+    RequestBody::List { after } => list_page(vec![list_part(state, principal, after)]),
     RequestBody::DaemonStatus => {
       let mine = shard_report(state);
       daemon_report(state, vec![mine])
@@ -4351,6 +4948,7 @@ fn dispatch_inner(
       target,
       filter,
       grant,
+      signature,
     } => crate::landing::land_verb(
       state,
       client_id,
@@ -4361,6 +4959,28 @@ fn dispatch_inner(
         target: &target,
         filter: &filter,
         grant,
+        present_only: false,
+        signature: signature.as_deref(),
+      },
+    ),
+    RequestBody::Present {
+      volume,
+      snapshot,
+      target,
+      filter,
+      signature,
+    } => crate::landing::land_verb(
+      state,
+      client_id,
+      principal,
+      crate::landing::LandCall {
+        volume,
+        snapshot,
+        target: &target,
+        filter: &filter,
+        grant: None,
+        present_only: true,
+        signature: signature.as_deref(),
       },
     ),
     RequestBody::FsWrite {
@@ -4421,10 +5041,16 @@ fn dispatch_inner(
       (volume, attachment),
       crate::fs_verbs::FsOp::Mkdir { path: &path, mode },
     ),
-    RequestBody::Grants => crate::landing::grants_verb(state, principal),
+    RequestBody::Grants { after } => {
+      crate::landing::grants_page(vec![crate::landing::grants_part(state, principal, after)])
+    }
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to, owed } => acknowledge(state, client_id, up_to, &owed),
-    RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
+    RequestBody::ReadBase {
+      volume,
+      path,
+      offset,
+    } => read_base(state, principal, volume, &path, offset),
     RequestBody::Digest { volume, path } => digest(state, principal, volume, &path),
     RequestBody::Rewitness { volume, paths } => {
       rewitness(state, principal, volume, paths.as_deref())
@@ -4437,7 +5063,14 @@ fn dispatch_inner(
       term_ns,
       proof,
     } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
-    RequestBody::Enroll { account, proof } => enroll(state, account, proof),
+    RequestBody::Enroll { account, proof } => enroll(state, principal, account, proof),
+    RequestBody::SetPolicy {
+      subject,
+      policy,
+      version,
+      proof,
+    } => crate::landing::set_policy_verb(state, principal, (subject, policy, version), proof),
+    RequestBody::Policy { subject } => crate::landing::policy_verb(state, subject),
     RequestBody::Share {
       volume,
       principal: subject,
@@ -4458,10 +5091,25 @@ fn dispatch_inner(
 /// verifies, a consumer id and a secret capability are minted, the hash of the capability is recorded
 /// durably (never the capability), and the capability is returned once for the human to deliver to the
 /// workload through the trusted harness. Refused `GrantIssuerUnverified` — counted — when the proof does
-/// not verify: an agent cannot enroll itself.
-fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody {
-  let expected = crate::landing::enroll_proof(&state.issuer_secret, account);
-  if !crate::landing::constant_time_eq(&expected, &proof) {
+/// not verify: an agent cannot enroll itself. Refused `Forbidden` — counted `enroll_by_consumer` — on a channel bound
+/// to a consumer, before anything else and whatever its proof (A-285): the launcher's authority is the instance's
+/// issuer, which an agent's consumer channel never holds, so a leaked proof cannot mint the agent a second consumer
+/// outside its own write policy.
+fn enroll(
+  state: &mut ShardState,
+  principal: &Principal,
+  account: u32,
+  proof: Capability,
+) -> ReplyBody {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("enroll_by_consumer", 1);
+    return forbidden("enroll");
+  }
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::enroll_proof(secret, account),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return refused(Refusal::GrantIssuerUnverified);
   }
@@ -4479,6 +5127,8 @@ fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody 
     account,
     secret,
     revoked: false,
+    write: None,
+    write_version: 0,
   };
   let now = state.clock.monotonic_ns();
   match state
@@ -4488,6 +5138,267 @@ fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody 
     Ok(_) => ReplyBody::Enrolled { consumer, secret },
     Err(e) => refused(refusal_of_db(&e)),
   }
+}
+
+/// Holds a consumer's channel to its own write policy (A-285): a landing with no grant is refused under a forbidding
+/// land mode and answered with its presentation under an asking one (`Present`); a merge is refused under a forbidding
+/// merge mode and held for approval under an asking one (`SubmitHeld`, `EditSubmitHeld`); a bypass mode passes the
+/// request as it came, so the volume's own policy decides. Any other request, and an account's channel, pass.
+fn consumer_gate(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  body: RequestBody,
+) -> Result<RequestBody, Refusal> {
+  use slates_db::catalog::WriteMode;
+  use slates_ipc::protocol::{PolicySubject, WriteAct};
+  let Some((consumer, policy)) =
+    state
+      .clients
+      .get(client)
+      .ok()
+      .and_then(|slot| match (&slot.principal, slot.consumer_policy) {
+        (Principal::Consumer { consumer, .. }, Some(policy)) => Some((*consumer, policy)),
+        _ => None,
+      })
+  else {
+    return Ok(body);
+  };
+  let forbids = |act| Refusal::PolicyForbids {
+    act,
+    by: PolicySubject::Consumer { consumer },
+  };
+  match body {
+    RequestBody::Land {
+      volume,
+      snapshot,
+      target,
+      filter,
+      grant: None,
+      signature,
+    } => match policy.land {
+      WriteMode::Forbid => {
+        state.count("policy_forbids.land", 1);
+        Err(forbids(WriteAct::Land))
+      }
+      // A signed landing is presented as an unsigned one is, its signature judged for the approval request (A-321).
+      WriteMode::Ask => Ok(RequestBody::Present {
+        volume,
+        snapshot,
+        target,
+        filter,
+        signature,
+      }),
+      WriteMode::Bypass => Ok(RequestBody::Land {
+        volume,
+        snapshot,
+        target,
+        filter,
+        grant: None,
+        signature,
+      }),
+    },
+    RequestBody::Submit { .. }
+    | RequestBody::SubmitSigned { .. }
+    | RequestBody::EditSubmit { .. }
+      if policy.merge == WriteMode::Forbid =>
+    {
+      state.count("policy_forbids.merge", 1);
+      Err(forbids(WriteAct::Merge))
+    }
+    RequestBody::Submit { work, evidence } if policy.merge == WriteMode::Ask => {
+      Ok(RequestBody::SubmitHeld {
+        work,
+        evidence,
+        signature: None,
+      })
+    }
+    // A signed merge is held as an unsigned one is, its signature kept for the approval request (A-321).
+    RequestBody::SubmitSigned {
+      work,
+      evidence,
+      signature,
+    } if policy.merge == WriteMode::Ask => Ok(RequestBody::SubmitHeld {
+      work,
+      evidence,
+      signature: Some(signature),
+    }),
+    RequestBody::EditSubmit {
+      work,
+      path,
+      at,
+      delete_len,
+      insert,
+      evidence,
+    } if policy.merge == WriteMode::Ask => Ok(RequestBody::EditSubmitHeld {
+      work,
+      path,
+      at,
+      delete_len,
+      insert,
+      evidence,
+    }),
+    other => Ok(other),
+  }
+}
+
+/// Sets a consumer's write policy (A-285), served on the channel as a revocation is: refused `Forbidden` for a consumer
+/// principal whatever its proof, `GrantIssuerUnverified` without the launcher's proof; then, as a task, recorded on the
+/// partition the consumer id names (refused `PolicyChanged` from a version the policy has moved past), and set on every
+/// shard's slots bound to the consumer before it answers, so the agent's very next request is held to it.
+fn set_consumer_policy_on_channel(
+  state: &mut ShardState,
+  (client_index, request): (u32, u64),
+  principal: &Principal,
+  (consumer, policy, version): (u64, slates_ipc::protocol::WritePolicy, u64),
+  proof: [u8; 32],
+) -> Served {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("policy_set_by_consumer", 1);
+    return Served::Reply(forbidden("set_policy"));
+  }
+  let subject = slates_ipc::protocol::PolicySubject::Consumer { consumer };
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::policy_proof(secret, &subject, &policy, version),
+    &proof,
+  ) {
+    state.count("grant_issuer_unverified", 1);
+    return Served::Reply(refused(Refusal::GrantIssuerUnverified));
+  }
+  // Signed merges are a volume's requirement (A-321): what a green accepts, or what a work's merges must carry, judged
+  // where the merge's verdict is, which holds both volumes' records and neither session's. A launcher holds an agent to
+  // it by setting it on the agent's work; a consumer's policy is refused it, rather than keep a rule nothing reads.
+  if policy.require_signed_merges {
+    return Served::Reply(refused(Refusal::BadRequest {
+      reason: "signed merges are required by a volume's policy, not a consumer's".to_owned(),
+    }));
+  }
+  let origin = state.shard;
+  let Some(owner) = shard_of_partition(state, owner_of_consumer(consumer)) else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  let shards = state.shards.clone();
+  let recorded = crate::landing::db_policy(policy);
+  let task = slates_rt::futures::spawn(async move {
+    let reply =
+      set_consumer_policy_everywhere(origin, owner, &shards, (consumer, recorded, version)).await;
+    crate::state::deliver(client_index, request, reply, false);
+  });
+  let Ok(task) = task else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  // Freshly admitted on this shard, with no await before detaching: the slot is still live.
+  let _ = slates_rt::futures::detach(task);
+  Served::Forwarded
+}
+
+/// The consumer policy's two bounded steps, as a revocation's: the durable record on `owner`, then every shard's bound
+/// slots. Each call is waited for in its target's own time, up to the liveness budget of its CPU; one that does not
+/// answer refuses `NotFound`, and the record, if written, stands for the retry.
+async fn set_consumer_policy_everywhere(
+  origin: u16,
+  owner: u16,
+  shards: &[u16],
+  (consumer, policy, version): (u64, slates_db::catalog::WritePolicy, u64),
+) -> ReplyBody {
+  let recorded = crate::xshard::call_in_shard_time(
+    origin,
+    owner,
+    move |s| {
+      let current = s
+        .db
+        .partition()
+        .consumer(consumer)
+        .ok_or(Refusal::NotFound)?
+        .write_version;
+      if current != version {
+        s.count("policy_changed", 1);
+        return Err(Refusal::PolicyChanged { current });
+      }
+      let now = s.clock.monotonic_ns();
+      s.db
+        .mutate(
+          &mut s.segment,
+          &Op::ConsumerWritePolicySet { consumer, policy },
+          now,
+        )
+        .map(|_| ())
+        .map_err(|e| refusal_of_db(&e))
+    },
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await;
+  match recorded {
+    None => return refused(Refusal::NotFound),
+    Some(Err(refusal)) => return refused(refusal),
+    Some(Ok(())) => {}
+  }
+  for shard in shards.iter().copied() {
+    let marked = crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |s| {
+        let bound: Vec<Handle<ClientSlot>> = s
+          .clients
+          .iter()
+          .filter(|(_, slot)| matches!(slot.principal, Principal::Consumer { consumer: c, .. } if c == consumer))
+          .map(|(h, _)| h)
+          .collect();
+        for handle in bound {
+          if let Ok(slot) = s.clients.get_mut(handle) {
+            slot.consumer_policy = Some(policy);
+          }
+        }
+      },
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    if marked.is_none() {
+      return refused(Refusal::NotFound);
+    }
+  }
+  ReplyBody::PolicySet
+}
+
+/// Reads a consumer's write policy and its version (A-285), served on the channel as a task: the record lives on the
+/// partition the consumer id names.
+fn consumer_policy_on_channel(
+  state: &mut ShardState,
+  (client_index, request): (u32, u64),
+  consumer: u64,
+) -> Served {
+  let origin = state.shard;
+  let Some(owner) = shard_of_partition(state, owner_of_consumer(consumer)) else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  let task = slates_rt::futures::spawn(async move {
+    let read = crate::xshard::call_in_shard_time(
+      origin,
+      owner,
+      move |s| {
+        s.db
+          .partition()
+          .consumer(consumer)
+          .map(|r| (r.write, r.write_version))
+      },
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    let reply = match read {
+      Some(Some((policy, version))) => ReplyBody::Policy {
+        policy: policy.map(crate::landing::wire_policy),
+        version,
+        signers: Vec::new(),
+      },
+      _ => refused(Refusal::NotFound),
+    };
+    crate::state::deliver(client_index, request, reply, false);
+  });
+  let Ok(task) = task else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  let _ = slates_rt::futures::detach(task);
+  Served::Forwarded
 }
 
 /// Revokes a consumer's enrollment (§4.13 "every later effect from a channel bound to it refuses
@@ -4500,16 +5411,25 @@ fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody 
 /// overtake (measured: the very next `Status` after `Revoked` was served), so the acknowledgement waits for
 /// every mark. A shard that does not answer within the liveness budget makes the revocation refuse
 /// `NotFound` rather than acknowledge a revocation not yet in force everywhere; the durable record stands,
-/// so the human retries and the retry is a no-op mark.
+/// so the human retries and the retry is a no-op mark. Refused `Forbidden` — counted `revoke_by_consumer` — on a channel
+/// bound to a consumer, before anything else and whatever its proof (A-285): revocation is the launcher's, so an agent
+/// holding a leaked proof cannot revoke another agent's consumer.
 fn revoke_on_channel(
   state: &mut ShardState,
-  client_index: u32,
-  request: u64,
+  (client_index, request): (u32, u64),
+  principal: &Principal,
   consumer: u64,
   proof: Capability,
 ) -> Served {
-  let expected = crate::landing::revoke_proof(&state.issuer_secret, consumer);
-  if !crate::landing::constant_time_eq(&expected, &proof) {
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("revoke_by_consumer", 1);
+    return Served::Reply(forbidden("revoke"));
+  }
+  if !crate::landing::proven_by_launcher(
+    state,
+    |secret| crate::landing::revoke_proof(secret, consumer),
+    &proof,
+  ) {
     state.count("grant_issuer_unverified", 1);
     return Served::Reply(refused(Refusal::GrantIssuerUnverified));
   }
@@ -4807,18 +5727,23 @@ fn attest_on_channel(
   };
   let task = slates_rt::futures::spawn(async move {
     // Waited for in the record's shard's own time (R3 class A): a starved shard's record is read, not taken for absent.
-    let facts: Option<ConsumerFacts> = crate::xshard::call_in_shard_time(
+    let fetched = crate::xshard::call_in_shard_time(
       origin,
       owner,
       move |s| {
         s.db
           .partition()
           .consumer(consumer)
-          .map(|r| (r.account, r.secret, r.revoked))
+          .map(|r| ((r.account, r.secret, r.revoked), r.write))
       },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;
+    let (facts, policy): (Option<ConsumerFacts>, _) = match fetched {
+      None => (None, None),
+      Some(None) => (Some(None), None),
+      Some(Some((facts, policy))) => (Some(Some(facts)), policy),
+    };
     let reply = match facts {
       None => refused(Refusal::NotFound),
       Some(facts) => match verify_attestation(&channel_principal, client_id, facts, &proof) {
@@ -4837,6 +5762,7 @@ fn attest_on_channel(
                 account,
                 consumer,
               };
+              slot.consumer_policy = policy;
             }
           })
           .is_ok();
@@ -5089,8 +6015,10 @@ fn create(
     lock: lock_credit,
   } = credits;
   let Some(id) = fresh_volume_id(state) else {
+    let hold = volume.version_hold();
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
+    release_version_hold(&mut state.store, hold);
     return give_back(
       state,
       reservation,
@@ -5113,6 +6041,9 @@ fn create(
       role: Role::Plain,
       live_shipped: false,
       live_holders: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -5130,6 +6061,7 @@ fn create(
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
     catalog_version: 0,
+    taken_over: None,
   };
   publish_created_volume(
     state,
@@ -5179,24 +6111,35 @@ pub(crate) fn admit(
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
+        return Err(Box::new(refused(refusal_of_mem(&e))));
       }
     },
     SizeClass::Dynamic { .. } => None,
   };
-  // Reserve the inode allowance against the shard's version slab *before* creating the volume (§4.2:
-  // "admission reserves all required credits or none before publishing"). So the advertised allowance
-  // is backed by real slab capacity — two volumes cannot each be promised the same slots — and a
-  // refusal here allocates nothing to leak (no root inode, trie or dir), giving back only the byte
-  // reservation. Bounded and dynamic both reserve their whole logical allowance: the sacred claim
-  // that backs divergence.
+  // Reserve a bounded claim's inode allowance against the shard's version slab *before* creating the volume (§4.2:
+  // "admission reserves all required credits or none before publishing"). So the advertised allowance is backed by
+  // real slab capacity — two claims cannot each be promised the same slots — and a refusal here allocates nothing to
+  // leak (no root inode, trie or dir), giving back only the byte reservation. A dynamic volume reserves nothing: its
+  // allowance is a ceiling, and it holds slots for its live inodes from the unpromised capacity as it makes them
+  // ([`Volume::hold_versions`] below; A-342), as its bytes grow — one big maximum promised the whole slab to a volume
+  // holding 54 bytes (docs/bugs/2026-11-18-a-dynamic-volume-reserved-the-whole-version-slab.md).
   let inode_alloc = inode_allowance(state, size);
-  let version_credit = match state.store.versions.reserve(inode_alloc) {
+  // A dynamic volume's first slots are its root's, taken here, before the volume is made, as a claim's reservation
+  // is, so a refusal leaves no root inode, trie or dir allocated; they become its hold once it is made (below).
+  let (wanted, taken) = match size {
+    SizeClass::Bounded { .. } => (inode_alloc, state.store.versions.reserve(inode_alloc)),
+    SizeClass::Dynamic { .. } => (
+      slates_vfs::volume::NEW_VOLUME_INODES,
+      state
+        .store
+        .versions
+        .grow(slates_vfs::volume::NEW_VOLUME_INODES),
+    ),
+  };
+  let version_credit = match taken {
     Ok(c) => Some(c),
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-      report_first_budget_refusal(state, "versions", inode_alloc, available);
+      report_first_budget_refusal(state, "versions", wanted, available);
       return Err(Box::new(give_back(
         state,
         reservation,
@@ -5211,9 +6154,7 @@ pub(crate) fn admit(
         reservation,
         None,
         None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )));
     }
   };
@@ -5304,6 +6245,15 @@ pub(crate) fn admit(
       refusal_of_vfs(&e),
     )));
   }
+  // A dynamic volume's root slot becomes its hold (A-342), which grows as it makes inodes and goes back with it at
+  // teardown, never a reserved credit.
+  let version_credit = match version_credit {
+    Some(credit) if matches!(size, SizeClass::Dynamic { .. }) => {
+      volume.adopt_version_hold(credit.slots);
+      None
+    }
+    credit => credit,
+  };
   Ok(Admitted {
     volume,
     host,
@@ -5316,13 +6266,25 @@ pub(crate) fn admit(
   })
 }
 
+/// Returns a dynamic volume's version hold (A-342) to the shard's version budget: what it took for its inodes, released
+/// whole when the volume is torn down or discarded, as its byte growth is.
+fn release_version_hold(store: &mut slates_vfs::volume::Store, hold: u64) {
+  if hold > 0 {
+    store
+      .versions
+      .release(slates_mem::budget::VersionCredit { slots: hold });
+  }
+}
+
 /// Discards an admitted volume that will not be recorded: its blocks back to the store, its credits back to their
 /// ledgers (a strict volume's locked entitlement with its credit's drop).
 pub(crate) fn discard_admitted(state: &mut ShardState, admitted: Admitted) {
   let Admitted {
     volume, credits, ..
   } = admitted;
+  let hold = volume.version_hold();
   let discarded = volume.discard_partial(&mut state.store);
+  release_version_hold(&mut state.store, hold);
   count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
   release_credits(
     state,
@@ -5358,8 +6320,10 @@ pub(crate) fn publish_created_volume(
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
+    let hold = volume.version_hold();
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
+    release_version_hold(&mut state.store, hold);
     return give_back(
       state,
       reservation,
@@ -5370,20 +6334,21 @@ pub(crate) fn publish_created_volume(
   }
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
+    let hold = volume.version_hold();
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
+    release_version_hold(&mut state.store, hold);
     return give_back(
       state,
       reservation,
       version_credit,
       metadata_credit,
-      Refusal::BadRequest {
-        reason: format!("volume registry full at {full}"),
-      },
+      refusal_of_mem(&slates_mem::MemError::SlabFull { capacity: full }),
     );
   }
   let mut volume = volume;
   crate::content_cipher::key_volume(&mut state.store, &mut volume, id.bytes);
+  let hold = volume.version_hold();
   let slot = VolumeSlot {
     id,
     name,
@@ -5401,16 +6366,17 @@ pub(crate) fn publish_created_volume(
         id: to_wire_volume(id),
       }
     }
-    // Unreachable given the room check above; the slot was consumed, so only the credits return.
-    Err(e) => give_back(
-      state,
-      reservation,
-      version_credit,
-      metadata_credit,
-      Refusal::BadRequest {
-        reason: e.to_string(),
-      },
-    ),
+    // Unreachable given the room check above; the slot was consumed, so only the credits and the hold return.
+    Err(e) => {
+      release_version_hold(&mut state.store, hold);
+      give_back(
+        state,
+        reservation,
+        version_credit,
+        metadata_credit,
+        refusal_of_mem(&e),
+      )
+    }
   }
 }
 
@@ -5475,6 +6441,255 @@ fn release_credits(
   }
 }
 
+/// A candidate's claim on the shard that would restore a live volume this node holds the log of (§4.2: "a remote holder
+/// makes the same admission against its own machine before acknowledging placement"; g229, 2026-11-18): the credits a
+/// successor's restore takes ([`begin_making`]), reserved when the candidate takes the log's first entry
+/// (`live_ship::admit_claim`), taken over by the restore ([`take_claim_or_admit`]), and released once the copy goes
+/// (`live_ship::reconcile_claims`). Before, a candidate reserved nothing and a successor made the admission only at its
+/// restore, so one whose shard had filled since gave the volume up while a survivor held every acknowledged write (CI's
+/// 7 GB macOS runner, diag-supervisor-live-2: refused `BudgetExceeded` for 100 periods, then `NotRecovered`).
+pub(crate) struct CandidateClaim {
+  /// The credits the restore takes over.
+  credits: Credits,
+  /// When the claim was reserved ([`slates_rt::futures::now_ns`]): a reconciliation that read the control shard's copies
+  /// before it never releases it ([`reconcile_candidate_claims`]).
+  reserved_ns: u64,
+}
+
+/// Where a reconciliation found a copy's claim on this shard ([`reconcile_candidate_claims`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimFound {
+  /// A candidate claim holding these bytes.
+  Claimed(u64),
+  /// No claim: this shard serves the volume itself, whose own credits hold its room (a successor's restore took the
+  /// claim over).
+  Served,
+  /// No claim and no volume: the control shard admits it again (a warm restart's copies).
+  Missing,
+}
+
+/// Counter: a candidate claim reserved for a live log this node holds (§4.2, [`CandidateClaim`]).
+/// Format: a counter name in the daemon's status report.
+const CLAIM_ADMITTED: &str = "fleet.live.claim_admitted";
+/// Counter: a candidate claim refused for room: the holder answered `NoRoom` and took nothing.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_REFUSED: &str = "fleet.live.claim_refused";
+/// Counter: a taken-over volume made from this node's candidate claim, which no admission since could take.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_TAKEN_OVER: &str = "fleet.live.claim_taken_over";
+/// Counter: a candidate claim released because its copy went (or its admission's copy was never taken).
+/// Format: a counter name in the daemon's status report.
+const CLAIM_RELEASED: &str = "fleet.live.claim_released";
+/// Counter: a taken-over volume's making that failed after it took its credits, which went back to its claim.
+/// Format: a counter name in the daemon's status report.
+const CLAIM_RETURNED: &str = "fleet.live.claim_returned";
+
+/// The credits a taken-over volume of `size` holds from its making ([`begin_making`]), as a create admits them: a
+/// bounded claim's bytes and inode allowance, the volume's records against the metadata ledger, and a strict volume's
+/// locked entitlement; whole or none, a refusal giving back what was taken. A dynamic volume reserves no bytes and no
+/// slots: it holds the slots of the inodes it is restored with, and grows from what is unpromised (A-342).
+fn restore_credits(
+  state: &mut ShardState,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<Credits, Refusal> {
+  let reservation = match size {
+    SizeClass::Bounded { limit } => {
+      Some(state.store.reserve(limit).map_err(|e| budget_refusal(&e))?)
+    }
+    SizeClass::Dynamic { .. } => None,
+  };
+  let version = match size {
+    SizeClass::Bounded { .. } => {
+      let allowance = inode_allowance(state, size);
+      match state.store.versions.reserve(allowance) {
+        Ok(credit) => Some(credit),
+        Err(e) => {
+          release_credits(state, reservation, None, None);
+          return Err(budget_refusal(&e));
+        }
+      }
+    }
+    SizeClass::Dynamic { .. } => None,
+  };
+  let metadata = match reserve_metadata(state, journal_floor_bytes(state)) {
+    Ok(credit) => credit,
+    Err(refusal) => {
+      release_credits(state, reservation, version, None);
+      return Err(refusal);
+    }
+  };
+  let lock = match require_locked
+    .then(|| reserve_locked(state, size))
+    .transpose()
+  {
+    Ok(lock) => lock,
+    Err(refusal) => {
+      release_credits(state, reservation, version, Some(metadata));
+      return Err(refusal);
+    }
+  };
+  Ok(Credits {
+    reservation,
+    version,
+    metadata: Some(metadata),
+    lock,
+  })
+}
+
+/// A ledger's refusal as a verb answers it: `BudgetExceeded` with what could be admitted, else the memory error's own.
+fn budget_refusal(error: &slates_mem::MemError) -> Refusal {
+  match error {
+    slates_mem::MemError::BudgetExceeded { available, .. } => Refusal::BudgetExceeded {
+      available: *available,
+    },
+    other => refusal_of_mem(other),
+  }
+}
+
+/// The bytes credits hold for a volume's content: a bounded claim's reservation, none for a dynamic volume.
+fn credit_bytes(credits: &Credits) -> u64 {
+  credits
+    .reservation
+    .map_or(0, |reservation| reservation.bytes)
+}
+
+/// Returns credits to the shard's ledgers, its locked entitlement with them.
+fn release_all(state: &mut ShardState, credits: Credits) {
+  let Credits {
+    reservation,
+    version,
+    metadata,
+    lock,
+  } = credits;
+  release_credits(state, reservation, version, metadata);
+  drop(lock);
+}
+
+/// Reserves this node's candidate claim on live volume `id` of `size` on this shard, the one its id routes to
+/// ([`CandidateClaim`]): the bytes it holds for the volume's content, its bound for a bounded claim and none for a
+/// dynamic volume. Idempotent: a claim reserved already answers its bytes. Refused typed, nothing kept, when the shard
+/// cannot make the admission a successor's restore would make.
+pub(crate) fn admit_candidate_claim(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<u64, Refusal> {
+  if let Some(claim) = state.candidate_claims.get(&id) {
+    return Ok(credit_bytes(&claim.credits));
+  }
+  match restore_credits(state, size, require_locked) {
+    Ok(credits) => {
+      let bytes = credit_bytes(&credits);
+      let reserved_ns = slates_rt::futures::now_ns();
+      state.candidate_claims.insert(
+        id,
+        CandidateClaim {
+          credits,
+          reserved_ns,
+        },
+      );
+      state.count(CLAIM_ADMITTED, 1);
+      Ok(bytes)
+    }
+    Err(refusal) => {
+      state.count(CLAIM_REFUSED, 1);
+      Err(refusal)
+    }
+  }
+}
+
+/// Releases this shard's candidate claims that `kept` does not name and that were reserved before `read_ns`, when the
+/// control shard read the live copies this node holds (`live_ship::reconcile_claims`): their copies went (a destroy's
+/// tombstone let them go), or their admission's copy was never taken. Answers where each of `kept` stands here, so the
+/// control shard admits a missing one again.
+pub(crate) fn reconcile_candidate_claims(
+  state: &mut ShardState,
+  kept: &std::collections::BTreeSet<DbVolumeId>,
+  read_ns: u64,
+) -> Vec<(DbVolumeId, ClaimFound)> {
+  let released: Vec<DbVolumeId> = state
+    .candidate_claims
+    .iter()
+    .filter(|(id, claim)| !kept.contains(id) && claim.reserved_ns < read_ns)
+    .map(|(id, _)| *id)
+    .collect();
+  for id in released {
+    if let Some(claim) = state.candidate_claims.remove(&id) {
+      release_all(state, claim.credits);
+      state.count(CLAIM_RELEASED, 1);
+    }
+  }
+  kept
+    .iter()
+    .map(|id| {
+      let found = match state.candidate_claims.get(id) {
+        Some(claim) => ClaimFound::Claimed(credit_bytes(&claim.credits)),
+        None if state.by_id.contains_key(id) && !lost_to_a_successor(state, *id) => {
+          ClaimFound::Served
+        }
+        None => ClaimFound::Missing,
+      };
+      (*id, found)
+    })
+    .collect()
+}
+
+/// The bytes this shard's candidate claim on `id` holds for its content ([`CandidateClaim`]), none without one: what a
+/// taken-over volume's restore counts as its own beside what the shard could admit ([`restore_taken_over`]).
+pub(crate) fn claimed_bytes(state: &ShardState, id: DbVolumeId) -> u64 {
+  state
+    .candidate_claims
+    .get(&id)
+    .map_or(0, |claim| credit_bytes(&claim.credits))
+}
+
+/// The credits a taken-over volume's making takes ([`begin_making`]): this node's candidate claim on it, taken over
+/// whole and counted, else the admission a create makes, refused typed. A successor that held the volume's log
+/// reserved its claim when it took the log's first entry, so nothing admitted since took its room.
+fn take_claim_or_admit(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  size: SizeClass,
+  require_locked: bool,
+) -> Result<Credits, Box<ReplyBody>> {
+  if let Some(claim) = state.candidate_claims.remove(&id) {
+    state.count(CLAIM_TAKEN_OVER, 1);
+    return Ok(claim.credits);
+  }
+  restore_credits(state, size, require_locked).map_err(|refusal| Box::new(refused(refusal)))
+}
+
+/// Puts the credits a failed making of `id` took back as its candidate claim, answering `refusal`
+/// ([`take_claim_or_admit`]): the next attempt finds the room this one had, whichever way the credits came. Released, as
+/// any claim is, once this node holds no copy of the volume's log ([`reconcile_candidate_claims`]).
+fn return_to_claim(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  credits: Credits,
+  refusal: Refusal,
+) -> ReplyBody {
+  keep_as_claim(state, id, credits);
+  refused(refusal)
+}
+
+/// Puts `credits` a making of `id` took back as its candidate claim, counted ([`return_to_claim`] without its answer):
+/// a claim already there is released first, so two never stand for one volume.
+fn keep_as_claim(state: &mut ShardState, id: DbVolumeId, credits: Credits) {
+  let reserved_ns = slates_rt::futures::now_ns();
+  if let Some(earlier) = state.candidate_claims.insert(
+    id,
+    CandidateClaim {
+      credits,
+      reserved_ns,
+    },
+  ) {
+    release_all(state, earlier.credits);
+  }
+  state.count(CLAIM_RETURNED, 1);
+}
+
 /// Reserves a volume's records against the shard's metadata ledger (§4.2 metadata dimension) before
 /// the volume exists: its journal's whole retention budget, its object and its snapshot slab's first
 /// segment, whole or not at all, so the sum of every volume's metadata stays inside the class.
@@ -5492,10 +6707,54 @@ pub(crate) fn reserve_metadata(
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
       Err(Refusal::BudgetExceeded { available })
     }
-    Err(e) => Err(Refusal::BadRequest {
-      reason: e.to_string(),
-    }),
+    Err(e) => Err(refusal_of_mem(&e)),
   }
+}
+
+/// Why the base directory at `path` could not be opened, as a create (and a clone of an overlay) is refused for it.
+fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal {
+  match error {
+    // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
+    slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
+      path: path.to_owned(),
+      used_as: slates_ipc::protocol::OwnMountUse::Base,
+    },
+    slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: code,
+    },
+    _ => Refusal::BaseUnavailable {
+      path: path.to_owned(),
+      errno: 0,
+    },
+  }
+}
+
+/// The host a clone of `record`'s overlay (in slot `origin`) reads its base through (§4.4 clone, AC-1.16): a duplicate of
+/// every directory handle the origin's host keeps, under the same handles (`OsHost::try_clone_dirs`), so each base
+/// directory the clone's plane names is the very directory the origin's names, whatever an outsider has since put at
+/// its path. `None` for a volume with no base directory (scratch, image). Before 2026-11-18 every clone was given no
+/// host, so an overlay's clone could not image its base and the clone verb was refused `ContentUnavailable` (GAPS
+/// 2026-11-05, "The daemon cannot clone an overlay volume").
+fn clone_base_host(
+  state: &ShardState,
+  origin: Handle<VolumeSlot>,
+  record: &VolumeRecord,
+) -> Result<Option<OsHost>, Refusal> {
+  let BaseRecord::Path { path } = &record.base else {
+    return Ok(None);
+  };
+  let slot = state.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
+  let Some(host) = slot.host.as_ref() else {
+    return Err(Refusal::BaseUnavailable {
+      path: path.clone(),
+      errno: 0,
+    });
+  };
+  host
+    .try_clone_dirs()
+    .map(Some)
+    .map_err(|error| base_open_refusal(path, error))
 }
 
 /// Opens a base directory (read-only, `O_NOFOLLOW`) and creates the overlay over it.
@@ -5504,23 +6763,8 @@ fn open_base(
   path: &str,
   config: VolumeConfig,
 ) -> Result<(Volume, Option<OsHost>), Box<ReplyBody>> {
-  let (mut host, root) = OsHost::open_root(std::path::Path::new(path)).map_err(|e| {
-    Box::new(refused(match e {
-      // A-227: a base on one of this daemon's own mounts, refused before anything opened it.
-      slates_vfs::host::HostError::OwnMount(_) => Refusal::OwnMount {
-        path: path.to_owned(),
-        used_as: slates_ipc::protocol::OwnMountUse::Base,
-      },
-      slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
-        path: path.to_owned(),
-        errno: code,
-      },
-      _ => Refusal::BaseUnavailable {
-        path: path.to_owned(),
-        errno: 0,
-      },
-    }))
-  })?;
+  let (mut host, root) = OsHost::open_root(std::path::Path::new(path))
+    .map_err(|e| Box::new(refused(base_open_refusal(path, e))))?;
   let facts = host.facts(root).map_err(|_| {
     Box::new(refused(Refusal::BaseUnavailable {
       path: path.to_owned(),
@@ -5543,20 +6787,43 @@ fn open_base(
 /// A snapshot of `volume` (§4.4 `snapshot`). A guest's DAX windows need nothing of it: each maps its file's backing, an
 /// object the write boundary keeps equal to the head, never the shared content a snapshot freezes (A-168, A-195).
 fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
-  use crate::merge_service::{StoreVerb, find_store_backed};
-  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Snapshot) {
-    Ok(x) => x,
-    Err(r) => return *r,
-  };
-  if !rights_of(&record, principal).write {
-    return forbidden("snapshot");
+  match take_snapshot(state, principal, volume) {
+    Ok((id, coverage)) => ReplyBody::Snapshotted { id, coverage },
+    Err(refusal) => *refusal,
   }
+}
+
+/// Takes the snapshot [`snapshot`] answers with, for `principal`, who must be allowed to write `volume`: its id and its
+/// coverage, or the refusal the verb answers. A Shards stream's SAVE takes one at its cut the same way (A-303), for
+/// the stream's own principal, so a save can do nothing its principal could not ask itself.
+pub(crate) fn take_snapshot(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+) -> Result<(SnapshotId, slates_ipc::protocol::SnapshotCoverage), Box<ReplyBody>> {
+  use crate::merge_service::{StoreVerb, find_store_backed};
+  let (handle, record) = find_store_backed(state, volume, StoreVerb::Snapshot)?;
+  if !rights_of(&record, principal).write {
+    return Err(Box::new(forbidden("snapshot")));
+  }
+  snapshot_effect(state, handle, &record).map(|(id, coverage, _)| (id, coverage))
+}
+
+/// The `Snapshot` verb's effect on `record`'s volume (in slot `handle`), its rights already checked: the barrier, the
+/// core's snapshot, and its records (`SnapshotTaken`, `VolumeHeadAdvanced`). Returns the snapshot, what its barrier lets
+/// it claim and the volume's new head epoch, or the refusal. A planned move's hand-over and its new owner's seal take
+/// theirs here too (A-291), their caller the system.
+fn snapshot_effect(
+  state: &mut ShardState,
+  handle: Handle<VolumeSlot>,
+  record: &VolumeRecord,
+) -> Result<(SnapshotId, slates_ipc::protocol::SnapshotCoverage, u64), Box<ReplyBody>> {
   // The volume's next epoch, checked before any effect: an epoch with no successor refuses the snapshot
   // rather than repeat one (AUD-29-26's sibling; reachable only through a maximal recorded epoch).
   let Some(next_epoch) = record.epoch.checked_add(1) else {
-    return refused(Refusal::Unsupported {
+    return Err(Box::new(refused(Refusal::Unsupported {
       feature: VOLUME_EPOCH_EXHAUSTED.to_owned(),
-    });
+    })));
   };
   // The barrier (§4.6 "Writeback and snapshot barrier"; GAP-A9-4): every live attachment of the
   // volume in the shard's registry has its generation closed before the root is frozen, so every
@@ -5569,20 +6836,20 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
       attachment,
       generation,
     }) => {
-      return refused(Refusal::BarrierIncomplete {
+      return Err(Box::new(refused(Refusal::BarrierIncomplete {
         attachment: catalog_attachment_of(state, attachment),
         generation,
-      });
+      })));
     }
-    Err(e) => return refused(refusal_of_vfs(&e)),
+    Err(e) => return Err(Box::new(refused(refusal_of_vfs(&e)))),
   };
   let taken = match state.volumes.get_mut(handle) {
     Ok(slot) => slot.volume.snapshot(&mut state.store),
-    Err(_) => return refused(Refusal::NotFound),
+    Err(_) => return Err(Box::new(refused(Refusal::NotFound))),
   };
   let id = match taken {
     Ok(id) => wire_snapshot(id),
-    Err(e) => return refused(refusal_of_vfs(&e)),
+    Err(e) => return Err(Box::new(refused(refusal_of_vfs(&e)))),
   };
   let now = state.clock.monotonic_ns();
   let ops = [
@@ -5604,10 +6871,82 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
   ];
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
-      return refused(refusal_of_db(&e));
+      return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  ReplyBody::Snapshotted { id, coverage }
+  Ok((id, coverage, next_epoch))
+}
+
+/// The head a planned move hands over (A-291, `crate::moves`), its caller having checked the volume's `admin`: the
+/// volume's head epoch when its live tree is exactly its head snapshot (nothing changed since, so no snapshot is
+/// taken and none is left behind), else the epoch of a snapshot taken now, as the `Snapshot` verb takes one.
+pub(crate) fn head_for_move(
+  state: &mut ShardState,
+  volume: VolumeId,
+) -> Result<u64, Box<ReplyBody>> {
+  let (handle, record) = find(state, volume)?;
+  let unchanged = record.epoch > 0
+    && state.volumes.get(handle).is_ok_and(|slot| {
+      slot
+        .volume
+        .unchanged_since(core_snapshot(SnapshotId {
+          value: record.head.value,
+        }))
+        .unwrap_or(false)
+    });
+  if unchanged {
+    return Ok(record.epoch);
+  }
+  snapshot_effect(state, handle, &record).map(|(_, _, epoch)| epoch)
+}
+
+/// The seal a moved volume's new owner takes once it serves the volume (A-291): a snapshot of `id` taken as the
+/// `Snapshot` verb takes one, which the record plane seals and places under this node's own placement. Returns the
+/// snapshot it superseded (the adopted head) and the new head epoch, or the refusal (the volume gone, an incomplete
+/// barrier while a writer's request is in flight), retried next period.
+pub(crate) fn seal_adopted_head(
+  state: &mut ShardState,
+  id: DbVolumeId,
+) -> Result<(DbSnapshotId, u64), Box<ReplyBody>> {
+  let (handle, record) = find(state, VolumeId { bytes: id.bytes })?;
+  let superseded = record.head;
+  snapshot_effect(state, handle, &record).map(|(_, _, epoch)| (superseded, epoch))
+}
+
+/// Destroys `id`'s snapshot `snapshot` as the `DestroySnapshot` verb does, its caller the system (A-291: the adopted
+/// head a moved volume's new owner superseded with its own seal). A snapshot a clone still pins is refused, as the verb
+/// refuses it, and kept.
+pub(crate) fn drop_snapshot(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  snapshot: DbSnapshotId,
+) -> Result<(), Box<ReplyBody>> {
+  let Some(&handle) = state.by_id.get(&id) else {
+    return Err(Box::new(refused(Refusal::NotFound)));
+  };
+  let wire = SnapshotId {
+    value: snapshot.value,
+  };
+  match state.volumes.get_mut(handle) {
+    Ok(slot) => slot
+      .volume
+      .destroy_snapshot(&mut state.store, core_snapshot(wire))
+      .map_err(|e| Box::new(refused(refusal_of_vfs(&e))))?,
+    Err(_) => return Err(Box::new(refused(Refusal::NotFound))),
+  }
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(
+      &mut state.segment,
+      &Op::SnapshotDestroyed {
+        volume: id,
+        id: snapshot,
+      },
+      now,
+    )
+    .map(|_| ())
+    .map_err(|e| Box::new(refused(refusal_of_db(&e))))
 }
 
 /// What a closed barrier lets the snapshot claim (§4.6): the attachments closed, and the narrowest
@@ -5789,6 +7128,9 @@ fn found_green(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -5801,6 +7143,7 @@ fn found_green(
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
     catalog_version: 0,
+    taken_over: None,
   };
   let now = state.clock.monotonic_ns();
   if let Err(e) = state
@@ -6021,13 +7364,20 @@ fn versions(state: &ShardState, principal: &Principal, green: VolumeId) -> Reply
   }
 }
 
-/// The files a green changed strictly after `version` (§4.16): the read a lagging work uses to know
-/// what green moved under it before it rebases.
+/// One page of the paths a green changed strictly after `version` (§4.16, A-264): the read a lagging work uses to know
+/// what the green moved under it before it rebases. Read from the green's change index from `from`, in version order,
+/// answering each path at the last version it changed at; the page ends when the next path would not fit one reply chunk
+/// or when the page has spent its slice of the shard's step ([`CHANGED_SLICE_PERMILLE`]), and its cursor names the first
+/// entry it did not pass. So a page costs the entries it passes, never the green's tree, and never more than its slice:
+/// before 2026-11-09 a page walked every path of every dimension, about 1 ms a page on a kernel tree whatever the span,
+/// and ten times that on ten times the tree. A version past the head is refused `UnknownBase`; one below the fold floor
+/// is answered, as the index keeps each path's last change there.
 fn changed_since(
   state: &ShardState,
   principal: &Principal,
   green: VolumeId,
   version: u64,
+  from: Option<slates_ipc::protocol::ChangedCursor>,
 ) -> ReplyBody {
   let record = match crate::merge_service::require_green(state, principal, green, "changed_since") {
     Ok(record) => record,
@@ -6036,35 +7386,222 @@ fn changed_since(
   let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
-  ReplyBody::ChangedSince {
-    paths: engine.changed_since(version),
+  if version > engine.head() {
+    return refused(Refusal::UnknownBase { green, version });
   }
+  let slice = state
+    .config
+    .step_quantum_ns()
+    .saturating_mul(CHANGED_SLICE_PERMILLE)
+    / PERMILLE;
+  let started = slates_rt::futures::now_ns();
+  let room = changed_page_room();
+  let mut used = 0usize;
+  let mut paths = Vec::new();
+  let mut next = None;
+  let cursor = from.map(|at| (at.version, usize::try_from(at.passed).unwrap_or(usize::MAX)));
+  for (passed, change) in engine.changes_after(version, cursor).enumerate() {
+    // Where a page that stops before this entry continues: this version, this many of its entries passed (a version
+    // holds far fewer than 2^32 paths; the green's memory is bounded long before).
+    let here = slates_ipc::protocol::ChangedCursor {
+      version: change.version,
+      passed: u32::try_from(change.index).unwrap_or(u32::MAX),
+    };
+    if passed > 0
+      && passed % CHANGED_CLOCK_EVERY == 0
+      && slates_rt::futures::now_ns().saturating_sub(started) >= slice
+    {
+      next = Some(here);
+      break;
+    }
+    if !change.last {
+      continue;
+    }
+    let path = change.path.to_owned();
+    let bytes = encoded_len(&path);
+    if !paths.is_empty() && used.saturating_add(bytes) > room {
+      next = Some(here);
+      break;
+    }
+    used = used.saturating_add(bytes);
+    paths.push(path);
+  }
+  ReplyBody::ChangedSince { paths, next }
 }
 
-/// Creates a work volume over a green (§4.16): an agent's private place to declare operations,
-/// based on the green's current head. The green must be owned by this shard (it holds the engine).
+/// Shape: a `changed_since` page's slice of the shard's step budget, parts per thousand: half, as a destroy slice's, so
+/// one page never takes the whole step from the shard's other clients (§4.3).
+const CHANGED_SLICE_PERMILLE: u64 = 500;
+/// Shape: the change-index entries a page passes between two looks at the clock: a look costs about what passing a
+/// few entries does, so one each 64 keeps the looks a small share and a page's overrun of its slice within 64 entries.
+const CHANGED_CLOCK_EVERY: usize = 64;
+
+/// The bytes a `changed_since` page's paths may take: one reply chunk less the page's own framing, its cursor included.
+fn changed_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::ChangedSince {
+    paths: Vec::new(),
+    next: Some(slates_ipc::protocol::ChangedCursor {
+      version: u64::MAX,
+      passed: u32::MAX,
+    }),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// The encoded bytes `value` adds to a reply.
+pub(crate) fn encoded_len<T: Wire>(value: &T) -> usize {
+  let mut encoded = Vec::new();
+  value.encode(&mut encoded);
+  encoded.len()
+}
+
+/// Creates a work volume over a green (§4.16) on this shard, the one that serves its creation (A-400): an agent's
+/// private place to declare operations, based on the green's current head. A name that hashes to another partition is
+/// held there by an alias of the work's id, reserved before the creation (`crate::work_home`) and confirmed once it
+/// commits, or released if it did not ([`settle_work_alias`]).
 fn create_work(
   state: &mut ShardState,
   principal: &Principal,
   green: VolumeId,
   name: &str,
 ) -> ReplyBody {
-  let green_id = match crate::merge_service::require_green(state, principal, green, "create_work") {
-    Ok(record) => record.id,
-    Err(refusal) => return refused(refusal),
-  };
-  let Some(engine) = state.greens.get(&green_id) else {
-    return refused(Refusal::NotFound);
-  };
-  // The work is the green at its head: it holds nothing of its own until it changes a file, and reads every
-  // other file from the green there (`crate::work_files`), so an edit to a base file splices what the file holds.
-  let base = engine.head();
-  if let Some(existing) = state.db.partition().volume_by_name(name) {
-    return refused(Refusal::AlreadyExists {
-      existing: to_wire_volume(existing.id),
-    });
+  let reserved = (owner_of_name(name, state.shards.len()) != state.partition)
+    .then(|| this_requests_pending_creation(state, name))
+    .flatten();
+  let reply = create_work_here(state, principal, green, name);
+  if let Some(id) = reserved {
+    settle_work_alias(state, id, name);
   }
-  let Some(id) = fresh_volume_id(state) else {
+  reply
+}
+
+/// The work id this request's own pending creation of `name` holds on this partition (A-247), if any.
+fn this_requests_pending_creation(state: &ShardState, name: &str) -> Option<DbVolumeId> {
+  let (origin, id) = state.current_request?;
+  state
+    .db
+    .partition()
+    .pending_creation(name)
+    .filter(|pending| {
+      (pending.origin, pending.client, pending.sequence) == (origin, id.client, id.sequence)
+    })
+    .map(|pending| pending.work)
+}
+
+/// Settles the alias `name`'s partition holds for `work`, a work this shard was making (A-400, A-236's last step): once
+/// this step's transaction is committed, confirmed there if the work stands here under its name, else released. A task of
+/// this shard decides from what committed, and the message to the name's shard is taken only while the alias still names
+/// `work`; one lost (counted) is the next start's reconcile's to settle.
+fn settle_work_alias(state: &mut ShardState, work: DbVolumeId, name: &str) {
+  let name_partition = owner_of_name(name, state.shards.len());
+  let (Some(here), Some(name_shard)) = (
+    shard_of_partition(state, state.partition),
+    shard_of_partition(state, name_partition),
+  ) else {
+    state.count(ALIAS_STEP_UNTAKEN, 1);
+    return;
+  };
+  let name = name.to_owned();
+  let settling = slates_rt::futures::spawn(async move {
+    // A refused borrow (counted by `with_state_counted`) decides nothing: the alias stays reserved, never released for
+    // a work that may stand, and the next start's reconcile settles it (A-236).
+    let Some(made) = crate::state::with_state_counted(|s| {
+      s.db
+        .partition()
+        .volume(work)
+        .is_some_and(|record| record.name == name)
+    }) else {
+      return;
+    };
+    crate::xshard::run_on_counted(here, name_shard, move |s| {
+      if !s
+        .db
+        .partition()
+        .name_alias(&name)
+        .is_some_and(|alias| alias.volume == work)
+      {
+        return;
+      }
+      let step = if made {
+        Op::NameAliasConfirmed { name }
+      } else {
+        Op::NameAliasReleased { name }
+      };
+      if alias_step(s, &step).is_err() {
+        s.count(ALIAS_STEP_UNTAKEN, 1);
+      }
+    });
+  })
+  .and_then(slates_rt::futures::detach);
+  if settling.is_err() {
+    state.count(ALIAS_STEP_UNTAKEN, 1);
+  }
+}
+
+/// [`create_work`]'s creation itself, on this shard.
+fn create_work_here(
+  state: &mut ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  name: &str,
+) -> ReplyBody {
+  // The green's owner admitted the work (A-247), having recorded its floor, or the green is on this shard and its
+  // floor is recorded below, in this transaction.
+  let (green_id, base, minted) = match state.work_home.admitted.take() {
+    Some(Ok(admitted)) => (to_db_volume(green), admitted.base, Some(admitted.id)),
+    Some(Err(refusal)) => {
+      // The owner refused it, so the name and the id it held go back.
+      if let Err(e) = settle_creation(state, name) {
+        return refused(refusal_of_db(&e));
+      }
+      return refused(refusal);
+    }
+    None if owner_of(green) != state.partition => {
+      // A green on another shard is admitted through its owner (`crate::work_home`); a creation that reaches here
+      // did not ask, because its name is held.
+      return refused(match name_held(state, name) {
+        Some(existing) => Refusal::AlreadyExists { existing },
+        None => Refusal::NotFound,
+      });
+    }
+    None => {
+      let green_id =
+        match crate::merge_service::require_green(state, principal, green, "create_work") {
+          Ok(record) => record.id,
+          Err(refusal) => return refused(refusal),
+        };
+      let Some(engine) = state.greens.get(&green_id) else {
+        return refused(Refusal::NotFound);
+      };
+      // The work is the green at its head: it holds nothing of its own until it changes a file, and reads every
+      // other file from the green there (`crate::work_files`), so an edit to a base file splices what the file holds.
+      // A name held for it at another partition holds the id its pending creation was given (A-400).
+      (
+        green_id,
+        engine.head(),
+        this_requests_pending_creation(state, name),
+      )
+    }
+  };
+  // An admitted work holds its own name while it waits (A-247): that is its own hold, released here.
+  if let Some(existing) = name_held(state, name)
+    && Some(to_db_volume(existing)) != minted
+  {
+    // Only an owner on another shard recorded a floor for the work at its admission; a green here records it below.
+    if let Some(id) = minted
+      && owner_of(green) != state.partition
+    {
+      crate::work_home::tell_floor(state, green_id, id, None);
+    }
+    return refused(Refusal::AlreadyExists { existing });
+  }
+  if minted.is_some()
+    && let Err(e) = settle_creation(state, name)
+  {
+    return refused(refusal_of_db(&e));
+  }
+  let Some(id) = minted.or_else(|| fresh_volume_id(state)) else {
     return refused(ids_exhausted());
   };
   let record = VolumeRecord {
@@ -6082,6 +7619,9 @@ fn create_work(
       },
       live_shipped: false,
       live_holders: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -6094,11 +7634,32 @@ fn create_work(
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
     catalog_version: 0,
+    taken_over: None,
   };
   let now = state.clock.monotonic_ns();
+  // A green elsewhere recorded the work's floor when it admitted the work; a green here records it below. The id may be
+  // minted here as well (a name held by an alias elsewhere, A-400), so where the floor is recorded follows the green.
+  let admitted_elsewhere = owner_of(green) != state.partition;
   if let Err(e) = state
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
+  {
+    if admitted_elsewhere {
+      crate::work_home::tell_floor(state, green_id, id, None);
+    }
+    return refused(refusal_of_db(&e));
+  }
+  // The green keeps this base while the work holds it (A-247).
+  if !admitted_elsewhere
+    && let Err(e) = state.db.mutate(
+      &mut state.segment,
+      &Op::WorkFloorSet {
+        green: green_id,
+        work: id,
+        base,
+      },
+      now,
+    )
   {
     return refused(refusal_of_db(&e));
   }
@@ -6113,6 +7674,8 @@ fn create_work(
       files: crate::work_files::WorkFiles::default(),
       revision: 0,
       charged,
+      entries: std::collections::BTreeMap::new(),
+      verdict: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -6255,9 +7818,43 @@ fn edit_and_submit(
   principal: &Principal,
   work: VolumeId,
   splice: Splice<'_>,
-  evidence: Vec<[u8; 32]>,
+  (evidence, held): (Vec<[u8; 32]>, bool),
 ) -> ReplyBody {
-  let edited = match splice.insert {
+  // The green's owner already judged what the edit would leave (A-247; `crate::work_home`). The edit was never applied
+  // to the work: an accept moves past it and a conflict applies it now, so the work holds it as a client's two verbs
+  // would have left it.
+  if let Some(reply) = state.work_home.verdict.take() {
+    if let Err(e) = settle_pending(state, to_db_volume(work)) {
+      return refused(refusal_of_db(&e));
+    }
+    return match crate::merge_service::require_work(state, principal, work, true, "edit") {
+      Ok((record, green)) => {
+        settle_edit_submit(state, principal, (record.id, green, work), splice, reply)
+      }
+      Err(refusal) => refused(refusal),
+    };
+  }
+  let edited = apply_splice(state, principal, work, splice);
+  match edited {
+    ReplyBody::Edited => submit(
+      state,
+      principal,
+      work,
+      (evidence, None),
+      if held { Approval::Held } else { Approval::None },
+    ),
+    refused_edit => refused_edit,
+  }
+}
+
+/// An edit-and-submit's edit, of its bytes inline or from a staging buffer.
+fn apply_splice(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  splice: Splice<'_>,
+) -> ReplyBody {
+  match splice.insert {
     slates_ipc::protocol::EditBytes::Inline { bytes } => edit(
       state,
       principal,
@@ -6275,10 +7872,33 @@ fn edit_and_submit(
       splice.at,
       splice.delete_len,
     ),
-  };
-  match edited {
-    ReplyBody::Edited => submit(state, principal, work, evidence),
-    refused_edit => refused_edit,
+  }
+}
+
+/// The owner's answer to an edit-and-submit on the work's shard (A-247): an accept resets the work; any other answer
+/// applies the edit, as the verb on one shard would have before its verdict, and answers as the submit did, a conflict
+/// kept with the work ([`kept_conflict`], A-267).
+fn settle_edit_submit(
+  state: &mut ShardState,
+  principal: &Principal,
+  (work_id, green_id, work): (DbVolumeId, DbVolumeId, VolumeId),
+  splice: Splice<'_>,
+  reply: ReplyBody,
+) -> ReplyBody {
+  if accepted_version(&reply).is_some() {
+    // The edit went to the owner inside the increment, so a buffer it came from is done with.
+    if let slates_ipc::protocol::EditBytes::Staged { token } = splice.insert {
+      let _ = state
+        .staging
+        .take((work_id, principal, token), &mut state.store.metadata);
+    }
+    return settle_submit(state, work_id, green_id, reply);
+  }
+  let edited = apply_splice(state, principal, work, splice);
+  if matches!(edited, ReplyBody::Edited) {
+    kept_conflict(state, work_id, reply)
+  } else {
+    edited
   }
 }
 
@@ -6324,6 +7944,7 @@ fn edit(
   };
   let base = crate::work_files::Base {
     green: state.greens.get(&w.green),
+    fetched: state.work_home.fetched.as_ref(),
     version: w.base_version,
   };
   // A file the work has not changed is the green's at its base; with the green gone it cannot be read (§4.16
@@ -6353,12 +7974,13 @@ fn edit(
   if let Err(refusal) = record_work_change(state, work_id, added, entry) {
     return refused(refusal);
   }
-  let (works, greens) = (&mut state.works, &state.greens);
+  let (works, greens, home) = (&mut state.works, &state.greens, &state.work_home);
   let Some(w) = works.get_mut(&work_id) else {
     return refused(Refusal::NotFound);
   };
   let base = crate::work_files::Base {
     green: greens.get(&w.green),
+    fetched: home.fetched.as_ref(),
     version: w.base_version,
   };
   // The base was read above on this single-threaded shard, so it still is; a refusal here gives the charge back.
@@ -6437,6 +8059,16 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     Ok((record, _)) => record.id,
     Err(refusal) => return refused(refusal),
   };
+  // A guest's own attribute namespaces (`trusted.`, `security.`) are its kernel's to set (A-290): a guest's kernel
+  // acts on them (a binary's capability, an overlay's opaque directory), and inside the guest only its privileged
+  // processes may set them. A declaration is a host's channel, so it sets and removes none, as no host's mount does.
+  if let WorkOp::SetXattr { name, .. } | WorkOp::RemoveXattr { name, .. } = &op
+    && slates_bridge_core::guest_only(name.as_bytes())
+  {
+    return refused(Refusal::Unsupported {
+      feature: format!("a guest's own attribute ({name}) from a host's channel"),
+    });
+  }
   let Some(w) = state.works.get(&work_id) else {
     return refused(Refusal::NotFound);
   };
@@ -6455,6 +8087,9 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
           kind: match node.kind {
             IpcNodeKind::Fifo => SpecialKind::Fifo,
             IpcNodeKind::Socket => SpecialKind::Socket,
+            // A declared device node is metadata (A-294): the merge keeps its number and nothing opens it.
+            IpcNodeKind::BlockDevice { major, minor } => SpecialKind::BlockDevice { major, minor },
+            IpcNodeKind::CharDevice { major, minor } => SpecialKind::CharDevice { major, minor },
           },
           uid: node.uid,
           gid: node.gid,
@@ -6498,6 +8133,7 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
   // file it now holds, a removal it records, the operation itself.
   let base = crate::work_files::Base {
     green: state.greens.get(&w.green),
+    fetched: state.work_home.fetched.as_ref(),
     version: w.base_version,
   };
   let Ok((moved, removed)) = w.files.declare_delta(base, &volume_op) else {
@@ -6513,12 +8149,13 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
   if let Err(refusal) = record_work_change(state, work_id, added, entry) {
     return refused(refusal);
   }
-  let (works, greens) = (&mut state.works, &state.greens);
+  let (works, greens, home) = (&mut state.works, &state.greens, &state.work_home);
   let Some(w) = works.get_mut(&work_id) else {
     return refused(Refusal::NotFound);
   };
   let base = crate::work_files::Base {
     green: greens.get(&w.green),
+    fetched: home.fetched.as_ref(),
     version: w.base_version,
   };
   if crate::work_log::apply_declare((&mut w.files, &mut w.journal), base, volume_op).is_err() {
@@ -6649,14 +8286,11 @@ fn assemble_post_state(
 /// the refusal to reply with.
 fn build_increment(
   state: &ShardState,
-  work_id: DbVolumeId,
+  sealed: &crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
-  let Some(w) = state.works.get(&work_id) else {
-    return Err(Refusal::NotFound);
-  };
-  let green_id = w.green;
-  let base_version = w.base_version;
+  let green_id = sealed.green;
+  let base_version = sealed.base_version;
   // The green is gone (destroyed), or the work's base is past the head it holds: the base names a
   // version this green does not have (§4.16 failure matrix, `UnknownBase`).
   let engine = state
@@ -6667,10 +8301,40 @@ fn build_increment(
       green: to_wire_volume(green_id),
       version: base_version,
     })?;
+  // A work off this shard composed its own (A-247): the owner only judges it.
+  if let Some(composed) = &sealed.composed {
+    return Ok((green_id, composed.clone()));
+  }
   // Only the base entries the journal names (`Green::base_for`): the deriver reads nothing else, and the
   // whole base cloned every path's name on every submit.
-  let base = engine.base_for(base_version, &w.journal);
-  let (doc, plan) = match slates_merge::increment::compose_volume_planned(&base, &w.journal) {
+  let base = engine.base_for(base_version, &sealed.journal);
+  let files_base = crate::work_files::Base {
+    green: Some(engine),
+    fetched: None,
+    version: base_version,
+  };
+  let inc = compose_increment(
+    (sealed.work, base_version),
+    &base,
+    (&sealed.files, files_base),
+    &sealed.journal,
+    evidence,
+  )?;
+  Ok((green_id, inc))
+}
+
+/// Composes a work's increment over `base`, the restricted base of its journal at `base_version` (§4.16): the ops
+/// document, the post-state assembled from the work's files over `files_base`, and the identity. The owner's shard and
+/// a work's own shard (A-247, from the entries it fetched, `Base::for_names`) compose by this one function, so the
+/// increment is the same byte for byte wherever it is composed.
+pub(crate) fn compose_increment(
+  (work_id, base_version): (DbVolumeId, u64),
+  base: &slates_merge::increment::Base,
+  (files, files_base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
+  journal: &[VolumeOp],
+  evidence: Vec<[u8; 32]>,
+) -> Result<slates_merge::engine::Increment, Refusal> {
+  let (doc, plan) = match slates_merge::increment::compose_volume_planned(base, journal) {
     Ok(planned) => planned,
     Err(e) => {
       return Err(Refusal::BadRequest {
@@ -6678,17 +8342,7 @@ fn build_increment(
       });
     }
   };
-  let post_state = assemble_post_state(
-    (&doc, &plan),
-    (
-      &w.files,
-      crate::work_files::Base {
-        green: Some(engine),
-        version: base_version,
-      },
-    ),
-    &w.journal,
-  );
+  let post_state = assemble_post_state((&doc, &plan), (files, files_base), journal);
   // The identity names the work and its base before the post-state and the document (§4.16 data model:
   // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
   // retry of this work's increment. Without them, a second work's identical edit from the same base was
@@ -6702,16 +8356,153 @@ fn build_increment(
   hasher.update(&doc.encode());
   hasher.update(&post_state);
   let id = *hasher.finalize().as_bytes();
-  Ok((
-    green_id,
-    slates_merge::engine::Increment {
-      id,
-      base: base_version,
-      doc,
-      post_state,
-      evidence,
-    },
-  ))
+  Ok(slates_merge::engine::Increment {
+    id,
+    base: base_version,
+    doc,
+    post_state,
+    evidence,
+  })
+}
+
+/// Keeps a conflicting verdict with its work (§4.16, A-267): every window, under a fresh id, until the work's next
+/// submit or rebase. Returns what the verdict's reply carries in `room` bytes — the first windows, the count of the
+/// rest, which `Conflicts` reads, and the id it reads them by. The id is the shard's monotonic clock, kept past the
+/// work's last, so a verdict replaced (or a daemon restarted, which keeps none) never answers for another.
+fn keep_verdict(
+  state: &mut ShardState,
+  work_id: DbVolumeId,
+  windows: Vec<slates_ipc::protocol::MergeWindow>,
+  room: usize,
+) -> (Vec<slates_ipc::protocol::MergeWindow>, u32, u64) {
+  let now = state.clock.monotonic_ns();
+  let Some(work) = state.works.get_mut(&work_id) else {
+    // No work to keep it with (it cannot happen inside the verb that judged it): carry what fits, read nothing more.
+    let (carried, elided) = carried(windows, room);
+    return (carried, elided, 0);
+  };
+  let id = now.max(
+    work
+      .verdict
+      .as_ref()
+      .map_or(1, |kept| kept.id.saturating_add(1)),
+  );
+  let (carried, elided) = carried(windows.clone(), room);
+  work.verdict = Some(crate::state::KeptVerdict { id, windows });
+  (carried, elided, id)
+}
+
+/// Keeps a conflicting verdict the green's half answered with the work it judged (§4.16, A-267; A-247). The verdict is
+/// the green's, judged on its owner's shard, which holds no work on another shard; the work and its `Conflicts` reads
+/// are on this one. So the green's half answers every window, and this shard keeps them and answers what one reply
+/// carries, the rest counted under the kept verdict's id. An answer already carried (a count or an id in it) and any
+/// answer but a conflict are the reply as they stand.
+fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) -> ReplyBody {
+  match reply {
+    ReplyBody::Submitted {
+      version: None,
+      conflicts,
+      conflicts_elided: 0,
+      verdict: 0,
+    } => {
+      let room = reply_room(&ReplyBody::Submitted {
+        version: None,
+        conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: u64::MAX,
+      });
+      let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
+      ReplyBody::Submitted {
+        version: None,
+        conflicts,
+        conflicts_elided,
+        verdict,
+      }
+    }
+    ReplyBody::SubmittedSigned {
+      version: None,
+      conflicts,
+      verification,
+      conflicts_elided: 0,
+      verdict: 0,
+    } => {
+      let room = reply_room(&ReplyBody::SubmittedSigned {
+        version: None,
+        conflicts: Vec::new(),
+        verification,
+        conflicts_elided: 0,
+        verdict: u64::MAX,
+      });
+      let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
+      ReplyBody::SubmittedSigned {
+        version: None,
+        conflicts,
+        verification,
+        conflicts_elided,
+        verdict,
+      }
+    }
+    ReplyBody::Rebased {
+      version: None,
+      conflicts,
+      conflicts_elided: 0,
+      verdict: 0,
+    } => {
+      let room = reply_room(&ReplyBody::Rebased {
+        version: None,
+        conflicts: Vec::new(),
+        conflicts_elided: 0,
+        verdict: u64::MAX,
+      });
+      let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
+      ReplyBody::Rebased {
+        version: None,
+        conflicts,
+        conflicts_elided,
+        verdict,
+      }
+    }
+    other => other,
+  }
+}
+
+/// `Conflicts`: one page of a work's kept verdict from position `from` (§4.16, A-267), as many windows as one reply
+/// holds, in the verdict's order. A verdict the work no longer keeps — replaced by a later submit or rebase, cleared by
+/// one that succeeded, or forgotten by a restart — is refused `VerdictReplaced`. A window always fits a page alone: a
+/// work's path arrives in a request, whose framing is larger than a page's (as A-264's changed paths).
+fn conflicts(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  verdict: u64,
+  from: u32,
+) -> ReplyBody {
+  let work_id = match crate::merge_service::require_work(state, principal, work, false, "conflicts")
+  {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
+  let Some(kept) = state
+    .works
+    .get(&work_id)
+    .and_then(|w| w.verdict.as_ref())
+    .filter(|kept| verdict != 0 && kept.id == verdict)
+  else {
+    return refused(Refusal::VerdictReplaced { work });
+  };
+  let room = reply_room(&ReplyBody::Conflicts {
+    windows: Vec::new(),
+    next: Some(u32::MAX),
+  });
+  let start = usize::try_from(from).unwrap_or(usize::MAX);
+  let rest = kept.windows.get(start..).unwrap_or_default();
+  let (windows, more) = fitting(rest.iter().cloned(), room);
+  let next = if more {
+    u32::try_from(start.saturating_add(windows.len())).ok()
+  } else {
+    None
+  };
+  ReplyBody::Conflicts { windows, next }
 }
 
 /// The conflict windows of a merge outcome, as the wire's [`MergeWindow`](slates_ipc::protocol::MergeWindow)s.
@@ -6729,22 +8520,146 @@ fn merge_windows(
     .collect()
 }
 
-/// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
-/// declared operations into the canonical document, seal the post-state, hash the identity, and run
-/// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
-fn submit(
+/// Takes a work's journal and changed files out, for a judge on this shard to read; [`put_back_sealed`] returns them.
+/// A move rather than a copy: a verdict on the green's own shard is one step, and nothing else can see the work.
+fn take_sealed(state: &mut ShardState, work: DbVolumeId) -> Option<crate::work_home::SealedWork> {
+  let w = state.works.get_mut(&work)?;
+  Some(crate::work_home::SealedWork {
+    work,
+    green: w.green,
+    base_version: w.base_version,
+    journal: std::mem::take(&mut w.journal),
+    files: std::mem::take(&mut w.files),
+    composed: None,
+  })
+}
+
+/// Returns what [`take_sealed`] took.
+fn put_back_sealed(state: &mut ShardState, sealed: crate::work_home::SealedWork) {
+  if let Some(w) = state.works.get_mut(&sealed.work) {
+    w.journal = sealed.journal;
+    w.files = sealed.files;
+  }
+}
+
+/// Whether the restatement a submit's accept records would fit the work's partition now (A-207).
+pub(crate) fn reset_would_fit(
+  state: &ShardState,
+  work: DbVolumeId,
+  now: u64,
+) -> Result<(), Refusal> {
+  state
+    .db
+    .partition()
+    .check(&restatement(work, &accepted_restatement(0)), now)
+    .map_err(|e| refusal_of_db(&e))
+}
+
+/// Serves `SubmitApproved` (A-285): the launcher's approval of exactly one increment, proven under the issuer secret,
+/// then the submit with that approval. Refused `Forbidden` for a consumer principal, whatever its proof (an agent never
+/// approves its own merge), and `GrantIssuerUnverified` when the proof does not verify.
+fn submit_approved(
   state: &mut ShardState,
   principal: &Principal,
-  work: VolumeId,
-  evidence: Vec<[u8; 32]>,
+  (work, evidence, signature): (VolumeId, Vec<[u8; 32]>, Option<Vec<u8>>),
+  identity: [u8; 32],
+  proof: [u8; 32],
 ) -> ReplyBody {
-  let (work_id, green_id) =
-    match crate::merge_service::require_work(state, principal, work, false, "submit") {
-      Ok((record, green)) => (record.id, green),
-      Err(refusal) => return refused(refusal),
-    };
-  // A green that requires evidence refuses an increment without any (§4.16 `EvidenceRequired`),
-  // before the seal: nothing is composed for a submit that cannot be accepted.
+  if matches!(principal, Principal::Consumer { .. }) {
+    state.count("merge_approved_by_consumer", 1);
+    return forbidden("submit_approved");
+  }
+  if !approval_verifies(state, principal, work, (&identity, &proof)) {
+    state.count("grant_issuer_unverified", 1);
+    return refused(Refusal::GrantIssuerUnverified);
+  }
+  submit(
+    state,
+    principal,
+    work,
+    (evidence, signature),
+    Approval::Of(identity),
+  )
+}
+
+/// What a submit carries of the write policy's approval (A-285).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Approval {
+  /// None: the volumes' merge modes decide.
+  None,
+  /// Held by the caller's own ask policy (`SubmitHeld`): asked whatever the volumes' modes, unless they forbid.
+  Held,
+  /// The launcher's approval of exactly this increment (`SubmitApproved`).
+  Of([u8; 32]),
+}
+
+/// Whether a `SubmitApproved` is the launcher's approval of `identity` for `work` (A-285): never from a consumer, and
+/// its proof the keyed hash under the launcher's secret or the issuer's (`landing::proven_by_launcher`). The work's
+/// shard holds a submit whose green lives elsewhere to this before it sends the approval to the verdict
+/// (`crate::work_home`), since the verdict trusts what it is sent.
+pub(crate) fn approval_verifies(
+  state: &ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  (identity, proof): (&[u8; 32], &[u8; 32]),
+) -> bool {
+  !matches!(principal, Principal::Consumer { .. })
+    && crate::landing::proven_by_launcher(
+      state,
+      |secret| crate::landing::merge_approval_proof(secret, work, identity),
+      proof,
+    )
+}
+
+/// A volume's merge mode under its write policy (A-285): `Bypass` when it has none set, as every merge was before write
+/// policies. Read where the volume's record is: a work's on the work's shard, a green's on its owner's (A-247), so a
+/// submit carries its work's mode to the verdict ([`SubmitPolicy`]).
+pub(crate) fn merge_mode_of(state: &ShardState, id: DbVolumeId) -> slates_db::catalog::WriteMode {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .and_then(|record| record.policy.write)
+    .map_or(slates_db::catalog::WriteMode::Bypass, |policy| policy.merge)
+}
+
+/// The merge mode a submit follows (A-285): the stricter of its work's and its green's, and the volume whose mode it is;
+/// a tie is the work's.
+fn stricter_merge_mode(
+  work: (slates_db::catalog::WriteMode, DbVolumeId),
+  green: (slates_db::catalog::WriteMode, DbVolumeId),
+) -> (slates_db::catalog::WriteMode, DbVolumeId) {
+  use slates_db::catalog::WriteMode;
+  let rank = |mode: WriteMode| match mode {
+    WriteMode::Forbid => 0u8,
+    WriteMode::Ask => 1,
+    WriteMode::Bypass => 2,
+  };
+  if rank(green.0) < rank(work.0) {
+    green
+  } else {
+    work
+  }
+}
+
+/// The refusals a submit into `green_id` meets before its seal, so nothing is composed for a submit that cannot be
+/// accepted: a forbidding write policy (A-285), `mode` the one `by` set; then a green that requires evidence, for an
+/// increment without any (§4.16 `EvidenceRequired`).
+fn refused_before_the_seal(
+  state: &mut ShardState,
+  (mode, by): (slates_db::catalog::WriteMode, DbVolumeId),
+  green_id: DbVolumeId,
+  evidence: &[[u8; 32]],
+) -> Option<ReplyBody> {
+  if mode == slates_db::catalog::WriteMode::Forbid {
+    state.count("policy_forbids.merge", 1);
+    return Some(refused(Refusal::PolicyForbids {
+      act: slates_ipc::protocol::WriteAct::Merge,
+      by: slates_ipc::protocol::PolicySubject::Volume {
+        volume: to_wire_volume(by),
+      },
+    }));
+  }
   if evidence.is_empty()
     && matches!(
       crate::merge_service::merge_role(state, green_id),
@@ -6753,16 +8668,380 @@ fn submit(
       })
     )
   {
-    return refused(Refusal::EvidenceRequired);
+    return Some(refused(Refusal::EvidenceRequired));
+  }
+  None
+}
+
+/// What a submit's write policy answers once the increment `inc` of `work` is built (A-285). The volumes' asking `mode`
+/// asks, and so does the caller's own ask policy (`Approval::Held`) whatever their modes, short of their forbidding it
+/// (refused before the seal). An ask merges only the increment an approval names: with none yet it answers what to
+/// approve, and an approval of another increment (the work changed since) is refused. A mode that does not ask, or an
+/// approval of this increment, answers nothing and the merge goes on. Building the increment changed nothing, so an
+/// answer leaves nothing to undo.
+fn approval_answer(
+  mode: slates_db::catalog::WriteMode,
+  approval: Approval,
+  (work, green, inc): (DbVolumeId, DbVolumeId, &slates_merge::engine::Increment),
+  signed: &JudgedSignature,
+) -> Option<ReplyBody> {
+  let asks = mode == slates_db::catalog::WriteMode::Ask
+    || (approval == Approval::Held && mode == slates_db::catalog::WriteMode::Bypass);
+  if !asks {
+    return None;
+  }
+  match approval {
+    Approval::Of(identity) if identity == inc.id => None,
+    Approval::Of(_) => Some(refused(Refusal::GrantMismatch)),
+    Approval::None | Approval::Held => Some(ReplyBody::MergeApprovalRequired {
+      work: to_wire_volume(work),
+      identity: inc.id,
+      paths: u64::try_from(inc.doc.paths.paths().len()).unwrap_or(u64::MAX),
+      statement: crate::signed_work::merge_statement(&work.bytes, &green.bytes, inc.base, &inc.id),
+      verification: signed.verification,
+    }),
+  }
+}
+
+/// A volume's signed-work rules (A-321): its trusted signers and whether its merges must be signed. Read where the
+/// volume's record is: a work's on the work's shard, a green's on its owner's (A-247), so a submit carries its work's
+/// to the verdict ([`SubmitPolicy`]) as it carries its work's merge mode.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SignedRules {
+  /// The trusted signers, in SSH wire form: read only for a submit that carries a signature, the only one they judge.
+  pub(crate) signers: Vec<Vec<u8>>,
+  /// Whether merges from (a work) or into (a green) the volume must be signed.
+  pub(crate) required: bool,
+}
+
+/// Whether `id`'s policy, as its record on this shard holds it, requires signed merges (A-321): never for a volume this
+/// shard does not hold.
+pub(crate) fn requires_signed_merges(state: &ShardState, id: DbVolumeId) -> bool {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .and_then(|record| record.policy.write)
+    .is_some_and(|policy| policy.require_signed_merges)
+}
+
+/// `id`'s trusted signers as its record on this shard holds them (A-321): none, for a volume this shard does not hold.
+pub(crate) fn signers_of(state: &ShardState, id: DbVolumeId) -> &[Vec<u8>] {
+  state
+    .db
+    .partition()
+    .volume(id)
+    .map_or(&[], |record| record.policy.signers.as_slice())
+}
+
+/// A submit's signature as its verdict judged it (A-321): over the merge's statement, under the work's and the green's
+/// trusted signers together.
+struct JudgedSignature {
+  /// Whether the submit carried a signature: its reply is then `SubmittedSigned`.
+  carried: bool,
+  /// How it was judged.
+  verification: slates_ipc::protocol::Verification,
+  /// The volume whose policy requires signed merges, when either does: the work's first, as a tie of merge modes is.
+  required_by: Option<DbVolumeId>,
+}
+
+/// Judges the signature `policy` carries for `inc`, the increment of `work` into `green` (A-321), on the green's owner,
+/// where the green's record is; the work's rules came with the submit. An unsigned submit costs two reads of the
+/// records' flags: the statement is built and the signers parsed only for a signature. Counted per verdict.
+fn judge_signature(
+  state: &mut ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+  inc: &slates_merge::engine::Increment,
+  policy: &SubmitPolicy,
+) -> JudgedSignature {
+  let verification = match policy.signature.as_deref() {
+    None => slates_ipc::protocol::Verification::Unsigned,
+    Some(signature) => {
+      let statement =
+        crate::signed_work::merge_statement(&work.bytes, &green.bytes, inc.base, &inc.id);
+      let trusted = crate::signed_work::trusted_of(
+        policy
+          .work_signed
+          .signers
+          .iter()
+          .chain(signers_of(state, green)),
+      );
+      crate::signed_work::judge(Some(signature), &statement, &trusted)
+    }
+  };
+  if let Some(counter) = crate::signed_work::counter(&verification) {
+    state.count(counter, 1);
+  }
+  let required_by = if policy.work_signed.required {
+    Some(work)
+  } else {
+    requires_signed_merges(state, green).then_some(green)
+  };
+  JudgedSignature {
+    carried: policy.signature.is_some(),
+    verification,
+    required_by,
+  }
+}
+
+/// The refusal a volume's signed-merge requirement makes of `signed` (A-321): `SignatureRequired`, naming the volume
+/// and how the signature was judged, unless it verified. Met in every write mode when the merge would happen: a bypass
+/// merge at once, an asked one at its approval.
+fn refused_unsigned(state: &mut ShardState, signed: &JudgedSignature) -> Option<ReplyBody> {
+  let by = signed.required_by?;
+  if matches!(
+    signed.verification,
+    slates_ipc::protocol::Verification::Verified { .. }
+  ) {
+    return None;
+  }
+  state.count("signature_required.merge", 1);
+  Some(refused(Refusal::SignatureRequired {
+    by: slates_ipc::protocol::PolicySubject::Volume {
+      volume: to_wire_volume(by),
+    },
+    verification: signed.verification,
+  }))
+}
+
+/// A conflict's reply (§4.16): `SubmittedSigned` with how the signature was judged when the submit carried one (A-321),
+/// else `Submitted`. Nothing is recorded for a conflict.
+fn conflicted_reply(
+  windows: &[slates_merge::engine::ConflictWindow],
+  signed: &JudgedSignature,
+) -> ReplyBody {
+  let conflicts = merge_windows(windows);
+  if signed.carried {
+    ReplyBody::SubmittedSigned {
+      version: None,
+      conflicts,
+      verification: signed.verification,
+      conflicts_elided: 0,
+      verdict: 0,
+    }
+  } else {
+    ReplyBody::Submitted {
+      version: None,
+      conflicts,
+      conflicts_elided: 0,
+      verdict: 0,
+    }
+  }
+}
+
+/// The version a submit's reply names as accepted, signed or not (A-321): what a work settles on.
+pub(crate) fn accepted_version(reply: &ReplyBody) -> Option<u64> {
+  match reply {
+    ReplyBody::Submitted {
+      version: Some(version),
+      ..
+    }
+    | ReplyBody::SubmittedSigned {
+      version: Some(version),
+      ..
+    } => Some(*version),
+    _ => None,
+  }
+}
+
+/// What a submit brings its verdict from its write policy (A-285): its work's own merge mode, read on the work's shard
+/// where the work's record is, and what it carries of an approval: none, its caller's own ask (a consumer's session
+/// held it, `SubmitHeld`), or the launcher's approval of one increment, verified before it got here
+/// ([`approval_verifies`]). And its signed work (A-321): the signature it carries, if any, and its work's signed-work
+/// rules, read with the mode. The green's mode and rules are read where the verdict runs.
+#[derive(Clone, Debug)]
+pub(crate) struct SubmitPolicy {
+  /// The work's merge mode ([`merge_mode_of`]).
+  pub(crate) work_mode: slates_db::catalog::WriteMode,
+  /// What the submit carries of an approval.
+  pub(crate) approval: Approval,
+  /// The signature the submit carries over its merge's statement (A-321).
+  pub(crate) signature: Option<Vec<u8>>,
+  /// The work's signed-work rules ([`requires_signed_merges`], [`signers_of`]).
+  pub(crate) work_signed: SignedRules,
+}
+
+impl SubmitPolicy {
+  /// The policy a submit of `work` carrying `approval` and `signature` brings its verdict, read on the work's shard.
+  pub(crate) fn of_work(
+    state: &ShardState,
+    work: DbVolumeId,
+    (approval, signature): (Approval, Option<Vec<u8>>),
+  ) -> SubmitPolicy {
+    SubmitPolicy {
+      work_mode: merge_mode_of(state, work),
+      approval,
+      work_signed: SignedRules {
+        signers: if signature.is_some() {
+          signers_of(state, work).to_vec()
+        } else {
+          Vec::new()
+        },
+        required: requires_signed_merges(state, work),
+      },
+      signature,
+    }
+  }
+}
+
+/// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
+/// declared operations into the canonical document, seal the post-state, hash the identity, and run
+/// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
+/// The verdict is the green's (A-247): here, in this step, when the green is on this shard; otherwise it was asked of
+/// the green's owner by `crate::work_home`, and this settles its answer on the work. The write policy is judged with
+/// the verdict ([`judge_submission`]), where both volumes' modes are known (A-285).
+fn submit(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  (evidence, signature): (Vec<[u8; 32]>, Option<Vec<u8>>),
+  approval: Approval,
+) -> ReplyBody {
+  let (work_id, green_id) =
+    match crate::merge_service::require_work(state, principal, work, false, "submit") {
+      Ok((record, green)) => (record.id, green),
+      Err(refusal) => return refused(refusal),
+    };
+  let reply = match state.work_home.verdict.take() {
+    Some(reply) => {
+      // The owner's verdict on a submit the work recorded as pending (A-247): settled here, in this transaction.
+      if let Err(e) = settle_pending(state, work_id) {
+        return refused(refusal_of_db(&e));
+      }
+      reply
+    }
+    None => {
+      // The restatement an acceptance records must fit before the verdict (A-207), so a submit is refused rather than
+      // accepted with the work's log unable to record it.
+      let now = state.clock.monotonic_ns();
+      if let Err(refusal) = reset_would_fit(state, work_id, now) {
+        return refused(refusal);
+      }
+      let Some(sealed) = take_sealed(state, work_id) else {
+        return refused(Refusal::NotFound);
+      };
+      let policy = SubmitPolicy::of_work(state, work_id, (approval, signature));
+      let reply = judge_submission(state, &sealed, evidence, policy);
+      put_back_sealed(state, sealed);
+      reply
+    }
+  };
+  settle_submit(state, work_id, green_id, reply)
+}
+
+/// Ends the work creation pending under `name` (A-247), in the running verb's transaction.
+pub(crate) fn settle_creation(
+  state: &mut ShardState,
+  name: &str,
+) -> Result<(), slates_db::DbError> {
+  if state.db.partition().pending_creation(name).is_none() {
+    return Ok(());
+  }
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(
+      &mut state.segment,
+      &Op::WorkCreationSettled {
+        name: name.to_owned(),
+      },
+      now,
+    )
+    .map(|_| ())
+}
+
+/// Clears `work`'s pending submit (A-247), in the transaction that settles its verdict.
+fn settle_pending(state: &mut ShardState, work: DbVolumeId) -> Result<(), slates_db::DbError> {
+  if state.db.partition().pending_submit(work).is_none() {
+    return Ok(());
+  }
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &Op::WorkSubmitSettled { work }, now)
+    .map(|_| ())
+}
+
+/// Settles a verdict on the work, in the verb's transaction: an accept moves the work's base to the new version and
+/// clears what it held, and tells the green's owner the floor moved; a conflict is kept with the work
+/// ([`kept_conflict`]). Anything else leaves the work as it was.
+fn settle_submit(
+  state: &mut ShardState,
+  work_id: DbVolumeId,
+  green_id: DbVolumeId,
+  reply: ReplyBody,
+) -> ReplyBody {
+  let Some(version) = accepted_version(&reply) else {
+    return kept_conflict(state, work_id, reply);
+  };
+  // A retry's answer for a work already past that version has nothing left to settle. At that very version it resets
+  // again, which an identical increment's accept needs (its version is the head the work is based on).
+  if state
+    .works
+    .get(&work_id)
+    .is_none_or(|w| w.base_version > version)
+  {
+    return reply;
+  }
+  let now = state.clock.monotonic_ns();
+  if let Err(e) = state.db.mutate(
+    &mut state.segment,
+    &restatement(work_id, &accepted_restatement(version)),
+    now,
+  ) {
+    return refused(refusal_of_db(&e));
+  }
+  reset_accepted_work(state, work_id, version);
+  crate::work_home::tell_floor(state, green_id, work_id, Some(version));
+  reply
+}
+
+/// The owner's half of a submit (§4.16, A-247): judges a work's sealed increment against the green and commits it, as
+/// the single serialized step of the green. Runs in the transaction of the verb that asked, whether on this shard or
+/// through [`owner_judge`]. The work's own reset is the caller's to settle.
+fn judge_submission(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+  policy: SubmitPolicy,
+) -> ReplyBody {
+  let green_id = sealed.green;
+  // The write policy (A-285): the stricter of the work's merge mode, read on the work's shard and carried here, and the
+  // green's, read here. A forbidding mode refuses before the increment is built; an asking one, or the caller's own
+  // ask (`Approval::Held`), is answered below, once the increment it would approve is known. Read here alone, a work on
+  // another shard than its green would merge under the green's mode only, since this partition holds no record of it
+  // (A-247).
+  let (mode, by) = stricter_merge_mode(
+    (policy.work_mode, sealed.work),
+    (merge_mode_of(state, green_id), green_id),
+  );
+  if let Some(refusal) = refused_before_the_seal(state, (mode, by), green_id, &evidence) {
+    return refusal;
   }
   // The submission barrier (§4.16 "Submission": "seal the work volume"): the seal is taken here, in
   // this verb, on the single-threaded owner shard — every declared operation before it is in the
   // increment, and a write that arrives after it is a later verb that lands in the next increment,
   // never this one.
-  let (green_id, inc) = match build_increment(state, work_id, evidence) {
+  let (green_id, inc) = match build_increment(state, sealed, evidence) {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
+  // Signed work (A-321): the signature is judged over the merge's statement, once the increment it names is built. It
+  // permits nothing — the modes above did — and is recorded with the version as its provenance. An asked merge answers
+  // with the verdict, so the approver sees it and a signer learns the statement from a held submit, whatever the
+  // requirement; a volume that requires signed merges refuses one that did not verify when it would merge, here.
+  let signed = judge_signature(state, (sealed.work, green_id), &inc, &policy);
+  if let Some(answer) = approval_answer(
+    mode,
+    policy.approval,
+    (sealed.work, green_id, &inc),
+    &signed,
+  ) {
+    return answer;
+  }
+  if let Some(refusal) = refused_unsigned(state, &signed) {
+    return refusal;
+  }
   // The increment is recorded durably so a restart replays it (§4.8, §4.16). Guard-then-apply: the
   // chain must be able to hold it *before* the verdict commits, so an accepted increment is always
   // recorded — otherwise a full-chain refusal after an in-memory commit would strand the green ahead
@@ -6780,18 +9059,18 @@ fn submit(
   if let Err(refusal) = chain_admits(state, green_id, &admission, now) {
     return refused(refusal);
   }
-  // So is the work's restatement an acceptance records with it (A-207): guard-then-apply, the whole submit is refused
-  // before the verdict rather than after the chain moved.
-  let reset = restatement(work_id, &accepted_restatement(inc.base));
-  if let Err(e) = state.db.partition().check(&reset, now) {
-    return refused(refusal_of_db(&e));
-  }
   // Charge superseded values before the verdict. Incoming bytes do not bound the retained
   // history: unlink carries none and a short overwrite retains the complete previous file.
   let Some(engine) = state.greens.get(&green_id) else {
     return refused(Refusal::NotFound);
   };
-  let secured = u64::try_from(engine.history_reservation(&inc)).unwrap_or(u64::MAX);
+  // The change index grows with the version too (A-264), charged with the history it indexes.
+  let secured = u64::try_from(
+    engine
+      .history_reservation(&inc)
+      .saturating_add(engine.changes_reservation(&inc)),
+  )
+  .unwrap_or(u64::MAX);
   // An accepted work is reset to its green at the new version, where it holds nothing of its own
   // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
@@ -6845,24 +9124,16 @@ fn submit(
       // The durable head is the checkpoint's version and the increments after it (W3).
       if let Err(refusal) = record_accepted(
         state,
-        green_id,
+        (green_id, sealed.work),
         version,
         (&increment_bytes, &inc),
-        applied.as_deref(),
+        (applied.as_deref(), &signed.verification),
       ) {
         return refused(refusal);
       }
-      if let Err(e) = state.db.mutate(
-        &mut state.segment,
-        &restatement(work_id, &accepted_restatement(version)),
-        now,
-      ) {
-        return refused(refusal_of_db(&e));
-      }
-      reset_accepted_work(state, work_id, version);
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
-      let completion = crate::merge_service::SubmitCompletion::of_current(state);
+      let completion = crate::merge_service::SubmitCompletion::of_current(state, sealed.work);
       crate::merge_service::enqueue_record(
         state,
         green_id,
@@ -6870,14 +9141,12 @@ fn submit(
         inc.id,
         inc.base,
         inc.evidence,
-        (completion, Some(work_id)),
+        (completion, Some(sealed.work)),
       );
-      // The work's base moved to the version, so the reachable floor may have risen: fold the histories
-      // to it and true the retention charge up to what the commit retained (the secured surplus credited).
-      // A settle after an accept only credits: nothing was retained beyond what was secured.
+      // True the retention charge up to what the commit retained (the secured surplus credited). A settle after an
+      // accept only credits: nothing was retained beyond what was secured. The work's floor moves when it has settled
+      // (`crate::work_home::tell_floor`), which folds the histories and may checkpoint the chain (W3).
       let _ = crate::merge_service::settle_green_retention(state, green_id);
-      // And the durable chain may be folded to it (W3): a checkpoint at the floor replaces the increments below.
-      crate::merge_service::checkpoint_green(state, green_id);
       // The acceptance is published only once the version's merge record is **committed at the
       // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
       // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
@@ -6888,18 +9157,16 @@ fn submit(
       if crate::merge_service::placed_version(state, object).is_none_or(|placed| placed < version) {
         crate::merge_service::defer_acceptance(state, green_id, version);
       }
-      ReplyBody::Submitted {
-        version: Some(version),
-        conflicts: Vec::new(),
-      }
+      // The version's own record answers (A-321): the signature recorded with it, which for an increment the engine
+      // had accepted before is that first submit's.
+      crate::merge_service::accepted_reply(state, green_id, version)
     }
     slates_merge::engine::Outcome::Conflict { windows } => {
       // The work is not reset: the bound secured for a reset is released.
       settle_after_conflict(state, green_id, &inc.id);
-      ReplyBody::Submitted {
-        version: None,
-        conflicts: merge_windows(&windows),
-      }
+      // Every window, for the work's shard to keep with the work and carry as far as one reply holds
+      // ([`kept_conflict`], A-267): this may be the green's owner, which holds no work on another shard.
+      conflicted_reply(&windows, &signed)
     }
     // A base below the green's checkpoint (W3) is no live reader's, so it is unknown: never judged, and nothing
     // retained, so the bytes secured are credited back.
@@ -6918,15 +9185,19 @@ fn submit(
 /// last accept (a work destroyed or rebased), and a full chain refuses every submit whose accept would take the
 /// checkpoint, so without it the green stayed full for good. What is still full is refused `TableAtCapacity`.
 /// Appends accepted `version`'s entry to `green`'s durable chain, unless an idempotent accept already holds it (A-257): the
-/// increment as submitted and what its verdict resolved it to. At a version whose record goes to holders the head's identity
-/// is read anyway, and goes beside it for a replay to compare; at `f = 0` the entries after the last checkpoint are checked
-/// by their digest alone.
+/// increment as submitted and what its verdict resolved it to, with the completion key of the submit from `work` that made
+/// it (A-255, A-288) and how its signature was judged (A-321: the version's provenance). At a version whose record goes to
+/// holders the head's identity is read anyway, and goes beside it for a replay to compare; at `f = 0` the entries after
+/// the last checkpoint are checked by their digest alone.
 fn record_accepted(
   state: &mut ShardState,
-  green: DbVolumeId,
+  (green, work): (DbVolumeId, DbVolumeId),
   version: u64,
   (increment_bytes, increment): (&[u8], &slates_merge::engine::Increment),
-  applied: Option<&[slates_merge::chain_entry::Applied]>,
+  (applied, verification): (
+    Option<&[slates_merge::chain_entry::Applied]>,
+    &slates_ipc::protocol::Verification,
+  ),
 ) -> Result<(), Refusal> {
   if state.db.partition().green_head(green) >= version {
     return Ok(());
@@ -6945,17 +9216,26 @@ fn record_accepted(
       increment_bytes,
       increment,
       applied.unwrap_or_default(),
-      crate::merge_service::SubmitCompletion::of_current(state)
+      crate::merge_service::SubmitCompletion::of_current(state, work)
         .map(crate::merge_service::SubmitCompletion::to_entry),
       identity,
+      crate::signed_work::to_entry(verification),
     ),
   };
   let now = state.clock.monotonic_ns();
   state
     .db
     .mutate(&mut state.segment, &record, now)
-    .map(|_| ())
-    .map_err(|e| refusal_of_db(&e))
+    .map_err(|e| refusal_of_db(&e))?;
+  // The version's provenance (A-321), once its entry is durable: what the version's answers and its merge record read,
+  // and what a checkpoint keeps when it folds the entry.
+  if let (Some(signature), Some(engine)) = (
+    crate::signed_work::to_entry(verification),
+    state.greens.get_mut(&green),
+  ) {
+    engine.record_signature(version, signature);
+  }
+  Ok(())
 }
 
 fn chain_admits(
@@ -6987,7 +9267,11 @@ fn reset_accepted_work(state: &mut ShardState, work_id: DbVolumeId, version: u64
   w.base_version = version;
   w.journal.clear();
   w.files.clear();
+  // The entries were the old base's (A-247).
+  w.entries.clear();
   w.revision = w.revision.wrapping_add(1);
+  // Accepted: no conflicting verdict stands, so a read of an earlier one is refused (A-267).
+  w.verdict = None;
   // The recount of what it now keeps: nothing, so the charge only falls and cannot be refused.
   let kept = crate::work_charge::footprint(&w.files, &w.journal);
   let _ = crate::work_charge::set_to(state, work_id, kept);
@@ -7012,16 +9296,38 @@ fn settle_after_conflict(state: &mut ShardState, green_id: DbVolumeId, increment
 /// journal in head coordinates so a later submit composes with no further mapping. A conflict returns
 /// the windows and changes nothing. The green is never changed by a rebase.
 fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> ReplyBody {
-  let work_id = match crate::merge_service::require_work(state, principal, work, false, "rebase") {
-    Ok((record, _)) => record.id,
-    Err(refusal) => return refused(refusal),
+  let (work_id, green_id) =
+    match crate::merge_service::require_work(state, principal, work, false, "rebase") {
+      Ok((record, green)) => (record.id, green),
+      Err(refusal) => return refused(refusal),
+    };
+  let answer = match state.work_home.rebased.take() {
+    Some(answer) => answer,
+    None => {
+      let Some(sealed) = take_sealed(state, work_id) else {
+        return refused(Refusal::NotFound);
+      };
+      let answer = map_rebase(state, &sealed);
+      put_back_sealed(state, sealed);
+      answer
+    }
   };
-  let (green_id, inc) = match build_increment(state, work_id, Vec::new()) {
+  settle_rebase(state, work_id, green_id, answer)
+}
+
+/// The owner's half of a rebase (A-247): maps a work's sealed increment through the green's deltas. The green is never
+/// changed by a rebase.
+fn map_rebase(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+) -> crate::work_home::RebaseAnswer {
+  use crate::work_home::RebaseAnswer;
+  let (green_id, inc) = match build_increment(state, sealed, Vec::new()) {
     Ok(built) => built,
-    Err(refusal) => return refused(refusal),
+    Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
   };
   let Some(engine) = state.greens.get_mut(&green_id) else {
-    return refused(Refusal::NotFound);
+    return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
   match engine.rebase(&inc) {
     slates_merge::engine::Rebased::Rebased {
@@ -7029,55 +9335,304 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
       changed,
       journal,
     } => {
-      // The work moves onto the head; the green is untouched. The engine returns only what the work's mapped edits
-      // leave different from the head (`Rebased::changed`), which becomes the work's delta over its new base
-      // (`crate::work_files`): O(what the work changed). The restatement's log entry is checked first (A-207), then
-      // its new footprint is charged: refused either way, the work stays where it was. `build_increment` proved the
-      // work exists, so this lookup finds it.
-      let changed = crate::work_files::WorkFiles::from_changed(changed);
-      let wanted = crate::work_charge::footprint(&changed, &journal);
-      let op = restatement(
-        work_id,
-        &crate::work_log::WorkLogEntry::restated(version, &changed, &journal),
-      );
-      let now = state.clock.monotonic_ns();
-      if let Err(e) = state.db.partition().check(&op, now) {
-        return refused(refusal_of_db(&e));
-      }
-      let charged_before = state.works.get(&work_id).map_or(0, |w| w.charged);
-      if let Err(available) = crate::work_charge::set_to(state, work_id, wanted) {
-        return refused(Refusal::BudgetExceeded { available });
-      }
-      if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
-        // Not recorded, so the work stays where it was and so does its charge (a return to what it held cannot be
-        // refused).
-        let _ = crate::work_charge::set_to(state, work_id, charged_before);
-        return refused(refusal_of_db(&e));
-      }
-      if let Some(w) = state.works.get_mut(&work_id) {
-        w.files = changed;
-        w.base_version = version;
-        w.journal = journal;
-        w.revision = w.revision.wrapping_add(1);
-      }
-      // The work's base rose, so the reachable floor may have: fold the green's histories to it and
-      // credit the retention released (a settle after a rise only credits).
-      let _ = crate::merge_service::settle_green_retention(state, green_id);
-      ReplyBody::Rebased {
-        version: Some(version),
-        conflicts: Vec::new(),
+      // A work that composed its own increment composes its next one too: it is given the entries it will need.
+      let entries = if sealed.composed.is_some() {
+        journal
+          .iter()
+          .flat_map(VolumeOp::names)
+          .flatten()
+          .map(|path| (path.to_owned(), engine.path_base(version, path)))
+          .collect()
+      } else {
+        std::collections::BTreeMap::new()
+      };
+      RebaseAnswer::Rebased {
+        version,
+        changed,
+        journal,
+        entries,
       }
     }
-    slates_merge::engine::Rebased::Conflict { windows } => ReplyBody::Rebased {
-      version: None,
-      conflicts: merge_windows(&windows),
-    },
+    slates_merge::engine::Rebased::Conflict { windows } => {
+      // Every window, for the work's shard to keep with the work and carry as far as one reply holds
+      // ([`kept_conflict`], A-267): this may be the green's owner, which holds no work on another shard.
+      RebaseAnswer::Reply(ReplyBody::Rebased {
+        version: None,
+        conflicts: merge_windows(&windows),
+        conflicts_elided: 0,
+        verdict: 0,
+      })
+    }
     // A base below the green's checkpoint (W3): unknown, as the submit answers it.
-    slates_merge::engine::Rebased::BaseUnavailable { base, .. } => refused(Refusal::UnknownBase {
-      green: to_wire_volume(green_id),
-      version: base,
-    }),
+    slates_merge::engine::Rebased::BaseUnavailable { base, .. } => {
+      RebaseAnswer::Reply(refused(Refusal::UnknownBase {
+        green: to_wire_volume(green_id),
+        version: base,
+      }))
+    }
   }
+}
+
+/// Settles a rebase on the work: the work moves onto the head; the engine returned only what the work's mapped edits
+/// leave different from the head (`Rebased::changed`), which becomes the work's delta over its new base
+/// (`crate::work_files`): O(what the work changed). The restatement's log entry is checked first (A-207), then its new
+/// footprint is charged: refused either way, the work stays where it was.
+fn settle_rebase(
+  state: &mut ShardState,
+  work_id: DbVolumeId,
+  green_id: DbVolumeId,
+  answer: crate::work_home::RebaseAnswer,
+) -> ReplyBody {
+  let (version, changed, journal, entries) = match answer {
+    crate::work_home::RebaseAnswer::Rebased {
+      version,
+      changed,
+      journal,
+      entries,
+    } => (version, changed, journal, entries),
+    crate::work_home::RebaseAnswer::Reply(reply) => return kept_conflict(state, work_id, reply),
+  };
+  let changed = crate::work_files::WorkFiles::from_changed(changed);
+  let wanted = crate::work_charge::footprint(&changed, &journal).saturating_add(
+    entries
+      .iter()
+      .map(|(path, base)| crate::work_charge::base_footprint(path, base))
+      .fold(0, u64::saturating_add),
+  );
+  let op = restatement(
+    work_id,
+    &crate::work_log::WorkLogEntry::restated(version, &changed, &journal),
+  );
+  let now = state.clock.monotonic_ns();
+  if let Err(e) = state.db.partition().check(&op, now) {
+    return refused(refusal_of_db(&e));
+  }
+  let charged_before = state.works.get(&work_id).map_or(0, |w| w.charged);
+  if let Err(available) = crate::work_charge::set_to(state, work_id, wanted) {
+    return refused(Refusal::BudgetExceeded { available });
+  }
+  if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+    // Not recorded, so the work stays where it was and so does its charge (a return to what it held cannot be
+    // refused).
+    let _ = crate::work_charge::set_to(state, work_id, charged_before);
+    return refused(refusal_of_db(&e));
+  }
+  if let Some(w) = state.works.get_mut(&work_id) {
+    w.files = changed;
+    w.base_version = version;
+    w.journal = journal;
+    w.entries = entries;
+    w.revision = w.revision.wrapping_add(1);
+    // Rebased: no conflicting verdict stands (A-267).
+    w.verdict = None;
+  }
+  // The work's base rose, so the reachable floor may have: the owner's floor moves, folds the green's histories to it
+  // and credits the retention released.
+  crate::work_home::tell_floor(state, green_id, work_id, Some(version));
+  ReplyBody::Rebased {
+    version: Some(version),
+    conflicts: Vec::new(),
+    conflicts_elided: 0,
+    verdict: 0,
+  }
+}
+
+/// A transaction of one op on this partition, for what the green's owner records on a work's behalf (A-247).
+fn owner_record(state: &mut ShardState, op: &Op) -> Result<(), slates_db::DbError> {
+  let now = state.clock.monotonic_ns();
+  state.db.begin();
+  let applied = state.db.mutate(&mut state.segment, op, now);
+  match (applied, state.db.commit(&mut state.segment)) {
+    (Ok(_), Ok(_)) => Ok(()),
+    (Err(error), _) | (_, Err(error)) => {
+      reconcile_unpublished_effects(state);
+      Err(error)
+    }
+  }
+}
+
+/// Admits a work over `green` for its own partition (A-247): the rights a creation needs and the green's head, the
+/// work's floor recorded with it.
+pub(crate) fn owner_admit(
+  state: &mut ShardState,
+  principal: &Principal,
+  green: DbVolumeId,
+  work: DbVolumeId,
+) -> Result<crate::work_home::Admitted, Refusal> {
+  let record =
+    crate::merge_service::require_green(state, principal, to_wire_volume(green), "create_work")?;
+  let engine = state.greens.get(&record.id).ok_or(Refusal::NotFound)?;
+  let base = engine.head();
+  owner_record(
+    state,
+    &Op::WorkFloorSet {
+      green: record.id,
+      work,
+      base,
+    },
+  )
+  .map_err(|error| refusal_of_db(&error))?;
+  Ok(crate::work_home::Admitted { id: work, base })
+}
+
+/// The base's bytes of `paths` for a verb on a work's shard (A-247).
+pub(crate) fn owner_files(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+  paths: &[String],
+) -> crate::work_files::FetchedBase {
+  let mut fetched = crate::work_files::FetchedBase::default();
+  let Some(engine) = state.greens.get(&green) else {
+    fetched.gone = true;
+    return fetched;
+  };
+  for path in paths {
+    let file = engine
+      .content_ref_at(path, version)
+      .map(std::borrow::Cow::into_owned);
+    fetched.files.insert(path.clone(), file);
+    // With the path's base entries, so the work composes its increment itself (A-247).
+    fetched
+      .entries
+      .insert(path.clone(), engine.path_base(version, path));
+  }
+  fetched
+}
+
+/// A page of the base's `path` for a paged read on a work's shard (A-247).
+pub(crate) fn owner_page(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+  path: String,
+  (offset, want): (u64, u64),
+) -> crate::work_files::FetchedBase {
+  let mut fetched = crate::work_files::FetchedBase::default();
+  let Some(engine) = state.greens.get(&green) else {
+    fetched.gone = true;
+    return fetched;
+  };
+  let page = engine.content_page_at(&path, version, (offset, want));
+  fetched.page = Some(crate::work_files::FetchedPage {
+    path,
+    offset,
+    answer: page,
+  });
+  fetched
+}
+
+/// Every file of the base with its length, for a listing or a status on a work's shard (A-247).
+pub(crate) fn owner_sizes(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> crate::work_files::FetchedBase {
+  let mut fetched = crate::work_files::FetchedBase::default();
+  let Some(engine) = state.greens.get(&green) else {
+    fetched.gone = true;
+    return fetched;
+  };
+  fetched.sizes = Some(
+    engine
+      .file_lens_at(version)
+      .into_iter()
+      .map(|(path, len)| (path.to_owned(), u64::try_from(len).unwrap_or(u64::MAX)))
+      .collect(),
+  );
+  fetched
+}
+
+/// The owner's step of a submit asked from a work's shard (A-247): the request's completion is the owner's to keep, so
+/// a retry meets it whatever the work now holds. Returns the reply, or `None` when the acceptance waits for its record
+/// to commit at the quorum (AUD-11) or joined one that does; `back` then carries it to the work's shard.
+pub(crate) fn owner_judge(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  (sealed, evidence, policy): (crate::work_home::SealedWork, Vec<[u8; 32]>, SubmitPolicy),
+  back: crate::merge_service::ReplyRoute,
+) -> Option<ReplyBody> {
+  match state
+    .db
+    .partition()
+    .completion(origin, id.client, id.sequence)
+  {
+    Seen::Completed(bytes) => {
+      return Some(
+        ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest)),
+      );
+    }
+    Seen::Acknowledged => return Some(refused(Refusal::DuplicateRequest)),
+    // It ran and waits for its version's commit (A-252): answered, or joined to the wait with this route, never run
+    // again, whatever the work sends now.
+    Seen::Awaiting { object, version } => {
+      state.reply_route = Some(back);
+      let answered = crate::merge_service::serve_awaiting(state, origin, id, (object, version));
+      state.reply_route = None;
+      return answered;
+    }
+    Seen::New => {
+      state.reply_route = Some(back);
+      if crate::merge_service::join_awaiting(state, origin, id) {
+        state.reply_route = None;
+        return None;
+      }
+      state.reply_route = None;
+    }
+  }
+  let verb = RequestBody::Submit {
+    work: to_wire_volume(sealed.work),
+    evidence: Vec::new(),
+  };
+  if let Some(owed) = acknowledgement_owed(state, origin, id.client, &verb) {
+    return Some(owed);
+  }
+  state.db.begin();
+  state.current_request = Some((origin, id));
+  state.reply_route = Some(back);
+  let reply = judge_submission(state, &sealed, evidence, policy);
+  state.current_request = None;
+  state.reply_route = None;
+  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let reply = if deferred {
+    reply
+  } else {
+    record_completion(state, origin, id, reply)
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => (!deferred).then_some(reply),
+    Err(error) => {
+      reconcile_unpublished_effects(state);
+      Some(refused(refusal_of_db(&error)))
+    }
+  }
+}
+
+/// The owner's step of a rebase asked from a work's shard (A-247): nothing of the green changes, so it records nothing
+/// and a retry runs it again.
+pub(crate) fn owner_rebase(
+  state: &mut ShardState,
+  sealed: crate::work_home::SealedWork,
+) -> crate::work_home::RebaseAnswer {
+  map_rebase(state, &sealed)
+}
+
+/// Moves or releases a work's floor on its green's partition, and folds what that frees (A-247).
+pub(crate) fn owner_floor(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  work: DbVolumeId,
+  base: Option<u64>,
+) {
+  let op = match base {
+    Some(base) => Op::WorkFloorSet { green, work, base },
+    None => Op::WorkFloorDropped { green, work },
+  };
+  if owner_record(state, &op).is_err() {
+    return;
+  }
+  let _ = crate::merge_service::settle_green_retention(state, green);
+  crate::merge_service::checkpoint_green(state, green);
 }
 
 fn clone(
@@ -7135,6 +9690,12 @@ pub(crate) fn name_held(state: &ShardState, name: &str) -> Option<VolumeId> {
         .name_alias(name)
         .map(|alias| to_wire_volume(alias.volume))
     })
+    .or_else(|| {
+      // A work being admitted by its green's owner holds its name meanwhile (A-247).
+      partition
+        .pending_creation(name)
+        .map(|pending| to_wire_volume(pending.work))
+    })
 }
 
 /// Records one step of a name alias on this, the name's, partition (A-236): its own durable record.
@@ -7183,7 +9744,7 @@ fn clone_named_elsewhere(
         confirmed: false,
       },
     };
-    let reserved = crate::xshard::call_within(
+    let reserved = crate::xshard::call_in_shard_time(
       this,
       name_shard,
       move |s| alias_step(s, &reservation),
@@ -7210,7 +9771,7 @@ fn clone_named_elsewhere(
       } else {
         Op::NameAliasReleased { name }
       };
-      let settled = crate::xshard::call_within(
+      let settled = crate::xshard::call_in_shard_time(
         this,
         name_shard,
         move |s| alias_step(s, &settle),
@@ -7315,19 +9876,17 @@ pub(crate) fn admit_clone(
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
+        return Err(Box::new(refused(refusal_of_mem(&e))));
       }
     },
     SizeClass::Dynamic { .. } => None,
   };
-  // Reserve the clone's inode allowance against the version slab *before* cloning (§4.2: reserve all
-  // credits or none before publishing), so a refusal allocates nothing and does not leave the
-  // origin's `clone_refs` bumped. A clone shares its origin's versions until it diverges, so it
-  // reserves the whole allowance — a create's fair share, but never below the count it inherits from
-  // the origin (equal to the origin's live count at clone time) — as the sacred claim that backs full
-  // divergence of the inherited inodes. If the slab cannot back it, the clone is refused.
+  // Take the clone's version slots *before* cloning (§4.2: reserve all credits or none before publishing), so a refusal
+  // allocates nothing and does not leave the origin's `clone_refs` bumped. A clone shares its origin's versions until
+  // it diverges. A bounded clone reserves its whole allowance — a create's fair share, but never below the count it
+  // inherits from the origin (equal to the origin's live count at clone time) — as the sacred claim that backs full
+  // divergence of the inherited inodes. A dynamic clone holds slots for the inodes it inherits only, from the
+  // unpromised capacity, and grows its hold as it makes more (A-342). If the slab cannot back them, the clone is refused.
   let inherited = match state.volumes.get(handle) {
     Ok(slot) => slot.volume.inode_usage().0,
     Err(_) => {
@@ -7341,7 +9900,13 @@ pub(crate) fn admit_clone(
     }
   };
   let clone_allowance = inode_allowance(state, size).max(inherited);
-  let version_credit = match state.store.versions.reserve(clone_allowance) {
+  let dynamic = matches!(size, SizeClass::Dynamic { .. });
+  let taken = if dynamic {
+    state.store.versions.grow(inherited)
+  } else {
+    state.store.versions.reserve(clone_allowance)
+  };
+  let version_credit = match taken {
     Ok(c) => Some(c),
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
       return Err(Box::new(give_back(
@@ -7358,9 +9923,7 @@ pub(crate) fn admit_clone(
         reservation,
         None,
         None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )));
     }
   };
@@ -7394,7 +9957,36 @@ pub(crate) fn admit_clone(
       )));
     }
   };
+  // A clone of a captured base holds its whole tree and has no base directory (A-291); any other overlay's clone reads
+  // the same base directories through a host of its own, made before the clone pins the snapshot so a refusal here has
+  // nothing to unpin.
+  let captured = state
+    .db
+    .partition()
+    .is_captured(record.id, to_db_snapshot(snapshot));
+  let host = match if captured {
+    Ok(None)
+  } else {
+    clone_base_host(state, handle, record)
+  } {
+    Ok(host) => host,
+    Err(refusal) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        version_credit,
+        metadata_credit,
+        refusal,
+      )));
+    }
+  };
   let cloned = match state.volumes.get_mut(handle) {
+    Ok(slot) if captured => Volume::clone_without_base(
+      &state.store,
+      &mut slot.volume,
+      core_snapshot(snapshot),
+      config,
+    ),
     Ok(slot) => Volume::clone_of(
       &state.store,
       &mut slot.volume,
@@ -7428,9 +10020,17 @@ pub(crate) fn admit_clone(
   // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
   let allowed = volume_core.set_inode_allowance(clone_allowance);
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
+  // A dynamic clone's slots become its version hold, returned with it at teardown, never a reserved credit (A-342).
+  let version_credit = match version_credit {
+    Some(credit) if dynamic => {
+      volume_core.adopt_version_hold(credit.slots);
+      None
+    }
+    credit => credit,
+  };
   Ok(Admitted {
     volume: volume_core,
-    host: None,
+    host,
     credits: Credits {
       reservation,
       version: version_credit,
@@ -7496,6 +10096,14 @@ pub(crate) fn publish_clone_as(
   new_record.access = Vec::new();
   new_record.lease = None;
   new_record.created_ns = now;
+  // A clone of a captured base holds its whole tree and reads no base directory (A-291).
+  if state
+    .db
+    .partition()
+    .is_captured(record.id, to_db_snapshot(snapshot))
+  {
+    new_record.base = BaseRecord::Scratch;
+  }
   let ops = [
     Op::VolumeCreated { record: new_record },
     Op::LineageAdded {
@@ -7518,21 +10126,22 @@ pub(crate) fn publish_clone_as(
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
     discard_clone(state, origin, snapshot, admitted);
-    return Err(Refusal::BadRequest {
-      reason: format!("volume registry full at {full}"),
-    });
+    return Err(refusal_of_mem(&slates_mem::MemError::SlabFull {
+      capacity: full,
+    }));
   }
   let Admitted {
     volume: mut volume_core,
+    host,
     credits,
-    ..
   } = admitted;
   crate::content_cipher::key_volume(&mut state.store, &mut volume_core, id.bytes);
   let slot = VolumeSlot {
     id,
     name: name.to_owned(),
     volume: volume_core,
-    host: None,
+    // An overlay's clone keeps the host its admission duplicated from its origin's (AC-1.16).
+    host,
     reservation: credits.reservation,
     version_credit: credits.version,
     metadata_credit: credits.metadata,
@@ -7551,9 +10160,7 @@ pub(crate) fn publish_clone_as(
         credits.version,
         credits.metadata,
       );
-      Err(Refusal::BadRequest {
-        reason: e.to_string(),
-      })
+      Err(refusal_of_mem(&e))
     }
   }
 }
@@ -7657,6 +10264,7 @@ fn attach(
     ),
   };
   let attachment = next_attachment_id(state);
+  let termed = matches!(consumer, Consumer::Termed { .. });
   let token = match capability_token(borrows_mount) {
     Ok(token) => token,
     Err(refusal) => return refused(refusal),
@@ -7683,6 +10291,12 @@ fn attach(
   }
   if let Err(refusal) = commit_attachment(state, &record, &form, attachment_record, now) {
     return refused(refusal);
+  }
+  if termed {
+    // Its making is its holder's first use: the gaps its term follows are measured from here (A-384).
+    state
+      .attachment_paces
+      .insert(attachment, crate::state::AttachmentPace::begun(now));
   }
   capability.read_write = read_write_of(intent);
   ReplyBody::Attached {
@@ -8251,23 +10865,122 @@ pub(crate) fn consumer_of(
   }
 }
 
-/// A CLI attachment's term (A-230, §4.7): the operator's failover SLO, as the write lease's (`take_write_lease`). The
-/// attachment holds the volume's write lease for an attach-for-write, so its term is the lease's: a renewal by each verb
-/// naming it keeps both for a user at work, and an abandoned one lets the lease go within one term, past which the
-/// failover SLO would be broken for any other writer anyway.
-pub(crate) fn attachment_term(state: &ShardState) -> u64 {
-  derived!(
-    state.config.failover_slo_ns,
-    "the operator's failover SLO, the write lease's term (a renewal is a verb's own round trip, microseconds)",
-    ["failover_slo_ns"]
-  )
-  .get()
+/// A CLI attachment's term (A-230, A-384, §4.7): the longest it may go unused before it lapses with the write lease it
+/// holds, its holder's own. At most this node's failover delay (`ShardState::failover_ns`, A-363): an abandoned attachment
+/// holds the volume's write lease no longer than a failover would leave the volume unserved, past which any other
+/// writer's failover delay would be broken anyway (A-230's bound). Within it, its holder's pace: the tail of the gaps
+/// between its uses (RFC 6298's estimator, `smoothed + 4·deviation`, as the failover estimate's terms) plus a liveness
+/// window, the lateness by which a live party may fall behind before it is judged (A-228) — an accrual term per holder
+/// (Hayashibara et al. 2004, judged at the estimator's tail). So a holder that renews at a steady pace (`slates attach
+/// --hold`, the library's and the SDKs' attachment objects, which renew at the cadence the `Renewed` reply names,
+/// [`renewal_cadence`]) is judged by its own pace, and one with no pace measured yet (just made, or recovered by a restart, or used by verbs
+/// alone a term apart) has the failover delay.
+pub(crate) fn attachment_term(state: &ShardState, attachment: u64) -> u64 {
+  let ceiling = state.failover_ns.max(1);
+  state
+    .attachment_paces
+    .get(&attachment)
+    .and_then(|pace| pace.gaps.tail_ns())
+    .map_or(ceiling, |tail| {
+      tail
+        .saturating_add(crate::daemon::LIVENESS_BUDGET_NS)
+        .min(ceiling)
+    })
 }
 
-/// When a CLI attachment made or renewed now lapses (A-230): one [`attachment_term`] from the shard's clock.
+/// When a CLI attachment made now lapses (A-230, A-384): one term from the shard's clock, its holder's pace not yet
+/// measured, so the failover delay ([`attachment_term`]).
 pub(crate) fn termed_expiry(state: &mut ShardState) -> u64 {
-  let term = attachment_term(state);
+  let term = state.failover_ns.max(1);
   state.clock.monotonic_ns().saturating_add(term)
+}
+
+/// The `Renew` verb (A-384): a holder's renewal of its CLI attachment's term, and nothing else. Renewed by
+/// [`use_attachment`] as any verb naming it is, and answered the term now in force and the cadence the holder renews at
+/// ([`renewal_cadence`]). Refused as any use is (`AttachmentExpired` past its term, `NotFound` for no such attachment);
+/// another principal's is `Forbidden`, its use having renewed nothing; and an attachment with no term (a mount's,
+/// which renews through its own activity) is a bad request.
+fn renew(state: &mut ShardState, principal: &Principal, attachment: u64) -> ReplyBody {
+  if let Err(refusal) = use_attachment(state, principal, attachment) {
+    return refused(refusal);
+  }
+  let Some(record) = state.db.partition().attachment(attachment).cloned() else {
+    return refused(Refusal::NotFound);
+  };
+  if &record.principal != principal {
+    return forbidden("renew");
+  }
+  let Consumer::Termed {
+    expires_ns: current,
+  } = record.consumer
+  else {
+    return refused(Refusal::BadRequest {
+      reason:
+        "only a CLI attachment has a term to renew; a mount's renews through its own activity"
+          .to_owned(),
+    });
+  };
+  // A renewal asked for is made: its holder's next is a third of the term away, so the expiry is a whole term from now,
+  // whatever an ordinary use's half-term rule left it at (`use_attachment`).
+  let term = attachment_term(state, attachment);
+  let now = state.clock.monotonic_ns();
+  let expires_ns = now.saturating_add(term);
+  if current < expires_ns {
+    let renewal = Op::AttachmentRenewed {
+      id: attachment,
+      expires_ns,
+    };
+    if let Err(e) = state.db.mutate(&mut state.segment, &renewal, now) {
+      return refused(refusal_of_db(&e));
+    }
+  }
+  ReplyBody::Renewed {
+    term_ns: term,
+    renew_every_ns: renewal_cadence(term),
+  }
+}
+
+/// Derived: how soon a holder renews its attachment again after a renewal that named `term_ns` (A-384): a third of the
+/// shorter of the term and the liveness window `W`, so two renewals lost or late are survived within the term. Not a
+/// third of the term alone: the holder's gaps shape its term (its tail plus `W`), so a cadence that followed the term fed
+/// back into it, and the term grew to the failover delay (1.0 s to 4.0 s in ten renewals on the Mac Studio, 2026-11-18).
+/// With the cadence a third of `W`, the gaps are steady and the term settles near `4W / 3`.
+pub(crate) fn renewal_cadence(term_ns: u64) -> u64 {
+  /// Format: the renewals a holder makes within the term it must renew inside: the one due, and two that may be lost or
+  /// late.
+  const RENEWALS_PER_TERM: u64 = 3;
+  term_ns
+    .min(crate::daemon::LIVENESS_BUDGET_NS)
+    .checked_div(RENEWALS_PER_TERM)
+    .unwrap_or(0)
+    .max(1)
+}
+
+/// Gives every CLI attachment of this partition a fresh term from now, at the shard's start (A-384): a holder could not
+/// renew while this daemon was not serving, and its own downtime is never counted against a holder (Lifeguard's rule,
+/// Dadgar et al. 2018: a member does not condemn others for its own unavailability). Each pace starts again with the
+/// failover delay. The attachments renewed; one whose renewal could not be recorded keeps its old expiry.
+pub(crate) fn renew_termed_at_start(state: &mut ShardState) -> usize {
+  let now = state.clock.monotonic_ns();
+  let expires_ns = now.saturating_add(state.failover_ns.max(1));
+  let termed: Vec<u64> = state
+    .db
+    .partition()
+    .attachments()
+    .filter(|record| matches!(record.consumer, Consumer::Termed { .. }))
+    .map(|record| record.id)
+    .collect();
+  let mut renewed = 0usize;
+  for id in termed {
+    let renewal = Op::AttachmentRenewed { id, expires_ns };
+    if state.db.mutate(&mut state.segment, &renewal, now).is_ok() {
+      state
+        .attachment_paces
+        .insert(id, crate::state::AttachmentPace::begun(now));
+      renewed = renewed.saturating_add(1);
+    }
+  }
+  renewed
 }
 
 /// The rights an attachment records (§4.13 "Access lists"; AUD-01): the principal's rights on the volume
@@ -8532,17 +11245,32 @@ fn bind_mount(
   }
 }
 
-/// Derived: the bytes of mount points one status report carries — a quarter of the reply's bulk chunk
+/// Derived: the most bytes of mounts one status report carries — a quarter of the reply's bulk chunk
 /// (`BULK_CHUNK_BYTES` / 4), so the mounts never crowd the report's other fields out of the slot; the
-/// rest are counted (`mounts_elided`).
+/// rest are counted (`mounts_elided`). Each mount is counted at its whole encoding (its attachment, its path's length
+/// prefix and its path), not its path alone, and the mounts take no more than the room the rest of the report leaves
+/// (A-267, 2026-11-18): a long name can leave less than this.
+/// Derived: `BULK_CHUNK_BYTES` (4096) / 4.
 const MOUNTS_REPORT_BYTES: usize = 1024;
 
+/// Format: what the retired whole-file `Read` is refused as (A-267): the verb, and the paged read that replaced it.
+const RETIRED_WHOLE_READ: &str =
+  "Read, retired (A-267): a file is read a page at a time with ReadRange";
+
+/// Format: the watcher text of a status of a volume with no base (a scratch volume, a clone of one).
+const WATCHER_SCRATCH: &str = "scratch";
+/// Format: the watcher text of a status whose base could not be read now.
+const WATCHER_UNAVAILABLE: &str = "unavailable";
+/// Format: the watcher text of a green's or a work volume's status (`crate::merge_service`).
+pub(crate) const WATCHER_MERGE: &str = "merge";
+
 /// The volume's bound host mounts for its status (§4.4 `Bound`; GAP-A9-4): each `Consumer::Bridge`
-/// attachment whose form is a chosen path, as many as the mount budget carries (in id order), and the
+/// attachment whose form is a chosen path, as many as `budget` bytes carry (in id order), and the
 /// count of those it did not.
 fn mounts_of(
   state: &ShardState,
   volume: DbVolumeId,
+  budget: usize,
 ) -> (Vec<slates_ipc::protocol::MountReport>, u32) {
   let mut mounts = Vec::new();
   let mut elided = 0u32;
@@ -8554,15 +11282,17 @@ fn mounts_of(
     if !matches!(record.consumer, Consumer::Bridge) {
       continue;
     }
-    if carried.saturating_add(path.len()) > MOUNTS_REPORT_BYTES {
+    let mount = slates_ipc::protocol::MountReport {
+      attachment: record.id,
+      path: path.to_owned(),
+    };
+    let bytes = encoded_len(&mount);
+    if carried.saturating_add(bytes) > budget {
       elided = elided.saturating_add(1);
       continue;
     }
-    carried = carried.saturating_add(path.len());
-    mounts.push(slates_ipc::protocol::MountReport {
-      attachment: record.id,
-      path: path.to_owned(),
-    });
+    carried = carried.saturating_add(bytes);
+    mounts.push(mount);
   }
   (mounts, elided)
 }
@@ -8610,7 +11340,13 @@ pub(crate) fn use_attachment(
     end_attachment(state, &record, Ending::Expired).map_err(|e| refusal_of_db(&e))?;
     return Err(expired);
   }
-  let term = attachment_term(state);
+  // The use is a sample of its holder's pace, which its term follows (A-384).
+  state
+    .attachment_paces
+    .entry(attachment)
+    .and_modify(|pace| pace.used(now))
+    .or_insert_with(|| crate::state::AttachmentPace::begun(now));
+  let term = attachment_term(state, attachment);
   if expires_ns.saturating_sub(now) < term / 2 {
     let renewal = Op::AttachmentRenewed {
       id: attachment,
@@ -8663,6 +11399,8 @@ pub(crate) fn end_attachment(
     Ending::Detached | Ending::Otherwise => Op::AttachmentRemoved { id: record.id },
   };
   state.db.mutate(&mut state.segment, &removal, now)?;
+  // Its pace goes with it (A-384).
+  state.attachment_paces.remove(&record.id);
   crate::merge_service::forget_attachment(state, record.id);
   // A mount that survived a takeover holds its volume's kept files until it ends, however it ends (U10).
   if let Some(&handle) = state.by_id.get(&record.volume)
@@ -8759,9 +11497,7 @@ fn grow_version_reservation(
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
       Err(Refusal::BudgetExceeded { available })
     }
-    Err(e) => Err(Refusal::BadRequest {
-      reason: e.to_string(),
-    }),
+    Err(e) => Err(refusal_of_mem(&e)),
   }
 }
 
@@ -8779,6 +11515,31 @@ fn settle_version_reservation(
     });
   }
   slates_mem::budget::VersionCredit { slots: new }
+}
+
+/// The version slots a resized volume's reservation moves to: a bounded claim's new allowance; a dynamic volume's
+/// unchanged (A-342), since it reserves none of its allowance and holds slots for its inodes instead.
+fn resized_reservation(volume: &Volume, old: u64, new_allowance: u64) -> u64 {
+  if volume.holds_versions() {
+    old
+  } else {
+    new_allowance
+  }
+}
+
+/// The version credit a resized volume's slot holds once the core accepted the resize: a bounded claim's reservation
+/// settled from its `old` slots to its new allowance ([`settle_version_reservation`]); a dynamic volume's unchanged
+/// (A-342), as it reserves none.
+fn settle_resized_credit(
+  versions: &mut slates_mem::budget::VersionBudget,
+  volume: &Volume,
+  credit: Option<slates_mem::budget::VersionCredit>,
+  (old, new_allowance): (u64, u64),
+) -> Option<slates_mem::budget::VersionCredit> {
+  if volume.holds_versions() {
+    return credit;
+  }
+  Some(settle_version_reservation(versions, old, new_allowance))
 }
 
 fn resize(
@@ -8809,8 +11570,9 @@ fn resize(
   };
   let new_allowance = derived_inode_allowance.max(slot.volume.inode_usage().0);
   let old_version = slot.version_credit.map_or(0, |c| c.slots);
+  let reserved = resized_reservation(&slot.volume, old_version, new_allowance);
   let version_grown =
-    match grow_version_reservation(&mut state.store.versions, old_version, new_allowance) {
+    match grow_version_reservation(&mut state.store.versions, old_version, reserved) {
       Ok(v) => v,
       Err(refusal) => return refused(refusal),
     };
@@ -8832,9 +11594,7 @@ fn resize(
         if let Some(v) = version_grown {
           state.store.versions.release(v);
         }
-        return refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        });
+        return refused(refusal_of_mem(&e));
       }
     }
   } else {
@@ -8854,11 +11614,12 @@ fn resize(
   // settle the byte reservation the same way.
   // Never refused: `new_allowance` is at least the live count, the setter's one refusal. Counted all the same.
   let allowed = slot.volume.set_inode_allowance(new_allowance);
-  slot.version_credit = Some(settle_version_reservation(
+  slot.version_credit = settle_resized_credit(
     &mut state.store.versions,
-    old_version,
-    new_allowance,
-  ));
+    &slot.volume,
+    slot.version_credit,
+    (old_version, new_allowance),
+  );
   if let Some(old) = old {
     let combined = old.bytes.saturating_add(grown.map_or(0, |g| g.bytes));
     state
@@ -8956,6 +11717,15 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
 /// so its destroy completes within the destroy slice budget the cooperative path uses; the loop is
 /// bounded by that volume's own extent. Returns how many volumes were released.
 pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
+  // The audit records the refused atom owed the control partition went with it: they are partition state (the outbox,
+  // A-265), rolled back with the rest.
+  // A grant the refused atom issued went with it (A-266): the shard's own table keeps what the durable one holds, so no
+  // landing runs under a grant whose issue was refused.
+  let partition = state.db.partition();
+  state
+    .landing
+    .grants
+    .retain(|id| partition.grant(id.0).is_some());
   let orphans: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()
@@ -8991,6 +11761,12 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     keep
   });
   crate::work_charge::release(state, released);
+  // A rolled-back clone's pin on its origin's snapshot: the record that named the origin went with the rollback, so the
+  // pins are recounted against the lineage the catalog still records, as a recovery recounts them. Before 2026-11-18
+  // the teardown kept the pin, and the snapshot's destroy was refused `Pinned` until a restart.
+  if !orphans.is_empty() {
+    reconcile_clone_pins(state);
+  }
   // A Shards stream whose attachment the rollback removed serves nothing, and its end is handed to no one (A-161).
   crate::shards::reconcile_unrecorded(state);
   // Nor does a vhost-user device the verb handed out (G-vhost).
@@ -9040,13 +11816,16 @@ fn teardown_started(
   true
 }
 
-/// One cooperative destroy slice per destroying volume; a finished one leaves the tables.
+/// One cooperative destroy slice per destroying volume and per stale copy relinquished to a re-adoption (A-362); a
+/// finished one leaves the tables.
 pub fn step_destroys(state: &mut ShardState) -> bool {
   let budget = state
     .config
     .step_quantum_ns()
     .saturating_mul(DESTROY_SLICE_PERMILLE)
     / PERMILLE;
+  let releasing = step_releases(state, budget.max(1));
+  let mut any = step_relinquished(state, budget);
   let destroying: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()
@@ -9059,7 +11838,6 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     })
     .map(|(id, h)| (*id, *h))
     .collect();
-  let mut any = false;
   for (id, handle) in destroying {
     // A volume whose guest devices still serve it waits for their ends (the round keeps running meanwhile).
     if !teardown_started(state, handle, id) {
@@ -9111,12 +11889,72 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       retire_local_tombstones(state);
     }
   }
+  any || releasing
+}
+
+/// One cooperative slice of each volume released to the member a move named (A-291, `crate::moves`): its record left
+/// already, so only its memory goes, a slice at a time as a destroy's does, and its slot with its credits once done.
+/// Whether any release is still unfinished.
+fn step_releases(state: &mut ShardState, budget: u64) -> bool {
+  let mut unfinished = Vec::new();
+  for (handle, origin_pin) in std::mem::take(&mut state.releasing) {
+    let mut begun = Ok(());
+    let done = match state.volumes.get_mut(handle) {
+      Ok(slot) => {
+        if !slot.volume.is_destroying() {
+          begun = slot.volume.destroy(&mut state.store);
+        }
+        matches!(
+          slot.volume.destroy_step(&mut state.store, budget),
+          Ok(DestroyProgress::Done) | Err(_)
+        )
+      }
+      Err(_) => true,
+    };
+    if let Err(e) = begun {
+      state.count(refusal_name(&refusal_of_vfs(&e)), 1);
+    }
+    if done {
+      if let Ok(slot) = state.volumes.remove(handle) {
+        release_slot_credits(state, &slot);
+      }
+      // A released clone's pin on its origin's snapshot goes once nothing of it is left (A-291).
+      release_origin_pin(state, origin_pin);
+    } else {
+      unfinished.push((handle, origin_pin));
+    }
+  }
+  let any = !unfinished.is_empty();
+  state.releasing = unfinished;
+  any
+}
+
+/// A volume's pin on its origin's snapshot, by the origin volume and the snapshot, or none (§4.5): a clone's origin, or
+/// the snapshot an image volume was built from (A-160).
+pub(crate) type OriginPin = Option<(DbVolumeId, DbSnapshotId)>;
+/// One destroy slice of each stale copy relinquished to a re-adoption ([`relinquish_superseded`], A-362), within `budget`
+/// each; a finished one gives its credits back and leaves. Whether any has more to tear down.
+fn step_relinquished(state: &mut ShardState, budget: u64) -> bool {
+  let mut any = false;
+  for mut slot in std::mem::take(&mut state.relinquished) {
+    let done = matches!(
+      slot.volume.destroy_step(&mut state.store, budget.max(1)),
+      Ok(DestroyProgress::Done) | Err(_)
+    );
+    if done {
+      release_slot_credits(state, &slot);
+      state.count(TAKEOVER_RELINQUISHED_FREED, 1);
+    } else {
+      any = true;
+      state.relinquished.push(slot);
+    }
+  }
   any
 }
 
 /// The origin snapshot volume `id` pins, captured before its record goes so the pin can be given back once its destroy
 /// is recorded (§4.5): a clone's origin, or the snapshot an image volume was built from (A-160).
-fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, DbSnapshotId)> {
+pub(crate) fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> OriginPin {
   state
     .db
     .partition()
@@ -9132,7 +11970,7 @@ fn origin_pin_of(state: &ShardState, id: DbVolumeId) -> Option<(DbVolumeId, DbSn
 
 /// Gives back a destroyed volume's pin on its origin's snapshot ([`origin_pin_of`]), when the origin is served here.
 /// Best-effort: the origin may be gone or on another shard.
-fn release_origin_pin(state: &mut ShardState, origin_pin: Option<(DbVolumeId, DbSnapshotId)>) {
+pub(crate) fn release_origin_pin(state: &mut ShardState, origin_pin: OriginPin) {
   if let Some((origin_volume, origin_snapshot)) = origin_pin
     && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
   {
@@ -9221,9 +12059,9 @@ fn record_unrecovered_destroy(
 }
 
 /// Returns every credit a torn-down volume held to the shard's ledgers (§4.2 accounting through
-/// teardown): its byte reservation, its inode allowance (so the version slab is never
-/// over-offered), its records' metadata reservation, and the growth a dynamic volume acquired from
-/// the shard budget as it wrote.
+/// teardown): its byte reservation, a bounded claim's inode allowance or a dynamic volume's version
+/// hold (so the version slab is never over-offered; A-342), its records' metadata reservation, and the
+/// growth a dynamic volume acquired from the shard budget as it wrote.
 fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
   // The volume's hold on its seal key goes with it (A-208); its sealed chunks hold the key while any of them lives.
   if !crate::content_cipher::release_seal_key(&mut state.store, slot.volume.seal_key()) {
@@ -9242,6 +12080,8 @@ fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
   if let Some(c) = slot.version_credit {
     state.store.versions.release(c);
   }
+  // A dynamic volume's slots for its inodes, taken from the unpromised capacity as it made them (A-342).
+  release_version_hold(&mut state.store, slot.volume.version_hold());
   if let Some(m) = slot.metadata_credit {
     state.store.metadata.release(m);
   }
@@ -9275,36 +12115,24 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
     return forbidden("status");
   }
   let transports = crate::transports::report(&crate::transports::situation(state, &rights));
-  let (mounts, mounts_elided) = mounts_of(state, record.id);
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return refused(Refusal::NotFound);
   };
   let accounting = slot.volume.accounting();
   let journal = journal_report(&slot.volume);
   let takeover_kept = u32::try_from(slot.volume.takeover_kept()).unwrap_or(u32::MAX);
-  let (drifted, watcher) = match slot.host.as_mut() {
-    Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
-      Ok(s) => (
-        s.drift
-          .iter()
-          .map(|(p, k)| format!("{p} ({k:?})"))
-          .chain(
-            s.unverified
-              .iter()
-              .map(|(p, refusal)| format!("{p} (unverified: {refusal})")),
-          )
-          .collect(),
-        format!("{:?}", s.watcher),
-      ),
-      Err(e) => (
-        vec![format!("status refused: {e:?}")],
-        "unavailable".to_owned(),
-      ),
-    },
-    None => (Vec::new(), "scratch".to_owned()),
-  };
+  let unchanged_since_head = record.epoch > 0
+    && slot
+      .volume
+      .unchanged_since(core_snapshot(SnapshotId {
+        value: record.head.value,
+      }))
+      .unwrap_or(false);
+  // An overlay's base, read once: text for people (`drifted`, `watcher`) and typed for consumers (`base`, A-299), the
+  // same entries in both, filled as far as one reply holds (A-267).
+  let read = drift_entries(slot, &mut state.store);
   let attachments = state.db.partition().attachments_of(record.id).len();
-  ReplyBody::Status {
+  let mut reply = ReplyBody::Status {
     report: Box::new(StatusReport {
       id: volume,
       name: record.name.clone(),
@@ -9315,8 +12143,8 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       head: SnapshotId {
         value: record.head.value,
       },
-      drifted,
-      watcher,
+      drifted: Vec::new(),
+      watcher: read.watcher.clone(),
       snapshots: u32::try_from(slot.volume.snapshot_count()).unwrap_or(u32::MAX),
       placed: placed_state(state, &record),
       // The daemon's NFS port (§4.6), 0 until the listener binds; report it so a client can mount.
@@ -9324,11 +12152,423 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
         .ok()
         .filter(|port| *port != 0),
       transports: Box::new(transports),
-      mounts,
-      mounts_elided,
+      mounts: Vec::new(),
+      mounts_elided: 0,
       journal,
       takeover_kept,
+      base: read.base.clone(),
+      loss: loss_report(state, &record, unchanged_since_head),
+      drifted_elided: 0,
     }),
+  };
+  // The mounts, then the drift, each in the room the report leaves (A-267): the mounts up to their budget.
+  let room = reply_room(&reply);
+  if let ReplyBody::Status { report } = &mut reply {
+    (report.mounts, report.mounts_elided) =
+      mounts_of(state, record.id, room.min(MOUNTS_REPORT_BYTES));
+  }
+  with_drift(reply, read)
+}
+
+/// A status reply's drift, filled in last (A-267): the status stays one reply, so it carries the first entries that fit
+/// beside its other fields — the same entries as text for people (`drifted`) and typed for consumers (`base`, A-299) —
+/// and counts the rest, which `Drifted` reads typed. An unreadable base's one text entry says why.
+fn with_drift(reply: ReplyBody, read: DriftRead) -> ReplyBody {
+  let ReplyBody::Status { mut report } = reply else {
+    return reply;
+  };
+  let DriftRead { items, refused, .. } = read;
+  let texts: Vec<String> = match refused {
+    Some(refusal) => vec![format!("status refused: {refusal:?}")],
+    None => items.iter().map(DriftItem::text).collect(),
+  };
+  let total = texts.len();
+  let room = reply_room(&ReplyBody::Status {
+    report: report.clone(),
+  });
+  let mut used = 0usize;
+  for (index, text) in texts.into_iter().enumerate() {
+    let typed = items.get(index).map_or(0, DriftItem::typed_len);
+    let bytes = encoded_len(&text).saturating_add(typed);
+    if used.saturating_add(bytes) > room {
+      break;
+    }
+    used = used.saturating_add(bytes);
+    report.drifted.push(text);
+    if let Some(item) = items.get(index) {
+      item.push_into(&mut report.base);
+    }
+  }
+  report.drifted_elided =
+    u32::try_from(total.saturating_sub(report.drifted.len())).unwrap_or(u32::MAX);
+  ReplyBody::Status { report }
+}
+
+/// One entry of an overlay's drift as a status reads it (§4.15 "Drift"): changed on the disk, or its re-check refused.
+enum DriftItem {
+  /// The disk changed it.
+  Drifted(slates_ipc::protocol::DriftEntry),
+  /// The host refused its re-check now; the refusal as people read it.
+  Unverified {
+    /// The entry.
+    path: String,
+    /// The host's refusal.
+    refusal: String,
+  },
+}
+
+impl DriftItem {
+  /// An entry of a page the volume core read ([`slates_vfs::base::DriftPageEntry`]).
+  fn of_page(entry: slates_vfs::base::DriftPageEntry) -> DriftItem {
+    match entry {
+      slates_vfs::base::DriftPageEntry::Drifted { path, kind } => {
+        DriftItem::Drifted(slates_ipc::protocol::DriftEntry {
+          path,
+          kind: wire_drift_kind(kind),
+        })
+      }
+      slates_vfs::base::DriftPageEntry::Unverified { path, refusal } => DriftItem::Unverified {
+        path,
+        refusal: format!("{refusal}"),
+      },
+    }
+  }
+
+  /// The entry's path.
+  fn path(&self) -> &str {
+    match self {
+      DriftItem::Drifted(entry) => &entry.path,
+      DriftItem::Unverified { path, .. } => path,
+    }
+  }
+
+  /// The entry as text for people: `PATH (KIND)`, or `PATH (unverified: REFUSAL)`.
+  fn text(&self) -> String {
+    match self {
+      DriftItem::Drifted(entry) => format!("{} ({:?})", entry.path, entry.kind),
+      DriftItem::Unverified { path, refusal } => format!("{path} (unverified: {refusal})"),
+    }
+  }
+
+  /// The bytes the entry takes in its typed list.
+  fn typed_len(&self) -> usize {
+    match self {
+      DriftItem::Drifted(entry) => encoded_len(entry),
+      DriftItem::Unverified { path, .. } => encoded_len(path),
+    }
+  }
+
+  /// Puts the entry in a read base's typed lists.
+  fn push_into(&self, base: &mut Option<slates_ipc::protocol::BaseReport>) {
+    if let Some(slates_ipc::protocol::BaseReport::Read {
+      drifted,
+      unverified,
+      ..
+    }) = base
+    {
+      match self {
+        DriftItem::Drifted(entry) => drifted.push(entry.clone()),
+        DriftItem::Unverified { path, .. } => unverified.push(path.clone()),
+      }
+    }
+  }
+}
+
+/// An overlay's base as one status reads it: its drifted and unverified entries in path order, the watcher as text,
+/// and the typed report with its lists empty (filled as far as a reply holds); none for a volume with no base. An
+/// unreadable base keeps the volume core's refusal.
+struct DriftRead {
+  items: Vec<DriftItem>,
+  watcher: String,
+  base: Option<slates_ipc::protocol::BaseReport>,
+  refused: Option<slates_vfs::VfsError>,
+}
+
+/// A drift's kind as the wire carries it.
+fn wire_drift_kind(kind: slates_vfs::base::DriftKind) -> slates_ipc::protocol::DriftKind {
+  use slates_ipc::protocol::DriftKind;
+  match kind {
+    slates_vfs::base::DriftKind::Modified => DriftKind::Modified,
+    slates_vfs::base::DriftKind::Deleted => DriftKind::Deleted,
+    slates_vfs::base::DriftKind::Replaced => DriftKind::Replaced,
+    slates_vfs::base::DriftKind::TypeChanged => DriftKind::TypeChanged,
+  }
+}
+
+/// Reads an overlay volume's base once, re-checking every witnessed entry ([`DriftRead`]).
+fn drift_entries(slot: &mut VolumeSlot, store: &mut slates_vfs::volume::Store) -> DriftRead {
+  use slates_ipc::protocol::{BaseReport, DriftEntry, WatcherState};
+  let Some(host) = slot.host.as_mut() else {
+    return DriftRead {
+      items: Vec::new(),
+      watcher: WATCHER_SCRATCH.to_owned(),
+      base: None,
+      refused: None,
+    };
+  };
+  match slot.volume.with_host(host).status(store) {
+    Ok(status) => {
+      let mut items: Vec<DriftItem> = status
+        .drift
+        .iter()
+        .map(|(path, kind)| {
+          DriftItem::Drifted(DriftEntry {
+            path: path.clone(),
+            kind: wire_drift_kind(*kind),
+          })
+        })
+        .chain(
+          status
+            .unverified
+            .iter()
+            .map(|(path, refusal)| DriftItem::Unverified {
+              path: path.clone(),
+              refusal: format!("{refusal}"),
+            }),
+        )
+        .collect();
+      items.sort_by(|a, b| a.path().cmp(b.path()));
+      DriftRead {
+        items,
+        watcher: format!("{:?}", status.watcher),
+        base: Some(BaseReport::Read {
+          drifted: Vec::new(),
+          unverified: Vec::new(),
+          watcher: match status.watcher {
+            slates_vfs::host::WatchState::Live => WatcherState::Live,
+            slates_vfs::host::WatchState::Overflowed => WatcherState::Overflowed,
+            slates_vfs::host::WatchState::Unavailable => WatcherState::Unavailable,
+          },
+        }),
+        refused: None,
+      }
+    }
+    Err(refusal) => DriftRead {
+      items: Vec::new(),
+      watcher: WATCHER_UNAVAILABLE.to_owned(),
+      base: Some(BaseReport::Unreadable),
+      refused: Some(refusal),
+    },
+  }
+}
+
+/// `Drifted`: one page of the volume's drift past inode `after` (A-267), typed as a status's `base` types it: the volume
+/// core visits, in inode order, the inodes a status would list, re-checking the witnessed ones now
+/// ([`slates_vfs::base::Overlay::drift_page`]), until a reply chunk's worth is found or the page has spent its slice of
+/// the shard's step ([`DRIFT_SLICE_PERMILLE`]). So a walk re-checks each witnessed entry once and a page never holds the
+/// shard longer than its slice; reading the whole status a page re-checked every entry once a page. An inode's entries
+/// go on one page together; an entry too long for any page alone is passed over and counted. A base that cannot be
+/// read now is refused as the volume core refused it.
+fn drifted(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  after: Option<u64>,
+) -> ReplyBody {
+  let (handle, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).read {
+    return forbidden("drifted");
+  }
+  let room = reply_room(&ReplyBody::Drifted {
+    drifted: Vec::new(),
+    unverified: Vec::new(),
+    next: Some(u64::MAX),
+    oversized: u32::MAX,
+  });
+  let slice = state
+    .config
+    .step_quantum_ns()
+    .saturating_mul(DRIFT_SLICE_PERMILLE)
+    / PERMILLE;
+  let ShardState { volumes, store, .. } = state;
+  let Ok(slot) = volumes.get_mut(handle) else {
+    return refused(Refusal::NotFound);
+  };
+  let Some(host) = slot.host.as_mut() else {
+    // A volume with no base has no drift.
+    return ReplyBody::Drifted {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      next: None,
+      oversized: 0,
+    };
+  };
+  let started = slates_rt::futures::now_ns();
+  let mut spent = || slates_rt::futures::now_ns().saturating_sub(started) >= slice;
+  let read = match slot.volume.with_host(host).drift_page(
+    store,
+    after.map(slates_vfs::ids::InodeNo),
+    drift_batch(room),
+    &mut spent,
+  ) {
+    Ok(read) => read,
+    Err(e) => return refused(refusal_of_vfs(&e)),
+  };
+  drift_page_reply(read, after, room)
+}
+
+/// A page of drift as one reply carries it: whole inodes in order while they fit `room`, an entry too long for any page
+/// alone passed over and counted, and the inode the next page starts after. A page always takes its first inode (as
+/// much of it as fits), so a walk moves.
+fn drift_page_reply(
+  read: slates_vfs::base::DriftPageRead,
+  after: Option<u64>,
+  room: usize,
+) -> ReplyBody {
+  let mut base = Some(slates_ipc::protocol::BaseReport::Read {
+    drifted: Vec::new(),
+    unverified: Vec::new(),
+    watcher: slates_ipc::protocol::WatcherState::Unavailable,
+  });
+  let mut used = 0usize;
+  let mut oversized = 0u32;
+  let mut cursor = after;
+  let mut taken_any = false;
+  let mut stopped_short = false;
+  for (no, found) in read.entries {
+    let items: Vec<DriftItem> = found.into_iter().map(DriftItem::of_page).collect();
+    let (sendable, too_long): (Vec<DriftItem>, Vec<DriftItem>) =
+      items.into_iter().partition(|item| item.typed_len() <= room);
+    let bytes: usize = sendable.iter().map(DriftItem::typed_len).sum();
+    if taken_any && used.saturating_add(bytes) > room {
+      stopped_short = true;
+      break;
+    }
+    oversized = oversized.saturating_add(u32::try_from(too_long.len()).unwrap_or(u32::MAX));
+    for item in sendable {
+      let len = item.typed_len();
+      if used.saturating_add(len) > room {
+        // Only the page's first inode can come here (two long entries of one inode): the rest of it is counted.
+        oversized = oversized.saturating_add(1);
+        continue;
+      }
+      used = used.saturating_add(len);
+      item.push_into(&mut base);
+    }
+    taken_any = true;
+    cursor = Some(no.0);
+  }
+  let next = if stopped_short {
+    cursor
+  } else {
+    read.next.map(|no| no.0)
+  };
+  let (drifted, unverified) = match base {
+    Some(slates_ipc::protocol::BaseReport::Read {
+      drifted,
+      unverified,
+      ..
+    }) => (drifted, unverified),
+    _ => (Vec::new(), Vec::new()),
+  };
+  ReplyBody::Drifted {
+    drifted,
+    unverified,
+    next,
+    oversized,
+  }
+}
+
+/// Shape: a `Drifted` page's slice of the shard's step budget, parts per thousand: half, as a `changed_since` page's
+/// and a destroy slice's, so one page never takes the whole step from the shard's other clients (§4.3). A re-check is a
+/// host's open, `fstat` and close, tens of microseconds, so the page looks at the clock after each.
+const DRIFT_SLICE_PERMILLE: u64 = 500;
+
+/// Derived: the inodes one drift page asks the volume core for: as many drifted entries as a page could hold at the
+/// smallest an entry encodes to (an empty path), so one visit fills a page.
+fn drift_batch(room: usize) -> usize {
+  let smallest = encoded_len(&slates_ipc::protocol::DriftEntry {
+    path: String::new(),
+    kind: slates_ipc::protocol::DriftKind::Modified,
+  });
+  room.checked_div(smallest).unwrap_or(1).max(1)
+}
+
+/// A volume's loss window for its status (§4.10 "Auto-seal", AC-8.3, D-18): what an owner loss would lose now, and the
+/// takeover that made this node its owner. `unchanged_since_head` is whether the volume is exactly its head snapshot.
+fn loss_report(
+  state: &ShardState,
+  record: &VolumeRecord,
+  unchanged_since_head: bool,
+) -> slates_ipc::protocol::LossReport {
+  let placed = newest_placed_seal(state, record);
+  slates_ipc::protocol::LossReport {
+    at_risk_ns: at_risk_ns(state, record, unchanged_since_head, placed),
+    placed_sequence: placed.map(|snapshot| snapshot.epoch),
+    live_shipped: record.policy.live_shipped,
+    taken_over: record
+      .taken_over
+      .map(|taken| slates_ipc::protocol::VolumeTakeover {
+        epoch: taken.epoch,
+        from_live_log: taken.from_live_log,
+        head_sequence: taken.head_sequence,
+        past_tolerance: taken.past_tolerance.map(wire_past_tolerance),
+      }),
+  }
+}
+
+/// A takeover's record of going past the volume's tolerance (A-309, A-332), as the loss report carries it.
+fn wire_past_tolerance(
+  past: slates_db::catalog::TakeoverPastTolerance,
+) -> slates_ipc::protocol::PastTolerance {
+  let shortfall = |short: slates_db::catalog::RecoveryShortfall| slates_ipc::protocol::Shortfall {
+    needed: short.needed,
+    remaining: short.remaining,
+  };
+  slates_ipc::protocol::PastTolerance {
+    registers: past.registers.map(shortfall),
+    live_log: past.live_log.map(shortfall),
+  }
+}
+
+/// The newest seal of `record`'s volume placed on `f + 1` hosts, by head sequence: the one a takeover would serve from
+/// now (§4.8: a successor adopts the newest committed head, and a seal is recorded placed only once its head is). None
+/// on a laptop (`f = 0`), where a seal is placed on the owner alone.
+fn newest_placed_seal<'a>(
+  state: &'a ShardState,
+  record: &VolumeRecord,
+) -> Option<&'a SnapshotRecord> {
+  if state.fleet.configuration().quorum.f == 0 {
+    return None;
+  }
+  state
+    .db
+    .partition()
+    .snapshots_of(record.id)
+    .into_iter()
+    .filter(|snapshot| matches!(snapshot.placed, PlacementState::Placed { .. }))
+    .max_by_key(|snapshot| snapshot.epoch)
+}
+
+/// The window an owner loss would lose of `record`'s volume now (AC-8.3), on this host's monotonic clock:
+/// - zero for a live-shipped volume in a fleet, whose writes are durable on its holders before they are answered
+///   (A-200);
+/// - zero for a volume that is exactly its head snapshot when that snapshot is `placed`, the newest seal on `f + 1`
+///   hosts;
+/// - otherwise the age of `placed`, the edits after which live on the owner alone;
+/// - and with none placed, the age of the volume itself: on a laptop (`f = 0`) nothing is on another host, a
+///   live-shipped volume's log included, so the volume's whole life is at risk to the loss of its one host.
+///
+/// `None` when that time is from another boot of the clock: an unknown window is never reported as zero, as
+/// [`mirror_age_ns`] reports the mirror's lag.
+fn at_risk_ns(
+  state: &ShardState,
+  record: &VolumeRecord,
+  unchanged_since_head: bool,
+  placed: Option<&SnapshotRecord>,
+) -> Option<u64> {
+  if record.policy.live_shipped && state.fleet.configuration().quorum.f > 0 {
+    return Some(0);
+  }
+  // The shard's clock is the host's monotonic clock (`HostClock`), read here without borrowing it mutably.
+  let now = slates_machine::clock::monotonic_ns();
+  match placed {
+    Some(snapshot) if snapshot.id == record.head && unchanged_since_head => Some(0),
+    Some(snapshot) => now.checked_sub(snapshot.taken_ns),
+    None => now.checked_sub(record.created_ns),
   }
 }
 
@@ -9506,174 +12746,169 @@ fn await_placed(
 
 /// Format: the head register's sequence at a volume's creation — the "epoch-one head record" that names
 /// no content yet (§4.4 create); each snapshot's placement then writes the next sequence.
-const CREATION_HEAD_SEQUENCE: u64 = 0;
+pub(crate) const CREATION_HEAD_SEQUENCE: u64 = 0;
 
-/// Materializes a taken-over volume on this node (§4.8 "Promotion and takeover": the new owner "adopts
-/// the newest records, and serves"; §4.10 clone-from-archive): from the adopted head's catalog essentials
-/// and the archive of the content it names, creates the volume **under its original id and name**, restores
-/// every directory, file (bytes, mode, times) and symlink from the archive, and seals the tree as the
-/// volume's head snapshot at the adopted `sequence` — with the manifest identity the head names and the
-/// content holders (`region`) the head recorded, so `status` and `await placed(region)` answer for it as
-/// they did on the dead owner. Idempotent: a volume already present under the id is served as it is. The
-/// admission (byte reservation, inode allowance) is the same a `create` makes, so a successor short of
-/// capacity refuses `BudgetExceeded` rather than over-committing; a mount name already taken locally is
-/// `AlreadyExists` (names are per host, §4.4); a malformed archive is a `BadRequest` naming the reader's
-/// refusal. Any refusal leaves nothing behind (the credits go back, the partial volume is discarded).
-/// Materializes a taken-over **green** on the shard its id routes to (§4.16 owner-loss recovery;
-/// AUD-14): records its catalog entry under the adopted record's name, evidence policy and owner, with the
-/// access list of its adopted catalog register at that register's sequence (guard-then-apply,
-/// refused typed when the name is taken or the chain budget cannot hold it),
-/// re-records its origin and every increment of the recovered chain durably — so a restart of this
-/// node rebuilds the same green — replays them into a fresh engine (`rebuild_green`: the same
-/// derivation a restart runs, with the rejected-cache budget and retention settled), and verifies the
-/// rebuilt head identity against the adopted record's: a mismatch is fatal-and-loud for the green
-/// here (the catalog record stays but the engine is not installed, counted). On success the adopted
-/// head is placed (its records committed at the quorum under the departed owner, the adoption under
-/// this node's epoch), so `await placed`, `versions`, reads at any version and new submits serve.
-/// Idempotent: a green this shard already holds is left alone.
-pub(crate) fn materialize_taken_over_green(
+/// Adopts a taken-over **green** on the shard its id routes to (§4.16 owner-loss recovery; AUD-14; A-333): records the
+/// green by its adoption — its catalog record under the adopted record's name, evidence policy and owner, with the
+/// access list of its adopted catalog register at that register's sequence, and the adopted version, its identity and
+/// version 0's inputs manifest (`Op::GreenAdopted`), one operation checked as a creation is — and installs the engine the
+/// control shard handed it, this node's replica at the adopted version, whose versions up to it are this node's holder
+/// ledger. Nothing is recorded or replayed beyond that: the origin's bytes and the adopted versions' increments stay in
+/// the ledger (`crate::green_adopt`). Then the completions the ledger's records carried are recorded (A-255) and the
+/// adopted head is placed (its records committed at the quorum under the departed owner, the adoption under this node's
+/// epoch), so `await placed`, `versions`, reads at any version and new submits serve. Idempotent: a green this shard
+/// already serves is left alone, and one recorded by the same adoption is installed. A name taken here, or a volume of
+/// another role or another adoption under the id, is refused typed and recorded nothing; the adoption is handed back so
+/// its engine waits on the control shard for the next attempt.
+pub(crate) fn adopt_taken_over_green(
   state: &mut ShardState,
   id: DbVolumeId,
-  recovery: crate::merge_service::GreenRecovery,
-) -> Result<(), Box<ReplyBody>> {
-  use crate::merge_service::MergeRole;
+  adopted: crate::green_adopt::AdoptedGreen,
+) -> Result<(), Box<crate::green_adopt::AdoptedGreen>> {
   if state.greens.contains_key(&id) {
     return Ok(());
   }
-  if state.db.partition().volume(id).is_none() {
-    if let Some(existing) = state.db.partition().volume_by_name(&recovery.name) {
-      return Err(Box::new(refused(Refusal::AlreadyExists {
-        existing: to_wire_volume(existing.id),
-      })));
-    }
-    let record = VolumeRecord {
-      id,
-      name: recovery.name.clone(),
-      owner_shard: state.partition,
-      policy: PolicyRecord {
-        size: db_size(SizeClass::Dynamic { max: 0 }),
-        names: DbNamePolicy::Exact,
-        require_locked: false,
-        role: Role::Green {
-          require_evidence: recovery.require_evidence,
-          head_version: recovery.head,
-        },
-        live_shipped: false,
-        live_holders: None,
-      },
-      base: BaseRecord::Scratch,
-      head: DbSnapshotId::default(),
-      epoch: 0,
-      referenced_bytes: 0,
-      unique_bytes: 0,
-      state: VolumeState::Live,
-      lease: None,
-      owner: recovery.owner.clone(),
-      access: recovery.access.clone(),
-      created_ns: state.clock.monotonic_ns(),
-      catalog_version: recovery.catalog_sequence,
-    };
-    let now = state.clock.monotonic_ns();
-    if let Err(e) = state
-      .db
-      .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
-    {
-      return Err(Box::new(refused(refusal_of_db(&e))));
-    }
-  }
-  debug_assert!(matches!(
-    crate::merge_service::merge_role(state, id),
-    Some(MergeRole::Green { .. })
-  ));
-  // The chain, durably, in order — each entry guarded before it is applied.
-  let now = state.clock.monotonic_ns();
-  // What this node holds durably already: its checkpoint's version and the increments after it (W3).
-  let already = usize::try_from(state.db.partition().green_head(id)).unwrap_or(usize::MAX);
-  if already == 0
-    && state.db.partition().green_origin(id).is_none()
-    && let Some(origin) = &recovery.origin
-  {
-    let op = Op::GreenOriginated {
-      green: id,
-      origin: origin.clone(),
-    };
-    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
-      return Err(Box::new(refused(refusal_of_db(&e))));
-    }
-  }
-  // A holder's records carry the increments a successor judges afresh (§4.16 "Apply on holders"); what each resolves to
-  // here is what this node's chain records of it (A-257).
-  let mut engine = match replay_green(state, id) {
-    Ok((engine, _)) => engine,
-    Err(fence) => {
-      return Err(Box::new(refused(Refusal::BadRequest {
-        reason: format!("taken-over green does not replay locally: {fence:?}"),
-      })));
-    }
-  };
-  for (increment_bytes, completion) in recovery
-    .chain
-    .iter()
-    .zip(&recovery.completions)
-    .skip(already)
-  {
-    let judged = slates_merge::engine::Increment::decode(increment_bytes)
-      .ok()
-      .map(|increment| {
-        let verdict = engine.submit_resolved(&increment);
-        (increment, verdict)
-      });
-    let Some((increment, (slates_merge::engine::Outcome::Accepted { .. }, Some(applied)))) = judged
-    else {
-      return Err(Box::new(refused(Refusal::BadRequest {
-        reason: "taken-over green's chain does not replay onto its adopted head".to_owned(),
-      })));
-    };
-    let op = Op::GreenAdvanced {
-      green: id,
-      increment: slates_merge::chain_entry::encode(
-        increment_bytes,
-        &increment,
-        &applied,
-        completion.map(crate::merge_service::SubmitCompletion::to_entry),
-        None,
-      ),
-    };
-    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
-      return Err(Box::new(refused(refusal_of_db(&e))));
-    }
+  if let Err(refusal) = record_adopted_green(state, id, &adopted) {
+    state.count(GREEN_TAKEOVER_ADOPTION_REFUSED, 1);
+    slates_machine::log_line!(
+      "slates-server: partition {}: taken-over green {} not adopted: {refusal:?}",
+      state.partition,
+      adopted.name
+    );
+    return Err(Box::new(adopted));
   }
   let Some(record) = state.db.partition().volume(id).cloned() else {
-    return Err(Box::new(refused(Refusal::NotFound)));
+    return Err(Box::new(adopted));
   };
-  rebuild_green(state, &record);
-  let rebuilt = state
-    .greens
-    .get_mut(&id)
-    .map(|engine| (engine.head(), engine.head_identity()));
-  if rebuilt != Some((recovery.head, recovery.identity)) {
-    // The chain this node held does not reproduce the adopted head: refuse the green here, loudly,
-    // rather than serve versions the quorum did not commit.
-    state.greens.remove(&id);
-    crate::merge_service::release_green_retention(state, id);
-    state.count(GREEN_TAKEOVER_MISMATCH, 1);
-    slates_machine::log_line!(
-      "slates-server: partition {}: taken-over green {} rebuilt to {:?}, the adopted record names version {} with another identity; refused",
-      state.partition,
-      record.name,
-      rebuilt.map(|(head, _)| head),
-      recovery.head
+  let crate::green_adopt::AdoptedGreen {
+    mut engine,
+    completions,
+    head,
+    ..
+  } = adopted;
+  engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
+  state.greens.insert(id, engine);
+  // The adopted replica holds every history in full; it is folded oldest-first to the budget and its retention charged,
+  // as a recovered green's is (`install_green`). A retention the budget cannot hold fences the green.
+  if let Err(short) = crate::merge_service::settle_green_retention(state, id) {
+    fence_green(
+      state,
+      &record,
+      crate::merge_service::GreenFence::Retention { short },
     );
-    return Err(Box::new(refused(Refusal::BadRequest {
-      reason: "taken-over green does not reproduce its adopted head".to_owned(),
-    })));
+    return Ok(());
   }
-  record_taken_over_completions(state, &recovery.completions);
+  record_taken_over_completions(state, &completions);
   let object = ObjectId(id.bytes);
-  let placed = state.merge.placed.entry(object).or_insert(recovery.head);
-  *placed = (*placed).max(recovery.head);
+  let placed = state.merge.placed.entry(object).or_insert(head);
+  *placed = (*placed).max(head);
+  // A round that gave the green up waiting for its cohorts' promises, then adopted it under a later configuration, left
+  // its record here (`takeover::give_up_unpromised`); the green is served now.
+  state.unrecovered.remove(&id);
+  state.count(GREEN_TAKEOVER_ADOPTED, 1);
   Ok(())
 }
+
+/// Records green `id` by its adoption (A-333), or finds it recorded by this same adoption: `Err` with the refusal when
+/// the id or the name is another volume's here, or the partition refuses the record.
+fn record_adopted_green(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  adopted: &crate::green_adopt::AdoptedGreen,
+) -> Result<(), Refusal> {
+  if let Some(existing) = state.db.partition().volume(id) {
+    // Recorded already: by this adoption (an attempt whose answer did not come within its period), or it is not this
+    // green, and the adoption would serve one object as another.
+    let this_adoption = matches!(existing.policy.role, Role::Green { .. })
+      && state
+        .db
+        .partition()
+        .green_adoption(id)
+        .is_some_and(|recorded| {
+          recorded.version == adopted.head && recorded.identity == adopted.identity
+        });
+    return if this_adoption {
+      Ok(())
+    } else {
+      Err(Refusal::AlreadyExists {
+        existing: to_wire_volume(id),
+      })
+    };
+  }
+  let record = VolumeRecord {
+    id,
+    name: adopted.name.clone(),
+    owner_shard: state.partition,
+    policy: PolicyRecord {
+      size: db_size(SizeClass::Dynamic { max: 0 }),
+      names: DbNamePolicy::Exact,
+      require_locked: false,
+      role: Role::Green {
+        require_evidence: adopted.require_evidence,
+        head_version: adopted.head,
+      },
+      live_shipped: false,
+      live_holders: None,
+      // The green's write policy and trusted signers, from its adopted catalog register (A-285, A-321): a successor
+      // enforces and reports them as the departed owner did.
+      write: adopted.write,
+      write_version: adopted.write_version,
+      signers: adopted.signers.clone(),
+    },
+    base: BaseRecord::Scratch,
+    head: DbSnapshotId::default(),
+    epoch: 0,
+    referenced_bytes: 0,
+    unique_bytes: 0,
+    state: VolumeState::Live,
+    lease: None,
+    owner: adopted.owner.clone(),
+    access: adopted.access.clone(),
+    created_ns: state.clock.monotonic_ns(),
+    catalog_version: adopted.catalog_sequence,
+    // The takeover that made this node the green's owner (AC-8.3, A-325): its promotion epoch, which the holders fenced
+    // the green at, is what this node writes the green's records at after a restart forgets `placed_heads`
+    // (`fleet::promotion_epoch`). Before A-333 a successor recorded none, so a restarted one wrote them at its own
+    // host's epoch, every one refused, and the green's next version never committed.
+    taken_over: Some(slates_db::catalog::TakeoverRecord {
+      epoch: adopted.epoch,
+      head_sequence: adopted.head,
+      from_live_log: false,
+      // A green's takeover past its tolerance is not carried here yet: the round keeps the shortfall of a volume's head
+      // register only (A-332; `takeover::record_adoption`), GAPS "The many-client load test", A-333's open items.
+      past_tolerance: None,
+    }),
+  };
+  let op = Op::GreenAdopted {
+    record,
+    version: adopted.head,
+    identity: adopted.identity,
+    origin: adopted.origin,
+  };
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &op, now)
+    .map(|_| ())
+    .map_err(|e| match refusal_of_db(&e) {
+      Refusal::AlreadyExists { .. } => match state.db.partition().volume_by_name(&adopted.name) {
+        Some(existing) => Refusal::AlreadyExists {
+          existing: to_wire_volume(existing.id),
+        },
+        None => Refusal::AlreadyExists {
+          existing: to_wire_volume(id),
+        },
+      },
+      refusal => refusal,
+    })
+}
+
+/// The status count of taken-over greens adopted from this node's holder ledger (A-333): the non-vacuity counter of the
+/// adoption.
+const GREEN_TAKEOVER_ADOPTED: &str = "merge.takeover.adopted";
+/// The status count of adoptions the owner shard refused (a name taken here, another volume under the id, the partition
+/// refusing the record); the control shard keeps the engine and attempts again.
+const GREEN_TAKEOVER_ADOPTION_REFUSED: &str = "merge.takeover.adoption_refused";
 
 /// The status count of a taken-over submit's completion recorded on its green's successor (A-255).
 const TAKEN_OVER_COMPLETION_RECORDED: &str = "merge.takeover.completion_recorded";
@@ -9685,7 +12920,10 @@ const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unreco
 
 /// Records, on a taken-over green's partition, the completions its merge records carried (A-255; RIFL §3, "If the
 /// object migrates, then the completion record must move with it"): each submit's resend after the takeover is then
-/// answered its version here, the request's key the one it was accepted under, and never run again.
+/// answered its version here, the request's key the one it was accepted under, and never run again. Each a resend can
+/// reach only through its work's route (a client of another node than the work's owner) is recorded under that work
+/// (A-288), so the partition counts what the route still leads to, and the route's adopter retires it once nothing is
+/// left to answer.
 ///
 /// Bounded per client as any client's records are ([`completion_bound`]): a client holds at most that many unacknowledged
 /// at once, so its newest that many submits are the ones it may still resend. Older ones it had acknowledged (the
@@ -9693,20 +12931,17 @@ const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unreco
 /// typed and runs nothing (the work is gone with its owner). Counted.
 fn record_taken_over_completions(
   state: &mut ShardState,
-  completions: &[Option<crate::merge_service::SubmitCompletion>],
+  completions: &[(u64, crate::merge_service::SubmitCompletion)],
 ) {
   let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
-  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<(u32, u64)>> =
+  // Each client's submits: a request's sequence, the version it was answered and the work it came from.
+  let mut by_client: std::collections::BTreeMap<(u64, u32), Vec<_>> =
     std::collections::BTreeMap::new();
-  for (index, key) in completions.iter().enumerate() {
-    let Some(key) = key else {
-      continue;
-    };
-    let version = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+  for (version, key) in completions {
     by_client
       .entry((key.origin, key.client))
       .or_default()
-      .push((key.sequence, version));
+      .push((key.sequence, *version, key.work));
   }
   for ((origin, client), mut submits) in by_client {
     submits.sort_unstable();
@@ -9715,15 +12950,17 @@ fn record_taken_over_completions(
       TAKEN_OVER_COMPLETION_PAST_BOUND,
       u64::try_from(past).unwrap_or(u64::MAX),
     );
-    for (sequence, version) in submits.into_iter().skip(past) {
-      let reply = record_completion(
+    for (sequence, version, work) in submits.into_iter().skip(past) {
+      let reply = record_completion_routed(
         state,
-        origin,
-        RequestId { client, sequence },
+        (origin, RequestId { client, sequence }),
         ReplyBody::Submitted {
           version: Some(version),
           conflicts: Vec::new(),
+          conflicts_elided: 0,
+          verdict: 0,
         },
+        work,
       );
       let counter = if matches!(reply, ReplyBody::Refused { .. }) {
         TAKEN_OVER_COMPLETION_UNRECORDED
@@ -9734,10 +12971,6 @@ fn record_taken_over_completions(
     }
   }
 }
-
-/// A taken-over green whose recovered chain did not reproduce the adopted head's identity: refused on
-/// this node, fatal-and-loud (§4.16 D-27).
-const GREEN_TAKEOVER_MISMATCH: &str = "merge.takeover_mismatch";
 
 /// What a takeover adopted for one volume: its head (the content), its catalog (what the volume is served
 /// as) and each register's adopted sequence.
@@ -9750,8 +12983,92 @@ pub(crate) struct TakenOver<'a> {
   pub catalog_sequence: u64,
   /// The head register's adopted sequence.
   pub sequence: u64,
+  /// The takeover itself, kept in the volume's record (AC-8.3, A-325): the epoch the head was placed under, `sequence`,
+  /// and whether the volume is rebuilt from its live log.
+  pub takeover: slates_db::catalog::TakeoverRecord,
 }
 
+/// Counter: a stale copy this node relinquished to a takeover that named it again (A-362, [`relinquish_superseded`]).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISHED: &str = "fleet.takeover.relinquished";
+/// Counter: a relinquished copy's slot torn down by the reaper's slices and its credits given back (A-362).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISHED_FREED: &str = "fleet.takeover.relinquished_freed";
+/// Counter: a relinquish whose shard image could not be published without the stale copy (A-362): the materialization
+/// is tried again next period, and finds the volume gone, so it makes it from the adopted state.
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_RELINQUISH_UNPUBLISHED: &str = "fleet.takeover.relinquish_unpublished";
+
+/// Relinquishes this node's stale copy of volume `id` to a takeover that names this node again (A-362; §4.8 "Promotion
+/// and takeover"). The copy was lost to a successor ([`lost_to_a_successor`]: its log fenced at a later epoch, A-338, or
+/// yielded at this host's re-admission, A-334), so the state the takeover adopted, which the successor's acknowledged
+/// writes passed, replaces it. Its attachments end; its record goes with no tombstone and no key erased
+/// (`Op::VolumeRelinquished`); its guest devices, streams and snapshot views end; its slot leaves the tables for the
+/// reaper to tear down a slice at a time ([`ShardState::relinquished`], [`step_destroys`]); its shipper and the fence it
+/// kept are forgotten, and it is yielded no more; and the shard's image is published without it before the adopted state
+/// is made under its id. So a restart in between rebuilds nothing stale: the old image with no record is torn down as an
+/// orphan, and the new record with no image is answered not recovered, typed. Counted [`TAKEOVER_RELINQUISHED`]. Until
+/// 2026-11-18 the takeover found the id present and kept the stale copy, served nowhere at the new epoch (A-334's owed
+/// re-adoption; the chaos nemesis, seed 6876545201569229162, after A-349).
+fn relinquish_superseded(state: &mut ShardState, id: DbVolumeId) -> Result<(), Box<ReplyBody>> {
+  let attachments: Vec<AttachmentRecord> = state
+    .db
+    .partition()
+    .attachments_of(id)
+    .into_iter()
+    .cloned()
+    .collect();
+  for attachment in &attachments {
+    end_attachment(state, attachment, Ending::Otherwise)
+      .map_err(|e| Box::new(refused(refusal_of_db(&e))))?;
+  }
+  let origin_pin = origin_pin_of(state, id);
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(&mut state.segment, &Op::VolumeRelinquished { id }, now)
+    .map_err(|e| Box::new(refused(refusal_of_db(&e))))?;
+  release_origin_pin(state, origin_pin);
+  #[cfg(unix)]
+  let _devices = crate::virtiofs::revoke_volume_devices(state, id);
+  let _streams = crate::shards::end_volume_streams(state, id);
+  crate::snapshot_view::end_all_of(state, id);
+  if let Some(handle) = state.by_id.remove(&id)
+    && let Ok(mut slot) = state.volumes.remove(handle)
+  {
+    if let Err(e) = slot.volume.destroy(&mut state.store) {
+      state.count(refusal_name(&refusal_of_vfs(&e)), 1);
+    }
+    state.relinquished.push(slot);
+  }
+  crate::live_ship::forget(state, id);
+  state.yielded.remove(&id);
+  state.unrecovered.remove(&id);
+  state.count(TAKEOVER_RELINQUISHED, 1);
+  match publish_shard(state) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+      state.count(TAKEOVER_RELINQUISH_UNPUBLISHED, 1);
+      Err(Box::new(refused(refusal_of_vfs(&e))))
+    }
+  }
+}
+
+/// Materializes a taken-over volume on this node (§4.8 "Promotion and takeover": the new owner "adopts
+/// the newest records, and serves"; §4.10 clone-from-archive): from the adopted head's catalog essentials
+/// and the archive of the content it names, creates the volume **under its original id and name**, restores
+/// every directory, file (bytes, mode, times) and symlink from the archive, and seals the tree as the
+/// volume's head snapshot at the adopted `sequence` — with the manifest identity the head names and the
+/// content holders (`region`) the head recorded, so `status` and `await placed(region)` answer for it as
+/// they did on the dead owner. Idempotent: a volume already present under the id is served as it is. The
+/// admission (byte reservation, inode allowance) is the same a `create` makes, so a successor short of
+/// capacity refuses `BudgetExceeded` rather than over-committing; a mount name already taken locally is
+/// `AlreadyExists` (names are per host, §4.4); a malformed archive is a `BadRequest` naming the reader's
+/// refusal. Any refusal leaves nothing behind (the credits go back, the partial volume is discarded). In one call:
+/// a takeover successor makes it in turns of its owner shard from the same pieces (`fleet::make_in_turns`, g251):
+/// [`restore_admitted`] at the restore's need, [`begin_making`], [`populate_making`] a piece a turn, and
+/// [`finish_making`].
+#[cfg(test)]
 pub(crate) fn materialize_taken_over(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -9759,130 +13076,161 @@ pub(crate) fn materialize_taken_over(
   region: Vec<u64>,
   archive: Option<&slates_archive::Archive>,
 ) -> Result<(), Box<ReplyBody>> {
-  let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
-  if state.by_id.contains_key(&id) {
+  if made_already(state, id, taken.catalog)? {
     return Ok(());
+  }
+  let restored = restore_taken_over(state, id, taken.catalog, archive)?;
+  begin_making(state, id, taken)?;
+  if let Some(restored) = restored.as_ref() {
+    let mut populating = Populating::new();
+    while !populate_making(state, id, &mut populating, restored, usize::MAX, || false)? {}
+  }
+  finish_making(state, id, taken, region)
+}
+
+/// Whether the taken-over volume `id` is made here already, refused when its name is taken here by another: a copy this
+/// takeover made already (a retry after its publication was refused) is kept; this node's own copy lost to a successor
+/// whose takeover now names this node again is relinquished, to be replaced by the state the takeover adopted (A-362).
+pub(crate) fn made_already(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  catalog: &crate::catalog::CatalogValue,
+) -> Result<bool, Box<ReplyBody>> {
+  if state.by_id.contains_key(&id) {
+    // A copy this node froze for a move it made (A-291) is superseded by what its takeover adopted: the member it moved
+    // the volume to died, this node is its successor, and that member may have taken writes since. The fleet's
+    // materialization lets it go before the volume's keys are adopted (`fleet::let_frozen_go`); one still here whose
+    // release the database refused is not made: the attempt is refused, retryable, and made again next period.
+    if state.moves_out.contains_key(&id) {
+      if !crate::moves::supersede_frozen(state, id) {
+        return Err(Box::new(refused(Refusal::Overloaded {
+          shard: state.shard,
+        })));
+      }
+    } else if !lost_to_a_successor(state, id) {
+      return Ok(true);
+    } else {
+      relinquish_superseded(state, id)?;
+    }
   }
   if let Some(existing) = state.db.partition().volume_by_name(&catalog.name) {
     return Err(Box::new(refused(Refusal::AlreadyExists {
       existing: to_wire_volume(existing.id),
     })));
   }
-  let size = match catalog.size {
+  Ok(false)
+}
+
+/// The size class a taken-over volume's catalog names.
+pub(crate) fn taken_over_size(catalog: &crate::catalog::CatalogValue) -> SizeClass {
+  match catalog.size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
+  }
+}
+
+/// A taken-over volume's archive restored for its making ([`begin_making`]) in one call, admitted before it allocates
+/// (AUD-29-13): no more than the volume may hold — its bound or its dynamic maximum — and no more than this shard could
+/// admit, since every restored byte is written into the volume next ([`restore_admitted`]). An archive needing more is
+/// refused typed before a byte is reconstructed; a malformed one is a `BadRequest` naming the reader's refusal
+/// ([`restore_refused`]). A contentless volume (a scratch volume never sealed, taken over) has no archive: it restores
+/// nothing and serves its empty tree from its adopted head and catalog registers. A takeover successor restores in
+/// steps instead (`slates_archive::Planning`, `Restoring`; `fleet::make_in_turns`), through the same admission.
+#[cfg(test)]
+pub(crate) fn restore_taken_over(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  catalog: &crate::catalog::CatalogValue,
+  archive: Option<&slates_archive::Archive>,
+) -> Result<Option<slates_archive::Restored>, Box<ReplyBody>> {
+  let Some(archive) = archive else {
+    return Ok(None);
   };
-  // The restore is admitted before it allocates (AUD-29-13): no more than the volume may hold — its bound
-  // or its dynamic maximum — and no more than this shard could admit, since every restored byte is written
-  // into the volume next. An archive needing more is refused typed before a byte is reconstructed.
-  let volume_cap = match size {
+  let needed = slates_archive::restore_needed(archive).map_err(|e| restore_refused(e, 0))?;
+  let (budget, room) = restore_admitted(state, id, catalog, needed);
+  slates_archive::restore(archive, budget)
+    .map(Some)
+    .map_err(|e| restore_refused(e, room))
+}
+
+/// The budget a taken-over volume's restore needing `needed` bytes is admitted against, and the room a refusal names: no
+/// more than the volume may hold (its bound or its dynamic maximum) and no more than this shard could admit. A shard
+/// that claims its arena lazily makes room for what the restore needs first (A-98); the refusal names what the shard
+/// could admit then, the pool's free extents included, since the arena claims nothing for a restore the pool cannot
+/// cover (A-98), so the budget alone names only what the shard already holds.
+pub(crate) fn restore_admitted(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  catalog: &crate::catalog::CatalogValue,
+  needed: u64,
+) -> (u64, u64) {
+  let volume_cap = match taken_over_size(catalog) {
     SizeClass::Bounded { limit } => limit,
     SizeClass::Dynamic { max } => max,
   };
-  // A shard that claims its arena lazily makes room for what the restore needs first (A-98); an archive that does not
-  // plan is refused by the restore below, as before. A contentless volume (a scratch volume never sealed, taken
-  // over) has no archive: it restores nothing and serves its empty tree from its adopted head and catalog registers.
-  let restored = match archive {
-    Some(archive) => {
-      if let Ok(needed) = slates_archive::restore_needed(archive) {
-        state.store.make_room(needed.min(volume_cap));
-      }
-      let restore_budget = volume_cap.min(state.store.budget.admittable());
-      // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing
-      // for a restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
-      let room = volume_cap.min(state.store.admittable());
-      Some(
-        slates_archive::restore(archive, restore_budget).map_err(|e| match e {
-          slates_archive::ArchiveError::OverBudget { .. } => {
-            refused(Refusal::BudgetExceeded { available: room })
-          }
-          other => refused(Refusal::BadRequest {
-            reason: format!("taken-over content archive: {other}"),
-          }),
-        })?,
-      )
+  state.store.make_room(needed.min(volume_cap));
+  // The room this node's candidate claim holds for the volume is the restore's own (§4.2, g229): what the shard could
+  // admit beside it no longer counts it.
+  let claimed = claimed_bytes(state, id);
+  let budget = volume_cap.min(state.store.budget.admittable().saturating_add(claimed));
+  let room = volume_cap.min(state.store.admittable().saturating_add(claimed));
+  (budget, room)
+}
+
+/// A taken-over volume's restore refused by the archive reader: over its budget, `BudgetExceeded` naming the `room` the
+/// shard could admit; anything else, a `BadRequest` naming the reader's refusal.
+pub(crate) fn restore_refused(e: slates_archive::ArchiveError, room: u64) -> Box<ReplyBody> {
+  Box::new(match e {
+    slates_archive::ArchiveError::OverBudget { .. } => {
+      refused(Refusal::BudgetExceeded { available: room })
     }
-    None => None,
-  };
-  let reservation = match size {
-    SizeClass::Bounded { limit } => match state.store.reserve(limit) {
-      Ok(r) => Some(r),
-      Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-        return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
-      }
-      Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
-      }
-    },
-    SizeClass::Dynamic { .. } => None,
-  };
-  let version_credit = match state.store.versions.reserve(inode_allowance(state, size)) {
-    Ok(c) => Some(c),
-    Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        Refusal::BudgetExceeded { available },
-      )));
-    }
-    Err(e) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
-      )));
-    }
-  };
+    other => refused(Refusal::BadRequest {
+      reason: format!("taken-over content archive: {other}"),
+    }),
+  })
+}
+
+/// A taken-over volume being made on its owner shard (g251): created under its original id and name and admitted, its
+/// credits held ([`begin_making`]), while its restored tree is laid into it a piece a turn ([`populate_making`]), until
+/// it is recorded, sealed and published ([`finish_making`]) or discarded with its credits given back
+/// ([`discard_making`]). Kept in `ShardState::making_volumes` between turns, never in a task alone, so a takeover
+/// refused or given up while it is made leaves nothing behind.
+pub struct MakingVolume {
+  volume: Volume,
+  size: SizeClass,
+  /// Its candidate claim's credits, taken over, or the admission a create makes ([`take_claim_or_admit`]).
+  credits: Credits,
+}
+
+/// Begins making taken-over volume `id` ([`MakingVolume`]): the admission a `create` makes (the byte reservation, the
+/// inode allowance, the metadata floor and a locked volume's lock), the volume created under its original id and name,
+/// and its dimensions admitted. A refusal gives back what was taken and leaves nothing. The caller checked it is not
+/// made already ([`made_already`]).
+pub(crate) fn begin_making(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  taken: &TakenOver<'_>,
+) -> Result<(), Box<ReplyBody>> {
+  // A making this shard was left with (a task gone before its end) is discarded first, so it is never leaked.
+  discard_making(state, id);
+  let catalog = taken.catalog;
+  let size = taken_over_size(catalog);
+  // The candidate claim this node reserved as it took the volume's log (§4.2, g229), else the admission a create makes:
+  // a bounded claim's bytes and inode allowance, its records, and a volume that must live in locked RAM keeps that
+  // guarantee on its successor (AUD-29-17): a successor that cannot promise it refuses the takeover typed rather than
+  // serve the volume swappable. A dynamic volume holds slots for the inodes it is restored with (taken below, once
+  // they are in) and grows its hold as it makes more (A-342). A failure after this point returns the credits to the
+  // claim ([`return_to_claim`]), so the next attempt finds the room this one had.
+  let credits = take_claim_or_admit(state, id, size, catalog.require_locked)?;
   let names = wire_names(catalog.names);
   let config = volume_config(state, names, quota_for(size));
-  // The taken-over volume's records are reserved against the metadata ledger before it exists (§4.2).
-  let metadata_credit = match reserve_metadata(state, config.journal_bytes) {
-    Ok(credit) => Some(credit),
-    Err(refusal) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        version_credit,
-        None,
-        refusal,
-      )));
-    }
-  };
-  // A volume that must live in locked RAM keeps that guarantee on its successor (§4.2, AUD-29-17): its entitlement
-  // is reserved against this process's lock capacity as a strict create reserves it, and a successor that cannot
-  // promise it refuses the takeover typed rather than serve the volume swappable.
-  let lock_credit = match catalog
-    .require_locked
-    .then(|| reserve_locked(state, size))
-    .transpose()
-  {
-    Ok(credit) => credit,
-    Err(refusal) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        version_credit,
-        metadata_credit,
-        refusal,
-      )));
-    }
-  };
   let mut volume = match Volume::create(&mut state.store, config) {
     Ok(v) => v,
     Err(e) => {
-      return Err(Box::new(give_back(
+      return Err(Box::new(return_to_claim(
         state,
-        reservation,
-        version_credit,
-        metadata_credit,
+        id,
+        credits,
         refusal_of_vfs(&e),
       )));
     }
@@ -9891,27 +13239,105 @@ pub(crate) fn materialize_taken_over(
   if let Err(e) = admit_dimensions(state, &mut volume, size) {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(Box::new(give_back(
+    return Err(Box::new(return_to_claim(
       state,
-      reservation,
-      version_credit,
-      metadata_credit,
+      id,
+      credits,
       refusal_of_vfs(&e),
     )));
   }
-  if let Some(restored) = &restored
-    && let Err(e) = populate_restored(&mut state.store, &mut volume, restored)
+  state.making_volumes.insert(
+    id,
+    MakingVolume {
+      volume,
+      size,
+      credits,
+    },
+  );
+  Ok(())
+}
+
+/// One step of laying `restored` into taken-over volume `id` being made ([`Populating::step`]): `true` once the tree is
+/// laid. A malformed tree discards the volume being made, its credits given back ([`discard_making`]), and is refused
+/// as the reader's refusal; a volume not being made here is `NotFound`.
+pub(crate) fn populate_making(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  populating: &mut Populating,
+  restored: &slates_archive::Restored,
+  slice_bytes: usize,
+  spent: impl FnMut() -> bool,
+) -> Result<bool, Box<ReplyBody>> {
+  let Some(making) = state.making_volumes.get_mut(&id) else {
+    return Err(Box::new(refused(Refusal::NotFound)));
+  };
+  match populating.step(
+    restored,
+    &mut state.store,
+    &mut making.volume,
+    slice_bytes,
+    spent,
+  ) {
+    Ok(laid) => Ok(laid),
+    Err(e) => {
+      discard_making(state, id);
+      Err(Box::new(refused(refusal_of_vfs(&e))))
+    }
+  }
+}
+
+/// Discards taken-over volume `id` being made, if it is: the partial volume freed and its credits put back as its
+/// candidate claim (§4.2, g229: [`return_to_claim`]), so the next attempt finds the room this one had; released, as any
+/// claim is, once this node holds no copy of the volume's log. A takeover refused or given up while its volume is made
+/// leaves nothing else behind.
+pub(crate) fn discard_making(state: &mut ShardState, id: DbVolumeId) {
+  let Some(making) = state.making_volumes.remove(&id) else {
+    return;
+  };
+  let discarded = making.volume.discard_partial(&mut state.store);
+  count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
+  keep_as_claim(state, id, making.credits);
+}
+
+/// Finishes making taken-over volume `id` once its tree is laid ([`populate_making`]): a dynamic volume's hold for the
+/// inodes it was restored with (A-342), its record created under the adopted catalog and published, and the tree sealed
+/// as the taken-over head: the snapshot at the adopted sequence, carrying the manifest identity the head names and the
+/// placement the head recorded (`region`), so the successor answers for it as the dead owner did
+/// ([`materialize_taken_over`]'s doc). A volume not being made here is `NotFound`.
+pub(crate) fn finish_making(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  taken: &TakenOver<'_>,
+  region: Vec<u64>,
+) -> Result<(), Box<ReplyBody>> {
+  let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
+  let Some(making) = state.making_volumes.remove(&id) else {
+    return Err(Box::new(refused(Refusal::NotFound)));
+  };
+  let MakingVolume {
+    mut volume,
+    size,
+    credits,
+  } = making;
+  // A dynamic volume's hold for the inodes it was restored with (A-342), whole or refused with nothing taken.
+  if matches!(size, SizeClass::Dynamic { .. })
+    && let Err(e) = volume.hold_versions(&mut state.store)
   {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-    return Err(Box::new(give_back(
+    return Err(Box::new(return_to_claim(
       state,
-      reservation,
-      version_credit,
-      metadata_credit,
+      id,
+      credits,
       refusal_of_vfs(&e),
     )));
   }
+  let Credits {
+    reservation,
+    version: version_credit,
+    metadata: metadata_credit,
+    lock: lock_credit,
+  } = credits;
   let now = state.clock.monotonic_ns();
   let record = VolumeRecord {
     id,
@@ -9927,6 +13353,12 @@ pub(crate) fn materialize_taken_over(
       // The holder set the dead owner's shipper recorded (A-240), kept until this node's own shipper records its own:
       // a catalog shipped meanwhile still names the holders that hold the log.
       live_holders: catalog.live_holders.clone(),
+      // The write policy and trusted signers the launcher set on the departed owner (A-285, A-321): a successor
+      // enforces and reports them as the owner did. Until 2026-11-18 the catalog carried neither and a volume taken
+      // over merged and landed as an unset one does, its signed-merge requirement dropped.
+      write: catalog.write,
+      write_version: catalog.write_version,
+      signers: catalog.signers.clone(),
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -9943,6 +13375,8 @@ pub(crate) fn materialize_taken_over(
     access: catalog.access.clone(),
     created_ns: now,
     catalog_version: taken.catalog_sequence,
+    // The takeover that made this node the owner, kept with the volume so its loss report survives a restart (A-325).
+    taken_over: Some(taken.takeover),
   };
   let published = publish_created_volume(
     state,
@@ -9993,37 +13427,350 @@ pub(crate) fn materialize_taken_over(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
+  // A round that gave the volume up waiting for its cohorts' promises, then adopted it under a later configuration, left
+  // its record here (`takeover::give_up_unpromised`); the volume is served now.
+  state.unrecovered.remove(&id);
   Ok(())
 }
 
-/// Recreates a restored archive's tree in a fresh volume: directories parents-first (the restore's paths
-/// sort so), then each file's bytes under its mode and times, a symlink (a file under the link type bits,
-/// its bytes the target) as a link. The archive's own metadata carries the permission bits, the owner, all
-/// four times and the extended attributes (format minor 3, AUD-29-56); the inode numbers are this
-/// volume's; the source inode number groups hard links so a takeover keeps every name of one file or IPC
-/// endpoint attached to the same new inode (A-26), and its attributes are set once.
+/// Recreates a restored archive's tree in a fresh volume in one call: [`Populating`] run to its end. The archive's own
+/// metadata carries the permission bits, the owner, all four times and the extended attributes (format minor 3,
+/// AUD-29-56); the inode numbers are this volume's; the source inode number groups hard links so a takeover keeps every
+/// name of one file or IPC endpoint attached to the same new inode (A-26), and its attributes are set once.
+#[cfg(test)]
 fn populate_restored(
   store: &mut slates_vfs::volume::Store,
   volume: &mut Volume,
   restored: &slates_archive::Restored,
 ) -> Result<(), slates_vfs::VfsError> {
-  use slates_vfs::export::{kind_of_mode, permissions_of_mode};
-  use slates_vfs::inode::Kind;
-  validate_restored_nodes(restored)?;
-  let mut inodes = std::collections::BTreeMap::new();
-  let mut directories: std::collections::BTreeMap<String, Handle<slates_vfs::dir::DirNode>> =
-    std::collections::BTreeMap::new();
-  directories.insert(String::new(), volume.root());
-  let parent_of = |directories: &std::collections::BTreeMap<_, _>, path: &str| {
+  let mut populating = Populating::new();
+  loop {
+    if populating.step(restored, store, volume, usize::MAX, || false)? {
+      return Ok(());
+    }
+  }
+}
+
+/// A restored tree laid into its volume a piece at a time (g251, CLAUDE.md "Bounded work everywhere"), so a takeover
+/// successor gives its shard back between pieces: in one call the kernel base volume's 97,254 files and 1.99 GB were
+/// seconds of one poll (g232). The pieces, in order:
+/// - each file against its metadata (a special node of no length, a file or a symlink its recorded size), and each
+///   repeated inode's names against its first (a hard link only when kind, attributes and bytes agree, so a hostile
+///   archive cannot alias unlike nodes: the bytes compared a slice a piece);
+/// - each inode's names counted against its link count;
+/// - the directories made, parents first (the restore's paths sort so);
+/// - each file made: a special node, a symlink, a link to an inode already made, or a file whose data pieces are
+///   written a slice a piece and nothing else (a hole stays a hole: unwritten, uncharged and found by `SEEK_HOLE`, as
+///   on the origin, AUD-29-57), then given its length;
+/// - the files' attributes, owners and times, once an inode, after the whole namespace exists (linking changes ctime);
+/// - the directories' attributes, owners and times, deepest first (a directory is only whole once its entries are in);
+/// - the root's mode, attributes, owner and times, from the archive's head (format minor 2).
+///
+/// The tree is the caller's, handed to every step unchanged; the cursors here are paths into it.
+#[derive(Default)]
+pub(crate) struct Populating {
+  stage: PopulateStage,
+  /// Each archived inode's first name and how many names it has.
+  groups: std::collections::BTreeMap<u64, (String, u32)>,
+  /// The directories made, by path.
+  directories: std::collections::BTreeMap<String, Handle<slates_vfs::dir::DirNode>>,
+  /// The inode each archived inode became.
+  inodes: std::collections::BTreeMap<u64, slates_vfs::ids::InodeNo>,
+  /// The inodes whose attributes are set (a hard link's once).
+  restored_inodes: std::collections::BTreeSet<slates_vfs::ids::InodeNo>,
+}
+
+/// Where a [`Populating`] stands: each stage names the last path it finished (`None`: none yet).
+#[derive(Debug, Default)]
+enum PopulateStage {
+  /// Files checked against their metadata and hard links against their first names; `comparing` a second name's
+  /// bytes against the first's while that comparison runs.
+  #[default]
+  Validating,
+  /// The same, past `after`.
+  ValidatingAfter {
+    after: String,
+    comparing: Option<Comparing>,
+  },
+  /// Each inode's names counted against its link count, past `after`.
+  Counting { after: Option<u64> },
+  /// Directories made, past `after`.
+  Directories { after: Option<String> },
+  /// Files made, past `after`; `writing` the file whose data pieces are being written.
+  Files {
+    after: Option<String>,
+    writing: Option<Writing>,
+  },
+  /// Files' attributes, owners and times, past `after`.
+  FileMeta { after: Option<String> },
+  /// Directories' attributes, owners and times, deepest first, before `before`.
+  DirectoryMeta { before: Option<String> },
+  /// The root's.
+  Root,
+}
+
+/// A second name's bytes compared with its inode's first name's: the piece and the byte in it the comparison stands at.
+#[derive(Debug)]
+struct Comparing {
+  first: String,
+  other: String,
+  piece: usize,
+  at: usize,
+}
+
+/// A file's data pieces being written: the piece and the byte in it the writing stands at.
+#[derive(Debug)]
+struct Writing {
+  path: String,
+  no: slates_vfs::ids::InodeNo,
+  piece: usize,
+  at: usize,
+}
+
+/// The first key of `map` past `after` (`None`: its first).
+fn key_past<'a, V>(
+  map: &'a std::collections::BTreeMap<String, V>,
+  after: Option<&str>,
+) -> Option<(&'a String, &'a V)> {
+  use std::ops::Bound;
+  match after {
+    None => map.iter().next(),
+    Some(after) => map
+      .range::<str, _>((Bound::Excluded(after), Bound::Unbounded))
+      .next(),
+  }
+}
+
+/// The slice of `bytes` from `at`, at most `slice_bytes` long and at least one byte (none when `at` is at the end).
+fn slice_from(bytes: &[u8], at: usize, slice_bytes: usize) -> &[u8] {
+  let end = at.saturating_add(slice_bytes.max(1)).min(bytes.len());
+  bytes.get(at..end).unwrap_or_default()
+}
+
+impl Populating {
+  /// A population of a fresh volume, nothing laid yet.
+  pub(crate) fn new() -> Populating {
+    Populating::default()
+  }
+
+  /// Lays `restored` into `volume` until `spent` says the step's share is spent, a piece at least, no piece writing or
+  /// comparing more than `slice_bytes` of a file (one byte at least); `true` once every piece is laid. `restored` must
+  /// be the same tree at every step. A malformed tree is refused [`slates_vfs::VfsError::RecoveryIncomplete`] or
+  /// [`slates_vfs::VfsError::NotFound`], as the one-call population refused it, and the volume is the caller's to
+  /// discard.
+  pub(crate) fn step(
+    &mut self,
+    restored: &slates_archive::Restored,
+    store: &mut slates_vfs::volume::Store,
+    volume: &mut Volume,
+    slice_bytes: usize,
+    mut spent: impl FnMut() -> bool,
+  ) -> Result<bool, slates_vfs::VfsError> {
+    loop {
+      let stage = std::mem::take(&mut self.stage);
+      let next = match stage {
+        PopulateStage::Validating => self.validate(restored, None)?,
+        PopulateStage::ValidatingAfter { after, comparing } => match comparing {
+          Some(comparing) => self.compare(restored, after, comparing, slice_bytes)?,
+          None => self.validate(restored, Some(after))?,
+        },
+        PopulateStage::Counting { after } => self.count_links(restored, after, volume)?,
+        PopulateStage::Directories { after } => {
+          self.make_directory(restored, after, store, volume)?
+        }
+        PopulateStage::Files { after, writing } => {
+          self.make_file(restored, (after, writing), (store, volume), slice_bytes)?
+        }
+        PopulateStage::FileMeta { after } => self.file_meta(restored, after, store, volume)?,
+        PopulateStage::DirectoryMeta { before } => {
+          self.directory_meta(restored, before, store, volume)?
+        }
+        PopulateStage::Root => {
+          use slates_vfs::export::permissions_of_mode;
+          // The root has no entry naming it; its own metadata rides the archive's head (format minor 2), so the
+          // rebuilt volume's root carries the mode, owner, times and attributes the origin's did, which, under the
+          // export's POSIX access control, is what lets the owner into their taken-over volume at all.
+          let root = volume.root_inode(store)?;
+          volume.chmod(store, root, permissions_of_mode(restored.root.mode))?;
+          restore_node(store, volume, root, &restored.root, restored.xattrs.get(""))?;
+          return Ok(true);
+        }
+      };
+      self.stage = next;
+      if spent() {
+        return Ok(false);
+      }
+    }
+  }
+
+  /// One file checked against its metadata, and its inode's group noted: a second name begins a comparison of its
+  /// bytes with the first's.
+  fn validate(
+    &mut self,
+    restored: &slates_archive::Restored,
+    after: Option<String>,
+  ) -> Result<PopulateStage, slates_vfs::VfsError> {
+    use slates_vfs::{VfsError, export::kind_of_mode, inode::Kind};
+    let Some((path, file)) = key_past(&restored.files, after.as_deref()) else {
+      return Ok(PopulateStage::Counting { after: None });
+    };
+    let meta = restored
+      .metadata
+      .get(path)
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    match kind_of_mode(meta.mode) {
+      Some(Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice)
+        if meta.size == 0 && file.len == 0 => {}
+      Some(Kind::File | Kind::Symlink) if meta.size == file.len => {}
+      _ => return Err(VfsError::RecoveryIncomplete),
+    }
+    let comparing = match self.groups.get_mut(&meta.ino) {
+      None => {
+        self.groups.insert(meta.ino, (path.clone(), 1));
+        None
+      }
+      Some((first, names)) => {
+        *names = names.checked_add(1).ok_or(VfsError::RecoveryIncomplete)?;
+        let first_meta = restored
+          .metadata
+          .get(first.as_str())
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        let first_file = restored
+          .files
+          .get(first.as_str())
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        if first_meta != meta
+          || first_file.len != file.len
+          || first_file.pieces.len() != file.pieces.len()
+        {
+          return Err(VfsError::RecoveryIncomplete);
+        }
+        Some(Comparing {
+          first: first.clone(),
+          other: path.clone(),
+          piece: 0,
+          at: 0,
+        })
+      }
+    };
+    Ok(PopulateStage::ValidatingAfter {
+      after: path.clone(),
+      comparing,
+    })
+  }
+
+  /// One slice of a second name's bytes compared with its first's: the same piece offsets and lengths, the same bytes.
+  fn compare(
+    &mut self,
+    restored: &slates_archive::Restored,
+    after: String,
+    mut comparing: Comparing,
+    slice_bytes: usize,
+  ) -> Result<PopulateStage, slates_vfs::VfsError> {
+    use slates_vfs::VfsError;
+    let first = restored
+      .files
+      .get(comparing.first.as_str())
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    let other = restored
+      .files
+      .get(comparing.other.as_str())
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    let (Some((first_at, first_bytes)), Some((other_at, other_bytes))) = (
+      first.pieces.get(comparing.piece),
+      other.pieces.get(comparing.piece),
+    ) else {
+      return Ok(PopulateStage::ValidatingAfter {
+        after,
+        comparing: None,
+      });
+    };
+    if first_at != other_at || first_bytes.len() != other_bytes.len() {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    let compared = slice_from(first_bytes, comparing.at, slice_bytes);
+    let against = slice_from(other_bytes, comparing.at, slice_bytes);
+    if compared != against {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    comparing.at = comparing.at.saturating_add(compared.len());
+    if comparing.at >= first_bytes.len() {
+      comparing.piece = comparing.piece.saturating_add(1);
+      comparing.at = 0;
+    }
+    Ok(PopulateStage::ValidatingAfter {
+      after,
+      comparing: Some(comparing),
+    })
+  }
+
+  /// One inode's names counted against its link count; past the last, the directories begin under the root.
+  fn count_links(
+    &mut self,
+    restored: &slates_archive::Restored,
+    after: Option<u64>,
+    volume: &Volume,
+  ) -> Result<PopulateStage, slates_vfs::VfsError> {
+    use std::ops::Bound;
+    let next = match after {
+      None => self.groups.iter().next(),
+      Some(after) => self
+        .groups
+        .range((Bound::Excluded(after), Bound::Unbounded))
+        .next(),
+    };
+    let Some((&ino, (first, names))) = next else {
+      self.directories.insert(String::new(), volume.root());
+      return Ok(PopulateStage::Directories { after: None });
+    };
+    let meta = restored
+      .metadata
+      .get(first.as_str())
+      .ok_or(slates_vfs::VfsError::RecoveryIncomplete)?;
+    if meta.nlink != *names {
+      return Err(slates_vfs::VfsError::RecoveryIncomplete);
+    }
+    Ok(PopulateStage::Counting { after: Some(ino) })
+  }
+
+  /// The directory a path's parent names, and the path's last component.
+  fn parent_of(
+    &self,
+    path: &str,
+  ) -> Result<(Handle<slates_vfs::dir::DirNode>, String), slates_vfs::VfsError> {
     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    directories
+    self
+      .directories
       .get(parent)
       .copied()
       .map(|handle| (handle, name.to_owned()))
       .ok_or(slates_vfs::VfsError::NotFound)
-  };
-  for path in &restored.directories {
-    let (parent, name) = parent_of(&directories, path)?;
+  }
+
+  /// One directory made under its parent, with the mode its metadata carries.
+  fn make_directory(
+    &mut self,
+    restored: &slates_archive::Restored,
+    after: Option<String>,
+    store: &mut slates_vfs::volume::Store,
+    volume: &mut Volume,
+  ) -> Result<PopulateStage, slates_vfs::VfsError> {
+    use slates_vfs::export::permissions_of_mode;
+    use std::ops::Bound;
+    let next = match after.as_deref() {
+      None => restored.directories.iter().next(),
+      Some(after) => restored
+        .directories
+        .range::<str, _>((Bound::Excluded(after), Bound::Unbounded))
+        .next(),
+    };
+    let Some(path) = next else {
+      return Ok(PopulateStage::Files {
+        after: None,
+        writing: None,
+      });
+    };
+    let (parent, name) = self.parent_of(path)?;
     let mode = restored
       .metadata
       .get(path)
@@ -10031,31 +13778,63 @@ fn populate_restored(
         permissions_of_mode(meta.mode)
       });
     let handle = volume.mkdir(store, parent, &name, mode)?;
-    directories.insert(path.clone(), handle);
+    self.directories.insert(path.clone(), handle);
+    Ok(PopulateStage::Directories {
+      after: Some(path.clone()),
+    })
   }
-  for (path, file) in &restored.files {
-    let (parent, name) = parent_of(&directories, path)?;
+
+  /// One file made (a link to its inode's first name, a special node, a symlink, or a file and the first slice of its
+  /// data), or one more slice of a file's data written; a file's length is given once its pieces are written.
+  fn make_file(
+    &mut self,
+    restored: &slates_archive::Restored,
+    (after, writing): (Option<String>, Option<Writing>),
+    (store, volume): (&mut slates_vfs::volume::Store, &mut Volume),
+    slice_bytes: usize,
+  ) -> Result<PopulateStage, slates_vfs::VfsError> {
+    use slates_vfs::export::{kind_of_mode, permissions_of_mode};
+    use slates_vfs::inode::Kind;
+    if let Some(writing) = writing {
+      return write_slice(restored, after, writing, (store, volume), slice_bytes);
+    }
+    let Some((path, file)) = key_past(&restored.files, after.as_deref()) else {
+      return Ok(PopulateStage::FileMeta { after: None });
+    };
+    let (parent, name) = self.parent_of(path)?;
     let meta = restored
       .metadata
       .get(path)
       .ok_or(slates_vfs::VfsError::RecoveryIncomplete)?;
-    if let Some(&no) = inodes.get(&meta.ino) {
+    let done = PopulateStage::Files {
+      after: Some(path.clone()),
+      writing: None,
+    };
+    if let Some(&no) = self.inodes.get(&meta.ino) {
       volume.link(store, parent, &name, no)?;
-      continue;
+      return Ok(done);
     }
-    let no = match kind_of_mode(meta.mode) {
-      Some(kind @ (Kind::Fifo | Kind::Socket)) => {
+    let (no, writing) = match kind_of_mode(meta.mode) {
+      // A name with no content: a FIFO or socket name (A-26), or a device node with the number its metadata carries
+      // (A-294).
+      Some(kind @ (Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice)) => {
         if file.len != 0 {
           return Err(slates_vfs::error::VfsError::RecoveryIncomplete);
         }
+        let node = slates_vfs::inode::SpecialNode::of(
+          kind,
+          slates_vfs::inode::DeviceNumber::new(meta.device_major, meta.device_minor),
+        )
+        .ok_or(slates_vfs::VfsError::RecoveryIncomplete)?;
         let parent_no = store.dirs.get(parent)?.inode;
-        volume.mknod_no(
+        let no = volume.mknod_no(
           store,
           parent_no,
           &name,
           permissions_of_mode(meta.mode),
-          kind,
-        )?
+          node,
+        )?;
+        (no, false)
       }
       Some(Kind::Symlink) => {
         let target = file
@@ -10063,100 +13842,119 @@ fn populate_restored(
           .ok_or(slates_vfs::VfsError::RecoveryIncomplete)?;
         let target =
           std::str::from_utf8(&target).map_err(|_| slates_vfs::VfsError::RecoveryIncomplete)?;
-        volume.symlink(store, parent, &name, target)?
+        (volume.symlink(store, parent, &name, target)?, false)
       }
-      Some(Kind::File) => {
-        let no = volume.create_file(store, parent, &name, permissions_of_mode(meta.mode))?;
-        write_sparse(store, volume, no, file)?;
-        no
-      }
+      Some(Kind::File) => (
+        volume.create_file(store, parent, &name, permissions_of_mode(meta.mode))?,
+        true,
+      ),
       Some(Kind::Dir) | None => return Err(slates_vfs::VfsError::RecoveryIncomplete),
     };
-    inodes.insert(meta.ino, no);
+    self.inodes.insert(meta.ino, no);
+    if !writing {
+      return Ok(done);
+    }
+    Ok(PopulateStage::Files {
+      after: Some(path.clone()),
+      writing: Some(Writing {
+        path: path.clone(),
+        no,
+        piece: 0,
+        at: 0,
+      }),
+    })
   }
-  // Linking changes ctime. Restore attributes only after the complete namespace exists. A hard link's
-  // names share one inode, so its attributes are set once, at its first name.
-  let mut restored_inodes = std::collections::BTreeSet::new();
-  for (path, meta) in &restored.metadata {
+
+  /// One file's attributes, owner and times, once an inode, after the whole namespace exists: linking changes ctime.
+  fn file_meta(
+    &mut self,
+    restored: &slates_archive::Restored,
+    after: Option<String>,
+    store: &mut slates_vfs::volume::Store,
+    volume: &mut Volume,
+  ) -> Result<PopulateStage, slates_vfs::VfsError> {
+    let Some((path, meta)) = key_past(&restored.metadata, after.as_deref()) else {
+      return Ok(PopulateStage::DirectoryMeta { before: None });
+    };
     if restored.files.contains_key(path)
-      && let Some(&no) = inodes.get(&meta.ino)
-      && restored_inodes.insert(no)
+      && let Some(&no) = self.inodes.get(&meta.ino)
+      && self.restored_inodes.insert(no)
     {
       restore_node(store, volume, no, meta, restored.xattrs.get(path))?;
     }
+    Ok(PopulateStage::FileMeta {
+      after: Some(path.clone()),
+    })
   }
-  // The directories' owners and times last: populating a directory moves its times, and a directory
-  // is only whole once its entries are in. Deepest first, so a parent's stamp follows its children's.
-  for path in restored.directories.iter().rev() {
-    if let (Some(handle), Some(meta)) = (directories.get(path), restored.metadata.get(path)) {
+
+  /// One directory's attributes, owner and times, deepest first, so a parent's stamp follows its children's.
+  fn directory_meta(
+    &mut self,
+    restored: &slates_archive::Restored,
+    before: Option<String>,
+    store: &mut slates_vfs::volume::Store,
+    volume: &mut Volume,
+  ) -> Result<PopulateStage, slates_vfs::VfsError> {
+    use std::ops::Bound;
+    let next = match before.as_deref() {
+      None => restored.directories.iter().next_back(),
+      Some(before) => restored
+        .directories
+        .range::<str, _>((Bound::Unbounded, Bound::Excluded(before)))
+        .next_back(),
+    };
+    let Some(path) = next else {
+      return Ok(PopulateStage::Root);
+    };
+    if let (Some(handle), Some(meta)) = (self.directories.get(path), restored.metadata.get(path)) {
       let no = store.dirs.get(*handle)?.inode;
       restore_node(store, volume, no, meta, restored.xattrs.get(path))?;
     }
+    Ok(PopulateStage::DirectoryMeta {
+      before: Some(path.clone()),
+    })
   }
-  // The root has no entry naming it; its own metadata rides the archive's head (format minor 2), so
-  // the rebuilt volume's root carries the mode, owner, times and attributes the origin's did — which,
-  // under the export's POSIX access control, is what lets the owner into their taken-over volume at all.
-  let root = volume.root_inode(store)?;
-  volume.chmod(store, root, permissions_of_mode(restored.root.mode))?;
-  restore_node(store, volume, root, &restored.root, restored.xattrs.get(""))?;
-  Ok(())
 }
 
-/// Writes a restored file's data pieces at their offsets and nothing else, then gives it its length — so a
-/// hole stays a hole: unwritten, uncharged, and found by `SEEK_HOLE` as on the origin (AUD-29-57). Until
-/// 2026-10-01 the file was written as one dense buffer of its logical length.
-fn write_sparse(
-  store: &mut slates_vfs::volume::Store,
-  volume: &mut Volume,
-  no: slates_vfs::ids::InodeNo,
-  file: &slates_archive::RestoredFile,
-) -> Result<(), slates_vfs::VfsError> {
-  for (offset, bytes) in &file.pieces {
-    volume.write(store, no, *offset, bytes)?;
-  }
-  let written = file.pieces.last().map_or(0, |(offset, bytes)| {
-    offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-  });
-  if file.len > written {
-    volume.truncate(store, no, file.len)?;
-  }
-  Ok(())
-}
-
-/// Validates archived inode groups before touching the replacement volume. A repeated inode is a
-/// hard link only when kind, attributes and bytes agree; a hostile archive cannot alias unlike nodes.
-fn validate_restored_nodes(
+/// One slice of a file's data written at its offset; past the last piece, the file is given its length, so a hole after
+/// the data stays a hole (AUD-29-57).
+fn write_slice(
   restored: &slates_archive::Restored,
-) -> Result<(), slates_vfs::VfsError> {
-  use slates_vfs::{VfsError, export::kind_of_mode, inode::Kind};
-  let mut groups: std::collections::BTreeMap<
-    u64,
-    (
-      &slates_archive::NodeMeta,
-      &slates_archive::RestoredFile,
-      u32,
-    ),
-  > = std::collections::BTreeMap::new();
-  for (path, file) in &restored.files {
-    let meta = restored
-      .metadata
-      .get(path)
-      .ok_or(VfsError::RecoveryIncomplete)?;
-    match kind_of_mode(meta.mode) {
-      Some(Kind::Fifo | Kind::Socket) if meta.size == 0 && file.len == 0 => {}
-      Some(Kind::File | Kind::Symlink) if meta.size == file.len => {}
-      _ => return Err(VfsError::RecoveryIncomplete),
+  after: Option<String>,
+  mut writing: Writing,
+  (store, volume): (&mut slates_vfs::volume::Store, &mut Volume),
+  slice_bytes: usize,
+) -> Result<PopulateStage, slates_vfs::VfsError> {
+  let file = restored
+    .files
+    .get(writing.path.as_str())
+    .ok_or(slates_vfs::VfsError::RecoveryIncomplete)?;
+  let Some((offset, bytes)) = file.pieces.get(writing.piece) else {
+    let written = file.pieces.last().map_or(0, |(offset, bytes)| {
+      offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+    });
+    if file.len > written {
+      volume.truncate(store, writing.no, file.len)?;
     }
-    let group = groups.entry(meta.ino).or_insert((meta, file, 0));
-    if group.0 != meta || group.1 != file {
-      return Err(VfsError::RecoveryIncomplete);
-    }
-    group.2 = group.2.checked_add(1).ok_or(VfsError::RecoveryIncomplete)?;
+    return Ok(PopulateStage::Files {
+      after,
+      writing: None,
+    });
+  };
+  let slice = slice_from(bytes, writing.at, slice_bytes);
+  if !slice.is_empty() {
+    let at = offset.saturating_add(u64::try_from(writing.at).unwrap_or(u64::MAX));
+    volume.write(store, writing.no, at, slice)?;
   }
-  if groups.values().any(|(meta, _, count)| meta.nlink != *count) {
-    return Err(VfsError::RecoveryIncomplete);
+  writing.at = writing.at.saturating_add(slice.len());
+  if writing.at >= bytes.len() {
+    writing.piece = writing.piece.saturating_add(1);
+    writing.at = 0;
   }
-  Ok(())
+  Ok(PopulateStage::Files {
+    after,
+    writing: Some(writing),
+  })
 }
 
 /// Gives a restored node the extended attributes, the owner and the times its archive metadata carries:
@@ -10187,34 +13985,513 @@ fn restore_node(
 /// Format: POSIX `0755`, the mode a restored directory takes when the archive carries none for it.
 const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 
-fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
-  let volumes = state
-    .db
-    .partition()
-    .volumes()
+/// What a verb is refused before it runs: a mutation before the consensus group exists, a landing whose target no
+/// grants page could hold (`landing::longest_grantable_target`), and a new volume whose name no listing page could hold
+/// ([`longest_listable_name`]).
+fn refused_before_dispatch(
+  state: &ShardState,
+  body: &RequestBody,
+  republish: bool,
+) -> Option<Refusal> {
+  if republish && !state.consensus_ready {
+    return Some(Refusal::ConsensusNotInitialized);
+  }
+  if let RequestBody::Land { target, .. } = body
+    && target.len() > crate::landing::longest_grantable_target()
+  {
+    // Typed (A-299's `Refusal::Target`): the length a grant's listing holds, which the caller compares its own with.
+    return Some(Refusal::Target {
+      refusal: slates_ipc::protocol::TargetRefusal::TooLong {
+        longest: u64::try_from(crate::landing::longest_grantable_target()).unwrap_or(u64::MAX),
+      },
+    });
+  }
+  if new_volume_name(body).is_some_and(|name| name.len() > longest_name()) {
+    return Some(Refusal::InvalidName);
+  }
+  match body {
+    RequestBody::Create {
+      base: Some(path), ..
+    } if path.len() > longest_recordable_base() => Some(Refusal::BaseUnavailable {
+      path: path.clone(),
+      errno: PATH_TOO_LONG_ERRNO,
+    }),
+    _ => None,
+  }
+}
+
+/// Format: the longest path the platform resolves, in bytes: `PATH_MAX` less its terminating NUL on macOS (1,024,
+/// `<sys/syslimits.h>`) and on Linux and the other Unixes (4,096, `<linux/limits.h>`), and on Windows the long-path
+/// limit, 32,767 UTF-16 units of at most three UTF-8 bytes each.
+#[cfg(target_os = "macos")]
+const PLATFORM_PATH_BYTES: usize = 1_023;
+/// Format: see the macOS arm.
+#[cfg(all(unix, not(target_os = "macos")))]
+const PLATFORM_PATH_BYTES: usize = 4_095;
+/// Format: see the macOS arm.
+#[cfg(windows)]
+const PLATFORM_PATH_BYTES: usize = 32_767 * 3;
+
+/// Format: the errno a base path past [`longest_recordable_base`] is refused with: `ENAMETOOLONG`, the host's own answer
+/// to a path past its maximum (the MSVC runtime's value on Windows, `<errno.h>`).
+#[cfg(unix)]
+const PATH_TOO_LONG_ERRNO: i32 = rustix::io::Errno::NAMETOOLONG.raw_os_error();
+/// Format: see the Unix arm.
+#[cfg(windows)]
+const PATH_TOO_LONG_ERRNO: i32 = 38;
+
+/// Format: the longest reason a recovery cause records ([`RecoveryCause`]'s `reason`), in bytes. A reason is the
+/// daemon's own text, never a caller's: a fixed phrase and a typed error's display (a host refusal and its errno, a
+/// byte count, a table's name), a short phrase beside one refusal's display. A reason built longer is cut here as it is
+/// recorded ([`recorded_reason`]), so the cause's bound does not rest on every display staying short.
+const RECOVERY_REASON_BYTES: usize = 256;
+
+/// Derived: the longest overlay base path a volume records, in bytes (§4.4 `create`, §4.8): the platform's path
+/// maximum, and no longer than one reply holds whole in the refusal every verb on the volume answers when recovery
+/// cannot reacquire the base (`NotRecovered { BaseUnavailable { path, reason } }` beside the longest reason), so
+/// `status` names the cause whole. A longer base is refused at `create`, `BaseUnavailable` with `ENAMETOOLONG`, before
+/// anything is made. A listing page shows the cause cut to fit beside the volume's name ([`listed`]); the record and
+/// the refusal keep it whole.
+pub fn longest_recordable_base() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let pathless = ReplyBody::Refused {
+    refusal: Refusal::NotRecovered {
+      cause: slates_ipc::protocol::RecoveryCause::BaseUnavailable {
+        path: String::new(),
+        reason: "r".repeat(RECOVERY_REASON_BYTES),
+      },
+    },
+  };
+  chunk
+    .saturating_sub(slates_ipc::protocol::framed_len(&pathless))
+    .min(PLATFORM_PATH_BYTES)
+}
+
+/// `reason` as a recovery cause records it: whole, as every reason the daemon builds is, or cut at a character boundary
+/// to [`RECOVERY_REASON_BYTES`].
+fn recorded_reason(mut reason: String) -> String {
+  let mut keep = reason.len().min(RECOVERY_REASON_BYTES);
+  while !reason.is_char_boundary(keep) {
+    keep = keep.saturating_sub(1);
+  }
+  reason.truncate(keep);
+  reason
+}
+
+/// The name of the volume a request would create, if it creates one.
+fn new_volume_name(body: &RequestBody) -> Option<&str> {
+  match body {
+    RequestBody::Create { name, .. }
+    | RequestBody::CreateGreen { name, .. }
+    | RequestBody::CreateWork { name, .. }
+    | RequestBody::Clone { name, .. }
+    | RequestBody::ImageBuild { name, .. }
+    | RequestBody::ImageMerge { name, .. } => Some(name),
+    _ => None,
+  }
+}
+
+/// Derived: the longest volume name, in bytes, whose summary one listing page holds alone (§4.4 `list`): the page's
+/// room less a summary's bytes with an empty name. Every volume a client can create is one it can list; a longer name
+/// is refused `InvalidName` before anything is made. A `create` request carried names up to 4,062 bytes in a reply
+/// chunk of 4,096 (2026-11-08), whose summary no page held.
+fn longest_listable_name() -> usize {
+  let unnamed = bare_causes()
     .into_iter()
-    .filter(|v| rights_of(v, principal).read && v.state != VolumeState::Destroyed)
-    .map(|v| VolumeSummary {
-      id: to_wire_volume(v.id),
-      name: v.name.clone(),
-      referenced_bytes: state
-        .by_id
-        .get(&v.id)
-        .and_then(|h| state.volumes.get(*h).ok())
-        .map_or(v.referenced_bytes, |s| {
-          s.volume.accounting().referenced_bytes
-        }),
-      unique_bytes: state
-        .by_id
-        .get(&v.id)
-        .and_then(|h| state.volumes.get(*h).ok())
-        .map_or(v.unique_bytes, |s| s.volume.accounting().unique_bytes),
-      overlay: matches!(v.base, BaseRecord::Path { .. }),
-      live_shipped: v.policy.live_shipped,
-      not_recovered: state.unrecovered.get(&v.id).cloned(),
+    .map(|cause| VolumeSummary {
+      id: VolumeId::default(),
+      name: String::new(),
+      referenced_bytes: u64::MAX,
+      unique_bytes: u64::MAX,
+      overlay: false,
+      live_shipped: false,
+      not_recovered: Some(cause),
     })
-    .collect();
-  ReplyBody::Listed { volumes }
+    .map(|summary| encoded_len(&summary))
+    .max()
+    .unwrap_or(0);
+  list_page_room().saturating_sub(unnamed)
+}
+
+/// Derived: the longest volume name, in bytes, every reply that names the volume holds: the lesser of what a listing
+/// page leaves a summary's name ([`longest_listable_name`], A-263) and what a status leaves its name beside its other
+/// fields at their widest ([`longest_statused_name`], A-267). A create refuses a longer name `InvalidName` before
+/// anything is made. Read once: it is a function of the wire's shapes and the reply chunk alone.
+fn longest_name() -> usize {
+  static LONGEST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+  *LONGEST.get_or_init(|| longest_listable_name().min(longest_statused_name()))
+}
+
+/// Derived: the longest name a status holds beside its other fields at their widest on any host (A-267): a reply
+/// chunk less the widest status with an empty name ([`widest_unnamed_status`]). The status's two lists, its mounts and
+/// its drift, are carried in the room it leaves and counted past it, so they take none here. Bounded by the listing
+/// alone, a volume was created and listed under a name of 4,012 bytes whose status was refused "reply too large for
+/// the bulk area" (`crates/server/tests/reply_bounds.rs`, 2026-11-18).
+fn longest_statused_name() -> usize {
+  reply_room(&ReplyBody::Status {
+    report: Box::new(widest_unnamed_status()),
+  })
+}
+
+/// Format: a status at its widest but for its name and the two lists it carries as far as its room allows (its mounts,
+/// its drift): every optional field present, every number at its largest, the watcher's text at the longest a status
+/// writes, the transports at their widest on any host (`crate::transports::widest_report`), the base read, and a
+/// takeover reported. The literal names every field, so a field appended to the report does not compile until it is
+/// given its widest here.
+fn widest_unnamed_status() -> StatusReport {
+  use slates_ipc::protocol::{
+    BaseReport, JournalReport, LossReport, PlacedState, VolumeTakeover, WatcherState,
+  };
+  StatusReport {
+    id: VolumeId::default(),
+    name: String::new(),
+    referenced_bytes: u64::MAX,
+    unique_bytes: u64::MAX,
+    lease_epoch: Some(u64::MAX),
+    attachments: u32::MAX,
+    head: SnapshotId { value: u64::MAX },
+    drifted: Vec::new(),
+    watcher: longest_watcher_text(),
+    snapshots: u32::MAX,
+    placed: PlacedState {
+      region: true,
+      mirror_age_ns: Some(u64::MAX),
+      host_epoch: u64::MAX,
+    },
+    nfs_port: Some(u16::MAX),
+    transports: Box::new(crate::transports::widest_report()),
+    mounts: Vec::new(),
+    mounts_elided: u32::MAX,
+    journal: JournalReport {
+      budget_bytes: u64::MAX,
+      retained_bytes: u64::MAX,
+      retained_records: u64::MAX,
+      mean_record_bytes: u64::MAX,
+      appended: u64::MAX,
+      dropped: u64::MAX,
+      rounds: u64::MAX,
+      overruns: u64::MAX,
+      largest_records: u64::MAX,
+      largest_bytes: u64::MAX,
+      largest_lag_ns: u64::MAX,
+      longest_lag_ns: u64::MAX,
+      readers: u64::MAX,
+      slowest_reader_behind: u64::MAX,
+      grown_bytes: u64::MAX,
+      growth_refused: u64::MAX,
+    },
+    takeover_kept: u32::MAX,
+    base: Some(BaseReport::Read {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      watcher: WatcherState::Unavailable,
+    }),
+    loss: LossReport {
+      at_risk_ns: Some(u64::MAX),
+      placed_sequence: Some(u64::MAX),
+      live_shipped: true,
+      taken_over: Some(VolumeTakeover {
+        epoch: u64::MAX,
+        from_live_log: true,
+        head_sequence: u64::MAX,
+        past_tolerance: Some(slates_ipc::protocol::PastTolerance {
+          registers: Some(slates_ipc::protocol::Shortfall {
+            needed: u64::MAX,
+            remaining: u64::MAX,
+          }),
+          live_log: Some(slates_ipc::protocol::Shortfall {
+            needed: u64::MAX,
+            remaining: u64::MAX,
+          }),
+        }),
+      }),
+    },
+    drifted_elided: u32::MAX,
+  }
+}
+
+/// Format: the longest watcher text a status writes: a scratch volume's, an unreadable base's, a merge volume's, or a
+/// base watcher's state by name (`drift_entries`).
+fn longest_watcher_text() -> String {
+  use slates_vfs::host::WatchState;
+  [WATCHER_SCRATCH, WATCHER_UNAVAILABLE, WATCHER_MERGE]
+    .map(str::to_owned)
+    .into_iter()
+    .chain(
+      [
+        WatchState::Live,
+        WatchState::Overflowed,
+        WatchState::Unavailable,
+      ]
+      .map(|state| format!("{state:?}")),
+    )
+    .max_by_key(String::len)
+    .unwrap_or_default()
+}
+
+/// Format: every recovery cause with its text empty: the fixed part of the cause a listed volume may carry, which the
+/// longest listable name leaves room for. A cause appended to the wire is added here too: [`shorten_cause`]'s match is
+/// exhaustive, so it does not compile until the new cause's text is given its place.
+fn bare_causes() -> [slates_ipc::protocol::RecoveryCause; 9] {
+  use slates_ipc::protocol::RecoveryCause;
+  [
+    RecoveryCause::NoImage,
+    RecoveryCause::BlocksUnclaimed,
+    RecoveryCause::BaseMissing {
+      path: String::new(),
+    },
+    RecoveryCause::BaseOnOwnMount {
+      path: String::new(),
+    },
+    RecoveryCause::BaseUnavailable {
+      path: String::new(),
+      reason: String::new(),
+    },
+    RecoveryCause::OriginNotRecovered,
+    RecoveryCause::ImageRefused {
+      reason: String::new(),
+    },
+    RecoveryCause::ResourcesUnavailable {
+      reason: String::new(),
+    },
+    RecoveryCause::TakeoverIncomplete {
+      waited_on: String::new(),
+    },
+  ]
+}
+
+/// `summary` as a listing page carries it (§4.4 `list`): whole when it fits a page alone, else with its recovery
+/// cause's text (the overlay base's path, a refusal's reason) shortened until it does. Its name, at most
+/// [`longest_listable_name`], always fits beside a cause's fixed part, so only the cause's text is ever cut; the cause
+/// names an unrecovered volume's trouble, and a path or a reason of any length cannot refuse the listing it is in.
+fn listed(mut summary: VolumeSummary) -> VolumeSummary {
+  let over = encoded_len(&summary).saturating_sub(list_page_room());
+  if over > 0
+    && let Some(cause) = summary.not_recovered.as_mut()
+  {
+    shorten_cause(cause, over);
+  }
+  summary
+}
+
+/// Cuts at least `over` bytes from `cause`'s text, its reason before its path, each at a character boundary.
+fn shorten_cause(cause: &mut slates_ipc::protocol::RecoveryCause, mut over: usize) {
+  use slates_ipc::protocol::RecoveryCause;
+  let texts: Vec<&mut String> = match cause {
+    RecoveryCause::BaseMissing { path } | RecoveryCause::BaseOnOwnMount { path } => vec![path],
+    RecoveryCause::BaseUnavailable { path, reason } => vec![reason, path],
+    RecoveryCause::ImageRefused { reason } | RecoveryCause::ResourcesUnavailable { reason } => {
+      vec![reason]
+    }
+    RecoveryCause::TakeoverIncomplete { waited_on } => vec![waited_on],
+    RecoveryCause::NoImage | RecoveryCause::BlocksUnclaimed | RecoveryCause::OriginNotRecovered => {
+      Vec::new()
+    }
+  };
+  for text in texts {
+    if over == 0 {
+      break;
+    }
+    let mut keep = text.len().saturating_sub(over);
+    while !text.is_char_boundary(keep) {
+      keep = keep.saturating_sub(1);
+    }
+    over = over.saturating_sub(text.len().saturating_sub(keep));
+    text.truncate(keep);
+  }
+}
+
+/// One shard's part of a page gathered from every shard (§4.3; a listing, §4.4 `list`, or a principal's grants): the
+/// items it holds past the page's cursor in key order, as many as one page can hold, and whether it holds more past
+/// them. No page takes more than one page's worth from any shard, so a shard's part never needs more, and a gather
+/// holds at most a page a shard.
+#[derive(Debug)]
+pub(crate) struct PagePart<T> {
+  pub(crate) items: Vec<T>,
+  pub(crate) more: bool,
+}
+
+impl<T> Default for PagePart<T> {
+  fn default() -> Self {
+    PagePart {
+      items: Vec::new(),
+      more: false,
+    }
+  }
+}
+
+/// A shard's part of a listing page.
+pub(crate) type ListPart = PagePart<VolumeSummary>;
+
+/// The parts of a listing page gathered so far, one a shard.
+pub(crate) type ListParts = Vec<ListPart>;
+
+/// The page the shards' `parts` make, merged in `key` order: as many items as `room` holds, and whether any part, or
+/// the merge, left more.
+pub(crate) fn merged_page<T: Wire, K: Ord>(
+  parts: Vec<PagePart<T>>,
+  room: usize,
+  key: impl Fn(&T) -> K,
+) -> (Vec<T>, bool) {
+  let more_elsewhere = parts.iter().any(|part| part.more);
+  let mut items: Vec<T> = parts.into_iter().flat_map(|part| part.items).collect();
+  items.sort_by_key(|item| key(item));
+  let (items, more_here) = fitting(items.into_iter(), room);
+  (items, more_here || more_elsewhere)
+}
+
+/// The bytes a listing page's volumes may take: one reply chunk less the page's own framing, its cursor included.
+fn list_page_room() -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let empty = ReplyBody::Listed {
+    volumes: Vec::new(),
+    next: Some(VolumeId {
+      bytes: [u8::MAX; 16],
+    }),
+  };
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(&empty))
+}
+
+/// The longest prefix of `items` a reply carries in `room` bytes beside the rest of it (§4.3: a reply is one bulk
+/// chunk; A-267), and how many it leaves out. A list that rides in a verb's own reply is carried this way — an advance's
+/// invalidated paths, a rewitness's paths, a presentation's conflicts, a refused landing's conflicts — so the reply
+/// always fits, and the count says what it could not hold. Unlike a page ([`fitting`]) no item is forced in: one path
+/// longer than the room is counted, never sent as a reply no chunk holds.
+pub(crate) fn carried<T: Wire>(items: Vec<T>, room: usize) -> (Vec<T>, u32) {
+  let total = items.len();
+  let mut used = 0usize;
+  let mut kept = Vec::new();
+  for item in items {
+    let bytes = encoded_len(&item);
+    if used.saturating_add(bytes) > room {
+      break;
+    }
+    used = used.saturating_add(bytes);
+    kept.push(item);
+  }
+  let elided = u32::try_from(total.saturating_sub(kept.len())).unwrap_or(u32::MAX);
+  (kept, elided)
+}
+
+/// The bytes a reply's carried list may take: one reply chunk less `empty`'s framing, `empty` being the reply with its
+/// list empty (§4.3). A sequence's length prefix and a count are fixed-width on the wire, so what the list adds is
+/// exactly its items' encodings.
+pub(crate) fn reply_room(empty: &ReplyBody) -> usize {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  chunk.saturating_sub(slates_ipc::protocol::framed_len(empty))
+}
+
+/// An advance's reply (§4.16 `advance`, §4.4): the version pinned and as many of the invalidated paths as one reply
+/// holds, the rest counted (A-267). The advance has taken effect, so its reply must always fit.
+pub(crate) fn advanced_reply(version: u64, invalidated: Vec<String>) -> ReplyBody {
+  let room = reply_room(&ReplyBody::Advanced {
+    version,
+    invalidated: Vec::new(),
+    invalidated_elided: 0,
+  });
+  let (invalidated, invalidated_elided) = carried(invalidated, room);
+  ReplyBody::Advanced {
+    version,
+    invalidated,
+    invalidated_elided,
+  }
+}
+
+/// The first of `items` (in the page's order) that fit `room`, and whether any are left: at least one, so a walk
+/// always progresses.
+pub(crate) fn fitting<T: Wire>(items: impl Iterator<Item = T>, room: usize) -> (Vec<T>, bool) {
+  let mut used = 0usize;
+  let mut page = Vec::new();
+  let mut items = items.peekable();
+  while let Some(item) = items.peek() {
+    let bytes = encoded_len(item);
+    if !page.is_empty() && used.saturating_add(bytes) > room {
+      break;
+    }
+    used = used.saturating_add(bytes);
+    if let Some(item) = items.next() {
+      page.push(item);
+    }
+  }
+  (page, items.peek().is_some())
+}
+
+/// This shard's part of the listing page after `after` ([`ListPart`]): its volumes the caller may read, in id order past
+/// the cursor, as many as one page holds. Read from the id index a batch at a time (`Partition::volumes_after`), and a
+/// summary is built only for a volume the page takes, so a page costs the volumes it passes, never the shard's table;
+/// collecting, summarizing and sorting every volume made a walk of the listing quadratic in it (A-267).
+fn list_part(state: &ShardState, principal: &Principal, after: Option<VolumeId>) -> ListPart {
+  let room = list_page_room();
+  let batch = list_batch();
+  let mut items = Vec::new();
+  let mut used = 0usize;
+  let mut cursor = after.map(to_db_volume);
+  loop {
+    let records = state.db.partition().volumes_after(cursor, batch);
+    let exhausted = records.len() < batch;
+    for v in records {
+      cursor = Some(v.id);
+      if !rights_of(v, principal).read || v.state == VolumeState::Destroyed {
+        continue;
+      }
+      let summary = listed_summary(state, v);
+      let bytes = encoded_len(&summary);
+      // A summary always fits a page alone (a name past `longest_listable_name` is refused at create, and a cause is
+      // cut to fit), so the first is always taken.
+      if !items.is_empty() && used.saturating_add(bytes) > room {
+        return ListPart { items, more: true };
+      }
+      used = used.saturating_add(bytes);
+      items.push(summary);
+    }
+    if exhausted {
+      return ListPart { items, more: false };
+    }
+  }
+}
+
+/// A volume as a listing page carries it ([`listed`]): its live accounting where this shard serves it.
+fn listed_summary(state: &ShardState, v: &slates_db::catalog::VolumeRecord) -> VolumeSummary {
+  let live = state
+    .by_id
+    .get(&v.id)
+    .and_then(|h| state.volumes.get(*h).ok())
+    .map(|s| s.volume.accounting());
+  listed(VolumeSummary {
+    id: to_wire_volume(v.id),
+    name: v.name.clone(),
+    referenced_bytes: live.map_or(v.referenced_bytes, |a| a.referenced_bytes),
+    unique_bytes: live.map_or(v.unique_bytes, |a| a.unique_bytes),
+    overlay: matches!(v.base, BaseRecord::Path { .. }),
+    live_shipped: v.policy.live_shipped,
+    not_recovered: state.unrecovered.get(&v.id).cloned(),
+  })
+}
+
+/// Derived: the volumes one read of the id index takes for a listing page: as many summaries as a page could hold at the
+/// smallest a summary encodes to (an empty name, no cause), so one read fills a page of readable volumes and a page
+/// that passes volumes it cannot read reads again.
+fn list_batch() -> usize {
+  let smallest = encoded_len(&VolumeSummary {
+    id: VolumeId::default(),
+    name: String::new(),
+    referenced_bytes: 0,
+    unique_bytes: 0,
+    overlay: false,
+    live_shipped: false,
+    not_recovered: None,
+  });
+  list_page_room().checked_div(smallest).unwrap_or(1).max(1)
+}
+
+/// The listing page the shards' `parts` make: their volumes in id order, as many as one reply chunk holds, and the
+/// cursor past the last when any part, or the merge, left more.
+fn list_page(parts: ListParts) -> ReplyBody {
+  let (volumes, more) = merged_page(parts, list_page_room(), |summary| summary.id);
+  let next = more
+    .then(|| volumes.last().map(|summary| summary.id))
+    .flatten();
+  ReplyBody::Listed { volumes, next }
 }
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32, owed: &[u32]) -> ReplyBody {
@@ -10270,11 +14547,15 @@ fn base_of(
   Ok(handle)
 }
 
+/// `read_base` (§4.4, A-267): one page of the base entry as the disk holds it now, from `offset`, as many bytes as one
+/// reply holds, with the file's size and its fingerprint's stamp. The client walks the pages and refuses a file whose
+/// stamp moved between them; neither a reply nor this shard holds more than a page of a base file however large.
 fn read_base(
   state: &mut ShardState,
   principal: &Principal,
   volume: VolumeId,
   path: &str,
+  offset: u64,
 ) -> ReplyBody {
   let handle = match base_of(state, principal, volume, "read_base", false) {
     Ok(h) => h,
@@ -10286,8 +14567,21 @@ fn read_base(
   let Some(host) = slot.host.as_mut() else {
     return refused(Refusal::NotFound);
   };
-  match slot.volume.with_host(host).read_base(path) {
-    Ok(bytes) => ReplyBody::BaseBytes { bytes },
+  let room = reply_room(&ReplyBody::BaseBytes {
+    bytes: Vec::new(),
+    total: u64::MAX,
+    stamp: u64::MAX,
+  });
+  match slot
+    .volume
+    .with_host(host)
+    .read_base_range(path, offset, room)
+  {
+    Ok(range) => ReplyBody::BaseBytes {
+      bytes: range.bytes,
+      total: range.total,
+      stamp: range.stamp,
+    },
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }
@@ -10340,7 +14634,18 @@ fn rewitness(
     .with_host(host)
     .rewitness(&mut state.store, paths)
   {
-    Ok(paths) => ReplyBody::Rewitnessed { paths },
+    Ok(paths) => {
+      // The rewitness has taken effect, so its reply must always fit: the paths one reply holds, the rest counted.
+      let room = reply_room(&ReplyBody::Rewitnessed {
+        paths: Vec::new(),
+        paths_elided: 0,
+      });
+      let (paths, paths_elided) = carried(paths, room);
+      ReplyBody::Rewitnessed {
+        paths,
+        paths_elided,
+      }
+    }
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }
@@ -10371,6 +14676,34 @@ fn pin(
     handle,
     volume: to_db_volume(volume),
     walk: slates_vfs::base::PinWalk::new(paths),
+    capture: false,
+  };
+  crate::image::defer(state, run_pin(job))
+}
+
+/// `CaptureBase` (§4.15 `capture_base`, A-291): captures an overlay's whole base into a complete immutable snapshot. The
+/// caller asserts its source is quiesced (kiln: a commit's tree checked out where nothing else writes); the capture walks
+/// the base a slice at a time as a pin does, making every file's bytes and every link's target the volume's own
+/// (`PinWalk::capture`), then takes a snapshot, judges it complete with the host, and records it captured
+/// (`Op::BaseCaptured`), so a clone of it is made with no base directory and moves between fleet members as a plain volume
+/// does. A source that changed under the walk, or a snapshot that still leans on the disk, is refused
+/// `ConsistentBaseUnavailable`; the reply waits for the walk (`BaseCaptured { snapshot }`).
+fn capture_base(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
+  let handle = match base_of(state, principal, volume, "capture_base", true) {
+    Ok(h) => h,
+    Err(r) => return *r,
+  };
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a capture outside a recorded request".to_owned(),
+    });
+  };
+  let job = PinJob {
+    request,
+    handle,
+    volume: to_db_volume(volume),
+    walk: slates_vfs::base::PinWalk::capture(),
+    capture: true,
   };
   crate::image::defer(state, run_pin(job))
 }
@@ -10381,6 +14714,8 @@ struct PinJob {
   handle: Handle<crate::state::VolumeSlot>,
   volume: DbVolumeId,
   walk: slates_vfs::base::PinWalk,
+  /// Whether it is a capture (§4.15 `capture_base`, A-291), which ends in a recorded complete snapshot.
+  capture: bool,
 }
 
 impl PinJob {
@@ -10401,8 +14736,18 @@ impl PinJob {
   }
 
   /// Publishes the volume so its pinned state precedes the completion (a client told it is pinned never meets a
-  /// restart that lost the pin); the reply.
+  /// restart that lost the pin); the reply. A capture first takes its snapshot and records it captured.
   fn finish(&self, state: &mut ShardState, pinned: usize) -> Result<ReplyBody, Refusal> {
+    if self.capture {
+      let snapshot = self.capture_snapshot(state)?;
+      return match publish_shard(state) {
+        Ok(published) if published.captured(self.volume) => {
+          Ok(ReplyBody::BaseCaptured { snapshot })
+        }
+        Ok(_) => Err(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete)),
+        Err(error) => Err(refusal_of_vfs(&error)),
+      };
+    }
     match publish_shard(state) {
       Ok(published) if published.captured(self.volume) => Ok(ReplyBody::Pinned {
         entries: u64::try_from(pinned).unwrap_or(u64::MAX),
@@ -10410,6 +14755,70 @@ impl PinJob {
       Ok(_) => Err(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete)),
       Err(error) => Err(refusal_of_vfs(&error)),
     }
+  }
+}
+
+impl PinJob {
+  /// A capture's snapshot (A-291): taken once the walk made every byte the volume's own, judged complete with the host
+  /// (no file left on the disk, every merged directory's base names in its frozen node, nothing drifted), and recorded
+  /// captured. A snapshot that is not complete is destroyed again and refused `ConsistentBaseUnavailable`: the source
+  /// changed under the capture, so it was not quiesced.
+  fn capture_snapshot(&self, state: &mut ShardState) -> Result<SnapshotId, Refusal> {
+    let record = state
+      .db
+      .partition()
+      .volume(self.volume)
+      .cloned()
+      .ok_or(Refusal::NotFound)?;
+    let (snapshot, _, _) =
+      snapshot_effect(state, self.handle, &record).map_err(|reply| match *reply {
+        ReplyBody::Refused { refusal } => refusal,
+        _ => Refusal::NotFound,
+      })?;
+    let complete = {
+      let slot = state
+        .volumes
+        .get_mut(self.handle)
+        .map_err(|_| Refusal::NotFound)?;
+      let core = core_snapshot(snapshot);
+      match slot.host.as_mut() {
+        Some(host) => {
+          let mut overlay = slot.volume.with_host(host);
+          let complete = overlay.snapshot_is_complete(&state.store, core);
+          let drifted = overlay
+            .status(&mut state.store)
+            .map(|status| !status.drift.is_empty() || !status.unverified.is_empty());
+          match (complete, drifted) {
+            (Ok(complete), Ok(drifted)) => Ok(complete && !drifted),
+            (Err(e), _) | (_, Err(e)) => Err(refusal_of_vfs(&e)),
+          }
+        }
+        None => Ok(false),
+      }
+    }?;
+    if !complete {
+      // The incomplete snapshot goes again; a refusal to drop it is the answer, since the snapshot stays.
+      drop_snapshot(state, self.volume, to_db_snapshot(snapshot)).map_err(
+        |reply| match *reply {
+          ReplyBody::Refused { refusal } => refusal,
+          _ => Refusal::NotFound,
+        },
+      )?;
+      return Err(Refusal::ConsistentBaseUnavailable);
+    }
+    let now = state.clock.monotonic_ns();
+    state
+      .db
+      .mutate(
+        &mut state.segment,
+        &Op::BaseCaptured {
+          volume: self.volume,
+          snapshot: to_db_snapshot(snapshot),
+        },
+        now,
+      )
+      .map_err(|e| refusal_of_db(&e))?;
+    Ok(snapshot)
   }
 }
 
@@ -10452,6 +14861,13 @@ pub fn serve_round(state: &mut ShardState) -> bool {
   for (index, handle) in handles {
     any |= serve_client(state, index, handle, now);
   }
+  // The closed loop's clock (`loop_hold`; A-326): the end of a round's client I/O, the requests of its clients' loops
+  // read and the replies to them written, before the round's background work, so a client's think time is read from its
+  // reply, not from the round's start, and a destroy's slices, a lease's expiry or an acknowledgement never stand in for
+  // a client's loop.
+  if std::mem::take(&mut state.loop_io) {
+    state.last_client_io_ns = state.clock.monotonic_ns();
+  }
   any |= step_destroys(state);
   any |= expire_leases(state) > 0;
   any
@@ -10471,7 +14887,8 @@ pub fn expire_leases(state: &mut ShardState) -> usize {
 }
 
 /// Deferred replies first: a reply back from another shard (recorded as a completion here,
-/// the client's shard) or one whose completion ring was full and may have room now.
+/// the client's shard) or one whose completion ring was full and may have room now. A reply written is a client's loop
+/// I/O, which `serve_round` stamps for the closed loop (`ShardState::loop_io`, A-326).
 fn retry_deferred(state: &mut ShardState) -> bool {
   let mut any = false;
   let deferred = std::mem::take(&mut state.deferred);
@@ -10503,6 +14920,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
     };
     if send_reply(state, client_index, request, &mut reply) {
       any = true;
+      state.loop_io = true;
       // The `ring.request` span (§4.14) for a reply that was deferred (its ring was full, or it came
       // back from another shard) and is now written: from the slot read to the reply written.
       if let Some(ring) = ring {
@@ -10642,8 +15060,9 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
       now,
     );
     state.current_span = Some(ring.context());
-    let served = serve(state, handle, &request);
+    let served = serve(state, handle, &request, now);
     state.current_span = None;
+    state.forward_hold_ns = 0;
     match served {
       Served::Reply(mut reply) => {
         if send_reply(state, index, request.request, &mut reply) {
@@ -10902,15 +15321,16 @@ pub(crate) async fn rebuild_recovered(
     nfs_states,
   } = recover_images(state);
   restore_nfs_answers(state, calls, nfs_replies);
-  // The barrier replies the dead daemon published and never delivered, for the mounts the anchor held (A-61).
-  #[cfg(target_os = "linux")]
+  // The barrier replies the dead daemon published and never delivered, for the mounts (Linux) and streams (A-316,
+  // A-339) the anchor held (A-61).
+  #[cfg(unix)]
   {
     state.recovered_replies = replies
       .into_iter()
       .map(|reply| (reply.attachment, (reply.unique, reply.reply)))
       .collect();
   }
-  #[cfg(not(target_os = "linux"))]
+  #[cfg(windows)]
   drop(replies);
   let mut rebuilt = Rebuilt::default();
   // Every block the images name is claimed before anything else allocates in the arena (A-64): the held
@@ -10931,15 +15351,23 @@ pub(crate) async fn rebuild_recovered(
   .await;
   rebuilt.blocks_swept = sweep_claims(state, claims);
   slices.unit_done().await;
-  // The FUSE writes acknowledged after the last publication, back on top of the rebuilt volumes (A-63).
-  #[cfg(target_os = "linux")]
+  // The objects the anchor held are taken back first, at the handles their backings had and dormant through the
+  // replay, since each already holds every write the dead daemon made, in order with the stores made through it: the
+  // writable direct maps' copies (A-197, Linux) and the Shards streams' DAX objects (A-365), in one ascending order of
+  // their backings' handles (A-389).
+  #[cfg(unix)]
   {
-    // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
-    // by the volume's write boundary (A-197).
-    rebuilt.copies_adopted = crate::held_copy::adopt_inherited(state);
+    rebuilt.copies_adopted = crate::shards::dax_hold::adopt_inherited(state);
     slices.unit_done().await;
-    rebuilt.writes_replayed = replay_writes(state, slices).await;
   }
+  // The writes acknowledged after the last publication, a FUSE mount's (Linux) and a Shards stream's (every platform;
+  // A-316, A-339, A-402), back on top of the rebuilt volumes (A-63).
+  rebuilt.writes_replayed = replay_writes(state, slices).await;
+  // The writable copies wake once the replay is done (A-389): every change reaches them again from here on, and what
+  // the replay wrote beneath one that it differs from is its client's later store, which the client's next sync writes
+  // back. The streams' DAX objects wake when their streams take them.
+  #[cfg(target_os = "linux")]
+  let _woken = crate::held_copy::wake_adopted(state);
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
   state.next_prefix = max_prefix;
@@ -10957,16 +15385,21 @@ pub(crate) async fn rebuild_recovered(
 
 /// The held replicas' content and registers from the image (AUD-29-59; §4.8 persistence before reply), what
 /// [`rebuild_recovered`] takes back before the volumes.
-fn restore_held_image(state: &mut ShardState, held: &[u8], rebuilt: &mut Rebuilt) {
+fn restore_held_image(
+  state: &mut ShardState,
+  held: &[slates_vfs::recover::HeldPiece],
+  rebuilt: &mut Rebuilt,
+) {
   // The held replicas' blocks too (A-64), then every claim is committed: the recovered image names them all, so none
   // is reused before this daemon's first publication commits.
-  // The held image carries the content hold and the held registers (§4.8 persistence before reply): split, the
-  // content claimed and rebuilt below, the registers rebuilt with their fences once the hold is.
+  // The held image's pieces carry the content hold, the held registers and the live copies (§4.8 persistence before
+  // reply; A-270): split, the content claimed and rebuilt below, the registers rebuilt with their fences once the hold
+  // is.
   let held = match crate::content_holder::split_held(held) {
     Ok(held) => Some(held),
     Err(e) => {
       slates_machine::log_line!(
-        "slates-server: partition {}: held image refused: {e:?}",
+        "slates-server: partition {}: held image refused: {e}",
         state.partition
       );
       rebuilt.replicas_refused = true;
@@ -10986,8 +15419,10 @@ fn restore_held_image(state: &mut ShardState, held: &[u8], rebuilt: &mut Rebuilt
     )
   });
   match recovered_hold {
-    Ok(hold) => {
+    Ok(mut hold) => {
       rebuilt.replicas = hold.manifest_count();
+      // The image it was rebuilt from carries every piece of it, so no change is owed to the next publication (A-376).
+      hold.clear_changes();
       state.held_content = hold;
     }
     Err(e) => {
@@ -11065,6 +15500,11 @@ async fn rebuild_record(
   max_prefix: &mut u16,
 ) -> bool {
   match record.policy.role {
+    // A green its takeover adopted from this node's holder ledger (A-333) is rebuilt from that ledger at boot, which
+    // no replay of this partition can do: it waits for it.
+    Role::Green { .. } if await_adoption(state, record) => {
+      rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
+    }
     Role::Green { .. } => {
       // A restarted owner owes its holders every merge record its chain holds that they may not: the pending records
       // lived in memory, so a version appended before the restart and not yet committed at `f + 1` was never shipped
@@ -11293,7 +15733,9 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
 /// Rebuilds a recovered green volume (§4.16, §4.8): a fresh merge engine with its persisted chain
 /// replayed in order, so its content, versions, last-changed index and dedup set return exactly as
 /// before the restart. A corrupt chain entry stops the replay there — the green recovers to its last
-/// good version, logged, rather than presenting a wrong later state.
+/// good version, logged, rather than presenting a wrong later state. The tests' form of
+/// [`rebuild_green_sliced`], in one call: a recovery runs the sliced one, and since A-333 a takeover replays nothing.
+#[cfg(test)]
 fn rebuild_green(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -11302,16 +15744,26 @@ fn rebuild_green(
   install_green(state, record, replayed)
 }
 
-/// [`rebuild_green`] in a recovery's slices (§2.6 boot step 2): the same replay, a directory of the held origin or a
-/// chain entry a unit.
+/// Rebuilds a recovered green volume in a recovery's slices (§2.6 boot step 2; §4.16, §4.8): a fresh merge engine with
+/// its persisted origin and chain replayed in order, a directory of the held origin or a chain entry a unit, so its
+/// content, versions, last-changed index and dedup set return exactly as before the restart; or the green fenced with
+/// why its replay was refused (AUD-29-18).
 async fn rebuild_green_sliced(
   state: &mut ShardState,
   record: &VolumeRecord,
   slices: &mut crate::recovery_slices::RecoverySlices,
 ) -> Vec<crate::merge_service::ReplayedVersion> {
-  let replayed = replay_green_sliced(state, record.id, slices).await;
+  let (replayed, load_steps) = replay_green_sliced(state, record.id, slices).await;
+  if load_steps > 0 {
+    state.count(GREEN_ORIGIN_LOAD_STEPS, load_steps);
+  }
   install_green(state, record, replayed)
 }
+
+/// Counted at a recovery for each share of a green's origin seeded into its rebuilt engine (`GreenReplay`'s load): more
+/// than one for a green shows its origin was seeded in shares, a recovery's unit each, not in one poll.
+/// Format: a counter name in the daemon's status report.
+const GREEN_ORIGIN_LOAD_STEPS: &str = "merge.recovery.origin_load_steps";
 
 /// Installs a replayed green and returns the versions its replay rebuilt, each owed to its holders again; or fences it
 /// with why its replay was refused (AUD-29-18), owing nothing.
@@ -11350,7 +15802,9 @@ fn install_green(
 /// acknowledged version, so each must decode and be accepted at exactly its own version — version `n` for
 /// the `n`-th entry after the checkpoint (W3) or over the origin's version 0 — or the replay is refused with the fence
 /// naming why (AUD-29-18). Until 2026-09-30 a corrupt origin installed an empty green, a corrupt entry stopped the
-/// replay and installed the shorter one, and a submit's outcome was not checked at all.
+/// replay and installed the shorter one, and a submit's outcome was not checked at all. [`rebuild_green`]'s replay,
+/// in one call, for the tests; a recovery runs [`replay_green_sliced`].
+#[cfg(test)]
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
@@ -11360,17 +15814,26 @@ fn replay_green(
   replay.finish(state)
 }
 
-/// [`replay_green`] in a recovery's slices: the slice may end after any unit.
+/// Replays green `id`'s durable origin and chain into a fresh engine in a recovery's slices ([`GreenReplay`]): the slice
+/// may end after any unit. With it, the shares its origin was seeded in.
 async fn replay_green_sliced(
   state: &ShardState,
   id: DbVolumeId,
   slices: &mut crate::recovery_slices::RecoverySlices,
-) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
-  let mut replay = GreenReplay::begin(state, id)?;
-  while !replay.step(state)? {
-    slices.unit_done().await;
+) -> (Result<ReplayedGreen, crate::merge_service::GreenFence>, u64) {
+  let mut replay = match GreenReplay::begin(state, id) {
+    Ok(replay) => replay,
+    Err(fence) => return (Err(fence), 0),
+  };
+  loop {
+    match replay.step(state) {
+      Ok(true) => break,
+      Ok(false) => slices.unit_done().await,
+      Err(fence) => return (Err(fence), replay.load_steps),
+    }
   }
-  replay.finish(state)
+  let load_steps = replay.load_steps;
+  (replay.finish(state), load_steps)
 }
 
 /// A green's engine as its replay rebuilt it, and each version the replay rebuilt, with what its merge record needs.
@@ -11379,20 +15842,30 @@ type ReplayedGreen = (
   Vec<crate::merge_service::ReplayedVersion>,
 );
 
-/// A green's replay a unit at a time ([`replay_green`]): its held origin walked a directory a step (A-217), then the
-/// engine restored at its checkpoint (W3) or built over the origin, then its chain an entry a step. Holds no borrow of
-/// the state between steps.
-struct GreenReplay {
+/// A green's replay a unit at a time (§4.16; every chain entry must decode and be accepted at exactly its own version,
+/// or the replay is refused with the fence naming why, AUD-29-18): its held origin walked a directory a step (A-217), or
+/// its recorded origin bytes decoded a share a step; then its engine seeded from the origin a share a step and restored
+/// at its checkpoint (W3); then its chain an entry a step. Holds no borrow of the state between steps. Until 2026-11-18 the engine
+/// was built from the whole origin in one step (`Green::with_origin`, or `Green::restore` over it), which hashes and
+/// copies every file: seconds of one poll over the Linux kernel's 1.67 GB, past the watchdog's verdict on a shard that
+/// runs a window of CPU in one step, so a restarted owner of a kernel-sized green was ended again inside its recovery.
+pub(crate) struct GreenReplay {
   /// The green replayed.
   id: DbVolumeId,
   /// Where the replay is.
   phase: GreenReplayPhase,
+  /// The shares its origin was seeded in: more than one shows the seeding was sliced.
+  load_steps: u64,
 }
 
 /// Where a [`GreenReplay`] is.
 enum GreenReplayPhase {
   /// Walking the held origin's base snapshot.
   Origin(Box<crate::merge_service::HeldWalk>),
+  /// Decoding the origin the green records as bytes (a taken-over green's), a share a step: where the decoding is.
+  Decode(Box<slates_merge::origin::DecodeCursor>),
+  /// Seeding the engine from the origin a share a step. Boxed: it holds the engine being seeded.
+  Load(Box<slates_merge::engine::OriginLoad>),
   /// Replaying the chain: the engine so far, the version its checkpoint holds (0 with none), the index of the next
   /// entry, the versions rebuilt so far, and the head and identity the checkpoint recorded (A-257).
   Chain {
@@ -11405,12 +15878,12 @@ enum GreenReplayPhase {
 }
 
 impl GreenReplay {
-  /// The replay of green `id`: its held origin's walk begun, or its engine built from the origin it records.
+  /// The replay of green `id`: its held origin's walk begun, its recorded origin's decoding begun, or, for a green with
+  /// no origin, its engine built.
   fn begin(
     state: &ShardState,
     id: DbVolumeId,
   ) -> Result<GreenReplay, crate::merge_service::GreenFence> {
-    use crate::merge_service::GreenFence;
     let partition = state.db.partition();
     let phase = match (partition.green_origin_ref(id), partition.green_origin(id)) {
       // A held origin (A-217) is walked again from its base snapshot, rebuilt before any green, and must give the
@@ -11418,26 +15891,51 @@ impl GreenReplay {
       (Some(held), _) => GreenReplayPhase::Origin(Box::new(
         crate::merge_service::HeldWalk::begin(state, held).map_err(held_origin_fence)?,
       )),
-      (None, Some(bytes)) => chain_phase(
-        state,
-        id,
-        Some(slates_merge::origin::Origin::decode(bytes).map_err(|_| GreenFence::OriginCorrupt)?),
-      )?,
+      (None, Some(_)) => {
+        GreenReplayPhase::Decode(Box::new(slates_merge::origin::DecodeCursor::new()))
+      }
       (None, None) => chain_phase(state, id, None)?,
     };
-    Ok(GreenReplay { id, phase })
+    Ok(GreenReplay {
+      id,
+      phase,
+      load_steps: 0,
+    })
   }
 
-  /// One unit: a piece of the held origin's walk, the engine built from the walked origin, or one chain entry submitted
-  /// at its own version. True once the chain is replayed.
+  /// One unit: a piece of the held origin's walk, a share of the recorded origin decoded, a share of the origin seeded,
+  /// or one chain entry submitted at its own version. True once the chain is replayed.
   fn step(&mut self, state: &ShardState) -> Result<bool, crate::merge_service::GreenFence> {
+    use crate::merge_service::GreenFence;
     let id = self.id;
-    match &mut self.phase {
+    let seeded = match &mut self.phase {
       GreenReplayPhase::Origin(walk) => {
-        if walk.step(state).map_err(held_origin_fence)? {
-          self.begin_chain(state)?;
+        if !walk.step(state).map_err(held_origin_fence)? {
+          return Ok(false);
         }
-        Ok(false)
+        None
+      }
+      GreenReplayPhase::Decode(cursor) => {
+        let bytes = state
+          .db
+          .partition()
+          .green_origin(id)
+          .ok_or(GreenFence::OriginUnavailable)?;
+        let decoded = cursor
+          .step(bytes, crate::merge_origin::copy_share(state))
+          .map_err(|_| GreenFence::OriginCorrupt)?;
+        if let Some(origin) = decoded {
+          self.phase =
+            GreenReplayPhase::Load(Box::new(slates_merge::engine::OriginLoad::new(origin)));
+        }
+        return Ok(false);
+      }
+      GreenReplayPhase::Load(load) => {
+        self.load_steps = self.load_steps.saturating_add(1);
+        match load.step(crate::merge_origin::hash_share(state)) {
+          Some(seeded) => Some(seeded),
+          None => return Ok(false),
+        }
       }
       GreenReplayPhase::Chain {
         green,
@@ -11445,28 +15943,29 @@ impl GreenReplay {
         next,
         replayed,
         head_check,
-      } => replay_chain_entry(state, id, green, (*held, *head_check), next, replayed),
-    }
-  }
-
-  /// The held origin's walk is whole: the engine is built from it, and the chain's replay begins.
-  fn begin_chain(&mut self, state: &ShardState) -> Result<(), crate::merge_service::GreenFence> {
-    let placeholder = GreenReplayPhase::Chain {
-      green: Box::new(slates_merge::engine::Green::new()),
-      held: 0,
-      next: 0,
-      replayed: Vec::new(),
-      head_check: None,
+      } => return replay_chain_entry(state, id, green, (*held, *head_check), next, replayed),
     };
-    if let GreenReplayPhase::Origin(walk) = std::mem::replace(&mut self.phase, placeholder) {
-      let origin = walk.finish().map_err(held_origin_fence)?;
-      self.phase = chain_phase(state, self.id, Some(origin))?;
+    match seeded {
+      // The origin is seeded: the engine is restored at its checkpoint and the chain's replay begins.
+      Some(seeded) => self.phase = chain_phase(state, id, Some(seeded))?,
+      // The held walk is whole: it is taken out and finished into the origin the engine is seeded from.
+      None => {
+        let walked = std::mem::replace(
+          &mut self.phase,
+          GreenReplayPhase::Decode(Box::new(slates_merge::origin::DecodeCursor::new())),
+        );
+        if let GreenReplayPhase::Origin(walk) = walked {
+          let origin = walk.finish().map_err(held_origin_fence)?;
+          self.phase =
+            GreenReplayPhase::Load(Box::new(slates_merge::engine::OriginLoad::new(origin)));
+        }
+      }
     }
-    Ok(())
+    Ok(false)
   }
 
   /// The replayed engine, with the shard's rejected-cache budget, and the versions it rebuilt; `OriginUnavailable` if
-  /// called before the origin's walk was whole (a caller that stopped stepping early).
+  /// called before the chain's replay began (a caller that stopped stepping early).
   fn finish(self, state: &ShardState) -> Result<ReplayedGreen, crate::merge_service::GreenFence> {
     match self.phase {
       GreenReplayPhase::Chain {
@@ -11482,8 +15981,14 @@ impl GreenReplay {
             .iter()
             .filter(|version| version.base < held)
             .count();
+          // The floor is a checkpoint's, or with none the version the green's takeover adopted it at (A-333).
+          let floor = if state.db.partition().green_checkpoint(self.id).is_some() {
+            "checkpoint"
+          } else {
+            "adoption"
+          };
           slates_machine::log_line!(
-            "slates-server: partition {}: green {} restored at checkpoint {held}, applied {} chain entries above it, {below} of them based below it",
+            "slates-server: partition {}: green {} restored at its {floor} at version {held}, applied {} chain entries above it, {below} of them based below it",
             state.partition,
             hex_of(&self.id.bytes),
             replayed.len()
@@ -11492,7 +15997,9 @@ impl GreenReplay {
         green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
         Ok((*green, replayed))
       }
-      GreenReplayPhase::Origin(_) => Err(crate::merge_service::GreenFence::OriginUnavailable),
+      GreenReplayPhase::Origin(_) | GreenReplayPhase::Decode(_) | GreenReplayPhase::Load(_) => {
+        Err(crate::merge_service::GreenFence::OriginUnavailable)
+      }
     }
   }
 }
@@ -11523,6 +16030,10 @@ fn replay_chain_entry(
   if accepted != version {
     return Err(GreenFence::WrongVersion { version, accepted });
   }
+  // The version's signature verdict, as its submit's was judged (A-321): provenance read back, never judged again.
+  if let Some(signature) = entry.signature {
+    green.record_signature(version, signature);
+  }
   let identity = green.head_identity();
   let at_checkpoint = head_check.and_then(|(at, recorded)| (at == version).then_some(recorded));
   if entry
@@ -11552,29 +16063,29 @@ fn replay_chain_entry(
 fn chain_phase(
   state: &ShardState,
   id: DbVolumeId,
-  origin: Option<slates_merge::origin::Origin>,
+  seeded: Option<slates_merge::engine::Green>,
 ) -> Result<GreenReplayPhase, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
-  let (mut green, held, head_check) = match state.db.partition().green_checkpoint(id) {
+  // The engine seeded from the origin (the empty engine for a green with no origin), restored at its checkpoint if it
+  // has one, as `Green::restore` does in one call.
+  let seeded = seeded.unwrap_or_default();
+  let partition = state.db.partition();
+  let adopted = partition.green_adoption(id).is_some();
+  let (mut green, held, head_check) = match partition.green_checkpoint(id) {
     Some((held, bytes)) => {
       let checkpoint = slates_merge::checkpoint::Checkpoint::decode(bytes)
         .ok()
         .filter(|checkpoint| checkpoint.version == held)
         .ok_or(GreenFence::CheckpointCorrupt)?;
       (
-        slates_merge::engine::Green::restore(origin.unwrap_or_default(), &checkpoint),
+        seeded.with_checkpoint(&checkpoint),
         held,
         checkpoint.head_check,
       )
     }
-    None => (
-      origin.map_or_else(
-        slates_merge::engine::Green::new,
-        slates_merge::engine::Green::with_origin,
-      ),
-      0,
-      None,
-    ),
+    // With no checkpoint the chain begins after the green's floor: 0, or the version its takeover adopted it at, whose
+    // engine the boot rebuilt from this node's ledger (A-333).
+    None => (seeded, partition.green_floor(id), None),
   };
   // The identity the head had when the checkpoint was taken (A-257): compared once the replay reaches that version.
   if head_check
@@ -11583,9 +16094,9 @@ fn chain_phase(
     return Err(GreenFence::IdentityDiverged { version: held });
   }
   // Version 0's merge record, as its owner enqueued it, when no checkpoint stands for it; `replay_chain_entry` keeps
-  // the rest.
+  // the rest. An adopted green's version 0 is its departed owner's, placed before its takeover (A-333).
   let mut replayed = Vec::new();
-  if held == 0 {
+  if held == 0 && !adopted {
     replayed.push(crate::merge_service::ReplayedVersion {
       version: 0,
       increment: [0u8; 32],
@@ -11641,12 +16152,178 @@ fn fence_green(
 /// report, alongside the verbs' refusal kinds.
 const GREEN_FENCED: &str = "merge.green_fenced";
 
+/// The status count of verbs on a green a restarted successor holds by adoption, answered `Overloaded` while the boot
+/// rebuilds its engine from this node's ledger (A-333).
+const GREEN_AWAITING_ADOPTION_REFUSED: &str = "merge.awaiting_adoption_refused";
+/// The status count of greens a recovery found held by adoption, left for the boot to rebuild from this node's ledger
+/// (A-333).
+const GREEN_AWAITING_ADOPTION: &str = "merge.recovery.awaiting_adoption";
+
+/// Leaves recovered green `record` for the boot to re-adopt, when its takeover adopted it from this node's holder ledger
+/// (A-333): its partition records the versions up to the adoption by reference, so no replay of the partition rebuilds
+/// it. Its engine is rebuilt from the ledger through the adopted version, or through version 0 alone when a checkpoint
+/// past the adoption stands (the checkpoint is applied onto the origin), then handed here
+/// (`crate::green_adopt::readopt_at_boot`). Whether the green waits so.
+fn await_adoption(state: &mut ShardState, record: &VolumeRecord) -> bool {
+  let partition = state.db.partition();
+  let Some(adoption) = partition.green_adoption(record.id).copied() else {
+    return false;
+  };
+  let awaiting = if partition.green_checkpoint(record.id).is_some() {
+    crate::green_adopt::AwaitingAdoption {
+      through: 0,
+      identity: None,
+      replay: None,
+    }
+  } else {
+    crate::green_adopt::AwaitingAdoption {
+      through: adoption.version,
+      identity: Some(adoption.identity),
+      replay: None,
+    }
+  };
+  state.merge.awaiting_adoption.insert(record.id, awaiting);
+  state.count(GREEN_AWAITING_ADOPTION, 1);
+  true
+}
+
+/// Takes the engine the boot rebuilt from this node's ledger for green `id`, awaiting its re-adoption here (A-333), and
+/// begins the replay of this partition's own chain onto it: its checkpoint applied when one stands, then each chain
+/// entry after the green's floor, a slice a call ([`step_readoption`]). False, and the engine dropped, when the engine
+/// is not at the version and identity the adoption names, or the checkpoint does not decode: the boot fences the green.
+/// A green no longer awaiting (destroyed meanwhile) takes nothing, and answers true.
+pub(crate) fn begin_readoption(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  mut engine: slates_merge::engine::Green,
+) -> bool {
+  let Some(awaiting) = state.merge.awaiting_adoption.get(&id) else {
+    return true;
+  };
+  let (through, identity) = (awaiting.through, awaiting.identity);
+  if engine.head() != through || identity.is_some_and(|identity| engine.head_identity() != identity)
+  {
+    return false;
+  }
+  let Ok(phase) = chain_phase(state, id, Some(engine)) else {
+    return false;
+  };
+  if let Some(awaiting) = state.merge.awaiting_adoption.get_mut(&id) {
+    awaiting.replay = Some(Box::new(GreenReplay {
+      id,
+      phase,
+      load_steps: 0,
+    }));
+  }
+  true
+}
+
+/// What one call of a green's re-adoption replay did ([`step_readoption`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadoptionStep {
+  /// A slice of the chain was applied; more remains.
+  More,
+  /// The chain is applied: the green is installed and served, each version after its floor owed to its holders again.
+  Installed,
+  /// The replay was refused (an entry that does not decode or does not reach its recorded identity), or none began:
+  /// the green is fenced.
+  Fenced,
+}
+
+/// Applies a slice of green `id`'s own chain onto the engine its re-adoption was handed ([`begin_readoption`], A-333);
+/// once all of it is applied, installs the green as a recovery does (`install_green`: the rejected-cache budget, the
+/// retention settled) and owes its holders every version after the green's floor again (A-246). A green no longer
+/// awaiting (destroyed meanwhile) is `Installed`: there is nothing left to do for it.
+pub(crate) fn step_readoption(state: &mut ShardState, id: DbVolumeId) -> ReadoptionStep {
+  let Some(awaiting) = state.merge.awaiting_adoption.get_mut(&id) else {
+    return ReadoptionStep::Installed;
+  };
+  let Some(mut replay) = awaiting.replay.take() else {
+    fence_awaiting_adoption(state, id);
+    return ReadoptionStep::Fenced;
+  };
+  let budget = state.config.copy_slice_ns().max(1);
+  let began = state.clock.monotonic_ns();
+  loop {
+    match replay.step(state) {
+      Ok(true) => break,
+      Ok(false) if state.clock.monotonic_ns().saturating_sub(began) < budget => {}
+      Ok(false) => {
+        if let Some(awaiting) = state.merge.awaiting_adoption.get_mut(&id) {
+          awaiting.replay = Some(replay);
+        }
+        return ReadoptionStep::More;
+      }
+      Err(fence) => {
+        state.merge.awaiting_adoption.remove(&id);
+        if let Some(record) = state.db.partition().volume(id).cloned() {
+          fence_green(state, &record, fence);
+        }
+        return ReadoptionStep::Fenced;
+      }
+    }
+  }
+  state.merge.awaiting_adoption.remove(&id);
+  let Some(record) = state.db.partition().volume(id).cloned() else {
+    return ReadoptionStep::Installed;
+  };
+  let replayed = replay.finish(state);
+  for version in install_green(state, &record, replayed) {
+    crate::merge_service::enqueue_recovered_record(state, id, version);
+  }
+  // The adopted version was placed at the quorum before the restart (the takeover re-committed it); only the versions
+  // after it are owed to the holders again.
+  if let Some(adoption) = state.db.partition().green_adoption(id).copied()
+    && state.greens.contains_key(&id)
+  {
+    let placed = state
+      .merge
+      .placed
+      .entry(ObjectId(id.bytes))
+      .or_insert(adoption.version);
+    *placed = (*placed).max(adoption.version);
+  }
+  ReadoptionStep::Installed
+}
+
+/// Fences green `id`, awaiting its re-adoption here, whose boot could not re-adopt it from this node's ledger (A-333):
+/// every verb on it refused typed from here, its records left as the evidence (AUD-29-18).
+pub(crate) fn fence_awaiting_adoption(state: &mut ShardState, id: DbVolumeId) {
+  if state.merge.awaiting_adoption.remove(&id).is_none() {
+    return;
+  }
+  if let Some(record) = state.db.partition().volume(id).cloned() {
+    fence_green(
+      state,
+      &record,
+      crate::merge_service::GreenFence::LedgerUnavailable,
+    );
+  }
+}
+
 /// Rebuilds a recovered work volume from its log (§4.16, A-207; D-18): its base, what it holds of its own and its
 /// journal, replayed over its rebuilt green, so every change it acknowledged before the restart is there after it.
 /// Skipped when its green is gone (the work has nothing to be over). Charged for what it keeps, like any work; a log
 /// that does not replay, or a budget that cannot hold the work, leaves it unbuilt and counted
 /// (`WORK_REBUILD_REFUSED`), never presented reset as if its edits were kept.
 fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId) {
+  // A green on another partition has not recovered yet, and its engine is not this shard's: the work is replayed
+  // through its owner once every partition has recovered, before any client is admitted (A-247). So is a work over a
+  // green this shard holds by adoption, whose engine the boot rebuilds from the ledger first (A-333).
+  if owner_of(to_wire_volume(green)) != state.partition
+    || state.merge.awaiting_adoption.contains_key(&green)
+  {
+    let created_at = match record.policy.role {
+      Role::Work { base_version, .. } => base_version,
+      _ => 0,
+    };
+    state.work_home.unbuilt.push(crate::work_home::Unbuilt {
+      work: record.id,
+      green,
+      created_at,
+    });
+    return;
+  }
   let Some(engine) = state.greens.get(&green) else {
     return;
   };
@@ -11664,14 +16341,24 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
     state.count(WORK_REBUILD_REFUSED, 1);
     return;
   };
-  // Charged like any work for what it keeps; a budget that cannot hold it leaves the work unbuilt and counted.
+  install_rebuilt_work(state, record.id, green, (base_version, files, journal));
+}
+
+/// Installs a recovered work (A-207): charged like any work for what it keeps; a budget that cannot hold it leaves the
+/// work unbuilt and counted.
+fn install_rebuilt_work(
+  state: &mut ShardState,
+  work: DbVolumeId,
+  green: DbVolumeId,
+  (base_version, files, journal): (u64, crate::work_files::WorkFiles, Vec<VolumeOp>),
+) {
   let charged = crate::work_charge::footprint(&files, &journal);
   if state.store.grow(charged).is_err() {
     state.count(WORK_REBUILD_REFUSED, 1);
     return;
   }
   state.works.insert(
-    record.id,
+    work,
     crate::state::WorkState {
       green,
       base_version,
@@ -11679,8 +16366,33 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
       files,
       revision: 0,
       charged,
+      entries: std::collections::BTreeMap::new(),
+      verdict: None,
     },
   );
+}
+
+/// The replay of a work's log for a shard that does not hold its green (A-247): run here, over the green.
+pub(crate) fn owner_replay(
+  state: &ShardState,
+  green: DbVolumeId,
+  created_at: u64,
+  entries: &[Vec<u8>],
+) -> Option<(u64, crate::work_files::WorkFiles, Vec<VolumeOp>)> {
+  let engine = state.greens.get(&green)?;
+  crate::work_log::replay(Some(engine), created_at, entries).ok()
+}
+
+/// A work the green's owner replayed, installed on its own shard; a log that did not replay is counted (A-207).
+pub(crate) fn install_replayed_work(
+  state: &mut ShardState,
+  unbuilt: &crate::work_home::Unbuilt,
+  replayed: Option<(u64, crate::work_files::WorkFiles, Vec<VolumeOp>)>,
+) {
+  match replayed {
+    Some(replayed) => install_rebuilt_work(state, unbuilt.work, unbuilt.green, replayed),
+    None => state.count(WORK_REBUILD_REFUSED, 1),
+  }
 }
 
 /// The status count of recovered works left unbuilt because their log did not replay or the shard's budget could not
@@ -11749,18 +16461,18 @@ fn content_range(start: usize, slice_len: usize, offset: usize, len: usize) -> O
     .flatten()
 }
 
-/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
-/// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
-/// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
-/// matching §4.8's "never an empty success".
-fn recover_images(state: &mut ShardState) -> RecoveredImages {
+/// The shard's journal as a restart reads it from its slice of the anchor content object (§4.8, A-68): the committed
+/// checkpoint with every valid delta after it applied, and the journal positioned after them; `None` without a content
+/// object or a slice in it.
+fn read_journal(
+  state: &ShardState,
+) -> Option<Result<(Option<ShardImage>, slates_vfs::checkpoint_log::Journal), slates_vfs::VfsError>>
+{
   let (start, end) = state.content_range;
   let (delta_start, delta_end) = state.delta_range;
-  let Some(object) = &state.content else {
-    return RecoveredImages::default();
-  };
+  let object = state.content.as_ref()?;
   if end <= start || end > object.len() {
-    return RecoveredImages::default();
+    return None;
   }
   let checkpoints = ContentView {
     object,
@@ -11777,11 +16489,39 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
       0
     },
   };
-  match slates_vfs::checkpoint_log::Journal::recover(&checkpoints, &log) {
+  Some(slates_vfs::checkpoint_log::Journal::recover(
+    &checkpoints,
+    &log,
+  ))
+}
+
+/// Test support (A-270's oracle): whether the held pieces a restart would read from this shard's committed journal are
+/// exactly the ones it holds now ([`crate::content_holder::held_image`]), each delta's pieces folded over its
+/// checkpoint. Read after a publication commits, a missed change mark is a difference here before it is a lost record.
+pub(crate) fn committed_held_agrees(state: &ShardState) -> bool {
+  let committed = match read_journal(state) {
+    Some(Ok((Some(shard), _))) => shard.held,
+    Some(Ok((None, _))) | None => Vec::new(),
+    Some(Err(_)) => return false,
+  };
+  let mut held = crate::content_holder::held_image(state);
+  held.sort_by_key(|piece| piece.key);
+  committed == held
+}
+
+/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
+/// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
+/// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
+/// matching §4.8's "never an empty success".
+fn recover_images(state: &mut ShardState) -> RecoveredImages {
+  let Some(recovered) = read_journal(state) else {
+    return RecoveredImages::default();
+  };
+  match recovered {
     Ok((Some(shard), journal)) => {
       state.journal = journal;
       state.published_keys = shard.volumes.iter().map(|keyed| keyed.key).collect();
-      state.published_held.clone_from(&shard.held);
+      state.published_held = crate::content_holder::published_from(&shard.held);
       RecoveredImages {
         volumes: shard
           .volumes
@@ -11811,7 +16551,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
 #[derive(Default)]
 struct RecoveredImages {
   volumes: std::collections::BTreeMap<[u8; 16], VolumeImage>,
-  held: Vec<u8>,
+  held: Vec<slates_vfs::recover::HeldPiece>,
   replies: Vec<slates_vfs::recover::HeldReply>,
   calls: Vec<slates_vfs::recover::HeldCall>,
   nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
@@ -12019,9 +16759,9 @@ fn held_nfs_replies_changed(state: &ShardState) -> bool {
 
 /// The barrier replies not yet delivered, which ride with the effects they answer (A-61).
 fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   return state.pending_replies.values().cloned().collect();
-  #[cfg(not(target_os = "linux"))]
+  #[cfg(windows)]
   {
     let _ = state;
     Vec::new()
@@ -12047,7 +16787,9 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  let held = crate::content_holder::held_image(state);
+  let mut held = crate::content_holder::held_image(state);
+  let whole = crate::content_holder::whole_of(&held);
+  let owned = crate::content_holder::owned_of(&held);
   let mut replies = pending_replies(state);
   let mut calls = call_records_checkpoint(state);
   let mut nfs_replies = held_nfs_replies(state);
@@ -12062,7 +16804,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
       state,
       &handles,
       &skipped,
-      &held,
+      &mut held,
       (&mut replies, &mut calls, &mut nfs_replies, &mut nfs_states),
     ) {
       Ok(Streamed::Uncaptured(id, e)) => skipped.push((id, e)),
@@ -12096,11 +16838,11 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
     }
   }
   state.published_keys = published.volumes.iter().map(|id| id.bytes).collect();
-  state.published_held = held;
+  crate::content_holder::held_committed(state, whole, true);
+  crate::live_ship::owned_committed(state, owned, true);
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
-  #[cfg(target_os = "linux")]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -12128,7 +16870,7 @@ fn stream_checkpoint(
   state: &mut ShardState,
   handles: &[Handle<VolumeSlot>],
   skipped: &[(DbVolumeId, slates_vfs::VfsError)],
-  held: &[u8],
+  held: &mut Vec<slates_vfs::recover::HeldPiece>,
   (replies, calls, nfs_replies, nfs_states): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
@@ -12320,8 +17062,7 @@ fn publish_delta_into(
     .filter(|key| !present.contains(*key))
     .copied()
     .collect();
-  let held = crate::content_holder::held_image(state);
-  let held_changed = held != state.published_held;
+  let mut held = crate::content_holder::held_changes(state);
   let (mut calls, mut calls_removed) = call_records_delta(state);
   let mut nfs_replies = held_nfs_replies_changed(state).then(|| held_nfs_replies(state));
   // The held connections' byte states (A-231), whole in every delta: a READ changes them without a publication of its
@@ -12332,7 +17073,7 @@ fn publish_delta_into(
     count_at,
     count,
     &mut removed,
-    held_changed.then_some(&held[..]),
+    (&mut held.put, &mut held.removed),
     Some(&pending_replies(state)),
     (&mut calls, &mut calls_removed),
     (nfs_replies.as_deref_mut(), Some(&mut nfs_states[..])),
@@ -12356,11 +17097,17 @@ fn publish_delta_into(
     }
   }
   state.published_keys = present;
-  if held_changed {
-    state.published_held = held;
+  let carried = held
+    .put
+    .iter()
+    .map(|piece| piece.bytes.len())
+    .fold(0usize, usize::saturating_add);
+  if carried > 0 {
+    state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }
+  crate::content_holder::held_committed(state, held.whole, false);
+  crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
-  #[cfg(target_os = "linux")]
   clear_write_log(
     state,
     published.skipped.is_empty(),
@@ -12368,6 +17115,10 @@ fn publish_delta_into(
   );
   Ok(published)
 }
+
+/// Format: the status counter of the held-image bytes the shard's committed deltas carried (§4.8 persistence before
+/// reply): what a holder's acknowledgement costs its publication, so a test can hold it to the change made.
+pub(crate) const DELTA_HELD_BYTES: &str = "publish.delta_held_bytes";
 
 /// Format: the status counter of publications run to release blocks whose frees waited on one (A-64).
 pub(crate) const DEFERRED_RELIEVED: &str = "arena.deferred_relieved";
@@ -12574,29 +17325,45 @@ fn rebuild_volume(
   let entries = entry_allowance(size).max(volume.entry_usage().0);
   let allowed = volume.set_entry_allowance(entries);
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
-  // Re-acquire the version reservation (§4.2 accounting through recovery), giving back the byte
-  // reservation and re-grown hold — and the rebuilt volume's slots, blocks and retention — if the
-  // slab shrank.
-  let version_credit =
-    match recover_version_reservations(&mut state.store, allowance, reservation, held) {
-      Ok(credit) => credit,
-      Err(reason) => {
+  // Re-acquire a bounded claim's version reservation (§4.2 accounting through recovery), or a dynamic volume's hold for
+  // the live inodes it was rebuilt with (A-342), giving back the byte reservation and re-grown hold — and the rebuilt
+  // volume's slots, blocks and retention — if the slab shrank.
+  let version_credit = match size {
+    SizeClass::Bounded { .. } => {
+      match recover_version_reservations(&mut state.store, allowance, reservation, held) {
+        Ok(credit) => credit,
+        Err(reason) => {
+          let discarded = volume.discard_partial(&mut state.store);
+          count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
+          return Err(resources(reason));
+        }
+      }
+    }
+    SizeClass::Dynamic { .. } => {
+      if let Err(e) = volume.hold_versions(&mut state.store) {
         let discarded = volume.discard_partial(&mut state.store);
         count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
-        return Err(resources(reason));
+        release_recovered_bytes(&mut state.store, reservation, held);
+        return Err(resources(format!(
+          "recovered dynamic volume's inodes exceed the version slab: {e}"
+        )));
       }
-    };
+      None
+    }
+  };
   // Re-acquire the records' metadata reservation (§4.2 accounting through recovery), giving every
   // other credit and the rebuilt volume back if the ledger cannot back it.
   let journal_bytes = journal_floor_bytes(state);
   let metadata_credit = match reserve_metadata(state, journal_bytes) {
     Ok(credit) => Some(credit),
     Err(refusal) => {
+      let hold = volume.version_hold();
       let discarded = volume.discard_partial(&mut state.store);
       count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
       if let Some(c) = version_credit {
         state.store.versions.release(c);
       }
+      release_version_hold(&mut state.store, hold);
       release_recovered_bytes(&mut state.store, reservation, held);
       return Err(resources(format!(
         "recovered volume records exceed the metadata ledger: {}",
@@ -12685,7 +17452,7 @@ fn build_recovered_volume(
     }
   };
   let mut volume = rebuilt.map_err(|error| RecoveryCause::ImageRefused {
-    reason: error.to_string(),
+    reason: recorded_reason(error.to_string()),
   })?;
   // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
   // publishes its image before its record commits. Refuse content exceeding that policy.
@@ -12698,7 +17465,9 @@ fn build_recovered_volume(
     let discarded = volume.discard_partial_releasing(&mut state.store, host);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return Err(RecoveryCause::ImageRefused {
-      reason: format!("the image's quota exceeds the acknowledged size policy: {error}"),
+      reason: recorded_reason(format!(
+        "the image's quota exceeds the acknowledged size policy: {error}"
+      )),
     });
   }
   Ok((volume, opened.map(|(host, _)| host), image.prefix))
@@ -12706,7 +17475,9 @@ fn build_recovered_volume(
 
 /// A recovered volume's resources that do not fit this process, named by `reason`.
 fn resources(reason: String) -> RecoveryCause {
-  RecoveryCause::ResourcesUnavailable { reason }
+  RecoveryCause::ResourcesUnavailable {
+    reason: recorded_reason(reason),
+  }
 }
 
 /// Why the overlay's base at `path` could not be reacquired, by the host's refusal.
@@ -12717,7 +17488,7 @@ fn base_cause(path: &str, error: slates_vfs::host::HostError) -> RecoveryCause {
     slates_vfs::host::HostError::OwnMount(_) => RecoveryCause::BaseOnOwnMount { path },
     other => RecoveryCause::BaseUnavailable {
       path,
-      reason: other.to_string(),
+      reason: recorded_reason(other.to_string()),
     },
   }
 }
@@ -12828,13 +17599,11 @@ const TAKEOVER_KEPT_UNRELEASED: &str = "recovery.takeover_kept_unreleased";
 const REVOKED_MOUNTS_OVERDUE: &str = "fuse.revoked_overdue";
 
 /// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
-#[cfg(target_os = "linux")]
 pub(crate) const WRITE_LOG_UNWRITTEN: &str = "recovery.write_log_unwritten";
 
 /// Empties the shard's FUSE write log after a publication that captured every volume (A-63), stamped with that
 /// publication's generation: every write before it is in that image now. A volume skipped keeps the log, so its
 /// writes stay owed to the next daemon.
-#[cfg(target_os = "linux")]
 fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generation: u64) {
   if !captured_every_volume {
     return;
@@ -12850,7 +17619,8 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 }
 
 /// Replays the FUSE writes the previous daemon acknowledged after its last publication (A-63) into the volumes
-/// recovery rebuilt, in the order they were acknowledged: each to the volume whose prefix its inode carries. A write
+/// recovery rebuilt, in the order they were acknowledged: each to the volume it was written through, which its record
+/// names (an inode number's prefix names a clone's origin for every file the clone inherited, 2026-11-18). A write
 /// that cannot be replayed is counted and the run carries on; the file then lacks it, as the record says. A write
 /// refused `PublishNeeded` (the arena's freed blocks wait on a publication, A-64) publishes, puts every record not
 /// yet replayed back in the log under the new image's stamp — the publication cleared the log, and a crash before
@@ -12858,7 +17628,6 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 /// place among the writes (GAPS, A-154's sibling): the kernel never resends one, so without it the references a dead
 /// daemon was given back after its last publication stayed counted, and an unlinked file the kernel had let go was
 /// never reclaimed.
-#[cfg(target_os = "linux")]
 async fn replay_writes(
   state: &mut ShardState,
   slices: &mut crate::recovery_slices::RecoverySlices,
@@ -12892,28 +17661,21 @@ async fn replay_writes(
   replayed
 }
 
-/// The volume slot whose prefix `inode` carries, when recovery rebuilt it.
-#[cfg(target_os = "linux")]
-fn slot_of_inode(
-  state: &mut ShardState,
-  inode: u64,
+/// The slot of the volume a record names, when recovery rebuilt it.
+fn slot_of_volume(
+  state: &ShardState,
+  volume: [u8; 16],
 ) -> Option<slates_mem::Handle<crate::state::VolumeSlot>> {
-  let prefix = u16::try_from(inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
-  state
-    .volumes
-    .iter()
-    .find(|(_, slot)| slot.volume.prefix() == prefix)
-    .map(|(handle, _)| handle)
+  state.by_id.get(&DbVolumeId { bytes: volume }).copied()
 }
 
-/// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its inode names; `None` when no
-/// rebuilt volume has it.
-#[cfg(target_os = "linux")]
+/// Gives back one logged `FORGET`'s lookups, as its attachment's own, in the volume its record names; `None` when
+/// recovery did not rebuild that volume.
 fn replay_forget(
   state: &mut ShardState,
   forgotten: crate::write_log::Forgotten,
 ) -> Option<Result<(), slates_vfs::VfsError>> {
-  let handle = slot_of_inode(state, forgotten.inode)?;
+  let handle = slot_of_volume(state, forgotten.volume)?;
   let slot = state.volumes.get_mut(handle).ok()?;
   Some(slot.volume.forget_for(
     &mut state.store,
@@ -12923,13 +17685,13 @@ fn replay_forget(
   ))
 }
 
-/// Writes one logged record into the volume whose prefix its inode carries; `None` when no rebuilt volume has it.
-#[cfg(target_os = "linux")]
+/// Writes one logged record into the volume it was written through, which the record names; `None` when recovery did
+/// not rebuild that volume.
 fn replay_one(
   state: &mut ShardState,
   record: &crate::write_log::Record,
 ) -> Option<Result<usize, slates_vfs::VfsError>> {
-  let handle = slot_of_inode(state, record.inode)?;
+  let handle = slot_of_volume(state, record.volume)?;
   let slot = state.volumes.get_mut(handle).ok()?;
   let inode = slates_vfs::ids::InodeNo(record.inode);
   let written = slot
@@ -12945,7 +17707,6 @@ fn replay_one(
 /// Empties the write log under the committed image's generation and appends `remaining` to it, so the records a
 /// replay has not yet applied survive a crash before it ends. A record the log cannot take marks it overflowed
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
-#[cfg(target_os = "linux")]
 fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged]) {
   let generation = state.journal.generation();
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
@@ -12954,9 +17715,12 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged
   let mut kept = log.clear(object, generation).is_ok();
   for logged in remaining {
     let appended = match logged {
-      crate::write_log::Logged::Write(record) => {
-        log.append(object, record.inode, record.offset, &record.bytes)
-      }
+      crate::write_log::Logged::Write(record) => log.append(
+        object,
+        (record.volume, record.inode),
+        record.offset,
+        &record.bytes,
+      ),
       crate::write_log::Logged::Forget(forgotten) => log.append_forget(object, *forgotten),
     };
     if kept && appended.is_err() {
@@ -12970,12 +17734,10 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Logged
 }
 
 /// Format: the refusal counter of a logged write recovery could not replay (A-63).
-#[cfg(target_os = "linux")]
 const WRITE_REPLAY_REFUSED: &str = "recovery.write_replay_refused";
 
 /// Format: the refusal counter of a logged `FORGET` recovery could not give back (no rebuilt volume holds its inode,
 /// or the volume refused it).
-#[cfg(target_os = "linux")]
 const FORGET_REPLAY_REFUSED: &str = "recovery.forget_replay_refused";
 
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
@@ -13066,6 +17828,19 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
       if crate::held_copy::keeps(&state.inherited_copies, a.id) {
         return false;
       }
+      // A Shards stream whose resync end the anchor held is kept, and served again on a fresh stream its device is handed
+      // over that end (A-316; macOS too, A-339); any other dies with the process, as before.
+      #[cfg(unix)]
+      if matches!(a.form, AttachForm::ShardsFs { .. })
+        && let Some(at) = state
+          .inherited_fuse
+          .iter()
+          .position(|held| held.attachment == a.id)
+      {
+        let held = state.inherited_fuse.swap_remove(at);
+        state.adopt_shards.push(((**a).clone(), held));
+        return false;
+      }
       #[cfg(windows)]
       if matches!(a.form, AttachForm::WinFspMount { .. })
         && let Some(at) = state
@@ -13140,6 +17915,74 @@ mod tests {
   };
   use slates_db::register::RootConfiguration;
 
+  /// §4.8, §4.4 `status` (A-263 on B9). Do: frame the refusal a verb on an unrecovered overlay answers, its cause the
+  /// longest one a volume records: a base path of [`super::longest_recordable_base`] bytes and a reason of
+  /// [`super::RECOVERY_REASON_BYTES`]; and record a reason past that bound, multi-byte characters at the cut. Expect: the
+  /// refusal fits one reply chunk whole, the base is no longer than the platform's path maximum, and the long reason
+  /// is cut at a character boundary to the bound.
+  #[test]
+  fn the_longest_recorded_cause_fits_the_refusal_whole() {
+    use slates_ipc::protocol::RecoveryCause;
+    let longest = super::longest_recordable_base();
+    let refusal = ReplyBody::Refused {
+      refusal: Refusal::NotRecovered {
+        cause: RecoveryCause::BaseUnavailable {
+          path: "p".repeat(longest),
+          reason: "r".repeat(super::RECOVERY_REASON_BYTES),
+        },
+      },
+    };
+    let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap();
+    let framed = slates_ipc::protocol::framed_len(&refusal);
+    eprintln!(
+      "the longest recorded base here: {longest} bytes; the refusal's own room: {} bytes",
+      chunk - (framed - longest)
+    );
+    assert!(framed <= chunk);
+    assert!(longest <= super::PLATFORM_PATH_BYTES);
+    let reason = super::recorded_reason("é".repeat(super::RECOVERY_REASON_BYTES));
+    assert!(reason.len() <= super::RECOVERY_REASON_BYTES && reason.chars().all(|c| c == 'é'));
+  }
+
+  /// §4.4 `list` (A-263 with B8's `not_recovered`). Do: list a summary with the longest listable name and an unrecovered
+  /// overlay's cause whose base path and reason run 10,000 bytes each, multi-byte characters among them; and one whose
+  /// cause is short. Expect: the first fits a page alone, its name whole and its cause the same variant shortened at
+  /// character boundaries; the second is listed unchanged. A cause's text comes from the host and the recorded base, so
+  /// without the cut one long path made the listing it was in "reply too large for the bulk area".
+  #[test]
+  fn a_listed_volume_fits_a_page_whatever_its_recovery_cause_says() {
+    use slates_ipc::protocol::{RecoveryCause, VolumeSummary};
+    let summary = |cause: RecoveryCause| VolumeSummary {
+      id: VolumeId::default(),
+      name: "n".repeat(super::longest_listable_name()),
+      referenced_bytes: u64::MAX,
+      unique_bytes: u64::MAX,
+      overlay: true,
+      live_shipped: false,
+      not_recovered: Some(cause),
+    };
+    let long = "é/".repeat(3_334);
+    let whole = summary(RecoveryCause::BaseUnavailable {
+      path: long.clone(),
+      reason: long,
+    });
+    assert!(
+      super::encoded_len(&whole) > super::list_page_room(),
+      "uncut, it fits no page"
+    );
+    let listed = super::listed(whole);
+    assert!(super::encoded_len(&listed) <= super::list_page_room());
+    assert_eq!(listed.name.len(), super::longest_listable_name());
+    assert!(matches!(
+      listed.not_recovered,
+      Some(RecoveryCause::BaseUnavailable { .. })
+    ));
+    let short = summary(RecoveryCause::BaseMissing {
+      path: String::new(),
+    });
+    assert_eq!(super::listed(short.clone()), short);
+  }
+
   /// A volume owned by `owner`, sharing it with each of `access`.
   fn volume_owned_by(
     owner: Principal,
@@ -13159,6 +18002,9 @@ mod tests {
         role: Role::Plain,
         live_shipped: false,
         live_holders: None,
+        write: None,
+        write_version: 0,
+        signers: Vec::new(),
       },
       base: BaseRecord::Scratch,
       head: SnapshotId::default(),
@@ -13171,6 +18017,7 @@ mod tests {
       access,
       created_ns: 0,
       catalog_version: 0,
+      taken_over: None,
     }
   }
 
@@ -13319,6 +18166,107 @@ mod tests {
   /// Shape: the reduced reserve the relief test's shard runs with, so filling its arena takes a few chunks, not the
   /// machine's measured production reserve.
   const RELIEF_RESERVE: u64 = 32 << 20;
+
+  /// A-63, A-166's sibling sweep (from reading, proven here, 2026-11-18): a FUSE write a dead daemon logged to a clone's
+  /// inherited file is replayed into the clone, never its origin. A clone keeps its origin's inode numbers, the origin's
+  /// prefix in their top bits, for every file it inherits, and the replay found its volume by that prefix. Do: on a
+  /// shard, a volume whose file "f" holds "origin", snapshotted and cloned; replay a logged write of "clone!" at offset 0
+  /// of the clone's "f", through the clone, as the successor of a daemon that served it would. Expect: the clone's "f"
+  /// reads "clone!" and the origin's still "origin", the inode carrying the origin's prefix (non-vacuous). Before, the
+  /// write went to the origin, the clone kept "origin" and lost its write. Every platform: a Shards stream's logged
+  /// writes are replayed on macOS (A-339) and Windows (A-402) too.
+  #[test]
+  fn a_replayed_write_to_a_clones_inherited_file_lands_in_the_clone() {
+    let (origin_reads, clone_reads, inherited_prefix, origin_prefix) =
+      crate::daemon::audit_on_shard(|state| {
+        let principal = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
+        let super::ReplyBody::Created { id: origin } = super::dispatch(
+          state,
+          1,
+          &principal,
+          super::RequestBody::Create {
+            name: "replay-origin".to_owned(),
+            size: super::SizeClass::Dynamic { max: 1 << 20 },
+            names: super::NamePolicy::Exact,
+            require_locked: false,
+            base: None,
+          },
+        ) else {
+          panic!("the origin was created")
+        };
+        let origin_handle = *state.by_id.get(&super::to_db_volume(origin)).unwrap();
+        let super::ShardState { store, volumes, .. } = &mut *state;
+        let slot = volumes.get_mut(origin_handle).unwrap();
+        let root = slot.volume.root_inode(store).unwrap();
+        let file = slot.volume.create_file_no(store, root, "f", 0o644).unwrap();
+        slot.volume.write(store, file, 0, b"origin").unwrap();
+        let origin_prefix = slot.volume.prefix();
+        let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+          state,
+          1,
+          &principal,
+          super::RequestBody::Snapshot { volume: origin },
+        ) else {
+          panic!("the origin was snapshotted")
+        };
+        let reply = super::dispatch(
+          state,
+          1,
+          &principal,
+          super::RequestBody::Clone {
+            volume: origin,
+            snapshot,
+            name: "replay-clone".to_owned(),
+          },
+        );
+        let super::ReplyBody::Cloned { id: clone } = reply else {
+          panic!("the clone was made: {reply:?}")
+        };
+        let clone_handle = *state.by_id.get(&super::to_db_volume(clone)).unwrap();
+        let super::ShardState { store, volumes, .. } = &mut *state;
+        let clone_slot = volumes.get(clone_handle).unwrap();
+        let clone_root = clone_slot.volume.root_inode(store).unwrap();
+        let inherited = clone_slot
+          .volume
+          .lookup_no(store, clone_root, "f")
+          .unwrap()
+          .inode;
+        let record = crate::write_log::Record {
+          volume: clone.bytes,
+          inode: inherited.0,
+          offset: 0,
+          bytes: b"clone!".to_vec(),
+        };
+        assert!(
+          matches!(super::replay_one(state, &record), Some(Ok(_))),
+          "the logged write was replayed"
+        );
+        let read = |state: &mut super::ShardState, handle| {
+          let super::ShardState { store, volumes, .. } = &mut *state;
+          let slot = volumes.get(handle).unwrap();
+          let root = slot.volume.root_inode(store).unwrap();
+          let no = slot.volume.lookup_no(store, root, "f").unwrap().inode;
+          let mut bytes = [0u8; 6];
+          let read = slot.volume.read(store, no, 0, &mut bytes).unwrap();
+          bytes.get(..read).unwrap_or_default().to_vec()
+        };
+        (
+          read(state, origin_handle),
+          read(state, clone_handle),
+          inherited.prefix(),
+          origin_prefix,
+        )
+      });
+    assert_eq!(
+      inherited_prefix, origin_prefix,
+      "the clone's inherited file carries its origin's prefix"
+    );
+    assert_eq!(clone_reads, b"clone!", "the clone has its replayed write");
+    assert_eq!(origin_reads, b"origin", "the origin is untouched");
+  }
 
   /// A-64 (the relief). Do: on a shard with a reduced reserve, write a file large enough that rewriting it leaves the
   /// arena below the operation headroom; publish (the image names its blocks); rewrite it whole, so every old block's
@@ -13881,6 +18829,71 @@ mod tests {
     id
   }
 
+  /// §4.8 "Recovery", §4.3 "Bounded work everywhere" (A-217's owed item; 2026-11-18, goal g232): a recovering green's
+  /// origin is decoded and seeded into its engine a share at a time, never in one step. The whole origin seeded in one
+  /// step hashed and copied every file: over the Linux kernel's 1.67 GB, seconds of one poll, past the watchdog's verdict
+  /// on a shard that runs a window of CPU in one step. Do: create a green with no origin, record an origin of four files
+  /// of a share each as a taken-over green records one (`GreenOriginated`), and replay it a unit at a time. Expect: the
+  /// origin decoded over more than one unit and seeded over more than one, and the replayed engine at version 0 with the
+  /// identity the whole origin seeds.
+  #[test]
+  fn a_recovering_green_decodes_and_seeds_its_origin_a_share_at_a_time() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::GreenCreated { id } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateGreen {
+          name: "seeded".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ) else {
+        panic!("create green")
+      };
+      let green = super::to_db_volume(id);
+      let share =
+        crate::merge_origin::hash_share(state).max(crate::merge_origin::copy_share(state));
+      let mut origin = slates_merge::origin::Origin::default();
+      for file in 0..4u8 {
+        origin
+          .files
+          .push((format!("file-{file}"), vec![file; share]));
+      }
+      origin.canonicalize();
+      let expected = slates_merge::engine::Green::with_origin(origin.clone()).head_identity();
+      let recorded = super::Op::GreenOriginated {
+        green,
+        origin: origin.encode(),
+      };
+      state.db.mutate(&mut state.segment, &recorded, 0).unwrap();
+      let mut replay = super::GreenReplay::begin(state, green).unwrap();
+      let (mut decoded_in, mut seeded_in) = (0u32, 0u32);
+      loop {
+        match &replay.phase {
+          super::GreenReplayPhase::Decode(_) => decoded_in += 1,
+          super::GreenReplayPhase::Load(_) => seeded_in += 1,
+          _ => {}
+        }
+        if replay.step(state).unwrap() {
+          break;
+        }
+      }
+      let (mut engine, _) = replay.finish(state).unwrap();
+      assert!(decoded_in > 1, "the origin decoded over {decoded_in} units");
+      assert!(seeded_in > 1, "the origin seeded over {seeded_in} units");
+      assert_eq!(
+        (engine.head(), engine.head_identity()),
+        (0, expected),
+        "the replayed engine is the whole origin's version 0"
+      );
+    });
+  }
+
   /// AUD-29-18 (§4.16, D-27: a recovered green is its acknowledged history or nothing): do: create a green,
   /// append a chain entry no increment decodes to its durable log, rebuild it as a restart does, then ask
   /// its versions; expect the green fenced — no engine installed, the verb refused `ContentUnavailable` —
@@ -14227,6 +19240,9 @@ mod tests {
       live_shipped: false,
       live_holders: None,
       work_of: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
     }
   }
 
@@ -14238,6 +19254,40 @@ mod tests {
     catalog: &crate::catalog::CatalogValue,
     archive: &slates_archive::Archive,
   ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_past(state, id, catalog, archive, None)
+  }
+
+  /// [`take_over`] recording `past_tolerance` as the takeover's (A-332): `None` within tolerance.
+  fn take_over_past(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    past_tolerance: Option<slates_db::catalog::TakeoverPastTolerance>,
+  ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_at(
+      state,
+      id,
+      catalog,
+      archive,
+      slates_db::catalog::TakeoverRecord {
+        epoch: 1,
+        head_sequence: 1,
+        from_live_log: false,
+        past_tolerance,
+      },
+    )
+  }
+
+  /// [`take_over`] as the takeover `takeover` records it: its epoch and head sequence (the adopted head's), served from a
+  /// seal or a live log, past tolerance or within it.
+  fn take_over_at(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    takeover: slates_db::catalog::TakeoverRecord,
+  ) -> Result<(), Box<super::ReplyBody>> {
     let head = crate::head::HeadValue {
       manifest: None,
       content_holders: Vec::new(),
@@ -14247,9 +19297,173 @@ mod tests {
       head: &head,
       catalog,
       catalog_sequence: 0,
-      sequence: 1,
+      sequence: takeover.head_sequence,
+      takeover,
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// The bytes of the file `f` a [`takeover_archive`] names, read from volume `id` on this shard.
+  fn read_f(state: &crate::state::ShardState, id: slates_db::catalog::VolumeId) -> Vec<u8> {
+    let slot = state.volumes.get(*state.by_id.get(&id).unwrap()).unwrap();
+    let inode = slot.volume.resolve(&state.store, "f").unwrap().inode;
+    let size = slot.volume.stat(&state.store, inode).unwrap().size;
+    let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
+    let read = slot
+      .volume
+      .read(&state.store, inode, 0, &mut bytes)
+      .unwrap();
+    bytes.truncate(read);
+    bytes
+  }
+
+  /// A-362 (§4.8 "Promotion and takeover", A-334; the chaos nemesis, seed 6876545201569229162): a takeover that names a
+  /// node holding its own superseded copy of the volume serves the state it adopted, not that copy. Do: take a volume over
+  /// from an archive holding `OLD!` (this node's copy, as it held it when it owned the volume); mark it yielded, as this
+  /// host's re-admission under its id marks every volume it catalogued (A-334); then take it over again from an archive
+  /// holding `NEW!` at a later epoch and head (the state its successor's acknowledged writes left), as a takeover that
+  /// names this node again does; then let the reaper step its destroys. Expect the file to read `NEW!`, the volume no
+  /// longer lost to a successor (its verbs run here), its record naming the later takeover, the stale copy counted
+  /// relinquished, and its slot torn down and counted freed. Before, the second takeover found the id present and kept the
+  /// stale copy: the file read `OLD!`, and every verb on the volume was still sent away from its new owner.
+  #[test]
+  fn a_takeover_that_names_this_node_again_replaces_its_superseded_copy() {
+    crate::daemon::audit_on_shard(|state| {
+      let archive_of = |bytes: &[u8]| {
+        let chunk = slates_archive::Archive::raw_chunk(bytes.to_vec());
+        takeover_archive(
+          vec![slates_archive::Extent {
+            offset: 0,
+            len: 4,
+            chunk: chunk.identity,
+            chunk_offset: 0,
+          }],
+          vec![chunk],
+        )
+      };
+      let id = slates_db::catalog::VolumeId { bytes: [0x81; 16] };
+      let catalog = takeover_catalog("readopted", 1 << 20);
+      take_over(state, id, &catalog, &archive_of(b"OLD!")).unwrap();
+      assert_eq!(read_f(state, id), b"OLD!", "this node's own copy");
+      state.yielded.insert(id);
+      assert!(
+        super::lost_to_a_successor(state, id),
+        "the copy is lost to a successor"
+      );
+      let later = slates_db::catalog::TakeoverRecord {
+        epoch: 3,
+        head_sequence: 9,
+        from_live_log: false,
+        past_tolerance: None,
+      };
+      take_over_at(state, id, &catalog, &archive_of(b"NEW!"), later).unwrap();
+      let count = |state: &crate::state::ShardState, name: &str| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      };
+      // Shape: destroy slices enough for a four-byte volume's teardown, many times over.
+      const STEPS: usize = 64;
+      for _ in 0..STEPS {
+        if !super::step_destroys(state) {
+          break;
+        }
+      }
+      assert_eq!(read_f(state, id), b"NEW!", "the adopted state is served");
+      assert!(
+        !super::lost_to_a_successor(state, id),
+        "its verbs run here, its new owner"
+      );
+      assert_eq!(
+        state
+          .db
+          .partition()
+          .volume(id)
+          .and_then(|record| record.taken_over),
+        Some(later),
+        "its record names the later takeover"
+      );
+      assert_eq!(
+        (
+          count(state, "fleet.takeover.relinquished"),
+          count(state, "fleet.takeover.relinquished_freed")
+        ),
+        (1, 1),
+        "the stale copy relinquished once and its slot torn down"
+      );
+    });
+  }
+
+  /// A-332 (A-309, AC-8.3; §4.10 "Auto-seal"): a takeover past the volume's tolerance shows in the volume's loss report.
+  /// Do: take over one volume recorded past tolerance (its head register adopted from one member of a cohort whose
+  /// recovery quorum is two, its live log within tolerance) and another within tolerance, then ask each one's status as
+  /// its owner. Expect the first's loss report to name the takeover and that shortfall, registers short and the live log
+  /// not, and the second's to name its takeover with no shortfall. Before, the report could not tell a takeover that
+  /// lost acknowledged writes to the lost hosts from one that kept every one.
+  #[test]
+  fn a_takeover_past_its_tolerance_shows_in_the_volumes_loss_report() {
+    crate::daemon::audit_on_shard(|state| {
+      let data = slates_archive::Archive::raw_chunk(b"DATA".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: data.identity,
+          chunk_offset: 0,
+        }],
+        vec![data.clone()],
+      );
+      // Shape: the store-destroyed takeover's cohort at `f = 1`, a recovery quorum of two with one member left.
+      let short = slates_db::catalog::RecoveryShortfall {
+        needed: 2,
+        remaining: 1,
+      };
+      let past = slates_db::catalog::VolumeId { bytes: [0x71; 16] };
+      take_over_past(
+        state,
+        past,
+        &takeover_catalog("past-tolerance", 1 << 20),
+        &archive,
+        Some(slates_db::catalog::TakeoverPastTolerance {
+          registers: Some(short),
+          live_log: None,
+        }),
+      )
+      .unwrap();
+      let within = slates_db::catalog::VolumeId { bytes: [0x72; 16] };
+      take_over(
+        state,
+        within,
+        &takeover_catalog("within-tolerance", 1 << 20),
+        &archive,
+      )
+      .unwrap();
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 501,
+      };
+      let taken = |state: &mut crate::state::ShardState, id: slates_db::catalog::VolumeId| {
+        match super::status(state, &owner, VolumeId { bytes: id.bytes }) {
+          ReplyBody::Status { report } => report.loss.taken_over,
+          other => panic!("the volume's status was answered: {other:?}"),
+        }
+      };
+      let past_taken = taken(state, past).expect("the takeover past tolerance is reported");
+      assert_eq!(
+        past_taken.past_tolerance,
+        Some(slates_ipc::protocol::PastTolerance {
+          registers: Some(slates_ipc::protocol::Shortfall {
+            needed: 2,
+            remaining: 1
+          }),
+          live_log: None,
+        }),
+        "its registers recovered from one member of a cohort that needed two: {past_taken:?}"
+      );
+      let within_taken = taken(state, within).expect("the takeover within tolerance is reported");
+      assert_eq!(
+        within_taken.past_tolerance, None,
+        "a takeover within tolerance names no shortfall: {within_taken:?}"
+      );
+    });
   }
 
   /// AUD-29-17: do: take over a volume whose catalog carries a consumer's grant, and one whose catalog
@@ -14578,6 +19792,163 @@ mod tests {
     });
   }
 
+  /// The tree [`a_tree_laid_a_piece_a_step_is_the_tree_laid_at_once`] lays: nested directories, a sparse file of two data
+  /// pieces around a hole with a hole after it (each piece past a page), a pair of hard links, a symlink, a FIFO, an
+  /// attribute, and owners and times on every node.
+  fn laid_tree() -> slates_archive::Restored {
+    let meta = |ino: u64, mode: u32, size: u64, nlink: u32| slates_archive::NodeMeta {
+      ino,
+      mode,
+      size,
+      nlink,
+      uid: 1234,
+      gid: 456,
+      atime_ns: 1_000 + i64::try_from(ino).unwrap(),
+      mtime_ns: 2_000 + i64::try_from(ino).unwrap(),
+      ctime_ns: 3_000 + i64::try_from(ino).unwrap(),
+      btime_ns: 500,
+      ..Default::default()
+    };
+    let sparse = slates_archive::RestoredFile {
+      len: 20_000,
+      pieces: vec![(0, vec![1; 5_000]), (10_000, vec![2; 3_000])],
+    };
+    let linked = slates_archive::RestoredFile {
+      len: 2_500,
+      pieces: vec![(0, vec![3; 2_500])],
+    };
+    let target = slates_archive::RestoredFile {
+      len: 7,
+      pieces: vec![(0, b"d/e/big".to_vec())],
+    };
+    slates_archive::Restored {
+      files: [
+        ("d/e/big".to_owned(), sparse),
+        ("d/link-a".to_owned(), linked.clone()),
+        ("d/link-b".to_owned(), linked),
+        ("p".to_owned(), slates_archive::RestoredFile::default()),
+        ("s".to_owned(), target),
+      ]
+      .into(),
+      directories: ["d".to_owned(), "d/e".to_owned()].into(),
+      metadata: [
+        ("d".to_owned(), meta(10, 0o040750, 0, 2)),
+        ("d/e".to_owned(), meta(11, 0o040700, 0, 2)),
+        ("d/e/big".to_owned(), meta(12, 0o100640, 20_000, 1)),
+        ("d/link-a".to_owned(), meta(13, 0o100600, 2_500, 2)),
+        ("d/link-b".to_owned(), meta(13, 0o100600, 2_500, 2)),
+        ("p".to_owned(), meta(14, 0o010644, 0, 1)),
+        ("s".to_owned(), meta(15, 0o120777, 7, 1)),
+      ]
+      .into(),
+      root: slates_archive::NodeMeta {
+        mode: 0o040751,
+        uid: 1234,
+        gid: 456,
+        mtime_ns: 9_000,
+        ..Default::default()
+      },
+      xattrs: [(
+        "d/e/big".to_owned(),
+        [(b"user.k".to_vec(), b"v".to_vec())].into(),
+      )]
+      .into(),
+      chunks_decoded: 0,
+    }
+  }
+
+  /// What a laid volume holds at each of `paths` and at its root: the inode's attributes, its bytes (a file's, read
+  /// whole, holes as zeros; a symlink's target; nothing for another kind, named by the path's `kind`), and its inode
+  /// counted from the first path's, so two volumes' numbering compares.
+  fn laid_view(
+    state: &crate::state::ShardState,
+    handle: super::Handle<super::VolumeSlot>,
+    paths: &[(&str, char)],
+  ) -> Vec<(String, slates_vfs::inode::Attrs, Vec<u8>, u64)> {
+    let slot = state.volumes.get(handle).unwrap();
+    let root = slot.volume.root_inode(&state.store).unwrap();
+    let mut view = vec![(
+      String::new(),
+      slot.volume.stat(&state.store, root).unwrap(),
+      Vec::new(),
+      0,
+    )];
+    let first = slot.volume.resolve(&state.store, paths[0].0).unwrap().inode;
+    for (path, kind) in paths {
+      let no = slot.volume.resolve(&state.store, path).unwrap().inode;
+      let attrs = slot.volume.stat(&state.store, no).unwrap();
+      let bytes = match kind {
+        'l' => slot
+          .volume
+          .readlink(&state.store, no)
+          .unwrap()
+          .as_bytes()
+          .to_vec(),
+        'f' => {
+          let mut bytes = vec![0; usize::try_from(attrs.size).unwrap()];
+          let read = slot.volume.read(&state.store, no, 0, &mut bytes).unwrap();
+          bytes.truncate(read);
+          bytes
+        }
+        _ => Vec::new(),
+      };
+      view.push(((*path).to_owned(), attrs, bytes, no.0.wrapping_sub(first.0)));
+    }
+    view
+  }
+
+  /// g251 (a takeover's tree laid in turns of its owner shard, CLAUDE.md "Bounded work everywhere"): a restored tree laid
+  /// a piece a step is the tree laid at once. Do lay one tree ([`laid_tree`]) into two fresh volumes, once in one call
+  /// and once a piece a step with a byte a write. Expect more steps than the bytes of the tree's largest piece (no step
+  /// wrote past its slice), and every path the same in both volumes: its attributes (mode, owner, link count, size, all
+  /// four times), its bytes, which inode it names (the hard links one), and the root's; the sparse file reading as its
+  /// pieces around zeros to its length.
+  #[test]
+  fn a_tree_laid_a_piece_a_step_is_the_tree_laid_at_once() {
+    crate::daemon::audit_on_shard(|state| {
+      let restored = laid_tree();
+      let once = created_volume(state, "laid-once");
+      let stepped = created_volume(state, "laid-stepped");
+      let slot = state.volumes.get_mut(once).unwrap();
+      super::populate_restored(&mut state.store, &mut slot.volume, &restored).unwrap();
+      let slot = state.volumes.get_mut(stepped).unwrap();
+      let mut populating = super::Populating::new();
+      let mut steps = 0u64;
+      while !populating
+        .step(&restored, &mut state.store, &mut slot.volume, 1, || true)
+        .unwrap()
+      {
+        steps += 1;
+      }
+      assert!(
+        steps > 5_000,
+        "a piece a step and a byte a write: {steps} steps for the tree's 5,000-byte piece"
+      );
+      let paths = [
+        ("d/e/big", 'f'),
+        ("d/link-a", 'f'),
+        ("d/link-b", 'f'),
+        ("p", 'p'),
+        ("s", 'l'),
+        ("d", 'd'),
+        ("d/e", 'd'),
+      ];
+      let view = laid_view(state, stepped, &paths);
+      assert_eq!(
+        view,
+        laid_view(state, once, &paths),
+        "the same tree either way"
+      );
+      assert_eq!(view[2].3, view[3].3, "the hard links name one inode");
+      assert_eq!(
+        Some(&view[1].2),
+        restored.files["d/e/big"].dense().as_ref(),
+        "the sparse file reads as its pieces around zeros, to its length"
+      );
+      assert_eq!(view[5].2, b"d/e/big".to_vec(), "the symlink's target");
+    });
+  }
+
   /// Creates a bounded volume named `name` as uid 1234 on the test shard and returns its slot handle.
   fn created_volume(
     state: &mut crate::state::ShardState,
@@ -14602,6 +19973,226 @@ mod tests {
       panic!("{reply:?}")
     };
     *state.by_id.get(&super::to_db_volume(id)).unwrap()
+  }
+
+  /// The adoption a test hands an owner shard (A-333): a green with no origin, at version 0, named `name`.
+  fn adoption(name: &str, owner: &Principal) -> crate::green_adopt::AdoptedGreen {
+    let mut engine = slates_merge::engine::Green::new();
+    let identity = engine.head_identity();
+    crate::green_adopt::AdoptedGreen {
+      name: name.to_owned(),
+      require_evidence: false,
+      owner: owner.clone(),
+      access: Vec::new(),
+      catalog_sequence: 1,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
+      head: 0,
+      identity,
+      origin: None,
+      epoch: 0,
+      engine,
+      completions: Vec::new(),
+    }
+  }
+
+  /// §4.16 owner-loss recovery, CLAUDE.md §2 item 6 (no panics in non-test code, ever), A-333: a taken-over green whose
+  /// id names a volume of another role on its owner shard is refused, and nothing is adopted over it. Do: create a plain
+  /// volume, then adopt a taken-over green under its id and another name. Expect the adoption handed back with its
+  /// engine, counted refused, no green engine, and the plain volume still plain and served. Before (2026-11-18), a
+  /// `debug_assert!` on the volume's role panicked the shard in a debug build, and a release build went on to replay the
+  /// green's chain against the plain volume's record.
+  #[test]
+  fn a_taken_over_green_whose_id_names_a_plain_volume_is_refused_typed() {
+    let (handed_back, refused, engine, role, served) = crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "plain".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id: wire } = reply else {
+        panic!("{reply:?}")
+      };
+      let id = super::to_db_volume(wire);
+      let answer = super::adopt_taken_over_green(state, id, adoption("green", &owner));
+      (
+        answer.err().map(|back| back.engine.head()),
+        state
+          .refusals
+          .get(super::GREEN_TAKEOVER_ADOPTION_REFUSED)
+          .copied(),
+        state.greens.contains_key(&id),
+        crate::merge_service::merge_role(state, id).is_none(),
+        state.by_id.contains_key(&id),
+      )
+    });
+    assert_eq!(
+      handed_back,
+      Some(0),
+      "the adoption is handed back with its engine"
+    );
+    assert_eq!(refused, Some(1), "counted refused once");
+    assert!(!engine, "no green engine over the plain volume");
+    assert!(role, "the volume under the id is still plain");
+    assert!(served, "the plain volume is still served");
+  }
+
+  /// §4.16 owner-loss recovery, A-333: a taken-over green is recorded on its owner shard by its adoption and served by
+  /// the engine handed to it. Do: adopt a green at version 0 under a free id and ask its versions; adopt it again; drop its
+  /// engine (an install that did not happen) and adopt it again; drop it again and adopt under the same id an adoption
+  /// naming another identity; adopt another green under the same name. Expect the first adoption served (its versions at
+  /// head 0), recorded with its adoption and no origin bytes, counted adopted once; the second a no-op; the same adoption
+  /// installed again over its own record, counted; the other adoption and the other green refused and handed back.
+  #[test]
+  fn a_taken_over_green_is_recorded_by_its_adoption_and_served() {
+    let (versions, recorded, origin_bytes, answers, adopted) =
+      crate::daemon::audit_on_shard(|state| {
+        let owner = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
+        let id = super::DbVolumeId { bytes: [0x42; 16] };
+        let first = super::adopt_taken_over_green(state, id, adoption("adopted", &owner)).is_ok();
+        let versions = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Versions {
+            green: super::to_wire_volume(id),
+          },
+        );
+        let recorded = state.db.partition().green_adoption(id).copied();
+        let origin_bytes = state.db.partition().green_origin(id).is_some();
+        let again = super::adopt_taken_over_green(state, id, adoption("adopted", &owner)).is_ok();
+        state.greens.remove(&id);
+        let reinstalled = super::adopt_taken_over_green(state, id, adoption("adopted", &owner))
+          .is_ok()
+          && state.greens.contains_key(&id);
+        state.greens.remove(&id);
+        let mut another = adoption("adopted", &owner);
+        another.identity = [9; 32];
+        let another = super::adopt_taken_over_green(state, id, another).is_err();
+        let other = super::DbVolumeId { bytes: [0x43; 16] };
+        let other =
+          super::adopt_taken_over_green(state, other, adoption("adopted", &owner)).is_err();
+        let adopted = state.refusals.get(super::GREEN_TAKEOVER_ADOPTED).copied();
+        (
+          versions,
+          recorded,
+          origin_bytes,
+          [first, again, reinstalled, another, other],
+          adopted,
+        )
+      });
+    assert!(
+      matches!(versions, ReplyBody::Versions { head: 0 }),
+      "{versions:?}"
+    );
+    assert_eq!(
+      recorded.map(|adoption| (adoption.version, adoption.origin)),
+      Some((0, None)),
+      "recorded by its adoption"
+    );
+    assert!(!origin_bytes, "no origin bytes recorded");
+    assert_eq!(
+      answers, [true; 5],
+      "installed; a no-op again; installed over its own record; another adoption and another green refused"
+    );
+    assert_eq!(adopted, Some(2), "counted adopted at each install");
+  }
+
+  /// §4.16 owner-loss recovery and its failure matrix (a green owner's restart is masked), A-333: a restarted successor's
+  /// green, held by adoption, waits for the engine its ledger rebuilds and serves once it has it. Do: adopt a green at
+  /// version 0 and another whose adoption names another identity; leave both as a restart leaves them (recorded, no engine,
+  /// nothing placed) and await their re-adoption; ask the first's versions; hand the second an engine at version 0, and the
+  /// first one, and step the first's replay; ask its versions again. Expect the first ask answered `Overloaded`, counted;
+  /// the engine off the second's identity not taken; the first's replay installed in one step, its versions at head 0 and
+  /// version 0 placed again.
+  #[test]
+  fn a_green_awaiting_its_readoption_answers_overloaded_then_serves_the_engine_handed_to_it() {
+    let (waiting, taken, step, versions, placed, counted) =
+      crate::daemon::audit_on_shard(|state| {
+        let owner = Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        };
+        let (id, off) = (
+          super::DbVolumeId { bytes: [0x44; 16] },
+          super::DbVolumeId { bytes: [0x45; 16] },
+        );
+        let mut other = adoption("off", &owner);
+        other.identity = [9; 32];
+        let adopted = super::adopt_taken_over_green(state, id, adoption("readopted", &owner))
+          .is_ok()
+          && super::adopt_taken_over_green(state, off, other).is_ok();
+        // What a restart leaves of each: its record and adoption, no engine and nothing placed.
+        for green in [id, off] {
+          state.greens.remove(&green);
+          state.merge.placed.remove(&ObjectId(green.bytes));
+          let record = state.db.partition().volume(green).cloned();
+          assert!(
+            adopted && record.is_some_and(|record| super::await_adoption(state, &record)),
+            "an adopted green waits for its ledger"
+          );
+        }
+        let wire = super::to_wire_volume(id);
+        let waiting = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Versions { green: wire },
+        );
+        let taken = [
+          super::begin_readoption(state, off, slates_merge::engine::Green::new()),
+          super::begin_readoption(state, id, slates_merge::engine::Green::new()),
+        ];
+        let step = super::step_readoption(state, id);
+        let versions = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Versions { green: wire },
+        );
+        let placed = crate::merge_service::placed_version(state, ObjectId(id.bytes));
+        let counted = state
+          .refusals
+          .get(super::GREEN_AWAITING_ADOPTION_REFUSED)
+          .copied();
+        (waiting, taken, step, versions, placed, counted)
+      });
+    assert!(
+      matches!(
+        waiting,
+        ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        }
+      ),
+      "a verb on a green awaiting its re-adoption is not started: {waiting:?}"
+    );
+    assert_eq!(
+      taken,
+      [false, true],
+      "an engine off the adoption's identity is not taken; the right one is"
+    );
+    assert_eq!(step, super::ReadoptionStep::Installed);
+    assert!(
+      matches!(versions, ReplyBody::Versions { head: 0 }),
+      "{versions:?}"
+    );
+    assert_eq!(placed, Some(0), "the adopted version is placed again");
+    assert_eq!(counted, Some(1), "the refused verb counted");
   }
 
   /// What a client observes of the node at `path`: its kind and permission bits, owner, link count, four
@@ -15024,6 +20615,73 @@ mod tests {
     }
   }
 
+  /// §4.9 (RIFL), the protocol's `Overloaded` ("the request was not started and may be retried" under its id), GAPS
+  /// "The many-client load test from 10,000 to 100,000 clients"
+  /// (`docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`): a verb answered `Overloaded` ran
+  /// nothing, so its id stays unanswered and a resend under it runs the verb. It was recorded as the completion, so
+  /// every resend under the id met it for good. Do: snapshot a volume this node holds a copy of and has not
+  /// materialized (the takeover's settle window, answered `Overloaded`); then, the copy gone, send the same request
+  /// again under its id. Expect: `Overloaded` first, counted unrecorded once; the resend runs the verb and answers what
+  /// it answers now, `NotFound`, not the first answer again.
+  #[test]
+  fn a_resend_under_the_id_of_an_overloaded_verb_runs_the_verb() {
+    let (first, resent, unrecorded) = crate::daemon::audit_on_shard(|state| {
+      let owner = HostId(7);
+      let volume = VolumeId {
+        bytes: ObjectId::new(owner, 3).0,
+      };
+      let object = ObjectId(volume.bytes);
+      state.holder_records.insert(
+        object,
+        slates_db::register::Acceptor::new(
+          owner,
+          slates_db::register::Authority {
+            generation: 1,
+            owner,
+          },
+        ),
+      );
+      let id = slates_wire::request::RequestId {
+        client: 1,
+        sequence: 1,
+      };
+      let principal = Principal::Uid {
+        host: HostId(0),
+        uid: 0,
+      };
+      let request = super::RequestBody::Snapshot { volume };
+      let first = super::run_forwarded(state, 1, id, 1, &principal, request.clone(), None);
+      state.holder_records.remove(&object);
+      let resent = super::run_forwarded(state, 1, id, 1, &principal, request, None);
+      let unrecorded = state
+        .refusals
+        .get(super::OVERLOADED_UNRECORDED)
+        .copied()
+        .unwrap_or(0);
+      (first, resent, unrecorded)
+    });
+    assert!(
+      matches!(
+        first,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        })
+      ),
+      "a held copy not yet materialized answers Overloaded: {first:?}"
+    );
+    assert_eq!(
+      resent,
+      Some(ReplyBody::Refused {
+        refusal: Refusal::NotFound
+      }),
+      "the resend under the same id ran the verb"
+    );
+    assert_eq!(
+      unrecorded, 1,
+      "the Overloaded answer was left unrecorded once"
+    );
+  }
+
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
   /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves
   /// locally — the fast path, taken before any map lookup.
@@ -15139,6 +20797,77 @@ mod tests {
       Err(Refusal::ConsumerNotEnrolled),
       "a proof under a guessed capability does not verify"
     );
+  }
+
+  /// The chaos nemesis at seed 6876545201569229162 (ReadSafety; §4.8 "Lookup"): a verb forwarded to this node as a
+  /// volume's owner by its own routing, a takeover's successor, before it has made the volume is refused `Overloaded`,
+  /// retryable, never answered `NotFound`. Do: route a volume another member created to this node, as a takeover's install
+  /// routes it to its successor, without making it; serve a forwarded status read of it as `serve_forward` does on its
+  /// owner shard; then create a volume here and serve the same read of it. Expect the first refused `Overloaded` and
+  /// counted once, the second answered. Before, the first answered `NotFound`: a reader through a holder was told its
+  /// acknowledged write did not exist.
+  #[test]
+  fn a_forwarded_read_of_a_volume_owned_here_but_not_made_is_refused_retryably() {
+    let (unmade, made, counted) = crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let local = state.fleet.host();
+      let creator = slates_db::HostId(local.0 ^ 1);
+      let unmade_id = super::VolumeId {
+        bytes: slates_db::register::ObjectId::new(creator, 7).0,
+      };
+      state
+        .fleet
+        .track_object_owner(slates_db::register::ObjectId(unmade_id.bytes), local);
+      let unmade = super::serve_forwarded_read(
+        state,
+        &principal,
+        super::RequestBody::Status { volume: unmade_id },
+        unmade_id,
+      );
+      let super::ReplyBody::Created { id } = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::Create {
+          name: "made-here".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the volume was created")
+      };
+      let made = super::serve_forwarded_read(
+        state,
+        &principal,
+        super::RequestBody::Status { volume: id },
+        id,
+      );
+      let counted = state
+        .refusals
+        .get(super::FORWARD_BEFORE_MADE)
+        .copied()
+        .unwrap_or(0);
+      (unmade, made, counted)
+    });
+    assert!(
+      matches!(
+        unmade,
+        super::ReplyBody::Refused {
+          refusal: Refusal::Overloaded { .. }
+        }
+      ),
+      "a volume owned here but not made is refused retryably: {unmade:?}"
+    );
+    assert!(
+      !matches!(made, super::ReplyBody::Refused { .. }),
+      "a volume made here is answered: {made:?}"
+    );
+    assert_eq!(counted, 1, "counted once");
   }
 }
 

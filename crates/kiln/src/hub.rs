@@ -7056,6 +7056,9 @@ pub(crate) mod tests {
         let mut cfg = Config::default();
         cfg.server.data_dir = dir.clone();
         cfg.terminal.enabled = false;
+        // A test's agents work in their folders unless it asks for volumes: none leaves a Slates volume or mount behind
+        // on the machine that runs it (docs/agentic.md W2).
+        cfg.agents.workspace = crate::config::DefaultWorkspace::Folder;
         f(&mut cfg);
         // Its slowest parts, and apart: the store's migrations (about 20 ms) and its keys (the
         // process's first key starts the crypto library, about as long), made side by side on the

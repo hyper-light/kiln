@@ -292,8 +292,9 @@ fn title_of(info: &Info, want: &Want) -> String {
 /// `actor` is who asked, as the audit trail names them.
 pub async fn open(hub: &Arc<Hub>, actor: &str, info: &Info, want: Want) -> Result<Record, Fail> {
     let paths = paths_of(hub, &info.id);
-    // In a workspace of its own, everything that changed there is its: its commands' changes too.
-    let own = info.workspace.as_ref().is_some_and(|w| w.made.is_some());
+    // In a workspace of its own, everything that changed there is its: its commands' changes too. In another agent's
+    // volume it works beside that agent, as in a folder they share: its own files are its.
+    let own = info.workspace.as_ref().is_some_and(|w| w.made.is_some() && w.owner.is_none());
     // Nothing new to push (no file changed, or no edit since its last version): `ready` alone
     // marks its draft ready where it is (W26-R18).
     let edited = edits_of(info);

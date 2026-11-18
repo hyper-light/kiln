@@ -620,8 +620,8 @@ async fn result(cx: Cx, v: Value) -> Out {
         "tree": info.tree,
         "machine": wait::machine(&info.target),
         "cost_usd": info.cost_usd,
-        // Its workspace of its own (docs/agentic.md, W): the folder it's laid over, and its volume.
-        "workspace": info.workspace.as_ref().map(|w| json!({"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount)})),
+        // Its workspace (docs/agentic.md, W): the folder it's laid over, and its volume.
+        "workspace": info.workspace.as_ref().map(workspace_shown),
         "branch": record.as_ref().map(|r| json!(r.branch)),
         "change_request": record.as_ref().map(crate::workspace::change::shown),
     }))
@@ -635,13 +635,23 @@ async fn change(cx: Cx, v: Value) -> Out {
     Ok(json!({"change_request": crate::workspace::change::shown(&r)}))
 }
 
+/// An agent's workspace as its views show it: its kind, the folder it's laid over and its place there, its volume and
+/// where it's mounted; whose volume it is when another agent's (`owner`).
+fn workspace_shown(w: &crate::workspace::Workspace) -> Value {
+    json!({"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount), "owner": w.owner})
+}
+
 async fn workspace(cx: Cx, v: Value) -> Out {
     let info = seen(&cx, &agent_of(&v)?).await?;
     let Some(w) = info.workspace.clone() else {
         return Ok(json!({"workspace": Value::Null, "drift": []}));
     };
+    // Its folder itself has nothing of its own to drift from.
+    if w.made.is_none() {
+        return Ok(json!({"workspace": workspace_shown(&w), "drift": []}));
+    }
     let look = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Look).await?;
-    Ok(json!({"workspace": {"kind": w.kind, "over": w.over, "sub": w.sub, "volume": w.made.as_ref().map(|m| &m.volume), "mount": w.made.as_ref().map(|m| &m.mount)}, "drift": look.get("drift").cloned().unwrap_or(json!([]))}))
+    Ok(json!({"workspace": workspace_shown(&w), "drift": look.get("drift").cloned().unwrap_or(json!([]))}))
 }
 
 /// Its repository's branches, tags and latest commits (docs/agents.md, "Compare").
@@ -694,19 +704,104 @@ async fn land(cx: Cx, v: Value) -> Out {
     if info.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
         return Err((StatusCode::CONFLICT, format!("{} works in its folder itself: what it changed is there already", info.name)));
     }
-    let Some(manifest) = v.get("manifest").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned) else {
-        let plan = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Plan).await?;
-        return Ok(plan);
-    };
-    // Writing to a person's folder waits on a person (docs/agentic.md: no agent answers what waits on one).
-    if cx.caller.agent.is_some() || cx.caller.kind == crate::authz::gate::Kind::Agent {
-        return Err((StatusCode::FORBIDDEN, "writing an agent's work to disk is a person's to say: they do it from the agent's Changes, or with this operation themselves".to_owned()));
+    // A volume lands whole, so an agent working in another's lands nothing of its own while that one works: its work
+    // lands with the volume's owner's (docs/agentic.md W2, W6). Once the owner has ended, the last of them lands it.
+    if let Some(owner) = info.workspace.as_ref().and_then(|w| w.owner.as_deref()).and_then(|o| cx.hub.harness.info(o)) {
+        return Err((StatusCode::CONFLICT, format!("{} works in {}'s volume ({}): it lands whole, with that agent's work, from that agent's Changes", info.name, owner.name, lineage::short(&owner.id))));
     }
+    let manifest = v.get("manifest").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned);
+    // A person reads the plan, then writes it; an agent lands as its mode lets it (the person's rule, 2026-11-18;
+    // docs/agentic.md W6): at once in a mode that edits unasked, its plan written as it stands when it names none;
+    // after its person's click in one that asks (`crate::confirms` asks it, and the call the click allows comes here
+    // as the person's); never in one that only plans.
+    let by = landing_by(&cx, &info)?;
+    if by == LandingBy::Asking && manifest.is_some() {
+        return Err((StatusCode::PRECONDITION_REQUIRED, format!("writing {}'s work to disk waits on its person's click, as its mode asks before it edits: kiln asks them when the call comes in their chat turn", info.name)));
+    }
+    let manifest = match manifest {
+        Some(m) => m,
+        None => {
+            let plan = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Plan).await?;
+            let manifest = plan.pointer("/plan/manifest").and_then(Value::as_str).map(str::to_owned);
+            match manifest {
+                // Its plan, written as it stands: under the same manifest, so what it saw is what lands.
+                Some(m) if by == LandingBy::Writing && plan.get("can_write") == Some(&Value::Bool(true)) => m,
+                Some(_) if by == LandingBy::Writing => {
+                    let why = plan.get("why_not").and_then(Value::as_str).unwrap_or("this machine can't write it");
+                    return Err((StatusCode::CONFLICT, format!("{}'s work can't be written to disk here: {why}", info.name)));
+                }
+                // To read (a person's, or an agent's whose mode asks), or nothing that waits on a grant.
+                _ => return Ok(typed_landing(plan)),
+            }
+        }
+    };
     let landed = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Land { manifest }).await?;
     if landed.get("landed").is_some() {
         cx.hub.store.audit(cx.caller.name.clone(), "agent.land".into(), format!("{} ({}): its workspace written to {}", info.name, lineage::short(&info.id), info.workspace.as_ref().and_then(|w| w.over.clone()).unwrap_or_default())).await;
     }
-    Ok(landed)
+    Ok(typed_landing(landed))
+}
+
+/// Who lands, as `agents.land` treats the call: a person (who reads the plan, then writes it), or an agent whose mode
+/// writes at once or asks first (`crate::workspace::landing_policy`, the lower of the asker's mode and that of the
+/// agent whose work it is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandingBy {
+    Person,
+    Writing,
+    Asking,
+}
+
+/// Who lands for this call of `agents.land` on `info`'s workspace. An agent kiln doesn't run has no mode kiln knows, so
+/// it lands nothing; one whose mode only plans is refused, saying whose mode it is.
+fn landing_by(cx: &Cx, info: &Info) -> Result<LandingBy, Fail> {
+    if cx.caller.agent.is_none() && cx.caller.kind != crate::authz::gate::Kind::Agent {
+        return Ok(LandingBy::Person);
+    }
+    let Some(asker) = cx.caller.agent.as_deref().and_then(|a| cx.hub.harness.info(a)) else {
+        return Err((StatusCode::FORBIDDEN, "an agent kiln doesn't run has no mode kiln knows, so it writes nothing to disk: a person does, from the agent's Changes".to_owned()));
+    };
+    match crate::workspace::landing_policy(&asker, info) {
+        slates_api::WriteMode::Bypass => Ok(LandingBy::Writing),
+        slates_api::WriteMode::Ask => Ok(LandingBy::Asking),
+        slates_api::WriteMode::Forbid => {
+            // Only a mode that plans refuses: the asker's, or else the one whose work it is (each as far as it was granted).
+            let planner = if lineage::granted(&asker) == lineage::Level::Plan { &asker } else { info };
+            Err((StatusCode::FORBIDDEN, format!("{}'s mode plans and changes nothing, so it writes nothing to disk: a person lands {}'s work from its Changes, or gives {} a mode that edits", planner.name, info.name, planner.name)))
+        }
+    }
+}
+
+/// A machine's answer to a landing, with its outcome named for whoever acts on it (docs/agents.md, "Workspaces of
+/// their own"): `written` (Slates' outcome, as `landed` has it), or `approval_required` (the plan to read and approve
+/// by its manifest: what was asked for, or the new plan when what was approved moved on, as `changed` says). The
+/// fields the machine answered stay as they were.
+fn typed_landing(mut answer: Value) -> Value {
+    // Slates' own outcome, inside its answer when nothing waited on a grant (`{grant_required: false, outcome}`).
+    let outcome_of = |said: Value| said.get("outcome").cloned().unwrap_or(said);
+    let plan = answer.get("plan").cloned();
+    let (outcome, field, value) = match (answer.get("landed").cloned(), plan) {
+        (Some(written), _) => ("written", "written", outcome_of(written)),
+        (None, Some(plan)) if plan.get("grant_required") == Some(&Value::Bool(false)) => ("written", "written", outcome_of(plan)),
+        (None, Some(plan)) => (
+            "approval_required",
+            "approval",
+            json!({
+                "manifest": plan.get("manifest"),
+                "summary": plan.get("summary"),
+                "conflicts": plan.get("conflicts").cloned().unwrap_or_else(|| json!([])),
+                "excludes": answer.get("excludes"),
+                "can_write": answer.get("can_write"),
+                "why_not": answer.get("why_not"),
+            }),
+        ),
+        (None, None) => return answer,
+    };
+    if let Some(o) = answer.as_object_mut() {
+        o.insert("outcome".into(), json!(outcome));
+        o.insert(field.into(), value);
+    }
+    answer
 }
 
 async fn changes(cx: Cx, v: Value) -> Out {
@@ -743,6 +838,10 @@ async fn interrupt(cx: Cx, v: Value) -> Out {
 /// Agents page's rename and keep going are (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S2).
 async fn control(cx: Cx, v: Value) -> Out {
     let c = Command::Control { id: text(&v, "control")?, value: v.get("value").cloned() };
+    // A permission control (Codex's approvals or sandbox, an ACP agent's mode options) is a person's to set: an agent
+    // never raises its own permission (the person's rule, 2026-11-18; docs/agentic.md W6).
+    let info = known(&cx, &agent_of(&v)?)?;
+    lineage::may_command(&cx.hub, &cx.caller, &info.id, &c)?;
     commanded(&cx, &v, c, "set").await
 }
 
@@ -780,7 +879,7 @@ async fn broadcast_to(cx: Cx, v: Value) -> Out {
         b.key = command.as_ref().and_then(super::registry::message_id);
     }
     let among = super::lineage::reached(&cx.hub, &cx.caller, cx.hub.harness.list(), super::lineage::Access::Act).await;
-    let report = super::broadcast::run(&cx.hub, &b, &key_scope(&cx.caller), &among).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let report = super::broadcast::run(&cx.hub, &b, &cx.caller, &key_scope(&cx.caller), &among).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // A command that only reads or refreshes (a snapshot, MCP servers' state) isn't a use (attention plan
     // 01a199e1b177752e84dad5dc990e6a15, step 1), as on every other path (`attention_hooks::command_kind`).
     let kind = if b.approvals.is_some() {
@@ -1156,7 +1255,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.land",
-            summary: "Write an agent's workspace of its own back to the folder it's laid over. Without `manifest`: the plan (what it would create, replace and delete, and any file changed on disk since, which it won't overwrite), for a person to read. With the plan's `manifest`: written exactly as that plan says, or, if anything changed since, nothing written and the new plan back (`changed`) — only a person can write, never an agent. Build output and what git ignores stay out, and so does `.git`.",
+            summary: "Write an agent's workspace of its own back to the folder it's laid over. Without `manifest`: the plan (what it would create, replace and delete, and any file changed on disk since, which it won't overwrite), to read. With the plan's `manifest`: written exactly as that plan says, or, if anything changed since, nothing written and the new plan back (`changed`). A person writes it; an agent writes as its mode lets it (the lower of its own and that of the agent whose work it is): at once in a mode that edits unasked (accept edits, auto, bypass), after its person's click in one that asks (428 until they confirm; then the same call again), never in one that only plans (403). Build output and what git ignores stay out, and so does `.git`. An agent working in another's volume lands nothing of its own while that one works: the volume lands whole, from its owner.",
             read_only: false,
             destructive: true,
             input: Input::of::<input::AgentsLand>(),
@@ -1413,10 +1512,11 @@ pub mod input {
         pub name: Option<String>,
         #[schemars(range(min = 1, max = 16))]
         pub count: Option<i64>,
-        /// Where it works: `folder`, its folder itself (the default), or `volume`, a Slates volume
-        /// of its own laid over the folder's repository, where what it changes stays its own until
-        /// it goes up for review (agents.change) or a person writes it to disk. Where the machine
-        /// has Slates.
+        /// Where it works: `volume`, a Slates volume of its own laid over the folder's repository,
+        /// where what it changes stays its own until it goes up for review (agents.change) or a
+        /// person writes it to disk (the default where its machine can make one; else its folder,
+        /// saying why), or `folder`, its folder itself. Started in another agent's folder on that
+        /// agent's machine, it works in that agent's volume.
         pub workspace: Option<AgentsStartWorkspace>,
         /// How it's held: `none`, a process on its machine (the default), or `microvm`, a microVM of
         /// its own, on a machine that starts them. An isolated agent's agents are isolated too. An
@@ -2987,6 +3087,51 @@ for line in sys.stdin:
             let deep = as_agent(&hub, &kid).await?;
             let Err((_, why)) = call(deep, "agents.start", json!({"kind": "claude", "mode": "plan", "cwd": NOWHERE})).await else { anyhow::bail!("too deep") };
             anyhow::ensure!(why.contains("max_depth"), "{why}");
+            Ok(())
+        })
+    }
+
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2): what an agent works in when its start names no
+    /// workspace is the server's `[agents] workspace`: on a server that says `folder` (a test's, a lab's) its folder
+    /// itself, nothing made for it; and a person's `folder` is kept as asked on a server whose default is a volume, its
+    /// machine asked nothing about one, as is the folder of one started in a person's shell; and where its machine can't
+    /// make a volume the start is refused, naming what it lacks (`lineage::NoWorkspace`), never run in its folder instead
+    /// (the coordinator's ruling of 2026-11-18: that fallback was a second path). None needs Slates, so this holds on
+    /// every machine.
+    #[test]
+    fn w2_a_start_naming_no_workspace_follows_the_servers_setting_and_a_folder_asked_for_is_kept() -> anyhow::Result<()> {
+        run(async {
+            let fail = |(s, m): crate::ops::Fail| anyhow::anyhow!("{s} {m}");
+            let started = |out: &Value| out.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            // A server whose agents work in their folders (every test server's): nothing named, nothing made.
+            let hub = hub_with(|_| {}).await?;
+            let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let id = started(&call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local"})).await.map_err(fail)?);
+            let info = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("no agent {id}"))?;
+            anyhow::ensure!(info.workspace.is_none(), "{:?}", info.workspace);
+            let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
+            anyhow::ensure!(ws == json!({"workspace": null, "drift": []}), "{ws}");
+            // kiln's default, a volume where its machine can make one: a person's `folder` is kept as asked.
+            let hub = hub_with(|c| c.agents.workspace = crate::config::DefaultWorkspace::Volume).await?;
+            let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+            let id = started(&call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local", "workspace": "folder"})).await.map_err(fail)?);
+            let info = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("no agent {id}"))?;
+            anyhow::ensure!(info.workspace == Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }), "{:?}", info.workspace);
+            // Its folder has nothing of its own to drift from, and no machine is asked.
+            let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
+            anyhow::ensure!(ws.pointer("/workspace/kind") == Some(&json!("folder")) && ws.get("drift") == Some(&json!([])), "{ws}");
+            anyhow::ensure!(ws.pointer("/workspace/volume") == Some(&Value::Null), "{ws}");
+            // One started in a person's shell works beside them in the shell's folder, its machine asked nothing.
+            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: Some("t1".into()), ..Default::default() };
+            let shelled = hub.harness.open(&hub, "local", spec, 1).await?;
+            anyhow::ensure!(shelled.first().is_some_and(|i| i.workspace.is_none()), "{shelled:?}");
+            // A machine that can't make a volume (here its kiln is older than workspaces) refuses a start that names
+            // none, typed, naming what it lacks: it never runs the agent in its plain folder instead (no second path).
+            hub.put_agent(crate::hub::tests::live_runner("old", "linux", "x86_64"));
+            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), ..Default::default() };
+            let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
+            let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
+            anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "{refused:?}");
             Ok(())
         })
     }

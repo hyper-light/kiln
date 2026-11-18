@@ -115,13 +115,36 @@ sudo mv target/release/slates /usr/local/bin/   # or add target/release to PATH
 slates --help
 ```
 
-Release builds for macOS, Linux (glibc and musl) and Windows run in CI on every tag, but no
-binaries are attached yet.
+No release is published yet. A release attaches one `slates` binary per platform, the same binary
+for the anchor, the daemon and every client verb, with `SHA256SUMS` and signed build provenance
+([docs/publish.md](docs/publish.md)): `slates-macos-arm64`; `slates-linux-x64` and
+`slates-linux-arm64` (glibc); `slates-linux-x64-musl` and `slates-linux-arm64-musl` (static, for any
+Linux); `slates-windows-x64.exe` and `slates-windows-arm64.exe`. To install one, for example on
+Linux x86_64:
+
+```sh
+gh release download v0.1.0 --repo hyper-light/slates --pattern slates-linux-x64 --pattern SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing      # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+gh attestation verify slates-linux-x64 --repo hyper-light/slates
+chmod +x slates-linux-x64 && sudo mv slates-linux-x64 /usr/local/bin/slates
+```
 
 > [!IMPORTANT]
 > Mounting a volume needs no root, no kernel extension and no entitlement on macOS: slates serves
 > NFS on a loopback socket and the built-in `mount_nfs` mounts it. Linux and Windows mounts are
 > limited today; the table above says how.
+
+On Windows a mount is a WinFsp drive. An Administrator installs WinFsp 2.1 once and, once, lets its
+driver make Mount Manager drives for programs that are not elevated: Windows resolves a file's final
+path on its drive letter only for such a drive (git with its symbolic links on, Python's `realpath`
+and Rust's `canonicalize` each ask for it):
+
+```bat
+reg add HKLM\SOFTWARE\WOW6432Node\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f
+```
+
+Without it `slates mount` is refused `MountManagerNotAllowed`. A drive is then the machine's, seen
+in every session, and only its account, SYSTEM and the Administrators may open what is on it.
 
 ## Quickstart
 

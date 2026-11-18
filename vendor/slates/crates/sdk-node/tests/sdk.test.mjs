@@ -7,7 +7,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, rmdirSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, rmSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -54,12 +54,41 @@ test('the addon loads and exposes the Client surface', (t) => {
     'create', 'snapshot', 'status', 'list', 'resize', 'destroy',
     'createGreen', 'createWork', 'versions', 'changedSince', 'edit', 'submit', 'rebase',
     'unlink', 'rename', 'mkdir', 'rmdir', 'chmod', 'symlink', 'link', 'setXattr', 'removeXattr',
-    'clientId', 'reconnects',
+    'clientId', 'reconnects', 'spinFor', 'parkRatio',
   ];
   for (const verb of expected) {
     assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);
   }
   assert.equal(typeof slates.Client.connect, 'function', 'Client.connect factory is exported');
+});
+
+// A-370, the chosen-path launcher's AppArmor option from Node (§4.6 "The launcher"). Do: build the launcher's command
+// with no options, with `{ apparmorProfile: true }` and with it `false`, and an empty command; render slates' AppArmor
+// profile for the installed binary's path and for one it cannot name exactly. Expect: the option off unless asked and on
+// exactly when asked, in every surface's grammar (each value after `=`); the profile named by the path granting
+// `userns,`; and a JS error for the empty command and the unnamable path.
+test('execCommand carries the AppArmor option only when asked, and apparmorProfile names the executable', (t) => {
+  if (!addonPath || !existsSync(addonPath)) {
+    t.skip('SLATES_NODE_ADDON is not set to a built .node addon — skipped loudly');
+    return;
+  }
+  const slates = require(addonPath);
+  assert.deepEqual(
+    slates.execCommand('scratch', '/home/u/build', ['cargo', 'build', '--', '-x']),
+    ['slates', 'exec', '--volume=scratch', '--at=/home/u/build', '--', 'cargo', 'build', '--', '-x'],
+  );
+  assert.deepEqual(
+    slates.execCommand('scratch', '/home/u/build', ['cargo', 'build'], {
+      apparmorProfile: true,
+      program: '/usr/local/bin/slates',
+    }),
+    ['/usr/local/bin/slates', 'exec', '--volume=scratch', '--at=/home/u/build', '--apparmor-profile', '--', 'cargo', 'build'],
+  );
+  assert.ok(!slates.execCommand('v', '/p', ['true'], { apparmorProfile: false }).includes('--apparmor-profile'));
+  assert.throws(() => slates.execCommand('v', '/p', []), /exec needs a command/);
+  const profile = slates.apparmorProfile('/usr/local/bin/slates');
+  assert.ok(profile.includes('profile /usr/local/bin/slates flags=(unconfined) {\n  userns,\n}'), profile);
+  assert.throws(() => slates.apparmorProfile('/opt/my tools/slates'), /cannot name exactly/);
 });
 
 test('connecting to a missing daemon throws a typed error', (t) => {
@@ -137,6 +166,8 @@ test('lifecycle round trip over a live daemon', async (t) => {
     assert.ok(status.mirrorAgeNs == null, 'no mirror on a laptop');
     assert.ok('nfsPort' in status, 'the status carries the NFS port field');
     assert.deepEqual(status.drifted, []);
+    // drifted → every drifted entry, past what a status carries (A-267): a scratch volume has none.
+    assert.deepEqual(client.drifted(volume), { drifted: [], unverified: [], oversized: 0 });
 
     // list → the volume appears with its fields (a scratch volume is not an overlay).
     const entry = client.list().find((v) => v.id === volume);
@@ -197,6 +228,66 @@ test('lifecycle round trip over a live daemon', async (t) => {
     assert.ok(nsChanged.some((p) => p.includes('keep.txt')), JSON.stringify(nsChanged));
   } finally {
     // Kill the whole process group (negative pid) so the supervised daemon goes with the anchor at once.
+    try {
+      process.kill(-anchor.pid, 'SIGKILL');
+    } catch {
+      // The group is already gone; nothing to reap.
+    }
+  }
+});
+
+// The synchronous calls the parked-beside-the-signal test makes, each parking at once.
+const PARKED_CALLS = 20;
+
+// §4.7, D-19: a synchronous call on a client whose async completion signal runs is woken by its reply. Do: on one
+// client, open the completion descriptor (which starts the signal: a bridge thread on macOS and Windows) and close the
+// copy handed over, have the client spin for none of a reply, and make twenty synchronous status calls. Expect each
+// answered within half the reply deadline, and every one of them parked. Before 2026-11-18 the bridge waited where a
+// parked call waits and the daemon wakes one waiter per reply, so on macOS a parked call often slept to its deadline
+// (16 to 19 of 20, Mac Studio); the bridge now passes such a wake on.
+test('a synchronous call beside the async completion signal is woken by its reply', async (t) => {
+  const daemon = process.env.SLATES_DAEMON;
+  if (!addonPath || !existsSync(addonPath)) {
+    t.skip('SLATES_NODE_ADDON is not set to a built .node addon — skipped loudly');
+    return;
+  }
+  if (!daemon || !existsSync(daemon)) {
+    t.skip('SLATES_DAEMON is not set to a built `slates` binary — skipped loudly');
+    return;
+  }
+  const slates = require(addonPath);
+  const instance = `slates-sdk-node-beside-${process.pid}`;
+  const anchor = spawn(daemon, ['--instance', instance, 'anchor', '--quick', '--shards', '1'], {
+    stdio: 'ignore',
+    detached: true,
+  });
+  try {
+    const client = await connectWhenReady(slates, instance);
+    const bootstrap = spawnSync(daemon, ['--instance', instance, 'bootstrap', 'root'], {
+      encoding: 'utf8', timeout: STARTUP_MS,
+    });
+    assert.equal(bootstrap.status, 0, bootstrap.stderr);
+    const volume = client.create('sdk-node-beside', VOLUME_BYTES);
+    // The descriptor is a copy the caller owns (a net.Socket would adopt and close it); the signal keeps running. A
+    // Windows copy is a socket handle, which fs cannot close, so it is left to the process's end there.
+    const completion = client.completionFd();
+    if (process.platform !== 'win32') closeSync(completion);
+    client.spinFor(0);
+    const [parksBefore] = client.parkRatio();
+    const deadlineNs = BigInt(REPLY_NS);
+    for (let call = 0; call < PARKED_CALLS; call += 1) {
+      const asked = process.hrtime.bigint();
+      assert.equal(client.status(volume).name, 'sdk-node-beside');
+      const tookNs = process.hrtime.bigint() - asked;
+      assert.ok(
+        tookNs < deadlineNs / 2n,
+        `call ${call}: a parked call took ${tookNs} ns of its ${deadlineNs} ns deadline: its wake went elsewhere`,
+      );
+    }
+    const [parksAfter] = client.parkRatio();
+    assert.ok(parksAfter - parksBefore >= PARKED_CALLS, `every call parked: ${parksBefore} before, ${parksAfter} after`);
+    client.spinFor(null);
+  } finally {
     try {
       process.kill(-anchor.pid, 'SIGKILL');
     } catch {

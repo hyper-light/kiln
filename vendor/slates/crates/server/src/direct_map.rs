@@ -380,14 +380,33 @@ fn sync_then(
   let mark = held
     .writer
     .and_then(|(volume, _)| crate::told::mark(state, crate::verbs::to_db_volume(volume)));
+  let writer = held.writer;
   let sync = match Sync::new(state, client_id, held, principal.clone()) {
     Ok(sync) => sync,
     Err(refusal) => return refused(refusal),
   };
+  // On a live-shipped volume the sync's reply may wait for durability, so it is seated among the shard's held replies
+  // before the write-back writes anything: refused `Overloaded` at the bound with nothing written, never after
+  // (A-200; `crate::live_ship::take_seat`). A release lets its copy go whatever its write-back answers, so it is
+  // seated when there is room and otherwise runs seatless, never refused for room (`seat_if_room`).
+  if let Some((volume, _)) = writer {
+    let volume = crate::verbs::to_db_volume(volume);
+    match after {
+      AfterSync::Answer => {
+        if let Err(refusal) = crate::live_ship::take_seat(state, volume, request) {
+          return refused(refusal);
+        }
+      }
+      AfterSync::Release => crate::live_ship::seat_if_room(state, volume, request),
+    }
+  }
   match defer_task(state, request, answer_after(sync, request, (after, mark))) {
     // Never seen: `run_recorded` sends nothing for a verb that deferred its acceptance.
     Ok(()) => ReplyBody::Acknowledged,
-    Err(refusal) => refused(refusal),
+    Err(refusal) => {
+      crate::live_ship::release_seat(state, request);
+      refused(refusal)
+    }
   }
 }
 
@@ -436,6 +455,8 @@ async fn answer_after(
       return crate::live_ship::defer(s, live, request, route, reply)
         .map(|refusal| (refusal, route, s.shard, None));
     }
+    // Answered without waiting for durability: the seat its sync took, if any, is given back.
+    crate::live_ship::release_seat(s, request);
     let (reply, route) = complete(s, request, reply);
     let owed = mark.and_then(|mark| crate::told::owed(s, mark));
     Some((reply, route, s.shard, owed))
@@ -445,22 +466,21 @@ async fn answer_after(
     if let Some(owed) = owed {
       let _ = crate::told::wait(owed).await;
     }
-    deliver_to(route, reply, here).await;
+    deliver_to(route, reply, here);
   }
 }
 
 /// Delivers a deferred reply where its request waits: on this shard's ring when its client is served here, else as a
 /// task on the client's shard (A-188), as an image build's reply goes, waiting for room as every reply carried home
 /// does (`crate::xshard::send_back`).
-async fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
+fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
   if route.shard == here {
     crate::state::deliver(route.client_index, route.request, reply, true);
     return;
   }
   crate::xshard::send_reply_home(route.shard, move || {
     crate::state::deliver(route.client_index, route.request, reply, true);
-  })
-  .await;
+  });
 }
 
 /// Writes back every writable map the dead client `client_id` holds on this shard (§4.6, A-186, A-188), before its reap
@@ -884,9 +904,6 @@ mod served {
       None,
     ) {
       Ok(fill) => defer(state, fill),
-      Err(Begun::Directory) => refused(Refusal::BadRequest {
-        reason: "the path is a directory".to_owned(),
-      }),
       Err(Begun::Vfs(error)) => refused(refusal_of_vfs(&error)),
       Err(Begun::Unavailable) => refused(Refusal::MapUnavailable),
       Err(Begun::FellBack) => {
@@ -956,9 +973,6 @@ mod served {
       Some((volume, attachment)),
     ) {
       Ok(fill) => defer(state, fill),
-      Err(Begun::Directory) => refused(Refusal::BadRequest {
-        reason: "the path is a directory".to_owned(),
-      }),
       Err(Begun::Vfs(error)) => refused(refusal_of_vfs(&error)),
       Err(Begun::Unavailable) => refused(Refusal::MapUnavailable),
       Err(Begun::FellBack) => {
@@ -983,9 +997,8 @@ mod served {
 
   /// Why a direct map did not begin.
   enum Begun {
-    /// The path is a directory.
-    Directory,
-    /// The path does not resolve, or its file cannot be read.
+    /// The path does not resolve, names a directory (A-299: the volume core's typed `IsDirectory`, never words), or
+    /// its file cannot be read.
     Vfs(slates_vfs::error::VfsError),
     /// A shape the direct map does not serve: an overlay, or a client served here that no descriptor can reach.
     Unavailable,
@@ -1080,7 +1093,7 @@ mod served {
         Target::Path(key) => {
           let located = slot.volume.resolve(store, key).map_err(Begun::Vfs)?;
           if matches!(located.child, Child::Dir(_)) {
-            return Err(Begun::Directory);
+            return Err(Begun::Vfs(slates_vfs::error::VfsError::IsDirectory));
           }
           located.inode
         }
@@ -1326,7 +1339,8 @@ mod served {
         return refused(Refusal::MapUnavailable);
       };
       let key = (slates_ipc::route::OfferKind::Map, mapping_id);
-      if !crate::shards_route::offer(state, key, secret, descriptor) {
+      // A map's copy rides alone: only a stream's offer carries a resync end (A-339).
+      if !crate::shards_route::offer(state, key, secret, (descriptor, None)) {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       }
@@ -1637,7 +1651,7 @@ mod served {
     });
     // Delivered after the state's borrow ends, since delivery takes it again.
     if let Some((reply, Some(route), here)) = answered {
-      super::deliver_to(route, reply, here).await;
+      super::deliver_to(route, reply, here);
     }
   }
 }

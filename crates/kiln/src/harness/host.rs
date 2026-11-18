@@ -205,6 +205,44 @@ enum ArchivePhase {
     Restoring,
 }
 
+/// What an archived agent's record says of its workspace, read without the rest of it (its events can be long).
+#[derive(Deserialize)]
+struct ArchivedWorkspace {
+    saved: ArchivedSpec,
+}
+
+#[derive(Deserialize)]
+struct ArchivedSpec {
+    spec: ArchivedSpecWorkspace,
+}
+
+#[derive(Deserialize)]
+struct ArchivedSpecWorkspace {
+    #[serde(default)]
+    workspace: Option<crate::workspace::Workspace>,
+}
+
+/// Whether an agent archived on this machine (its record in `archives`) keeps the volume `workspace` is in: an archive
+/// keeps its agent's workspace for its restore ([`Host::archive`]), whoever else worked in it has ended
+/// (docs/agentic.md W3). Never for a workspace with no volume, nor where there are no archives; an archives folder that
+/// can't be read keeps it, since what it holds can't be known. A record that can't be read keeps nothing (startup
+/// leaves such a one archived, and never restores it).
+fn archived_keep(archives: Option<&std::path::Path>, workspace: Option<&crate::workspace::Workspace>) -> bool {
+    if workspace.is_none_or(|w| w.made.is_none()) {
+        return false;
+    }
+    let Some(dir) = archives else { return false };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).any(|path| {
+        let Ok(file) = std::fs::File::open(&path) else { return false };
+        serde_json::from_reader::<_, ArchivedWorkspace>(std::io::BufReader::new(file)).is_ok_and(|a| crate::workspace::same_volume(a.saved.spec.workspace.as_ref(), workspace))
+    })
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ArchivedSession {
     saved: Saved,
@@ -2767,9 +2805,28 @@ impl Host {
         if let Some(s) = s {
             free_claim(s.spec.lock().claim.clone());
             s.close();
-            // A workspace of its own ends with it.
+            let closed = std::time::Instant::now();
+            // Its workspace ends with it, once no other agent here works in it (a child in its parent's volume, or a
+            // parent its child outlived: docs/agentic.md W3) and no archived one keeps it (an archive keeps its
+            // agent's workspace for its restore, [`Host::archive`]): the last of them ends it.
             let spec = s.spec.lock().clone();
-            crate::workspace::release(&spec);
+            let others: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+            if !others.iter().any(|o| crate::workspace::same_volume(o.spec.lock().workspace.as_ref(), spec.workspace.as_ref())) {
+                let archives = self.archive_dir();
+                let ending = Arc::clone(&s);
+                crate::rt::spawn(async move {
+                    let probe = spec.clone();
+                    // Unread, it's kept: an archived agent's work is never lost to a failed look.
+                    let kept = crate::rt::blocking(move || archived_keep(archives.as_deref(), probe.workspace.as_ref())).await.unwrap_or(true);
+                    if !kept {
+                        // Its processes gone first: its harness works in the mount, which can't come down under it
+                        // (macOS refused it busy, and there's no lazy unmount there). How long their end took, from its
+                        // close, is how long what they left behind may still hold it (`workspace::release`).
+                        ending.close_wait().await;
+                        crate::workspace::release(&spec, closed.elapsed()).await;
+                    }
+                });
+            }
             // Its attachments go with it.
             let dir = self.files_dir.join(id);
             crate::rt::spawn(async move {
@@ -3921,6 +3978,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         subagent: spec.subagent,
         variant_of: spec.variant_of.clone(),
         no_bypass: !spec.allow_bypass,
+        launched: Some(spec.launched_level()),
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
         runs: None,
@@ -3957,6 +4015,30 @@ mod tests {
     use super::*;
     use kiln_seams::clock::SimClock;
     use crate::util::Must as _;
+
+    /// docs/agentic.md W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2): when the last live agent working in a volume
+    /// ends, an agent archived on its machine that worked in it keeps it for its restore; an archive of another volume, of
+    /// none, one that can't be read, a restored marker and no archives at all keep nothing, and a workspace with no
+    /// volume is never kept.
+    #[test]
+    fn w3_an_archived_agents_volume_outlives_the_last_live_agent_working_in_it() -> anyhow::Result<()> {
+        use crate::workspace::{Workspace, slates::Made};
+        let dir = tempfile::tempdir()?;
+        let ws = |volume: &str| Workspace { kind: "volume".into(), over: Some("/src".into()), made: Some(Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: format!("/w/kiln-{volume}") }), ..Workspace::default() };
+        let record = |w: Option<Workspace>| serde_json::json!({"saved": {"id": "a", "spec": {"kind": "claude", "workspace": w}}, "state": {}, "events": [{"long": "history"}], "phase": "archived"});
+        std::fs::write(dir.path().join("a.json"), serde_json::to_vec(&record(Some(ws("v1"))))?)?;
+        std::fs::write(dir.path().join("b.json"), serde_json::to_vec(&record(None))?)?;
+        std::fs::write(dir.path().join("c.json"), b"{not a record")?;
+        std::fs::write(dir.path().join("d.restored"), serde_json::to_vec(&record(Some(ws("v2"))))?)?;
+        assert!(archived_keep(Some(dir.path()), Some(&ws("v1"))), "its archived agent's, for its restore");
+        assert!(!archived_keep(Some(dir.path()), Some(&ws("v2"))), "a restored marker is no archive");
+        assert!(!archived_keep(Some(dir.path()), Some(&ws("v3"))), "no archive worked in it");
+        assert!(!archived_keep(Some(dir.path()), Some(&Workspace { kind: "folder".into(), ..Workspace::default() })), "no volume");
+        assert!(!archived_keep(Some(dir.path()), None));
+        assert!(!archived_keep(Some(&dir.path().join("none")), Some(&ws("v1"))), "no archives yet");
+        assert!(!archived_keep(None, Some(&ws("v1"))), "no durable record here");
+        Ok(())
+    }
 
     /// A1 (step 30's follow-up): across a successor upgrade, the fresh runner gives each handed
     /// session the descriptors the supervisor carried, in session-id order (the order the runner

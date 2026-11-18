@@ -303,5 +303,6 @@ export type { WebrtcUp } from "./WebrtcUp";
 export type { Wire } from "./Wire";
 export type { WorkFacts } from "./WorkFacts";
 export type { Workspace } from "./Workspace";
+export type { WorkspaceMissing } from "./WorkspaceMissing";
 export type { Workspaces } from "./Workspaces";
 export type { JsonValue } from "./serde_json/JsonValue";

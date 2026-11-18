@@ -13,7 +13,8 @@
 //! adapter for the other suites — running those over the FUSE mount itself is owed (pjdfstest's root cases
 //! need `allow_other`, an operator's `user_allow_other`); on Windows (A-209, 2026-11-05) the harness mounts the
 //! volume as a WinFsp drive (`slates mount ID E:`) and runs WinFsp's own two suites over it, the fsx port and
-//! winfstest, each built from its pinned source with MSVC, on both Windows lanes;
+//! winfstest, each built from its pinned source with MSVC, on both Windows lanes, and since A-300 the workload
+//! roster's version-control workloads (git, Mercurial, Subversion) through Git for Windows' shell;
 //! virtio-fs runs a live Linux guest through QEMU's vhost-user-fs, which mounts the tag and runs the workload
 //! roster identically on slates and on its RAM (`crates/server/tests/virtiofs.rs`), while the other suites have
 //! no guest leg yet; the OCI container
@@ -95,7 +96,8 @@ const NO_PRESSURE_OR_FAILURE_SUITE: &str = concat!(
 /// The reason the virtio-fs workloads cell is not run by this harness: it ran in a live guest elsewhere.
 const VIRTIOFS_WORKLOADS_IN_THE_GUEST_TEST: &str = concat!(
   "the roster runs in a live Linux guest through QEMU's vhost-user-fs-pci, each workload compared between ",
-  "slates and the guest's RAM — all nine identical on 2026-10-01 (crates/server/tests/virtiofs.rs ",
+  "slates and the guest's RAM — all twelve identical, git's history, Mercurial and Subversion among them, in CI ",
+  "run 44260193629 (2026-11-18, the guest's run 247 s; crates/server/tests/virtiofs.rs ",
   "a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram, gated on QEMU and a guest ",
   "kernel); this harness has no VMM leg (a vhost-user device is attached in-process), so the cell is not run here"
 );
@@ -138,10 +140,12 @@ const OCI_OWED: &str = "the container form exists — `attach` returns a verifie
 pub const LINUX_NFS_ADAPTER: Adapter = Adapter {
   name: "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback \
     export (the same serving code as macOS)",
-  not_covered: "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane \
-    mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), \
-    and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with \
-    `user_allow_other`)",
+  not_covered: concat!(
+    "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane ",
+    "mounts through the NFS adapter for this suite; the workload roster runs over the FUSE mount itself (A-293), ",
+    "and the other suites over it run in the Linux container lane (`oci-linux`, `slates mount --shared` with ",
+    "`user_allow_other`)",
+  ),
 };
 
 /// Tools every mounted macOS suite needs.
@@ -325,10 +329,15 @@ fn native_windows(suite: Suite) -> Availability {
       root: RootNeed::None,
       adapter: None,
     },
-    Suite::Workloads => Availability::Owed(
-      "the harness mounts the drive (A-209), but the roster's tools and their byte-identity comparison are POSIX's \
-       (git over a mode-keeping tree, cargo, rsync, sqlite, a watcher) and no Windows roster is defined yet",
-    ),
+    // The roster's version-control workloads over the drive (A-300), each script run by Git for Windows' shell in an
+    // NTFS folder and on the drive and compared byte for byte, with the drive's one stated difference (it makes no
+    // hard link); the roster's other workloads are owed a Windows form (`Workload::runs_on_windows`).
+    Suite::Workloads => Availability::Runnable {
+      on,
+      tools: &[WINFSP_LIBRARY, "sh"],
+      root: RootNeed::None,
+      adapter: None,
+    },
     Suite::Hermeticity => Availability::Owed("no ETW filesystem-write tracer is wired for Windows"),
     Suite::Pressure | Suite::Failure => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
   }
@@ -368,13 +377,7 @@ mod tests {
       Suite::Workloads,
       Suite::Hermeticity,
     ] {
-      match availability(Transport::NativeMacosNfs, suite) {
-        Availability::Runnable { on, adapter, .. } => {
-          assert_eq!(on, HostOs::Macos);
-          assert!(adapter.is_none());
-        }
-        other => panic!("{suite:?} on macOS: {other:?}"),
-      }
+      expect_runnable_on_macos_with_no_adapter(suite);
       match (suite, availability(Transport::NativeLinuxFuse, suite)) {
         (
           Suite::Workloads,
@@ -395,6 +398,17 @@ mod tests {
         }
         (_, other) => panic!("{suite:?} on Linux: {other:?}"),
       }
+    }
+  }
+
+  /// The macOS half of `native_lanes_run_on_their_own_os`: expect `suite` runnable on macOS with no adapter.
+  fn expect_runnable_on_macos_with_no_adapter(suite: Suite) {
+    match availability(Transport::NativeMacosNfs, suite) {
+      Availability::Runnable { on, adapter, .. } => {
+        assert_eq!(on, HostOs::Macos);
+        assert!(adapter.is_none());
+      }
+      other => panic!("{suite:?} on macOS: {other:?}"),
     }
   }
 
@@ -444,10 +458,11 @@ mod tests {
     );
   }
 
-  /// A-209: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter.
+  /// A-209: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter; A-300: and the
+  /// workload roster, whose scripts need a POSIX shell on the `PATH` (Git for Windows').
   #[test]
-  fn windows_runs_fsx_and_winfstest() {
-    for suite in [Suite::Fsx, Suite::Winfstest] {
+  fn windows_runs_fsx_winfstest_and_the_workloads() {
+    for suite in [Suite::Fsx, Suite::Winfstest, Suite::Workloads] {
       assert!(
         matches!(
           availability(Transport::NativeWindowsWinfsp, suite),
@@ -461,6 +476,10 @@ mod tests {
         "{suite:?}"
       );
     }
+    assert!(matches!(
+      availability(Transport::NativeWindowsWinfsp, Suite::Workloads),
+      Availability::Runnable { tools, .. } if tools.contains(&"sh")
+    ));
   }
 
   /// A-209: winfstest applies to no other transport, and pjdfstest and fsstress do not apply to Windows.

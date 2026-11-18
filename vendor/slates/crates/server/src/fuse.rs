@@ -153,6 +153,9 @@ const REVOKED_REFUSED: &str = "fuse.revoked_refused";
 /// Format: fenced mounts whose task could not be woken to drop their kernel's cache (the change signal refused): each
 /// drops it at its next request instead. Zero is the healthy reading.
 const REVOKED_UNWOKEN: &str = "fuse.revoked_unwoken";
+/// Format: mounts ended because this node lost their volume to a takeover (A-346): each fenced as a revoked mount is, its
+/// kernel's cache dropped, then ended.
+const SUPERSEDED_ENDED: &str = "fuse.superseded_ended";
 /// Shape: the share of the shard's step quantum one slice of a takeover round may take, in permille: half, as a landing
 /// slice and a destroy slice take, so a mount taken over with a large kernel cache leaves the rest of each step to the
 /// shard's other clients (§4.3).
@@ -223,11 +226,11 @@ impl OwnMountRecord {
   }
 }
 
-/// The refusal of a FUSE mount at `mount_point` this daemon could not record as its own.
+/// The refusal of a FUSE mount at `mount_point` this daemon could not record as its own, typed (A-299); the point and
+/// why are logged.
 fn own_refusal(why: Unrecorded, mount_point: &str) -> Refusal {
-  Refusal::TargetUnavailable {
-    reason: format!("the FUSE mount at {mount_point} {why}"),
-  }
+  slates_machine::log_line!("slates-server: the FUSE mount at {mount_point} {why}");
+  crate::error::target(crate::error::target_of_unrecorded(why))
 }
 
 /// Learns the FUSE mounts a predecessor kept that this shard's catalog names and the kernel's table still holds,
@@ -274,13 +277,16 @@ struct HeldFsync {
   unique: u64,
   reply: Vec<u8>,
   target: u64,
-  deadline_ns: u64,
+  held_at_ns: u64,
+  /// When it gives up: a window with nothing heard on the volume's durability path (`slates_bridge_core::durable_bound`).
+  bound: slates_bridge_core::durable_bound::DurableBound,
 }
 
 /// Counter: `fsync` replies held until their live volume was durable.
 const LIVE_FSYNC_HELD: &str = "fuse.live_fsync_held";
-/// Counter: held `fsync` replies answered `EIO`: the wait passed, the volume was destroyed or its owner superseded, or
-/// the mount already held its bound of them.
+/// Counter: held `fsync` replies answered `EIO`: the wait gave up (a window with nothing heard, or its total bound;
+/// `slates_bridge_core::durable_bound`), the volume was destroyed or its owner superseded, or the mount already held its
+/// bound of them.
 const LIVE_FSYNC_REFUSED: &str = "fuse.live_fsync_refused";
 
 impl std::fmt::Debug for FuseMount {
@@ -309,19 +315,31 @@ pub(crate) struct PendingAttach {
   pub(crate) token: [u8; 16],
 }
 
+/// The OS error number a refused FUSE mount names, when one was given: the helper's own words, and how it exited, go
+/// to the daemon's log (A-299).
+fn mount_errno(error: &MountError) -> Option<i32> {
+  match error {
+    MountError::Socketpair { code } | MountError::Spawn { code } | MountError::Recv { code } => {
+      *code
+    }
+    MountError::Helper { .. }
+    | MountError::NoDevice { .. }
+    | MountError::Timeout { .. }
+    | MountError::Channel(_)
+    | MountError::AllowOtherNotGranted => None,
+  }
+}
+
 /// Checks a FUSE mount point before any effect (§4.6 A-9's `UserOwnedExistingDirectory`): an absolute path
 /// to an existing directory — not followed through a final symbolic link — owned by the daemon's user and,
 /// for a Unix-user principal, by that user. `fusermount3` alone would mount over a regular file the user
 /// owns, so the transport's stated constraint is the daemon's to hold. A read-only query of the path the
 /// caller named; nothing is created.
 pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(), Refusal> {
-  let refuse = |why: String| {
-    Err(Refusal::TargetUnavailable {
-      reason: format!("the FUSE mount point {path} {why}"),
-    })
-  };
+  use slates_ipc::protocol::TargetRefusal as Typed;
+  let refuse = |why: Typed| Err(crate::error::target(why));
   if !path.starts_with('/') {
-    return refuse("is not an absolute path".to_owned());
+    return refuse(Typed::NotAbsolute);
   }
   // Every component is walked first, and none on a mount this daemon serves is entered (A-227): a mount point inside
   // another of its FUSE mounts would make the shard ask its own mount.
@@ -337,7 +355,7 @@ pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(),
         used_as: slates_ipc::protocol::OwnMountUse::MountPoint,
       });
     }
-    Err(e) => return refuse(format!("cannot be read ({e})")),
+    Err(e) => return refuse(crate::error::target_of_host(&e)),
   };
   let stat = match rustix::fs::statat(
     &point,
@@ -345,21 +363,21 @@ pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(),
     rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
   ) {
     Ok(stat) => stat,
-    Err(e) => return refuse(format!("cannot be read (code {})", e.raw_os_error())),
+    Err(e) => {
+      return refuse(Typed::Host {
+        errno: e.raw_os_error(),
+      });
+    }
   };
   if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
-    return refuse("is not a directory".to_owned());
+    return refuse(Typed::NotDirectory);
   }
   let owner = stat.st_uid;
-  if owner != rustix::process::geteuid().as_raw() {
-    return refuse(format!("belongs to uid {owner}, not the daemon's user"));
-  }
-  if let Principal::Uid { uid, .. } = principal
-    && *uid != owner
-  {
-    return refuse(format!(
-      "belongs to uid {owner}, not the requesting uid {uid}"
-    ));
+  // Not the daemon's user's, or not the requesting user's.
+  let owned_by_another = owner != rustix::process::geteuid().as_raw()
+    || matches!(principal, Principal::Uid { uid, .. } if *uid != owner);
+  if owned_by_another {
+    return refuse(Typed::OwnedByAnother { owner: Some(owner) });
   }
   Ok(())
 }
@@ -374,9 +392,9 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
   };
   // The mount's source is this daemon's tag (A-227), never its attachment: the kernel's table is world-readable.
   let Some(fsname) = slates_base::own_mounts::fsname() else {
-    return crate::verbs::refused(Refusal::TargetUnavailable {
-      reason: "this daemon has no record of its own mounts".to_owned(),
-    });
+    return crate::verbs::refused(crate::error::target(
+      slates_ipc::protocol::TargetRefusal::NoOwnMountTag,
+    ));
   };
   let route = state.reply_route.take();
   let cause = state.current_span;
@@ -410,9 +428,14 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
         Err(error) => {
           s.count(MOUNT_REFUSED, 1);
           release_unmounted_lease(s, &pending.record);
-          crate::verbs::refused(Refusal::TargetUnavailable {
-            reason: format!("the FUSE mount at {mount_point} was refused: {error}"),
-          })
+          slates_machine::log_line!(
+            "slates-server: the FUSE mount at {mount_point} was refused: {error}"
+          );
+          crate::verbs::refused(crate::error::target(
+            slates_ipc::protocol::TargetRefusal::MountRefused {
+              errno: mount_errno(&error),
+            },
+          ))
         }
       });
       deliver(s, reply, route);
@@ -701,9 +724,13 @@ async fn wait_for_work(
   let mut signal = std::pin::pin!(slates_rt::readiness::readable(signal));
   // The earliest held `fsync`'s give-up, armed as this wait begins: holds are only added in turns, between waits.
   let earliest = state::with_state(|s| {
-    s.fuse_mounts
-      .get(&attachment)
-      .and_then(|mount| mount.held.iter().map(|held| held.deadline_ns).min())
+    s.fuse_mounts.get(&attachment).and_then(|mount| {
+      mount
+        .held
+        .iter()
+        .map(|held| held.bound.next_look_ns())
+        .min()
+    })
   })
   .flatten();
   let mut give_up = std::pin::pin!(async move {
@@ -828,6 +855,16 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     return Turned::Ended;
   };
   let told_before = mount.serve.told_through();
+  // A volume this node lost to a successor (`verbs::lost_to_a_successor`: its log fenced, A-338, or yielded at this
+  // host's re-admission, A-334) ends its mount as a revoked one ends (A-346, [`superseded`]): fenced here too, for a
+  // mount the loss was learned before it was made or whose wake was refused, and one over a log fenced before a restart
+  // (A-344).
+  if crate::verbs::lost_to_a_successor(s, mount.volume)
+    && s.attachments.context(mount.registry).is_ok()
+  {
+    s.attachments.revoke(mount.registry);
+    s.count(SUPERSEDED_ENDED, 1);
+  }
   // The live-tree fence the NFS mount applies before every procedure (§4.8 "Leases and reads"; AUD-29-83):
   // while the owner's lease does not hold, no request is read, so none is answered from a stale view.
   // A mount whose attachment admits nothing more answers nothing from the volume, so it needs no lease: it refuses
@@ -925,7 +962,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     }
     Ok(Turn::Ended) => return Turned::Ended,
     Ok(Turn::Dispatched(dispatched)) => {
-      log_write(s, &dispatched);
+      log_write(s, mount.volume, &dispatched);
       if dispatched.resent() {
         let count = s.refusals.entry(RESENT).or_insert(0);
         *count = count.saturating_add(1);
@@ -941,7 +978,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // What the round that just finished could not deliver. Counted rather than raised: the refusal is not
   // retryable (the next round is refused identically, and a round kept for retry is an unbounded loop), but it is
   // never silent — CLAUDE.md #9.
-  log_forgets(s, attachment, mount.serve.take_forgotten());
+  crate::write_log::log_forgets(s, (mount.volume, attachment), mount.serve.take_forgotten());
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
   let conflicts = mount.serve.take_writeback_conflicts();
@@ -1083,7 +1120,8 @@ fn hold_fsync(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched
     unique: dispatched.unique(),
     reply: dispatched.reply(&mount.serve).to_vec(),
     target,
-    deadline_ns: futures::now_ns().saturating_add(crate::live_ship::durable_wait_ns()),
+    held_at_ns: futures::now_ns(),
+    bound: crate::live_ship::begin_durable_bound(s, mount.volume, futures::now_ns()),
   });
   s.count(LIVE_FSYNC_HELD, 1);
   true
@@ -1099,12 +1137,28 @@ fn settle_held(s: &mut ShardState, attachment: u64, waker: Option<&std::task::Wa
   };
   let now = futures::now_ns();
   let mut kept = std::collections::VecDeque::new();
-  while let Some(held) = mount.held.pop_front() {
+  while let Some(mut held) = mount.held.pop_front() {
     let settled = crate::live_ship::durability(s, mount.volume, held.target, waker);
     let answer = match settled {
       crate::live_ship::Durability::Durable => Some(None),
       crate::live_ship::Durability::Never => Some(Some(EIO)),
-      crate::live_ship::Durability::Pending if now >= held.deadline_ns => Some(Some(EIO)),
+      crate::live_ship::Durability::Pending
+        if let Some(why) =
+          crate::live_ship::judge_durable_bound(s, mount.volume, &mut held.bound, now) =>
+      {
+        // What durability still lacked when the wait gave up: logged, since an `EIO` tells the application its data
+        // may be lost (2026-11-09).
+        slates_machine::log_line!(
+          "slates-server: a held fsync gave up after {} ms and {} windows of {} ms, {} (shard {}): {}",
+          now.saturating_sub(held.held_at_ns) / crate::live_ship::NS_PER_MS,
+          held.bound.windows(),
+          crate::live_ship::durable_wait_ns() / crate::live_ship::NS_PER_MS,
+          why.named(),
+          s.shard,
+          crate::live_ship::durability_report(s, mount.volume, held.target)
+        );
+        Some(Some(EIO))
+      }
       crate::live_ship::Durability::Pending => None,
     };
     match answer {
@@ -1212,13 +1266,14 @@ fn fail(s: &mut ShardState, attachment: u64) {
   ended(s, attachment);
 }
 
-/// Logs a write's bytes in the shard's write log before its reply (A-63, `crate::write_log`): the write is
+/// Logs a write's bytes in the shard's write log before its reply, under the mount's `volume`, where a replay puts them
+/// (A-63, `crate::write_log`; an inode number alone names the origin of a clone's inherited file): the write is
 /// acknowledged before the next publication, so a daemon that dies first must leave its bytes for its successor to
 /// replay. Logged before the reply, so a write applied and never answered is resent, not replayed twice over a
 /// different later write (the kernel resends it with the same bytes at the same offset). A log with no room forces a
 /// publication, which carries this write (already applied) and empties the log; only a refused publication leaves the
 /// write unlogged, marked as an overflow so the next daemon reports the loss rather than replaying around it.
-fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
+fn log_write(s: &mut ShardState, volume: VolumeId, dispatched: &Dispatched) {
   if dispatched.opcode != Some(slates_bridge_fuse::Opcode::Write) || dispatched.error != 0 {
     return;
   }
@@ -1228,7 +1283,9 @@ fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
     return;
   };
   let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-    (Some(log), Some(object)) => log.append(object, dispatched.nodeid(), offset, data),
+    (Some(log), Some(object)) => {
+      log.append(object, (volume.bytes, dispatched.nodeid()), offset, data)
+    }
     _ => return,
   };
   let logged = match appended {
@@ -1243,39 +1300,6 @@ fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
     s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
     if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
       let _ = log.overflow(object);
-    }
-  }
-}
-
-/// Format: the counter of a `FORGET` the write log could not take and no publication carried: its lookups stay
-/// counted across a restart, a bounded leak (GAPS, A-154's sibling), never a lost write.
-const FORGET_UNLOGGED: &str = "write_log.forget_unlogged";
-
-/// Logs the lookups this turn's `FORGET`s gave back through `attachment` in the shard's write log (GAPS, A-154's
-/// sibling): a `FORGET` takes no reply and is never resent, so one served after the last publication would otherwise
-/// leave its references counted in the image for good. A log with no room forces a publication, which carries the
-/// `FORGET` (already applied) and empties the log; one still refused is counted, and never marks the log overflowed,
-/// which would report every taken-over file as having lost writes.
-fn log_forgets(s: &mut ShardState, attachment: u64, forgotten: Vec<(u64, u64)>) {
-  for (inode, count) in forgotten {
-    let forgotten = crate::write_log::Forgotten {
-      attachment,
-      inode,
-      count,
-    };
-    let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-      (Some(log), Some(object)) => log.append_forget(object, forgotten),
-      _ => return,
-    };
-    let logged = match appended {
-      Ok(()) => true,
-      Err(crate::write_log::Refused::Full) => {
-        crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
-      }
-      Err(crate::write_log::Refused::Unwritten) => false,
-    };
-    if !logged {
-      s.count(FORGET_UNLOGGED, 1);
     }
   }
 }
@@ -1295,22 +1319,13 @@ fn hand_over_session(s: &mut ShardState, attachment: u64, mount: &mut FuseMount)
   }
 }
 
-/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61), and closes every held
-/// device recovery found no record for. Each kept mount gets a registry attachment from its record (its rights,
-/// its durable owner, so the references recovery gave back are its own), the serve state its session restored,
-/// and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and never answered come back; then its
-/// serve task. A mount that cannot be served again is unmounted and ended, counted.
+/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61). Each kept mount gets a
+/// registry attachment from its record (its rights, its durable owner, so the references recovery gave back are its
+/// own), the serve state its session restored, and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and
+/// never answered come back; then its serve task. A mount that cannot be served again is unmounted and ended, counted.
+/// A held device recovery found no record for is closed by `crate::shards::adopt_held`, which runs next on every Unix.
 pub(crate) fn adopt_held() {
-  let (kept, orphaned) = state::with_state(|s| {
-    (
-      std::mem::take(&mut s.adopt_fuse),
-      std::mem::take(&mut s.inherited_fuse),
-    )
-  })
-  .unwrap_or_default();
-  for held in orphaned {
-    let _ = crate::fuse_hold::release(held.attachment);
-  }
+  let kept = state::with_state(|s| std::mem::take(&mut s.adopt_fuse)).unwrap_or_default();
   for (record, held) in kept {
     let _ = state::with_state_counted(move |s| adopt_one(s, record, held));
   }
@@ -1453,6 +1468,25 @@ pub(crate) fn fence_if_mounted(s: &mut ShardState, attachment: u64) {
   if mount.change.signal().is_err() {
     // The task still sees the revocation at its next request; only the drop waits for one.
     s.count(REVOKED_UNWOKEN, 1);
+  }
+}
+
+/// Ends every FUSE mount this shard serves of `volume`, which this node has just lost to a successor (A-346; its log
+/// fenced at a later epoch, A-338, or yielded at this host's re-admission, A-334): each is fenced as a revoked mount is
+/// ([`fence_if_mounted`]), so its kernel drops what it cached of the volume, every request meanwhile is refused
+/// `ENOTCONN`, and the mount ends: FUSE's form of the `NFS3ERR_STALE` an NFS mount of the volume answers. Before, such a
+/// mount went on answering from this node's copy, which the successor's writes had passed, or, behind the lease gate,
+/// held its requests in the kernel for good.
+pub(crate) fn superseded(s: &mut ShardState, volume: VolumeId) {
+  let mounts: Vec<u64> = s
+    .fuse_mounts
+    .iter()
+    .filter(|(_, mount)| mount.volume == volume)
+    .map(|(attachment, _)| *attachment)
+    .collect();
+  for attachment in mounts {
+    fence_if_mounted(s, attachment);
+    s.count(SUPERSEDED_ENDED, 1);
   }
 }
 
