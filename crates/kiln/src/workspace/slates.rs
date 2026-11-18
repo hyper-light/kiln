@@ -13,7 +13,7 @@
 //! anchor`, [`ROLE_ARG`]), handed to Slates' own main before kiln's runtime starts
 //! (`entry::main`, [`role_main`]), so the daemon a runner talks to is the same code as the client
 //! it links. Each call is one of the library's synchronous round trips, run on kiln's blocking
-//! pool on a client of its own ([`call`]): microseconds for most verbs, longer for a mount or a
+//! pool on a client of its own (`call`): microseconds for most verbs, longer for a mount or a
 //! landing, which wait while the daemon lives.
 //!
 //! The machine keeps one Slates instance (`kiln`) for all its runner processes. Its anchor is
@@ -21,13 +21,16 @@
 //! elsewhere), so restarting or upgrading the runner never ends it: a volume lives in the
 //! anchor's memory, and goes when it does.
 //!
-//! A landing is granted under the anchor's issuer authority, which Slates hands the anchor's user
-//! where its segment has a name (macOS, Windows: the anchor prints the handoff, [`can_take_grants`]),
-//! as the library's [`slates_api::Issuer`]; on Linux the segment is a descriptor only the anchor's
-//! own children hold (Slates' GAP-A9-10), so the plan says so. Under the person's rule of
-//! 2026-11-18 the go-ahead becomes the launcher's: the permission mode kiln gives each agent sets
-//! what a landing may do, with no proof at all, through Slates' typed landing contract (its
-//! A-285 and A-278's next pieces), which this module moves onto as it lands.
+//! kiln speaks Slates' typed consumer contract (slates-api's A-299, pinned at [`CONTRACT`]): every
+//! answer is a typed outcome and every failure a typed error, never text to parse. Writing a volume
+//! back to its folder follows the write mode its launcher gave it (the person's rule, 2026-11-18):
+//! kiln, the launcher, sets each workspace's policy from its agent's permission mode
+//! ([`set_policy`]), and Slates itself writes a landing at once (bypass), holds it as an approval
+//! request (ask) or refuses it (forbid) ([`land_by_policy`]). Setting a policy and approving are
+//! the launcher's acts, proven by a secret of kiln's own that it keeps in its state, 0600, and
+//! hands the anchor at every start (`launcher`), so kiln's authority outlives its own restarts
+//! and the daemon's, on every system. An agent can neither set its policy nor approve its own
+//! landing: Slates refuses both on an agent's channel, and only kiln holds the secret.
 //!
 //! Slates as built (c8d6adb4) couldn't clone a snapshot of an overlay volume
 //! (`ContentUnavailable`), and a pinned base makes every pinned file part of a landing's plan, so
@@ -42,10 +45,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use slates_api::{Approved, Filter, GrantScope, Instance, LandingOutcome, LandingPlan, LandingRequest, LandingSummary, MountKind, Planned, StartSpec, VolumeId};
+use slates_api::{DriftReport, Filter, Instance, Issuer, LandOutcome, LandingApproval, LandingConflict, LandingReport, LandingRequest, LauncherSecret, MountKind, PolicyRefusal, PolicySubject, StartSpec, Summary, VolumeId, VolumeSpec, WritePolicy};
 
 /// The Slates instance kiln keeps on a machine.
 pub const INSTANCE: &str = "kiln";
+/// The version of Slates' consumer contract this module is written against (slates-api's `CONTRACT`,
+/// A-299, raised with every change to a type or a verb of it): a re-vendor that moves it fails
+/// `w1_kiln_speaks_the_contract_it_was_written_against` beside the matches it must extend.
+pub const CONTRACT: u32 = 8;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -59,16 +66,14 @@ const SHARDS: u16 = 2;
 /// The largest a workspace may grow to, at most (what it changes is held in memory): a quarter of
 /// the machine's memory, up to this.
 const MAX_VOLUME_GIB: u64 = 64;
-/// What the anchor prints of its issuer authority's handoff (Slates' `role::anchor`,
-/// `announce_issuer_surface`): the variables a process of the anchor's user exports to hold it.
-const ISSUER_SURFACE: &str = "issuer surface: export ";
 
 struct Here {
     /// Where workspaces are mounted (`<state>/workspaces/<name>`).
     root: PathBuf,
-    /// What the instance's anchor and daemon say as they run, when this process started them: the
-    /// issuer authority's handoff among it (macOS, Windows).
+    /// What the instance's anchor and daemon say as they run, when this process started them.
     log: PathBuf,
+    /// kiln's launcher secret for its instance (`launcher`), 0600.
+    secret: PathBuf,
 }
 
 static HERE: OnceLock<Here> = OnceLock::new();
@@ -76,7 +81,7 @@ static HERE: OnceLock<Here> = OnceLock::new();
 /// Where this process keeps its machine's workspaces: under `state_dir` (a runner's, shared by
 /// every runner process of the machine; the server's data directory for its own agents).
 pub fn init(state_dir: &Path) {
-    let _ = HERE.set(Here { root: state_dir.join("workspaces"), log: state_dir.join("slates-anchor.log") });
+    let _ = HERE.set(Here { root: state_dir.join("workspaces"), log: state_dir.join("slates-anchor.log"), secret: state_dir.join("slates-launcher.key") });
 }
 
 fn here() -> anyhow::Result<&'static Here> {
@@ -139,18 +144,18 @@ pub fn role_main(args: &[String]) -> std::process::ExitCode {
 
 /// What kiln calls a host mount of `kind` (its facts' `mount`): `fuse` (Linux, through
 /// `fusermount3`, no privilege), `nfs` (macOS, on loopback) or `winfsp` (Windows, a drive letter of
-/// its own: `super::place`). None for a kind kiln doesn't mount.
+/// its own: `super::place`). Matched whole: a kind the contract adds fails the build here until kiln
+/// says how it mounts it.
 fn mount_word(kind: MountKind) -> Option<&'static str> {
     match kind {
         MountKind::Fuse => Some("fuse"),
         MountKind::NfsLoopback => Some("nfs"),
         MountKind::WinFsp => Some("winfsp"),
-        _ => None,
     }
 }
 
 /// How a volume is mounted here, as Slates' library finds it, when kiln mounts that kind
-/// ([`mount_word`]).
+/// (`mount_word`).
 pub fn mount_kind() -> Option<&'static str> {
     slates_api::mount::available().ok().and_then(mount_word)
 }
@@ -217,12 +222,23 @@ pub fn started_anchor() -> Option<u32> {
 }
 
 /// What starts the machine's instance: kiln's own executable in Slates' roles, [`SHARDS`] shards,
-/// a laptop's instance of its own (no fleet).
-fn start_spec() -> anyhow::Result<StartSpec> {
+/// a laptop's instance of its own (no fleet), handed `launcher`'s secret when there is one.
+fn start_spec(launcher: Option<LauncherSecret>) -> anyhow::Result<StartSpec> {
     let mut spec = StartSpec::new(&instance(), program()?, &[ROLE_ARG]);
     spec.shards = Some(SHARDS);
     spec.quick = OVERRIDE.get().is_some_and(|o| o.quick);
-    Ok(spec)
+    Ok(match launcher {
+        Some(secret) => spec.with_launcher(secret),
+        None => spec,
+    })
+}
+
+/// Whether the anchor starts under a systemd user unit of its own (Linux, where there is one),
+/// rather than here: tests and labs start theirs here (`KILN_SLATES_DIRECT`), so no unit outlives
+/// them.
+fn under_systemd() -> bool {
+    let direct = OVERRIDE.get().is_some() || std::env::var_os("KILN_SLATES_DIRECT").is_some();
+    !direct && cfg!(target_os = "linux") && std::env::var_os("XDG_RUNTIME_DIR").is_some() && crate::os::which("systemd-run").is_some()
 }
 
 /// Starts the instance's anchor apart from this process: a systemd user unit of its own on Linux
@@ -230,10 +246,11 @@ fn start_spec() -> anyhow::Result<StartSpec> {
 /// process group elsewhere, with what it says appended to `log`. The anchor started here, which
 /// [`ensure_up`] watches while it waits for its daemon to answer; none for a unit's.
 async fn start_anchor(log: &Path) -> anyhow::Result<Option<std::process::Child>> {
-    let mut anchor = start_spec()?.anchor_command();
-    // Tests and labs start theirs here (`KILN_SLATES_DIRECT`): no unit outlives them.
-    let direct = OVERRIDE.get().is_some() || std::env::var_os("KILN_SLATES_DIRECT").is_some();
-    if !direct && cfg!(target_os = "linux") && std::env::var_os("XDG_RUNTIME_DIR").is_some() && crate::os::which("systemd-run").is_some() {
+    if under_systemd() {
+        // A unit's anchor takes no standard input, so it carries no launcher secret yet (Slates' `StartSpec`
+        // hands the secret on the command's own standard input, which a host can't give its wrapper); kiln
+        // can't approve on it ([`can_take_grants`]).
+        let anchor = start_spec(None)?.anchor_command().map_err(|e| anyhow::anyhow!("Slates: {e}"))?;
         let unit = format!("{}-slates", instance());
         let mut reset = Command::new("systemctl");
         reset.args(["--user", "reset-failed", &format!("{unit}.service")]);
@@ -246,11 +263,13 @@ async fn start_anchor(log: &Path) -> anyhow::Result<Option<std::process::Child>>
             Err(e) => tracing::info!(error = %format!("{e:#}"), "Slates' anchor didn't start as a unit of its own; starting it here"),
         }
     }
+    let mut anchor = start_spec(Some(launcher_secret()?))?.anchor_command().map_err(|e| anyhow::anyhow!("Slates: {e}"))?;
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
     let err = out.try_clone()?;
+    // Its standard input stays the one Slates gave it: the launcher's secret, then its end.
     anchor.stdout(out).stderr(err);
     let child = crate::os::supervise::spawn_detached(&mut anchor)?;
     let _ = STARTED.set(child.id());
@@ -318,7 +337,7 @@ fn volume_id(text: &str) -> anyhow::Result<VolumeId> {
     Ok(VolumeId { bytes: hex_bytes(text).ok_or_else(|| anyhow::anyhow!("{text:?} isn't a Slates volume id: 32 hexadecimal digits"))? })
 }
 
-/// A manifest's hash from its text (64 hexadecimal digits, as [`LandingPlan::manifest_text`] writes
+/// A manifest's hash from its text (64 hexadecimal digits, as [`LandingApproval::manifest_text`] writes
 /// it).
 fn manifest_hash(text: &str) -> anyhow::Result<[u8; 32]> {
     hex_bytes(text).ok_or_else(|| anyhow::anyhow!("{text:?} isn't a landing's manifest: 64 hexadecimal digits"))
@@ -343,8 +362,8 @@ fn hex_bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
 /// that one meanwhile.
 pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
-    let spec = slates_api::overlay(name, over, volume_max()).map_err(|e| anyhow::anyhow!("Slates: {e}"))?;
-    let id = call("volume create", move |i| i.create(&spec)).await?;
+    let spec = VolumeSpec::overlay(name, over, volume_max());
+    let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
     let volume = slates_api::volume_id_text(id);
     let mut failed = anyhow::anyhow!(super::place::NO_POINT);
     for point in super::place::points(&here()?.root, name) {
@@ -440,10 +459,31 @@ pub async fn remove(m: &Made) -> anyhow::Result<()> {
 }
 
 /// The files of the folder below workspace `m` that changed on disk after the agent changed them
-/// in its workspace (each as Slates says it: `/README.md (Modified)`).
+/// in its workspace, each as kiln shows it (`/README.md (Modified)`, `drift_lines`).
 pub async fn drift(m: &Made) -> anyhow::Result<Vec<String>> {
     let volume = volume_id(&m.volume)?;
-    call("status", move |i| i.drift(volume)).await
+    let report = call("status", move |i| i.drift(volume)).await?;
+    Ok(report.as_ref().map(drift_lines).unwrap_or_default())
+}
+
+/// A drift report as kiln shows it: each drifted entry and what the disk did to it, then each entry
+/// whose re-check the host refused, as not known to match.
+fn drift_lines(report: &DriftReport) -> Vec<String> {
+    let drifted = report.drifted.iter().map(|d| format!("{} ({:?})", d.path, d.kind));
+    drifted.chain(report.unverified.iter().map(|path| format!("{path} (Unverified)"))).collect()
+}
+
+/// Sets workspace `m`'s write policy: what its landings do, as the launcher (kiln) gives it from its
+/// agent's permission mode, and an agent can never raise. A setting another raced is read and set
+/// again, once.
+pub async fn set_policy(m: &Made, policy: WritePolicy) -> anyhow::Result<()> {
+    let authority = launcher()?;
+    let volume = volume_id(&m.volume)?;
+    call("write policy", move |i| match i.set_write_policy(PolicySubject::Volume(volume), &policy, &authority) {
+        Err(slates_api::Error::Stale(_)) => i.set_write_policy(PolicySubject::Volume(volume), &policy, &authority),
+        set => set,
+    })
+    .await
 }
 
 /// What every landing leaves out: git's own directory.
@@ -556,93 +596,191 @@ pub async fn writable(m: &Made, plan: &Value) -> Result<(), String> {
     ))
 }
 
-/// A landing's summary as Slates' own JSON has it (its MCP server's and command line's): entries
-/// per action, bytes to write, entries the filter left out.
-fn summary_json(s: &LandingSummary) -> Value {
-    json!({
-        "by_action": s.by_action.iter().map(|a| json!({"action": a.action, "count": a.count})).collect::<Vec<_>>(),
-        "bytes": s.bytes,
-        "filtered_out": s.filtered_out,
-    })
+/// What a landing would write, as kiln shows it (the shape Slates' own JSON had): entries per
+/// action, bytes to write, entries the filter left out.
+fn summary_json(s: &Summary) -> Value {
+    let a = &s.actions;
+    let by_action: Vec<Value> = [("create", a.create), ("replace", a.replace), ("delete", a.delete), ("rename", a.rename), ("mkdir", a.mkdir), ("rmdir", a.rmdir), ("symlink", a.symlink), ("clear", a.clear)]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(action, count)| json!({"action": action, "count": count}))
+        .collect();
+    json!({"by_action": by_action, "bytes": s.bytes, "filtered_out": s.filtered_out})
 }
 
-/// A finished landing's outcome as Slates' own JSON has it: its counts, the durability it reached,
-/// and each degraded cell it met, as Slates words it.
-fn outcome_json(o: &LandingOutcome) -> Value {
+/// What reached the disk, as kiln shows it: the landing's counts, how it finished, the durability
+/// it reached and each degraded cell it met.
+fn report_json(r: &LandingReport) -> Value {
     json!({
-        "landing": o.landing,
-        "state": o.state,
-        "written": o.written,
-        "skipped": o.skipped,
-        "conflicts": o.conflicts,
-        "failed": o.failed,
-        "bytes_written": o.bytes_written,
-        "held": o.held,
+        "landing": r.landing,
+        "state": format!("{:?}", r.state).to_ascii_lowercase(),
+        "written": r.written,
+        "skipped": r.skipped,
+        "conflicts": r.conflicts,
+        "failed": r.failed,
+        "bytes_written": r.bytes_written,
+        "held": r.held,
         "durability": {
-            "data_synced": o.durability.data_synced,
-            "dirs_synced": o.durability.dirs_synced,
-            "media": o.durability.media,
-            "media_requested": o.durability.media_requested,
-            "dirs": o.durability.dirs,
+            "data_synced": r.durability.data_synced,
+            "dirs_synced": r.durability.dirs_synced,
+            "media": r.durability.media,
+            "media_requested": r.durability.media_requested,
+            "dirs": r.durability.dirs,
         },
-        "degraded": o.degraded.iter().map(|d| format!("{d:?}")).collect::<Vec<_>>(),
-        "barriers": o.barriers,
+        "degraded": r.degraded.iter().map(|d| format!("{d:?}")).collect::<Vec<_>>(),
+        "barriers": r.barriers,
     })
 }
 
-/// A plan a person approves as Slates' own JSON has it: the landing, its manifest's hash (what a
-/// grant binds), what it would write, and the conflicts found before any write.
-fn plan_json(p: &LandingPlan) -> Value {
-    json!({
-        "grant_required": true,
-        "landing": p.landing,
-        "manifest": p.manifest_text(),
-        "summary": summary_json(&p.summary),
-        "conflicts": p.conflicts,
-    })
+/// What an approval would write, as kiln shows it: the manifest it binds (64 hexadecimal digits),
+/// what it writes, and its presentation.
+fn approval_json(a: &LandingApproval) -> Value {
+    json!({"manifest": a.manifest_text(), "summary": summary_json(&a.summary), "presentation": a.presentation})
 }
 
-/// A landing's presentation as kiln shows it: the plan a person approves, or, when nothing needed a
-/// grant (nothing to write), how it went.
-fn planned_json(p: &Planned) -> Value {
-    match p {
-        Planned::Plan(plan) => plan_json(plan),
-        Planned::Landed(outcome) => json!({"grant_required": false, "outcome": outcome_json(outcome)}),
+/// Each landing conflict as kiln shows it: the entry and why it can't land.
+fn conflicts_json(conflicts: &[LandingConflict]) -> Value {
+    Value::Array(conflicts.iter().map(|c| json!({"path": c.path, "class": format!("{:?}", c.class)})).collect())
+}
+
+/// A policy's refusal as kiln shows it: the act, whose policy, why, and the same in words.
+fn refusal_json(r: &PolicyRefusal) -> Value {
+    let by = match r.by {
+        PolicySubject::Volume(v) => json!({"volume": slates_api::volume_id_text(v)}),
+        PolicySubject::Consumer(c) => json!({"consumer": c}),
+    };
+    json!({"act": format!("{:?}", r.act).to_ascii_lowercase(), "by": by, "reason": format!("{:?}", r.reason), "said": r.to_string()})
+}
+
+/// A landing's outcome as kiln answers it (docs/agentic.md W6): `outcome` names Slates' typed
+/// outcome, and the field of that name holds it: `written` (what reached the disk),
+/// `approval_required` (the `approval` the launcher or a person approves), `conflicted` (the
+/// `conflicts`; nothing written) or `refused` (the policy's `refusal`).
+pub fn outcome_json(o: &LandOutcome) -> Value {
+    match o {
+        LandOutcome::Written(report) => json!({"outcome": "written", "written": report_json(report)}),
+        LandOutcome::ApprovalRequired(approval) => json!({"outcome": "approval_required", "approval": approval_json(approval)}),
+        LandOutcome::Conflicted(conflicts) => json!({"outcome": "conflicted", "conflicts": conflicts_json(conflicts)}),
+        LandOutcome::Refused(refusal) => json!({"outcome": "refused", "refusal": refusal_json(refusal)}),
     }
+}
+
+/// A presentation as kiln's plan shows it (`agents.land` with no manifest): the plan an approval
+/// binds (its manifest, what it writes), the conflicts that hold it back with no manifest to
+/// approve, how it went when nothing needed an approval, or the policy's refusal.
+fn plan_json(o: &LandOutcome) -> Value {
+    match o {
+        LandOutcome::ApprovalRequired(a) => json!({"grant_required": true, "landing": a.presentation, "manifest": a.manifest_text(), "summary": summary_json(&a.summary), "conflicts": []}),
+        LandOutcome::Conflicted(conflicts) => json!({"grant_required": true, "conflicts": conflicts.iter().map(|c| c.path.clone()).collect::<Vec<_>>()}),
+        LandOutcome::Written(report) => json!({"grant_required": false, "outcome": report_json(report)}),
+        LandOutcome::Refused(refusal) => json!({"grant_required": true, "refused": refusal_json(refusal)}),
+    }
+}
+
+/// The landing of workspace `m` into `over` as Slates presents it, never writing whatever the
+/// volume's mode (its present-only verb): what review shows, and what an approval binds; what git
+/// ignores and git's own directory left out ([`excludes`]).
+pub async fn plan(m: &Made, over: &str) -> anyhow::Result<LandOutcome> {
+    let excludes = excludes(m).await;
+    plan_with(m, over, &excludes).await
+}
+
+/// [`plan`] with `excludes` left out.
+async fn plan_with(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<LandOutcome> {
+    let request = landing(m, over, excludes)?;
+    call("land", move |i| i.plan_landing(&request)).await
 }
 
 /// What writing workspace `m` back to `over` would do: Slates' presentation (`landing`,
-/// `manifest`, `summary`, `conflicts`, `grant_required`), or how it went if nothing needed a grant;
-/// and what it leaves out ([`excludes`]).
+/// `manifest`, `summary`, `conflicts`, `grant_required`), or how it went if nothing needed an
+/// approval; and what it leaves out ([`excludes`]).
 pub async fn plan_landing(m: &Made, over: &str) -> anyhow::Result<(Value, Vec<String>)> {
     let excludes = excludes(m).await;
+    let shown = plan_with(m, over, &excludes).await?;
+    Ok((plan_json(&shown), excludes))
+}
+
+/// Lands workspace `m` into `over` as its write policy says ([`set_policy`]): written at once
+/// (bypass), held as an approval request (ask), conflicted, or refused (forbid), Slates' typed
+/// outcome either way; what git ignores and git's own directory left out ([`excludes`]).
+pub async fn land_by_policy(m: &Made, over: &str) -> anyhow::Result<LandOutcome> {
+    let excludes = excludes(m).await;
     let request = landing(m, over, &excludes)?;
-    let planned = call("land", move |i| i.plan_landing(&request)).await?;
-    Ok((planned_json(&planned), excludes))
+    call("land", move |i| i.land(&request, None)).await
 }
 
-/// The handoff of the anchor's issuer authority in what the anchor printed (`log`): the variables
-/// of its last `issuer surface: export NAME=VALUE ...` line, the one the running anchor printed.
-fn handoff_in(log: &str) -> Option<Vec<(String, String)>> {
-    let line = log.lines().rev().find_map(|l| l.split_once(ISSUER_SURFACE).map(|(_, rest)| rest))?;
-    Some(line.split_whitespace().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect())
+/// Approves the landing of workspace `m` into `over` whose manifest is `manifest` (64 hexadecimal
+/// digits), as the launcher: Slates presents it again (never writing), and when its manifest is
+/// still that one approves exactly it under kiln's authority and lands it
+/// ([`Instance::approve_landing`], from any client: an approval is bound to its request and
+/// manifest). When anything changed, nothing is written and the answer is what holds now: the new
+/// approval request, the conflicts, or the policy's refusal.
+pub async fn approve(m: &Made, over: &str, manifest: &str) -> anyhow::Result<LandOutcome> {
+    let authority = launcher()?;
+    let approved = manifest_hash(manifest)?;
+    // The plan the person saw left out what git ignored then; asked again, a new ignored path moves the manifest, and
+    // nothing is approved.
+    let excludes = excludes(m).await;
+    let request = landing(m, over, &excludes)?;
+    call("land", move |i| match i.plan_landing(&request)? {
+        LandOutcome::ApprovalRequired(approval) if approval.manifest == approved => i.approve_landing(&approval, &authority),
+        other => Ok(other),
+    })
+    .await
 }
 
-/// How a person's grant reaches this machine's Slates: the handoff of its anchor's issuer authority
-/// (macOS and Windows, where the anchor's segment has a name and the anchor kiln started printed it
-/// into its log). Linux has none: there the segment is a descriptor only the anchor's own children
-/// hold (Slates' GAP-A9-10).
-fn issuer_handoff() -> anyhow::Result<Vec<(String, String)>> {
-    if cfg!(target_os = "linux") {
-        anyhow::bail!("Slates on Linux can't take a person's go-ahead from kiln yet (Slates' GAP-A9-10): put the work up for review instead");
+/// kiln's launcher secret for its instance, made once and kept in its state (0600): the same at
+/// every start and after kiln's own restarts, so the authority it proves never changes under a
+/// running instance. Two processes making it at once keep the first one written.
+fn launcher_secret() -> anyhow::Result<LauncherSecret> {
+    secret_at(&here()?.secret)
+}
+
+/// The launcher secret kept at `path`, made and kept there first when there is none (`launcher_secret`).
+fn secret_at(path: &Path) -> anyhow::Result<LauncherSecret> {
+    if let Some(kept) = read_secret(path)? {
+        return Ok(kept);
     }
-    let log = std::fs::read_to_string(&here()?.log).unwrap_or_default();
-    handoff_in(&log).ok_or_else(|| anyhow::anyhow!("Slates' anchor here wasn't started by kiln, so kiln can't pass on a person's approval to it"))
+    let fresh = LauncherSecret::generate().map_err(|e| anyhow::anyhow!("Slates: {e}"))?;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    crate::util::write_secret(&tmp, fresh.bytes(), 0o600)?;
+    // Linked, never renamed over: a secret another process kept first stays, and this one goes.
+    let kept = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match kept {
+        Ok(()) => Ok(fresh),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_secret(path)?.ok_or_else(|| anyhow::anyhow!("{} vanished as it was made", path.display())),
+        Err(e) => Err(e.into()),
+    }
 }
 
-/// Whether this machine's Slates takes a person's go-ahead from kiln, and why not.
+/// The launcher secret kept at `path`, if one is: refused when the file holds anything but one.
+fn read_secret(path: &Path) -> anyhow::Result<Option<LauncherSecret>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let bytes: [u8; slates_api::launcher::LAUNCHER_SECRET_BYTES] = bytes.try_into().map_err(|b: Vec<u8>| anyhow::anyhow!("{} holds {} bytes, not a launcher secret", path.display(), b.len()))?;
+    LauncherSecret::from_bytes(bytes).map(Some).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+}
+
+/// kiln's authority as its instance's launcher (`launcher_secret`): what sets a workspace's write
+/// policy and approves a landing its mode asks about. Refused where the instance runs under a
+/// systemd unit, which took no secret at its start ([`can_take_grants`]).
+fn launcher() -> anyhow::Result<Issuer> {
+    can_take_grants()?;
+    Ok(Issuer::from_launcher_secret(&launcher_secret()?))
+}
+
+/// Whether this machine's Slates takes kiln's approvals and policies, and why not: an instance
+/// kiln starts under a systemd unit (Linux) is handed no launcher secret yet.
 pub fn can_take_grants() -> anyhow::Result<()> {
-    issuer_handoff().map(|_| ())
+    anyhow::ensure!(
+        !under_systemd(),
+        "Slates on this machine runs under a systemd unit of its own, which kiln can't hand its launcher secret to yet: put the work up for review instead"
+    );
+    Ok(())
 }
 
 /// What came of writing a workspace back: written (Slates' outcome), or not, because the plan is no
@@ -654,35 +792,23 @@ pub enum Landed {
 }
 
 /// Writes workspace `m` back to `over` exactly as the plan whose manifest is `manifest` (the one
-/// the person saw) says. Slates holds a presentation only as long as the client that made it, and
-/// each of kiln's calls has its own, so the plan is made again here: when its manifest is no longer
-/// the one the person saw, nothing is written and the new plan comes back. When it still is, and
-/// writes no more than git sees changed ([`writable`]), the library presents it once more, grants
-/// exactly that manifest under the anchor's issuer authority and lands it under that grant, all on
-/// one client ([`Instance::land_approved`]); a manifest that moved meanwhile writes nothing and
-/// comes back as the new plan.
+/// the person saw) says, when it writes no more than git sees changed ([`writable`]): approved
+/// under kiln's authority ([`approve`]). When anything changed, nothing is written and the new plan
+/// comes back.
 pub async fn land(m: &Made, over: &str, manifest: &str) -> anyhow::Result<Landed> {
-    let handoff = issuer_handoff()?;
-    let approved = manifest_hash(manifest)?;
-    let (plan, excludes) = plan_landing(m, over).await?;
-    if plan.get("grant_required").and_then(Value::as_bool) != Some(true) {
-        // Nothing waits on a grant (nothing to write, or it landed as it was).
-        return Ok(Landed::Written(plan));
+    can_take_grants()?;
+    let (shown, excludes) = plan_landing(m, over).await?;
+    if shown.get("manifest").and_then(Value::as_str).map(str::to_ascii_lowercase) != Some(manifest.to_ascii_lowercase()) {
+        return Ok(match shown.get("grant_required").and_then(Value::as_bool) {
+            // Nothing waits on an approval (nothing to write, or it landed as it was).
+            Some(false) => Landed::Written(shown),
+            _ => Landed::Changed(shown, excludes),
+        });
     }
-    if plan.get("manifest").and_then(Value::as_str).map(str::to_ascii_lowercase) != Some(manifest.to_ascii_lowercase()) {
-        return Ok(Landed::Changed(plan, excludes));
-    }
-    writable(m, &plan).await.map_err(anyhow::Error::msg)?;
-    // Landed exactly as planned: the same prefixes left out, so the same manifest.
-    let request = landing(m, over, &excludes)?;
-    let came = call("land", move |i| {
-        let issuer = slates_api::Issuer::from_handoff(&handoff)?;
-        i.land_approved(&issuer, &request, &approved, (GrantScope::Once, slates_api::GRANT_TERM_NS))
-    })
-    .await?;
-    Ok(match came {
-        Approved::Landed(outcome) => Landed::Written(json!({"grant_required": false, "outcome": outcome_json(&outcome)})),
-        Approved::Changed(plan) => Landed::Changed(plan_json(&plan), excludes),
+    writable(m, &shown).await.map_err(anyhow::Error::msg)?;
+    Ok(match approve(m, over, manifest).await? {
+        LandOutcome::Written(report) => Landed::Written(json!({"grant_required": false, "outcome": report_json(&report)})),
+        other => Landed::Changed(plan_json(&other), excludes),
     })
 }
 
@@ -724,35 +850,44 @@ mod tests {
         Ok(())
     }
 
+    /// An approval of `manifest` writing two files and making a directory, of a landing into `/src/kiln`.
+    fn approval(manifest: [u8; 32]) -> anyhow::Result<LandingApproval> {
+        let m = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into() };
+        Ok(LandingApproval {
+            request: landing(&m, "/src/kiln", &EXCLUDES.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>())?,
+            presentation: 7,
+            manifest,
+            summary: Summary { actions: slates_api::ActionTally { create: 2, mkdir: 1, ..Default::default() }, bytes: 12, filtered_out: 3 },
+            verification: slates_api::Verification::Unsigned,
+        })
+    }
+
+    /// W1: kiln speaks the contract it was written against; a re-vendor that moves it fails here, beside the matches
+    /// it must extend.
+    #[test]
+    fn w1_kiln_speaks_the_contract_it_was_written_against() {
+        assert_eq!(slates_api::CONTRACT, CONTRACT);
+    }
+
     /// W6: the manifest a person saw comes back to Slates as the hash it wrote; anything else is
-    /// refused before Slates is asked, never granted as another plan.
+    /// refused before Slates is asked, never approved as another plan.
     #[test]
     fn w6_the_manifest_a_person_saw_is_the_hash_slates_wrote() -> anyhow::Result<()> {
-        let plan = LandingPlan { landing: 1, manifest: [0x5a; 32], summary: LandingSummary::default(), conflicts: Vec::new() };
-        assert_eq!(manifest_hash(&plan.manifest_text())?, plan.manifest);
-        assert_eq!(manifest_hash(&plan.manifest_text().to_uppercase())?, plan.manifest);
+        let shown = approval([0x5a; 32])?;
+        assert_eq!(manifest_hash(&shown.manifest_text())?, shown.manifest);
+        assert_eq!(manifest_hash(&shown.manifest_text().to_uppercase())?, shown.manifest);
         for bad in ["", "5a", &"5a".repeat(31), &"5a".repeat(33), &format!("{}zz", "5a".repeat(31))] {
             assert!(manifest_hash(bad).is_err(), "{bad:?} taken as a manifest");
         }
         Ok(())
     }
 
-    /// W6: a plan shows what Slates would write as Slates' own JSON has it (the manifest a grant
-    /// binds in hexadecimal, entries per action, the conflicts), and a landing with nothing to write
-    /// shows how it went.
+    /// W6: a plan shows what Slates would write as kiln always showed it (the manifest an approval
+    /// binds in hexadecimal, entries per action, the conflicts), weighed as before; a conflicted
+    /// presentation shows its conflicts and no manifest to approve.
     #[test]
-    fn w6_a_landing_plan_reads_as_slates_writes_it() {
-        let plan = LandingPlan {
-            landing: 7,
-            manifest: [0xab; 32],
-            summary: LandingSummary {
-                by_action: vec![slates_api::ActionCount { action: "create".into(), count: 2 }, slates_api::ActionCount { action: "mkdir".into(), count: 1 }],
-                bytes: 12,
-                filtered_out: 3,
-            },
-            conflicts: vec!["/README.md".into()],
-        };
-        let shown = planned_json(&Planned::Plan(plan));
+    fn w6_a_landing_plan_reads_as_kiln_showed_it() -> anyhow::Result<()> {
+        let shown = plan_json(&LandOutcome::ApprovalRequired(approval([0xab; 32])?));
         let at = |pointer: &str| shown.pointer(pointer).cloned().unwrap_or_default();
         assert_eq!(at("/grant_required"), json!(true));
         assert_eq!(at("/landing"), json!(7));
@@ -760,26 +895,68 @@ mod tests {
         assert_eq!(at("/summary/by_action"), json!([{"action": "create", "count": 2}, {"action": "mkdir", "count": 1}]));
         assert_eq!(at("/summary/bytes"), json!(12));
         assert_eq!(at("/summary/filtered_out"), json!(3));
-        assert_eq!(at("/conflicts"), json!(["/README.md"]));
+        assert_eq!(at("/conflicts"), json!([]));
         assert_eq!(planned_files(&shown), 2, "kiln weighs Slates' plan as it weighed its command line's");
+        let conflict = LandingConflict { path: "/README.md".into(), class: slates_api::ConflictClass::ModifyModify, planned: None };
+        let held = plan_json(&LandOutcome::Conflicted(vec![conflict]));
+        assert_eq!(held.get("conflicts"), Some(&json!(["/README.md"])));
+        assert!(held.get("manifest").is_none(), "nothing to approve while it conflicts: {held}");
+        Ok(())
     }
 
-    /// W6: a person's go-ahead reaches the anchor kiln started through the handoff it printed last
-    /// (a restarted anchor prints its own), and a log with none says the anchor isn't kiln's.
+    /// W6 (docs/agentic.md; kiln's slates e2e contract): a landing's outcome names Slates' typed outcome, and the
+    /// field of that name holds it, the approval's manifest as the 64 hexadecimal digits a person approves.
     #[test]
-    fn w6_the_go_ahead_takes_the_handoff_the_running_anchor_printed() {
-        let log = "slates anchor: instance kiln up; daemon pid 10; 2 shards\n\
-                   slates anchor: issuer surface: export SLATES_ANCHOR=old SLATES_ANCHOR_LEN=1\n\
-                   slates anchor: stopped (daemon exit Some(0))\n\
-                   slates anchor: issuer surface: export SLATES_ANCHOR=slates-kiln-2 SLATES_ANCHOR_LEN=4096\n\
-                   slates daemon: serving\n";
-        assert_eq!(handoff_in(log), Some(vec![("SLATES_ANCHOR".to_owned(), "slates-kiln-2".to_owned()), ("SLATES_ANCHOR_LEN".to_owned(), "4096".to_owned())]));
-        assert_eq!(handoff_in("slates anchor: instance kiln up\n"), None);
-        assert_eq!(handoff_in(""), None);
+    fn w6_a_landing_outcome_names_slates_typed_outcome() -> anyhow::Result<()> {
+        let held = outcome_json(&LandOutcome::ApprovalRequired(approval([0xcd; 32])?));
+        assert_eq!(held.get("outcome"), Some(&json!("approval_required")));
+        assert_eq!(held.pointer("/approval/manifest"), Some(&json!("cd".repeat(32))));
+        assert_eq!(held.pointer("/approval/summary/bytes"), Some(&json!(12)));
+        let conflict = LandingConflict { path: "/a.rs".into(), class: slates_api::ConflictClass::ModifyModify, planned: None };
+        let conflicted = outcome_json(&LandOutcome::Conflicted(vec![conflict]));
+        assert_eq!(conflicted.get("outcome"), Some(&json!("conflicted")));
+        assert_eq!(conflicted.pointer("/conflicts/0/path"), Some(&json!("/a.rs")));
+        let volume = VolumeId { bytes: [7; 16] };
+        let refusal = PolicyRefusal { act: slates_api::WriteAct::Land, by: PolicySubject::Volume(volume), reason: slates_api::PolicyReason::Forbidden };
+        let refused = outcome_json(&LandOutcome::Refused(refusal));
+        assert_eq!(refused.get("outcome"), Some(&json!("refused")));
+        assert_eq!(refused.pointer("/refusal/act"), Some(&json!("land")));
+        assert_eq!(refused.pointer("/refusal/by/volume"), Some(&json!(slates_api::volume_id_text(volume))));
+        assert_eq!(refused.pointer("/refusal/reason"), Some(&json!("Forbidden")));
+        assert!(refused.pointer("/refusal/said").and_then(Value::as_str).is_some_and(|s| s.contains("forbidden")), "{refused}");
+        Ok(())
     }
 
-    /// W1: the facts name the mounts kiln makes by the library's word, and leave out a kind kiln
-    /// doesn't mount at yet.
+    /// W4: a drifted entry shows as kiln always showed it, the disk's change named, and one the host
+    /// couldn't re-check as not known to match.
+    #[test]
+    fn w4_drift_reads_as_kiln_showed_it() {
+        let report = DriftReport { drifted: vec![slates_api::Drift { path: "/README.md".into(), kind: slates_api::DriftKind::Modified }], unverified: vec!["/b.rs".into()], watcher: slates_api::Watcher::Unavailable };
+        assert_eq!(drift_lines(&report), ["/README.md (Modified)", "/b.rs (Unverified)"]);
+        assert!(drift_lines(&DriftReport { drifted: Vec::new(), unverified: Vec::new(), watcher: slates_api::Watcher::Live }).is_empty());
+    }
+
+    /// W6: kiln's launcher secret is made once and kept, private, and read back the same at every
+    /// start; a kept file that holds anything but a secret is refused, never replaced.
+    #[test]
+    fn w6_kilns_launcher_secret_is_made_once_and_kept() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("slates-launcher.key");
+        let made = secret_at(&path)?;
+        assert_eq!(secret_at(&path)?, made, "the same secret at every start");
+        assert_eq!(std::fs::read(&path)?, made.bytes().to_vec());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600, "kept private");
+        }
+        std::fs::write(&path, b"not a secret")?;
+        assert!(secret_at(&path).is_err(), "a kept file that isn't a secret is refused");
+        assert_eq!(std::fs::read(&path)?, b"not a secret", "never replaced");
+        Ok(())
+    }
+
+    /// W1: the facts name the mounts kiln makes by the library's word, a WinFsp drive among them.
     #[test]
     fn w1_the_facts_name_the_mount_the_library_offers() {
         assert_eq!(mount_word(MountKind::Fuse), Some("fuse"));
@@ -803,15 +980,22 @@ mod tests {
     /// its shards and its quick profile only where a test asked.
     #[test]
     fn w1_the_anchor_is_kilns_own_executable_in_slates_role() -> anyhow::Result<()> {
-        let spec = start_spec()?;
+        let spec = start_spec(None)?;
         assert_eq!(spec.prefix, vec![ROLE_ARG.to_owned()]);
         assert_eq!(spec.shards, Some(SHARDS));
         assert!(spec.fleet.is_none(), "a machine's instance runs alone");
-        let command = spec.anchor_command();
+        let command = spec.anchor_command()?;
         let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(args.first().map(String::as_str), Some(ROLE_ARG), "{args:?}");
         assert!(args.windows(2).any(|w| matches!(w, [flag, name] if flag == "--instance" && *name == spec.instance)), "{args:?}");
         assert!(args.iter().any(|a| a == "anchor"), "{args:?}");
+        // With kiln's secret, the anchor is told its standard input carries it (and the secret is in no argument).
+        let secret = LauncherSecret::generate()?;
+        let handed = start_spec(Some(secret.clone()))?.anchor_command()?;
+        let marked = handed.get_envs().any(|(k, v)| k == "SLATES_LAUNCHER" && v.is_some_and(|v| v == "stdin"));
+        assert!(marked, "{:?}", handed.get_envs().collect::<Vec<_>>());
+        let hex: String = secret.bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert!(handed.get_args().all(|a| !a.to_string_lossy().contains(&hex)), "the secret rides no argument");
         Ok(())
     }
 
