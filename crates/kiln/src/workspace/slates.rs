@@ -61,7 +61,14 @@ pub const INSTANCE: &str = "kiln";
 /// a volume's loss window (10), a daemon's recovered verdict (11), a Shards stream's resync
 /// channel (12), signed merges (13), the volume core's typed refusals (15, which kiln shows in
 /// Slates' words as it did).
-pub const CONTRACT: u32 = 16;
+///
+/// 19 since kiln took Slates at e599cae8a (from 16). What 17 to 19 added are refusals typed where
+/// they carried words, each shown by kiln in Slates' words as before, and none matched by kiln: the
+/// daemon's database refusals (17, `Unusable::Database`), a snapshot's retention refused apart from
+/// the volume's quota (18, `Exhausted::Volume`: the review read of the HVF drive was refused
+/// "Quota" for it before A-342), and a target's, a mount point's and a mount's refusals (19,
+/// `HostFault::Target`).
+pub const CONTRACT: u32 = 19;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
