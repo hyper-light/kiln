@@ -773,17 +773,24 @@ fn landing_by(cx: &Cx, info: &Info) -> Result<LandingBy, Fail> {
 }
 
 /// A machine's answer to a landing, with its outcome named for whoever acts on it (docs/agents.md, "Workspaces of
-/// their own"): `written` (Slates' outcome, as `landed` has it), or `approval_required` (the plan to read and approve
-/// by its manifest: what was asked for, or the new plan when what was approved moved on, as `changed` says). The
-/// fields the machine answered stay as they were.
+/// their own"), as Slates' typed outcome names it: `written` (Slates' outcome, as `landed` has it); `conflicted`
+/// (`conflicts`, each typed: the disk changed entries the volume changed too, so nothing was written, whoever asked
+/// and whatever their mode, and there's no manifest to approve until a person settles them); `refused` (the policy's
+/// `refusal`); or `approval_required` (the plan to read and approve by its manifest: what was asked for, or the new
+/// plan when what was approved moved on, as `changed` says). The fields the machine answered stay as they were.
 fn typed_landing(mut answer: Value) -> Value {
     // Slates' own outcome, inside its answer when nothing waited on a grant (`{grant_required: false, outcome}`).
     let outcome_of = |said: Value| said.get("outcome").cloned().unwrap_or(said);
     let plan = answer.get("plan").cloned();
-    let (outcome, field, value) = match (answer.get("landed").cloned(), plan) {
-        (Some(written), _) => ("written", "written", outcome_of(written)),
-        (None, Some(plan)) if plan.get("grant_required") == Some(&Value::Bool(false)) => ("written", "written", outcome_of(plan)),
-        (None, Some(plan)) => (
+    // A policy's refusal, and the conflicts a plan met that holds no manifest to approve.
+    let refused = plan.as_ref().and_then(|p| p.get("refused")).filter(|r| !r.is_null()).cloned();
+    let met = plan.as_ref().filter(|p| p.get("manifest").and_then(Value::as_str).is_none()).and_then(conflicts_in);
+    let (outcome, field, value) = match (answer.get("landed").cloned(), plan, refused, met) {
+        (Some(written), ..) => ("written", "written", outcome_of(written)),
+        (None, Some(plan), ..) if plan.get("grant_required") == Some(&Value::Bool(false)) => ("written", "written", outcome_of(plan)),
+        (None, Some(_), Some(refusal), _) => ("refused", "refusal", refusal),
+        (None, Some(_), None, Some(conflicts)) => ("conflicted", "conflicts", conflicts),
+        (None, Some(plan), None, None) => (
             "approval_required",
             "approval",
             json!({
@@ -795,13 +802,23 @@ fn typed_landing(mut answer: Value) -> Value {
                 "why_not": answer.get("why_not"),
             }),
         ),
-        (None, None) => return answer,
+        (None, None, ..) => return answer,
     };
     if let Some(o) = answer.as_object_mut() {
         o.insert("outcome".into(), json!(outcome));
         o.insert(field.into(), value);
     }
     answer
+}
+
+/// The conflicts a landing's plan met, each typed (`conflicted`: its path and class, as Slates' `LandingConflict` has
+/// them); a runner older than that names each by its path alone (`conflicts`). None when it met none.
+fn conflicts_in(plan: &Value) -> Option<Value> {
+    let nonempty = |key: &str| plan.get(key).and_then(Value::as_array).filter(|c| !c.is_empty());
+    match nonempty("conflicted") {
+        Some(typed) => Some(Value::Array(typed.clone())),
+        None => nonempty("conflicts").map(|paths| Value::Array(paths.iter().map(|path| json!({"path": path})).collect())),
+    }
 }
 
 async fn changes(cx: Cx, v: Value) -> Out {
@@ -2035,6 +2052,36 @@ mod tests {
         assert_eq!(key_scope(&caller("ada", None, Some("u1"))), key_scope(&caller("Ada L", None, Some("u1"))));
         assert_ne!(key_scope(&caller("x", Some("01a1"), None)), key_scope(&caller("x", None, Some("01a1"))), "an agent's key isn't a person's");
     }
+
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W6; Slates' `LandOutcome::Conflicted`, "the disk
+    /// changed entries the volume changed too: each conflict, typed. Nothing was written"): a landing whose plan met
+    /// conflicts answers `conflicted`, each conflict typed, whoever asks and whatever their mode, never an approval
+    /// request that names no manifest, which nobody can approve. The bare-metal drift drive's bypass agent, landing over
+    /// a file its person had changed on disk, read `approval_required` with a null manifest (Linux and macOS, kiln
+    /// a2cc1e429, 2026-11-18). A policy's refusal answers `refused`; a plan to approve, `approval_required` as before.
+    #[test]
+    fn w6_a_landing_whose_plan_met_conflicts_answers_conflicted_and_a_policys_refusal_refused() {
+        let readme = json!([{"path": "/README.md", "class": "ModifyModify"}]);
+        let met = typed_landing(json!({"plan": {"grant_required": true, "conflicts": ["/README.md"], "conflicted": readme}, "excludes": ["/.git"], "can_write": true, "why_not": null}));
+        assert_eq!(met.get("outcome"), Some(&json!("conflicted")), "{met}");
+        assert_eq!(met.get("conflicts"), Some(&readme), "each conflict typed: {met}");
+        assert!(met.get("approval").is_none(), "nothing to approve: {met}");
+        assert_eq!(met.pointer("/plan/conflicts"), Some(&json!(["/README.md"])), "the fields the UI reads stay: {met}");
+        // A runner older than the typed conflicts names each by its path alone.
+        let older = typed_landing(json!({"plan": {"grant_required": true, "conflicts": ["/README.md"]}, "excludes": [], "can_write": true}));
+        assert_eq!((older.get("outcome"), older.get("conflicts")), (Some(&json!("conflicted")), Some(&json!([{"path": "/README.md"}]))), "{older}");
+        // Approved, then met conflicts before it was written: nothing written, and the conflicts are the answer.
+        let moved = typed_landing(json!({"changed": true, "plan": {"grant_required": true, "conflicts": ["/a"], "conflicted": [{"path": "/a", "class": "CreateCreate"}]}, "excludes": []}));
+        assert_eq!(moved.get("outcome"), Some(&json!("conflicted")), "{moved}");
+        let refusal = json!({"act": "land", "by": {"volume": "00"}, "reason": "Forbidden", "said": "the volume's policy forbids landing"});
+        let refused = typed_landing(json!({"plan": {"grant_required": true, "refused": refusal}, "excludes": []}));
+        assert_eq!((refused.get("outcome"), refused.get("refusal")), (Some(&json!("refused")), Some(&refusal)), "{refused}");
+        let manifest = "ab".repeat(32);
+        let asked = typed_landing(json!({"plan": {"grant_required": true, "manifest": manifest, "summary": {"files": 1}, "conflicts": []}, "excludes": [], "can_write": true}));
+        assert_eq!((asked.get("outcome"), asked.pointer("/approval/manifest")), (Some(&json!("approval_required")), Some(&json!(manifest))), "{asked}");
+        let landed = typed_landing(json!({"landed": {"grant_required": false, "outcome": {"files": 1}}}));
+        assert_eq!((landed.get("outcome"), landed.get("written")), (Some(&json!("written")), Some(&json!({"files": 1}))), "{landed}");
+    }
 }
 
 /// The operations end to end on a hub of their own, under a timeout: a parent that asks starts a
@@ -3094,10 +3141,11 @@ for line in sys.stdin:
     /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2): what an agent works in when its start names no
     /// workspace is the server's `[agents] workspace`: on a server that says `folder` (a test's, a lab's) its folder
     /// itself, nothing made for it; and a person's `folder` is kept as asked on a server whose default is a volume, its
-    /// machine asked nothing about one, as is the folder of one started in a person's shell; and where its machine can't
-    /// make a volume the start is refused, naming what it lacks (`lineage::NoWorkspace`), never run in its folder instead
-    /// (the coordinator's ruling of 2026-11-18: that fallback was a second path). None needs Slates, so this holds on
-    /// every machine.
+    /// machine asked nothing about one; and where its machine can't make a volume the start is refused, naming what it
+    /// lacks (`lineage::NoWorkspace`), never run in its folder instead (the coordinator's ruling of 2026-11-18: that
+    /// fallback was a second path), one started in a person's shell like any other: it works on a volume too, its folder
+    /// and environment moved onto it, never beside it in the person's folder (I11), and so does a conversation taken up
+    /// (I12). None needs Slates, so this holds on every machine.
     #[test]
     fn w2_a_start_naming_no_workspace_follows_the_servers_setting_and_a_folder_asked_for_is_kept() -> anyhow::Result<()> {
         run(async {
@@ -3121,17 +3169,17 @@ for line in sys.stdin:
             let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
             anyhow::ensure!(ws.pointer("/workspace/kind") == Some(&json!("folder")) && ws.get("drift") == Some(&json!([])), "{ws}");
             anyhow::ensure!(ws.pointer("/workspace/volume") == Some(&Value::Null), "{ws}");
-            // One started in a person's shell works beside them in the shell's folder, its machine asked nothing.
-            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: Some("t1".into()), ..Default::default() };
-            let shelled = hub.harness.open(&hub, "local", spec, 1).await?;
-            anyhow::ensure!(shelled.first().is_some_and(|i| i.workspace.is_none()), "{shelled:?}");
             // A machine that can't make a volume (here its kiln is older than workspaces) refuses a start that names
-            // none, typed, naming what it lacks: it never runs the agent in its plain folder instead (no second path).
+            // none, typed, naming what it lacks: it never runs the agent in its plain folder instead (no second path);
+            // one started in a person's shell there is refused alike, since it too works on a volume, and so is a
+            // conversation taken up there (I12).
             hub.put_agent(crate::hub::tests::live_runner("old", "linux", "x86_64"));
-            let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), ..Default::default() };
-            let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
-            let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
-            anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "{refused:?}");
+            for (shell, resume) in [(None, None), (Some("t1"), None), (None, Some("0e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b"))] {
+                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: shell.map(str::to_owned), resume: resume.map(str::to_owned), ..Default::default() };
+                let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
+                let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
+                anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "shell {shell:?}, resume {resume:?}: {refused:?}");
+            }
             Ok(())
         })
     }

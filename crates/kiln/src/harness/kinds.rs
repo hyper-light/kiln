@@ -136,6 +136,12 @@ impl Kind {
         }
         p.current_dir(&cwd);
         set_env(&mut p, spec);
+        // `PWD` names where it starts, as a shell sets it for what it runs (POSIX `cd`), whatever environment it was
+        // handed: a person's shell's names their own folder, as it was when that shell started, where an agent on a
+        // volume starts at the mount (docs/agentic.md W2).
+        if cfg!(unix) {
+            p.env("PWD", &cwd);
+        }
         match self.protocol {
             Protocol::ClaudeStreamJson => {
                 let session_id = spec.resume.is_none().then(|| uuid::Uuid::now_v7().to_string());
@@ -1455,6 +1461,26 @@ mod tests {
         let (modes, default) = kind.modes();
         assert_eq!(default, "accept-edits");
         assert_eq!(modes.iter().map(|m| (m.id.as_str(), m.dangerous)).collect::<Vec<_>>(), [("accept-edits", false), ("smart", false), ("ask", false), ("plan", false), ("bypass", true)]);
+        Ok(())
+    }
+
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2, I11): a harness starts with `PWD` naming the
+    /// folder it starts in, whatever environment it was handed. One started in a person's shell is handed the shell's,
+    /// whose `PWD` names the person's own folder (as it was when the shell started), while it works on its volume at the
+    /// mount: a command that trusts `PWD` would write past its volume into the person's folder.
+    #[test]
+    #[cfg(unix)]
+    fn w2_a_harness_starts_with_pwd_naming_the_folder_it_starts_in() -> anyhow::Result<()> {
+        let kind = Kind::get("devin").ok_or_else(|| anyhow::anyhow!("no Devin harness"))?;
+        let mount = tempfile::tempdir()?;
+        let cwd = mount.path().join("src");
+        std::fs::create_dir_all(&cwd)?;
+        let shells = vec![("PWD".to_owned(), "/Users/person/project/src".to_owned()), ("OLDPWD".to_owned(), "/Users/person".to_owned())];
+        let spec = Spec { kind: "devin".into(), program: Some("/path/to/devin".into()), cwd: Some(cwd.to_string_lossy().into_owned()), shell: Some("t1".into()), env: shells, ..Spec::default() };
+        let launch = kind.launch(&spec, "session")?;
+        let env: std::collections::HashMap<_, _> = launch.get_envs().collect();
+        assert_eq!(env.get(std::ffi::OsStr::new("PWD")), Some(&Some(cwd.as_os_str())), "its PWD is where it starts, the shell's no longer");
+        assert_eq!(env.get(std::ffi::OsStr::new("OLDPWD")), Some(&Some(std::ffi::OsStr::new("/Users/person"))), "a folder outside the volume's stays as the shell had it");
         Ok(())
     }
 

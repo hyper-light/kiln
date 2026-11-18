@@ -14,8 +14,10 @@
 //!
 //! What is mounted at a point is judged by the system's own word, never by a path's spelling: a mount's device differs
 //! from its parent's (Unix), or the drive is there and Windows names its file system Slates' (`slates`, the name its
-//! WinFsp volume gives). Whether a machine can mount at all, and why not, is Slates' library's word
-//! (`slates_api::mount::available`, through `super::slates::facts`).
+//! WinFsp volume gives). A point is named as the kernel's mount table names the mount, by its real path ([`points`]),
+//! and whether a workspace is still mounted as it's taken down is that table's word, read without touching the mount
+//! (`listed`), never a stat of a hard NFS mount that waits on its server. Whether a machine can mount at all, and why
+//! not, is Slates' library's word (`slates_api::mount::available`, through `super::slates::facts`).
 
 use std::path::{Path, PathBuf};
 
@@ -28,8 +30,9 @@ pub fn free_letter(held: u32) -> Option<char> {
     })
 }
 
-/// Where workspace `name` may be mounted, in the order to try: `root/<name>` alone (Unix); on Windows each drive letter
-/// free now, the highest first ([`free_letter`]), so a letter another start took in the meantime gives way to the next.
+/// Where workspace `name` may be mounted, in the order to try: `root/<name>` alone (Unix), under the root's real path,
+/// the spelling the kernel's mount table gives the mount once it's made ([`real`]); on Windows each drive letter free
+/// now, the highest first ([`free_letter`]), so a letter another start took in the meantime gives way to the next.
 pub fn points(root: &Path, name: &str) -> Vec<PathBuf> {
     if cfg!(windows) {
         let mut held = drives();
@@ -44,7 +47,28 @@ pub fn points(root: &Path, name: &str) -> Vec<PathBuf> {
         }
         free
     } else {
-        vec![root.join(name)]
+        vec![real(root).join(name)]
+    }
+}
+
+/// `path` as the kernel resolves it: its real path, every link on the way followed (Slates mounts at the real path,
+/// and the kernel's mount table names the mount by it: macOS reaches `/var`, where every temporary folder lies, through
+/// a link to `/private/var`), or, where it isn't there yet, its nearest ancestor's real path with the rest as given. A
+/// mount named by another spelling is one kiln unmounts, reports and is told about by a name the table doesn't hold.
+pub fn real(path: &Path) -> PathBuf {
+    let mut below = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(at) {
+            return below.iter().rev().fold(resolved, |whole, part| whole.join(part));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(part)) => {
+                below.push(part.to_os_string());
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -108,6 +132,48 @@ pub fn is_mount(point: &Path) -> bool {
 #[cfg(not(any(unix, windows)))]
 pub fn is_mount(_point: &Path) -> bool {
     false
+}
+
+/// Whether the kernel's mount table holds a mount at `point` (named as [`points`] names it, the table's own spelling),
+/// read without touching the mount ([`mount_table`]).
+#[cfg(unix)]
+pub fn listed(point: &Path) -> anyhow::Result<bool> {
+    Ok(mount_table()?.iter().any(|at| at == point))
+}
+
+/// The mount points the kernel's mount table holds now, read without touching any mount: Linux's
+/// `/proc/self/mountinfo` (proc(5)); BSD `mount`'s list elsewhere (macOS's reads the table with `getmntinfo` and
+/// `MNT_NOWAIT`, asking no file server). Whether a workspace is still mounted is asked here as it's taken down: a stat
+/// of a hard NFS mount's point ([`is_mount`]) waits on its server for as long as that can't answer, and takes any
+/// refusal for no mount at all.
+#[cfg(unix)]
+pub fn mount_table() -> anyhow::Result<Vec<PathBuf>> {
+    if cfg!(target_os = "linux") {
+        return Ok(linux_points(&std::fs::read_to_string("/proc/self/mountinfo")?));
+    }
+    let listed = std::process::Command::new("mount").output()?;
+    anyhow::ensure!(listed.status.success(), "mount: {}", String::from_utf8_lossy(&listed.stderr).trim());
+    Ok(bsd_points(&String::from_utf8_lossy(&listed.stdout)))
+}
+
+/// The mount points a Linux `/proc/self/mountinfo` lists: each line's fifth field, which the kernel writes with a
+/// space, a tab, a newline and a backslash as octal escapes (proc(5)).
+#[cfg(any(unix, test))]
+fn linux_points(text: &str) -> Vec<PathBuf> {
+    let unescape = |field: &str| field.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\");
+    text.lines().filter(|line| line.contains(" - ")).filter_map(|line| line.split(' ').nth(4)).map(|at| PathBuf::from(unescape(at))).collect()
+}
+
+/// The mount points BSD's `mount` lists, macOS's among them: `<source> on <point> (<type>, <options>…)`.
+#[cfg(any(unix, test))]
+fn bsd_points(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(" on ")?;
+            let (at, _) = rest.rsplit_once(" (")?;
+            Some(PathBuf::from(at))
+        })
+        .collect()
 }
 
 /// The drives Windows holds now (`GetLogicalDrives`), none elsewhere.
@@ -200,5 +266,40 @@ mod tests {
     #[cfg(not(windows))]
     fn elsewhere_a_workspace_is_mounted_at_a_folder_of_its_own() {
         assert_eq!(points(Path::new("/state/workspaces"), "kiln-a"), vec![PathBuf::from("/state/workspaces/kiln-a")]);
+    }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a workspace's mount point is named as the kernel's mount table
+    /// names the mount, its real path, though its state folder is reached through a link (macOS's `/var` is a link to
+    /// `/private/var`, where every temporary folder lies), whether the workspaces folder is there yet or not. The
+    /// bare-metal drive on macOS read kiln's mount as `/var/folders/…/kiln-<id>` and the table's as
+    /// `/private/var/folders/…/kiln-<id>` (kiln eba1841e, 2026-11-18), and the volume stayed mounted after its agent ended.
+    #[test]
+    #[cfg(unix)]
+    fn w3_a_mount_point_is_named_as_the_kernels_mount_table_names_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = std::fs::canonicalize(dir.path())?.join("state");
+        std::fs::create_dir_all(&real)?;
+        let link = dir.path().join("linked-state");
+        std::os::unix::fs::symlink(&real, &link)?;
+        let want = vec![real.join("workspaces").join("kiln-a")];
+        assert_eq!(points(&link.join("workspaces"), "kiln-a"), want, "no workspaces folder yet");
+        std::fs::create_dir_all(real.join("workspaces"))?;
+        assert_eq!(points(&link.join("workspaces"), "kiln-a"), want, "its workspaces folder there");
+        Ok(())
+    }
+
+    /// W3: the kernel's mount table read as each system writes it, a mount point with a space included: Linux's
+    /// `/proc/self/mountinfo` (its fifth field, octal escapes undone) and BSD `mount`'s list (macOS's).
+    #[test]
+    fn w3_the_mount_table_is_read_as_each_system_writes_it() {
+        let linux = "36 35 98:0 /mnt1 /mnt/with\\040space rw,noatime master:1 - ext3 /dev/root rw,errors=continue\n\
+                     612 30 0:77 / /home/ada/.kiln/workspaces/kiln-01a1 rw,nosuid,nodev,relatime shared:300 - fuse.slates slates:0000000000000002 rw,user_id=1000\n\
+                     garbage\n";
+        assert_eq!(linux_points(linux), vec![PathBuf::from("/mnt/with space"), PathBuf::from("/home/ada/.kiln/workspaces/kiln-01a1")]);
+        let macos = "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n\
+                     map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)\n\
+                     slates:/kiln-01a1 on /private/var/folders/4y/T/a b/slates-state/workspaces/kiln-01a1 (nfs, nodev, nosuid, mounted by ada)\n\
+                     garbage\n";
+        assert_eq!(bsd_points(macos), vec![PathBuf::from("/"), PathBuf::from("/System/Volumes/Data/home"), PathBuf::from("/private/var/folders/4y/T/a b/slates-state/workspaces/kiln-01a1")]);
     }
 }

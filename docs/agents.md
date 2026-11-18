@@ -1037,7 +1037,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
 | `agents.refs` | `GET /api/harness/agents/:id/refs` | → `{refs: {branches, tags, commits: [{sha, subject, at, ...}], trunk}}` ("Compare", below) |
 | `agents.compare` | `GET /api/harness/agents/:id/compare?from=&to=&split=&path=` | → `{compared: {files: [FileChange], counts_only, split, changed_by: {path: [who]}}}`; a point is `now`, `began`, `agent:<who>` or a branch, tag or commit ("Compare", below) |
-| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}` (an agent whose granted mode edits unasked: written at once); `{manifest}` (that plan's: a person's, or an agent's as its granted mode lets it) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more; each answer names its `outcome` (`written` or `approval_required`) |
+| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}` (an agent whose granted mode edits unasked: written at once); `{manifest}` (that plan's: a person's, or an agent's as its granted mode lets it) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more; each answer names its `outcome` (`written`, `approval_required`, `conflicted` with each conflict typed, nothing written whoever asks, or `refused`) |
 | `agents.credential` | `POST /api/harness/agents/:id/credential` | → `{token, expires_at}`: the agent's own token for git, for a day, so its pushes to kiln's repositories go as the agent, for its person (ci.md W27-R03). Only that very agent is given it, as its runner asks when its git needs it: never a person or another agent, and it's no tool of an agent's |
 
 Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
@@ -1062,9 +1062,10 @@ kiln's MCP server tells each agent its id. `workspace` is `volume` (a Slates vol
 what it gets when it names none; a machine that can't make one refuses the start, 409, naming what
 it lacks) or `folder` (the folder itself, a person's explicit choice); in a result it is
 `{kind, over, sub, volume, mount, owner}`: `owner` when it works in another agent's volume,
-and `null` for one isolated in a microVM, a conversation taken up (`resume`), one started in a person's shell
-(`shell`), or one started before
-volumes were the default; `branch` and
+and `null` for one isolated in a microVM or one started before volumes were the default (one started in a person's
+shell works on a volume too, its folder and environment moved onto the mount, its `PWD` the folder it starts in, and so
+does a conversation taken up, `resume`, its harness's record of it moved to where the harness looks from the mount's
+folder); `branch` and
 `change_request` are `null` until it has a change request.
 
 An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,
@@ -1291,8 +1292,10 @@ agent's folder on that agent's machine works in that agent's volume:
   at once in a mode that edits
   unasked (accept edits, auto, bypass); after its person's click in one that asks (asked in their
   chat turn: 428 until they confirm, then the same call again; refused outside one); never in one that
-  only plans (403). The answer names its `outcome`: `written` (Slates' outcome) or
-  `approval_required` (`approval`: the manifest to approve, its summary and conflicts). An agent
+  only plans (403). The answer names its `outcome`: `written` (Slates' outcome),
+  `approval_required` (`approval`: the manifest to approve, its summary and conflicts), `conflicted`
+  (`conflicts`, each its path and class: a file it changed that a person changed on disk since;
+  nothing is written, whoever asks and whatever their mode) or `refused` (the policy's). An agent
   working in another's volume lands nothing of its own while that one works: the volume lands whole,
   from its owner. kiln approves it with a secret of its own that it hands Slates at every start,
   on every system. kiln leaves out what git ignores in the workspace (the agent's build output

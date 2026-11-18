@@ -851,7 +851,8 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
         && cfg!(unix)
         && let Some(mount) = &made.mount
     {
-        mount_gone(&canonical(Path::new(mount))).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+        // A mount that stays says what kiln's runner and Slates said of it.
+        mount_gone(&canonical(Path::new(mount))).map_err(|e| fail(format!("{e:#}")))?;
     }
     Ok(())
 }

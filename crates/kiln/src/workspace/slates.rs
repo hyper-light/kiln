@@ -282,14 +282,17 @@ pub fn started_anchor() -> Option<u32> {
 }
 
 /// What starts the machine's instance: kiln's own executable in Slates' roles, [`SHARDS`] shards,
-/// a laptop's instance of its own (no fleet), handed `launcher`'s secret when there is one, and
-/// asked to stop if none of its daemons ever serves (`StartSpec::until_served`, Slates' A-366): kiln
-/// mounts nothing on it before [`ensure_up`]'s wait and first call succeed, so no mount can wait on
-/// an instance that never answered, and that wait needs no deadline of its own.
-fn start_spec(launcher: Option<LauncherSecret>) -> anyhow::Result<StartSpec> {
+/// as a node of kiln's Slates fleet where the operator chose this runner (`fleet`, its manifest
+/// checked by Slates' own reader: `super::slates_fleet::join`) and an instance of its own
+/// otherwise, handed `launcher`'s secret when there is one, and asked to stop if none of its
+/// daemons ever serves (`StartSpec::until_served`, Slates' A-366): kiln mounts nothing on it before
+/// [`ensure_up`]'s wait and first call succeed, so no mount can wait on an instance that never
+/// answered, and that wait needs no deadline of its own.
+fn start_spec(launcher: Option<LauncherSecret>, fleet: Option<slates_api::role::FleetSelection>) -> anyhow::Result<StartSpec> {
     let mut spec = StartSpec::new(&instance(), program()?, &[ROLE_ARG]).until_served();
     spec.shards = Some(SHARDS);
     spec.quick = OVERRIDE.get().is_some_and(|o| o.quick);
+    spec.fleet = fleet;
     Ok(match launcher {
         Some(secret) => spec.with_launcher(secret),
         None => spec,
@@ -328,10 +331,10 @@ fn scope_wrapper(unit: &str) -> Vec<OsString> {
     ["systemd-run", "--user", "--scope", "--quiet", "--collect", &format!("--unit={unit}"), "--"].into_iter().map(OsString::from).collect()
 }
 
-/// The anchor's command, handed `launcher`'s secret: run under [`scope_wrapper`] where it starts
-/// under systemd (`scoped`), as itself elsewhere.
-fn anchor_command(launcher: LauncherSecret, scoped: bool) -> anyhow::Result<Command> {
-    let spec = start_spec(Some(launcher))?;
+/// The anchor's command, handed `launcher`'s secret, a node of `fleet` where there is one: run under
+/// [`scope_wrapper`] where it starts under systemd (`scoped`), as itself elsewhere.
+fn anchor_command(launcher: LauncherSecret, scoped: bool, fleet: Option<slates_api::role::FleetSelection>) -> anyhow::Result<Command> {
+    let spec = start_spec(Some(launcher), fleet)?;
     let command = if scoped {
         let wrapper = scope_wrapper(&format!("{}-slates", instance()));
         spec.anchor_command_under(&wrapper.iter().map(OsString::as_os_str).collect::<Vec<&OsStr>>())
@@ -346,8 +349,8 @@ fn anchor_command(launcher: LauncherSecret, scoped: bool) -> anyhow::Result<Comm
 /// ([`starts_in_a_scope`], [`scope_wrapper`]), in its own process group elsewhere, with what it says
 /// (systemd-run's own refusal included) appended to `log`. The process started is the anchor
 /// itself, which [`ensure_up`] watches while it waits for its daemon to answer.
-fn start_anchor(log: &Path) -> anyhow::Result<std::process::Child> {
-    let mut anchor = anchor_command(launcher_secret()?, starts_in_a_scope())?;
+fn start_anchor(log: &Path, fleet: Option<slates_api::role::FleetSelection>) -> anyhow::Result<std::process::Child> {
+    let mut anchor = anchor_command(launcher_secret()?, starts_in_a_scope(), fleet)?;
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -376,7 +379,15 @@ pub async fn ensure_up() -> anyhow::Result<()> {
         return Ok(());
     }
     let h = here()?;
-    let anchor = start_anchor(&h.log)?;
+    // A runner the operator chose joins kiln's Slates fleet (`[slates_fleet]`, K3): its place asked of the server, its
+    // node's identity, word and manifest made, and the manifest read by Slates' own reader before the instance starts on
+    // it. Any other process's instance runs alone. A chosen runner that can't join starts nothing: the next start asks
+    // again, rather than starting an instance outside the fleet it was chosen for.
+    let joined = match super::slates_fleet::source() {
+        Some(source) => super::slates_fleet::join(source).await?,
+        None => None,
+    };
+    let anchor = start_anchor(&h.log, joined.as_ref().map(|j| j.selection.clone()))?;
     let name = instance();
     // The anchor started here is watched while it's waited for, and never after: it outlives this process. The wait
     // lasts while the anchor lives, with no deadline of kiln's: the anchor judges its starting daemon by the daemon's
@@ -395,8 +406,32 @@ pub async fn ensure_up() -> anyhow::Result<()> {
     {
         anyhow::bail!("{} (its log: {})", start_refused(&e), h.log.display());
     }
-    // A new instance holds no volumes until its group exists; an existing one is left as it is.
+    // A fleet node imports its groups (Slates: never make one there), and says its member id, which a move of a volume to
+    // it names (K4): its runner's word again, now with the member its daemon serves as since this start.
+    if let (Some(joined), Some(source)) = (&joined, super::slates_fleet::source()) {
+        match call("member", |i| i.member()).await {
+            Ok(member) => {
+                if let Err(e) = super::slates_fleet::report_member(source, &joined.node, member).await {
+                    tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't say its member id: no volume moves to it until it does");
+                }
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't read its member id: no volume moves to it until it does"),
+        }
+        return Ok(());
+    }
+    // A new instance run alone holds no volumes until its group exists; an existing one is left as it is.
     call("bootstrap", |i| i.ensure_group()).await
+}
+
+/// The machine's instance started as kiln's Slates fleet's node now, where the server's `[slates_fleet]` lists this
+/// runner (K4): a fleet node holds other runners' copies and takes moved volumes only while its daemon runs, so it isn't
+/// left to start with this machine's first workspace. Nothing for a runner not listed.
+pub async fn start_if_chosen() -> anyhow::Result<()> {
+    let Some(source) = super::slates_fleet::source() else { return Ok(()) };
+    if super::slates_fleet::ask_place(source).await?.is_none() {
+        return Ok(());
+    }
+    ensure_up().await
 }
 
 /// What kiln says of a start of the machine's instance that ended before it answered (`e`, Slates' refusal of its wait).
@@ -512,10 +547,93 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     if m.mount.is_empty() {
         return Ok(());
     }
-    if is_mount(Path::new(&m.mount)) {
+    if mounted_as_made(m).await? {
         return Ok(());
     }
     mount_at(m).await
+}
+
+/// Workspace `m` as this machine places it: where its mount names another machine's place for workspaces (it moved here
+/// with its agent, K4), its own place under this machine's ([`super::place::points`]); as it was otherwise.
+pub fn placed_here(m: &Made) -> anyhow::Result<Made> {
+    placed_under(m, &here()?.root)
+}
+
+/// [`placed_here`] with this machine's place for workspaces `root`.
+fn placed_under(m: &Made, root: &Path) -> anyhow::Result<Made> {
+    let mount = Path::new(&m.mount);
+    if m.mount.is_empty() || mount.starts_with(root) || mount.starts_with(super::place::real(root)) {
+        return Ok(m.clone());
+    }
+    let point = super::place::points(root, &m.name).into_iter().next().ok_or_else(|| anyhow::anyhow!(super::place::NO_POINT))?;
+    Ok(Made { mount: point.to_string_lossy().into_owned(), ..m.clone() })
+}
+
+/// [`mounted`], waiting while Slates asks for a pause (a volume that just moved here is served once its new owner has
+/// adopted it: until then its verbs are refused for now, `Error::Retry`), each pause the one Slates derived: Slates
+/// bounds the adoption itself, so no clock of kiln's ends the wait.
+pub async fn mounted_patiently(m: &Made) -> anyhow::Result<()> {
+    if m.mount.is_empty() || mounted_as_made(m).await? {
+        return Ok(());
+    }
+    loop {
+        match mount_typed(m).await? {
+            Ok(()) => return Ok(()),
+            Err(slates_api::Error::Retry { pause_ns, .. }) => pause_for_move(Duration::from_nanos(pause_ns)).await,
+            Err(refused) => anyhow::bail!("Slates' mount: {refused}"),
+        }
+    }
+}
+
+/// Workspace `m`'s mount let go before its volume moves (K4): its agent's harness is down, so nothing of it holds the
+/// mount; one still held is refused, and the volume stays.
+pub(super) async fn unmount_for_move(m: &Made) -> anyhow::Result<()> {
+    if m.mount.is_empty() || !mounted_as_made(m).await? {
+        return Ok(());
+    }
+    unmount(m).await?;
+    anyhow::ensure!(!mounted_as_made(m).await?, "its mount at {} is still held", m.mount);
+    Ok(())
+}
+
+/// One ask of volume `volume`'s move to fleet member `member` (Slates' `Instance::move_volume`, contract 33): its typed
+/// answer, apart from a failure to reach Slates at all.
+pub(super) async fn ask_move(volume: &str, member: u64) -> anyhow::Result<Result<slates_api::MoveProgress, slates_api::Error>> {
+    let id = volume_id(volume)?;
+    call("move", move |i| Ok(i.move_volume(id, member))).await
+}
+
+/// A pause between two asks of a move, or of a mount of a volume that just moved here.
+#[allow(clippy::disallowed_methods)] // (e) a move's measured pause
+pub(super) async fn pause_for_move(pause: Duration) {
+    crate::rt::sleep(pause).await;
+}
+
+/// Whether workspace `m`'s own volume is mounted where it says: the kernel's mount table holds a mount at its folder
+/// ([`mounted_now`]; Unix: no other workspace mounts at a workspace's folder); on Windows its drive letter holds a
+/// Slates drive that its volume reports ([`holds_own_drive`]), since a letter is any workspace's to take.
+async fn mounted_as_made(m: &Made) -> anyhow::Result<bool> {
+    let point = PathBuf::from(&m.mount);
+    if !cfg!(windows) {
+        return Ok(mounted_now(&point).await);
+    }
+    let volume = volume_id(&m.volume)?;
+    let own = call("status", move |i| i.status(volume)).await?.mounts;
+    Ok(holds_own_drive(is_mount(&point), &own, &m.mount))
+}
+
+/// Whether drive letter `point` holds its workspace's own volume (Windows): the drive is Slates' (`drive_is_slates`)
+/// and the volume's own mounts as Slates reports them (`own`) name it. A letter is any workspace's to take, so a drive
+/// this volume left behind and another workspace's took since is never taken for its own: neither used as its mount at
+/// a restart nor taken down at its end.
+fn holds_own_drive(drive_is_slates: bool, own: &[slates_api::MountReport], point: &str) -> bool {
+    drive_is_slates && attachment_at(own, point).is_some()
+}
+
+/// The attachment of `own` (a volume's mounts, as Slates reports them) that serves drive letter `point`, in either
+/// case: what to detach to take that drive down, and nothing of another volume's.
+fn attachment_at(own: &[slates_api::MountReport], point: &str) -> Option<u64> {
+    own.iter().find(|mount| mount.path.eq_ignore_ascii_case(point)).map(|mount| mount.attachment)
 }
 
 /// Mounts workspace `m` at its point, which holds nothing of it now: a folder made for it (Unix), or a drive letter
@@ -548,23 +666,26 @@ fn another_letter_may_serve(refused: &slates_api::Error, taken_now: bool) -> boo
     taken_now || matches!(refused, slates_api::Error::Host(slates_api::HostFault::Target(slates_api::TargetRefusal::DriveLetterTaken)))
 }
 
-/// Takes the mount at `path` away: with the OS's own unmount, which needs no daemon (Unix); or by
-/// ending its attachment (Windows, where the drive is the daemon's own). On Windows Slates finds
-/// the drive among its volumes' mounts, and names each volume it couldn't ask (one its recovery
-/// couldn't rebuild): those are logged, since their mounts are unknown.
-async fn unmount(path: String) -> anyhow::Result<()> {
+/// Takes workspace `m`'s mount away: with the OS's own unmount, which needs no daemon (Unix); or by
+/// ending its own volume's attachment at its drive (Windows, where the drive is the daemon's own:
+/// [`attachment_at`]). Never Slates' `Instance::unmount` by the letter there, which detaches
+/// whichever volume reports the letter first: another workspace's, where this one's drive went and
+/// another's took the letter since.
+async fn unmount(m: &Made) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
+        let path = m.mount.clone();
         crate::rt::blocking(move || slates_api::mount::unmount(&path)).await?.map_err(|e| anyhow::anyhow!("Slates' unmount: {e}"))
     }
     #[cfg(not(unix))]
     {
-        let unmounted = call("unmount", move |i| i.unmount(&path)).await?;
-        if !unmounted.unreported.is_empty() {
-            let unreported: Vec<String> = unmounted.unreported.iter().map(ToString::to_string).collect();
-            tracing::info!(unreported = %unreported.join("; "), "Slates unmounted a workspace's drive but couldn't ask every volume for its mounts");
-        }
-        Ok(())
+        let volume = volume_id(&m.volume)?;
+        let point = m.mount.clone();
+        call("unmount", move |i| match attachment_at(&i.status(volume)?.mounts, &point) {
+            Some(attachment) => i.detach(attachment),
+            None => Ok(()),
+        })
+        .await
     }
 }
 
@@ -584,6 +705,42 @@ async fn let_go(path: String) -> anyhow::Result<slates_api::LetGo> {
     }
 }
 
+/// Whether workspace mount `dir` is still there as its removal asks: the kernel's mount table's word, read without
+/// touching the mount (`super::place::listed`), never a stat of a hard NFS mount, which waits on its server for as long
+/// as that can't answer and reads any refusal as no mount; on Windows, the drive's file system. A table that can't be
+/// read counts it mounted, so its removal asks to take it down rather than leave it unasked.
+async fn mounted_now(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let point = dir.to_path_buf();
+        match crate::rt::blocking(move || super::place::listed(&point)).await.and_then(|listed| listed) {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::info!(mount = %dir.display(), error = %format!("{e:#}"), "the mount table couldn't be read: a workspace's mount is taken as there");
+                true
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        is_mount(dir)
+    }
+}
+
+/// Lets go of workspace `m`'s mount at `dir`, which something still held past `patience` (`refused`: the last refusal),
+/// then says what came of it: let go, or still mounted, with what holds it, looked up only then, so a slow look never
+/// stands between the let-go and the agent's end.
+async fn let_go_of(m: &Made, dir: &Path, refused: &str, patience: Duration) {
+    let how = let_go(m.mount.clone()).await;
+    if !mounted_now(dir).await {
+        tracing::info!(mount = %m.mount, %refused, ?patience, let_go = ?how.ok(), "an ended agent's workspace was still in use past its agent's end: let go");
+        return;
+    }
+    let holders = holders(&m.mount).await;
+    let error = how.err().map(|e| format!("{e:#}")).unwrap_or_default();
+    tracing::warn!(mount = %m.mount, %refused, %holders, ?patience, %error, "an ended agent's workspace stays mounted: what holds it holds it past its agent's end");
+}
+
 /// What came of taking a workspace's mount down ([`unmount_patiently`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Unmounted {
@@ -598,10 +755,12 @@ enum Unmounted {
 /// way out, the kernel's last reference to a file it had open) goes in about the time its agent's own end took, which is
 /// what its caller gives as `patience`; a refusal then isn't the agent's leftovers. The last refusal, where it's still
 /// held after that.
-async fn unmount_patiently<A, F>(mut ask: A, held: impl Fn() -> bool, patience: Duration) -> Unmounted
+async fn unmount_patiently<A, F, H, G>(mut ask: A, mut held: H, patience: Duration) -> Unmounted
 where
     A: FnMut() -> F,
     F: std::future::Future<Output = anyhow::Result<()>>,
+    H: FnMut() -> G,
+    G: std::future::Future<Output = bool>,
 {
     let began = Instant::now();
     let mut pause: Option<Duration> = None;
@@ -611,7 +770,7 @@ where
             Ok(()) => return Unmounted::Gone,
             Err(e) => format!("{e:#}"),
         };
-        if !held() {
+        if !held().await {
             return Unmounted::Gone;
         }
         let took = asked.elapsed();
@@ -654,21 +813,22 @@ async fn holders(_mount: &str) -> String {
     "what holds a drive isn't asked on Windows".to_owned()
 }
 
-/// Workspace `m` gone: unmounted, its volume destroyed and its mount point removed. What it held is lost. A mount still in
+/// Workspace `m` gone: unmounted (on Windows only a drive its own volume reports, [`mounted_as_made`]), its volume
+/// destroyed and its mount point removed. What it held is lost. A mount still in
 /// use is asked again for as long as `patience` (its agent's own end took that long: [`unmount_patiently`]); still in
 /// use then, it's let go on a Unix host, detached on Linux and forced on macOS ([`let_go`]), kiln saying what held it,
 /// and a Windows drive stays mounted, kiln saying so. Its volume is destroyed all the same: nothing is kept for an agent
 /// that has ended.
 pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
     let dir = PathBuf::from(&m.mount);
-    if !m.mount.is_empty() && is_mount(&dir) {
-        let held = || is_mount(&dir);
-        if let Unmounted::StillHeld(refused) = unmount_patiently(|| unmount(m.mount.clone()), held, patience).await {
-            let holders = holders(&m.mount).await;
-            match let_go(m.mount.clone()).await {
-                Ok(how) => tracing::info!(mount = %m.mount, %refused, %holders, ?patience, let_go = ?how, "an ended agent's workspace was still in use past its agent's end: let go"),
-                Err(e) => tracing::warn!(mount = %m.mount, %refused, %holders, ?patience, error = %format!("{e:#}"), "an ended agent's workspace stays mounted: what holds it holds it past its agent's end"),
+    if !m.mount.is_empty() {
+        if mounted_as_made(m).await? {
+            match unmount_patiently(|| unmount(m), || mounted_now(&dir), patience).await {
+                Unmounted::Gone => tracing::info!(mount = %m.mount, "an ended agent's workspace is unmounted"),
+                Unmounted::StillHeld(refused) => let_go_of(m, &dir, &refused, patience).await,
             }
+        } else {
+            tracing::info!(mount = %m.mount, "an ended agent's workspace had nothing of its own mounted at its point");
         }
     }
     let volume = volume_id(&m.volume)?;
@@ -910,11 +1070,13 @@ pub fn outcome_json(o: &LandOutcome) -> Value {
 
 /// A presentation as kiln's plan shows it (`agents.land` with no manifest): the plan an approval
 /// binds (its manifest, what it writes), the conflicts that hold it back with no manifest to
-/// approve, how it went when nothing needed an approval, or the policy's refusal.
+/// approve (their paths, which the UI lists, and each typed in `conflicted`, which the server
+/// answers as the landing's outcome), how it went when nothing needed an approval, or the policy's
+/// refusal.
 fn plan_json(o: &LandOutcome) -> Value {
     match o {
         LandOutcome::ApprovalRequired(a) => json!({"grant_required": true, "landing": a.presentation, "manifest": a.manifest_text(), "summary": summary_json(&a.summary), "conflicts": []}),
-        LandOutcome::Conflicted(conflicts) => json!({"grant_required": true, "conflicts": conflicts.iter().map(|c| c.path.clone()).collect::<Vec<_>>()}),
+        LandOutcome::Conflicted(conflicts) => json!({"grant_required": true, "conflicts": conflicts.iter().map(|c| c.path.clone()).collect::<Vec<_>>(), "conflicted": conflicts_json(conflicts)}),
         LandOutcome::Written(report) => json!({"grant_required": false, "outcome": report_json(report)}),
         LandOutcome::Refused(refusal) => json!({"grant_required": true, "refused": refusal_json(refusal)}),
     }
@@ -1054,6 +1216,19 @@ mod tests {
         assert!((1..=MAX_VOLUME_GIB).contains(&(max >> 30)), "{max}");
     }
 
+    /// W6: a plan that met conflicts carries each conflict typed (`conflicted`: its path and class, as `outcome_json`
+    /// names them), beside the paths the UI reads (`conflicts`), and no manifest: the server answers it `conflicted`
+    /// from these (`harness::ops::typed_landing`), never as an approval nobody could give.
+    #[test]
+    fn w6_a_plan_that_met_conflicts_carries_each_typed_and_no_manifest() {
+        let met = LandOutcome::Conflicted(vec![LandingConflict { path: "/README.md".into(), class: slates_api::ConflictClass::ModifyModify, planned: None }]);
+        let plan = plan_json(&met);
+        assert_eq!(plan.get("conflicts"), Some(&json!(["/README.md"])), "{plan}");
+        assert_eq!(plan.get("conflicted"), Some(&json!([{"path": "/README.md", "class": "ModifyModify"}])), "{plan}");
+        assert_eq!(plan.get("conflicted"), outcome_json(&met).get("conflicts"), "typed as a landing's own outcome types them");
+        assert!(plan.get("manifest").is_none(), "{plan}");
+    }
+
     #[test]
     fn a_landing_is_weighed_against_what_git_sees_changed() {
         // ` M a`, `?? n`, a rename (its source a field of its own), a deletion.
@@ -1109,16 +1284,16 @@ mod tests {
                 let n = asks.fetch_add(1, Ordering::Relaxed);
                 async move { if n < free_at { anyhow::bail!("Resource busy") } else { Ok(()) } }
             };
-            let gone = unmount_patiently(|| busy_until(2), || true, Duration::from_secs(60)).await;
+            let gone = unmount_patiently(|| busy_until(2), || async { true }, Duration::from_secs(60)).await;
             anyhow::ensure!(gone == Unmounted::Gone && asks.load(Ordering::Relaxed) == 3, "taken down at its third ask: {gone:?} after {asks:?}");
             asks.store(0, Ordering::Relaxed);
-            let once = unmount_patiently(|| busy_until(u32::MAX), || true, Duration::ZERO).await;
+            let once = unmount_patiently(|| busy_until(u32::MAX), || async { true }, Duration::ZERO).await;
             anyhow::ensure!(once == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) == 1, "no patience: asked once: {once:?} after {asks:?}");
             asks.store(0, Ordering::Relaxed);
-            let went = unmount_patiently(|| busy_until(u32::MAX), || false, Duration::from_secs(60)).await;
+            let went = unmount_patiently(|| busy_until(u32::MAX), || async { false }, Duration::from_secs(60)).await;
             anyhow::ensure!(went == Unmounted::Gone && asks.load(Ordering::Relaxed) == 1, "no longer mounted: gone, asked no more: {went:?} after {asks:?}");
             asks.store(0, Ordering::Relaxed);
-            let held = unmount_patiently(|| busy_until(u32::MAX), || true, Duration::from_millis(50)).await;
+            let held = unmount_patiently(|| busy_until(u32::MAX), || async { true }, Duration::from_millis(50)).await;
             anyhow::ensure!(held == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) > 1, "asked again, then held: {held:?} after {asks:?}");
             Ok(())
         })
@@ -1139,6 +1314,24 @@ mod tests {
         assert!(another_letter_may_serve(&not_allowed, true), "a drive took the letter meanwhile: the next one");
         let refused = Error::Host(HostFault::Target(TargetRefusal::MountRefused { errno: Some(5) }));
         assert!(!another_letter_may_serve(&refused, false));
+    }
+
+    /// W1 (kiln goal 01a1ec34599974448aed2672bafaf9a2, Windows): a drive letter is any workspace's to take, so a
+    /// workspace's drive is its own only when its own volume reports a mount there. A Slates drive at its letter that its
+    /// volume doesn't report (its drive went, and another workspace's took the letter since) is neither used as its
+    /// mount at a restart nor taken down at its end; the attachment its end detaches is its volume's own at that letter,
+    /// in either case. Before, a Slates drive at the letter was taken as the workspace's whatever volume it served.
+    #[test]
+    fn w1_a_windows_workspaces_drive_is_its_own_only_when_its_volume_reports_it() {
+        let at = |attachment, path: &str| slates_api::MountReport { attachment, path: path.to_owned() };
+        let own = [at(7, "J:"), at(9, "K:")];
+        assert!(holds_own_drive(true, &own, "K:"));
+        assert!(holds_own_drive(true, &own, "k:"), "a drive letter in either case");
+        assert!(!holds_own_drive(true, &[at(7, "J:")], "K:"), "a Slates drive its volume doesn't report: another workspace's");
+        assert!(!holds_own_drive(true, &[], "K:"));
+        assert!(!holds_own_drive(false, &own, "K:"), "its volume's record of a drive that isn't there now");
+        assert_eq!(attachment_at(&own, "k:"), Some(9), "its own attachment at the letter");
+        assert_eq!(attachment_at(&own, "L:"), None, "none of its own there: nothing to detach");
     }
 
     /// W2: what a machine lacks for workspaces is typed from Slates' own typed answer (`mount::available`), so a start
@@ -1166,7 +1359,7 @@ mod tests {
     /// apart from an anchor that ended for another reason.
     #[test]
     fn w1_kiln_waits_on_its_anchor_while_it_lives_and_hears_a_start_that_never_served() -> anyhow::Result<()> {
-        assert!(start_spec(None)?.until_served, "kiln asks until_served");
+        assert!(start_spec(None, None)?.until_served, "kiln asks until_served");
         let never = start_refused(&slates_api::Error::Start(slates_api::StartFault::NeverServed));
         assert!(never.contains("never answered") && never.contains("none of them served"), "{never}");
         let ended = start_refused(&slates_api::Error::Start(slates_api::StartFault::AnchorExited { code: Some(4) }));
@@ -1325,10 +1518,10 @@ mod tests {
     /// its shards and its quick profile only where a test asked.
     #[test]
     fn w1_the_anchor_is_kilns_own_executable_in_slates_role() -> anyhow::Result<()> {
-        let spec = start_spec(None)?;
+        let spec = start_spec(None, None)?;
         assert_eq!(spec.prefix, vec![ROLE_ARG.to_owned()]);
         assert_eq!(spec.shards, Some(SHARDS));
-        assert!(spec.fleet.is_none(), "a machine's instance runs alone");
+        assert!(spec.fleet.is_none(), "a machine the operator didn't choose runs its instance alone");
         let command = spec.anchor_command()?;
         let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(args.first().map(String::as_str), Some(ROLE_ARG), "{args:?}");
@@ -1336,11 +1529,43 @@ mod tests {
         assert!(args.iter().any(|a| a == "anchor"), "{args:?}");
         // With kiln's secret, the anchor is told its standard input carries it (and the secret is in no argument).
         let secret = LauncherSecret::generate()?;
-        let handed = start_spec(Some(secret.clone()))?.anchor_command()?;
+        let handed = start_spec(Some(secret.clone()), None)?.anchor_command()?;
         let marked = handed.get_envs().any(|(k, v)| k == "SLATES_LAUNCHER" && v.is_some_and(|v| v == "stdin"));
         assert!(marked, "{:?}", handed.get_envs().collect::<Vec<_>>());
         let hex: String = secret.bytes().iter().map(|b| format!("{b:02x}")).collect();
         assert!(handed.get_args().all(|a| !a.to_string_lossy().contains(&hex)), "the secret rides no argument");
+        Ok(())
+    }
+
+    /// K4 (kiln goal 95101ef32ffb8b099942fe076619c310): a workspace that moved here with its agent names the other
+    /// machine's place for workspaces; it's placed under this machine's own, by its name, its volume the same; one placed
+    /// here already, and one with no mount (an isolated session's), stay as they are.
+    #[cfg(unix)]
+    #[test]
+    fn k4_a_workspace_that_moved_here_is_placed_under_this_machines_own_place() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let root = scratch.path().join("workspaces");
+        let moved = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into() };
+        let placed = placed_under(&moved, &root)?;
+        let here = super::super::place::real(&root).join("kiln-a");
+        assert_eq!(placed, Made { mount: here.to_string_lossy().into_owned(), ..moved.clone() });
+        assert_eq!(placed_under(&placed, &root)?, placed, "placed here already");
+        let unmounted = Made { mount: String::new(), ..moved };
+        assert_eq!(placed_under(&unmounted, &root)?, unmounted);
+        Ok(())
+    }
+
+    /// K3 (kiln goal 95101ef32ffb8b099942fe076619c310): a runner the operator chose starts its instance as the node its
+    /// manifest names: the anchor's command carries the manifest and the machine's name (`--fleet PATH --node NAME`),
+    /// as Slates' anchor reads them.
+    #[test]
+    fn k3_a_chosen_runners_anchor_is_started_as_the_fleets_node() -> anyhow::Result<()> {
+        let selection = slates_api::role::FleetSelection { manifest: "/state/slates-fleet/fleet.json".to_owned(), node: "bench-a".to_owned() };
+        let spec = start_spec(None, Some(selection.clone()))?;
+        assert_eq!(spec.fleet, Some(selection));
+        let args: Vec<String> = spec.anchor_command()?.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| matches!(w, [flag, path] if flag == "--fleet" && path == "/state/slates-fleet/fleet.json")), "{args:?}");
+        assert!(args.windows(2).any(|w| matches!(w, [flag, node] if flag == "--node" && node == "bench-a")), "{args:?}");
         Ok(())
     }
 
@@ -1366,13 +1591,13 @@ mod tests {
     fn w1_under_systemd_the_anchor_runs_in_a_scope_of_its_own_handed_the_secret() -> anyhow::Result<()> {
         let text = |os: &OsStr| os.to_string_lossy().into_owned();
         let secret = LauncherSecret::generate()?;
-        let scoped = anchor_command(secret.clone(), true)?;
+        let scoped = anchor_command(secret.clone(), true, None)?;
         assert_eq!(scoped.get_program(), "systemd-run");
         let args: Vec<String> = scoped.get_args().map(text).collect();
         let unit = format!("--unit={}-slates", instance());
         let wrapper = ["--user", "--scope", "--quiet", "--collect", unit.as_str(), "--"];
         assert_eq!(args.get(..wrapper.len()), Some(&wrapper.map(str::to_owned)[..]), "{args:?}");
-        let own = anchor_command(secret.clone(), false)?;
+        let own = anchor_command(secret.clone(), false, None)?;
         let mut execed = vec![text(own.get_program())];
         execed.extend(own.get_args().map(text));
         assert_eq!(args.get(wrapper.len()..), Some(&execed[..]), "what the scope execs is the anchor's own command");

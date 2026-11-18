@@ -87,6 +87,17 @@ async fn ask(c: Command) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()).filter(|s| !s.is_empty())
 }
 
+/// Where `cwd` is in its repository, as git places it (`git rev-parse --show-prefix`): the folders from the working tree's
+/// top down to it, `/`-separated with a trailing `/` (`crates/kiln/`), empty at the top. Read from git, never by taking
+/// [`Facts::top`] off `cwd`'s front: git names the top by its real path (symbolic links resolved, and on Windows a
+/// short 8.3 name made long and each name in its case on disk), which `cwd` as a person or a harness spelled it need not
+/// share, while git finds the prefix by walking up `cwd` as it is spelled.
+pub async fn prefix(cwd: &Path) -> anyhow::Result<String> {
+    let mut c = git(cwd);
+    c.args(["rev-parse", "--show-prefix"]);
+    run(c, GIT_TIMEOUT).await
+}
+
 /// The repository `cwd` is in.
 pub async fn facts(cwd: &Path) -> anyhow::Result<Facts> {
     let mut c = git(cwd);

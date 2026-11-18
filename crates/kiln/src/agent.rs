@@ -2049,6 +2049,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let root = ca.clone();
     // The machine's certificate, its capacity holder's proof (docs/lb.md "A machine's keeper").
     let machine_leaf = leaf.clone();
+    // What this runner's Slates needs to join kiln's Slates fleet where the server's `[slates_fleet]` chooses it (docs/agentic.md
+    // W7; `workspace::slates_fleet`): asked as its machine's instance starts. Never in a job pod or an outpost.
+    if !o.ephemeral && !o.outpost {
+        crate::workspace::slates_fleet::set_source(crate::workspace::slates_fleet::Source {
+            dir: o.state_dir.join("slates-fleet"),
+            server_url: o.server_url.clone(),
+            ca_pem: crate::pki::cert_pem(&root),
+            machine_name: name.clone(),
+            machine: machine_leaf.clone(),
+        });
+    }
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {
@@ -2503,6 +2514,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
+        // A runner the server's `[slates_fleet]` lists starts its Slates as the fleet's node now (K4): a node holds the
+        // fleet's copies and takes moved volumes only while its daemon runs.
+        drop(crate::rt::spawn(async {
+            if let Err(e) = crate::workspace::slates::start_if_chosen().await {
+                tracing::warn!(error = %format!("{e:#}"), "this runner's Slates didn't start as kiln's Slates fleet's node now: it joins with its first workspace");
+            }
+        }));
         // What an agent changes in the runner's own folders is an agent's own (docs/agents.md).
         crate::harness::whose::note_kiln(&o.state_dir);
         let waits = cfg!(unix) && take_over_pending.is_some() && !crate::convo::off();
@@ -7626,7 +7644,7 @@ mod tests {
         let send = Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None };
         let moved: std::collections::HashSet<Owned> = [Owned::Agent("s1".into())].into_iter().collect();
         let me = Me { machine: "box".into(), instance: "01a17502".into(), root: Vec::new() };
-        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false })?)];
+        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false, slates: None })?)];
         for w in [Word::Taken, Word::Refused("no room".into()), Word::NotPassed("x".into()), Word::Unsure("x".into()), Word::NoneNewer("x".into())] {
             words.push((format!("HandedOver ({w:?})"), cmd(&w.command())?));
         }
@@ -7634,7 +7652,7 @@ mod tests {
             ("a person's message", cmd(&send)?),
             ("a message for its epoch", ServerMsg::HarnessSend { session: "s1".into(), epoch: 2, json: serde_json::to_string(&send)? }),
             ("an interrupt", cmd(&Command::Interrupt)?),
-            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false, native: false })?),
+            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false, native: false, slates: None })?),
             ("a close", ServerMsg::HarnessClose { session: "s1".into() }),
         ];
         let b64 = |m: &ServerMsg| -> anyhow::Result<String> { Ok(base64::engine::general_purpose::STANDARD.encode(proto::encode(m)?)) };
