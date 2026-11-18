@@ -30,7 +30,7 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 | P | A plan run as one agent per step | O (W for parallel steps' isolation) | built: P1–P4: each met step's work goes up as one diff on the diff of the step met before it, so the run ends as a stack (P-AC1, tested in process against kiln's own git hosting). Since 2026-10-21 a run follows its steps' `needs` (a graph): steps that don't wait for each other run side by side, as many at once as there's room for, sharing one folder unless given folders or machines of their own (their isolation, W5, held with Slates); a step can go on the main agent's own goal stack rather than to an agent of its own; and the agent holding a step splits its goal into its acceptance criteria and tests (`goals_split`) and says each met (`goals_done`). Tested in process: a five-step graph run side by side and blocked by one unmet step until retried, `max_parallel`, and a step given to the main agent. Checked live 2026-10-21 on a throwaway server with real Claude Code agents: a four-step graph (step 1 given to a Sonnet main agent, which split it into its two criteria and its test and said each met with `goals_done`; steps 2 and 3 side by side on Haiku agents of their own, met by Claude Code's `/goal`; step 4 after both) ran to done in 74 s, as four commits in the order met, each by its step's agent with only its own file; and since 2026-10-22 a goal turns into a plan (`goals_plan`): planned first (research inside and outside, each finding graded by kiln from its sources: docs/research.md), its steps then the goal's parts or a run, the goal met once every step is; plan runs and goal stacks draw where each step stands as the conversation draws work |
 | G | Goal stacks as a graph, run side by side on subagents | O, P | in progress (docs/goals.md, "What a goal waits for"). The person's decisions, 2026-10-24: order is inferred as far as it can be, then goals fan out; while subagents are in play the stack's agent coordinates, and otherwise it does the work itself; a plan is a subgraph drawing on the same pool, filled greedily; with no Subagents setting there's no maximum; a goal's subagent ends once its goal is met; every subagent at work draws on the session's pool. G1 (built): what a goal waits for (`needs` on `goals_add` and `goals_update`, `goals_order` for several at once), with loops refused, a goal taken out passing on what it waited for, and the next goal the first one ready (in the stack's order where nothing says otherwise). G2: the ready goals out to subagents, with the agent coordinating, and goals that say nothing ordered by the agent first. Built of G2 (2026-11-05; docs/goals.md, "Goals side by side" and "Several goals under way at once"): several goals of a stack under way at once, each ending alone; the agent sets goals under way itself for its own harness's subagents (`goals_update` `active`), beside its goal under way, which stays the one kiln sends it and holds it to; and on a stack that runs side by side (`side_by_side`), its goals ready together that say what they wait for go each to a subagent of the agent's (P2's subagents, under way there and here), as many as its Subagents setting leaves room for, the rest waiting for room while the agent coordinates; a goal's parts that say what they wait for (a plan inside it) fan out the same way; met there is met here, not met comes back to the agent, and pauses, removals, clears and restarts are followed as P2's are. Not built: kiln asking the agent to order the goals that say nothing (today they go in turn, on the agent). G3: a plan's steps as a subgraph of the same pool (with P2's subagents). G4: one pool per session. G5: docs, metrics and G-AC1, a live check |
 | R | Runners: diagnostics, upgrades and repair, by agents and people | O | built: R1–R5 (docs/releases.md, "Diagnosing and repairing a runner"; docs/agents.md, "Attached agents"): R4 is an agent attached to the runners, woken by a failed upgrade, a failing check or a machine offline (the CI's `runner.offline`), held to `diagnose` and `manage-runners`, its incident on the runner's row in System → Updates. R-AC1 passed 2026-10-19 on a throwaway server and runner (a self-build without npm failed; Claude Code as the runner doctor diagnosed it as a missing dependency, retried by download with a person approving its calls, the runner upgraded, and the doctor resolved its incident once told the upgrade went through: in the lab by hand, the message kiln now sends itself) |
-| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes; Linux landing: its issuer surface), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk on a person's go-ahead where Slates takes one from kiln: macOS). **Held** (2026-10-19: Slates is far from complete): W5 merging between agents, moving an agent with a volume to another machine (refused, saying why), installing Slates from kiln's releases, workspaces on Windows (no mount there yet), writing to disk on Linux (Slates' issuer surface). W8 waits on Shards |
+| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes; landing by the launcher's permission mode: its typed landing contract), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk on a person's go-ahead where Slates takes one from kiln: macOS). Since 2026-11-18 kiln vendors Slates (`vendor/slates`) and drives it through its library alone, never its command line: kiln's own executable is the instance's anchor and daemon, so no machine installs Slates. **Held** (2026-10-19: Slates is far from complete): W5 merging between agents, moving an agent with a volume to another machine (refused, saying why), workspaces on Windows (no mount there yet), writing to disk on Linux (Slates' issuer surface, which the launcher's permission mode replaces). W8 waits on Shards |
 | C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI; a plan run's steps go up as a stack, one diff per step (P4). A comment's message tells the agent how to answer in its thread once W14's `ci.diffs.reply` is there (the CI work's, on its way to main); until then agents answer with a new version |
 | K | Agentic control of CI/CD, whatever the provider | W20 (ci.md), the provider model | K1: W20-R02's operations, the CI work's (in progress there, `ci.diffs.*` included); K2 built: attachments and incidents (W20-R08 to R10, `crate::ci::attach`; docs/agents.md, "Attached agents"), Agents → Attached, Mission Control grouping an attachment's agents under it; their questions come to Needs you and notifications as any agent's do |
 
@@ -237,23 +237,32 @@ kiln is the harness Slates leaves room for: Slates owns the bytes (overlays, wit
 merging, landing under a person's grant); kiln owns the agents, their identity, review, history and
 the place a person says yes (Slates' SLATES_DESIGN.md §1.3, §4.13).
 
-**W1 Slates on every machine.** A runner finds Slates (the binary kiln installed under its state
-directory, else `slates` on `PATH`) and keeps one instance, `kiln`, for all the machine's runner
-processes. The instance's anchor starts apart from the runner: its own systemd user unit on Linux,
-its own process group elsewhere, so restarting or upgrading the runner never ends it (a volume
-lives in the anchor's memory). A new instance gets its one-node group (`slates bootstrap root`).
-Runner facts say whether workspaces work there and why not (`workspaces`: Slates installed, a
-mount it can make: FUSE through `fusermount3` on Linux, NFS on loopback on macOS; Windows has none
-yet), and `GET /api/harness/workspaces` says it for every machine. Building Slates for every
-platform beside kiln (the release pipeline, fleet self-builds) is still to come: today a person
-installs it (`cargo install --path crates/cli` in a Slates checkout puts `slates` on `PATH`).
+**W1 Slates on every machine.** kiln vendors Slates (`vendor/slates` at one revision,
+docs/vendoring.md) and drives it through its library (`slates-api`, Slates' A-278) alone, never its
+command line (the person, 2026-11-18): every verb is a call of the library on a client of its own,
+run on kiln's blocking pool (`crate::workspace::slates`). kiln carries no Slates binary, and no
+machine installs one: kiln's own executable is Slates' anchor and daemon (`kiln slates-role
+--instance <name> anchor`, and the daemon its anchor starts the same way), handed to Slates' own
+main before kiln's runtime starts, so the daemon a runner talks to is the same code as the client it
+links, built with every kiln on every platform kiln builds. A role's process ends at any panic, as
+Slates' own builds do, so its anchor starts a daemon again rather than leave one serving with a
+thread gone. A runner keeps one instance, `kiln`, for all the machine's runner processes. The
+instance's anchor starts apart from the runner: its own systemd user unit on Linux, its own process
+group elsewhere, so restarting or upgrading the runner never ends it (a volume lives in the
+anchor's memory). A new instance gets its one-node group. Runner facts say whether workspaces work
+there and why not, in the library's words (`workspaces`: the Slates revision kiln links, a mount it
+can make: FUSE through `fusermount3` on Linux, NFS on loopback on macOS; Windows mounts at drive
+letters, which kiln's workspaces don't use yet), and `GET /api/harness/workspaces` says it for every
+machine. `KILN_SLATES_INSTANCE` names another instance (labs, tests), and `KILN_SLATES_DIRECT`
+starts its anchor in its own process group on Linux too; every process of an instance carries
+`--instance <name>`.
 
 **W2 New agents choose.** `workspace`: `folder` (the folder itself, still the default) or
 `volume` (**its own Slates volume**), in Mission control's composer (More options) and `agents.start`, only where the machine can
 make one; a machine that can't says why. Several agents on one folder each get their own.
 
 **W3 How.** On the agent's machine, before its harness starts: an **overlay volume** laid over its
-folder's repository (`slates volume create --base <top>`), mounted under the runner's state
+folder's repository (the library's overlay over `<top>`), mounted under the runner's state
 directory (`workspaces/kiln-<id>`), its harness's folder the same place in the volume as the one
 asked for. What the agent hasn't touched is read from the folder as it is now; what it changes
 (edits, build output, git's own writes) is held in the volume alone, so the folder and other
@@ -278,17 +287,21 @@ what it would create, replace and delete (git's own directory left out), and any
 the folder since the agent changed it, in which case
 nothing is written until they agree. On a person's go-ahead kiln gives Slates the grant for exactly
 that plan and lands it; no agent can (refused by kind, whatever it asks). Slates holds a plan only
-while the command that made it runs (a client's departure abandons it, AUD-29-07), so kiln plans
-again at the go-ahead and grants only when the new plan's manifest is the one the person saw; if
-anything changed, nothing is written and the new plan is shown instead. Slates' command line
-leaves out one path per landing (each `--exclude` keeps its last value, though its wire format
-takes several), so kiln leaves out `.git` and writes only when the plan's files are no more than
-git sees changed in the workspace; when the agent's build output or dependencies (what git
-ignores) would be written too, its work goes up for review instead, until Slates' command line
-takes several. Slates takes a grant from
-kiln where its anchor's segment has a name kiln can pass on (macOS, Windows). On Linux it doesn't
-yet: the segment is a descriptor only the anchor's own children hold (Slates' GAP-A9-10), so the
-plan says so, and the work goes up as a change request instead.
+as long as the client that presented it (a client's departure abandons it, AUD-29-07), and each of
+kiln's calls has a client of its own, so kiln plans again at the go-ahead; when the new plan's
+manifest is the one the person saw, the library presents it once more, grants exactly that manifest
+and lands under the grant on one client (`land_approved`), and if anything changed, nothing is
+written and the new plan is shown instead. kiln leaves out `.git` and writes only when the plan's
+files are no more than git sees changed in the workspace; when the agent's build output or
+dependencies (what git ignores) would be written too, its work goes up for review instead. Slates
+takes a grant from kiln where its anchor's segment has a name kiln can pass on (macOS, Windows: the
+handoff the anchor kiln started prints, as the library's issuer). On Linux it doesn't yet: the
+segment is a descriptor only the anchor's own children hold (Slates' GAP-A9-10), so the plan says
+so, and the work goes up as a change request instead. The person's rule of 2026-11-18 replaces
+this go-ahead: what a landing may do follows the permission mode the launcher gives each agent (full
+bypass writes, an ask mode returns an approval request a person or the harness answers, a mode that
+forbids writing is refused), with no keys or proofs, through Slates' typed landing contract (its
+A-285, and A-278's next piece), which kiln moves onto as it lands.
 
 **W7 Moves and restarts.** A volume outlives the runner's restarts (its anchor runs apart). A
 machine's restart loses it: Slates keeps volumes in memory. An agent with a volume doesn't move to

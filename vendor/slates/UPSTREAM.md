@@ -1,11 +1,11 @@
 # Slates, vendored
 
 Agents' workspaces of their own (docs/agentic.md, W; kiln plan 01a157fdefce75f698e67bc147f47586, CP-T4.1): an
-agent's folder is a Slates volume laid over the real one. kiln is to drive Slates through its library (`slates-api`,
-Slates' A-278), linked from here, never through its command line (the person, 2026-11-18). This revision's library
-also starts an instance from its host's own executable (A-278's second piece: `slates_api::role::main`,
-`Instance::start`), so `crates/kiln/src/workspace/slates.rs` moves onto it next. Then kiln runs no Slates binary, and
-its daemon is the same code as the client kiln links.
+agent's folder is a Slates volume laid over the real one. kiln drives Slates through its library (`slates-api`,
+Slates' A-278), linked from here, never through its command line (the person, 2026-11-18):
+`crates/kiln/src/workspace/slates.rs` calls it, and kiln's own executable runs the instance's anchor and daemon
+(`kiln slates-role`, served by `slates_api::role::main`), so kiln carries no Slates binary and the daemon is the same
+code as the client kiln links.
 
 - **Upstream:** https://github.com/hyper-light/slates, branch `main`, commit
   `dbf53afa21bf0e88f7099247c00c2c252ff96b1b` (2026-11-18), MIT (`LICENSE`).
@@ -27,6 +27,11 @@ its daemon is the same code as the client kiln links.
 - **Its own workspace:** `Cargo.toml` is upstream's root manifest, its hyper-raft paths and `[patch.crates-io]`
   changed (below). kiln's workspace excludes `vendor/slates`, so kiln's lints don't apply here and Slates' do. Run in
   this folder, cargo takes Slates' toolchain (`rust-toolchain.toml`, 1.98.1); kiln builds on stable.
+- **How kiln links it:** `crates/kiln` takes `slates-api` by name, pointed here by the root manifest's
+  `[patch.crates-io]`; the library takes Slates' other crates by path, as upstream's root manifest points them, so
+  every kiln build on every platform builds them with kiln's toolchain and profile. kiln's release builds unwind on a
+  panic where Slates' abort, so a Slates role's process (`kiln slates-role`) aborts once a panic is reported
+  (`workspace::slates::role_main`).
 
 ## Changes from upstream
 

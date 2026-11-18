@@ -327,7 +327,8 @@ impl std::fmt::Display for Engine {
 pub struct Workspaces {
     /// Agents here can have them.
     pub available: bool,
-    /// The Slates binary.
+    /// The Slates kiln links (`slates <commit>`: the revision it vendors), whose anchor and daemon are
+    /// kiln's own executable.
     pub slates: Option<String>,
     /// How a volume is mounted here: `fuse` (Linux) or `nfs` (macOS).
     pub mount: Option<String>,

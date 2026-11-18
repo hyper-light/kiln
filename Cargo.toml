@@ -96,6 +96,9 @@ seccompiler = { path = "vendor/hex/vendor/seccompiler" }
 shards-agentfile = { path = "vendor/shards/crates/agentfile" }
 shards-api = { path = "vendor/shards/crates/api" }
 shards-image = { path = "vendor/shards/crates/image" }
+# Slates, agents' workspaces of their own (vendor/slates; docs/agentic.md, W): its library, the crate kiln names.
+# Its own crates take one another by path, as Slates' root manifest points them.
+slates-api = { path = "vendor/slates/crates/api" }
 quiver = { path = "vendor/quiver/crates/quiver" }
 quiver-api = { path = "vendor/quiver/crates/quiver-api" }
 # vorpal, the search across a change (docs/ci.md W26-R07): its crates, the tree-sitter runtime it
