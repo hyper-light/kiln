@@ -19,8 +19,11 @@
 //! records it again on its own partition, in one transaction with the work's reset, so a retry there meets that. A
 //! re-seal under a new request id is answered by the engine's identity cache (`Green::accepted`).
 //!
-//! **Bounds.** A shard's parked verbs are bounded by its client credit, as `lease_wait`'s are; each ask has a deadline
-//! (the lease bound), past which the verb answers `Overloaded`, unrecorded, and its retry runs it again.
+//! **Bounds.** A shard's parked verbs are bounded by its client credit, as `lease_wait`'s are. A batch of asks waits
+//! for room on its owner's channel and for the owner's answer in the owner's own time (A-426); a verb whose verdict the
+//! owner answers at its quorum commit, or that waits for its work's route, is held at most the node's failover delay,
+//! a held reply's total (A-354, A-375, A-434; [`park_bound_ns`]); past either, the verb answers `Overloaded`,
+//! unrecorded, and its retry runs it again.
 //!
 //! **Asks are batched.** A shard keeps at most two batches of asks out to each owner at a time ([`Outbox`],
 //! [`BATCHES_OUT`]), each carrying what gathered while the others were out, at most a client region's credit, and a batch
@@ -109,6 +112,7 @@ pub(crate) struct SealedWork {
 }
 
 /// What a clean rebase leaves a work, or the answer when it was not clean.
+#[derive(Debug)]
 pub(crate) enum RebaseAnswer {
   /// The work moves to `version`, holding `changed` with `journal`.
   Rebased {
@@ -150,8 +154,8 @@ struct Queue {
   waiting: VecDeque<ParkedVerb>,
   asking: bool,
   /// When the owner took the oldest verb's verdict to answer at its quorum commit, or the verb waits for its work's
-  /// route (A-298): the instant (the lease's clock) past which the verb stops waiting, is answered `Overloaded`, and the
-  /// work is released (its retry joins the owner, or meets the route again).
+  /// route (A-298): the instant (the host's monotonic clock) past which the verb stops waiting, is answered
+  /// `Overloaded`, and the work is released (its retry joins the owner, or meets the route again).
   deferred_until: Option<u64>,
 }
 
@@ -1010,6 +1014,14 @@ fn start_ask(
     Need::Route => return false,
   };
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
+  // What this shard's replica of the green holds is answered here, by the function the owner answers it by over the
+  // replica's engine, with no hop to the owner (A-465, A-273 step 5b); anything else is asked of the owner as before,
+  // why counted (`crate::green_replicas::serving`).
+  if let Some(answered) = answered_by_replica(state, green, version, &need)
+    && answer_here(state, queue, answered)
+  {
+    return true;
+  }
   let owner_partition =
     target.unwrap_or_else(|| crate::verbs::owner_of(crate::verbs::to_wire_volume(green)));
   let Some(owner) = crate::verbs::shard_of_partition(state, owner_partition) else {
@@ -1082,7 +1094,56 @@ fn start_ask(
   }
 }
 
+/// What this shard's replica of `green` answers of `need` (A-465, A-273 step 5b): a work's base read at `version`, its
+/// base version (`owner_files`, `owner_page`, `owner_sizes`), and its rebase (`owner_rebase`), each by the same function
+/// over the replica's engine, so the answer is the owner's for the same state. `None` when the replica does not hold
+/// the version asked (counted by why), or for any other need, which is the owner's.
+fn answered_by_replica(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  need: &Need,
+) -> Option<Answered> {
+  let asked = match need {
+    Need::Files(_) | Need::Page { .. } | Need::Sizes => version,
+    Need::Rebase { sealed } => sealed.base_version,
+    _ => return None,
+  };
+  let engine = crate::green_replicas::serving(state, green, asked)?;
+  let answered = match need {
+    Need::Files(paths) => Answered::Base(crate::verbs::base_files(Some(&*engine), version, paths)),
+    Need::Page { path, offset, want } => Answered::Base(crate::verbs::base_page(
+      Some(&*engine),
+      version,
+      path.clone(),
+      (*offset, *want),
+    )),
+    Need::Sizes => Answered::Base(crate::verbs::base_sizes(Some(&*engine), version)),
+    Need::Rebase { sealed } => Answered::Rebased(crate::verbs::rebase_on(Some(engine), sealed)),
+    _ => return None,
+  };
+  state.count(crate::green_replicas::SERVED, 1);
+  Some(answered)
+}
+
+/// Settles `answered`, the replica's answer to `queue`'s ask, on this shard once the verb that asked has parked, as an
+/// owner's answer is settled when it comes back: whether it was sent. One this shard's own channel refuses is asked of
+/// the owner instead.
+fn answer_here(state: &mut ShardState, queue: DbVolumeId, answered: Answered) -> bool {
+  let Some(here) = crate::verbs::shard_of_partition(state, state.partition) else {
+    return false;
+  };
+  crate::xshard::hand_reply_home(here, move || {
+    let _ = state::with_state_counted(|s| settle_outcome(s, queue, Outcome::Answered(answered)));
+  })
+  .is_ok()
+}
+
 /// What the owner answered for one ask of a batch.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "an answer is the common outcome: boxing it would allocate per ask, to shrink the rare Deferred"
+)]
 enum Outcome {
   Answered(Answered),
   /// The owner took the verdict and answers when it commits.
@@ -1098,8 +1159,8 @@ async fn send_batches(here: u16, owner: u16) {
       return;
     }
     let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
-    let deadline = crate::lease::lease_bound_ns();
-    let answers = crate::xshard::call_within_room(
+    let budget = crate::lease::lease_bound_ns();
+    let answers = crate::xshard::call_in_shard_time_given_room(
       here,
       owner,
       move |s| {
@@ -1108,7 +1169,7 @@ async fn send_batches(here: u16, owner: u16) {
           .map(|item| answer_on_owner(s, item))
           .collect::<Vec<_>>()
       },
-      deadline,
+      budget,
     )
     .await;
     let _ = state::with_state_counted(|s| match answers {
@@ -1270,8 +1331,8 @@ fn route_committed(state: &ShardState, work: DbVolumeId) -> bool {
 
 /// Holds `work`'s oldest verb, a submit, until the work's route is committed (A-298). The work's catalog register ships
 /// now rather than at the coordinator's period, and the record plane's next pass on this shard after it commits runs
-/// the verb's gate again ([`routes_placed`]). Past the lease bound the verb is answered `Overloaded`, unrecorded, so its
-/// retry runs it again: nothing went to the owner, so nothing waits to be settled.
+/// the verb's gate again ([`routes_placed`]). Past the failover delay ([`park_bound_ns`]) the verb is answered
+/// `Overloaded`, unrecorded, so its retry runs it again: nothing went to the owner, so nothing waits to be settled.
 fn await_route(state: &mut ShardState, work: DbVolumeId) {
   state.count(AWAITED_ROUTE, 1);
   state.work_home.routing.insert(work);
@@ -1298,10 +1359,19 @@ pub(crate) fn routes_placed(state: &mut ShardState) {
   }
 }
 
-/// The oldest verb of `work` waits for its quorum commit, or for its route (A-298), up to the lease bound.
+/// Derived: how long a verb of a work is held for a quorum commit — its verdict's, which the owner answers once its
+/// version commits at the quorum (AUD-11), or its work's route's (A-298) — before it is answered `Overloaded` and
+/// retried (A-434): the node's failover delay (`ShardState::failover_ns`, A-363), a held reply's total (A-354, A-375,
+/// `live_ship`'s durable spans read the same). A commit at the quorum waits, when a holder is lost, for the fleet to fail
+/// over, so a verb given up sooner only comes back to wait again. Before A-434 it was the owner lease's bound (about
+/// 0.9 s), the bound a verb waits for its own lease to confirm (`lease_wait`), which a commit is not.
+fn park_bound_ns(state: &ShardState) -> u64 {
+  state.failover_ns.max(1)
+}
+
+/// The oldest verb of `work` waits for its quorum commit, or for its route (A-298), up to [`park_bound_ns`].
 fn defer_oldest(state: &mut ShardState, work: DbVolumeId) {
-  let deadline =
-    slates_machine::clock::monotonic_ns().saturating_add(crate::lease::lease_bound_ns());
+  let deadline = slates_machine::clock::monotonic_ns().saturating_add(park_bound_ns(state));
   if let Some(queue) = state.work_home.queues.get_mut(&work) {
     queue.deferred_until = Some(deadline);
   }
@@ -1349,7 +1419,11 @@ async fn deferred_timer() {
 
 /// Answers `Overloaded` to every deferred verb past its deadline, releasing its work.
 fn release_expired(state: &mut ShardState) {
-  let now = slates_machine::clock::monotonic_ns();
+  release_expired_at(state, slates_machine::clock::monotonic_ns());
+}
+
+/// [`release_expired`] at `now`, on the host's monotonic clock.
+fn release_expired_at(state: &mut ShardState, now: u64) {
   let expired: Vec<DbVolumeId> = state
     .work_home
     .queues
@@ -1529,7 +1603,7 @@ pub(crate) fn tell_floor(
     state.count(FLOOR_NOT_SENT, 1);
     return;
   };
-  let deadline = crate::lease::lease_bound_ns();
+  let budget = crate::lease::lease_bound_ns();
   let spawned = slates_rt::futures::spawn(async move {
     let took = state::with_state(|s| match base {
       Some(base) => s.works.get(&work).is_some_and(|w| w.base_version == base),
@@ -1539,11 +1613,11 @@ pub(crate) fn tell_floor(
     if !took {
       return;
     }
-    let sent = crate::xshard::call_within_room(
+    let sent = crate::xshard::call_in_shard_time_given_room(
       here,
       owner,
       move |s| crate::verbs::owner_floor(s, green, work, base),
-      deadline,
+      budget,
     )
     .await;
     if sent.is_none() {
@@ -1555,5 +1629,69 @@ pub(crate) fn tell_floor(
       let _ = slates_rt::futures::detach(task);
     }
     Err(_) => state.count(FLOOR_NOT_SENT, 1),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{DbVolumeId, ParkedVerb, Queue, defer_oldest, release_expired_at};
+
+  /// The verb a test parks: a status asked by a local client, with nowhere to reply (answered `Overloaded` at its release,
+  /// nothing is sent).
+  fn parked_verb() -> ParkedVerb {
+    ParkedVerb {
+      verb: crate::lease_wait::ResumedVerb {
+        route: None,
+        origin: 0,
+        id: slates_wire::request::RequestId::from_word(1),
+        client_id: 1,
+        principal: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        },
+        body: slates_ipc::protocol::RequestBody::DaemonStatus,
+      },
+      fetched: None,
+      verdict: None,
+      rebased: None,
+      admitted: None,
+      named: None,
+    }
+  }
+
+  /// A-434 (R3's class B: a verb held for its quorum commit). Do: on one shard whose failover delay is held at three of
+  /// the owner lease's bounds, park a verb at the front of a work's queue and defer it as a verdict its owner answers at
+  /// its quorum commit; release what has expired once the owner lease's bound has passed since the deferral, then once
+  /// the failover delay has. Expect: the verb still held past the lease's bound, and released at the failover delay.
+  /// Before, it was answered `Overloaded` at the lease's bound, though a commit at the quorum waits out a failover when
+  /// a holder is lost, as a held reply does.
+  #[test]
+  fn a_verb_held_for_its_quorum_commit_waits_the_failover_delay() {
+    crate::daemon::audit_on_shard(|state| {
+      let lease = crate::lease::lease_bound_ns();
+      state.failover_ns = 3 * lease;
+      let work = DbVolumeId { bytes: [7; 16] };
+      let mut queue = Queue::default();
+      queue.waiting.push_back(parked_verb());
+      queue.asking = true;
+      state.work_home.queues.insert(work, queue);
+      state.work_home.parked = 1;
+      defer_oldest(state, work);
+      let deferred = slates_machine::clock::monotonic_ns();
+      let held = |state: &crate::state::ShardState| {
+        state
+          .work_home
+          .queues
+          .get(&work)
+          .is_some_and(|queue| !queue.waiting.is_empty())
+      };
+      release_expired_at(state, deferred + lease);
+      assert!(
+        held(&*state),
+        "the verb is still held once the owner lease's bound has passed"
+      );
+      release_expired_at(state, deferred + 3 * lease);
+      assert!(!held(&*state), "the verb is released at the failover delay");
+    });
   }
 }

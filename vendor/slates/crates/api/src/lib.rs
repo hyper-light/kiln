@@ -51,16 +51,14 @@
 //! compile errors of the matches it must extend — never as a variant falling silently through a wildcard. The wire
 //! types re-exported here grow append-only (D-15) and count as the contract's where it returns them.
 //!
-//! **What is owed** (GAPS, the A-278, A-299 and A-321 rows): the starter handed the launcher's authority on every
-//! platform; typed fields on the wire
-//! for drift, a presentation's conflicts and a merge's versions, replacing what this crate reads from text; a paged
-//! listing; an async form over a host's reactor (R6); a typed class for a pinned snapshot's destroy, which the daemon
-//! answers untyped (`Invalid::Request`, A-310).
+//! **What is owed** (GAPS, the A-278 and A-299 rows): a typed field on the wire for a merge's versions (the work's
+//! base beside the green's head), which this crate reads in a second call after the verdict; and the async form for
+//! the verbs it does not serve yet (the paged reads, landings, merges, policies and observation).
 //!
 //! **The seam (A-310).** A host whose rules reach other products only through a trait with a simulator and a
 //! conformance suite (Hex's `CLAUDE.md` §9) holds [`Volumes`]: the contract's volume verbs, implemented by [`Instance`]
 //! and by [`SimVolumes`], an in-memory stand-in that answers the same typed outcomes and errors. One conformance suite
-//! runs over both (`tests/seam.rs`).
+//! runs over both (`the_seam_conforms` in `tests/api.rs`).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds are exempt.
 // The panic rule: a print macro panics on a refused write, and a library prints nothing: every outcome is returned.
@@ -145,7 +143,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (the same day). 11: `DaemonReport::recovered`, the anchor's verdict that the daemon has served as long as its start
 /// took, so its exit is no failed start (A-311) (the same day). 12: `ShardsStream::resync`, the device's end of a Shards
 /// stream's resync channel, which `serve_shards` hands beside the stream's where the daemon makes one (Linux; macOS too
-/// since A-339, the type unchanged), none elsewhere and from the simulator (A-316; the same day). 13: signed merges
+/// since A-339, and Windows since A-427, the type unchanged), none from the simulator (A-316; the same day). 13: signed merges
 /// (A-321): `merge` sends its signature and answers how the daemon judged it, `merge_statement` (a
 /// [`MergeStatement`]), `approve_merge` carries the signature again (`MergeApproval::signature`), `merge_record` (a
 /// [`MergeRecord`], `Missing::Version`), `set_signers` and `signers` ([`TrustedSigner`]); a volume's policy may require
@@ -215,31 +213,48 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// refused request with no trail; under 30 it wrote an end naming no manifest (the same day). 36: a busy mount is let go
 /// of on every Unix host: [`mount::unmount_busy`] answers how ([`LetGo::Detached`] on Linux, [`LetGo::Forced`] on macOS
 /// and the BSDs), where Linux's `unmount_lazy` was refused elsewhere; `MountMissing::LazyUnmount` is gone (found by
-/// g076a; the same day).
+/// g076a; the same day). 37: [`mount::available`] on Windows answers [`MountMissing::MountManager`] where the machine
+/// does not let WinFsp's driver make a mount's drive (`MountUseMountmgrFromFSD`, which the driver reads at every mount,
+/// A-369); until then such a machine was told it could mount, and every mount there was refused afterwards (A-417; the
+/// same day). 38: [`Instance::export_archive`], a snapshot exported as its archive into a volume of the caller's
+/// ([`ArchiveExported`], [`ARCHIVE_FILE`]), read back a page at a time with [`Instance::read`] (Mantle's CP-T10.4,
+/// A-441; the same day).
+/// 39: [`role::check_fleet`] reads a fleet manifest and plans its node exactly as the node's anchor and
+/// daemon do at their start, answering a [`role::FleetCheck`] or the start's own refusal, for a starter that writes the
+/// manifest itself (kiln's runners as a fleet, kiln goal 95101ef3; the same day).
+/// 40: [`Instance::import_archive`], a volume made from an archive a volume of the caller's holds as [`ARCHIVE_FILE`]
+/// ([`ArchiveImported`]), and its refusal by kind, [`Invalid::Archive`] naming an [`ArchiveFault`] (Mantle's
+/// CP-T10.4, A-453; the same day).
+/// 41: a landing carries a file whose mode or Windows attribute bits alone changed (A-458): [`PlannedAction::Chmod`]
+/// names such an entry with the mode and bits it had, and [`ActionTally::chmod`] counts them; until then such a change
+/// was planned as a replacement the verdict passed by, and it never landed (the same day).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 36;
+pub const CONTRACT: u32 = 41;
 
 /// What a rewitness did (§4.15 `rewitness`): the paths one reply holds and the count of the rest (A-267).
 pub use slates_client::Rewitnessed;
+/// A snapshot exported as its archive ([`Instance::export_archive`], A-441), and a volume made from one
+/// ([`Instance::import_archive`], A-453).
+pub use slates_client::{ArchiveExported, ArchiveImported};
 /// The typed client and its own types, for the verbs [`Instance::client`] lends outside the contract.
 pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, VhostUserDevice};
 /// The wire's types the contract takes and returns (§4.9; append-only, D-15).
 pub use slates_ipc::protocol::{
-  AttachTransport, ChangedCursor, ConflictClass, DaemonReport, DatabaseRefusal, FailoverReport,
-  Filter, GrantScope, GreenBase, HostAnswer, HostPathReason, Intent, JournalReport,
-  LandingDegradation, LandingDurability, LossReport, MountReport, NamePolicy, OwnMountUse,
-  PastTolerance, PlacedState, PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt,
-  RecoveryCause, Shortfall, SnapshotId, TargetRefusal, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
+  ARCHIVE_FILE, ArchiveFault, AttachTransport, ChangedCursor, ConflictClass, DaemonReport,
+  DatabaseRefusal, FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostPathReason,
+  Intent, JournalReport, LandingDegradation, LandingDurability, LossReport, MountReport,
+  NamePolicy, OwnMountUse, PastTolerance, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
+  Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId, TargetRefusal, TelemetryReport,
+  TransportReport, UnsupportedReason, VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};
 
-/// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a reply is waited
-/// for as long as the anchor waits for the daemon's heartbeat before it questions the daemon's liveness, and a
-/// reconnect is tried for the recovery budget a restart is bounded by. Every client this crate makes uses them, as the
-/// CLI's do.
+/// The client's deadlines as the product derives them (§4.7 "Failure matrix"; `Deadlines::derive`): a wait that cannot
+/// see the daemon's departure asks after the daemon's liveness as often as the anchor waits for the daemon's heartbeat
+/// (a synchronous call's reply is waited for until it comes or the daemon's process ends, A-456), and a reconnect is
+/// tried for the recovery budget a restart is bounded by. Every client this crate makes uses them, as the CLI's do.
 pub fn deadlines() -> Deadlines {
   Deadlines::derive(
     slates_server::daemon::LIVENESS_BUDGET_NS,
@@ -267,4 +282,53 @@ pub(crate) fn absolute_text(path: &std::path::Path) -> Result<String, Error> {
       fault: PathFault::NotUnicode,
     })
   })
+}
+
+/// The user guide, `docs/library.md`, as rustdoc collects doctests: each of its Rust examples compiles against this
+/// crate (`cargo test -p slates-api --doc`), so the guide cannot drift from the API it shows (a doc-truth test,
+/// CLAUDE.md §4; the library audit's gap d, 2026-11-18). Nothing else ever sees it: `cfg(doctest)` holds only while
+/// rustdoc collects doctests, so no build compiles it, no rendered page shows it, and a vendored copy without `docs/`
+/// builds as before.
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/library.md")]
+pub struct Guide;
+
+#[cfg(test)]
+mod contract_history {
+  /// §4.12 "Versioning" (A-299; a doc-truth test, CLAUDE.md §4): the contract's version list names every version up to
+  /// [`super::CONTRACT`] in order, so a raised number without its line, or a line past the number, fails here. Do: read
+  /// [`super::CONTRACT`]'s own doc from this file and find each version's number as the list writes it (`N: `). Expect
+  /// every number from 1 to `CONTRACT` named, in increasing order, and none past it.
+  #[test]
+  fn the_contract_history_names_every_version_in_order() {
+    let source = include_str!("lib.rs");
+    let declared = source
+      .find("pub const CONTRACT: u32")
+      .expect("the contract's constant");
+    let doc_start = source
+      .get(..declared)
+      .and_then(|before| before.rfind("/// The consumer contract's version"))
+      .expect("the contract's doc");
+    let doc: String = source
+      .get(doc_start..declared)
+      .expect("the doc's text")
+      .lines()
+      .map(|line| line.trim_start_matches("///"))
+      .collect::<Vec<_>>()
+      .join(" ");
+    let mut from = 0;
+    for version in 1..=super::CONTRACT {
+      let line = format!(" {version}: ");
+      let at = doc
+        .get(from..)
+        .and_then(|rest| rest.find(&line))
+        .unwrap_or_else(|| panic!("version {version} has no line after the one before it"));
+      from = from + at + line.len();
+    }
+    let past = format!(" {}: ", super::CONTRACT + 1);
+    assert!(
+      !doc.contains(&past),
+      "a line past the contract's number: {past}"
+    );
+  }
 }

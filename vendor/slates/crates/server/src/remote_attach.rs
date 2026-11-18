@@ -9,8 +9,9 @@
 //! **How a remote attachment ends.** A detach routed by its volume (`DetachOf`; an attachment id names its owner
 //! partition, not its host); its host's reap of the dead client (`RemoteReap`, which B sends the owner of each volume
 //! it remembers the client attached, a set bounded per client); its host's retirement from the fleet (`end_retired`);
-//! and the volume's destroy, as every attachment. A silent holder's write lease ends at its term, `failover_slo_ns`
-//! (`verbs::take_write_lease`, D-16), whatever ends its record.
+//! and the volume's destroy, as every attachment. The volume's write lease stays its holder's while the record lives,
+//! renewed at each lapse, and lasts one term (the node's failover delay) after the record ends, whatever ends it
+//! (`verbs::lease_kept_until`, D-16, A-414).
 //!
 //! **R8.** At one node nothing is forwarded, no attachment is `Remote`, and every rule here holds the same way for a
 //! local requester: the requester's host is this node's, and a local attachment is its own.
@@ -296,8 +297,11 @@ pub(crate) fn end_hosts(state: &mut ShardState, anchors: &[u64]) -> Result<u64, 
 }
 
 /// The reap loop's look at departures (A-222), run on the control shard each liveness budget: the departed anchors,
-/// then their attachments ended on every shard, each through a call bounded by the budget. Owed again at the next look
-/// unless every shard answered.
+/// then their attachments ended on every shard, each through a call judged in that shard's own time
+/// (`xshard::call_in_shard_time`, A-65, A-408), whose budget is the window every such wait takes: one liveness window
+/// on the wall, then more while the shard runs or waits for a CPU, so a starved shard's end is heard and a wedged
+/// one's given up (A-449, R3's class B, item B-f: the departure itself was decided by the fleet's membership, its own
+/// estimators, A-363). Owed again at the next look unless every shard answered.
 pub(crate) async fn sweep_departed() {
   let Some((control, shards, gone)) = crate::state::with_state(|state| {
     let control = state.shards.first().copied()?;
@@ -493,6 +497,10 @@ pub(crate) async fn reap_at_owners(
   if requests.is_empty() {
     return Ok(());
   }
+  // A wall bound, by its reason (A-440): the task's own waits are on remote owners, each held to the forward lane's
+  // bound (class B), so the control shard's own time would judge the wrong clock; and the remote reap is idempotent at
+  // its owners (`serve_unforwardable`: it ends what the client still holds there and keeps no completion record), so a
+  // reap this wait gives up on is sent again by the next sweep at no cost but the asking.
   crate::xshard::task_within(
     origin,
     control,

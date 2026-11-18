@@ -114,12 +114,13 @@ pub const NO_ESTIMATE_MULTIPLE: Derived<u64> = derived!(
 
 /// The longest one idle spin may run, nanoseconds, whatever its window, its estimate or a hold asks: the liveness budget
 /// less one beat. The watchdog judges a shard spinning once it has run its spin window of CPU with no step and no park
-/// (`crate::watchdog::spin_window_ns`, the budget held to the build and never below it, A-318), and an idle spin is
-/// neither: it follows a step that found nothing and ends in a step, a park or one idle slice of a step's quantum. A
-/// spin held under the budget by a beat can therefore never reach the verdict, on any platform and in any build: an
-/// idle shard polling for work is not a wedged one. The ceiling binds no rule in use, whose windows are R9's floor and
-/// a closed loop's hold of at most 2F × the cycles of 1,024 shards (471 ms, [`closed_loop_hold`]); it is what keeps a
-/// rule's mistake, or an estimate gone wild, from killing a live daemon, as the Windows multiple did (A-361).
+/// (`crate::watchdog::spin_window_ns`, the shard's window held to the build and never below the budget, A-318, A-455),
+/// and an idle spin is neither: it follows a step that found nothing and ends in a step, a park or one idle slice of a
+/// step's quantum. A spin held under the budget by a beat can therefore never reach the verdict, on any platform and in
+/// any build: an idle shard polling for work is not a wedged one. The ceiling binds no rule in use, whose windows are
+/// R9's floor and a closed loop's hold of at most 2F × the cycles of 1,024 shards (471 ms, [`closed_loop_hold`]); it is
+/// what keeps a rule's mistake, or an estimate gone wild, from killing a live daemon, as the Windows multiple did
+/// (A-361).
 pub const IDLE_SPIN_CEILING: Derived<u64> = derived!(
   crate::daemon::LIVENESS_BUDGET_NS.saturating_sub(crate::daemon::HEARTBEAT_NS),
   "liveness budget − one beat: under the least spin window the watchdog judges by",
@@ -428,6 +429,10 @@ pub struct DaemonConfig {
   /// one bulk chunk of a client's region holds past the report's fixed part, measured from the wire
   /// encoding at boot.
   pub telemetry_spans_per_reply: usize,
+  /// Derived: the replicas a green's owner takes (A-457, A-273 step 5a; `crate::green_replicas`):
+  /// `slates_merge::replica::replica_limit` of the runtime's shards, a replica on each other shard of the node and its
+  /// rebuild's fresh one beside it; none with one shard (R8).
+  pub replica_limit: usize,
   /// The fleet this node joins (§4.8, boot step 6), or `None` for the laptop (`f = 0`, solo — the
   /// degenerate of the same code path, R8). A single-host daemon leaves this `None` and every placement
   /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
@@ -648,14 +653,18 @@ impl DaemonConfig {
 
   /// Derived: the copies an anchor may hold for this daemon across a restart: every writable direct map's copy its shards
   /// may hold at once (A-197), `shards × direct_maps_per_shard`, of which the writable ones are some; and every Shards
-  /// stream's DAX object (A-365), `shards × dax_range_slots`, since each backing counts at least one range against its
-  /// shard's fill budget.
+  /// stream's DAX object ([`DaemonConfig::held_dax_bound`]).
   pub fn held_copy_bound(&self) -> usize {
-    usize::from(self.runtime.shards).saturating_mul(
-      self
-        .direct_maps_per_shard
-        .saturating_add(self.dax_range_slots()),
-    )
+    usize::from(self.runtime.shards)
+      .saturating_mul(self.direct_maps_per_shard)
+      .saturating_add(self.held_dax_bound())
+  }
+
+  /// Derived: the Shards streams' DAX objects an anchor may hold for this daemon across a restart (A-365; Windows' DAX
+  /// sections, A-448): `shards × dax_range_slots`, since each backing counts at least one range against its shard's fill
+  /// budget, so no shard ever has more backings than slots.
+  pub fn held_dax_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(self.dax_range_slots())
   }
 
   /// Derived (A-365): the slots of each shard's DAX range table, one for each range its fill budget can count: the
@@ -909,6 +918,33 @@ impl DaemonConfig {
       green_chain_bytes: usize::try_from(tables.get()).unwrap_or(usize::MAX),
       audit_records: audit_records.get(),
     };
+    // A green's replicas on the node's other shards (A-457, A-273 step 5a; `crate::green_replicas`): how many its owner
+    // takes, and at boot the most each may hold and what the owner keeps for them. Each making takes its shard's
+    // admittable room then, and each settle the owner's own retention then: the live figures are the inputs (D-11).
+    let replica_limit: Derived<usize> = derived!(
+      slates_merge::replica::replica_limit(usize::from(runtime.shards.max(1))),
+      "(shards − 1) × 2: a replica on each other shard of the node and its rebuild's fresh one beside it; none with \
+       one shard",
+      ["shards"]
+    );
+    derivations.push(note("replica_limit", &replica_limit));
+    let replica_budget: Derived<usize> = derived!(
+      slates_merge::replica::replica_budget(
+        caps.green_chain_bytes,
+        usize::try_from(reserve.get()).unwrap_or(usize::MAX)
+      ),
+      "min(green_chain_bytes, the shard's room): the per-green budget, and at most the shard's reserve; each making \
+       takes the shard's admittable room then",
+      ["table_bytes", "reserve_per_shard"]
+    );
+    derivations.push(note("replica_budget_bytes", &replica_budget));
+    let replica_held: Derived<usize> = derived!(
+      slates_merge::replica::held_limit(caps.green_chain_bytes, 0),
+      "green_chain_bytes − the owner's own retention (none at boot): what an owner keeps for its replicas; each settle \
+       takes its own retention then",
+      ["table_bytes"]
+    );
+    derivations.push(note("replica_held_limit_bytes", &replica_held));
     // The store's tables (§4.2 metadata dimension): each slab's bound is the metadata class — the
     // shard's second memory class, one reserve — over the true slot cost of the dimension's unit
     // (an inode is a version slot and a table slot; a directory a node and a block), so the slabs'
@@ -1111,6 +1147,7 @@ impl DaemonConfig {
       page_fault_ns: page_fault_ns.get(),
       codec,
       telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
+      replica_limit: replica_limit.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
       fleet: None,
@@ -1267,7 +1304,16 @@ pub struct NfsV4Caps {
   /// Derived: the bytes of call records a shard holds at once (A-127): what answers a compound retried after a
   /// restart, bounded beside the slot caches it is the durable twin of.
   pub record_bytes: usize,
+  /// Derived: the lease the listener grants every client and advertises (`FATTR4_LEASE_TIME`, RFC 8881 §8.3), which
+  /// is also the wait a recalled delegation is owed before it is revoked (§10.4.5) and every wait on that (A-425). Read
+  /// only through `nfs::v4_lease_ns`, so the lease told and the waits on it are one number.
+  pub lease_ns: u64,
 }
+
+/// Format: how long an idle Linux NFSv4 client goes between two renewals of its lease however short the lease it is
+/// told: `nfs4_schedule_state_renewal` waits two thirds of the lease, never less than five seconds (`if (timeout < 5 *
+/// HZ) timeout = 5 * HZ;`, fs/nfs/nfs4renewd.c, Linux master, read 2026-11-18). The served client's fact, not a tunable.
+pub const NFS_V4_CLIENT_RENEWAL_FLOOR_NS: u64 = 5_000_000_000;
 
 /// Shape: the holders the NFSv4 client share of a shard's reserve is split between (A-127): the slot caches (a kept
 /// reply per slot) and the call records (what a kept reply becomes across a restart, published with its effects).
@@ -1344,12 +1390,27 @@ fn nfs_v4_caps(
     ["max_inodes", "shards"]
   );
   derivations.push(note("nfs_v4_locks", &locks));
+  // The lease (A-425) outlasts the longest an idle client goes between two renewals, the Linux client's floor, by the
+  // lateness a live party may show before it is judged (A-228's window), for the renewal's delivery; in the whole seconds
+  // `FATTR4_LEASE_TIME` carries, so the lease a client is told is the lease it holds. Not the failover delay, which is
+  // shorter: below the floor a live idle client's lease lapses between its renewals, and a full table drops its state.
+  let lease_ns: Derived<u64> = derived!(
+    NFS_V4_CLIENT_RENEWAL_FLOOR_NS
+      .saturating_add(crate::daemon::LIVENESS_BUDGET_NS)
+      .div_ceil(NANOS_PER_SECOND)
+      .saturating_mul(NANOS_PER_SECOND),
+    "ceil((NFS_V4_CLIENT_RENEWAL_FLOOR_NS + LIVENESS_BUDGET_NS) / 1 s) s: an idle Linux client's longest gap between \
+     renewals and the lateness a live party may show, in the whole seconds FATTR4_LEASE_TIME carries",
+    ["NFS_V4_CLIENT_RENEWAL_FLOOR_NS", "LIVENESS_BUDGET_NS"]
+  );
+  derivations.push(note("nfs_v4_lease_ns", &lease_ns));
   NfsV4Caps {
     slots: slots.get(),
     clients: clients.get(),
     opens: opens.get(),
     locks: locks.get(),
     record_bytes: record_bytes.get(),
+    lease_ns: lease_ns.get(),
   }
 }
 

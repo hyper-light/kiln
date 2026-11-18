@@ -409,16 +409,24 @@ pub struct Pending {
   pub shards: Vec<u16>,
 }
 
-/// Shape: how long a client waits for the daemon to answer a claim before reporting it unavailable
-/// (nanoseconds): the control shard's loop is microseconds, so a second is a dead daemon.
+/// How long the rendezvous waits for a silent party, in nanoseconds. Its users: the daemon's wait for a client's opening
+/// (Linux); the daemon's reclaim of a claim slot a party left (macOS, Windows: twice it); a Windows claim's wait for its
+/// answer under a live anchor (at least it); one more of it for a claim the daemon took to answer; and the async
+/// connect's pacing (a tenth of it, `slates_client::Connecting::next_poll_ns`). Each is a fixed second R3 forbids, owed
+/// in GAPS (the `LIVENESS_BUDGET_NS` entry's class C). A claim on a daemon that holds its own rendezvous waits instead
+/// while that daemon lives ([`begin_connect_as`], A-443, A-447).
+/// Derived: one liveness window W, the window an anchor judges its daemon silent by (`slates_server::daemon::
+/// LIVENESS_BUDGET_NS`, itself `slates_db::replay::RECOVERY_BUDGET_NS`, a second): a party silent that long is gone. This
+/// crate sits below both, so the value is restated here.
 pub const CLAIM_WAIT_NS: u64 = 1_000_000_000;
 
 /// The client's side: connects to `instance` and returns its region, the doorbell for a parked
 /// shard, and the platform's control channel where one exists.
 /// A daemon no anchor holds the rendezvous for (an in-process daemon in a test) has no restart to wait out, so this
-/// connect waits one claim wait; a client of an anchored instance passes its restart bound to [`connect_as`].
+/// connect gives no restart bound and waits while the daemon lives; a client of an anchored instance passes its restart
+/// bound to [`connect_as`].
 pub fn connect(instance: &str) -> Result<Connected, IpcError> {
-  connect_as(instance, 0, CLAIM_WAIT_NS)
+  connect_as(instance, 0, 0)
 }
 
 /// Connects asking for a client id it held before (a reconnect after the daemon restarted, so
@@ -440,20 +448,27 @@ pub fn connect_as(
 /// waits on the daemon, so an event loop that drives the claim is never held by a slow, stopped or dead
 /// one.
 ///
-/// A claim waits one claim wait for its answer, unless the rendezvous is held by a live anchor (A-114): then the daemon
-/// may be restarting, and the claim waits up to `restart_wait_ns` (the caller's bound on a restart — a client passes
-/// its reconnect deadline, the recovery budget plus a reply deadline), so a restart slower than a claim wait (a large
-/// volume to recover, a busy machine) is waited out instead of reported as no daemon. On Linux a listening socket
-/// exists only while its owner lives (a daemon answers at once; the anchor holds it across a restart), so the handoff
-/// may always wait that long; on macOS and Windows the bootstrap header names the holding anchor, whose liveness is
-/// checked.
+/// A claim waits while its rendezvous's owner lives (A-443; R3's class C): the daemon, when it holds its own
+/// rendezvous, answers or dies, and its death ends the claim at once, so a daemon alive and slow to answer (a busy
+/// machine, a long start) is waited for, never reported gone by a clock. Where a live anchor holds the rendezvous
+/// (A-114), the daemon may be restarting under it and the anchor's life says nothing of the daemon's, so the claim
+/// waits up to `restart_wait_ns` as well (the caller's bound on a restart: a client passes its reconnect deadline, the
+/// recovery budget plus a reply deadline); zero gives none. The owner's life is the platform's own: on Linux the
+/// socket, whose connection the kernel resets when the listener's owner dies (an anchor holds the listener across a
+/// restart, which a claim cannot tell from its daemon's, so a restart bound given bounds it there); on macOS the
+/// owner's bootstrap name, which launchd takes back at its holder's death (`crate::owner_name`), looked up as the claim
+/// waits, at twice the time it has waited each time, so the looks cost the logarithm of the wait and a death is seen
+/// within the time already waited. On Windows no probe of the owner's life is made yet (opening the owner's named Event
+/// would keep the name, and refuse a successor its ownership while the probe held it): a claim there waits the claim
+/// wait, or the restart bound under a live anchor, as before (GAPS). Until A-443 every claim gave up at the claim wait,
+/// a second, with its daemon alive.
 pub fn begin_connect_as(
   instance: &str,
   wanted: u32,
   restart_wait_ns: u64,
 ) -> Result<Claim, IpcError> {
   Ok(Claim {
-    inner: platform::begin(instance, wanted, restart_wait_ns.max(CLAIM_WAIT_NS))?,
+    inner: platform::begin(instance, wanted, restart_wait_ns)?,
   })
 }
 
@@ -471,14 +486,15 @@ impl std::fmt::Debug for Claim {
 
 impl Claim {
   /// Reads the daemon's answer without waiting: `Some` once connected, `None` while it is still due,
-  /// a typed refusal when the daemon refused the claim or did not answer it within the claim wait.
+  /// a typed refusal when the daemon refused the claim, died before answering it, or did not answer it within its bound
+  /// (the restart bound under an anchor; the claim wait on Windows; [`begin_connect_as`]).
   /// Once it has returned `Some` or an error, the claim is spent and a further poll is refused.
   pub fn poll(&mut self) -> Result<Option<Connected>, IpcError> {
     self.inner.poll()
   }
 
-  /// Waits for the answer (the synchronous facade): the platform's own wait between polls, bounded by
-  /// the claim wait.
+  /// Waits for the answer (the synchronous facade): the platform's own wait between polls, until the answer, the
+  /// daemon's death or the claim's bound.
   pub fn wait(self) -> Result<Connected, IpcError> {
     self.inner.wait()
   }
@@ -622,6 +638,33 @@ impl Liveness {
   /// path: asked only after a reply has stalled past the client's deadline.
   pub fn daemon_gone(&self) -> bool {
     self.inner.daemon_gone()
+  }
+
+  /// The daemon's process handle, to wait on beside the reply's Event (Windows, A-456), as a claim waits beside its
+  /// answer's (A-447); `None` when the process was already gone when the watch was taken.
+  #[cfg(windows)]
+  #[must_use]
+  pub fn exit_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+    self.inner.exit_handle()
+  }
+
+  /// A liveness check over `socket`, the client's end of a control socket a test made (Linux), its deliveries opened
+  /// under the stand-in seal.
+  #[cfg(all(test, target_os = "linux"))]
+  pub(crate) fn of_socket(socket: std::os::fd::OwnedFd) -> Result<Liveness, IpcError> {
+    Ok(Liveness {
+      inner: platform::Liveness::of_socket(socket)?,
+    })
+  }
+
+  /// A liveness check on the daemon of `instance` whose process is `pid` (macOS, Windows): the start stamp the instance's
+  /// bootstrap object holds now, and an exit watch on `pid`, as a claim's answer would give a client. Refused when no
+  /// daemon has published the object.
+  #[cfg(all(test, any(target_os = "macos", windows)))]
+  pub(crate) fn of_daemon(instance: &str, pid: u32) -> Result<Liveness, IpcError> {
+    Ok(Liveness {
+      inner: platform::Liveness::of_daemon(instance, pid)?,
+    })
   }
 
   /// A descriptor that reports the daemon's departure when polled (Linux: the control socket, whose peer end closes
@@ -1093,6 +1136,16 @@ pub mod platform {
         // Reset, or an unusable descriptor: the channel is gone either way.
         Err(_) => true,
       }
+    }
+
+    /// A liveness check over a test's `socket`, its deliveries opened under the stand-in seal (A-187's test channel).
+    #[cfg(test)]
+    pub(super) fn of_socket(socket: OwnedFd) -> Result<Liveness, IpcError> {
+      let (_daemon_seal, client_seal) = crate::toy_seal::channel_pair()?;
+      Ok(Liveness {
+        socket,
+        seal: RefCell::new(client_seal),
+      })
     }
 
     /// Receives a delivery from the daemon over the control socket (§4.6: a content map, A-135; a stream end,
@@ -1696,9 +1749,10 @@ pub mod platform {
     /// The socket; taken once the claim is answered or refused.
     socket: Option<OwnedFd>,
     started: std::time::Instant,
-    /// How long the handoff may take: the caller's restart bound, since a listening socket means a live daemon or the
-    /// anchor holding the rendezvous across a restart (`super::begin_connect_as`).
-    wait_ns: u64,
+    /// How long the handoff may take: the caller's restart bound when it gave one, since a listening socket means a live
+    /// daemon or the anchor holding the rendezvous across a restart; `None` when it gave none, and the claim waits while
+    /// the listener's owner lives, its death resetting the connection (`super::begin_connect_as`, A-443).
+    wait_ns: Option<u64>,
     /// Where the exchange stands.
     stage: Stage,
   }
@@ -1754,7 +1808,7 @@ pub mod platform {
       instance: instance.to_owned(),
       socket: Some(socket),
       started: std::time::Instant::now(),
-      wait_ns,
+      wait_ns: (wait_ns > 0).then_some(wait_ns),
       stage: Stage::AwaitingKey {
         seal,
         wanted,
@@ -1823,14 +1877,18 @@ pub mod platform {
       }
     }
 
-    /// `None` while the claim wait lasts; unavailable past it.
+    /// `None` while the claim lasts: while the listener's owner lives (its death resets the connection, which the reads
+    /// report), and within the restart bound when one was given; unavailable past that bound.
     fn due(&self) -> Result<Option<Connected>, IpcError> {
-      if elapsed_ns(self.started) < self.wait_ns {
+      if self
+        .wait_ns
+        .is_none_or(|bound| elapsed_ns(self.started) < bound)
+      {
         return Ok(None);
       }
       Err(IpcError::DaemonUnavailable {
         endpoint: self.instance.clone(),
-        why: "the daemon did not answer the claim within the claim wait",
+        why: "the daemon did not answer the claim within the restart bound",
       })
     }
 
@@ -1946,7 +2004,8 @@ pub mod platform {
       Ok(Some(Opened { body, fds }))
     }
 
-    /// Waits for the handoff between polls on the socket's readability, bounded by the claim wait.
+    /// Waits for the handoff between polls on the socket's readability: its answer, its reset at the owner's death,
+    /// or the restart bound when one was given.
     pub(super) fn wait(mut self) -> Result<Connected, IpcError> {
       use rustix::event::{PollFd, PollFlags, Timespec};
       loop {
@@ -1956,13 +2015,15 @@ pub mod platform {
         let Some(socket) = self.socket.as_ref() else {
           continue;
         };
-        let remaining = self.wait_ns.saturating_sub(elapsed_ns(self.started));
-        let timeout = Timespec {
-          tv_sec: i64::try_from(remaining / NS_PER_SECOND).unwrap_or(i64::MAX),
-          tv_nsec: i64::try_from(remaining % NS_PER_SECOND).unwrap_or(0),
-        };
+        let timeout = self.wait_ns.map(|bound| {
+          let remaining = bound.saturating_sub(elapsed_ns(self.started));
+          Timespec {
+            tv_sec: i64::try_from(remaining / NS_PER_SECOND).unwrap_or(i64::MAX),
+            tv_nsec: i64::try_from(remaining % NS_PER_SECOND).unwrap_or(0),
+          }
+        });
         let mut fds = [PollFd::new(socket, PollFlags::IN)];
-        match rustix::event::poll(&mut fds, Some(&timeout)) {
+        match rustix::event::poll(&mut fds, timeout.as_ref()) {
           Ok(_) | Err(rustix::io::Errno::INTR) => {}
           Err(e) => return Err(refused("poll", e)),
         }
@@ -2768,12 +2829,26 @@ pub mod platform {
   /// Format: the bootstrap object's magic, `SLB2` in little-endian ASCII: the layout with the rings' marks (A-381). The
   /// layout before it, `SLBT`, had no marks, and a client of it rings without naming its shard, so an object or a client
   /// of either layout is refused by the other as another layout, never served with its rings unheard.
-  const MAGIC: u32 = 0x3242_4C53;
+  ///
+  /// `SLB3` (A-447) is that layout with the daemon's process mark in its header ([`DaemonMark`]): a Windows claimant of
+  /// it waits on the daemon's exit, and one of `SLB2` would read no mark, so each refuses the other as another layout.
+  /// Format: `SLB3`'s four ASCII bytes read as a little-endian `u32`.
+  const MAGIC: u32 = 0x3342_4C53;
   /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4), the claim's mark (4,
-  /// A-381), the daemon's start stamp (8), padding (4), the holding anchor's process id (4), padding to a cache line.
-  /// The padding after the stamp held the daemon's process id until A-159: a client judges the daemon that answered its
-  /// claim by the pid in the answer (A-143), so the header's copy had no reader left.
+  /// A-381), the daemon's start stamp (8), the daemon's process id (4, A-447), the holding anchor's process id (4), the
+  /// daemon's creation time (8, A-447), padding to a cache line. The daemon's process id held the slot after the stamp
+  /// until A-159, when a client judged its daemon by the pid in the answer alone (A-143); a Windows claim reads it again
+  /// with the creation time, to wait on the daemon's exit before any answer (A-447).
+  /// Format: 64 bytes, the fields above and their padding.
   const HEADER_BYTES: usize = 64;
+  /// Format: the daemon's process id's offset in the header (A-447), written by a Windows daemon before it publishes
+  /// the header; zero where none is written (a macOS daemon, whose claimants judge the owner's bootstrap name, A-443).
+  #[cfg(any(windows, test))]
+  const AT_DAEMON_PID: usize = 24;
+  /// Format: the daemon's creation time's offset in the header (A-447): `GetProcessTimes`' creation time, 100 ns
+  /// intervals since 1601, which tells the daemon's process from another given its pid after it.
+  #[cfg(any(windows, test))]
+  const AT_DAEMON_CREATED: usize = 32;
   /// Format: the slot count's offset in the header (after the magic).
   const AT_SLOT_COUNT: usize = 4;
   /// Format: the doorbell word's offset in the header.
@@ -2917,6 +2992,26 @@ pub mod platform {
   impl Liveness {
     pub(super) fn daemon_gone(&self) -> bool {
       self.watch.exited() || generation_of(&self.instance).is_none_or(|now| now != self.generation)
+    }
+
+    /// The daemon's process handle (Windows; [`super::Liveness::exit_handle`]).
+    #[cfg(windows)]
+    pub(super) fn exit_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+      self.watch.handle()
+    }
+
+    /// A liveness check on `instance`'s daemon whose process is `pid` ([`super::Liveness::of_daemon`]).
+    #[cfg(test)]
+    pub(super) fn of_daemon(instance: &str, pid: u32) -> Result<Liveness, IpcError> {
+      let generation = generation_of(instance).ok_or_else(|| IpcError::DaemonUnavailable {
+        endpoint: instance.to_owned(),
+        why: "the daemon has not yet published its rendezvous object",
+      })?;
+      Ok(Liveness {
+        instance: instance.to_owned(),
+        generation,
+        watch: crate::exit_watch::ExitWatch::on(pid)?,
+      })
     }
 
     /// No control socket here yet (§4.6, A-135), so no descriptor is ever delivered over one: a same-kernel client on
@@ -3459,12 +3554,20 @@ pub mod platform {
   impl Listener {
     pub(super) fn open(instance: &str, adoption: Option<&str>) -> Result<Listener, IpcError> {
       // The anchor owns the object it holds; a daemon run alone owns the one it makes.
-      let (object, owner) = if adoption.is_some() {
+      #[cfg_attr(not(windows), allow(unused_mut))]
+      let (mut object, owner) = if adoption.is_some() {
         (adopt(instance)?, None)
       } else {
         let (object, owner) = fresh(instance)?;
         (object, Some(owner))
       };
+      // Windows: this daemon's process mark, which its claimants wait on the exit of (A-447), before the stamp publishes it.
+      #[cfg(windows)]
+      {
+        let (pid, created) = own_mark()?.bytes();
+        object.write(AT_DAEMON_PID, &pid)?;
+        object.write(AT_DAEMON_CREATED, &created)?;
+      }
       // The start stamp last, with release: it publishes the header and the free table (never zero).
       let stamp = stamp_now().max(1);
       object
@@ -3813,11 +3916,127 @@ pub mod platform {
     started: std::time::Instant,
     /// Whether the deadline was already extended once for a claim the daemon took to answer.
     extended: bool,
-    /// The answer's deadline from `started`: one claim wait, extended by one more when the daemon has
-    /// taken the claim to answer it.
-    wait_ns: u64,
+    /// How the claim ends if nothing answers it ([`Ends`]).
+    ends: Ends,
+    /// The time waited at which the owner's life is next looked at ([`Ends::WithOwner`]): at once, then twice the time
+    /// waited at each look, so the looks cost the logarithm of the wait and a death is seen within the time waited.
+    #[cfg(target_os = "macos")]
+    next_look_ns: u64,
+    /// The start stamp published when the claim began (Windows): a daemon that stops takes it back (`Listener`'s drop,
+    /// A-176), which is how a claim on a daemon stopped inside its own process, whose exit nobody sees, learns it went.
+    #[cfg(windows)]
+    stamp: u64,
     /// Whether the slot is still this client's to give back (cleared once answered or refused).
     open: bool,
+  }
+
+  /// The daemon's process mark in the bootstrap header (A-447): its process id and its creation time, which a claimant
+  /// opens the process by and judges it by, so a pid reused after the daemon's exit is never taken for the daemon.
+  #[cfg(any(windows, test))]
+  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  struct DaemonMark {
+    /// The daemon's process id.
+    pid: u32,
+    /// Its creation time (`GetProcessTimes`, 100 ns intervals since 1601).
+    created: u64,
+  }
+
+  #[cfg(any(windows, test))]
+  impl DaemonMark {
+    /// Its bytes as the header holds them, little-endian: the process id's and the creation time's.
+    fn bytes(self) -> ([u8; size_of::<u32>()], [u8; size_of::<u64>()]) {
+      (self.pid.to_le_bytes(), self.created.to_le_bytes())
+    }
+
+    /// The mark a header's image holds: `None` for none written (a zero process id or creation time, which no live
+    /// process has) or an image too short to hold one.
+    fn of(header: &[u8]) -> Option<DaemonMark> {
+      let pid = header
+        .get(AT_DAEMON_PID..AT_DAEMON_PID.checked_add(size_of::<u32>())?)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)?;
+      let created = header
+        .get(AT_DAEMON_CREATED..AT_DAEMON_CREATED.checked_add(size_of::<u64>())?)?
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)?;
+      (pid != 0 && created != 0).then_some(DaemonMark { pid, created })
+    }
+  }
+
+  /// This process's mark (Windows), written into the header before the daemon publishes it.
+  #[cfg(windows)]
+  fn own_mark() -> Result<DaemonMark, IpcError> {
+    Ok(DaemonMark {
+      pid: std::process::id(),
+      created: crate::exit_watch::ExitWatch::own_creation()?,
+    })
+  }
+
+  /// How a claim nothing answers ends (A-443).
+  #[derive(Debug)]
+  enum Ends {
+    /// At this time waited from the claim's start: the restart bound under a live anchor (A-114), or the claim wait
+    /// where the owner's life is not probed (Windows); extended once by a claim wait when the daemon has taken the claim
+    /// to answer it.
+    At(u64),
+    /// When the rendezvous's owner is found gone: a daemon that holds its own rendezvous, or an anchor that holds it and
+    /// was given no restart bound.
+    #[cfg(target_os = "macos")]
+    WithOwner,
+    /// When the daemon exits (Windows, A-447): its process, opened by the header's mark and judged by its creation
+    /// time, whose handle a wait takes beside the claim's Event.
+    #[cfg(windows)]
+    WithDaemon(crate::exit_watch::ExitWatch),
+  }
+
+  /// How a claim on macOS ends unanswered: within the restart bound under a live anchor that was given one, else with
+  /// the rendezvous's owner, whose bootstrap name launchd takes back at its death ([`owner_lives`]).
+  #[cfg(target_os = "macos")]
+  fn unanswered_end(
+    _object: &SharedObject,
+    anchored: bool,
+    restart_wait_ns: u64,
+  ) -> Result<Ends, IpcError> {
+    Ok(if anchored && restart_wait_ns > 0 {
+      Ends::At(restart_wait_ns)
+    } else {
+      Ends::WithOwner
+    })
+  }
+
+  /// The paired arm (Windows, A-447): within the restart bound under a live anchor, as before (a restarted daemon is
+  /// another process); else with the daemon the header's mark names, whose process the claim opens for `SYNCHRONIZE`
+  /// and a limited query alone and judges by its creation time. Opening the owner's named Event instead would keep its
+  /// name and refuse a successor its ownership while the probe held it (A-176); a process handle keeps no object the
+  /// process named. A header with no mark is refused typed: every daemon of this layout writes one before it publishes.
+  #[cfg(windows)]
+  fn unanswered_end(
+    object: &SharedObject,
+    anchored: bool,
+    restart_wait_ns: u64,
+  ) -> Result<Ends, IpcError> {
+    if anchored {
+      return Ok(Ends::At(restart_wait_ns.max(CLAIM_WAIT_NS)));
+    }
+    let mut header = [0u8; HEADER_BYTES];
+    object.read(0, &mut header)?;
+    let mark = DaemonMark::of(&header).ok_or(IpcError::Layout {
+      reason: "the bootstrap header names no daemon process",
+    })?;
+    Ok(Ends::WithDaemon(crate::exit_watch::ExitWatch::on_created(
+      mark.pid,
+      mark.created,
+    )?))
+  }
+
+  /// Whether `instance`'s rendezvous has a live owner (macOS): its token's bootstrap name is held, which launchd takes
+  /// back the moment its holder's receive right dies (`crate::owner_name`, measured there). The look holds nothing of
+  /// the name: a send right to a port keeps neither the port's receive right nor the name alive.
+  #[cfg(target_os = "macos")]
+  fn owner_lives(instance: &str) -> Result<bool, IpcError> {
+    crate::owner_name::look_up(&owner_token_name(instance)).map(|found| found.is_some())
   }
 
   /// Claims a slot and rings the daemon-wide doorbell so a parked control shard sees the claim; nothing
@@ -3830,13 +4049,11 @@ pub mod platform {
     let (handoff, mut object) = open_bootstrap(instance)?;
     // A live holding anchor means the daemon may be restarting: the claim waits out the restart (A-114).
     let anchor = read_u32(&object, AT_ANCHOR_PID)?;
-    let wait_ns = if anchor != 0
-      && crate::exit_watch::ExitWatch::on(anchor).is_ok_and(|watch| !watch.exited())
-    {
-      restart_wait_ns
-    } else {
-      CLAIM_WAIT_NS
-    };
+    let anchored =
+      anchor != 0 && crate::exit_watch::ExitWatch::on(anchor).is_ok_and(|watch| !watch.exited());
+    let ends = unanswered_end(&object, anchored, restart_wait_ns)?;
+    #[cfg(windows)]
+    let stamp = object.atomic_u64(AT_GENERATION)?.load(Ordering::Acquire);
     let index = claim(&mut object, wanted)?;
     #[cfg(windows)]
     let ready_event = match crate::wake::Event::open(&ready_event_name(instance, index)) {
@@ -3868,15 +4085,18 @@ pub mod platform {
       ready_event,
       started: std::time::Instant::now(),
       extended: false,
-      wait_ns,
+      ends,
+      #[cfg(target_os = "macos")]
+      next_look_ns: 0,
+      #[cfg(windows)]
+      stamp,
       open: true,
     })
   }
 
   impl Claim {
-    /// The answer, without waiting: the slot `READY` or `REFUSED` is read and finished; past the claim
-    /// wait the claim is taken back by CAS — only if the daemon has not taken it to answer, whose answer
-    /// is then awaited one more claim wait.
+    /// The answer, without waiting: the slot `READY` or `REFUSED` is read and finished; otherwise the claim is due
+    /// until it ends as [`Ends`] says, with its owner ([`Claim::look`]) or at its deadline ([`Claim::past`]).
     pub(super) fn poll(&mut self) -> Result<Option<Connected>, IpcError> {
       if !self.open {
         return Err(IpcError::DaemonUnavailable {
@@ -3891,10 +4111,58 @@ pub mod platform {
         return self.complete(now).map(Some);
       }
       let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-      if elapsed < self.wait_ns {
+      match &self.ends {
+        Ends::At(wait_ns) => {
+          let wait_ns = *wait_ns;
+          self.past(elapsed, wait_ns)
+        }
+        #[cfg(target_os = "macos")]
+        Ends::WithOwner => self.look(elapsed),
+        #[cfg(windows)]
+        Ends::WithDaemon(daemon) => {
+          if daemon.exited() {
+            self.daemon_went("the daemon exited before answering the claim")
+          } else if self
+            .object
+            .atomic_u64(AT_GENERATION)?
+            .load(Ordering::Acquire)
+            != self.stamp
+          {
+            self.daemon_went(
+              "the daemon stopped before answering the claim: it took back its start stamp",
+            )
+          } else {
+            Ok(None)
+          }
+        }
+      }
+    }
+
+    /// The daemon went with the claim unanswered (Windows, A-447): its process exited, or it stopped inside the process
+    /// and took back its start stamp. The claim is taken back if the daemon never took it (one that took it went
+    /// mid-answer, its slot left to a successor's stale reclaim) and reported unavailable, saying `why`.
+    #[cfg(windows)]
+    fn daemon_went(&mut self, why: &'static str) -> Result<Option<Connected>, IpcError> {
+      let _taken_back = state(&self.object, self.index)?.compare_exchange(
+        CLAIMED,
+        FREE,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+      );
+      self.open = false;
+      Err(IpcError::DaemonUnavailable {
+        endpoint: self.instance.clone(),
+        why,
+      })
+    }
+
+    /// A claim with a deadline, `wait_ns` from its start: due before it; past it the claim is taken back by CAS, only if
+    /// the daemon has not taken it to answer, whose answer is then awaited one more claim wait.
+    fn past(&mut self, elapsed: u64, wait_ns: u64) -> Result<Option<Connected>, IpcError> {
+      if elapsed < wait_ns {
         return Ok(None);
       }
-      let took_back = word
+      let took_back = state(&self.object, self.index)?
         .compare_exchange(CLAIMED, FREE, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
       if took_back || self.extended {
@@ -3908,8 +4176,33 @@ pub mod platform {
       }
       // The daemon took the claim to answer it: its answer is due; wait one more claim wait for it.
       self.extended = true;
-      self.wait_ns = self.wait_ns.saturating_add(CLAIM_WAIT_NS);
+      self.ends = Ends::At(wait_ns.saturating_add(CLAIM_WAIT_NS));
       Ok(None)
+    }
+
+    /// A claim that waits while its rendezvous's owner lives (A-443): due while it does, looked at when the look is due;
+    /// once the owner is found gone, the claim is taken back if the daemon never took it (one that took it died
+    /// mid-answer, its slot left to a successor's stale reclaim) and reported unavailable.
+    #[cfg(target_os = "macos")]
+    fn look(&mut self, elapsed: u64) -> Result<Option<Connected>, IpcError> {
+      if elapsed < self.next_look_ns {
+        return Ok(None);
+      }
+      if owner_lives(&self.instance)? {
+        self.next_look_ns = elapsed.saturating_mul(2).max(elapsed.saturating_add(1));
+        return Ok(None);
+      }
+      let _taken_back = state(&self.object, self.index)?.compare_exchange(
+        CLAIMED,
+        FREE,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+      );
+      self.open = false;
+      Err(IpcError::DaemonUnavailable {
+        endpoint: self.instance.clone(),
+        why: "the daemon's rendezvous has no live owner: its daemon died before answering the claim",
+      })
     }
 
     /// Waits for the answer between polls on the slot's state word (Windows: the slot's Event).
@@ -3924,12 +4217,28 @@ pub mod platform {
           continue;
         }
         let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // Until the claim's deadline, or its owner's next look.
+        let until = match &self.ends {
+          Ends::At(wait_ns) => *wait_ns,
+          #[cfg(target_os = "macos")]
+          Ends::WithOwner => self.next_look_ns,
+          #[cfg(windows)]
+          Ends::WithDaemon(daemon) => {
+            // The answer's Event or the daemon's exit, whichever comes first, or as long again as the claim has waited:
+            // the poll then reads the start stamp, which a daemon stopped inside its own process takes back (A-443's
+            // doubling, so the looks cost the logarithm of the wait). One already exited is read at the poll.
+            if let Some(process) = daemon.handle() {
+              self
+                .ready_event
+                .wait_or_exit(process, Some(elapsed.max(1)))?;
+            }
+            continue;
+          }
+        };
         #[cfg(not(windows))]
-        let _ = wake::wait(word, now, Some(self.wait_ns.saturating_sub(elapsed)))?;
+        let _ = wake::wait(word, now, Some(until.saturating_sub(elapsed)))?;
         #[cfg(windows)]
-        let _ = self
-          .ready_event
-          .wait(Some(self.wait_ns.saturating_sub(elapsed)))?;
+        let _ = self.ready_event.wait(Some(until.saturating_sub(elapsed)))?;
       }
     }
 
@@ -3980,12 +4289,11 @@ pub mod platform {
     /// and this process alone; the answer names nothing.
     #[cfg(target_os = "macos")]
     fn region(&self, _name: String, len: usize) -> Result<ClientRegion, IpcError> {
-      let wait_ms = u32::try_from(CLAIM_WAIT_NS.div_ceil(NS_PER_MS)).unwrap_or(u32::MAX);
+      // Waited for while the owner lives (A-452).
       let fd = crate::mach_claim::fetch(
         &self.instance,
         &owner_token_name(&self.instance),
         self.index,
-        wait_ms,
       )?;
       ClientRegion::from_descriptor(fd, len)
     }
@@ -3996,10 +4304,6 @@ pub mod platform {
       ClientRegion::open(&Handoff::Name(name), len)
     }
   }
-
-  /// Format: nanoseconds in a millisecond, a Mach timeout's unit.
-  #[cfg(target_os = "macos")]
-  const NS_PER_MS: u64 = 1_000_000;
 
   impl Drop for Claim {
     /// A claim dropped unanswered (a cancelled connect) gives its slot back, only while it is still
@@ -4143,6 +4447,122 @@ pub mod platform {
       ));
       assert!(accept(&mut listener, "d").unwrap().is_none());
       assert_eq!(state(&client, 0).unwrap().load(Acquire), FREE);
+    }
+
+    /// Shape: how long the late-answer test leaves its claim unanswered: half again the claim wait, past the second a
+    /// claim gave up at before A-443.
+    #[cfg(target_os = "macos")]
+    const LATE_NS: u64 = CLAIM_WAIT_NS + CLAIM_WAIT_NS / 2;
+    /// Shape: the late-answer test's pause between its polls: a hundredth of the claim wait, so it polls about a hundred
+    /// and fifty times through the wait without spinning a CPU.
+    #[cfg(target_os = "macos")]
+    const POLL_PAUSE_NS: u64 = CLAIM_WAIT_NS / 100;
+
+    /// A-443 (R3's class C). Do: begin a claim with no restart bound on a daemon end that answers it only after half
+    /// again the claim wait, polling it meanwhile; then answer it. Expect: the claim due all the while, then connected
+    /// to the region the daemon end made for it. Before, the claim was refused `DaemonUnavailable` at the claim wait, a
+    /// second, with its daemon alive.
+    #[cfg(target_os = "macos")]
+    #[test]
+    // The test thread stands for a client polling at its own pace: it pauses between its polls.
+    #[allow(clippy::disallowed_methods)]
+    fn a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served() {
+      let name = instance("late");
+      let mut listener = Listener::open(&name, None).unwrap();
+      let mut claim = begin(&name, 0, 0).unwrap();
+      let started = std::time::Instant::now();
+      while started.elapsed() < std::time::Duration::from_nanos(LATE_NS) {
+        assert!(
+          claim.poll().unwrap().is_none(),
+          "the claim is due while its daemon lives"
+        );
+        std::thread::sleep(std::time::Duration::from_nanos(POLL_PAUSE_NS));
+      }
+      let accepted = accept(&mut listener, "late")
+        .unwrap()
+        .expect("the claim is answered");
+      let connected = loop {
+        if let Some(connected) = claim.poll().unwrap() {
+          break connected;
+        }
+      };
+      assert_eq!(connected.region.client_id(), accepted.client_id);
+    }
+
+    /// A-443 (R3's class C). Do: begin a claim with no restart bound on a daemon end, then let the daemon end go with
+    /// the claim unanswered, its owner's token with it, and poll the claim. Expect: refused `DaemonUnavailable` for a
+    /// rendezvous with no live owner, within the claim wait of the daemon's going: by the owner's life, not by a clock.
+    /// Before, the claim waited out the claim wait from its start and was refused for not answering within it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock() {
+      let name = instance("gone");
+      let listener = Listener::open(&name, None).unwrap();
+      let mut claim = begin(&name, 0, 0).unwrap();
+      assert!(claim.poll().unwrap().is_none(), "the claim is due");
+      let gone = std::time::Instant::now();
+      drop(listener);
+      let refusal = loop {
+        match claim.poll() {
+          Ok(None) => {}
+          Ok(Some(_)) => panic!("a claim with no daemon was answered"),
+          Err(refusal) => break refusal,
+        }
+      };
+      let waited = gone.elapsed();
+      println!("a claim on a daemon that went: {refusal:?} after {waited:?}");
+      assert!(
+        matches!(&refusal, IpcError::DaemonUnavailable { why, .. } if why.contains("no live owner")),
+        "{refusal:?}"
+      );
+      assert!(
+        waited < std::time::Duration::from_nanos(CLAIM_WAIT_NS),
+        "the claim ended {waited:?} after its daemon went, not by its owner's life"
+      );
+    }
+
+    /// A-447 (a golden vector and hostile images). Do: put a daemon's mark into a header's image as the daemon writes it
+    /// and read it back; read an image with no mark, one with a zero process id, one with a zero creation time, one too
+    /// short, and one of every bit set. Expect: the process id's four bytes little-endian at 24 and the creation time's
+    /// eight at 32, the mark read back whole; none for the unwritten, zero and short images; the all-set image read as
+    /// written, for the system to refuse its pid; and the layout's magic `SLB3`.
+    #[test]
+    fn the_daemons_mark_is_little_endian_at_its_offsets_and_none_is_read_where_none_was_written() {
+      let mark = DaemonMark {
+        pid: 0x0403_0201,
+        created: 0x1817_1615_1413_1211,
+      };
+      let mut header = [0u8; HEADER_BYTES];
+      let (pid, created) = mark.bytes();
+      header[AT_DAEMON_PID..AT_DAEMON_PID + pid.len()].copy_from_slice(&pid);
+      header[AT_DAEMON_CREATED..AT_DAEMON_CREATED + created.len()].copy_from_slice(&created);
+      assert_eq!(&header[24..28], &[0x01, 0x02, 0x03, 0x04]);
+      assert_eq!(
+        &header[32..40],
+        &[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]
+      );
+      assert_eq!(DaemonMark::of(&header), Some(mark));
+      assert_eq!(
+        DaemonMark::of(&[0u8; HEADER_BYTES]),
+        None,
+        "no mark written"
+      );
+      let mut no_pid = header;
+      no_pid[24..28].fill(0);
+      assert_eq!(DaemonMark::of(&no_pid), None, "a zero process id");
+      let mut no_time = header;
+      no_time[32..40].fill(0);
+      assert_eq!(DaemonMark::of(&no_time), None, "a zero creation time");
+      assert_eq!(DaemonMark::of(&header[..39]), None, "an image too short");
+      assert_eq!(
+        DaemonMark::of(&[0xFF; HEADER_BYTES]),
+        Some(DaemonMark {
+          pid: u32::MAX,
+          created: u64::MAX
+        }),
+        "a hostile mark is read as written; the system refuses its pid"
+      );
+      assert_eq!(MAGIC.to_le_bytes(), *b"SLB3");
     }
 
     /// AUD-29-19 (a cancelled connect). Do: begin a claim on a daemon end that has not accepted it, then

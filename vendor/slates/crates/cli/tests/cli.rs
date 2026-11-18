@@ -546,8 +546,8 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// restarted. Do: start an anchor, freeze its daemon (`SIGSTOP`: alive and silent), and wait for another daemon to
 /// answer. Expect the frozen one gone, killed once, and the anchor's kill line to be its process judgment, never a
 /// withheld beat's: the line names a beat at least a window old and a process that made no progress for at least the
-/// window and at most one more, the window being the liveness budget; and the new daemon answering within the suite's
-/// start wait.
+/// window and at most one more, the window being the anchor's (the liveness budget, raised to how late the anchor's own
+/// waits ran where that is longer, A-461); and the new daemon answering within the suite's start wait.
 ///
 /// A frozen process stops its watchdog with every other thread, so the watchdog's silence cannot say whether the daemon
 /// is stuck or only starved; since A-232 the anchor then judges the process by the start's rule, sparing a starved one
@@ -610,10 +610,9 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
-  assert_eq!(
-    window,
-    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
-    "the anchor's window is the liveness budget"
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the anchor's window is the liveness budget, or longer where its own waits ran later (A-461): {window:?} ({line})"
   );
   assert!(
     age >= window && still >= window,
@@ -634,7 +633,7 @@ const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
 
 /// Format: the words of the anchor's kill line for a daemon whose watchdog has gone silent and whose process the start's
 /// rule finds stuck (`on_lapse`, A-232): "the daemon's watchdog has not looked for L ms, its heartbeat A ms old; its
-/// process made no progress for F ms (the W ms liveness window); killing it".
+/// process made no progress for F ms (its W ms window); killing it" (A-461: the window the anchor judged it by).
 const PROCESS_KILL_LINE: &str = "; its process made no progress for ";
 
 /// The beat's age, how long the process made no progress, and the window the anchor's process kill line names: its
@@ -769,12 +768,30 @@ fn a_stuck_start_is_killed_and_restarted() {
   drop(anchor);
   assert_ne!(answered, stuck);
   assert!(!stuck_alive, "the stuck start was killed");
-  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-  let still_for = kill_line
+  // The stillness and the window the line names (A-461: the anchor's window, the liveness budget or, where its own waits
+  // ran later, longer): "made no progress for F ms (its W ms window)".
+  let named: Vec<u64> = kill_line
     .split_once(STUCK_WORDS)
-    .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-    .and_then(|ms| ms.parse().ok())
-    .map(Duration::from_millis);
+    .map(|(_, rest)| {
+      rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .take(2)
+        .filter_map(|word| word.parse().ok())
+        .collect()
+    })
+    .unwrap_or_default();
+  let (still_for, window) = match named[..] {
+    [still, window] => (
+      Some(Duration::from_millis(still)),
+      Duration::from_millis(window),
+    ),
+    _ => (None, Duration::ZERO),
+  };
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the start was judged by the anchor's window, never under the liveness budget: {kill_line:?}"
+  );
   assert!(
     still_for.is_some_and(|still| still >= window && still < window * 2),
     "killed as a start within a window of its last progress: {kill_line:?}"
@@ -7625,12 +7642,7 @@ fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
   let report: serde_json::Value = serde_json::from_slice(&check.stdout)
     .unwrap_or_else(|e| panic!("apparmor check --json: {e}: {check:?}"));
   let readiness = report["readiness"].as_str().unwrap_or_default().to_owned();
-  match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
-    Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),
-    Ok("absent") => assert_eq!(readiness, "profile-missing", "{report}"),
-    Ok(other) => panic!("{APPARMOR_REGIME_ENV}={other}: expected `loaded` or `absent`"),
-    Err(_) => {}
-  }
+  assert_the_ci_regime(&readiness, &report);
   let root = build_output_dir("slates-apparmor-root");
   let at = build_output_dir("slates-apparmor-at");
   shell(&format!(
@@ -7640,47 +7652,35 @@ fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
   let on = launch_reporting(&root, &at, true);
   let left = shell(&format!("ls -A {at}"));
   shell(&format!("rm -rf {root} {at}"));
+  judge_apparmor_launches(&readiness, &report, &off, &on);
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// When CI names this run's AppArmor regime (`APPARMOR_REGIME_ENV`), the check's readiness must be that regime's.
+#[cfg(target_os = "linux")]
+fn assert_the_ci_regime(readiness: &str, report: &serde_json::Value) {
+  match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
+    Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),
+    Ok("absent") => assert_eq!(readiness, "profile-missing", "{report}"),
+    Ok(other) => panic!("{APPARMOR_REGIME_ENV}={other}: expected `loaded` or `absent`"),
+    Err(_) => {}
+  }
+}
+
+/// The launches with the option off and on, judged by the host's readiness: under a loaded profile only the option's
+/// launch runs, unconfined and holding no grant; with the profile missing both are refused, the option's naming how to
+/// load it; on a host that refuses user namespaces outright, a loud skip; elsewhere both read the volume.
+#[cfg(target_os = "linux")]
+fn judge_apparmor_launches(
+  readiness: &str,
+  report: &serde_json::Value,
+  off: &Launched,
+  on: &Launched,
+) {
   let executable = report["executable"].as_str().unwrap_or_default();
-  match readiness.as_str() {
-    "profile-loaded" => {
-      assert_eq!(
-        on.code, 0,
-        "the profile's launcher runs the command: {}",
-        on.err
-      );
-      assert_eq!(
-        on.out.lines().collect::<Vec<_>>(),
-        ["through-the-bind", "unconfined", "grant-withheld"],
-        "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
-      );
-      assert_eq!(
-        off.code, 4,
-        "without the option the launcher leaves the profile: {}",
-        off.err
-      );
-      assert!(
-        off.err.contains("--apparmor-profile") && off.err.contains(executable),
-        "the refusal names the option and the loaded profile: {}",
-        off.err
-      );
-    }
-    "profile-missing" => {
-      assert_eq!(off.code, 4, "{}", off.err);
-      assert_eq!(
-        off.err.trim(),
-        format!("slates: {CONFINED_REFUSAL}"),
-        "without the option, the refusal as it read before A-370"
-      );
-      assert_eq!(on.code, 4, "{}", on.err);
-      let file = report["profile_file"].as_str().unwrap_or_default();
-      assert!(
-        !file.is_empty()
-          && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
-          && on.err.contains(executable),
-        "with the option, the refusal names this binary's profile and how to load it: {}",
-        on.err
-      );
-    }
+  match readiness {
+    "profile-loaded" => judge_launches_under_a_loaded_profile(off, on, executable),
+    "profile-missing" => judge_launches_with_the_profile_missing(off, on, report, executable),
     _ if off.err.contains("cannot create a user+mount namespace") => {
       eprintln!(
         "SKIP: this host refuses unprivileged user namespaces outright: {}",
@@ -7694,13 +7694,63 @@ fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
       }
     }
   }
-  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
 }
 
-/// A-370. Do: print slates' AppArmor profile for an installed path and for this binary's own, and check this host.
-/// Expect: the profile names the path and grants `userns,` in unconfined mode; a path the profile cannot name exactly
-/// is refused (exit 1) naming why; and the check reports the binary's path as the kernel records it, succeeding exactly
-/// where `exec` can make its namespace.
+/// Under a loaded profile only the option's launch runs, outside the profile and holding no user-namespace grant; the
+/// launch without the option is refused, naming the option and the loaded profile's `executable`.
+#[cfg(target_os = "linux")]
+fn judge_launches_under_a_loaded_profile(off: &Launched, on: &Launched, executable: &str) {
+  assert_eq!(
+    on.code, 0,
+    "the profile's launcher runs the command: {}",
+    on.err
+  );
+  assert_eq!(
+    on.out.lines().collect::<Vec<_>>(),
+    ["through-the-bind", "unconfined", "grant-withheld"],
+    "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
+  );
+  assert_eq!(
+    off.code, 4,
+    "without the option the launcher leaves the profile: {}",
+    off.err
+  );
+  assert!(
+    off.err.contains("--apparmor-profile") && off.err.contains(executable),
+    "the refusal names the option and the loaded profile: {}",
+    off.err
+  );
+}
+
+/// With the profile missing both launches are refused: the one without the option as it read before A-370, the option's
+/// naming this binary's profile file from `report` and how to load it.
+#[cfg(target_os = "linux")]
+fn judge_launches_with_the_profile_missing(
+  off: &Launched,
+  on: &Launched,
+  report: &serde_json::Value,
+  executable: &str,
+) {
+  assert_eq!(off.code, 4, "{}", off.err);
+  assert_eq!(
+    off.err.trim(),
+    format!("slates: {CONFINED_REFUSAL}"),
+    "without the option, the refusal as it read before A-370"
+  );
+  assert_eq!(on.code, 4, "{}", on.err);
+  let file = report["profile_file"].as_str().unwrap_or_default();
+  assert!(
+    !file.is_empty()
+      && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
+      && on.err.contains(executable),
+    "with the option, the refusal names this binary's profile and how to load it: {}",
+    on.err
+  );
+}
+
+/// A-370. Do: print slates' AppArmor profile for an installed path, and for a path it cannot name. Expect: the profile
+/// names the path and grants `userns,` in unconfined mode; a path the profile cannot name exactly is refused (exit 1)
+/// naming why.
 #[test]
 fn apparmor_prints_the_profile_and_checks_the_host() {
   let printed = slates()
@@ -7729,6 +7779,13 @@ fn apparmor_prints_the_profile_and_checks_the_host() {
     .unwrap();
   assert_eq!(refused.status.code(), Some(1), "{refused:?}");
   assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot name exactly"));
+}
+
+/// A-370. Do: check this host, and print this binary's own profile. Expect: the check reports the binary's path as the
+/// kernel records it, succeeding exactly where `exec` can make its namespace, and the profile names that path; off
+/// Linux the check answers `unsupported`.
+#[test]
+fn apparmor_check_reports_this_binary_and_this_host() {
   let check = slates()
     .args(["apparmor", "check", "--json"])
     .output()

@@ -2986,54 +2986,7 @@ impl Volume {
       .snapshots
       .get(snapshot_handle(id))
       .map_err(|_| VfsError::StaleHandle)?;
-    let inode = exact_inode(store, s.inode_root, no)?;
-    if inode.kind.is_special() {
-      return Err(VfsError::SpecialFileOperation);
-    }
-    let size = inode.attrs.size;
-    if off >= size {
-      return Ok(0);
-    }
-    let want = usize::try_from(
-      size
-        .saturating_sub(off)
-        .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
-    )
-    .unwrap_or(0);
-    let out = buf.get_mut(..want).unwrap_or_default();
-    out.fill(0);
-    let read_end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
-    match &inode.body {
-      Body::Inline(bytes) => copy_range(bytes, 0, off, out),
-      Body::Sealed(extents) => {
-        for e in overlapping(extents, off, read_end) {
-          store.content.read_extent_into(e, off, out)?;
-        }
-      }
-      Body::Open { open, sealed } => {
-        for e in overlapping(sealed, off, read_end) {
-          store.content.read_extent_into(e, off, out)?;
-        }
-        copy_range(store.content.open_bytes(open), open.off, off, out);
-      }
-      // A base-backed file as the snapshot froze it: the same rule as the head's `read` — its pinned
-      // extents serve, an unpinned range needs the host (a snapshot has none lent: `BaseUnavailable`),
-      // and a lost entry is `BaseDrift`, never zeros presented as content.
-      Body::Base(b) => {
-        if b.lost {
-          return Err(VfsError::BaseDrift);
-        }
-        let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
-        if unpinned {
-          return Err(VfsError::BaseUnavailable(0));
-        }
-        for e in overlapping(&b.pinned, off, read_end) {
-          store.content.read_extent_into(e, off, out)?;
-        }
-      }
-      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
-    }
-    Ok(want)
+    read_frozen_body(store, exact_inode(store, s.inode_root, no)?, off, buf)
   }
 
   /// A symlink's target as a snapshot holds it.
@@ -3056,6 +3009,35 @@ impl Volume {
       return Err(VfsError::NotFound);
     }
     Ok(inode.attrs)
+  }
+
+  /// Whether inode `no`'s bytes, as the head holds them, are the bytes its witness recorded (A-458): a base file the
+  /// volume copied up for its metadata alone, its body still the disk's, nothing of the volume's own pinned over it and its
+  /// length the witnessed length. Their identity is then the witness's, known without reading the disk, whatever the disk
+  /// holds now: a landing plans the file from it, where a read would refuse a disk that drifted since (`BaseDrift`).
+  pub fn holds_witnessed_bytes(&self, store: &Store, no: InodeNo) -> Result<bool, VfsError> {
+    Ok(witnessed_bytes(self.inode(store, no)?))
+  }
+
+  /// [`Volume::holds_witnessed_bytes`] as snapshot `id` holds inode `no`.
+  pub fn holds_witnessed_bytes_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<bool, VfsError> {
+    Ok(witnessed_bytes(self.inode_in(store, id, no)?))
+  }
+
+  /// The Windows attribute bits kept beside inode `no`'s mode as snapshot `id` holds them (A-262): what a landing of
+  /// the snapshot carries (A-451), as [`Volume::windows_attributes`] gives the head's.
+  pub fn windows_attributes_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<crate::inode::WindowsAttributes, VfsError> {
+    Ok(self.inode_in(store, id, no)?.windows)
   }
 
   /// A device node's number as a snapshot holds it (A-294); `None` for every other kind.
@@ -7136,6 +7118,63 @@ fn materialized_windows_in(
   map
 }
 
+/// The bytes of a frozen inode's body from `off`, as far as `buf` holds (a snapshot's file, or a captured base's in
+/// [`crate::captured::read_file`]): its inline bytes, its sealed and open extents, or a base body's pinned ranges.
+pub(crate) fn read_frozen_body(
+  store: &Store,
+  inode: &Inode,
+  off: u64,
+  buf: &mut [u8],
+) -> Result<usize, VfsError> {
+  if inode.kind.is_special() {
+    return Err(VfsError::SpecialFileOperation);
+  }
+  let size = inode.attrs.size;
+  if off >= size {
+    return Ok(0);
+  }
+  let want = usize::try_from(
+    size
+      .saturating_sub(off)
+      .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+  )
+  .unwrap_or(0);
+  let out = buf.get_mut(..want).unwrap_or_default();
+  out.fill(0);
+  let read_end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
+  match &inode.body {
+    Body::Inline(bytes) => copy_range(bytes, 0, off, out),
+    Body::Sealed(extents) => {
+      for e in overlapping(extents, off, read_end) {
+        store.content.read_extent_into(e, off, out)?;
+      }
+    }
+    Body::Open { open, sealed } => {
+      for e in overlapping(sealed, off, read_end) {
+        store.content.read_extent_into(e, off, out)?;
+      }
+      copy_range(store.content.open_bytes(open), open.off, off, out);
+    }
+    // A base-backed file as the snapshot froze it: the same rule as the head's `read` — its pinned
+    // extents serve, an unpinned range needs the host (a snapshot has none lent: `BaseUnavailable`),
+    // and a lost entry is `BaseDrift`, never zeros presented as content.
+    Body::Base(b) => {
+      if b.lost {
+        return Err(VfsError::BaseDrift);
+      }
+      let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
+      if unpinned {
+        return Err(VfsError::BaseUnavailable(0));
+      }
+      for e in overlapping(&b.pinned, off, read_end) {
+        store.content.read_extent_into(e, off, out)?;
+      }
+    }
+    Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
+  }
+  Ok(want)
+}
+
 /// The inode numbered exactly `no` under the inode table `root`. The table is keyed by the number's 48-bit
 /// counter, which is unique within a volume's lineage (a clone continues its origin's counter); the 16-bit volume
 /// prefix above it is a tag the table does not index, so a number with any other prefix would find the same inode.
@@ -7488,6 +7527,15 @@ fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
 
 /// The sealed extents a body holds: its sealed list, the sealed list beneath an open extent, or a
 /// base body's pinned windows; none for inline, symlink, directory and empty bodies.
+/// Whether `inode` holds its witness's bytes and none of its own ([`Volume::holds_witnessed_bytes`]).
+fn witnessed_bytes(inode: &Inode) -> bool {
+  matches!(
+    &inode.body,
+    Body::Base(base)
+      if base.witness.is_some() && base.pinned.is_empty() && inode.attrs.size == base.base_len
+  )
+}
+
 pub(crate) fn body_extents(body: &Body) -> &[Extent] {
   match body {
     Body::Sealed(extents) => extents,

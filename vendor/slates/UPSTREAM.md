@@ -6,11 +6,11 @@ Slates' A-278), linked from here, never through its command line (the person, 20
 `crates/kiln/src/workspace/slates.rs` calls it, and kiln's own executable runs the instance's anchor and daemon
 (`kiln slates-role`, served by `slates_api::role::main`), so kiln carries no Slates binary and the daemon is the same
 code as the client kiln links. kiln speaks the library's typed consumer contract (A-299) and pins the version it was
-written against (`workspace::slates::CONTRACT`, 36 at this revision): a re-vendor that moves it fails kiln's unit test
+written against (`workspace::slates::CONTRACT`, 41 at this revision): a re-vendor that moves it fails kiln's unit test
 `w1_kiln_speaks_the_contract_it_was_written_against`.
 
 - **Upstream:** https://github.com/hyper-light/slates, branch `main`, commit
-  `e418f5cd240c213d0f07cb395f749e849c9a09fb` (2026-11-18), MIT (`LICENSE`).
+  `1f332da55c8199a04758edf977d3a53df2c9d7f5` (2026-11-18), MIT (`LICENSE`).
 - **What is here:** upstream's tree, at upstream's paths: its crates (`crates/*`), its root manifest, its toolchain,
   lint and format settings with the budgets its own checks read (`clippy.toml`, `rustfmt.toml`,
   `rust-toolchain.toml`, `unsafe-budget.toml`, `ratchets.toml`), its `xtask`, its agents' skills (`skills/`, which its
@@ -44,7 +44,6 @@ branch, and Slates' agent is told of it; a vendoring change alone (the first bel
 | File | Change | Why | Recorded as |
 |---|---|---|---|
 | `Cargo.toml` | each of hyper-raft's crates taken by path from kiln's copy (`../hyper-raft/crates/hyper-*`), not from `vendor/hyper-raft/*`; the root's `[patch.crates-io]` points aws-lc-rs at kiln's copy (`../aws-lc-rs/aws-lc-rs`) and leaves aws-lc-sys crates.io's | kiln holds one copy of each: two linked copies of hyper-raft fail CP-M1's one-revision test, and Slates' own copies (its `vendor/`) aren't here. A path dependency can't be patched, so the paths change | `0001-its-crates-on-kiln-s-one-hyper-raft-and-aws-lc-rs.patch` |
-| `crates/api/src/role/fleet.rs`, `crates/api/src/role/mod.rs`, `crates/api/Cargo.toml` | `role::check_fleet` and `role::FleetCheck`: a fleet manifest and the files it names read, and its node planned, exactly as the node's anchor and daemon do at their start (the planning split from the disk's reads, `plan_from`, with a test of its own, whose certificates `rcgen` mints as a dev-dependency) | kiln writes each chosen runner's fleet manifest and checks it with Slates' own reader before it starts the instance on it (kiln goal 95101ef3, K3). Upstream as Slates' contract 39 (Slates 3e6a8ff6a); here without the contract's number, which names Slates' versions after this revision's 36 | `0002-slates-api-role-check-fleet-a-fleet-manifest-read-and.patch` |
 
 ## Taking a newer upstream
 

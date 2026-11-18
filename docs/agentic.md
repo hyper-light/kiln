@@ -343,8 +343,8 @@ can't run its tools in one. Until then work merges where it always has: as chang
 review and the land queue (C).
 
 **W6 Writing to disk.** **Write to disk…** in its Changes (`agents.land`) shows Slates' plan first:
-what it would create, replace and delete (what git ignores and git's own directory left out), and any file changed in
-the folder since the agent changed it, in which case nothing is written until they agree. kiln
+what it would create, replace and delete, and each file whose mode alone it sets (Slates' contract 41) (what git ignores
+and git's own directory left out), and any file changed in the folder since the agent changed it, in which case nothing is written until they agree. kiln
 speaks Slates' typed consumer contract (slates-api's A-299, pinned at its `CONTRACT`): a plan is
 Slates' present-only answer, which never writes whatever the volume's mode; a landing answers one
 typed outcome, written, held for approval, conflicted or refused. A landing follows the write mode
@@ -454,7 +454,8 @@ Slates serves the volume to the microVM itself, over Slates' own virtio-fs devic
 stream kiln asks of its instance and hands Shards through Hex (Shards' D286, Hex's `ShardsImage::served`,
 `sandbox::served`), so nothing of it is mounted on the machine and the harness works at its project's own
 path in its guest. Its change request is built from the volume's own changes (`workspace::review`: Slates'
-landing entries, each file read from the volume and checked against its BLAKE3; A-287), and its landing
+landing entries, each file read from the volume and checked against its BLAKE3, and a file whose executable bit alone
+changed read there and checked against the folder's copy, whose bytes its landing keeps; A-287), and its landing
 is the same Slates landing as a mounted workspace's. Owed: its real-VM run (`tests/slates_e2e.rs`'s
 `microvm::` drive); Shards' D286 on Shards' main (carried as a recorded change of vendor/shards until then).
 

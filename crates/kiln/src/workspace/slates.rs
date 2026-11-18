@@ -98,7 +98,18 @@ pub const INSTANCE: &str = "kiln";
 /// fleet member (33) and a captured base (34); their refusals kiln shows in Slates' words. The
 /// revision brings Slates' A-384 too, a term for a command line's attachment, which kiln makes
 /// none of (module docs).
-pub const CONTRACT: u32 = 36;
+///
+/// 41 since kiln took Slates at 1f332da55 (from 36; Slates' A-496). kiln uses 39: a fleet runner's
+/// manifest read by Slates' own reader before its instance starts on it (`role::check_fleet`,
+/// `super::slates_fleet::checked`), which kiln carried as a recorded change of its own until this
+/// revision; and 41: a file whose mode or Windows attribute bits alone changed lands as a `chmod`
+/// entry (Slates' A-458), which a plan shows (`summary_json`) and counts among the files it lands
+/// (`planned_files`), and which a review commits where git keeps the change, its executable bit
+/// (`super::review`). It maps 37's `MountMissing::MountManager` (Windows) to its own can't-mount
+/// refusal, and needs none of the rest: a snapshot's archive exported (38) and a volume imported
+/// from one (40), whose refusal (`Invalid::Archive`) kiln shows in Slates' words. kiln's move of a
+/// workspace (`super::slates_move`) uses 33 since 36.
+pub const CONTRACT: u32 = 41;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -247,7 +258,7 @@ fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
             slates_api::MountMissing::FuseDevice => WorkspaceMissing::FuseDevice,
             slates_api::MountMissing::WinFsp => WorkspaceMissing::WinFsp,
             slates_api::MountMissing::MountNfs => WorkspaceMissing::MountNfs,
-            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared => WorkspaceMissing::Mount,
+            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared | slates_api::MountMissing::MountManager => WorkspaceMissing::Mount,
         },
         _ => WorkspaceMissing::Mount,
     }
@@ -960,7 +971,10 @@ fn count_changed(text: &str) -> usize {
     n
 }
 
-/// The files a landing's plan would write, create or delete (not counting directories).
+/// The files a landing's plan would write, create, delete or set the mode of (not counting directories). A mode git keeps
+/// no part of (any permission bit but the executable one, a Windows attribute) is counted all the same, where git's
+/// count of what changed has no record of it: such a landing is held back for review rather than judged by a count that
+/// can't tell it from build output git ignores (Slates' contract 41, `chmod`).
 fn planned_files(plan: &Value) -> usize {
     plan.pointer("/summary/by_action")
         .and_then(Value::as_array)
@@ -991,17 +1005,18 @@ pub async fn writable(m: &Made, over: &str, plan: &Value) -> Result<(), String> 
         return Ok(());
     }
     Err(format!(
-        "it would also write {} file{} git ignores (build output, dependencies) into the folder, made since kiln asked git what it ignores: plan it again once the agent's build is done, or put the work up for review instead",
+        "it would also write {} file{} git doesn't see changed into the folder: what git ignores (build output, dependencies) made since kiln asked git, or a mode git keeps no part of: plan it again once the agent's build is done, or put the work up for review instead",
         planned.saturating_sub(changed),
         if planned.saturating_sub(changed) == 1 { "" } else { "s" }
     ))
 }
 
 /// What a landing would write, as kiln shows it (the shape Slates' own JSON had): entries per
-/// action, bytes to write, entries the filter left out.
+/// action, a file whose mode alone it sets as `chmod` (Slates' contract 41), bytes to write, entries
+/// the filter left out.
 fn summary_json(s: &Summary) -> Value {
     let a = &s.actions;
-    let by_action: Vec<Value> = [("create", a.create), ("replace", a.replace), ("delete", a.delete), ("rename", a.rename), ("mkdir", a.mkdir), ("rmdir", a.rmdir), ("symlink", a.symlink), ("clear", a.clear)]
+    let by_action: Vec<Value> = [("create", a.create), ("replace", a.replace), ("delete", a.delete), ("rename", a.rename), ("mkdir", a.mkdir), ("rmdir", a.rmdir), ("symlink", a.symlink), ("clear", a.clear), ("chmod", a.chmod)]
         .into_iter()
         .filter(|(_, count)| *count > 0)
         .map(|(action, count)| json!({"action": action, "count": count}))
@@ -1399,6 +1414,19 @@ mod tests {
         let held = plan_json(&LandOutcome::Conflicted(vec![conflict]));
         assert_eq!(held.get("conflicts"), Some(&json!(["/README.md"])));
         assert!(held.get("manifest").is_none(), "nothing to approve while it conflicts: {held}");
+        Ok(())
+    }
+
+    /// W6 (Slates' contract 41, A-458): a file whose mode alone changes shows in a plan as `chmod`, after the actions
+    /// kiln always showed, and counts among the files the plan lands, so a person sees every entry they approve, and a
+    /// mode git keeps no part of holds the landing back for review rather than passing as no change.
+    #[test]
+    fn w6_a_plan_shows_a_file_whose_mode_alone_changes_and_counts_it() -> anyhow::Result<()> {
+        let mut shown = approval([0x3c; 32])?;
+        shown.summary.actions.chmod = 2;
+        let plan = plan_json(&LandOutcome::ApprovalRequired(shown));
+        assert_eq!(plan.pointer("/summary/by_action"), Some(&json!([{"action": "create", "count": 2}, {"action": "mkdir", "count": 1}, {"action": "chmod", "count": 2}])));
+        assert_eq!(planned_files(&plan), 4, "two files written and two whose mode alone it sets; the directory not counted");
         Ok(())
     }
 

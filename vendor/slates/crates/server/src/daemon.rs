@@ -75,15 +75,18 @@ pub const LIVENESS_BUDGET_NS: u64 = slates_db::replay::RECOVERY_BUDGET_NS;
 /// Derived: ten liveness budgets ([`LIVENESS_BUDGET_NS`]).
 pub const OBSERVE_BUDGET_NS: u64 = 10 * LIVENESS_BUDGET_NS;
 
-/// Shape: how long [`Daemon::hold_record_session`] waits for a record session that is not in its link — one
-/// liveness budget. A live peer's session is out only for a dispatch, a discovery page or a re-dial, each far
-/// shorter; one still absent after a liveness budget names a real absence, which the hold reports rather than
-/// waits out. Derived: [`LIVENESS_BUDGET_NS`], a tenth of [`OBSERVE_BUDGET_NS`], so the report arrives
-/// inside the observation's budget.
-pub const SESSION_WAIT_NS: u64 = LIVENESS_BUDGET_NS;
+/// Derived: how long test support ([`Daemon::hold_record_session`], [`Daemon::ask_live_reports`]) waits for a record
+/// session that is not in its link (A-449): the span of one record-plane exchange (`fleet::record_exchange_budget_ns`,
+/// the record plane's round budget over the slowest measured path, its whole span), the bound every borrower of a record
+/// session runs its exchange under, so a lent session comes back within it; the span a location round gives a lent
+/// session (A-437), as the supervisor ruled on 2026-11-07. One still absent after it names a real absence, which the
+/// hold reports rather than waits out. Until A-449 it was one liveness window.
+pub fn session_wait_ns() -> u64 {
+  crate::fleet::record_exchange_budget_ns()
+}
 
 /// What [`Daemon::hold_record_session`] found: the session taken (and how long it waited for it), or, after
-/// [`SESSION_WAIT_NS`], why there was none — a link for the peer whose session never came back to it, or no
+/// [`session_wait_ns`], why there was none — a link for the peer whose session never came back to it, or no
 /// link for the peer at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionHold {
@@ -885,15 +888,19 @@ impl Daemon {
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the devices (FUSE devices on Linux, Shards streams' resync
     // ends on Linux and macOS, A-316, A-339), each moved to the shard that owns its attachment, and the NFS loopback
-    // connections, served again on the listener's shard below.
-    let handed = crate::anchor_hold::adopt(config.held_device_bound());
+    // connections, served again on the listener's shard below. Windows parses at most every entry its anchor may hold,
+    // of every class: the attachments' and the DAX sections' (A-448).
+    let handed = crate::anchor_hold::adopt(
+      config
+        .held_device_bound()
+        .saturating_add(config.held_dax_bound()),
+    );
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
-    // The held copies: the Shards streams' DAX objects (A-365), each moved to the shard that owns its attachment; and
-    // the writable direct maps' copies (A-197), each to the shard that holds its map, which Linux alone sends the anchor.
-    #[cfg(unix)]
+    // The held copies: the Shards streams' DAX objects (A-365; Windows' sections, A-448), each moved to the shard that
+    // owns its attachment; and the writable direct maps' copies (A-197), each to the shard that holds its map, which
+    // Linux alone sends the anchor.
     let (other_copies, inherited_dax) = crate::shards::dax_hold::split(handed.copies, shards.len());
-    #[cfg(unix)]
     let mut inherited_dax = inherited_dax.into_iter();
     #[cfg(target_os = "linux")]
     let mut inherited_copies = crate::held_copy::split(other_copies, shards.len()).into_iter();
@@ -902,8 +909,27 @@ impl Daemon {
       // No other kind of copy is held here: one is let go at once, its record no shard's.
       let _released = crate::anchor_hold::release_copy(copy.copy);
     }
+    // No other kind of copy is held on Windows: a section whose record is no DAX record is an entry no shard adopts,
+    // which the control shard releases with the refused mounts (its release is an exchange only a shard can make).
     #[cfg(windows)]
-    let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
+    let mut held_mounts = handed.mounts;
+    #[cfg(windows)]
+    held_mounts.extend(
+      other_copies
+        .into_iter()
+        .map(|copy| crate::anchor_hold::HandedMount {
+          attachment: copy.copy,
+          handles: Vec::new(),
+          record: copy.record,
+          adoptable: false,
+        }),
+    );
+    #[cfg(windows)]
+    let mut inherited_winfsp = crate::winfsp::split_held(held_mounts, shards.len()).into_iter();
+    // The Shards streams' resync ends (A-433), each to the shard that owns its attachment.
+    #[cfg(windows)]
+    let mut inherited_resync =
+      crate::shards::split_held_resync(handed.resync_ends, shards.len()).into_iter();
     #[cfg(windows)]
     let mut windows_channel = handed.channel;
     #[cfg(windows)]
@@ -927,14 +953,16 @@ impl Daemon {
         dax: inherited_dax.next().unwrap_or_default(),
       };
       #[cfg(windows)]
-      let windows_holds = (
-        inherited_winfsp.next().unwrap_or_default(),
-        if index == 0 {
+      let holds = ShardHolds {
+        winfsp: inherited_winfsp.next().unwrap_or_default(),
+        channel: if index == 0 {
           windows_channel.take()
         } else {
           None
         },
-      );
+        resync: inherited_resync.next().unwrap_or_default(),
+        dax: inherited_dax.next().unwrap_or_default(),
+      };
       // This shard's learning of the mounts it keeps, taken before it starts so none of the daemon's crossings is
       // judged before the shard has recorded them (A-227). A Linux shard the anchor handed no FUSE device keeps no mount
       // that could wait on it (a kept mount with no device answers `ENOTCONN`), so it counts as learned at once. A
@@ -964,10 +992,7 @@ impl Daemon {
           (partition, sealing, learning),
           all,
           retained,
-          #[cfg(unix)]
           holds,
-          #[cfg(windows)]
-          windows_holds,
         ));
         if let Err(e) = start.and_then(futures::detach) {
           INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
@@ -1355,7 +1380,7 @@ impl Daemon {
   /// control shard, where the record sessions live, and it sleeps on the shard's timer, so the shard keeps
   /// serving meanwhile. A session that is not in its link when the hold starts (out on a dispatch or a
   /// discovery page, or being established by its link task after a membership change) is waited for, paced
-  /// at the fleet's poll interval, for at most [`SESSION_WAIT_NS`], as a forward waits for it
+  /// at the fleet's poll interval, for at most [`session_wait_ns`], as a forward waits for it
   /// (`fleet::forward_over_leader_session`); taking only what is there at the first look made the hold a race
   /// against those (CI run 36275755772, docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md). Returns
   /// once the hold has run its take, with what it found ([`SessionHold`]); the typed refusal when the control
@@ -1378,7 +1403,7 @@ impl Daemon {
           if !sessions.is_empty() {
             break (sessions, SessionHold::Took { waited_ns });
           }
-          if waited_ns >= SESSION_WAIT_NS {
+          if waited_ns >= session_wait_ns() {
             let linked =
               crate::state::with_state(|s| s.record_sessions.contains_key(&peer)).unwrap_or(false);
             let outcome = if linked {
@@ -1442,7 +1467,7 @@ impl Daemon {
   /// (`live_ship::ask_reports`), each under a budget of `budget_ns`, then waits `settle_ns` (a record period or more,
   /// so queued stragglers are drained) and reports what is left of this node's record link to each peer
   /// ([`LinkAfter`]), with how many rounds found a peer's session in its link to ask over. A round waits for the
-  /// session as [`Self::hold_record_session`] does, for at most the longer of [`SESSION_WAIT_NS`] and `settle_ns`, since
+  /// session as [`Self::hold_record_session`] does, for at most the longer of [`session_wait_ns`] and `settle_ns`, since
   /// a link an earlier round dropped is dialed afresh meanwhile; a round that finds none ends the asking. Runs on the control shard, where the record sessions live. A budget too short for any reply makes each
   /// question unanswered, as a reply past the liveness budget is on a lossy path (KIND's wan-loss profile, CI
   /// diag-raft-chaos-final-41).
@@ -1461,7 +1486,7 @@ impl Daemon {
       .spawn_on_with_receipt(shard, async move {
         let poll_ns = (HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).max(1);
         // A link dropped by an earlier round is dialed afresh by its task, which can take longer than a session wait.
-        let session_wait_ns = SESSION_WAIT_NS.max(settle_ns);
+        let session_wait_ns = session_wait_ns().max(settle_ns);
         let mut asked = 0usize;
         for _ in 0..rounds {
           let began = slates_rt::futures::now_ns();
@@ -1544,7 +1569,7 @@ impl Daemon {
     // Every round's session wait and question, and the settle, on top of the observe budget.
     let rounds_ns = u64::try_from(rounds)
       .unwrap_or(u64::MAX)
-      .saturating_mul(SESSION_WAIT_NS.max(settle_ns).saturating_add(budget_ns));
+      .saturating_mul(session_wait_ns().max(settle_ns).saturating_add(budget_ns));
     let bound_ns = OBSERVE_BUDGET_NS
       .saturating_add(rounds_ns)
       .saturating_add(settle_ns);
@@ -2812,13 +2837,9 @@ impl Daemon {
         (adopted, identities)
       })?;
     if let Some(through) = adopted_through {
+      // Its ledger's, with the versions its durable checkpoint stands for (A-404, A-476).
       let mut ledger = self.observe(self.shards.first().copied(), move |s| {
-        (1..=through)
-          .filter_map(|version| {
-            crate::merge_origin::ledger_value(s, object, version)
-              .map(|value| (version, value.increment))
-          })
-          .collect::<Vec<_>>()
+        crate::merge_origin::ledger_identities(s, object, through)
       })?;
       ledger.append(&mut identities);
       identities = ledger;
@@ -3388,18 +3409,22 @@ impl Daemon {
     })
   }
 
-  /// Test support: while `Some(ns)`, this node's control shard publishes `ns` as its failover delay in place of its
-  /// estimate, and fans it to every shard with the next period (A-363): the bound of every wait that bounds a failover
-  /// (a forward, the location round, a held reply, a takeover's attempts) for a test whose subject is that bound's
-  /// rule. `None` returns to the estimate.
+  /// Test support: while `Some(ns)`, this node publishes `ns` as its failover delay in place of its estimate, on every
+  /// shard at once (A-363, A-414): the bound of every wait that bounds a failover (a forward, the location round, a held
+  /// reply, a takeover's attempts) and the term of the leases that read it (the write lease, a landing's target lease,
+  /// a staging buffer), for a test whose subject is that bound's or term's rule. `None` returns to the estimate at the
+  /// control shard's next period, which the fan carries to the others.
   pub fn inject_failover(&self, ns: Option<u64>) -> Result<(), ObserveError> {
-    self.observe(self.shards.first().copied(), move |s| {
-      s.injected_failover_ns = ns;
-      // In force on the control shard at once; the period's fan carries it to the others.
-      if let Some(ns) = ns {
-        s.failover_ns = ns;
-      }
-    })
+    // On every shard at once: a laptop runs no coordinator to fan it, and a fleet's fan carries the same value.
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| {
+        s.injected_failover_ns = ns;
+        if let Some(ns) = ns {
+          s.failover_ns = ns;
+        }
+      })?;
+    }
+    Ok(())
   }
 
   /// The failover delay this node's waits read now, nanoseconds (A-363): the control shard's estimate in whole
@@ -3755,8 +3780,10 @@ impl Daemon {
       .is_some()
   }
 
-  /// The CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness budget held to
-  /// this build (A-318, [`crate::watchdog::spin_window_ns`]). `None` once the daemon has stopped its watchdog.
+  /// The least CPU one poll may run without a step before the watchdog judges its shard spinning: the liveness window
+  /// held to this build (A-318, [`crate::watchdog::spin_window_ns`]); a shard whose host overruns that window is held to
+  /// its own window's, which is longer (A-455, [`crate::watchdog::watch_window_ns`]). `None` once the daemon has stopped
+  /// its watchdog.
   pub fn spin_window_ns(&self) -> Option<u64> {
     self
       .watchdog
@@ -3802,6 +3829,11 @@ impl Daemon {
     if let Some(watchdog) = self.watchdog.as_ref() {
       watchdog.stopping();
     }
+    // Every replica of a green leaves before its owner is given up (A-457, A-273 step 5a; `slates_mem::sealed`,
+    // "Lifetimes"), while the shards still run to carry the registrations home.
+    if self.runtime.is_some() {
+      self.give_back_replicas();
+    }
     if let Some(runtime) = self.runtime.take()
       && let Err(error) = runtime.shutdown()
     {
@@ -3816,6 +3848,47 @@ impl Daemon {
     // window, then left to the process's end, never waited for without end.
     if let Some(mut log_writer) = self.log_writer.take() {
       log_writer.stop(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
+    }
+  }
+}
+
+impl Daemon {
+  /// Closes every shard's green replicas and waits until no shard holds a registration of one, a replica, or a
+  /// registration owed home (A-457, A-273 step 5a; `crate::green_replicas::close`, `outstanding`), within an
+  /// observation's budget: an owner dropped with a replica registered keeps its blocks to the process's end
+  /// (`slates_mem::sealed::dropped_with_readers`). A shard that cannot be asked, and what is left at the budget, are
+  /// logged, never silent.
+  fn give_back_replicas(&self) {
+    for shard in &self.shards {
+      if let Err(error) = self.observe(Some(*shard), crate::green_replicas::close) {
+        slates_machine::log_line!(
+          "slates-server: stopping: shard {} gives back no replica: {error}",
+          shard.0
+        );
+      }
+    }
+    let started = slates_machine::clock::monotonic_ns();
+    loop {
+      let outstanding = self
+        .shards
+        .iter()
+        .filter_map(|shard| {
+          self
+            .observe(Some(*shard), crate::green_replicas::outstanding)
+            .ok()
+        })
+        .fold(0usize, usize::saturating_add);
+      if outstanding == 0 {
+        return;
+      }
+      if slates_machine::clock::monotonic_ns().saturating_sub(started) > OBSERVE_BUDGET_NS {
+        slates_machine::log_line!(
+          "slates-server: stopping with {outstanding} green replica registrations not given back: their owners keep \
+           their blocks to the process's end"
+        );
+        return;
+      }
+      std::thread::yield_now();
     }
   }
 }
@@ -4039,9 +4112,9 @@ fn content_slice(
   }
 }
 
-/// The DAX range table in this shard's slice of the content object (A-365), with what the previous daemon recorded in
-/// it; none without a content object holding the shard's images (`images`, [`content_slice`]'s range).
-#[cfg(unix)]
+/// The DAX range table in this shard's slice of the content object (A-365; Windows' sections, A-448), with what the
+/// previous daemon recorded in it; none without a content object holding the shard's images (`images`,
+/// [`content_slice`]'s range).
 fn dax_range_table(
   config: &DaemonConfig,
   partition: u16,
@@ -4094,6 +4167,20 @@ struct ShardHolds {
   dax: Vec<crate::shards::dax_hold::InheritedDax>,
 }
 
+/// What the anchor handed back for one shard's partition (Windows): its WinFsp mounts (A-198), the hold channel (the
+/// control shard's alone), and its Shards streams' resync ends (A-433) and DAX sections (A-448).
+#[cfg(windows)]
+struct ShardHolds {
+  /// The held WinFsp mounts.
+  winfsp: Vec<crate::winfsp::InheritedMount>,
+  /// The hold channel's daemon end: the control shard installs it.
+  channel: Option<std::os::windows::io::OwnedHandle>,
+  /// The held Shards streams' resync ends (A-433).
+  resync: Vec<crate::anchor_hold::HandedResync>,
+  /// The held Shards streams' DAX sections (A-448).
+  dax: Vec<crate::shards::dax_hold::InheritedDax>,
+}
+
 /// A shard's start, run alone on its shard ([`futures::spawn_alone`]): its boot fault if the tests set one, then
 /// [`init_shard`], and the boot log's line of how long it took and in how many slices.
 async fn start_shard(
@@ -4103,11 +4190,7 @@ async fn start_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   all: Vec<u16>,
   retained: Option<crate::retention::Retained>,
-  #[cfg(unix)] holds: ShardHolds,
-  #[cfg(windows)] windows_holds: (
-    Vec<crate::winfsp::InheritedMount>,
-    Option<std::os::windows::io::OwnedHandle>,
-  ),
+  holds: ShardHolds,
 ) {
   // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to each
   // shard queues behind it (GAPS, boot, 2026-10-05).
@@ -4125,10 +4208,7 @@ async fn start_shard(
     (partition, sealing, learning),
     &all,
     retained,
-    #[cfg(unix)]
     holds,
-    #[cfg(windows)]
-    windows_holds,
   )
   .await;
   let took_us = started.elapsed().as_micros();
@@ -4253,12 +4333,17 @@ async fn init_shard(
   (partition, sealing, learning): (u16, crate::seal_keys::RootState, ShardLearning),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
-  #[cfg(unix)] holds: ShardHolds,
-  #[cfg(windows)] (inherited_winfsp, windows_channel): (
-    Vec<crate::winfsp::InheritedMount>,
-    Option<std::os::windows::io::OwnedHandle>,
-  ),
+  holds: ShardHolds,
 ) -> Result<crate::recovery_slices::SliceReport, ServerError> {
+  #[cfg(windows)]
+  let ShardHolds {
+    winfsp: inherited_winfsp,
+    channel: windows_channel,
+    resync: inherited_resync,
+    dax: inherited_dax,
+  } = holds;
+  #[cfg(unix)]
+  let inherited_dax = holds.dax;
   // The carrier of what this shard sends other shards whose control channels are full (§4.3, `xshard::carrier`):
   // first, so nothing the shard sends is ever without it. Refused, the shard serves nothing: a typed initialization
   // failure, as a refused serve loop is below.
@@ -4377,8 +4462,7 @@ async fn init_shard(
   };
   let (content_range, write_log, recovered_writes) =
     content_slice(config, partition, content.as_mut());
-  // The DAX range table (A-365), with what the previous daemon recorded in it.
-  #[cfg(unix)]
+  // The DAX range table (A-365; Windows' sections, A-448), with what the previous daemon recorded in it.
   let dax_ranges = dax_range_table(config, partition, content_range, content.as_mut());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
@@ -4422,19 +4506,15 @@ async fn init_shard(
     journal: slates_vfs::checkpoint_log::Journal::default(),
     checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
+    deferred_kept: false,
     published_held: crate::content_holder::PublishedHeld::default(),
     write_log,
     writes_lost: recovered_writes.everything_lost,
     replay: recovered_writes.records,
-    #[cfg(unix)]
     pending_replies: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
     recovered_replies: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
     dax_ranges,
-    #[cfg(unix)]
-    inherited_dax: holds.dax,
-    #[cfg(unix)]
+    inherited_dax,
     adopted_dax: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     nfs_v4: None,
@@ -4488,8 +4568,9 @@ async fn init_shard(
     inherited_copies: holds.copies,
     #[cfg(target_os = "linux")]
     adopt_fuse: Vec::new(),
-    #[cfg(unix)]
     adopt_shards: Vec::new(),
+    #[cfg(windows)]
+    inherited_resync,
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     guest_devices: Vec::new(),
@@ -4530,6 +4611,7 @@ async fn init_shard(
     loop_io: false,
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
+    told_times: crate::told::ToldTimes::default(),
     nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
@@ -4616,6 +4698,7 @@ async fn init_shard(
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
+    green_replicas: crate::green_replicas::GreenReplicas::default(),
     read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
@@ -4714,7 +4797,6 @@ async fn init_shard(
   crate::fuse::adopt_held();
   // The Shards streams whose resync ends the anchor held, served again on fresh streams (A-316, A-339), and every held
   // device no record claimed released.
-  #[cfg(unix)]
   crate::shards::adopt_held();
   #[cfg(windows)]
   crate::winfsp::adopt_held();
@@ -5399,6 +5481,10 @@ fn sample_pressure_hold() -> Option<(u16, Vec<u16>, u64)> {
 async fn free_room_of(origin: u16, shards: &[u16]) -> Vec<u64> {
   let mut free = Vec::with_capacity(shards.len());
   for &shard in shards {
+    // A wall bound, by its reason (A-435): the reap cadence's sample, taken on the control shard's reaper task beside
+    // its lease expiries and reaps; a shard that does not answer within a heartbeat reads as no room (counted), and
+    // the hold it would have taken goes to the others or to the debt the next growth takes on, so nothing is lost,
+    // while a wait in the shard's own time would hold the cadence's other work behind one busy shard.
     let room = crate::xshard::call_within(
       origin,
       shard,
@@ -6320,9 +6406,10 @@ pub(crate) struct StopWatch {
   wake: std::sync::mpsc::SyncSender<()>,
 }
 
-/// Logs a beat that came [`LATE_BEAT_SHARE`] of the liveness budget or more after the one before (§4.14
-/// `daemon.alive`): the shard went that long without running its heartbeat task, and past the budget the anchor
-/// kills it. With the gap goes what the shard did in it, from its counters `before` and `after`: its steps and
+/// Logs a beat that came late, [`LATE_BEAT_SHARE`] of the window the watchdog judges the control shard by or more after
+/// the one before ([`beat_is_late`], A-470; §4.14 `daemon.alive`): the shard went that long without running its heartbeat
+/// task, and past its window the watchdog judges it. With the gap goes what the shard did in it, from its counters
+/// `before` and `after`: its steps and
 /// polls, each long poll by what held it (a task's own CPU past the quantum, the thread blocked in the kernel,
 /// the host keeping a runnable thread off the CPU, or unattributed), the timers it fired, the times it waited,
 /// the tasks it spawned and finished and those live, its longest poll and its measured timer overrun. So a near
@@ -6334,19 +6421,19 @@ fn log_late_beat(
   before: &slates_rt::shard::Counters,
   after: &slates_rt::shard::Counters,
 ) {
-  if gap < LIVENESS_BUDGET_NS / LATE_BEAT_SHARE {
+  if !beat_is_late(gap, after.scheduler_overrun_ns) {
     return;
   }
   let delta =
     |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
   slates_machine::log_line!(
-    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against a {} ms window; \
+    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against its {} ms window; \
      the anchor's beat is the watchdog's now): in the gap the shard \
      ran {} steps and {} polls ({} long in a task, {} blocked in the kernel, {} preempted by the host, {} \
      unattributed), fired {} timers, waited {} times, spawned {} tasks and finished {}; {} tasks live; its \
      longest poll is {} ms and its timer overrun {} ms",
     gap / NS_PER_MS,
-    LIVENESS_BUDGET_NS / NS_PER_MS,
+    crate::watchdog::watch_window_ns(after.scheduler_overrun_ns) / NS_PER_MS,
     delta(|c| c.steps),
     delta(|c| c.polls),
     delta(|c| c.long_steps),
@@ -6363,10 +6450,59 @@ fn log_late_beat(
   );
 }
 
-/// Shape: a beat that late — this share of the liveness budget or more after the last — is logged as a near
-/// miss ([`log_late_beat`]): half the budget, so the stalls that stop short of a kill are seen too. A writer waits for
-/// its volume's FUSE mounts no longer than that ([`crate::told::TOLD_WAIT_NS`], AC-3.3).
+/// Shape: a beat that late — this share of the shard's window or more after the last — is logged as a near
+/// miss ([`log_late_beat`]): half the window, so the stalls that stop short of a kill are seen too. A scatter's part
+/// waits for room a window of that share at a time (`crate::verbs::PART_ROOM_BUDGET_NS`, A-426).
 pub(crate) const LATE_BEAT_SHARE: u64 = 2;
+
+/// Whether the control shard's beat task, run `gap_ns` after its last turn, ran late ([`log_late_beat`], A-470): a
+/// [`LATE_BEAT_SHARE`] or more of the window the watchdog judges that shard by now (A-455,
+/// `crate::watchdog::watch_window_ns` over `overrun_ns`, the scheduler overrun the shard measured). A gap is a near miss
+/// against the verdict the watchdog would reach, and the watchdog reaches it at the shard's own window: on a host that
+/// holds the shard off its CPU longer than the liveness window, a gap that window explains is no near miss, and before
+/// A-470 every such turn was logged as one, against a window the watchdog no longer judged the shard by. Pure, so the
+/// rule is tested on every host.
+pub(crate) fn beat_is_late(gap_ns: u64, overrun_ns: u64) -> bool {
+  gap_ns >= crate::watchdog::watch_window_ns(overrun_ns) / LATE_BEAT_SHARE
+}
+
+#[cfg(test)]
+mod late_beat_tests {
+  use super::{LIVENESS_BUDGET_NS, beat_is_late};
+
+  /// A-470, A-455, §4.14. Do: judge the control shard's beat gaps against the shard's own window, on a quiet shard (no
+  /// overrun measured), on one the host held off its CPU two and a half liveness windows, and on one whose reading ran
+  /// away (an hour, a process stopped whole and continued). Expect: on the quiet shard a gap of three fifths of the
+  /// liveness window late and two fifths not, as before; on the held one three fifths not late, since its window is two
+  /// and a half and the watchdog judges it there, and thirteen tenths late; on the runaway one the ceiling's half the
+  /// line, four windows not late and five late. Before A-470 every gap past half the liveness window was logged as a
+  /// near miss, whatever window the watchdog judged the shard by.
+  #[test]
+  fn a_beat_is_late_against_the_shards_own_window() {
+    let window = LIVENESS_BUDGET_NS;
+    let quiet = 0;
+    assert!(beat_is_late(3 * window / 5, quiet), "a quiet shard's gap");
+    assert!(
+      !beat_is_late(2 * window / 5, quiet),
+      "a quiet shard's short gap"
+    );
+    let held = 5 * window / 2;
+    assert!(
+      !beat_is_late(3 * window / 5, held),
+      "a gap the held shard's window explains"
+    );
+    assert!(
+      beat_is_late(13 * window / 10, held),
+      "past half the held shard's window"
+    );
+    let runaway = 3_600 * window;
+    assert!(
+      !beat_is_late(4 * window, runaway),
+      "under the ceiling's half"
+    );
+    assert!(beat_is_late(5 * window, runaway), "at the ceiling's half");
+  }
+}
 
 /// Format: nanoseconds per millisecond, for the late-beat log.
 const NS_PER_MS: u64 = 1_000_000;
@@ -6522,8 +6658,8 @@ mod limits {
 
 #[cfg(test)]
 pub(crate) use tests::{
-  audit_daemon, audit_daemon_configured, audit_on_shard, audit_on_shard_configured, observe_first,
-  test_profile,
+  audit_daemon, audit_daemon_configured, audit_daemon_of, audit_on_shard,
+  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
 };
 
 #[cfg(test)]
@@ -6723,6 +6859,44 @@ mod tests {
     audit_daemon_with(&profile, config, instance)
   }
 
+  /// A running audit daemon of `shards` shards, bootstrapped, for a test of one shard's call to another (a wait judged
+  /// in its target's own time, A-432); the test stops it.
+  pub(crate) fn audit_daemon_of(shards: u16) -> super::Daemon {
+    let profile = test_profile();
+    static NEXT_OF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let instance = format!(
+      "audit-of-{}-{}",
+      std::process::id(),
+      NEXT_OF.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(shards));
+    audit_daemon_with(&profile, config, instance)
+  }
+
+  /// Shape: a busy poll's cycle ([`hold_busy`]): ten milliseconds.
+  const BUSY_CYCLE_NS: u64 = 10_000_000;
+  /// Shape: the part of each cycle a busy poll runs on its CPU: a fifth, so the shard runs about a fifth of the poll's
+  /// wall time, as a shard starved by its neighbours does (`crates/server/tests/cross_shard_wait.rs`'s control shard).
+  const BUSY_ON_CPU_NS: u64 = BUSY_CYCLE_NS / 5;
+
+  /// Holds the calling shard in one poll for `wall_ns`: a fifth of each cycle spinning on its CPU, the rest asleep, so
+  /// the shard makes progress at a fifth of the wall's pace while every message on its channel waits for the poll's end
+  /// (a busy or starved target, which a wait judged in its own time waits for, A-432).
+  // The busy poll stands for a shard held off its CPU most of each cycle: it must sleep on the shard's thread.
+  #[allow(clippy::disallowed_methods)]
+  pub(crate) fn hold_busy(wall_ns: u64) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_nanos(wall_ns) {
+      let cycle = std::time::Instant::now();
+      while cycle.elapsed() < std::time::Duration::from_nanos(BUSY_ON_CPU_NS) {
+        std::hint::spin_loop();
+      }
+      std::thread::sleep(std::time::Duration::from_nanos(
+        BUSY_CYCLE_NS - BUSY_ON_CPU_NS,
+      ));
+    }
+  }
+
   /// Runs `history` on `daemon`'s first shard (an [`audit_daemon`]'s one), as [`audit_on_shard`] does, leaving the
   /// daemon running.
   pub(crate) fn observe_first<T: Send + 'static>(
@@ -6731,6 +6905,17 @@ mod tests {
   ) -> T {
     daemon
       .observe(daemon.shards.first().copied(), history)
+      .expect("the observation completed")
+  }
+
+  /// [`observe_first`] on the shard of partition `partition`: a test's look at a shard other than the first.
+  pub(crate) fn observe_at<T: Send + 'static>(
+    daemon: &super::Daemon,
+    partition: usize,
+    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  ) -> T {
+    daemon
+      .observe(daemon.shards.get(partition).copied(), history)
       .expect("the observation completed")
   }
 

@@ -2,13 +2,17 @@
 //!
 //! **A call waits while its daemon lives, and fails `DaemonGone` once it is gone (§4.7, A-232).** One rule for every
 //! wait a call makes, the async driver's (`crate::driver`) and the two here: `round_trip`'s wait for its
-//! reply and `send`'s wait for a slot on a full command ring. Each reply deadline that passes asks the daemon's
+//! reply and `send`'s wait for a slot on a full command ring. `round_trip`'s wait has no deadline: it ends at the
+//! reply or at the daemon's departure, which the end waits on beside the reply (`ClientEnd::wait_while_daemon_lives`,
+//! A-456: on Linux the control socket's close, on Windows the daemon's process handle, on macOS its exit watch looked
+//! at on a doubling schedule). The other two cannot see the departure yet (a slot that frees wakes nothing, and the
+//! async driver's loop polls only the completion descriptor), so each reply deadline that passes asks the daemon's
 //! liveness, a cold-path question (`ClientEnd::daemon_gone`: the peer's close on Linux, the exit watch and the
 //! bootstrap stamp on macOS and Windows). Gone, the client reconnects under its id within the reconnect budget and
-//! the caller resends, or the call fails `DaemonGone` past it. Alive, the deadline re-arms and the wait goes on: a
-//! daemon answers every call it is given, however long the work (a granted landing, a forward across the fleet) or
-//! however starved its threads, and a daemon judged stuck is ended by its supervisor, or by its own watchdog when it
-//! runs alone, which the next deadline then finds gone. Until 2026-11-13 a live daemon's overdue call failed
+//! the caller resends, or the call fails `DaemonGone` past it. Alive, the wait goes on: a daemon answers every call it
+//! is given, however long the work (a granted landing, a forward across the fleet) or however starved its threads, and
+//! a daemon judged stuck is ended by its supervisor, or by its own watchdog when it runs alone, which the wait then
+//! sees gone. Until 2026-11-13 a live daemon's overdue call failed
 //! `Stalled` unless its request was one the daemon defers (`defers_reply`, now gone with it); a daemon starved at
 //! `cpu.weight` 1, alive by its own watchdog, had its calls failed so in 10 of 10 runs on both of CI's Linux runners
 //! (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
@@ -33,7 +37,7 @@ use slates_ipc::protocol::{
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
-  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, begin_connect_as, connect_as,
+  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, Waited, begin_connect_as, connect_as,
 };
 use slates_machine::{Derived, derived};
 use slates_wire::request::RequestId;
@@ -113,10 +117,35 @@ pub struct ImageBuilt {
   pub inodes_used: u64,
 }
 
+/// A snapshot exported as its archive (§4.11, A-441): the volume whose root holds the archive file
+/// ([`slates_ipc::protocol::ARCHIVE_FILE`]), read a page at a time with [`Client::read`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveExported {
+  /// The archive volume, the caller's own.
+  pub id: VolumeId,
+  /// The archive file's length in bytes.
+  pub archive_bytes: u64,
+  /// The archive's manifest identity: the BLAKE3 Merkle root of the snapshot's tree (D-17).
+  pub manifest: [u8; 32],
+}
+
+/// A volume made from an archive (§4.11, A-453): the new volume, and the manifest identity of the archive it was made
+/// from, verified against its tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveImported {
+  /// The new volume, the caller's own.
+  pub id: VolumeId,
+  /// The archive's manifest identity: the BLAKE3 Merkle root of the exported snapshot's tree (D-17).
+  pub manifest: [u8; 32],
+}
+
 /// The client's deadlines, every one a derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlines {
-  /// How long a reply is waited for before the daemon's liveness is questioned.
+  /// How long a wait that cannot see the daemon's departure waits before it asks the daemon's liveness, and again
+  /// after each answer that it lives: the async driver's tick, the wait for a slot on a full ring, a delivery's read
+  /// and the macOS route's claim steps. The synchronous wait for a reply uses none: it ends at the reply or the
+  /// departure itself (A-456).
   pub reply_ns: u64,
   /// How long a reconnect is tried after the daemon is found gone.
   pub reconnect_ns: u64,
@@ -184,8 +213,8 @@ pub struct ShardsStream {
   pub stream: StreamEnd,
   /// The device's end of the stream's resync channel (A-316, A-339; `slates_bridge_fuse::shards_resync`),
   /// close-on-exec, to hand the VMM beside the stream's (`slates_ipc::stream::exec_with_ends`): over it a successor
-  /// daemon hands the device a fresh stream after this one's daemon dies. None where the daemon hands none (Windows
-  /// yet), or made no channel.
+  /// daemon hands the device a fresh stream after this one's daemon dies. On Windows (A-427) a handle the daemon
+  /// duplicated into this process, a message-mode pipe's end. None where the daemon made no channel.
   pub resync: Option<StreamEnd>,
 }
 
@@ -1925,9 +1954,13 @@ impl Client {
         lease_epoch,
         capability,
         handle,
+        resync,
       } => Ok(ShardsStream {
         stream: adopt_handed_stream(handle)?,
-        resync: None,
+        // The device's end of the resync channel, beside the stream's (A-427): zero where the daemon made or handed none.
+        resync: (resync != 0)
+          .then(|| adopt_handed_stream(resync))
+          .transpose()?,
         attachment: Attachment {
           attachment,
           lease_epoch,
@@ -2346,8 +2379,9 @@ impl Client {
     })
   }
 
-  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon was found
-  /// gone and the client reconnected instead (the caller binds and resends).
+  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon departed and
+  /// the client reconnected instead (the caller binds and resends). The wait has no deadline: it ends at the reply or
+  /// at the daemon's departure, which the end waits on beside the reply (A-456; the module doc's rule).
   fn round_trip(
     &mut self,
     id: RequestId,
@@ -2357,8 +2391,12 @@ impl Client {
       return Ok(None);
     }
     loop {
-      match self.end.wait(Some(self.deadlines.reply_ns)) {
-        Ok(reply) => {
+      match self
+        .end
+        .wait_while_daemon_lives()
+        .map_err(ClientError::Ipc)?
+      {
+        Waited::Reply(reply) => {
           if reply.request != id.word() {
             // Another request's reply (an async call's, or an abandoned one's still in flight): kept for its
             // caller when one awaits it, else dropped and counted, as the async drain does (AUD-29-22); this wait
@@ -2369,15 +2407,12 @@ impl Client {
           }
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
         }
-        Err(IpcError::DeadlineExceeded) if self.end.daemon_gone() => {
+        // The daemon's process ended with the reply unwritten. A daemon that stops answering is ended by its supervisor,
+        // or by its own watchdog when it runs alone (A-232), so this is where every unanswered call's wait ends.
+        Waited::Departed => {
           self.reconnect()?;
           return Ok(None);
         }
-        // The daemon lives: the next wait re-arms the deadline (the module doc's rule, A-232). A daemon that stops
-        // answering is ended by its supervisor, or by its own watchdog when it runs alone, and a later deadline then
-        // finds it gone.
-        Err(IpcError::DeadlineExceeded) => {}
-        Err(e) => return Err(ClientError::Ipc(e)),
       }
     }
   }
@@ -5037,6 +5072,62 @@ impl Client {
       ReplyBody::BaseCaptured { snapshot } => Ok(snapshot),
       _ => Err(ClientError::UnexpectedReply {
         verb: "capture_base",
+      }),
+    }
+  }
+
+  /// Exports `snapshot` of `volume` as its archive (§4.11, A-441): a new volume `name`, the caller's, whose root holds
+  /// one file, [`slates_ipc::protocol::ARCHIVE_FILE`], the snapshot's content-addressed archive, read a page at a time
+  /// with [`Client::read`]. Waits for the export, which walks the snapshot in slices on its owner. `read` on the volume
+  /// is required; a snapshot whose entries still read an overlay's base is refused `Unsupported` (capture the base
+  /// first, [`Client::capture_base`]).
+  pub fn archive_export(
+    &mut self,
+    volume: VolumeId,
+    snapshot: SnapshotId,
+    name: &str,
+  ) -> Result<ArchiveExported, ClientError> {
+    match self.call(&RequestBody::ArchiveExport {
+      volume,
+      snapshot,
+      name: name.to_owned(),
+    })? {
+      ReplyBody::ArchiveExported {
+        id,
+        archive_bytes,
+        manifest,
+      } => Ok(ArchiveExported {
+        id,
+        archive_bytes,
+        manifest,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "archive_export",
+      }),
+    }
+  }
+
+  /// Makes a volume `name` of `size` from the archive the caller's volume `archive` holds in its root as
+  /// [`slates_ipc::protocol::ARCHIVE_FILE`] (§4.11, A-453), as an export leaves it or as a caller writes the bytes it
+  /// kept; `require_locked` as a create's. Waits for the import, which reads, verifies and restores the archive in
+  /// slices on `archive`'s owner. `read` on `archive` is required; bytes that make no volume are refused
+  /// `ArchiveRefused` by their kind, with nothing made.
+  pub fn archive_import(
+    &mut self,
+    archive: VolumeId,
+    name: &str,
+    size: SizeClass,
+    require_locked: bool,
+  ) -> Result<ArchiveImported, ClientError> {
+    match self.call(&RequestBody::ArchiveImport {
+      archive,
+      name: name.to_owned(),
+      size,
+      require_locked,
+    })? {
+      ReplyBody::ArchiveImported { id, manifest } => Ok(ArchiveImported { id, manifest }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "archive_import",
       }),
     }
   }

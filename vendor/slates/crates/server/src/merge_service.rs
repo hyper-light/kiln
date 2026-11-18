@@ -89,6 +89,9 @@ pub struct MergeShardState {
   pub(crate) checkpoints_changed: BTreeSet<ObjectId>,
   /// The greens this holder refused for good after a recomputation mismatch (fatal-and-loud).
   pub refused: BTreeSet<ObjectId>,
+  /// The greens whose ledger inputs this holder is fetching from a record's sender, its replica behind its own ledger
+  /// (A-412, `fleet::fetch_ledger_inputs`): one fetch a green at a time. Bounded by the greens this holder backs.
+  pub catching_up: BTreeSet<ObjectId>,
   /// Faults a test injects on this holder; never set from the wire.
   pub fault: MergeFault,
   /// Submits whose acceptance waits for their version's merge record to commit at the quorum
@@ -326,13 +329,24 @@ pub(crate) fn settle_green_retention_leaving(
 ) -> Result<(), u64> {
   let floor = reachable_floor(state, green);
   let budget = rejected_cache_budget(state);
+  let replicated = crate::green_replicas::has_replicas(state, green);
   let Some(engine) = state.greens.get_mut(&green) else {
     return Ok(());
   };
   // Oldest-first, only as far as the retention budget needs (the same derived cap the rejected
   // cache is bounded by: one merge byte bound per green) with `room` to spare, never past a live reader's version.
-  engine.fold_history_to_budget(floor, budget.saturating_sub(room));
+  // A green with replicas takes the fold's message for them (A-457, A-273 step 5a) and holds what it keeps for them to
+  // the room this budget leaves beyond its own retention.
+  let fold = if replicated {
+    let (_, fold) = engine.fold_to_budget_and_feed(floor, budget.saturating_sub(room));
+    crate::green_replicas::hold_within(engine, budget);
+    fold
+  } else {
+    engine.fold_history_to_budget(floor, budget.saturating_sub(room));
+    None
+  };
   let wanted = u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX);
+  crate::green_replicas::feed_fold(state, green, fold);
   let charged = state.green_retention.get(&green).copied().unwrap_or(0);
   if wanted > charged {
     // Capacity is claimed as it is needed (A-98), and a green's works, which claim it by their charges, live on other
@@ -570,6 +584,10 @@ pub(crate) enum StoreVerb {
   Base,
   /// `image_build`, `image_merge`: a disk image of a snapshot, and its merge into a clone (A-160).
   Image,
+  /// `archive_export`: a snapshot's archive in a volume of its own (A-441).
+  Archive,
+  /// `archive_import`: the archive file read from a volume's root (A-453).
+  ArchiveRead,
 }
 
 /// The typed refusal a store-backed `verb` gets on a merge volume, or `None` for a plain volume
@@ -600,6 +618,14 @@ pub(crate) fn refuse_store_verb(
     },
     (_, StoreVerb::Image) => Refusal::Unsupported {
       feature: "a disk image of a merge volume".to_owned(),
+    },
+    (_, StoreVerb::Archive) => Refusal::Unsupported {
+      feature: "an archive of a merge volume: export a work's clone of its green instead"
+        .to_owned(),
+    },
+    (_, StoreVerb::ArchiveRead) => Refusal::Unsupported {
+      feature: "an archive read from a merge volume: write the archive into a plain volume's root"
+        .to_owned(),
     },
   };
   Some(refused(refusal))
@@ -1310,7 +1336,8 @@ pub(crate) fn destroy_merge_volume(
     let _ = settle_green_retention(state, work.green);
   }
   crate::verbs::release_origin_snapshot(state, held.as_ref());
-  if state.greens.remove(&id).is_some() {
+  // Its engine is given up once every replica of it has left (A-457, A-273 step 5a).
+  if crate::green_replicas::give_up(state, id) {
     state.merge.attachments.retain(|_, pin| pin.green != id);
     release_green_retention(state, id);
     // Nothing of a destroyed green is left to place: its owner-side placement state goes with it, so the
@@ -3428,6 +3455,7 @@ fn record_standing(
   state: &mut ShardState,
   object: ObjectId,
   version: u64,
+  sender: HostId,
 ) -> Option<RecordStanding> {
   let next = match state.merge.replicas.get(&object) {
     Some(replica) => Some(replica.head().saturating_add(1)),
@@ -3444,10 +3472,48 @@ fn record_standing(
     (Some(next), version) if version < next => Some(RecordStanding::Applied),
     (None, 0) => Some(RecordStanding::Next),
     (Some(next), version) if version == next => Some(RecordStanding::Next),
+    (Some(next), version) => catch_up(state, object, (next, version), sender),
     _ => {
       state.count(OUT_OF_ORDER, 1);
       None
     }
+  }
+}
+
+/// A record of `version` ahead of this holder's replica, whose next version is `next` (A-412). A takeover commits the
+/// versions it adopted again through the register path (`takeover::commit_adopted`), which carries no inputs, and the
+/// record plane never ships a placed version again, so a holder whose replica had not reached them held their records
+/// and nothing that would bring its replica up to them: it answered every later version out of order, for good, and at
+/// `f = 1` with the old owner gone the successor's next version never reached its quorum. Now the versions between come
+/// from this holder's own ledger: with their inputs held, the replica is advanced through the version before and the
+/// record served as its next; with an input not held, it is fetched by identity from `sender`, the record's owner, which
+/// holds every version's inputs while its records name them (A-244), and the record waits for the owner's next
+/// shipment. A version between whose record this holder lacks is out of order, as before.
+fn catch_up(
+  state: &mut ShardState,
+  object: ObjectId,
+  (next, version): (u64, u64),
+  sender: HostId,
+) -> Option<RecordStanding> {
+  let Some(through) = version.checked_sub(1) else {
+    state.count(OUT_OF_ORDER, 1);
+    return None;
+  };
+  match crate::merge_origin::ledger_unheld(state, object, (next, through)) {
+    Err(_) => {
+      state.count(OUT_OF_ORDER, 1);
+      None
+    }
+    Ok(unheld) if !unheld.is_empty() => {
+      crate::fleet::fetch_ledger_inputs(state, object, sender, unheld);
+      None
+    }
+    Ok(_) => match crate::merge_origin::advance_replica(state, object, through) {
+      crate::merge_origin::Rebuild::Installed(head) if head == through => {
+        Some(RecordStanding::Next)
+      }
+      _ => None,
+    },
   }
 }
 
@@ -3527,7 +3593,7 @@ pub(crate) fn accept_merge_record(
   // A different value at a position this holder holds one is held first, which rewinds a replica built over the value
   // it replaces; the record is then served as the replica's next version (A-373).
   hold_replacing_record(state, local, peer_host, record);
-  match record_standing(state, object, value.version) {
+  match record_standing(state, object, value.version, peer_host) {
     None => return Vec::new(),
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
     Some(RecordStanding::Applied) => {

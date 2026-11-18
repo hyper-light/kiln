@@ -144,6 +144,9 @@ pub struct RecordLink {
   /// The session's congestion state when it was last returned or established, so status reports it while a borrower
   /// has it out (a cross-region read keeps it borrowed for the whole transfer).
   pub last_seen: Option<slates_ipc::protocol::SessionReport>,
+  /// How long this peer takes to answer a live exchange as a holder (A-396): the window the control shard holds its idle
+  /// window for through the next one (`live_ship::hold_for_exchange`). Learned again with a new session.
+  pub(crate) live_answers: crate::live_hold::AnswerWindow,
 }
 
 impl RecordLink {
@@ -154,6 +157,7 @@ impl RecordLink {
       borrowed: None,
       lent_to: None,
       last_seen: None,
+      live_answers: crate::live_hold::AnswerWindow::default(),
     }
   }
 
@@ -313,6 +317,10 @@ pub struct ShardState {
   pub checkpoint_buffer: Vec<u8>,
   /// The volume keys the committed journal holds, so a delta names the volumes gone since (A-68).
   pub published_keys: std::collections::BTreeSet<[u8; 16]>,
+  /// Whether the last publication kept a record of a volume it left out, and so kept every deferred block the arena
+  /// holds (A-430, `verbs::keep_left_out_records_blocks`): until one that keeps none commits, a publication run only to
+  /// relieve the arena releases nothing, and is not run.
+  pub(crate) deferred_kept: bool,
   /// What of the held pieces the committed journal holds that a delta cannot tell from the tracked maps alone
   /// (A-270; `crate::content_holder::held_changes`): the whole pieces' bytes and each live copy's published slots.
   pub(crate) published_held: crate::content_holder::PublishedHeld,
@@ -326,29 +334,28 @@ pub struct ShardState {
   pub(crate) replay: Vec<crate::write_log::Logged>,
   /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
   /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
-  /// writes (A-61, A-63), and so is every file a resynced Shards stream's guest had open (A-393).
+  /// writes (A-61, A-63), and so is every file a resynced Shards stream's guest had open (A-393). Unix only: a FUSE
+  /// mount is Linux's and a resynced stream Unix's, and nothing on Windows outlives its daemon to be told (a Windows
+  /// stream's resync is owed, g234), so there the recovered log's verdict has no reader.
   pub(crate) writes_lost: bool,
   /// The barrier reply each FUSE mount (Linux) or resyncable Shards stream (A-316, A-339) is about to deliver (A-61):
   /// recorded before the barrier publishes, so the publication carries it with the effect, and removed once written. At
-  /// most one per attachment (each serves one request at a time).
-  #[cfg(unix)]
+  /// most one per attachment (each serves one request at a time). A Windows stream's too, since A-433.
   pub(crate) pending_replies: std::collections::BTreeMap<u64, slates_vfs::recover::HeldReply>,
   /// The barrier replies the previous daemon published and never delivered, by attachment (A-61), handed to the
   /// mounts and streams recovery keeps.
-  #[cfg(unix)]
   pub(crate) recovered_replies: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
   /// Each range a Shards stream's held DAX backing has answered, in the region of the anchor's content object after the
-  /// delta log (A-365; `crate::dax_ranges`): what a successor ingests and never refills. `None` without a content object.
-  #[cfg(unix)]
+  /// delta log (A-365; Windows' sections, A-448; `crate::dax_ranges`): what a successor ingests and never refills. `None`
+  /// without a content object.
   pub(crate) dax_ranges: Option<crate::dax_ranges::RangeTable>,
-  /// The DAX objects the anchor handed back for this shard's partition (A-365; `crate::shards::dax_hold`), until
-  /// recovery takes each back or lets it go. Bounded by the anchor's held-copy bound.
-  #[cfg(unix)]
+  /// The DAX objects the anchor handed back for this shard's partition (A-365; Windows' sections, A-448;
+  /// `crate::shards::dax_hold`), until recovery takes each back or lets it go. Bounded by the anchor's bound for them
+  /// (`DaemonConfig::held_dax_bound`).
   pub(crate) inherited_dax: Vec<crate::shards::dax_hold::InheritedDax>,
   /// The DAX objects recovery kept again in the store, by the attachment of the stream they belong to, until the
   /// stream's adoption takes them (`crate::shards::adopt_one`); any left after every adoption is let go. Bounded as
   /// `inherited_dax` is, of which these were part.
-  #[cfg(unix)]
   pub(crate) adopted_dax: std::collections::BTreeMap<u64, Vec<crate::shards::dax_hold::AdoptedDax>>,
   /// The NFS write verifier this shard's exports answer WRITE and COMMIT with (RFC 1813
   /// `writeverf3`, §4.6): the shard's boot instant, so it is unique to this daemon instance and a
@@ -570,6 +577,19 @@ pub struct ShardState {
     slates_db::catalog::AttachmentRecord,
     crate::fuse_hold::HeldDevice,
   )>,
+  /// The Windows Shards streams recovery kept because the anchor held their resync ends (A-433), each with its record,
+  /// served again on a fresh stream once the shard runs (`shards::adopt_held`). Filled once at recovery and emptied by
+  /// that step; bounded as `inherited_resync` is, of which these were part.
+  #[cfg(windows)]
+  pub(crate) adopt_shards: Vec<(
+    slates_db::catalog::AttachmentRecord,
+    crate::anchor_hold::HandedResync,
+  )>,
+  /// The Shards streams' resync ends the anchor handed back for this shard's partition (Windows, A-433), until recovery
+  /// keeps each whose record it keeps (`adopt_shards`) or `shards::adopt_held` lets it go. Bounded by the anchor's
+  /// held-entry bound.
+  #[cfg(windows)]
+  pub(crate) inherited_resync: Vec<crate::anchor_hold::HandedResync>,
   /// The read-only views of snapshots presented through host mounts and guest devices, by attachment (AUD-29-76;
   /// `crate::snapshot_view`). Bounded by the partition's attachment cap: one per recorded snapshot attachment.
   pub(crate) snapshot_views: std::collections::BTreeMap<u64, crate::snapshot_view::SnapshotView>,
@@ -702,6 +722,9 @@ pub struct ShardState {
   /// work retirement moves this to exactly what the engine holds. Balanced by construction; bounded
   /// by the greens.
   pub green_retention: BTreeMap<VolumeId, u64>,
+  /// The replicas of greens this shard owns or holds (A-457, A-273 step 5a; `crate::green_replicas`): as an owner, the
+  /// shards it fed and the engines it is retiring; as a replica's shard, the replicas it holds and what they charged.
+  pub(crate) green_replicas: crate::green_replicas::GreenReplicas,
   /// The read-ahead windows this shard's clients hold or are fetching (`crate::verbs::ReadAhead`): the bytes charged,
   /// never past `DaemonConfig::read_ahead_bytes`. Charged before a batch is fetched, credited as each window is
   /// replaced, dropped or its client goes.
@@ -750,6 +773,9 @@ pub struct ShardState {
   /// The writers parked until every FUSE mount of their volume has been told of their change, and the replies held for
   /// them (AC-3.3; `crate::told`). Bounded by the tasks waiting and the shard's client credit.
   pub(crate) told_waiters: crate::told::ToldWaiters,
+  /// How long this shard's writers waited for their volume's FUSE mounts to be told, and the back-off after overdue
+  /// waits: what the told bound is learned from (AC-3.3, A-431; `crate::told::bound_ns`). Two words and an estimator.
+  pub(crate) told_times: crate::told::ToldTimes,
   /// What each NFS connection's client cache holds of the files it touched, by volume (A-192; `crate::nfs_writeback`).
   /// Bounded by the metadata ledger and the listener's connections.
   pub(crate) nfs_writeback: crate::nfs_writeback::WritebackStates,
