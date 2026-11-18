@@ -1414,8 +1414,14 @@ mod tests {
                 let n = asks.fetch_add(1, Ordering::Relaxed);
                 async move { if n < free_at { anyhow::bail!("Resource busy") } else { Ok(()) } }
             };
-            let gone = unmount_patiently(|| busy_until(2), || async { true }, Duration::from_secs(60)).await;
+            // Mounted until an ask has taken it down: the table's word follows the asks.
+            let up_until = |free_at: u32| asks.load(Ordering::Relaxed) <= free_at;
+            let gone = unmount_patiently(|| busy_until(2), || async { up_until(2) }, Duration::from_secs(60)).await;
             anyhow::ensure!(gone == Unmounted::Gone && asks.load(Ordering::Relaxed) == 3, "taken down at its third ask: {gone:?} after {asks:?}");
+            asks.store(0, Ordering::Relaxed);
+            // An unmount that answers done while the table still holds the mount isn't believed: asked again, then held.
+            let told = unmount_patiently(|| busy_until(0), || async { true }, Duration::from_millis(50)).await;
+            anyhow::ensure!(told == Unmounted::StillHeld("the unmount answered done, but the mount table still holds it".into()) && asks.load(Ordering::Relaxed) > 1, "an unmount the table belies: {told:?} after {asks:?}");
             asks.store(0, Ordering::Relaxed);
             let once = unmount_patiently(|| busy_until(u32::MAX), || async { true }, Duration::ZERO).await;
             anyhow::ensure!(once == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) == 1, "no patience: asked once: {once:?} after {asks:?}");
