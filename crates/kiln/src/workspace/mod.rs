@@ -290,21 +290,29 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
 /// writes back to no folder until Slates' move carries its capture (`slates::arrived`, K5). Whether it has a workspace
 /// volume to mount here as it starts ([`mounted_for`]), so its folder is never taken for one this machine lacks.
 pub fn arrived_here(spec: &mut crate::harness::session::Spec, from_elsewhere: bool) -> bool {
-    let Some(w) = spec.workspace.as_mut().filter(|w| w.kind == "volume") else { return false };
-    let Some(m) = w.made.as_ref().filter(|m| !m.mount.is_empty()) else { return false };
-    let arrived = match slates::arrived(m, from_elsewhere) {
-        Ok(arrived) => arrived,
+    let Some(m) = spec.workspace.as_ref().filter(|w| w.kind == "volume").and_then(|w| w.made.clone()).filter(|m| !m.mount.is_empty()) else { return false };
+    match slates::arrived(&m, from_elsewhere) {
+        Ok(arrived) => follow_to(spec, arrived),
         Err(e) => {
             tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "a workspace that arrived couldn't be placed here");
-            return false;
+            false
         }
-    };
-    if arrived.mount != m.mount {
-        let top = place::top(&arrived.mount);
-        let here = if w.sub.is_empty() { top } else { top.join(&w.sub) };
+    }
+}
+
+/// Agent `spec`'s workspace volume as it was placed here, `arrived`: where its mount moved, its folder follows it (the
+/// mount's top, with the agent's place beneath it). Whether it has a workspace volume to mount here.
+fn follow_to(spec: &mut crate::harness::session::Spec, arrived: slates::Made) -> bool {
+    let Some(w) = spec.workspace.as_mut().filter(|w| w.kind == "volume") else { return false };
+    let Some(was) = w.made.as_ref().filter(|m| !m.mount.is_empty()).map(|m| m.mount.clone()) else { return false };
+    let sub = w.sub.clone();
+    let now = arrived.mount.clone();
+    w.made = Some(arrived);
+    if now != was {
+        let top = place::top(&now);
+        let here = if sub.is_empty() { top } else { top.join(&sub) };
         spec.cwd = Some(here.to_string_lossy().into_owned());
     }
-    w.made = Some(arrived);
     true
 }
 
@@ -674,6 +682,28 @@ mod tests {
 
     fn volume_at(volume: &str, mount: &str, over: &str) -> Workspace {
         Workspace { kind: "volume".into(), over: Some(over.into()), made: Some(made(volume, mount)), ..Workspace::default() }
+    }
+
+    /// W7 (kiln goal 01a1ec34599974448aed2672bafaf9a2, I14): an agent whose volume moved here with it works at the mount
+    /// its volume is placed at here, its folder and its environment with it: every path of its environment on the mount
+    /// it left (moved there as it started: an activated virtual environment, a `CARGO_TARGET_DIR`) names its place on the
+    /// new one, and the rest stays as it was.
+    #[test]
+    fn w7_a_moved_agents_folder_and_environment_follow_its_volume_to_its_new_mount() {
+        let (was, now) = ("/Users/a/.kiln/state/workspaces/kiln-x", "/home/b/.kiln/state/workspaces/kiln-x");
+        let mut spec = crate::harness::session::Spec {
+            cwd: Some(format!("{was}/src")),
+            env: vec![("VIRTUAL_ENV".to_owned(), format!("{was}/.venv")), ("CARGO_TARGET_DIR".to_owned(), format!("{was}/target")), ("EDITOR".to_owned(), "vi".to_owned())],
+            workspace: Some(Workspace { sub: "src".into(), ..volume_at("v1", was, "/Users/a/project") }),
+            ..Default::default()
+        };
+        assert!(follow_to(&mut spec, made("v1", now)));
+        assert_eq!(spec.cwd.as_deref(), Some("/home/b/.kiln/state/workspaces/kiln-x/src"));
+        let env: std::collections::HashMap<&str, &str> = spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(env.get("VIRTUAL_ENV"), Some(&"/home/b/.kiln/state/workspaces/kiln-x/.venv"), "{env:?}");
+        assert_eq!(env.get("CARGO_TARGET_DIR"), Some(&"/home/b/.kiln/state/workspaces/kiln-x/target"), "{env:?}");
+        assert_eq!(env.get("EDITOR"), Some(&"vi"));
+        assert_eq!(spec.workspace.and_then(|w| w.made).map(|m| m.mount), Some(now.to_owned()));
     }
 
     /// W2: an ended agent's conversation goes back from its folder on its volume's mount to its person's folder the
