@@ -297,7 +297,10 @@ agents never see it. Ended for good, the agent's volume goes with it, once no ot
 of the agents working in one ends it (on its machine's runner process), and an agent that couldn't start after all
 takes only a volume made for it alone with it. Its mount goes first, asked again while what the agent left behind
 still holds it for as long as the agent's own end took, then let go: detached on Linux, forced off on macOS (Slates'
-`mount::unmount_busy`, contract 36), kiln saying what held it. A mount is its own attachment in Slates (its file-system
+`mount::unmount_busy`, contract 36), kiln saying what held it where it stays. kiln names a mount by its real path, as
+the kernel's mount table names it (macOS reaches `/var`, where temporary folders lie, through a link to
+`/private/var`), and judges whether it's still there by that table, never by looking into the mount, which on a hard
+NFS mount waits on its server and takes any refusal for no mount. A mount is its own attachment in Slates (its file-system
 bridge's), lasting until it's unmounted, as a microVM's stream lasts until it closes (W8): none of kiln's attachments
 has the term Slates gives its command line's, which lapses once nothing renews it (Slates' A-384), so nothing kiln
 keeps between an agent's turns needs renewing.
