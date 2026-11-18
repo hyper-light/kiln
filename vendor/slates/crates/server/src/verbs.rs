@@ -40,7 +40,7 @@ use slates_wire::Wire;
 use slates_wire::observe::{Chokepoint, SpanContext};
 use slates_wire::request::{RequestId, Seen};
 
-use crate::error::{refusal_of_db, refusal_of_vfs};
+use crate::error::{refusal_of_db, refusal_of_mem, refusal_of_vfs};
 use crate::state::{ClientSlot, Deferred, PendingForward, ShardState, VolumeSlot};
 
 /// Format: parts per thousand.
@@ -4273,6 +4273,8 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::PolicyChanged { .. } => "policy_changed",
     Refusal::SignatureRequired { .. } => "signature_required",
     Refusal::Volume { .. } => "volume",
+    Refusal::Database { .. } => "database",
+    Refusal::Target { .. } => "target",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -5888,9 +5890,7 @@ pub(crate) fn admit(
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
+        return Err(Box::new(refused(refusal_of_mem(&e))));
       }
     },
     SizeClass::Dynamic { .. } => None,
@@ -5933,9 +5933,7 @@ pub(crate) fn admit(
         reservation,
         None,
         None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )));
     }
   };
@@ -6124,9 +6122,7 @@ pub(crate) fn publish_created_volume(
       reservation,
       version_credit,
       metadata_credit,
-      Refusal::BadRequest {
-        reason: format!("volume registry full at {full}"),
-      },
+      refusal_of_mem(&slates_mem::MemError::SlabFull { capacity: full }),
     );
   }
   let mut volume = volume;
@@ -6157,9 +6153,7 @@ pub(crate) fn publish_created_volume(
         reservation,
         version_credit,
         metadata_credit,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )
     }
   }
@@ -6243,9 +6237,7 @@ pub(crate) fn reserve_metadata(
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
       Err(Refusal::BudgetExceeded { available })
     }
-    Err(e) => Err(Refusal::BadRequest {
-      reason: e.to_string(),
-    }),
+    Err(e) => Err(refusal_of_mem(&e)),
   }
 }
 
@@ -9000,9 +8992,7 @@ pub(crate) fn admit_clone(
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
+        return Err(Box::new(refused(refusal_of_mem(&e))));
       }
     },
     SizeClass::Dynamic { .. } => None,
@@ -9049,9 +9039,7 @@ pub(crate) fn admit_clone(
         reservation,
         None,
         None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )));
     }
   };
@@ -9231,9 +9219,9 @@ pub(crate) fn publish_clone_as(
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
     discard_clone(state, origin, snapshot, admitted);
-    return Err(Refusal::BadRequest {
-      reason: format!("volume registry full at {full}"),
-    });
+    return Err(refusal_of_mem(&slates_mem::MemError::SlabFull {
+      capacity: full,
+    }));
   }
   let Admitted {
     volume: mut volume_core,
@@ -9265,9 +9253,7 @@ pub(crate) fn publish_clone_as(
         credits.version,
         credits.metadata,
       );
-      Err(Refusal::BadRequest {
-        reason: e.to_string(),
-      })
+      Err(refusal_of_mem(&e))
     }
   }
 }
@@ -10473,9 +10459,7 @@ fn grow_version_reservation(
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
       Err(Refusal::BudgetExceeded { available })
     }
-    Err(e) => Err(Refusal::BadRequest {
-      reason: e.to_string(),
-    }),
+    Err(e) => Err(refusal_of_mem(&e)),
   }
 }
 
@@ -10572,9 +10556,7 @@ fn resize(
         if let Some(v) = version_grown {
           state.store.versions.release(v);
         }
-        return refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        });
+        return refused(refusal_of_mem(&e));
       }
     }
   } else {
@@ -11696,9 +11678,7 @@ pub(crate) fn materialize_taken_over(
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
       }
       Err(e) => {
-        return Err(Box::new(refused(Refusal::BadRequest {
-          reason: e.to_string(),
-        })));
+        return Err(Box::new(refused(refusal_of_mem(&e))));
       }
     },
     SizeClass::Dynamic { .. } => None,
@@ -11727,9 +11707,7 @@ pub(crate) fn materialize_taken_over(
         reservation,
         None,
         None,
-        Refusal::BadRequest {
-          reason: e.to_string(),
-        },
+        refusal_of_mem(&e),
       )));
     }
   };
@@ -14116,6 +14094,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   // content put only once a publish carrying it commits.
   let mut held = crate::content_holder::held_image(state);
   let whole = crate::content_holder::whole_of(&held);
+  let owned = crate::content_holder::owned_of(&held);
   let mut replies = pending_replies(state);
   let mut calls = call_records_checkpoint(state);
   let mut nfs_replies = held_nfs_replies(state);
@@ -14165,6 +14144,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   state.published_keys = published.volumes.iter().map(|id| id.bytes).collect();
   crate::content_holder::held_committed(state, whole, true);
+  crate::live_ship::owned_committed(state, owned, true);
   call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
@@ -14432,6 +14412,7 @@ fn publish_delta_into(
     state.count(DELTA_HELD_BYTES, u64::try_from(carried).unwrap_or(u64::MAX));
   }
   crate::content_holder::held_committed(state, held.whole, false);
+  crate::live_ship::owned_committed(state, held.owned, false);
   call_records_published(state);
   #[cfg(target_os = "linux")]
   clear_write_log(
