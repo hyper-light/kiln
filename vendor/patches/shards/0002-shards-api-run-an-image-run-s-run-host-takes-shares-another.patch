@@ -1,9 +1,9 @@
 Subject: shards api-run: an image run's run host takes shares another server serves (D286, image channel 52)
-Why: the run host's side of Shards' D286, whose API side is change 0001-shards-api-shards-ipc-an-image-run-takes-shares-another (Hex's too): it takes the served shares' streams with the run's request (Unix: the links socket's SERVED_SHARES; Windows: the handles duplicated into it), puts each in a share slot after the run's own, mounts it as a bind's, and saves no run holding one; kiln's microVM engine shares each agent's slates volume into its guest so (kiln goal 01a1ec34599974448f6b7663ddb07001). Upstream on Shards' branch agents/g265-kiln-shards-microvm-served-image-share (4ff40fc99 on main 4776b2e56; e4e0118c8 on 04481e36b), which ROOT lands after Shards' v0.8.0 tag; dropped once kiln takes a Shards revision holding it
+Why: the run host's side of Shards' D286, whose API side is change 0001-shards-api-shards-ipc-an-image-run-takes-shares-another (Hex's too): it takes the served shares' streams with the run's request (Unix: the links socket's SERVED_SHARES; Windows: the handles duplicated into it), puts each in a share slot after the run's own (hosted::served_slots), mounts it as a bind's, and saves no run holding one; kiln's microVM engine shares each agent's slates volume into its guest so (kiln goal 01a1ec34599974448f6b7663ddb07001). Upstream on Shards' branch agents/g265-kiln-shards-microvm-served-image-share (4ff40fc99 and 5376b406a on main 4776b2e56; e4e0118c8 and 74d1bc82f on 04481e36b), which ROOT lands after Shards' v0.8.0 tag; dropped once kiln takes a Shards revision holding it
 Kiln-only: crates/shards, the binary kiln carries (ci/shards/pack.sh), which Hex's API-only copy of Shards doesn't take, so no product holds this change
 
 diff --git a/crates/shards/src/api_run.rs b/crates/shards/src/api_run.rs
-index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42777844ef 100644
+index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc1e6ab142 100644
 --- a/crates/shards/src/api_run.rs
 +++ b/crates/shards/src/api_run.rs
 @@ -20,6 +20,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -221,11 +221,10 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42
              let shape = crate::run::Shape {
                  size: prepared.size,
                  cpu_baseline: &cpu_baseline,
-@@ -3639,7 +3748,63 @@ mod hosted {
-     /// The run `request`, its deadline `ready_by`, of its microVM `shaped`: its members'
-     /// stages, its published ports bound, its nesting grant decided, its setup and spec, its
-     /// security's filters its microVM's own (`Shaped::secured`).
--    fn plan(request: &wire::Request, ready_by: Option<u64>, shaped: Shaped) -> Result<Plan, No> {
+@@ -3636,10 +3745,66 @@ mod hosted {
+         Ok((shaped, layering))
+     }
+ 
 +    /// The run's shares another server serves (D286) given the share slots after its own in
 +    /// `opened`, one for each of `asked`, in order: each slot's descriptor its stream from
 +    /// `streams`, which the run's share process hands its VM as it is (share.rs, as it hands a
@@ -234,7 +233,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42
 +    /// (D279). Refused `Request` where the streams are not one for each, or a place is no
 +    /// absolute path, the root, or one a share, a volume or another served share takes, in the
 +    /// words a bind's refusal has.
-+    fn serve(
++    fn served_slots(
 +        opened: &mut crate::volumes::Opened,
 +        asked: &[wire::ServedAt],
 +        streams: Vec<OwnedFd>,
@@ -277,6 +276,10 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42
 +        Ok(())
 +    }
 +
+     /// The run `request`, its deadline `ready_by`, of its microVM `shaped`: its members'
+     /// stages, its published ports bound, its nesting grant decided, its setup and spec, its
+     /// security's filters its microVM's own (`Shaped::secured`).
+-    fn plan(request: &wire::Request, ready_by: Option<u64>, shaped: Shaped) -> Result<Plan, No> {
 +    fn plan(
 +        request: &wire::Request,
 +        ready_by: Option<u64>,
@@ -291,7 +294,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42
          // `ATTEND`.
          let (_, _, most) = crate::run::sizes(&run.resources, crate::build::host_memory());
 +        // Its shares another server serves (D286), in the slots after its own shares'.
-+        serve(&mut opened, &request.served, served)?;
++        served_slots(&mut opened, &request.served, served)?;
          // The shares it gives members as they start (D277), told in their entries.
          let given = super::share_members(request, &members)?;
          let volumes = agentfile
@@ -477,7 +480,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42
 -        let plan = match plan(&request, ready_by, shaped) {
 +        // No served share's stream (D286): its share process started before its run asked, so a
 +        // run naming one is another microVM's than this one (its exemplar's check above), and
-+        // one this host's exemplar names is refused by `serve` for its streams' want.
++        // one this host's exemplar names is refused by `served_slots` for its streams' want.
 +        let plan = match plan(&request, ready_by, shaped, Vec::new()) {
              Ok(plan) => plan,
              // Its shares' directories went with `shaped`, as `plan` failed.
@@ -515,7 +518,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42
 +    mod served {
 +        use super::*;
 +
-+        /// A descriptor of a file of `dir`'s, standing in for a share's in `Opened`: `serve` reads
++        /// A descriptor of a file of `dir`'s, standing in for a share's in `Opened`: `served_slots` reads
 +        /// none of them.
 +        fn held(dir: &Path, name: &str) -> OwnedFd {
 +            let at = dir.join(name);
@@ -550,7 +553,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42
 +                handle: None,
 +            };
 +            let mut opened = own();
-+            serve(
++            served_slots(
 +                &mut opened,
 +                &[at("/v/a/../b", true, true), at("/x", false, false)],
 +                vec![held(dir.path(), "s0"), held(dir.path(), "s1")],
@@ -598,7 +601,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..a085d6860bdf7f86b9cd12b20ef65e42
 +                ),
 +            ] {
 +                let mut opened = own();
-+                let refused = serve(&mut opened, &asked, streams);
++                let refused = served_slots(&mut opened, &asked, streams);
 +                assert!(
 +                    matches!(&refused, Err(No(Cause::Request, w)) if w.contains(why)),
 +                    "{why}: {refused:?}"

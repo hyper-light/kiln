@@ -1,5 +1,5 @@
 Subject: shards-api, shards-ipc: an image run takes shares another server serves (D286, image channel 52)
-Why: kiln's microVM engine shares each agent's slates volume into its guest over slates' own virtio-fs device, a stream handed to Shards with no host mount between (kiln goal 01a1ec34599974448f6b7663ddb07001); upstream on Shards' branch agents/g265-kiln-shards-microvm-served-image-share (4ff40fc99 on main 4776b2e56, and e4e0118c8 on this revision), which ROOT lands after Shards' v0.8.0 tag; dropped once Hex takes a Shards revision that holds it
+Why: kiln's microVM engine shares each agent's slates volume into its guest over slates' own virtio-fs device, a stream handed to Shards with no host mount between (kiln goal 01a1ec34599974448f6b7663ddb07001); upstream on Shards' branch agents/g265-kiln-shards-microvm-served-image-share (4ff40fc99 and 5376b406a on main 4776b2e56; e4e0118c8 and 74d1bc82f on this revision), which ROOT lands after Shards' v0.8.0 tag; dropped once Hex takes a Shards revision that holds it
 
 diff --git a/crates/api/src/image.rs b/crates/api/src/image.rs
 index 7535c206fb64f6e359d3dc5fad35ee6249986bc8..d8d49211d390d331d364ef3381a509595adf8112 100644
@@ -552,7 +552,7 @@ index 69f3badc528ba3754710b5e875cb67e7c4a95a93..fd6c5a8cfb7d8d1b82336a4a0f1d56fe
      /// starts, as one that fails or is killed does. Expect: the boot refused, its host gone,
      /// and no file of the host's left in its home's `layers`, another host's kept.
 diff --git a/crates/api/src/image/wire.rs b/crates/api/src/image/wire.rs
-index 92b5d66781f5c828636cc4e56039b963ae5baaaa..0bb0274b060461820e390f576a4d9919145ef5fd 100644
+index 92b5d66781f5c828636cc4e56039b963ae5baaaa..6672b7a05fcbd97016ec8b6009749d5c365684cd 100644
 --- a/crates/api/src/image/wire.rs
 +++ b/crates/api/src/image/wire.rs
 @@ -141,8 +141,13 @@ pub use shards_abi::run::nesting::Ready;
@@ -1113,6 +1113,84 @@ index 92b5d66781f5c828636cc4e56039b963ae5baaaa..0bb0274b060461820e390f576a4d9919
              gpu_report: None,
          }
      }
+@@ -7175,8 +7348,9 @@ mod tests {
+             let request = asked(control);
+             assert_eq!(Request::decode(&request.encode().unwrap()).unwrap(), request);
+         }
+-        // Its members' stdio asked (version 44): the request's last byte, read as a flag, and
+-        // one of another value refused by type, never read as a default.
++        // Its members' stdio asked (version 44): the request's last byte but the served shares'
++        // count (version 52), read as a flag, and one of another value refused by type, never
++        // read as a default.
+         let stdio = asked(Some(ControlAsk {
+             controller: [9u8; 32],
+             sockets: None,
+@@ -7184,9 +7358,10 @@ mod tests {
+         }))
+         .encode()
+         .unwrap();
+-        assert_eq!(stdio.last(), Some(&1));
++        let at = stdio.len() - 4 - 1;
++        assert_eq!(stdio[at], 1);
+         let mut bad = stdio.clone();
+-        *bad.last_mut().unwrap() = 2;
++        bad[at] = 2;
+         assert!(matches!(
+             Request::decode(&bad),
+             Err(WireError::Tag {
+@@ -7194,9 +7369,10 @@ mod tests {
+                 tag: 2
+             })
+         ));
+-        // None asked: one byte past v13's encoding, its absence.
++        // None asked: one byte past v13's encoding, its absence, before the served shares' count
++        // (version 52).
+         let none = asked(None).encode().unwrap();
+-        assert_eq!(none.last(), Some(&0));
++        assert_eq!(none.get(none.len() - 4 - 1..), Some(&[0, 0, 0, 0, 0][..]));
+     }
+ 
+     /// Step 11 (b), D252: a started run tells where its endpoint is bound and the microVM's own
+@@ -7296,8 +7472,9 @@ mod tests {
+         // count (version 35) and the share's members (version 37), made one D232's grammar
+         // refuses.
+         let mut unnamed = bytes.clone();
+-        // ... the members' ceilings' count (version 39) and the share's exec flag (version 41).
+-        let at = unnamed.len() - 1 - 1 - 4 - 1 - 4 - 1 - 4 - 4 - 4 - "metal:00000001000002a1".len();
++        // ... the members' ceilings' count (version 39), the share's exec flag (version 41) and the
++        // served shares' count (version 52).
++        let at = unnamed.len() - 4 - 1 - 1 - 4 - 1 - 4 - 1 - 4 - 4 - 4 - "metal:00000001000002a1".len();
+         assert_eq!(unnamed[at], b'm');
+         unnamed[at] = b'x';
+         assert_eq!(Request::decode(&unnamed), Err(WireError::Gpu));
+@@ -7410,11 +7587,24 @@ mod tests {
+         // The second sign-in's CLI, its code after its name, made one no version has; the one
+         // member's MCP bridge's flag (version 25), the upstream roots' count (version 26), the
+         // GPU report's flag (version 29), the plug roots' count (version 35), the share's
+-        // members (version 37), the members' ceilings' count (version 39) and the share's exec
+-        // flag (version 41) after it.
++        // members (version 37), the members' ceilings' count (version 39), the share's exec flag
++        // (version 41) and the served shares' count (version 52) after it.
+         let mut cli = bytes.clone();
+         let at = cli.len()
+-            - (4 + "chatgpt.com".len() + 4 + "api.openai.com".len() + 4 + 1 + 1 + 1 + 4 + 1 + 4 + 1 + 4 + 1);
++            - (4 + "chatgpt.com".len()
++                + 4
++                + "api.openai.com".len()
++                + 4
++                + 1
++                + 1
++                + 1
++                + 4
++                + 1
++                + 4
++                + 1
++                + 4
++                + 1
++                + 4);
+         assert_eq!(cli[at], Cli::Codex.code());
+         cli[at] = 9;
+         assert!(matches!(Request::decode(&cli), Err(WireError::Tag { .. })));
 diff --git a/crates/ipc/src/lib.rs b/crates/ipc/src/lib.rs
 index 4f9d1f8244c107da5118c545cb3fa5aff3c40cbf..290743a7fee91a2bf7b8a1991905068faa56298c 100644
 --- a/crates/ipc/src/lib.rs
