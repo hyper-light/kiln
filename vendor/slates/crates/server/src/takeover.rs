@@ -33,7 +33,10 @@
 //!   retired, so an object waiting for its promise would wait without end. Each learned object counts the periods it
 //!   waits with no member promising it anew and no page advancing ([`PromiseWait`]); past the failover SLO's worth it is
 //!   given up by name ([`give_up_unpromised`]), and the share stays unconfirmed, so its holders keep their copies
-//!   (A-272's rule). A wait past tolerance, for every surviving member, is bounded the same way.
+//!   (A-272's rule). A wait past tolerance, for every surviving member, is bounded the same way. A round that gave
+//!   objects up starts over on a new configuration, and once its retired host is heard alive again, once a refutation
+//!   (A-351, [`HostTakeover::heard_since`]): the configuration re-admits that host only once its retirement completes,
+//!   so without the second the round, the retirement and the fleet's split stayed for good.
 //! - **Confirmation.** A successor confirms its share once every member it asked has answered in full and every
 //!   object it learned is adopted, none given up (A-272, A-304); the council records it ([`crate::fleet`]'s report stream), and a
 //!   retirement becomes a completion record once every survivor has confirmed or carried its share into a takeover
@@ -44,6 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::{ClusterError, CommitBudget, broadcast, commit_record};
 use slates_db::register::{
   Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, Lineage, ObjectId,
@@ -128,6 +132,10 @@ const TAKEOVER_KEPT_UNRESOLVED: &str = "fleet.takeover.kept_unresolved";
 /// ([`Lineage::Lost`]): nothing can recover it. Counted at each install that judges it (A-340). Format: a refusal name in
 /// the daemon's status report.
 const TAKEOVER_KEPT_LOST: &str = "fleet.takeover.kept_lost";
+/// The status count of takeover rounds that gave objects up and started over because their retired host was heard alive
+/// again since ([`HostTakeover::heard_since`], A-351): each judges its given-up objects afresh. Format: a refusal name in
+/// the daemon's status report.
+const TAKEOVER_JUDGED_AFRESH: &str = "fleet.takeover.judged_afresh";
 
 /// Counter: takeover pages and questions by name a test's injected silence left unanswered
 /// (`Daemon::inject_takeover_silence`); zero in production. Format: a counter name in the daemon's status report.
@@ -168,6 +176,15 @@ const TAKEOVER_RECOVERED_PAST_TOLERANCE: &str = "fleet.takeover.recovered_past_t
 /// The status count under which a successor records an object it adopted and placed under itself.
 /// Format: a refusal name in the daemon's status report.
 const TAKEOVER_ADOPTED: &str = "fleet.takeover.adopted";
+
+/// Counter: a takeover round started over, under a newer configuration or above a fence a holder reported
+/// ([`begin_round`]); the objects it adopted stay adopted, and their copies do not raise its epoch (A-353).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_ROUND_RESTARTED: &str = "fleet.takeover.restarted";
+
+/// Counter: a finished share whose confirmation a test withheld (`Daemon::inject_confirmation_withheld`, A-353).
+/// Format: a counter name in the daemon's status report.
+const TAKEOVER_CONFIRMATION_WITHHELD: &str = "fleet.takeover.confirmation_withheld_by_fault";
 
 /// Derived: the bytes one takeover page may carry — the credit a fresh fleet session grants before any window
 /// update (`slates_transport::connection::initial_receive_window` at the fleet frame cap: the reorder
@@ -212,6 +229,14 @@ pub struct HostTakeover {
   /// for ([`give_up_unpromised`]). Never adopted or learned again in this round, and the share is not confirmed while
   /// any is here, so their holders keep their copies (A-272's rule). Bounded by the retired host's objects.
   given_up: BTreeSet<ObjectId>,
+  /// Per learned object judged ready past tolerance ([`ready_objects`]), the first of its cohorts short of the recovery
+  /// quorum: its adoption records it with a volume's head, whose loss report names it once served (A-332). Bounded by
+  /// `learned`: an entry leaves with its object.
+  past_tolerance: BTreeMap<ObjectId, slates_db::catalog::RecoveryShortfall>,
+  /// The retired host's incarnation as this node held it when the round began or last started over: once the host is
+  /// held alive at a newer one, it has been heard since, and a round that gave objects up starts over
+  /// ([`HostTakeover::heard_since`], A-351).
+  judged_incarnation: u64,
 }
 
 /// One learned object's wait for its recovery cohorts' promises (§4.8 phase one), as the round's bound counts it: the
@@ -254,8 +279,8 @@ struct Page {
 }
 
 impl HostTakeover {
-  /// A round under `generation` at `epoch`, having asked nothing yet.
-  fn new(generation: u64, epoch: HostEpoch) -> HostTakeover {
+  /// A round under `generation` at `epoch`, having asked nothing yet, its retired host held at `incarnation`.
+  fn new(generation: u64, epoch: HostEpoch, incarnation: u64) -> HostTakeover {
     HostTakeover {
       generation,
       epoch,
@@ -267,14 +292,17 @@ impl HostTakeover {
       page_advances: 0,
       waits: BTreeMap::new(),
       given_up: BTreeSet::new(),
+      past_tolerance: BTreeMap::new(),
+      judged_incarnation: incarnation,
     }
   }
 
-  /// Starts the round over at `generation` and `epoch`: every promise was for the old round, so every page is
-  /// asked again. What was adopted stays adopted, and the page advances stay counted. What was given up is judged
-  /// afresh: the new configuration may have retired the member it waited for, and an adoption then clears its record
-  /// on the owner shard (`verbs::materialize_taken_over`).
-  fn restart(&mut self, generation: u64, epoch: HostEpoch) {
+  /// Starts the round over at `generation` and `epoch`, its retired host held at `incarnation`: every promise was for
+  /// the old round, so every page is asked again. What was adopted stays adopted, and the page advances stay counted.
+  /// What was given up is judged afresh: the new configuration may have retired the member it waited for, or the
+  /// retired host, heard again, may have ended the wait (A-351); and an adoption then clears its record on the owner
+  /// shard (`verbs::materialize_taken_over`).
+  fn restart(&mut self, generation: u64, epoch: HostEpoch, incarnation: u64) {
     self.generation = generation;
     self.epoch = epoch;
     self.pages.clear();
@@ -283,6 +311,24 @@ impl HostTakeover {
     self.named_nothing.clear();
     self.waits.clear();
     self.given_up.clear();
+    self.past_tolerance.clear();
+    self.judged_incarnation = incarnation;
+  }
+
+  /// Whether this round gave objects up and its retired host has been heard alive since it was last judged: `held`, this
+  /// node's belief about the host, is alive at an incarnation newer than [`HostTakeover::judged_incarnation`] (A-351).
+  /// A host the fleet retired on a false death refutes it when it hears the fleet again, and what held the round's
+  /// promises back may have ended with that: a holder answering its probes deferred every page until it announced the
+  /// configuration that retired it, which it learns from those answers, and a partition that cut it off cut the holders
+  /// off too. Nothing else starts such a round over but a configuration change, and none comes, since the configuration
+  /// re-admits the host only once its retirement completes ([`RegionalConfiguration::admits`]): before, the nemesis's
+  /// fleet stayed split for good, the survivors at two members and the retired owner at three. Once per refutation,
+  /// so a host that stays alive starts a round that gives up again over no more.
+  fn heard_since(&self, held: Option<MemberState>) -> bool {
+    !self.given_up.is_empty()
+      && held.is_some_and(|held| {
+        held.liveness == Liveness::Alive && held.incarnation > self.judged_incarnation
+      })
   }
 
   /// Whether `object` is settled in this round, so no answer makes it learned again: adopted, or given up on.
@@ -812,7 +858,16 @@ async fn drive_host_takeover(
   let past = state::with_state(|s| unpromised_past_the_bound(s, departed)).unwrap_or_default();
   give_up_unpromised(departed, past, local).await;
   let done = state::with_state(|s| round_done(s, departed, local)).unwrap_or(false);
-  if done {
+  // Test support: a confirmation withheld, as one late to commit leaves the share owed (A-353).
+  let withheld = done
+    && state::with_state(|s| {
+      if s.injected_confirmation_withheld {
+        s.count(TAKEOVER_CONFIRMATION_WITHHELD, 1);
+      }
+      s.injected_confirmation_withheld
+    })
+    .unwrap_or(false);
+  if done && !withheld {
     crate::fleet::send_council_report(
       slates_cluster::config_group::ConfigCommand::Confirm {
         departed,
@@ -827,8 +882,9 @@ async fn drive_host_takeover(
   dispatches
 }
 
-/// Readies this period's round of `departed`'s takeover: starts it (or starts it over, on a new configuration
-/// or above a fence a holder reported), promises this node's own copies of the objects that fall to it, and
+/// Readies this period's round of `departed`'s takeover: starts it (or starts it over, on a new configuration,
+/// above a fence a holder reported, or once `departed` is heard alive again after the round gave objects up, A-351),
+/// promises this node's own copies of the objects that fall to it, and
 /// returns each member's next question: its next page while its pages are incomplete, then the objects it has not
 /// answered for by name, if any. `None` while this node's placement
 /// is behind the council's (its round must run under the configuration the holders install).
@@ -846,13 +902,17 @@ pub(crate) fn begin_round(
     state.count(TAKEOVER_EPOCH_EXHAUSTED, 1);
     return None;
   };
+  let held = state.fleet.membership().state(departed);
+  let incarnation = held.map_or(0, |held| held.incarnation);
   let take = state
     .host_takeovers
     .entry(departed)
-    .or_insert_with(|| HostTakeover::new(regional.version, first_epoch));
+    .or_insert_with(|| HostTakeover::new(regional.version, first_epoch, incarnation));
+  let mut restarted = false;
   if take.generation != regional.version {
     let epoch = take.epoch.max(first_epoch);
-    take.restart(regional.version, epoch);
+    take.restart(regional.version, epoch, incarnation);
+    restarted = true;
   }
   if let Some(fence) = take.fenced {
     let Some(above) = fence.0.checked_add(1) else {
@@ -860,9 +920,21 @@ pub(crate) fn begin_round(
       return None;
     };
     let epoch = HostEpoch(above).max(take.epoch);
-    take.restart(regional.version, epoch);
+    take.restart(regional.version, epoch, incarnation);
+    restarted = true;
+  }
+  let judged_afresh = take.heard_since(held);
+  if judged_afresh {
+    let epoch = take.epoch;
+    take.restart(regional.version, epoch, incarnation);
   }
   let (epoch, generation) = (take.epoch, take.generation);
+  if restarted {
+    state.count(TAKEOVER_ROUND_RESTARTED, 1);
+  }
+  if judged_afresh {
+    state.count(TAKEOVER_JUDGED_AFRESH, 1);
+  }
   // This node's own copies count toward each cohort's `f + 1` only once it may promise them, as a holder's
   // answer does ([`gate_open`]); until then it still asks the other members, and counts their answers.
   if gate_open(state, departed) {
@@ -938,10 +1010,18 @@ fn unanswered_by_name(
     .collect()
 }
 
-/// The epoch a new round of `departed`'s takeover starts at: above every epoch this node's copies of the
-/// objects that fall to it were written at, and at least the retired host's bumped fencing epoch — the fence
-/// every holder raised for it at the install. A holder's fence above it sends the round higher. `None` when a
-/// copy was written at `u64::MAX`, which no epoch can exceed.
+/// The epoch a round of `departed`'s takeover starts at, or starts over at under a newer configuration: above every
+/// epoch this node's copies of the objects that fall to it and that the round has not adopted were written at, and at
+/// least the retired host's bumped fencing epoch — the fence every holder raised for it at the install. A holder's
+/// fence above it sends the round higher. `None` when a copy was written at `u64::MAX`, which no epoch can exceed.
+///
+/// An object the round adopted is left out (A-353): its copies hold this node's own adoption and every record it wrote
+/// since, all at the round's epoch, and this node writes it there. Counted, they put a round started over under a newer
+/// configuration one above that epoch, its pages raised every holder's fence for the adopted objects there, and every
+/// record this node wrote for them after was refused `StaleEpoch` for good: the catalog naming a successor's live
+/// holders never placed, its shipper never shipped, and a write through the successor waited without end (the lossy
+/// flow's hang, caught live on a Mac Studio by g229, 2026-11-18). Each survivor's confirmation of its own share is a new
+/// configuration, so the round starts over whenever another survivor confirms first.
 fn initial_epoch(
   state: &ShardState,
   regional: &RegionalConfiguration,
@@ -953,10 +1033,17 @@ fn initial_epoch(
     .get(&departed)
     .copied()
     .unwrap_or(slates_db::register::FIRST_EPOCH);
+  let adopted = state
+    .host_takeovers
+    .get(&departed)
+    .map(|take| &take.adopted);
   state
     .holder_records
     .iter()
-    .filter(|(object, acceptor)| copy_falls_to(regional, acceptor, **object, departed, local))
+    .filter(|(object, acceptor)| {
+      copy_falls_to(regional, acceptor, **object, departed, local)
+        && !adopted.is_some_and(|adopted| adopted.contains(*object))
+    })
     .flat_map(|(_, acceptor)| acceptor.persisted().1)
     .try_fold(bumped, |highest, (_, _, epoch, _)| {
       Some(highest.max(HostEpoch(epoch.0.checked_add(1)?)))
@@ -1185,11 +1272,17 @@ pub(crate) fn ready_objects(
           ready.push((*object, newest));
         }
       }
-      Readiness::ReadyPastTolerance { .. } => {
-        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted.
+      Readiness::ReadyPastTolerance {
+        needed, members, ..
+      } => {
+        // Every surviving member of its cohorts has promised (A-309): adopted as a ready one is, counted, and the cohort
+        // it fell short in kept for the volume's loss report (A-332).
         take.waits.remove(object);
         if let Some(newest) = reports.values().cloned().reduce(newest_of) {
           past_tolerance = past_tolerance.saturating_add(1);
+          take
+            .past_tolerance
+            .insert(*object, shortfall(needed, members));
           ready.push((*object, newest));
         }
       }
@@ -1222,10 +1315,22 @@ pub(crate) fn ready_objects(
   take
     .waits
     .retain(|object, _| take.learned.contains_key(object));
+  take
+    .past_tolerance
+    .retain(|object, _| take.learned.contains_key(object));
   if past_tolerance > 0 {
     state.count(TAKEOVER_RECOVERED_PAST_TOLERANCE, past_tolerance);
   }
   ready
+}
+
+/// The shortfall a readiness past tolerance judged (A-332): a cohort's recovery quorum `needed` and the `members` of it
+/// left, as the loss report counts them.
+fn shortfall(needed: usize, members: usize) -> slates_db::catalog::RecoveryShortfall {
+  slates_db::catalog::RecoveryShortfall {
+    needed: u64::try_from(needed).unwrap_or(u64::MAX),
+    remaining: u64::try_from(members).unwrap_or(u64::MAX),
+  }
 }
 
 /// The members that promised one learned object: those that listed it, with the highest record each holds, and those
@@ -1692,7 +1797,9 @@ fn record_adoption(
   // The members other than this node that reported the adopted position: a green's successor fetches any input it
   // lacks from them (`fleet::fetch_green_inputs`), since each accepted that version holding its inputs.
   let mut reported_adopted = Vec::new();
+  let mut registers_short = None;
   if let Some(take) = state.host_takeovers.get_mut(&departed) {
+    registers_short = take.past_tolerance.remove(&object);
     if let Some(reports) = take.learned.remove(&object) {
       reported_adopted = reports
         .into_iter()
@@ -1740,10 +1847,9 @@ fn record_adoption(
       .collect();
     cohort_hosts.sort_unstable_by_key(|host| host.0);
     cohort_hosts.dedup();
-    state.pending_materializations.insert(
-      object,
-      crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts),
-    );
+    let mut pending = crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts);
+    pending.registers_short = registers_short;
+    state.pending_materializations.insert(object, pending);
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
@@ -1768,7 +1874,7 @@ fn record_adoption(
 }
 
 /// Whether this node's share of `departed`'s takeover is done: every member of the recovery neighbourhoods it
-/// asked has answered in full, and every object it learned is adopted, none given up ([`share_done`]).
+/// asked has answered in full, and every object it learned is adopted and held here, none given up ([`share_done`]).
 fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
   let regional = state.council.configuration();
   let Some(take) = state.host_takeovers.get(&departed) else {
@@ -1779,6 +1885,7 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
     take.fenced.is_none(),
     take.learned.is_empty(),
     take.given_up.is_empty(),
+    !materializing(state, departed),
     regional
       .recovery_hosts(departed)
       .into_iter()
@@ -1787,8 +1894,27 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
   )
 }
 
+/// Whether an object `departed`'s round adopted is still being materialized on this node (A-345): its volume's content,
+/// or its live log, not yet held, or a green not yet rebuilt. Its share is not done until it is, since until then this
+/// node still reads from the holders, and a holder that keeps no record of the object authorizes that read through the
+/// departed owner's kept retirement (`fleet::content_authority`'s `successor`). Confirmed with the registers alone, the
+/// share let the retirement complete and go while a live takeover still waited for a falsely retired holder of the
+/// newest entries, and the other holder then refused the successor every report (the fresh-member flow, 2026-11-18:
+/// `fleet.live.hold_refused.fetch_unauthorized` 82, the volume given up). A retirement kept a little longer only delays
+/// the re-admission of the hosts it names, which still answer a report meanwhile.
+fn materializing(state: &ShardState, departed: HostId) -> bool {
+  state
+    .pending_materializations
+    .values()
+    .any(|pending| pending.departed == Some(departed))
+    || state
+      .pending_green_materializations
+      .values()
+      .any(|pending| pending.departed == Some(departed))
+}
+
 /// Whether a share is done, from its round's facts: under the current configuration, unfenced, every member's page
-/// complete, and every object it learned adopted, none given up (A-272, A-304). A confirmation is what lets the takeover
+/// complete, and every object it learned adopted and held here, none given up (A-272, A-304, A-345). A confirmation is what lets the takeover
 /// complete, and a completed takeover settles its objects' lines for every holder it asked (A-309), so a round with an
 /// object still learned or given up must not confirm: its retirement stays kept, and its holders keep their copies.
 /// Before A-272 an object declared lost was dropped from those learned and the round confirmed as though it had been
@@ -1799,9 +1925,10 @@ fn share_done(
   unfenced: bool,
   nothing_learned: bool,
   nothing_given_up: bool,
+  nothing_materializing: bool,
   every_page: bool,
 ) -> bool {
-  current && unfenced && nothing_learned && nothing_given_up && every_page
+  current && unfenced && nothing_learned && nothing_given_up && nothing_materializing && every_page
 }
 
 #[cfg(test)]
@@ -1854,7 +1981,7 @@ mod tests {
   #[test]
   fn a_round_advances_only_when_a_member_moves_on_and_a_restart_keeps_the_count() {
     let member = HostId(2);
-    let mut take = HostTakeover::new(5, HostEpoch(3));
+    let mut take = HostTakeover::new(5, HostEpoch(3), 0);
     let page = |after: u64, complete: bool| Page {
       after: (!complete).then_some(ObjectId::new(HostId(1), after)),
       complete,
@@ -1871,7 +1998,7 @@ mod tests {
       seen.push(take.page_advances);
     }
     assert_eq!(seen, vec![1, 1, 2, 3, 3]);
-    take.restart(6, HostEpoch(4));
+    take.restart(6, HostEpoch(4), 0);
     assert_eq!(
       take.page_advances, 3,
       "a restart keeps the round's progress counted"
@@ -1880,6 +2007,52 @@ mod tests {
     assert_eq!(
       take.page_advances, 4,
       "the first page asked again after the restart moves the member on"
+    );
+  }
+
+  /// A-351 (§4.8 "Promotion and takeover"; the chaos nemesis's split fleet): a round that gave objects up starts over once
+  /// its retired host is heard alive again, once a refutation. Do: judge a round begun with its host held at incarnation
+  /// 4 that gave nothing up, then, having given an object up, against its host held dead at 5, alive at 4, not held,
+  /// and alive at 5; start it over there, give the object up again and judge it once more. Expect a fresh judgement only
+  /// with an object given up and the host alive at 5, the restart clearing what was given up, and none after it until
+  /// the host refutes again.
+  #[test]
+  fn a_round_that_gave_objects_up_starts_over_once_its_retired_host_is_heard_alive_again() {
+    let held = |liveness, incarnation| {
+      Some(MemberState {
+        liveness,
+        incarnation,
+      })
+    };
+    let given_up = ObjectId::new(HostId(1), 7);
+    let mut take = HostTakeover::new(5, HostEpoch(3), 4);
+    assert!(
+      !take.heard_since(held(Liveness::Alive, 5)),
+      "nothing given up: nothing to judge afresh"
+    );
+    take.given_up.insert(given_up);
+    assert!(
+      !take.heard_since(held(Liveness::Dead, 5)),
+      "held dead: not heard"
+    );
+    assert!(
+      !take.heard_since(held(Liveness::Alive, 4)),
+      "alive at the incarnation the round was judged under: not heard since"
+    );
+    assert!(!take.heard_since(None), "not held at all: not heard");
+    assert!(
+      take.heard_since(held(Liveness::Alive, 5)),
+      "refuted since the round gave the object up: judged afresh"
+    );
+    take.restart(5, HostEpoch(3), 5);
+    assert!(
+      take.given_up.is_empty(),
+      "the restart judges the given-up object afresh"
+    );
+    take.given_up.insert(given_up);
+    assert!(
+      !take.heard_since(held(Liveness::Alive, 5)),
+      "once a refutation: given up again, the round waits for the next"
     );
   }
 
@@ -1922,27 +2095,34 @@ mod tests {
     );
   }
 
-  /// A-272, A-304, A-309: a round confirms its share only once every object it learned is adopted, none given up. Do ask
-  /// whether a share is done with every page complete, with and without an object still learned or given up, and with a
-  /// page missing. Expect done only with nothing learned, nothing given up and every page in. Before A-272 a lost object
+  /// A-272, A-304, A-309, A-345: a round confirms its share only once every object it learned is adopted and held here,
+  /// none given up. Do ask whether a share is done with every page complete, with and without an object still learned,
+  /// given up or still materializing, and with a page missing. Expect done only with nothing learned, nothing given up,
+  /// nothing materializing and every page in. A-345: confirmed with an adopted volume's live log still unfetched, the
+  /// retirement completed and went while the successor waited for a falsely retired holder, and the other holder then
+  /// refused the successor every report. Before A-272 a lost object
   /// counted as done; since A-309 none is lost, and an object past tolerance stays learned until every surviving holder
   /// has answered and it is adopted, or is given up at A-304's bound.
   #[test]
   fn a_round_confirms_only_once_every_object_it_learned_is_adopted() {
     assert!(
-      !share_done(true, true, false, true, true),
+      !share_done(true, true, false, true, true, true),
       "an object still learned: not done, the takeover stays kept"
     );
     assert!(
-      !share_done(true, true, true, false, true),
+      !share_done(true, true, true, false, true, true),
       "an object given up: not done, the takeover stays kept"
     );
     assert!(
-      share_done(true, true, true, true, true),
-      "every object adopted: done"
+      !share_done(true, true, true, true, false, true),
+      "an object adopted but still materializing here: not done, the takeover stays kept (A-345)"
     );
     assert!(
-      !share_done(true, true, true, true, false),
+      share_done(true, true, true, true, true, true),
+      "every object adopted and held: done"
+    );
+    assert!(
+      !share_done(true, true, true, true, true, false),
       "a member's pages incomplete: not done"
     );
   }
@@ -2060,6 +2240,52 @@ mod tests {
     ));
   }
 
+  /// A-345: what keeps a round's share open while its adoptions are not yet held here is exactly the pending objects that
+  /// round adopted. Do: in an audit shard, adopt a volume for departed owner 7 and a green for owner 8, then ask, for each
+  /// owner and for an owner 9 that adopted nothing, whether its round is still materializing; then hold both (take them
+  /// off the pending maps) and ask again. Expect owner 7 and owner 8 materializing while theirs are pending, owner 9
+  /// never, and neither once its object is held.
+  #[test]
+  fn a_round_is_materializing_only_while_an_object_it_adopted_is_pending_here() {
+    crate::daemon::audit_on_shard(|state| {
+      let (seven, eight, nine) = (RegisterHost(7), RegisterHost(8), RegisterHost(9));
+      let volume = ObjectId::new(seven, 1);
+      let green = ObjectId::new(eight, 2);
+      state.pending_materializations.insert(
+        volume,
+        crate::state::PendingVolume::adopted(sealed(&[1], 3), Some(seven), Vec::new()),
+      );
+      let merge = crate::merge_service::MergeRecordValue {
+        version: 1,
+        increment: [3; 32],
+        base: 0,
+        inputs: None,
+        identity: [4; 32],
+        evidence: Vec::new(),
+        name: "pending-green".to_owned(),
+        require_evidence: false,
+        owner: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 0,
+        },
+        completion: None,
+      };
+      state.pending_green_materializations.insert(
+        green,
+        crate::state::PendingGreen::adopted(merge, Some(eight), Vec::new()),
+      );
+      assert!(materializing(state, seven), "owner 7's volume is pending");
+      assert!(materializing(state, eight), "owner 8's green is pending");
+      assert!(!materializing(state, nine), "owner 9 adopted nothing");
+      state.pending_materializations.remove(&volume);
+      state.pending_green_materializations.remove(&green);
+      assert!(
+        !materializing(state, seven) && !materializing(state, eight),
+        "held, neither round is materializing"
+      );
+    });
+  }
+
   fn sealed(keys: &[u64], manifest: u8) -> HeadValue {
     HeadValue {
       manifest: Some([manifest; 32]),
@@ -2159,7 +2385,7 @@ mod tests {
 
   /// A round of the audit node's for `departed`'s takeover that has learned `object` and adopted nothing.
   fn round_that_learned(state: &mut ShardState, departed: HostId, object: ObjectId) {
-    let mut take = HostTakeover::new(state.council.configuration().version, HostEpoch(2));
+    let mut take = HostTakeover::new(state.council.configuration().version, HostEpoch(2), 0);
     take.learned.insert(object, BTreeMap::new());
     state.host_takeovers.insert(departed, take);
   }

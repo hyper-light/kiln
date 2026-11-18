@@ -10,7 +10,7 @@ written against (`workspace::slates::CONTRACT`, 19 at this revision): a re-vendo
 `w1_kiln_speaks_the_contract_it_was_written_against`.
 
 - **Upstream:** https://github.com/hyper-light/slates, branch `main`, commit
-  `e599cae8ab57860478a7973bbb55a0f48a391f1e` (2026-11-18), MIT (`LICENSE`).
+  `ca98a952d0613cfe3a79f93f20b054745bf90710` (2026-11-18), MIT (`LICENSE`).
 - **What is here:** upstream's tree, at upstream's paths: its crates (`crates/*`), its root manifest, its toolchain,
   lint and format settings with the budgets its own checks read (`clippy.toml`, `rustfmt.toml`,
   `rust-toolchain.toml`, `unsafe-budget.toml`, `ratchets.toml`), its `xtask`, its agents' skills (`skills/`, which its

@@ -2189,24 +2189,34 @@ fn stream_through_holding<F: FnOnce(&Instant, &SamplerHolds, &NewestAcknowledged
   })
 }
 
-/// Lets the stream run until `count` writes have been acknowledged since `from`, within the fleet wait (the chaos
-/// thread's way to put an event mid-stream). Polls the owner's log head, which every acknowledged write moves.
+/// Lets the stream run until `count` more positions of the owner's live log are durable than at the call, within the
+/// fleet wait ([`until_durable`]; the chaos thread's way to put an event mid-stream): every acknowledged write moves the
+/// owner's durable position by one at least.
 fn after_writes(owner: &str, volume: &str, count: u64) {
-  let head_now = || {
-    live_states(owner, volume)
-      .unwrap_or_default()
-      .into_iter()
-      .find(|state| !state.holding)
-      .and_then(|state| state.durable)
-  };
-  let from = head_now().unwrap_or(0);
+  let from = owned_durable(owner, volume).unwrap_or(0);
+  until_durable(owner, volume, from.saturating_add(count));
+}
+
+/// `owner`'s durable position of `volume`'s live log as its own line reports it, `None` while it shows none.
+fn owned_durable(owner: &str, volume: &str) -> Option<u64> {
+  live_states(owner, volume)
+    .unwrap_or_default()
+    .into_iter()
+    .find(|state| !state.holding)
+    .and_then(|state| state.durable)
+}
+
+/// Waits until `owner`'s live log of `volume` is durable at `target` or past it, within the fleet wait from the call;
+/// the stall guard: a write the daemon never answers fails the flow with the fleet printed.
+fn until_durable(owner: &str, volume: &str, target: u64) {
+  let from = owned_durable(owner, volume);
   let deadline = Instant::now() + FLEET_WAIT;
-  while head_now().unwrap_or(0) < from + count {
+  while owned_durable(owner, volume).unwrap_or(0) < target {
     if Instant::now() >= deadline {
       let instances = DIAGNOSED.with(|instances| instances.borrow().clone());
       panic!(
-        "the stream made {count} writes durable on {owner} (from {from}, now {:?}):\n{}",
-        head_now(),
+        "the stream made {owner}'s log durable at {target} (from {from:?}, now {:?}):\n{}",
+        owned_durable(owner, volume),
         diagnosis(&instances, volume)
       );
     }
@@ -3461,6 +3471,10 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
         "StaleNeverCommits (fences)",
         fenced_at_or_above(&survivors, &volume, epoch),
       );
+      verdict.check(
+        "the loss report names a takeover past tolerance exactly when it went past (A-332)",
+        past_tolerance_reported(successor, &volume),
+      );
       judge_takeover(
         &mut verdict,
         &fleet,
@@ -3490,6 +3504,51 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
   }
   drop(fleet);
   verdict.judge();
+}
+
+/// A-332: where `successor`'s loss report for `volume` and its counts disagree on whether its takeover went past
+/// tolerance: its registers (`fleet.takeover.recovered_past_tolerance`) and its live log
+/// (`fleet.live.taken_over_past_tolerance`), each part named in the report exactly when the successor counted it. Each
+/// disagreement in words; empty when they agree. The flow's fleet serves this one volume, so a count is its own.
+fn past_tolerance_reported(successor: &str, volume: &str) -> Vec<String> {
+  let counted = [
+    counter(successor, "fleet.takeover.recovered_past_tolerance") > 0,
+    counter(successor, "fleet.live.taken_over_past_tolerance") > 0,
+  ];
+  let report = Client::connect(successor, deadlines())
+    .map_err(|e| format!("{e:?}"))
+    .and_then(|mut client| {
+      client
+        .status(volume_id_of(volume))
+        .map_err(|e| format!("{e:?}"))
+    });
+  let taken = match report {
+    Ok(report) => report.loss.taken_over,
+    Err(why) => return vec![format!("{successor} answered no status of {volume}: {why}")],
+  };
+  let Some(taken) = taken else {
+    return vec![format!(
+      "{successor}'s loss report names no takeover of {volume}"
+    )];
+  };
+  let named = [
+    taken
+      .past_tolerance
+      .is_some_and(|past| past.registers.is_some()),
+    taken
+      .past_tolerance
+      .is_some_and(|past| past.live_log.is_some()),
+  ];
+  ["registers", "live log"]
+    .iter()
+    .zip(counted.iter().zip(named))
+    .filter(|(_, (counted, named))| **counted != *named)
+    .map(|(part, (counted, named))| {
+      format!(
+        "{successor}: its {part} past tolerance counted {counted}, reported {named} ({taken:?})"
+      )
+    })
+    .collect()
 }
 
 /// The control for every chaos flow's latency: do stream writes to a live volume on a fleet nothing disturbs, for
@@ -3825,17 +3884,17 @@ fn a_long_live_log_is_taken_over_whole() {
   let target = u64::try_from(LONG_LOG).unwrap();
   let (outcomes, samples) = stream_through(&fleet.instances, &owner, &volume, 0..LONG_LOG, |_| {
     loop {
-      let durable = live_states(&owner, &volume)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|state| !state.holding)
-        .and_then(|state| state.durable)
-        .unwrap_or(0);
-      let left = target.saturating_sub(durable);
-      if left == 0 {
+      let durable = owned_durable(&owner, &volume).unwrap_or(0);
+      if durable >= target {
         break;
       }
-      after_writes(&owner, &volume, left.min(BETWEEN_EVENTS));
+      // Each step's target is absolute, from this one reading: a step re-read later asked past the stream's end
+      // (from 962, 40 more, against a log that ended at 1,001: CI diag run 44274378785, Linux x86_64, 2026-11-18).
+      until_durable(
+        &owner,
+        &volume,
+        target.min(durable.saturating_add(BETWEEN_EVENTS)),
+      );
     }
   });
   verdict.note(latency_line(&outcomes));
@@ -4965,6 +5024,23 @@ fn slow_candidate_waited(outcomes: &[Outcome], slowed: (Duration, Duration)) -> 
   }
 }
 
+/// Derived: the longest a volume may go unserved before a takeover serves it, the operator's failover SLO (§4.8, "the
+/// operator's bound on how long an object may go unserved"; the daemons' default, `slates_server::config::FAILOVER_SLO_NS`),
+/// counted from the partition's start, detection and the takeover's round included. Before A-351 a deafened owner, which
+/// still probes, kept its holders' promotion gate shut and was taken over after 22.7 and 34.8 s (CI diag run
+/// 44315314779), or not at all.
+const FAILOVER_BOUND: Duration = Duration::from_nanos(slates_server::config::FAILOVER_SLO_NS);
+
+/// Derived: the longest a write sent to a partitioned owner may wait for its answer: the failover SLO from its hold, at
+/// which a verb's reply held for durability is refused `DurabilityPending` (A-354, the total bound of the rule every
+/// transport's held reply is judged by, A-292), plus one liveness budget for the record period that judges it and the
+/// reply's way back to its client. A write held longer was held past what the fleet promises to keep: before A-354 the
+/// deafened owner's write waited 41 to 85 s and the cut-off and muted owners' about 20.5 s, each until the relay healed
+/// (CI diag runs 44302631709 and 44315314779, 2026-11-18).
+const HELD_WRITE_BOUND: Duration = Duration::from_nanos(
+  slates_server::config::FAILOVER_SLO_NS.saturating_add(slates_server::daemon::LIVENESS_BUDGET_NS),
+);
+
 /// How a flow partitions one node mid-stream (goal g229).
 #[derive(Clone, Copy, Debug)]
 enum Partition {
@@ -5046,8 +5122,9 @@ impl Drop for StopOnDrop<'_> {
 /// write through the successor (its first write, then a stream); read its last acknowledged writes through every
 /// survivor, then through the old owner: while the partition lasts when its process runs on (its lease lapsed unrenewed
 /// while it still serves its clients, its peers silent from its side), and the moment it resumes when it was stopped
-/// (its lease lapsed by the clock meanwhile); heal; let the old owner's stream go on. Expect: no write sent to the old
-/// owner while it was partitioned acknowledged ([`judge_stale_writes`]); every read refused or answered with the write,
+/// (its lease lapsed by the clock meanwhile); heal; let the old owner's stream go on. Expect: the volume taken over within
+/// [`FAILOVER_BOUND`]; no write sent to the old owner while it was partitioned acknowledged, and every write to it
+/// answered within [`HELD_WRITE_BOUND`] ([`judge_stale_writes`]); every read refused or answered with the write,
 /// never other bytes and never missing (ReadSafety); every write either owner acknowledged served by the successor
 /// (NoLoss), those made through the old node after the heal included; the successor's first head past every position
 /// durable under the old epoch (Continuity); every copy fenced at or above the successor's epoch; one identity at every
@@ -5109,6 +5186,15 @@ fn partition_owner_mid_stream(
     "owner {partition:?} at {:?}; taken over: {taken:?}",
     run.partitioned_at
   ));
+  verdict.check(
+    "the volume taken over within the failover SLO",
+    match taken {
+      Some((_, took)) if took > FAILOVER_BOUND => vec![format!(
+        "taken over {took:?} after the owner was {partition:?}, past {FAILOVER_BOUND:?}"
+      )],
+      _ => Vec::new(),
+    },
+  );
   let last = match taken {
     Some((taken_by, _)) => write_through_successor(taken_by, volume, began, &mut run),
     None => Vec::new(),
@@ -5234,6 +5320,14 @@ fn judge_stale_writes(
       .iter()
       .filter(|outcome| outcome.refused.is_none())
       .map(|outcome| format!("{outcome:?}"))
+      .collect(),
+  );
+  verdict.check(
+    "every write to the old owner answered within the held-write bound",
+    outcomes
+      .iter()
+      .filter(|outcome| outcome.took > HELD_WRITE_BOUND)
+      .map(|outcome| format!("{outcome:?} past {HELD_WRITE_BOUND:?}"))
       .collect(),
   );
 }

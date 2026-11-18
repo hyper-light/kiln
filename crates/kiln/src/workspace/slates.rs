@@ -42,7 +42,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -68,15 +68,21 @@ pub const INSTANCE: &str = "kiln";
 /// the volume's quota (18, `Exhausted::Volume`: the review read of the HVF drive was refused
 /// "Quota" for it before A-342), and a target's, a mount point's and a mount's refusals (19,
 /// `HostFault::Target`).
-pub const CONTRACT: u32 = 19;
+///
+/// 23 since kiln took Slates at ca98a952d (from 19). kiln uses 23: its start of the machine's
+/// instance asks `StartSpec::until_served` and waits on its anchor while it lives, no wall-clock
+/// deadline of its own, a start whose daemons never serve ending `StartFault::NeverServed`
+/// ([`ensure_up`]; Slates' A-366). It needs none of the rest: signed landings (20: a
+/// `LandingApproval` carries the statement a signer signs and the signature it carried, which kiln
+/// sends none of), a takeover past its volume's tolerance (21) and a reply held for durability as a
+/// typed retry (22, `RetryCause::DurabilityPending`, which kiln shows in Slates' words as before).
+pub const CONTRACT: u32 = 23;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
 pub const ROLE_ARG: &str = "slates-role";
 /// How long one git command over a workspace may take.
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long a new anchor has to answer.
-const UP_WAIT: Duration = Duration::from_secs(30);
 /// Shards the instance runs (each is a core's worth of work when busy): agents' folders need few.
 const SHARDS: u16 = 2;
 /// The largest a workspace may grow to, at most (what it changes is held in memory): a quarter of
@@ -238,9 +244,12 @@ pub fn started_anchor() -> Option<u32> {
 }
 
 /// What starts the machine's instance: kiln's own executable in Slates' roles, [`SHARDS`] shards,
-/// a laptop's instance of its own (no fleet), handed `launcher`'s secret when there is one.
+/// a laptop's instance of its own (no fleet), handed `launcher`'s secret when there is one, and
+/// asked to stop if none of its daemons ever serves (`StartSpec::until_served`, Slates' A-366): kiln
+/// mounts nothing on it before [`ensure_up`]'s wait and first call succeed, so no mount can wait on
+/// an instance that never answered, and that wait needs no deadline of its own.
 fn start_spec(launcher: Option<LauncherSecret>) -> anyhow::Result<StartSpec> {
-    let mut spec = StartSpec::new(&instance(), program()?, &[ROLE_ARG]);
+    let mut spec = StartSpec::new(&instance(), program()?, &[ROLE_ARG]).until_served();
     spec.shards = Some(SHARDS);
     spec.quick = OVERRIDE.get().is_some_and(|o| o.quick);
     Ok(match launcher {
@@ -331,12 +340,14 @@ pub async fn ensure_up() -> anyhow::Result<()> {
     let h = here()?;
     let anchor = start_anchor(&h.log)?;
     let name = instance();
-    let until = Instant::now() + UP_WAIT;
-    // The anchor started here is watched while it's waited for (its exit ends the wait, a scope
-    // systemd refused included), and never after: it outlives this process.
+    // The anchor started here is watched while it's waited for, and never after: it outlives this process. The wait
+    // lasts while the anchor lives, with no deadline of kiln's: the anchor judges its starting daemon by the daemon's
+    // own progress, never a second, so a slow start under load is waited for (a 30 s deadline failed one at load 28,
+    // 2026-11-18), and its exit ends the wait: a scope systemd refused, or, asked `until_served`, its daemons' crash
+    // loop before any served (Slates' A-366).
     let answered = crate::rt::blocking(move || {
         let mut anchor = anchor;
-        Instance::wait_for(&name, Some(&mut anchor), Some(until)).map(|_| ())
+        Instance::wait_for(&name, Some(&mut anchor), None).map(|_| ())
     })
     .await?;
     // Another of the machine's kiln processes may have started it meanwhile, its anchor this one's
@@ -344,10 +355,20 @@ pub async fn ensure_up() -> anyhow::Result<()> {
     if let Err(e) = answered
         && !up().await
     {
-        anyhow::bail!("Slates' anchor didn't answer within {}s: {e} (its log: {})", UP_WAIT.as_secs(), h.log.display());
+        anyhow::bail!("{} (its log: {})", start_refused(&e), h.log.display());
     }
     // A new instance holds no volumes until its group exists; an existing one is left as it is.
     call("bootstrap", |i| i.ensure_group()).await
+}
+
+/// What kiln says of a start of the machine's instance that ended before it answered (`e`, Slates' refusal of its wait).
+fn start_refused(e: &slates_api::Error) -> String {
+    match e {
+        slates_api::Error::Start(slates_api::StartFault::NeverServed) => {
+            "Slates' instance never answered: its daemons failed their starts in a row and none of them served, so its anchor stopped".to_owned()
+        }
+        other => format!("Slates' anchor ended before its instance answered: {other}"),
+    }
 }
 
 /// The most a workspace may hold, in bytes: a quarter of this machine's memory, at least a GiB and
@@ -924,6 +945,8 @@ mod tests {
             manifest,
             summary: Summary { actions: slates_api::ActionTally { create: 2, mkdir: 1, ..Default::default() }, bytes: 12, filtered_out: 3 },
             verification: slates_api::Verification::Unsigned,
+            statement: Vec::new(),
+            signature: None,
         })
     }
 
@@ -932,6 +955,19 @@ mod tests {
     #[test]
     fn w1_kiln_speaks_the_contract_it_was_written_against() {
         assert_eq!(slates_api::CONTRACT, CONTRACT);
+    }
+
+    /// W1 (Slates' A-366): kiln's start of its machine's instance asks the anchor to stop if none of its daemons ever
+    /// serves, so its wait on the anchor needs no deadline of its own; a start that ends so says so in its own words,
+    /// apart from an anchor that ended for another reason.
+    #[test]
+    fn w1_kiln_waits_on_its_anchor_while_it_lives_and_hears_a_start_that_never_served() -> anyhow::Result<()> {
+        assert!(start_spec(None)?.until_served, "kiln asks until_served");
+        let never = start_refused(&slates_api::Error::Start(slates_api::StartFault::NeverServed));
+        assert!(never.contains("never answered") && never.contains("none of them served"), "{never}");
+        let ended = start_refused(&slates_api::Error::Start(slates_api::StartFault::AnchorExited { code: Some(4) }));
+        assert!(ended.contains("anchor ended") && ended.contains("code 4"), "{ended}");
+        Ok(())
     }
 
     /// W6: the manifest a person saw comes back to Slates as the hash it wrote; anything else is

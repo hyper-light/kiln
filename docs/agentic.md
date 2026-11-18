@@ -251,7 +251,11 @@ instance's anchor starts apart from the runner: on Linux, where the runner runs 
 service manager (its user unit), in a systemd user scope of its own (`systemd-run --user --scope`,
 which execs the anchor with its standard input kept, so kiln's launcher secret reaches it); in its
 own process group elsewhere. So restarting or upgrading the runner never ends it (a volume lives
-in the anchor's memory). A new instance gets its one-node group. Runner facts say whether workspaces work
+in the anchor's memory). kiln waits for a new instance's first answer while its anchor lives, with
+no deadline of its own (the anchor judges its starting daemon by the daemon's own progress, never a
+second): it asks the anchor to stop if none of its daemons ever serves (Slates' A-366,
+`StartSpec::until_served`), so a start that can't come up ends saying so rather than waiting for
+good, and a slow one under load is waited for. A new instance gets its one-node group. Runner facts say whether workspaces work
 there and why not, in the library's words (`workspaces`: the Slates revision kiln links, a mount it
 can make: FUSE through `fusermount3` on Linux, NFS on loopback on macOS, WinFsp on Windows,
 installed once from winfsp.dev), and `GET /api/harness/workspaces` says it for every machine. On
