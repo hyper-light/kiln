@@ -79,7 +79,7 @@ test("one made, changed in place, applied to this session, refused deletion whil
   await form.getByRole("combobox", { name: "Where variable 2 comes from" }).selectOption("machine");
   await form.getByRole("combobox", { name: "Variable 2's machine variable" }).selectOption("CARGO_HOME");
   await expect(form.getByRole("textbox", { name: "Variable 2's name" })).toHaveValue("CARGO_HOME");
-  await expect(form.getByRole("group", { name: "Variable 2" })).toContainText("set in login shell");
+  await expect(form.getByRole("combobox", { name: "Variable 2's machine variable" }).locator("option:checked")).toHaveText("CARGO_HOME · login shell");
   // One of the person's own secrets, by name; moved up one.
   await form.getByRole("button", { name: "Add a variable" }).click();
   await form.getByRole("combobox", { name: "Where variable 3 comes from" }).selectOption("secret");

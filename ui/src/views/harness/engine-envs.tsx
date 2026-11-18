@@ -560,7 +560,8 @@ function MachinePick({ target, v, i, onPick }: { target: string; v: DraftVar; i:
           </option>
         ))}
       </select>
-      {v.pick && <span className="sb-dim ev-src">{picked ? `set in ${sourcesOf(picked)}` : `${machineOf(target)}'s user hasn't it now: it's left unset`}</span>}
+      {/* Where a picked one is set, its option says; one the machine hasn't, this line. */}
+      {v.pick && !picked && <span className="sb-dim ev-src">{`${machineOf(target)}'s user hasn't it now: it's left unset`}</span>}
     </>
   );
 }
