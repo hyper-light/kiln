@@ -957,49 +957,25 @@ impl Wake {
     }
 
     /// Waits for kiln's next change: until a frame comes down the socket, or `within` passes (none: no
-    /// bound). Frames that follow it within `settle` (how long a look takes) are read with it, so looks
-    /// never outrun kiln's answers. The socket is opened as it's first waited on, and again after it
-    /// ended; that wait returns at once, so a change made while it opened is looked at. An opening
-    /// that fails pauses as long as it took. What it read, each frame's JSON, is its answer (a session's
-    /// admission's word on a message among them: [`Watch::heard`]).
+    /// bound). Frames that follow it within `settle` of it (how long a look takes) are read with it
+    /// ([`frames`]), so looks never outrun kiln's answers. The socket is opened as it's first waited on, and
+    /// again after it ended; that wait returns at once, so a change made while it opened is looked at. An
+    /// opening that fails pauses as long as it took. What it read, each frame's JSON, is its answer (a
+    /// session's admission's word on a message among them: [`Watch::heard`]).
     pub fn next(&mut self, within: Option<Duration>, settle: Duration) -> Vec<Value> {
-        let mut said = Vec::new();
         if self.sock.is_none() {
             let began = Instant::now();
             match self.open() {
                 Ok(s) => self.sock = Some(s),
                 Err(_) => std::thread::sleep(began.elapsed()),
             }
-            return said;
+            return Vec::new();
         }
         if within.is_some_and(|w| w.is_zero()) {
-            return said;
+            return Vec::new();
         }
-        let Some(s) = self.sock.as_mut() else { return said };
-        // A frame within `t` (none: no bound), each read with its own bound: a frame that began is
-        // read whole, with none.
-        let mut read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
-            s.set_read_timeout(t)?;
-            let Some(payload) = frame_or_quiet(s)? else { return Ok(false) };
-            if let Ok(v) = serde_json::from_slice::<Value>(&payload) {
-                said.push(v);
-            }
-            Ok(true)
-        };
-        let ended = match read(s, within) {
-            Ok(true) => {
-                !settle.is_zero()
-                    && loop {
-                        match read(s, Some(settle)) {
-                            Ok(true) => {}
-                            Ok(false) => break false,
-                            Err(_) => break true,
-                        }
-                    }
-            }
-            Ok(false) => false,
-            Err(_) => true,
-        };
+        let Some(s) = self.sock.as_mut() else { return Vec::new() };
+        let (said, ended) = frames(s, within, settle);
         if ended {
             self.sock = None;
         }
@@ -1013,6 +989,45 @@ impl Wake {
         }
         Ok(s)
     }
+}
+
+/// What kiln's socket `s` says to a wait ([`Wake::next`]): its next frame, waited for up to `within` (none: no
+/// bound), and the frames that follow it within `settle` of it, each frame's JSON; and whether `s` ended or broke.
+/// Those that come later are the next look's: kiln's events socket is never quiet for long (its server samples
+/// itself every `[telemetry] sample_seconds`), so a wait that read on while each frame followed the last within
+/// `settle` never looked again. pre2's start, asked twice under strain and each POST unanswered for its 75 s, was
+/// never asked a third time, the strain's end and five clear hours after it included (adacachy, 2026-11-18).
+pub fn frames(s: &mut std::net::TcpStream, within: Option<Duration>, settle: Duration) -> (Vec<Value>, bool) {
+    let mut said = Vec::new();
+    // A frame within `t` (none: no bound), each read with its own bound: a frame that began is
+    // read whole, with none.
+    let mut read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
+        s.set_read_timeout(t)?;
+        let Some(payload) = frame_or_quiet(s)? else { return Ok(false) };
+        if let Ok(v) = serde_json::from_slice::<Value>(&payload) {
+            said.push(v);
+        }
+        Ok(true)
+    };
+    let ended = match read(s, within) {
+        Ok(true) => {
+            let until = Instant::now().checked_add(settle);
+            loop {
+                let left = until.map_or(Duration::ZERO, |u| u.saturating_duration_since(Instant::now()));
+                if left.is_zero() {
+                    break false;
+                }
+                match read(s, Some(left)) {
+                    Ok(true) => {}
+                    Ok(false) => break false,
+                    Err(_) => break true,
+                }
+            }
+        }
+        Ok(false) => false,
+        Err(_) => true,
+    };
+    (said, ended)
 }
 
 /// One WebSocket frame off `s`, the server's (unmasked): its payload where one came; none where none

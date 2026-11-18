@@ -836,6 +836,36 @@ mod waits {
         Ok(())
     }
 
+    /// A wait reads the frames that follow kiln's next change within a look's time of it, never past, so a socket
+    /// kiln keeps busy (its server samples itself every `[telemetry] sample_seconds`) can't keep it from looking
+    /// again. Here kiln speaks every twentieth of a look's time for twenty looks' time: a wait that reads on while
+    /// each frame follows the last within a look's time reads until kiln stops, as pre2's start's wait read kiln's
+    /// frames for hours, never asking again (adacachy, 2026-11-18).
+    #[test]
+    fn s35_a_busy_socket_never_holds_a_wait_past_a_looks_time() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        let look = s(1);
+        let (every, speaks_for) = (look / 20, look.saturating_mul(20));
+        let busy = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            while began.elapsed() < speaks_for {
+                if server.write_all(&[0x81, 2, b'{', b'}']).is_err() {
+                    return;
+                }
+                std::thread::sleep(every);
+            }
+        });
+        let (said, ended) = frames(&mut client, None, look);
+        drop(client);
+        let _ = busy.join();
+        assert!(!said.is_empty(), "kiln's next change heard");
+        assert!(!ended, "it read kiln's {} frames until kiln stopped speaking, past a look's time", said.len());
+        Ok(())
+    }
+
     /// A wait's socket read is bounded by what's left of its window, never more: none before a first
     /// answer; from its last progress once there's one. Bounding the read by a period of its own would
     /// refuse late or look for nothing.
