@@ -441,6 +441,8 @@ impl ImageClass {
             plug_roots: Vec::new(),
             // No member's reach (Shards' D278, image channel v39): it runs no member, and nothing passes its VM.
             egress_ceiling: Vec::new(),
+            // No share another server serves (Shards' D286, image channel v52): a node VM's shares are its host's.
+            served: Vec::new(),
         })
     }
 }

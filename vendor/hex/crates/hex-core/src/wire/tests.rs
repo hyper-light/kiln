@@ -5969,6 +5969,73 @@ fn p6_2_a_shards_image_vms_volumes_cross_the_wire_after_its_sign_ins() {
     ));
 }
 
+/// Shards' D286 (kiln goal 01a1ec34…): do create a Shards image VM given a share another server serves, beside a
+/// volume, writable into its harness, and a second, read-only, given to no member. Expect it read back whole, its served
+/// shares after its volumes, each its source, where its guest sees it, whether read-only and its members. Do read it as
+/// a peer would send it with the second's read-only flag a byte neither 0 nor 1. Expect it refused as that flag.
+#[test]
+fn d286_a_shards_image_vms_served_shares_cross_the_wire_after_its_volumes() {
+    let harness = Member {
+        kind: MemberKind::Harness,
+        name: "claude".to_owned(),
+    };
+    let create = Request::Call(Call::Create(Box::new(BoxSpec {
+        id: id("image-served"),
+        bounds: Bounds::default(),
+        class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+            members: vec![hex_api::ImageMember::new(harness.clone())],
+            volumes: vec![hex_api::ImageVolume {
+                name: "kiln-agent-cache".to_owned(),
+                bound: std::num::NonZeroU64::new(1 << 20).unwrap(),
+                at: "/volumes/cache".to_owned(),
+                members: vec![harness.clone()],
+                read_only: false,
+            }],
+            served: vec![
+                hex_api::ServedMount {
+                    source: "kiln-01a1ec34".to_owned(),
+                    destination: "/srv/projects/hex".to_owned(),
+                    read_only: false,
+                    members: vec![harness],
+                },
+                hex_api::ServedMount {
+                    source: "kiln-reference".to_owned(),
+                    destination: "/srv/reference".to_owned(),
+                    read_only: true,
+                    members: Vec::new(),
+                },
+            ],
+            ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
+        })),
+        owner: None,
+        devices: Vec::new(),
+        allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+        route: None,
+        band: 0,
+    })));
+    let bytes = request(96, &create, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        create
+    );
+    // The second's read-only flag follows where its guest sees it, a string no other bytes of the message spell.
+    let place = b"/srv/reference";
+    let at = bytes.windows(place.len()).position(|w| w == place).unwrap() + place.len();
+    assert_eq!(
+        bytes[at], 1,
+        "the second's read-only flag follows its place"
+    );
+    let mut bad = bytes.clone();
+    bad[at] = 2;
+    assert!(matches!(
+        read_request(&received(&bad, 0), MAX_MESSAGE).map_err(|bad| bad.fault),
+        Err(Fault::Value {
+            what: "served share read_only",
+            ..
+        })
+    ));
+}
+
 /// Joint plan step 15 (every grant visible in Hex's record of the VM): do create a Shards image VM granted a provider
 /// by name, kiln on its host and a publish; expect it read back whole, its grants written after its command. Do
 /// write one whose grants the check refuses (a loopback destination), and read it as a peer that skipped the check

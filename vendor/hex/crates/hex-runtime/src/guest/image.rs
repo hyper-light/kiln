@@ -582,6 +582,9 @@ pub struct ImageClass {
     /// The warm pools it keeps and the room their hosts are charged to, bound once ([`ImageClass::bind_room`]): none
     /// bound, it keeps none.
     kept: OnceLock<Kept>,
+    /// What serves its VMs' shares another server serves, its orchestrator's, bound once (Shards' D286;
+    /// [`ImageClass::bind_servers`]): none bound, a box naming one is refused as it is created.
+    pub(super) servers: OnceLock<Arc<dyn hex_api::serve::Servers>>,
 }
 
 /// The warm pools the class keeps (kiln plan `01a1dd2e313f72f69c6d93061143cc2e`, P3.1; Shards' D253): for each kiln
@@ -1628,7 +1631,7 @@ fn member_spec(m: &ImageMember) -> MemberSpec {
 const FIRST_GENERATION: u32 = 0;
 
 /// A member as Shards' image boot names it.
-fn member_name(m: &Member) -> MemberName {
+pub(super) fn member_name(m: &Member) -> MemberName {
     match m.kind {
         MemberKind::Harness => MemberName::harness(&m.name),
         MemberKind::Agent => MemberName::agent(&m.name),
@@ -2708,6 +2711,7 @@ impl ImageClass {
             native_paths: None,
             lessors: None,
             kept: OnceLock::new(),
+            servers: OnceLock::new(),
         }
     }
 
@@ -2932,6 +2936,9 @@ impl ImageClass {
             // No member's reach past its image's grants (Shards' D278, image channel v39): its grants are the start's,
             // and this class changes no member's reach as it runs.
             egress_ceiling: Vec::new(),
+            // Its shares another server serves (Shards' D286, image channel v52), each one's stream asked of the node's
+            // server as its start boots it ([`ImageClass::served`]), never kept in a record.
+            served: Vec::new(),
         })
     }
 
@@ -3181,6 +3188,8 @@ impl ImageClass {
             crate::grants::program(image)?;
             // As are credentials no one can lease here (joint plan step 33).
             self.can_lease(image)?;
+            // As are shares another server serves where no server of them is bound (Shards' D286).
+            self.can_serve(image)?;
             // As are volumes beneath no root its guest grants, or past the disk the box was admitted with (kiln plan
             // 01a1dd2e…, P6.2).
             plug_roots(image)?;
@@ -3227,6 +3236,9 @@ impl ImageClass {
         // The run's lessor, its orchestrator's, made before any effect (joint plan step 33): a run granting no
         // credential has none and asks nothing.
         spec.lessor = self.run_lessor(&id, shards)?;
+        // Its shares another server serves (Shards' D286), each one's stream asked of the node's server before any
+        // effect, as its lessor is made: a run naming none asks nothing.
+        spec.served = self.served(&id, shards)?;
         // Its diagnostics are its own output on the node's disk, charged to it: their file is held within the disk its
         // box was admitted with, no number picked (the review's B-9, ROOT's ruling of 2026-11-14), less its volumes'
         // bounds, which are drawn from the same disk (kiln plan 01a1dd2e…, P6.2); a box admitted with no receipt has no

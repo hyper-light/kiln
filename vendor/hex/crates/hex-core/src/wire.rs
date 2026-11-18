@@ -58,9 +58,9 @@ use hex_api::{
     LearnedWindow, LifecycleCause, MAX_DEVICES, MAX_LEARNED_HOLDINGS, MAX_LEARNED_PRIORS,
     MAX_RUNTIME_ROUTES, Member, MemberKind, Mount, Network, NodeVmPhase, NodeVmReceipt, OciSpec,
     PhysicalDevice, PhysicalReport, Ports, Program, Proto, Published, RateHeld, Receiver, Refusal,
-    Rootfs, RouteKey, RouteOffer, RouteReceipt, RuntimeCost, ShardsImage, Signal, StartedFrom,
-    Upstream, Usage, User, VolumeCause, check_credentials, check_grants, check_published,
-    check_sign_ins,
+    Rootfs, RouteKey, RouteOffer, RouteReceipt, RuntimeCost, ServedMount, ShardsImage, Signal,
+    StartedFrom, Upstream, Usage, User, VolumeCause, check_credentials, check_grants,
+    check_published, check_sign_ins,
 };
 
 use hex_api::lease::{Lease, LeaseRefused, SignInRefused, SignInTokens, Value};
@@ -3577,7 +3577,9 @@ fn oci(r: &mut Reader<'_>) -> Result<OciSpec, Fault> {
 /// whether read-only, and the members it is given to (Shards' D277), as a mount's ([`put_mount`]), then its credential
 /// grants (joint plan step 33, [`put_credentials`]), then its sign-ins ([`put_sign_ins`]), then its volumes (kiln plan
 /// 01a1dd2e…, P6.2), each its name, its bound, where its members see it, its members, each as a grant's member, and
-/// whether read-only. Fields a later step adds go after the volumes (append-only).
+/// whether read-only, then its shares another server serves (Shards' D286), each its source, where its guest sees it,
+/// whether read-only, and its members, each as a grant's member. Fields a later step adds go after the served shares
+/// (append-only).
 fn put_shards_image(w: &mut Writer, image: &ShardsImage) -> Result<(), Fault> {
     w.string(&image.image)?;
     w.option_with(image.command.as_deref(), |w, command| {
@@ -3605,6 +3607,12 @@ fn put_shards_image(w: &mut Writer, image: &ShardsImage) -> Result<(), Fault> {
         w.list(&v.members, put_member)?;
         w.bool(v.read_only);
         Ok(())
+    })?;
+    w.list(&image.served, |w, s| {
+        w.string(&s.source)?;
+        w.string(&s.destination)?;
+        w.bool(s.read_only);
+        w.list(&s.members, put_member)
     })
 }
 
@@ -3626,6 +3634,7 @@ fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
         credentials: Vec::new(),
         sign_ins: Vec::new(),
         volumes: Vec::new(),
+        served: Vec::new(),
     };
     image.credentials = credentials(r, &image.grants)?;
     image.sign_ins = sign_ins(r, &image.credentials, &image.grants)?;
@@ -3638,6 +3647,14 @@ fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
             at: r.string("volume place")?,
             members: r.list(member)?,
             read_only: r.bool("volume read_only")?,
+        })
+    })?;
+    image.served = r.list(|r| {
+        Ok(ServedMount {
+            source: r.string("served share source")?,
+            destination: r.string("served share destination")?,
+            read_only: r.bool("served share read_only")?,
+            members: r.list(member)?,
         })
     })?;
     Ok(image)
