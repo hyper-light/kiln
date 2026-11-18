@@ -1029,7 +1029,7 @@ pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
     }
     // Its base goes with the last workspace that's a clone of it (K5).
     if let Some(base) = &m.base {
-        release_base(base, volume).await;
+        release_base(base, volume_id(&m.volume)?).await;
     }
     Ok(())
 }
