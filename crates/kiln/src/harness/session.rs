@@ -6818,6 +6818,7 @@ mod tests {
             ("context_pct", Info { context_pct: Some(40), ..base.clone() }),
             ("keep_off", Info { keep_off: true, ..base.clone() }),
             ("no_bypass", Info { no_bypass: true, ..base.clone() }),
+            ("launched", Info { launched: Some(super::super::lineage::Level::Bypass), ..base.clone() }),
             ("parent", Info { parent: Some("p".into()), ..base.clone() }),
             ("last_activity", Info { last_activity: 99, ..base.clone() }),
             ("queue", Info { queue: vec![super::super::queued::Queued::of("q1", "later")], ..base.clone() }),
