@@ -8,7 +8,7 @@ use std::io::Write as _;
 #[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
 
-use crate::daemon::ends::{End, Ends, Followed};
+use crate::daemon::ends::{End, Ends, Followed, GoesOn};
 
 /// A socket handed to a network process (a published port's host socket, a peer's link):
 /// a descriptor on Unix; on Windows a socket, which Winsock closes (closesocket).
@@ -518,8 +518,17 @@ fn reap_by(net: &NetProcess, ends: &Ends, slice: Option<std::time::Duration>) {
             }
             return;
         }
-        if followed.goes_on().is_none() {
-            break;
+        match followed.goes_on() {
+            GoesOn::Went(_) => {}
+            GoesOn::Still => break,
+            GoesOn::Unread(why) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "shards: network or share process {}: its end could not be read at its look, so it is ended: {why}",
+                    net.id()
+                );
+                break;
+            }
         }
     }
     let _ = net.kill(shards_ipc::signal::SIGKILL);
@@ -1027,7 +1036,9 @@ mod reap_tests {
     pub(super) fn until_stopped(pid: u32) {
         let watched = || {
             let followed = shards_api::Followed::of_pid(pid).unwrap().unwrap();
-            shards_api::Watch::of(followed).unwrap().unwrap()
+            shards_api::Watch::of(followed, &shards_api::Listing::new())
+                .unwrap()
+                .unwrap()
         };
         while !watched().stopped() {
             std::thread::yield_now();
@@ -1144,7 +1155,7 @@ mod ask_tests {
     fn an_ask_of_a_network_process_that_runs_nothing_is_refused_past_w_star() {
         let record = shards_api::Record::new();
         let slowest = Duration::from_millis(200);
-        record.teach(slowest, Duration::from_millis(1));
+        record.teach(slowest, shards_api::Work::of_cpu(Duration::from_millis(1)));
         // Stopped, waited for to its stop, its start's own CPU behind it: a cgroup freezer's
         // cycles wake a sleeper, a kiln run's about six a second (PM M562), and no stopped one.
         let asleep = stand("kill -STOP $$");

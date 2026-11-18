@@ -2137,7 +2137,7 @@ fn a_volumes_large_files_go_through_its_dax_window() {
     {
         use std::os::fd::AsRawFd as _;
         let file = std::fs::File::open(dir.join("pages")).unwrap();
-        file.sync_all().unwrap();
+        shards_durable::all(&file).unwrap();
         // SAFETY: posix_fadvise(2) on a descriptor this test holds open.
         let advised = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         assert_eq!(advised, 0);
@@ -4034,8 +4034,10 @@ fn what_a_microvm_holds_cold_is_given_back_at_its_hosts_word() {
     let built = run_shards_env(&[], &["build", "-q", "-t", "big:1", ctx.to_str().unwrap()], &env);
     assert_eq!(built.status, Some(0), "{built}");
     std::fs::remove_file(ctx.join("big")).unwrap();
+    // Privileged, for a /sys its root's execs may write (init setup.rs `privileged`), where
+    // its guest is asked to report what it freed (below).
     let provider = shards(
-        &run_args(&image, &["-d", "--name", "prov"], &["sleep"])
+        &run_args(&image, &["-d", "--name", "prov", "--privileged"], &["sleep"])
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
@@ -4063,14 +4065,34 @@ fn what_a_microvm_holds_cold_is_given_back_at_its_hosts_word() {
     // Its microVM grown first, as the group's test grows its own: a run's grower plugs for
     // what its runs touch, not for what they read (D148), and jupiter's guest kept 107 MiB of
     // four reads (PM M391). What it touched and freed given back (D151) before it is idle:
-    // idle once its give-back has ended (`Falling`, D209 Part 4), followed from before the
-    // free. A second read of a file its guest's kernel finds the first's still holding makes
-    // its pages active, which a give-back takes none of (`reclaim_cold`, `inactive_file`),
-    // and an idle measured as it went on giving back had the file read twice and gave back
-    // nothing of it on Fedora, once in 6.
-    let falling = Falling::begin(pid);
+    // idle once its give-back has ended (`Falling`, D209 Part 4). A second read of a file its
+    // guest's kernel finds the first's still holding makes its pages active, which a
+    // give-back takes none of (`reclaim_cold`, `inactive_file`), and an idle measured as it
+    // went on giving back had the file read twice and gave back nothing of it on Fedora,
+    // once in 6. What it freed is reported at once before idle is read, as a template's init
+    // and a builder's report theirs (`page_reporting.flush`, resources/kernel/patches/0005,
+    // root's alone): a pass already due as it freed the GiB brought the first fall in sooner
+    // than the kernel's two seconds between passes, the settle ended between them, and the
+    // read took the guest's free pages not yet reported, which its host still held (CI
+    // 44007524337, 44138098584 and 44282442232 on x86_64 Linux: its last fall 1.8 s in, then
+    // 30 MiB more after the read, or 122 and 130 MiB less).
     let grown = shards(&["exec", "prov", "/bin/testguest", "alloc-free", "1024", "0"]);
     assert_eq!(grown.status, Some(0), "{grown}");
+    // Followed from here, the GiB freed and still held, so that its first look finds the fall
+    // its report brings: followed from before the free, it first looked once the report had
+    // given the GiB back, found nothing fallen, and waited for a fall come and gone between
+    // its looks for as long as the microVM lived (macOS arm64, a5b586919a: 54 minutes).
+    let falling = Falling::begin(pid);
+    let reported = shards(&[
+        "exec",
+        "-u",
+        "0",
+        "prov",
+        "/bin/testguest",
+        "fs",
+        "write:/sys/module/page_reporting/parameters/flush=1",
+    ]);
+    assert_eq!(reported.status, Some(0), "{reported}");
     let idle = falling.settled();
     // Its guest holds what its joiner read, read once.
     let read = shards(&["exec", "reader", "/bin/testguest", "read", "/big"]);
@@ -9252,20 +9274,31 @@ fn a_run_on_the_hosts_network_is_on_the_hosts_network() {
         let (mut child, port) = serving(&home, &image, &["udp-serve", addr]);
         let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         client.send_to(b"datagram", loopback(port)).unwrap();
+        // Its run's end, waited for while its client goes on, comes after its answer has
+        // reached this socket (D124): the run's ports are let go before its end is told, and
+        // only once the network process has taken what its guest sent before them (warm.rs
+        // `host_net` and `release_ports`, net's `serve`). So its answer is read once its end
+        // has come, without waiting: there, or lost. Before, it was waited for while its
+        // daemon went on, which its warm microVMs' idle ticks kept doing for 903 s after an
+        // answer was lost (CI 44245219858, x86_64 musl, iteration 2).
+        let status = exit(&mut child, &home);
+        let mut said = String::new();
+        if let Some(out) = child.stdout.as_mut() {
+            let _ = std::io::Read::read_to_string(out, &mut said);
+        }
+        client.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 64];
-        let n = received(
-            &home,
-            "a UDP server's answer",
-            |t| client.set_read_timeout(t),
-            || client.recv(&mut buf),
-        )
-        .unwrap_or_else(|e| panic!("{i} {addr}: {e}"));
+        let n = client.recv(&mut buf).unwrap_or_else(|e| {
+            panic!(
+                "{i} {addr}: its server's run ended, status {status:?}, and its answer never came ({e}); what it said after its ready line: {said:?}"
+            )
+        });
         assert_eq!(
             String::from_utf8_lossy(&buf[..n]),
             format!("from {peer} datagram"),
             "{i}"
         );
-        assert_eq!(exit(&mut child, &home), Some(0));
+        assert_eq!(status, Some(0), "{i} {addr}: {said:?}");
     }
 
     // A port the host holds is the host's (EADDRINUSE, Linux's 98); one the guest closed

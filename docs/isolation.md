@@ -230,7 +230,7 @@ its own through Hex (`sandbox::hexvm`).
   kiln vendored before (1969a423e, on Shards 9975d1f55): its image class gave a start share to the run's root alone,
   so a harness never started in its project (Shards D277: `Setup (entering its working directory): errno 2`), its
   run ended failed, and kiln said exit -1; the switch ended nothing, the session having ended before it. The Hex
-  kiln vendors now (f6192bc99, on Shards 1799412f9) gives a share its members (`hex_api::Mount`), and kiln maps
+  kiln vendors now (84c870b0f, on Shards v0.8.0, aa819b058) gives a share its members (`hex_api::Mount`), and kiln maps
   `Share::members` in `sandbox::hexvm` (P1.4); its run on that Hex is owed.
 
 ## Live overrides

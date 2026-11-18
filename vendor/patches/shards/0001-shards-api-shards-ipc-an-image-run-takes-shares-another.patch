@@ -1192,7 +1192,7 @@ index 92b5d66781f5c828636cc4e56039b963ae5baaaa..6672b7a05fcbd97016ec8b6009749d5c
          cli[at] = 9;
          assert!(matches!(Request::decode(&cli), Err(WireError::Tag { .. })));
 diff --git a/crates/ipc/src/lib.rs b/crates/ipc/src/lib.rs
-index b5b8780e5222870e7b9d921c6c680e683782a6ef..f3204835da3b9cf279f6ecb7f367dca90a62713b 100644
+index 7fc5cf4d6c17de77895f1a4096183da0cebca92c..b14a8271f8be6bc3ac4b499fdf58fd2061e41126 100644
 --- a/crates/ipc/src/lib.rs
 +++ b/crates/ipc/src/lib.rs
 @@ -527,6 +527,12 @@ pub mod kind {

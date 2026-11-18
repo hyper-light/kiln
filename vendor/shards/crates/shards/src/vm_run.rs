@@ -303,6 +303,15 @@ impl Common {
                 }
                 CWD.set(dir).map_err(|_| "--cwd given twice".to_string())?;
             }
+            "--durable" => {
+                let home = PathBuf::from(value("--durable")?);
+                if !home.is_absolute() {
+                    return Err(format!("--durable: {} is not an absolute path", home.display()));
+                }
+                DURABLE
+                    .set(home)
+                    .map_err(|_| "--durable given twice".to_string())?;
+            }
             "--grants" => grants(&text(value("--grants")?)?)?,
             "-e" | "--env" => w.env.push(text(value("--env")?)?),
             "-w" | "--workdir" => w.workdir = text(value("--workdir")?)?,
@@ -1673,20 +1682,267 @@ fn arm_input(_args: &[OsString]) -> std::io::Result<InputOwner> {
     Ok(InputOwner::Console)
 }
 
+/// Console input as the thread that forwards it would find it, decided before that thread
+/// starts, without waiting for it ([`pending`]), on every host.
+#[derive(Debug, PartialEq, Eq)]
+enum Pending {
+    /// Ended: no more will come. A first read took nothing, or there is no input at all.
+    Ended,
+    /// Nothing to read yet: the thread waits for it.
+    Waiting,
+    /// What a first read took, which the thread forwards first.
+    Read(usize),
+}
+
+/// What `from` holds before a thread waits on it: where a read would not wait (POSIX's
+/// "ready for reading", [`ready`]), a first read ([`first_read`]) takes it. Input that has
+/// already ended so starts no thread: a bare restore's stdin of /dev/null, as the Firecracker
+/// comparison's restores have, made one that ended at once, its stack unmapped under the page
+/// table of its top, which the stack above it kept (mm/memory.c `free_pgd_range`): a page-table
+/// page mapping nothing in every such VM. Input that is not open has ended; any other refusal
+/// is said by the caller, which starts no thread.
+#[cfg(unix)]
+fn pending(from: &mut (impl Read + std::os::fd::AsRawFd), buf: &mut [u8]) -> std::io::Result<Pending> {
+    match ready(from.as_raw_fd()) {
+        Ok(false) => Ok(Pending::Waiting),
+        Ok(true) => first_read(from, buf),
+        Err(e) if e.raw_os_error() == Some(libc::EBADF) => Ok(Pending::Ended),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a read of `fd` would not wait, asked without waiting: poll(2), which Linux answers
+/// for every file (a file without a poll method reads without waiting: fs/select.c
+/// `DEFAULT_POLLMASK`), its POLLNVAL saying that `fd` is not open.
+#[cfg(target_os = "linux")]
+fn ready(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+    let mut event = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: poll(2) of one pollfd of ours, waiting for nothing.
+        if unsafe { libc::poll(&raw mut event, 1, 0) } >= 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    if (event.revents & libc::POLLNVAL) != 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    Ok(event.revents != 0)
+}
+
+/// Whether a read of `fd` would not wait, asked without waiting: select(2), which asks a
+/// device's own select routine, where macOS's poll(2) supports no device (poll(2), BUGS: it
+/// answers POLLNVAL for /dev/null and /dev/zero, macOS 26.4, which select(2) answers readable,
+/// and a pipe and a pseudo-terminal alike either way).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ready(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+    match usize::try_from(fd) {
+        Err(_) => return Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+        Ok(fd) if fd >= libc::FD_SETSIZE => {
+            return Err(std::io::Error::other(format!(
+                "descriptor {fd} lies past what select(2) takes"
+            )));
+        }
+        Ok(_) => {}
+    }
+    loop {
+        // SAFETY: an fd_set is plain data, all zeros when empty (FD_ZERO's own).
+        let mut set: libc::fd_set = unsafe { std::mem::zeroed() };
+        let mut now = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        // SAFETY: `fd` lies below FD_SETSIZE (above); `set` and `now` are ours, the one
+        // descriptor's set and a wait of nothing.
+        let answered = unsafe {
+            libc::FD_SET(fd, &raw mut set);
+            libc::select(
+                fd + 1,
+                &raw mut set,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut now,
+            )
+        };
+        if answered >= 0 {
+            // SAFETY: `set` as select(2) left it, `fd` below FD_SETSIZE.
+            return Ok(answered > 0 && unsafe { libc::FD_ISSET(fd, &raw const set) });
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// [`pending`] on Windows, decided by the kind of input its handle is (GetFileType): a pipe by
+/// what waits in it (PeekNamedPipe, which says ERROR_BROKEN_PIPE once its writer has gone and
+/// nothing is left in it); a file by a first read, which never waits; a console as waiting,
+/// its input typed as it comes; NUL as ended, by its device type ([`device_type`]). Any other
+/// device's input cannot be told without a read that may wait: said, starting no thread. No
+/// handle, or one not open, has ended.
+#[cfg(windows)]
+fn pending(
+    from: &mut (impl Read + std::os::windows::io::AsRawHandle),
+    buf: &mut [u8],
+) -> std::io::Result<Pending> {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN, GetFileType,
+    };
+    use windows_sys::Win32::System::Console::GetConsoleMode;
+    use windows_sys::Win32::System::Ioctl::FILE_DEVICE_NULL;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let handle = from.as_raw_handle();
+    if handle.is_null() {
+        return Ok(Pending::Ended);
+    }
+    // SAFETY: GetFileType of the handle `from` holds, which says a handle not open as such.
+    match unsafe { GetFileType(handle) } {
+        FILE_TYPE_DISK => first_read(from, buf),
+        FILE_TYPE_PIPE => {
+            let mut waiting = 0u32;
+            // SAFETY: a peek of no bytes at the pipe's end `from` holds, its count ours.
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &raw mut waiting,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peeked == 0 {
+                let e = std::io::Error::last_os_error();
+                return if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    Ok(Pending::Ended)
+                } else {
+                    Err(e)
+                };
+            }
+            if waiting == 0 {
+                Ok(Pending::Waiting)
+            } else {
+                first_read(from, buf)
+            }
+        }
+        FILE_TYPE_CHAR => {
+            let mut mode = 0u32;
+            // SAFETY: the handle `from` holds, and a mode of ours for the call to fill.
+            if unsafe { GetConsoleMode(handle, &raw mut mode) } != 0 {
+                return Ok(Pending::Waiting);
+            }
+            match device_type(handle)? {
+                FILE_DEVICE_NULL => Ok(Pending::Ended),
+                other => Err(std::io::Error::other(format!(
+                    "its standard input is a device (type {other:#x}) whose input cannot be told without a read that may wait"
+                ))),
+            }
+        }
+        FILE_TYPE_UNKNOWN => {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == i32::try_from(ERROR_INVALID_HANDLE).ok() {
+                Ok(Pending::Ended)
+            } else {
+                Err(std::io::Error::other(format!(
+                    "its standard input is of a kind Windows does not say: {e}"
+                )))
+            }
+        }
+        other => Err(std::io::Error::other(format!(
+            "its standard input is of kind {other:#x}"
+        ))),
+    }
+}
+
+/// The device type of the file `handle` holds (NtQueryVolumeInformationFile's
+/// FileFsDeviceInformation): FILE_DEVICE_NULL for NUL.
+#[cfg(windows)]
+fn device_type(handle: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<u32> {
+    use windows_sys::Wdk::Storage::FileSystem::{FileFsDeviceInformation, NtQueryVolumeInformationFile};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    /// FILE_FS_DEVICE_INFORMATION (ntifs.h): the device's type, then its characteristics.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Device {
+        kind: u32,
+        _characteristics: u32,
+    }
+    let mut device = Device::default();
+    // SAFETY: an IO_STATUS_BLOCK is plain data (a status or pointer, and a count), which the
+    // call fills; zero is a valid one.
+    let mut status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(size_of::<Device>()).map_err(std::io::Error::other)?;
+    // SAFETY: the handle the caller holds, and a Device and an IO_STATUS_BLOCK of ours for
+    // the call to fill, of their own sizes.
+    let got = unsafe {
+        NtQueryVolumeInformationFile(
+            handle,
+            &raw mut status,
+            (&raw mut device).cast(),
+            size,
+            FileFsDeviceInformation,
+        )
+    };
+    if got < 0 {
+        // SAFETY: no pointers; an NTSTATUS as Win32 says it.
+        let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(got) };
+        return Err(std::io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    Ok(device.kind)
+}
+
+/// A first read of input that a read does not wait for: nothing is its end, and what it takes
+/// the thread forwards first. Interrupted, it is made again; where another reader of the same
+/// input took what was there first (EAGAIN), more is still to come.
+fn first_read(from: &mut impl Read, buf: &mut [u8]) -> std::io::Result<Pending> {
+    loop {
+        match from.read(buf) {
+            Ok(0) => return Ok(Pending::Ended),
+            Ok(n) => return Ok(Pending::Read(n)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(Pending::Waiting),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn forward_stdin(handle: vm::Handle) {
+    // As much as a buffer the guest posts takes: the rest waits in stdin.
+    let mut buf = [0u8; shards_vmm::devices::virtio::console::INPUT_AT_ONCE];
+    // Read here, the guest is given it on the thread: the console takes input only as its
+    // guest posts buffers, and this thread waits next for the VM's end.
+    let first = match pending(&mut std::io::stdin(), &mut buf) {
+        Ok(Pending::Ended) => return,
+        Ok(Pending::Waiting) => 0,
+        Ok(Pending::Read(n)) => n,
+        Err(e) => {
+            report(format!("console input unavailable: {e}"));
+            return;
+        }
+    };
     let spawned = std::thread::Builder::new()
         .name("console-in".into())
         .spawn(move || {
             let mut stdin = std::io::stdin().lock();
-            // As much as a buffer the guest posts takes: the rest waits in stdin.
-            let mut buf = [0u8; shards_vmm::devices::virtio::console::INPUT_AT_ONCE];
             let mut typed = Vec::with_capacity(buf.len());
             let mut escape = false;
+            let mut n = first;
             loop {
-                let n = match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => n,
-                };
+                if n == 0 {
+                    n = match stdin.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                }
                 // What was read goes to the guest at once, its escapes taken out: one
                 // buffer of the guest's for as much as it holds, not one for each byte.
                 typed.clear();
@@ -1704,6 +1960,7 @@ fn forward_stdin(handle: vm::Handle) {
                     escape = !escape && b == 0x01;
                 }
                 handle.console_input(&typed);
+                n = 0;
             }
         });
     if let Err(e) = spawned {
@@ -2382,15 +2639,25 @@ fn serve_workload(
                                 (timing, working_set)
                             });
                         };
-                        let saved = |used| crate::warm::layer_saved(&link, used);
+                        // Its layer's word, or why it has none (D37).
+                        let saved = |came: Result<Option<u64>, String>| match came {
+                            Ok(used) => crate::warm::layer_saved(&link, used),
+                            Err(why) => crate::warm::layer_lost(&link, &why),
+                        };
                         // A layer that stays in its file (D190) is the daemon's to read
                         // once the machine is gone, nothing of it writing the file then:
                         // whether this run's may stay, and whether its guest kept it.
                         let layer_stays = std::sync::atomic::AtomicBool::new(false);
                         let layer_kept = std::sync::atomic::AtomicBool::new(false);
-                        let kept = |used| match crate::warm::hold_kept(&link, used) {
-                            Ok(()) => layer_kept.store(true, std::sync::atomic::Ordering::Relaxed),
-                            Err(e) => shards_vmm::debug!("holding the kept layer's word: {e}"),
+                        let kept = |came: Result<Option<u64>, String>| {
+                            let held = came.and_then(|used| {
+                                crate::warm::hold_kept(&link, used)
+                                    .map_err(|e| format!("holding its word that it kept them: {e}"))
+                            });
+                            match held {
+                                Ok(()) => layer_kept.store(true, std::sync::atomic::Ordering::Relaxed),
+                                Err(why) => crate::warm::layer_lost(&link, &why),
+                            }
                         };
                         let processes = |records: &[u8]| crate::warm::processes(&link, records);
                         let members = |ended: &[u8]| crate::warm::member_ended(&link, ended);
@@ -2615,8 +2882,15 @@ fn serve_workload(
             }
         });
         // Its joiners (D119), which the guest ended with its workload, tell the daemon how
-        // each ended before this process goes, as the relay has had 5 s to (below).
-        crate::warm::await_joiners(std::time::Duration::from_secs(5));
+        // each ended before this process goes, as the relay has had 5 s to (below). Those
+        // that had not, whose links close with it, their layers too, are said.
+        let within = std::time::Duration::from_secs(5);
+        let unfinished = crate::warm::await_joiners(within);
+        if unfinished > 0 {
+            shards_vmm::warn!(
+                "{unfinished} of its joiners had not told their ends and layers within {within:?}: its VM ends with their links"
+            );
+        }
         // A warm VM's client printed its timing line from the exit status.
         if !warm {
             report_timing(&handle, Some(timing));
@@ -2644,6 +2918,11 @@ fn serve_workload(
         if refill && TAKEN.get().is_none() && matches!(reason, ExitReason::Reset | ExitReason::PowerOff) {
             report("its guest ended before it took a run");
             return ExitCode::from(shards_ipc::TEMPLATE_FAILED_STATUS);
+        }
+        // One its host refused to enter before it took a run, said above, says so by its
+        // status too: its daemon then starts no VM into its host's refusals (D26, D261).
+        if refill && TAKEN.get().is_none() && matches!(reason, ExitReason::Refused(_)) {
+            return ExitCode::from(shards_ipc::HOST_REFUSED_STATUS);
         }
         // The guest waits for its status to be read before it powers off, so the relay
         // has finished unless the guest never ran the command.
@@ -2977,8 +3256,8 @@ fn restore_reported(
             // On Windows before the state is read too, which looks at each file it names,
             // as an AppContainer may not at one it was not handed (PM M345).
             #[cfg(windows)]
-            refuse_unasked(&shards_vmm::snapshot::backing_named(&cfg.dir)?)?;
-            let pinned = read_snapshot(&cfg.dir)?;
+            refuse_unasked(&snapshot_read(shards_vmm::snapshot::backing_named(&cfg.dir))?)?;
+            let pinned = snapshot_read(shards_vmm::snapshot::read(&cfg.dir))?;
             refuse_unasked(&shards_vmm::snapshot::backing_of(&pinned))?;
             pinned
         }
@@ -2989,10 +3268,10 @@ fn restore_reported(
         // newer generation in between names others.
         #[cfg(windows)]
         None => {
-            let named = shards_vmm::snapshot::backing_named(&cfg.dir)?;
+            let named = snapshot_read(shards_vmm::snapshot::backing_named(&cfg.dir))?;
             add(&mut paths, &named);
             confine(&paths)?;
-            let pinned = read_snapshot(&cfg.dir)?;
+            let pinned = snapshot_read(shards_vmm::snapshot::read(&cfg.dir))?;
             if shards_vmm::snapshot::backing_of(&pinned) != named {
                 return Err(format!(
                     "{}: its snapshot was saved again as it was read",
@@ -3003,7 +3282,7 @@ fn restore_reported(
         }
         #[cfg(not(windows))]
         None => {
-            let pinned = read_snapshot(&cfg.dir)?;
+            let pinned = snapshot_read(shards_vmm::snapshot::read(&cfg.dir))?;
             add(&mut paths, &shards_vmm::snapshot::backing_of(&pinned));
             confine(&paths)?;
             pinned
@@ -3035,14 +3314,19 @@ fn restore_reported(
 }
 
 /// Whether this process's restore found its snapshot's files unreadable
-/// ([`read_snapshot`]): their fault, its template's where a warm VM restores one, which such
+/// ([`snapshot_read`]): their fault, its template's where a warm VM restores one, which such
 /// a VM's status tells its daemon ([`serve_workload`], D26), not its host's.
 static SNAPSHOT_UNREAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-/// The snapshot in `dir`, read and pinned (`shards_vmm::snapshot::read`), a failure kept
-/// ([`SNAPSHOT_UNREAD`]).
-fn read_snapshot(dir: &Path) -> Result<shards_vmm::snapshot::Pinned, String> {
-    shards_vmm::snapshot::read(dir).inspect_err(|_| {
+/// What a read of the snapshot's files gave, a failure kept ([`SNAPSHOT_UNREAD`]): the one way
+/// each read of a restore's snapshot goes, its state read and pinned
+/// (`shards_vmm::snapshot::read`) and, on Windows, the read before it of the files that state
+/// names (`shards_vmm::snapshot::backing_named`), which fails as surely where the state does
+/// not read. One that went around it was its template's fault unsaid: its warm VM exited 125,
+/// not `TEMPLATE_FAILED_STATUS`, and its daemon refilled from the template for ever (CI
+/// 44227612442, windows-2025, images.rs `repeat_runs_restore_a_template_of_the_image`).
+fn snapshot_read<T>(read: Result<T, String>) -> Result<T, String> {
+    read.inspect_err(|_| {
         let _ = SNAPSHOT_UNREAD.set(());
     })
 }
@@ -3064,6 +3348,36 @@ static BACKING: std::sync::OnceLock<Vec<(PathBuf, bool)>> = std::sync::OnceLock:
 /// The directory relative paths are of (`--cwd DIR`): the VM's starter's own on macOS, where App
 /// Sandbox starts a VM process in its container instead.
 static CWD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The home this process declares its durable writes in (`--durable HOME`, D286): its
+/// spawner's, which follows it by them (D215).
+static DURABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The slot file of [`DURABLE`]'s home, where it was given one.
+fn durable_file() -> Option<PathBuf> {
+    DURABLE.get().map(|home| home.join(shards_durable::FILE))
+}
+
+/// Declares this process's durable writes in its spawner's home's slot file (D286), where it
+/// was given one (`--durable`): on macOS and Windows the file its spawner granted it, opened to
+/// be written (`Access::Write`), which its spawner made first; on Linux opened here, before
+/// Landlock, which gives no rule for it, as its vCPU records are held (D261). One that cannot
+/// be installed fails its start: its writes would go undeclared, as no judge may take them.
+fn durable_installed() -> Result<(), String> {
+    let Some(path) = durable_file() else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "macos", windows))]
+    let file = shards_vmm::platform::open_input(&path, true);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(&path);
+    file.and_then(shards_durable::install_file).map_err(|e| {
+        format!(
+            "{}: its home's declarations of durable writes: {e}",
+            path.display()
+        )
+    })
+}
 
 /// What a VM that saves a snapshot gives up once it is committed (review 8.2): the
 /// snapshot's directory, which only the save writes. A template's saver goes on to serve a
@@ -3518,6 +3832,7 @@ fn granted(paths: &crate::confine::Paths) -> Result<(), String> {
         .chain(paths.write.iter().map(|p| (Access::Write, p.clone())))
         .chain(paths.write_under.iter().map(|p| (Access::MakeDir, p.clone())))
         .chain(paths.records.iter().map(|p| (Access::Keep, p.clone())))
+        .chain(durable_file().map(|p| (Access::Write, p)))
         .chain(paths.vsock.iter().map(|p| (Access::Listen, p.clone())))
         .collect();
     // The last it asks for: on macOS its link closes after unless it dials (`confine`); on
@@ -3693,20 +4008,23 @@ fn confine(paths: &crate::confine::Paths) -> Result<(), String> {
     // The last it asks for: the link closes, and the spawner grants nothing more, unless
     // the guest's connections to host ports go through it.
     #[cfg(target_os = "macos")]
-    return granted(paths).and_then(|()| match &paths.vsock {
-        Some(vsock) => dial_through_spawner(vsock),
-        None => {
-            if let Some(link) = GRANTS.get() {
-                shards_ipc::end(link);
+    return granted(paths)
+        .and_then(|()| durable_installed())
+        .and_then(|()| match &paths.vsock {
+            Some(vsock) => dial_through_spawner(vsock),
+            None => {
+                if let Some(link) = GRANTS.get() {
+                    shards_ipc::end(link);
+                }
+                Ok(())
             }
-            Ok(())
-        }
-    });
+        });
     // Its sockets narrowed, every connect refused, then Landlock, on every thread; and
     // its vsock path bound, and its dials beside it made, by its spawner (D30), whose link
     // closes where it has none to make.
     #[cfg(target_os = "linux")]
     return crate::confine::sockets()
+        .and_then(|()| durable_installed())
         .and_then(|()| crate::confine::landlock(paths))
         .and_then(|()| match &paths.vsock {
             Some(vsock) => {
@@ -3732,6 +4050,7 @@ fn confine(paths: &crate::confine::Paths) -> Result<(), String> {
     {
         shards_vmm::hv::forbid_dynamic_code_once_set_up();
         granted(paths)?;
+        durable_installed()?;
         // Its spawner stages its snapshots and reads its files' ranges for it, as long as
         // the link stays: it may make no FSCTL (D141), and a restore copies a template's
         // writable layer by its ranges (D196), as any save of it copies its layer and swap
@@ -4494,6 +4813,36 @@ mod lifeline_tests {
             lifeline_open(&reader).unwrap_err().kind(),
             std::io::ErrorKind::BrokenPipe
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod console_input_tests {
+    use super::*;
+
+    /// The null device, whose every read takes nothing.
+    #[cfg(unix)]
+    const NULL: &str = "/dev/null";
+    #[cfg(windows)]
+    const NULL: &str = "NUL";
+
+    /// Console input that has already ended starts no thread (`pending`, which `forward_stdin`
+    /// returns on before it spawns one), on every host: a pipe whose writer has gone, and the
+    /// null device, the stdin of the Firecracker comparison's bare restores. Input still to
+    /// come waits on its thread, and input already there is read for it.
+    #[test]
+    fn console_input_that_has_already_ended_starts_no_thread() {
+        let mut buf = [0u8; 8];
+        let (mut reader, mut writer) = std::io::pipe().unwrap();
+        assert_eq!(pending(&mut reader, &mut buf).unwrap(), Pending::Waiting);
+        writer.write_all(b"ab").unwrap();
+        assert_eq!(pending(&mut reader, &mut buf).unwrap(), Pending::Read(2));
+        assert!(buf.starts_with(b"ab"));
+        drop(writer);
+        assert_eq!(pending(&mut reader, &mut buf).unwrap(), Pending::Ended);
+        let mut null = std::fs::File::open(NULL).unwrap();
+        assert_eq!(pending(&mut null, &mut buf).unwrap(), Pending::Ended);
     }
 }
 

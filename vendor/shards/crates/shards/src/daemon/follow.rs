@@ -20,7 +20,7 @@ use shards_ipc::{ExitWatch, Poller};
 #[cfg(unix)]
 use shards_vmm::platform::{ExitWatch, Poller};
 
-use super::ends::End;
+use super::ends::{End, GoesOn};
 use super::{Daemon, Inbox, Threads, lock, log};
 use crate::containers::{Disk, Removal};
 
@@ -325,17 +325,21 @@ impl<D: Disk> Daemon<D> {
                         continue;
                     }
                     let goes_on = match unpublishing.as_mut() {
-                        Some(followed) => Some(followed.goes_on().is_some()),
-                        None => following
-                            .as_mut()
-                            .map(|(_, followed)| followed.goes_on().is_some()),
+                        Some(followed) => Some(followed.goes_on()),
+                        None => following.as_mut().map(|(_, followed)| followed.goes_on()),
                     };
                     let next = match goes_on {
-                        Some(true) => self
+                        Some(GoesOn::Went(_)) => self
                             .ends
                             .slice(End::Helper)
                             .and_then(|slice| Instant::now().checked_add(slice)),
-                        Some(false) => {
+                        Some(still) => {
+                            if let GoesOn::Unread(why) = still {
+                                log(format!(
+                                    "network process {}: its end could not be read at its look, so it is ended: {why}",
+                                    child.id()
+                                ));
+                            }
                             *following = None;
                             *unpublishing = None;
                             let _ = child.kill(shards_ipc::signal::SIGKILL);
@@ -751,8 +755,19 @@ impl<D: Disk> Daemon<D> {
     /// Waits until every removal queued is complete, with the anonymous volumes of those
     /// that ended with `--rm`, and every one a run's end has taken out and not yet queued:
     /// what a command that reads volumes sees, as `docker run --rm` has removed them by the
-    /// time it returns, and what a shutdown leaves done.
+    /// time it returns. On Windows first each `--rm` run's end kept for its VM process, a
+    /// record leaving, taken out as it is told (D281, `await_leaving`).
     pub(super) fn await_removals(&self) {
+        #[cfg(windows)]
+        self.await_leaving(None);
+        self.await_queued_removals();
+    }
+
+    /// [`await_removals`](Self::await_removals) of the removals taken out alone: what a
+    /// shutdown leaves done, which tells no end kept for a VM process (`park_end` keeps
+    /// DONE's order once the daemon stops) and holds the daemon's state as it waits, which
+    /// telling one takes (`budget_left`).
+    pub(super) fn await_queued_removals(&self) {
         let c = &self.completing;
         let mut pending = lock(&c.pending);
         while !pending.is_empty()
@@ -767,8 +782,18 @@ impl<D: Disk> Daemon<D> {
     }
 
     /// Waits while a removal pending holds `name`. Takes the records' lock under the
-    /// queue's, as nothing takes the queue's under the records'.
+    /// queue's, as nothing takes the queue's under the records'. On Windows first the end
+    /// of the `--rm` run holding it, kept for its VM process, judged on that process alone
+    /// (D281, `await_leaving`): its client has its status as its command ends, before its
+    /// VM's, and a script's next `run --rm --name` was refused the name.
     pub(super) fn await_released(&self, name: &str) {
+        #[cfg(windows)]
+        {
+            let holder = lock(&self.containers).name_taken(name).map(|c| c.id.clone());
+            if let Some(holder) = holder {
+                self.await_leaving(Some(&holder));
+            }
+        }
         let c = &self.completing;
         let mut pending = lock(&c.pending);
         loop {
