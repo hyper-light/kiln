@@ -165,6 +165,111 @@ reads `~/.zshrc` or `~/.profile`, so an API key a harness signs in by exported t
 the subscription it was signed in to and paused at that account's usage limits. An agent started
 from a kiln shell (`kiln spawn`) has that shell's environment over the login shell's.
 
+## Environments
+
+An **environment** (`agentenv` in kiln's operations, routes and wire, apart from CI's and CD's
+environments, docs/ci.md W15) is a person's named set of variables an agent session runs with:
+picked from what the machine's user has, set to a value, given one of the person's own secrets, or
+taken away. One is chosen as an agent starts (Mission control's composer, More options →
+Environment) or applied to one that runs (its Engine tab), which starts its harness again on its
+conversation, as a restart does: a running process takes no new environment. Without one, a
+session runs with the machine's user's environment (above), as it would from that user's terminal.
+Decided by the user (2026-11-18): environments, the Engine tab for every session, and a person's
+secrets given to the sessions they choose them for (until then, to their Agentfiles' builds alone,
+kiln plan 01a1cd8e862e7169a074db3d5fa33f3d decision 6).
+
+### What one is
+
+| Field | |
+|---|---|
+| `id`, `owner` | made by kiln; an environment is its owner's alone, as their Agentfiles and secrets are |
+| `name` | unique among its owner's; shown wherever it's chosen |
+| `description?` | |
+| `base` | `user`: the machine's user's environment (above), its variables over it; `clean`: only what the harness needs to run (its home, user, shell, search path, temporary folder, locale and time zone; on Windows also `SystemRoot`, `SystemDrive`, `ComSpec`, `PATHEXT`, `windir`, `APPDATA`, `LOCALAPPDATA`, `USERPROFILE`, `ProgramData`, `ProgramFiles`), its variables over that |
+| `vars` | in order, each `{name, from, of?, value?, secret?}`; a later one of a name wins |
+| `version`, `created_at`, `updated_at` | its version goes up with each change; a session says the version it started with |
+
+A variable's `name` is a portable one (`[A-Za-z_][A-Za-z0-9_]*`; on Windows, names differ by more
+than their case or are refused there). `from`:
+
+- `machine`: the machine's user's variable `of` (its own name when none), read by the runner as the
+  session starts and never leaving that machine; one the machine hasn't is left unset, and the
+  session's timeline says so.
+- `value`: `value`, kept as it is and shown to its owner. Not for secrets.
+- `secret`: the owner's own secret `secret` (Settings → Your secrets, `secrets.mine.*`), opened by the
+  server as the session starts, sent to its runner over the runner's link, kept in the runner's
+  memory alone (never in its record of sessions, a move, a checkpoint or the session's state), and
+  marked used; never shown. A secret the owner deletes leaves the next start refused, naming it.
+- `unset`: taken away from what the base gives.
+
+### Where they apply
+
+A session's environment, top wins: kiln's own (`KILN_AGENT`, its sockets; `KILN_*` from nowhere
+else, above), the environment's variables, the shell `kiln spawn` took the environment of, the base,
+the runner's own. The search path is the machine's as above unless the environment sets `PATH`.
+
+A session in a microVM takes an environment's `machine` and `value` variables into its harness's
+member, as they are: nothing else of the machine's environment goes in (below), and its base is its
+image's. Its `secret` variables are refused there, naming them: a secret is granted to a microVM by
+name, never by value ("Signing in, and your credentials", below). What a `value` or `machine`
+variable holds is its owner's choice, a secret among them: kiln doesn't look for secrets in them,
+refuse them or warn about them (decided by the user, 2026-11-18).
+
+The server keeps which environment each session runs with, and opens it again (its newest version,
+its secrets read again) whenever the session's harness starts: started, restarted, resumed after a
+crash or a runner's restart, moved. An environment applied to a running session starts its harness
+again at once, unless it is told to wait for its next start (`restart: false`). An environment some
+session runs with can't be deleted: the refusal names those sessions.
+
+### What a machine's user has
+
+A runner says which variables its user has and where each is set, by name alone, never a value
+(`agentenvs.machine`): what an environment's `machine` variables are picked from.
+
+| System | Where it looks | `sources` |
+|---|---|---|
+| macOS | the login shell (`$SHELL -l -i`, above); launchd's user domain (`launchctl getenv`, for the names `launchctl` reports set) | `login_shell`, `launchd` |
+| Linux | the login shell; the systemd user manager (`systemctl --user show-environment`: `environment.d`, `systemctl --user set-environment`); PAM's (`/etc/environment`, `~/.pam_environment`) | `login_shell`, `systemd_user`, `pam` |
+| Windows | the user's and the system's environment in the registry (`HKCU\Environment`, `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`), `REG_EXPAND_SZ` expanded as Windows does | `user_registry`, `system_registry` |
+| every | the runner's own process | `runner` |
+
+### Operations
+
+| Operation | Route | |
+|---|---|---|
+| `agentenvs.list` | `GET /api/agentenvs` | → `{agentenvs: Agentenv[]}`, its caller's, by name, each with `sessions` (the ids of those running with it) |
+| `agentenvs.get` | `GET /api/agentenvs/:id` | → `Agentenv`; 404 when it isn't the caller's |
+| `agentenvs.create` | `POST /api/agentenvs` | `{name, description?, base, vars}` → `Agentenv`; 409 when the name is taken; 400 naming a bad variable or a secret the caller hasn't |
+| `agentenvs.update` | `PATCH /api/agentenvs/:id` | `{version, name?, description?, base?, vars?}` → `Agentenv`; 409 when `version` isn't its current one |
+| `agentenvs.delete` | `DELETE /api/agentenvs/:id` | → 204; 409 naming the sessions that run with it |
+| `agentenvs.machine` | `GET /api/agentenvs/machine?target=` | → `{vars: [{name, sources}]}` of that machine's user, by name; 502 while it's away |
+| `agentenvs.apply` | `PUT /api/harness/sessions/:id/agentenv` | `{agentenv: id \| null, restart?: true}` → `{agent, agentenv, restarted}`: `null` puts it back on the machine's user's environment |
+| (start) | `agents.start`, `POST /api/harness/agents` | `agentenv?: id`, the environment it starts with |
+
+`AgentInfo` says `agentenv?: {id, name, version}` of each session. Each change is an `agentenv`
+event (`{type, agentenv, deleted?}`) on `/api/events`. A refusal is typed (`agentenv_unknown`,
+`agentenv_name_taken`, `agentenv_stale`, `agentenv_in_use`, `agentenv_secret_missing`,
+`agentenv_secret_in_microvm`, `agentenv_bad_var`), its text the UI's to show.
+
+On the wire (docs/wire.md, feature `agentenv`): the server sends a session's resolved environment
+in its `Spec` (`agentenv`: `{id, name, version, base, vars}`, a `secret` variable carrying its value,
+taken out of the spec as the runner reads it, as an Agentfile build's secrets are), replaces it on a
+running session with `Command::Agentenv` in `HarnessCmd` (applied, then the harness started again
+unless told not to; the server's alone, refused from a client), and asks a runner its user's
+variables with `ServerMsg::UserEnv`, answered as `Answer`.
+
+### In the Engine tab
+
+Every agent's Engine tab has its Environments, beside its Agents (and its Sandboxes, in a
+microVM): a section that folds, found by a filter with facets (Base, What it uses: machine
+variables, values, secrets; Where: this session's, others', none) and sorted (newest, oldest, name,
+most variables, most sessions), a card each, this session's first and marked. A card is its name,
+base and version, its variables a line each (name, where it comes from, a value shown or a secret's
+name, never a secret's value), and the sessions running with it; it's changed in place, and applied
+to this session from there, the card saying the session starts again on its conversation. A new
+one is a card at the top, filled in the same way: a `machine` variable is picked from what the
+session's machine says its user has, with where each is set; a `secret`, from the person's own.
+
 ## What an agent left running
 
 Every agent session's processes are held together by the system where it can (`crate::os::contain`):

@@ -445,6 +445,12 @@ pub struct Spec {
     /// no copy of the session (a move, a hand-over, a resume) carries them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub build_secrets: Vec<crate::secrets::mine::BuildSecret>,
+    /// Its environment (docs/agents.md, "Environments"), as kiln's server resolved it as it started:
+    /// its secrets' values opened. Set by kiln, never from what was asked; its machine takes it out of
+    /// the session as it starts it and keeps it in memory alone, so no record or copy of the session
+    /// carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentenv: Option<super::agentenv::Resolved>,
     /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -546,6 +552,7 @@ impl Default for Spec {
             isolation: None,
             agentfile: None,
             build_secrets: Vec::new(),
+            agentenv: None,
             variant_of: None,
             opener: None,
             dirs: Vec::new(),
