@@ -7,7 +7,10 @@
 //! machine holds as many workspaces at once as it has drive letters free, and each is taken from the top of the
 //! alphabet down: Windows gives a new disk or a removable drive the lowest letter free, so the highest are the least
 //! likely to be wanted next. Two agents starting at once can find the same letter free; Slates refuses the second
-//! mount there, and its maker takes the next letter free ([`points`]).
+//! mount there, and its maker takes the next letter free ([`points`]). So it does where Slates refuses a letter as
+//! another volume's that this process sees free (Slates' A-369 `DriveLetterTaken`: the Mount Manager has given it to a
+//! volume that isn't here, or a definition local to the daemon's session hides it): `super::slates::make` judges by
+//! that typed refusal, and by [`taken`].
 //!
 //! What is mounted at a point is judged by the system's own word, never by a path's spelling: a mount's device differs
 //! from its parent's (Unix), or the drive is there and Windows names its file system Slates' (`slates`, the name its

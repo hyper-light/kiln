@@ -263,7 +263,9 @@ installed once from winfsp.dev), and `GET /api/harness/workspaces` says it for e
 Windows each workspace is mounted at a drive letter of its own, the highest free, since Slates mounts
 a WinFsp volume at a drive letter alone (a directory mount point is an NTFS reparse point, a write to
 the disk it refuses), so a Windows machine holds as many workspaces at once as it has letters free
-(`workspace::place`). `KILN_SLATES_INSTANCE` names another instance (labs, tests), and
+(`workspace::place`); a letter Slates refuses as another volume's (its A-369 `DriveLetterTaken`: the Mount
+Manager has given it to another volume, or a definition local to the daemon's session hides it) is passed
+for the next free one, as is a letter another start took meanwhile. `KILN_SLATES_INSTANCE` names another instance (labs, tests), and
 `KILN_SLATES_DIRECT` starts its anchor in its own process group on Linux too; every process of an
 instance carries `--instance <name>`.
 

@@ -454,8 +454,8 @@ fn hex_bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
 }
 
 /// A new workspace `name` laid over `over`, mounted where its machine mounts workspaces (`super::place`): its folder
-/// under the workspaces folder, or on Windows the highest drive letter free, the next one free when another start took
-/// that one meanwhile.
+/// under the workspaces folder, or on Windows the highest drive letter free, the next one free when Slates refuses that
+/// one as another volume's or another start took it meanwhile ([`another_letter_may_serve`]).
 pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
     let spec = VolumeSpec::overlay(name, over, volume_max());
@@ -466,8 +466,16 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
         let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned() };
         // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
         // volume, not this one, and Slates refuses a second mount at it.
-        match mount_at(&m).await {
-            Ok(()) => return Ok(m),
+        match mount_typed(&m).await {
+            Ok(Ok(())) => return Ok(m),
+            // Refused as another volume's letter, or taken meanwhile: the next one; any other refusal ends the search.
+            Ok(Err(refused)) => {
+                let next = another_letter_may_serve(&refused, super::place::taken(&point));
+                failed = anyhow::anyhow!("Slates' mount: {refused}");
+                if !next {
+                    break;
+                }
+            }
             // Taken meanwhile (a drive letter another start mounted first): the next one.
             Err(e) if super::place::taken(&point) => failed = e,
             Err(e) => {
@@ -511,15 +519,33 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
 }
 
 /// Mounts workspace `m` at its point, which holds nothing of it now: a folder made for it (Unix), or a drive letter
-/// the mount itself makes (Windows).
+/// the mount itself makes (Windows). [`mount_typed`], its refusal in Slates' words.
 async fn mount_at(m: &Made) -> anyhow::Result<()> {
+    mount_typed(m).await?.map_err(|refused| anyhow::anyhow!("Slates' mount: {refused}"))
+}
+
+/// [`mount_at`] with Slates' refusal kept typed (`Ok(Err(refused))`), apart from a failure to ask Slates at all, so
+/// [`make`] can tell a drive letter Slates refuses as another volume's from a refusal every letter would meet.
+async fn mount_typed(m: &Made) -> anyhow::Result<Result<(), slates_api::Error>> {
     let dir = PathBuf::from(&m.mount);
     super::place::ready(&dir)?;
     let volume = volume_id(&m.volume)?;
     let path = m.mount.clone();
-    call("mount", move |i| i.mount(volume, &path, &slates_api::MountOptions::default())).await?;
+    if let Err(refused) = call("mount", move |i| Ok(i.mount(volume, &path, &slates_api::MountOptions::default()))).await? {
+        return Ok(Err(refused));
+    }
     anyhow::ensure!(is_mount(&dir), "Slates said it mounted {} at {}, but nothing is mounted there", m.name, m.mount);
-    Ok(())
+    Ok(Ok(()))
+}
+
+/// Whether a mount refused at a drive letter (`refused`, Slates' typed refusal) leaves the next free letter worth trying:
+/// Slates refused it as another volume's (`DriveLetterTaken`, its A-369: the Mount Manager has given the letter to
+/// another volume, or a definition local to the daemon's session hides it), which this process's own view of the drives
+/// can miss; or a drive holds the letter now (`taken_now`: another start mounted there first). Any other refusal is the
+/// machine's or the volume's (WinFsp's driver not allowed to make drives, the volume gone), which every letter would
+/// meet.
+fn another_letter_may_serve(refused: &slates_api::Error, taken_now: bool) -> bool {
+    taken_now || matches!(refused, slates_api::Error::Host(slates_api::HostFault::Target(slates_api::TargetRefusal::DriveLetterTaken)))
 }
 
 /// Takes the mount at `path` away: with the OS's own unmount, which needs no daemon (Unix); or by
@@ -1096,6 +1122,23 @@ mod tests {
             anyhow::ensure!(held == Unmounted::StillHeld("Resource busy".into()) && asks.load(Ordering::Relaxed) > 1, "asked again, then held: {held:?} after {asks:?}");
             Ok(())
         })
+    }
+
+    /// W1 (kiln goal 01a1ec34599974448aed2672bafaf9a2, Windows; Slates' A-369): a drive letter Slates refuses as another
+    /// volume's makes a workspace try the next free letter, though no drive holds it in this process's view (the Mount
+    /// Manager has given it to a volume that isn't here, or a definition local to the daemon's session hides it); one a
+    /// drive took meanwhile does too, whatever Slates said; a refusal every letter would meet ends the search there.
+    #[test]
+    fn w1_a_drive_letter_slates_refuses_as_another_volumes_moves_on_to_the_next() {
+        use slates_api::{Error, HostFault, TargetRefusal};
+        let taken = Error::Host(HostFault::Target(TargetRefusal::DriveLetterTaken));
+        assert!(another_letter_may_serve(&taken, false), "refused as another volume's, though this process sees the letter free");
+        assert!(another_letter_may_serve(&taken, true));
+        let not_allowed = Error::Host(HostFault::Target(TargetRefusal::MountManagerNotAllowed));
+        assert!(!another_letter_may_serve(&not_allowed, false), "the machine's refusal: every letter meets it");
+        assert!(another_letter_may_serve(&not_allowed, true), "a drive took the letter meanwhile: the next one");
+        let refused = Error::Host(HostFault::Target(TargetRefusal::MountRefused { errno: Some(5) }));
+        assert!(!another_letter_may_serve(&refused, false));
     }
 
     /// W2: what a machine lacks for workspaces is typed from Slates' own typed answer (`mount::available`), so a start
