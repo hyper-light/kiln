@@ -563,10 +563,15 @@ fn joined_path(first: Option<&std::ffi::OsStr>, then: Option<&std::ffi::OsStr>) 
     std::env::join_paths(dirs).ok().filter(|p| !p.is_empty())
 }
 
-/// The session's environment over the machine's: what its shell had (minus the shell's own
-/// terminal plumbing), with no `KILN_*` variable of either but those kiln gives it, and without what
-/// a Claude Code session sets for its children.
+/// The session's environment over its user's login shell's, over the machine's: what its shell had
+/// (minus the shell's own terminal plumbing), with no `KILN_*` variable of any but those kiln gives
+/// it, and without what a Claude Code session sets for its children.
 fn set_env(p: &mut Process, spec: &Spec) {
+    set_env_over(p, spec, &crate::reach::serve::login_said().unwrap_or_default());
+}
+
+/// [`set_env`], with `login` the variables the login shell said.
+fn set_env_over(p: &mut Process, spec: &Spec, login: &[(String, String)]) {
     // kiln's own variables are the server's or the runner's that starts it (its data folder, its
     // config, its supervisor's socket, its admin token), or those of the shell `kiln spawn` took the
     // environment of, which a kiln terminal has from the server: none goes on to the agent, which
@@ -575,6 +580,17 @@ fn set_env(p: &mut Process, spec: &Spec) {
     for (k, _) in std::env::vars_os() {
         if kilns(&k) {
             p.env_remove(k);
+        }
+    }
+    // What its user's login shell sets, as `kiln run`'s commands have it (`crate::reach::serve`):
+    // a harness signs in by an API key there too (docs/agents.md, "Signing harnesses in and
+    // out"), which a runner's service never read. Without it, a session started from Mission
+    // control or a goal ran Claude Code on the subscription it was signed in to, and paused at
+    // that account's usage limits, while one `kiln spawn` started from a terminal used the key that
+    // terminal had.
+    for (k, v) in login {
+        if !kilns(std::ffi::OsStr::new(k)) && !matches!(k.as_str(), "TERM" | "COLUMNS" | "LINES") {
+            p.env(k, v);
         }
     }
     // The PATH it was found on, so what it starts (its interpreter, its tools) is found too.
@@ -611,13 +627,15 @@ fn kilns(name: &std::ffi::OsStr) -> bool {
 }
 
 /// Where Claude Code keeps its configuration for this session: `CLAUDE_CONFIG_DIR` from the
-/// session's environment or the machine's, else `~/.claude`.
+/// session's environment, its user's login shell's or the machine's, as [`set_env`] layers them,
+/// else `~/.claude`.
 fn claude_config_dir(spec: &Spec) -> String {
     spec.env
         .iter()
         .rev()
         .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
         .map(|(_, v)| v.clone())
+        .or_else(|| crate::reach::serve::login_said()?.into_iter().rev().find(|(k, _)| k == "CLAUDE_CONFIG_DIR").map(|(_, v)| v))
         .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
         .filter(|d| !d.trim().is_empty())
         .unwrap_or_else(|| crate::os::home_dir().join(".claude").to_string_lossy().into_owned())
@@ -1598,6 +1616,33 @@ mod tests {
         let mine = dirs(std::env::var_os("PATH").as_deref());
         assert!(!ran.is_empty() && ran.starts_with(&mine), "{ran:?} starts with {mine:?}");
         Ok(())
+    }
+
+    /// A harness has what its user's login shell sets, as `kiln run`'s commands do: an API key it
+    /// signs in by (`ANTHROPIC_API_KEY` in `~/.zshrc`), which a runner's service never read, so
+    /// Claude Code ran on its subscription and paused at its usage limits. The session's own
+    /// shell's variables still win, and neither gives it a `KILN_*` variable, terminal plumbing or
+    /// what a Claude Code session sets for its children.
+    #[test]
+    fn a_harness_has_its_users_login_shell_variables_under_its_sessions() {
+        let spec = Spec { kind: "claude".into(), env: vec![("SET_BY_BOTH".into(), "session".into())], ..Spec::default() };
+        let login: Vec<(String, String)> = [("ANTHROPIC_API_KEY", "login-key"), ("SET_BY_BOTH", "login"), ("KILN_DATA_DIR", "/production"), ("TERM", "dumb"), ("CLAUDECODE", "1")]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let mut p = Process::new("claude");
+        set_env_over(&mut p, &spec, &login);
+        let env: std::collections::HashMap<_, _> = p.get_envs().collect();
+        let var = |k: &str| env.get(std::ffi::OsStr::new(k)).copied();
+        assert_eq!(var("ANTHROPIC_API_KEY"), Some(Some(std::ffi::OsStr::new("login-key"))));
+        assert_eq!(var("SET_BY_BOTH"), Some(Some(std::ffi::OsStr::new("session"))));
+        assert_ne!(var("KILN_DATA_DIR"), Some(Some(std::ffi::OsStr::new("/production"))));
+        assert_eq!(var("TERM"), None);
+        assert_eq!(var("CLAUDECODE"), Some(None));
+        // Without the login shell's answer, nothing of it.
+        let mut p = Process::new("claude");
+        set_env_over(&mut p, &spec, &[]);
+        assert!(p.get_envs().all(|(k, _)| k != "ANTHROPIC_API_KEY"));
     }
 
     #[test]

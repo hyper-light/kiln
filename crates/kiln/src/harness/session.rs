@@ -5214,9 +5214,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
                 let isolated = spec.isolation.is_some();
-                // One the machine's own PATH lacks may be on its user's: their login shell is asked
-                // first (once, then kept ten minutes).
-                if blocked.is_none() && !isolated && spec.program.is_none() && !kind.available() {
+                // It runs with its user's login shell's environment (its PATH, and an API key it
+                // signs in by: `kinds::set_env`): that shell is asked first, unless what it said is
+                // kept (until one of its startup files changes).
+                if blocked.is_none() && !isolated {
                     crate::reach::serve::login_env().await;
                 }
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).

@@ -157,8 +157,13 @@ harness's sessions listing new models (`crate::harness::kinds::changed`; it look
 service keeps the PATH of the terminal it was installed from, so a harness installed since in a
 folder that PATH lacks (Claude Code's and Codex's installers put theirs in `~/.local/bin`) is
 found all the same, within a minute, without the runner starting again. The harness runs with
-that PATH too: the runner's folders first, then those only the login shell has. An agent started
-from a kiln shell (`kiln spawn`) has that shell's PATH, as it has the rest of its environment.
+that PATH too: the runner's folders first, then those only the login shell has. It has the rest of
+that login shell's environment as well, as reach's runs do, kiln's own `KILN_*` variables and
+terminal ones (`TERM`, `COLUMNS`, `LINES`) left out: a runner's service (launchd, systemd) never
+reads `~/.zshrc` or `~/.profile`, so an API key a harness signs in by exported there
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) reaches it only this way. Without it, Claude Code ran on
+the subscription it was signed in to and paused at that account's usage limits. An agent started
+from a kiln shell (`kiln spawn`) has that shell's environment over the login shell's.
 
 ## What an agent left running
 
