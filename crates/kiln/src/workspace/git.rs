@@ -1291,11 +1291,13 @@ mod tests {
         let listed = out(&top, &["ls-tree", "-r", "--format=%(objectmode) %(path)", made.sha.as_str()])?;
         let mut tree: Vec<&str> = listed.lines().collect();
         tree.sort_unstable();
-        assert_eq!(tree, [".gitignore", "a", "b", "gen/fresh.rs", "latest", "lib/new/one.rs", "lib/new/two.rs", "tools/run.sh"].map(|p| match p {
+        let mut want = [".gitignore", "a", "b", "gen/fresh.rs", "latest", "lib/new/one.rs", "lib/new/two.rs", "tools/run.sh"].map(|p| match p {
             "latest" => "120000 latest".to_owned(),
             "tools/run.sh" => "100755 tools/run.sh".to_owned(),
             p => format!("100644 {p}"),
-        }));
+        });
+        want.sort_unstable();
+        assert_eq!(tree, want, "each path with its mode: the cleared directory's old file gone, the moved one's beneath its new place");
         let show = |path: &str| out(&top, &["show", format!("{}:{path}", made.sha).as_str()]);
         assert_eq!(show("a")?, "a, the agent's");
         assert_eq!(show("lib/new/one.rs")?, "one", "a moved directory's unchanged file keeps its bytes");
