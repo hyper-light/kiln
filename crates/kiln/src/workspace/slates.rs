@@ -554,7 +554,7 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     match call("volume destroy", move |i| i.destroy(id)).await {
         Ok(()) => {
             if let Some(base) = &base {
-                let_go(base, id).await;
+                release_base(base, id).await;
             }
         }
         Err(gone) => tracing::warn!(%volume, error = %format!("{gone:#}"), "a workspace that couldn't be mounted stayed"),
@@ -606,7 +606,7 @@ async fn in_fleet() -> bool {
 }
 
 /// Each folder's captured base, kept for the next agent over it while one is a clone of it (K5): a base goes with its last
-/// clone ([`let_go`]), so nothing kiln captured outlives the workspaces made from it.
+/// clone ([`release_base`]), so nothing kiln captured outlives the workspaces made from it.
 fn kept() -> &'static parking_lot::Mutex<std::collections::HashMap<PathBuf, Base>> {
     static KEPT: OnceLock<parking_lot::Mutex<std::collections::HashMap<PathBuf, Base>>> = OnceLock::new();
     KEPT.get_or_init(Default::default)
@@ -689,7 +689,7 @@ async fn capture(over: &Path) -> anyhow::Result<Base> {
 /// Destroyed workspace volume `clone`'s base let go, unless another workspace is a clone of it still (K5): once Slates has
 /// finished the clone's destroy ([`destroyed`]), which gives the clone's pin on the base's snapshot back, the snapshot and
 /// then the base are destroyed ([`let_go_of_base`]). Where the destroy can't be followed, the base stays, said in the log.
-async fn let_go(base: &Base, clone: VolumeId) {
+async fn release_base(base: &Base, clone: VolumeId) {
     if !destroyed(clone).await {
         tracing::warn!(base = %base.volume, volume = %slates_api::volume_id_text(clone), "a workspace's base stayed: its clone's destroy couldn't be followed to its end");
         return;
@@ -1052,7 +1052,7 @@ pub async fn remove(m: &Made, patience: Duration) -> anyhow::Result<()> {
     }
     // Its base goes with the last workspace that's a clone of it (K5).
     if let Some(base) = &m.base {
-        let_go(base, volume).await;
+        release_base(base, volume).await;
     }
     Ok(())
 }
