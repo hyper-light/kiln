@@ -1,0 +1,35 @@
+[package]
+name = "slates-machine"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Boot calibration: the machine profile every slates tunable is derived from (design §4.1, D-11)."
+
+[features]
+# The codec probe (LZ4 and zstd) is on by default; a cross-compilation check that has no C
+# toolchain for the target turns it off and the profile says so in its notes.
+default = ["codecs"]
+codecs = ["dep:lz4_flex", "dep:zstd"]
+# BLAKE3's pure-Rust implementation (no C or assembly), for the same cross checks.
+pure-hash = ["blake3/pure"]
+
+[dependencies]
+memmap2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+lz4_flex = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lints]
+workspace = true

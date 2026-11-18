@@ -1,0 +1,2212 @@
+//! The shard: one thread, one task arena, one run queue, one timing wheel, one driver, and the
+//! loop that ties them (§4.3, "Loop").
+//!
+//! Each iteration: drain the control channel and the inbound rings (spawns, cancels, shutdown,
+//! wakes) and the driver's completions into the run queue; expire timers; run ready tasks to
+//! their next await, at most a batch of them; then, if nothing is ready, spin out the idle window
+//! that client activity opened (§4.7), and park in the driver until a kick, a completion or the
+//! next deadline. Cancellation is a message that guarantees a terminal completion: the future is
+//! dropped at the next poll boundary, the task's children are cancelled and joined, and whoever
+//! joins it sees `Cancelled`. The watchdog counts polls that exceed the step quantum — the expected wake
+//! (a step longer than a peer's wake starves the shard), which the shard refines from the kicked parks it
+//! pays (§4.3, the online wake estimate) — and attributes each to its task (past the quantum on the CPU,
+//! or waiting inside a call) or to the host (runnable and off the CPU), so a poll the operating system
+//! preempted is not counted as the task's bug ([`crate::attribution`]).
+//!
+//! Ownership: a context is built on its own thread from a [`ShardSeed`] and leaked, so every
+//! reference to it is `&'static` and the thread-local the wakers route through holds a plain
+//! reference; the mutable state sits in a `RefCell`, so a task's poll runs with no borrow held
+//! and a waker, spawn or join from inside the poll takes its own short borrow; a nested borrow
+//! is refused and counted, never undefined. There is no unsafe code in this module.
+
+use std::cell::{Cell, RefCell};
+use std::pin::Pin;
+use std::sync::atomic::{Ordering, fence};
+use std::sync::mpsc::Receiver;
+use std::task::{Context, Poll};
+
+use slates_mem::{Encoded, Handle, Slab, ring};
+
+use slates_machine::wake::WakeEstimate;
+
+use crate::attribution::{self, Attribution, Tracker};
+use crate::control::Control;
+use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
+use crate::error::RtError;
+use crate::interest::{Direction, Interests, Taken};
+use crate::parking::{Parked, Woken};
+use crate::queue::LocalQueue;
+use crate::registry::{self, Entry, MAX_SHARDS};
+use crate::runtime::RuntimeConfig;
+use crate::task::{Admission, BoxedFuture, NO_LINK, Outcome, SpawnRequest, State, TaskSlot};
+use crate::timer::Wheel;
+use crate::waker::waker_for;
+
+/// A shard's process-wide id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShardId(pub u16);
+
+/// A task's id: its packed word (shard, slot, generation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TaskId(pub Encoded);
+
+impl TaskId {
+  /// The owning shard.
+  pub fn shard(&self) -> ShardId {
+    ShardId(self.0.shard())
+  }
+}
+
+/// What one loop iteration did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepOutcome {
+  /// Whether any message, timer or task was processed.
+  pub did_work: bool,
+  /// The next timer deadline, in the driver's nanoseconds.
+  pub next_deadline_ns: Option<u64>,
+  /// Whether the shard finished its shutdown and left the loop.
+  pub exit: bool,
+}
+
+/// The shard's counters (the tripwires of GAPS §7 read them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+  /// Loop iterations.
+  pub steps: u64,
+  /// Task polls.
+  pub polls: u64,
+  /// Polls past the step quantum that were their task's own — the bounded-work rule's bug signal (§4.3):
+  /// past it on the CPU, or waiting inside a call past it ([`Counters::blocked_steps`]).
+  pub long_steps: u64,
+  /// Of `long_steps`, the polls that waited inside a call: blocked in the kernel (a voluntary context
+  /// switch, counted per thread on Linux) or yielded by the runtime to a full peer ring.
+  pub blocked_steps: u64,
+  /// Polls past the quantum by the wall clock that the host held: within it on the CPU and never waiting
+  /// inside a call — preempted by the operating system, or the virtual CPU stolen by the hypervisor.
+  pub preempted_steps: u64,
+  /// Polls past the quantum by the wall clock that could not be attributed: no window open yet, a window
+  /// whose earlier work leaves the poll's CPU undecided, off the CPU where the platform cannot tell a
+  /// block from a preemption (macOS), or no per-thread clock (Windows). With `long_steps` and
+  /// `preempted_steps`, every poll past the quantum by the wall clock.
+  pub unattributed_steps: u64,
+  /// The longest poll by the wall clock, in nanoseconds (how long the shard was held, whoever held it).
+  pub longest_step_ns: u64,
+  /// Kicked parks whose kick-to-running latency fed the online wake estimate (a non-vacuity count).
+  pub wake_samples: u64,
+  /// Kick stamps that predated their park's announcement (a sender that saw an earlier park), dropped.
+  pub wake_stale: u64,
+  /// Kicks that found the shard not yet asleep, so no wake was measured: stamped while its park was being
+  /// set up, or (Linux, where the thread's voluntary switches are counted) answered by a wait that never
+  /// slept.
+  pub wake_unslept: u64,
+  /// The online wake estimate, nanoseconds (the step quantum while the shard tracks one).
+  pub wake_cost_ns: u64,
+  /// Tasks admitted.
+  pub spawns: u64,
+  /// Tasks whose future returned.
+  pub completed: u64,
+  /// Tasks whose future was dropped.
+  pub cancelled: u64,
+  /// Wakes that arrived over a shard-pair ring.
+  pub wakes_pair: u64,
+  /// Wakes that arrived over the foreign ring.
+  pub wakes_foreign: u64,
+  /// Control messages received.
+  pub controls: u64,
+  /// Wakes whose generation no longer matched.
+  pub stale_wakes: u64,
+  /// Timers fired.
+  pub timers_fired: u64,
+  /// Sleeps that found the timer wheel full and waited for a timer to free rather than completing before
+  /// their deadline (AUD-29-39): an overload tripwire, each wait woken by the next freed timer.
+  pub timer_waits: u64,
+  /// Driver waits.
+  pub waits: u64,
+  /// Driver completions delivered.
+  pub completions: u64,
+  /// Times the driver was lost.
+  pub driver_lost: u64,
+  /// Driver errors other than loss.
+  pub driver_errors: u64,
+  /// Refused nested borrows (a bug signal).
+  pub nested_borrows: u64,
+  /// Admissions refused because the arena was full.
+  pub admission_refused: u64,
+  /// Spawn requests drained after shutdown began and refused unadmitted (their receipts answered
+  /// `Terminated`, their futures dropped): a shard shutting down admits nothing new, so its arena
+  /// drains monotonically and the loop's exit is bounded by the tasks it already holds.
+  pub refused_at_shutdown: u64,
+  /// Idle spins that ended with work arriving.
+  pub spin_hits: u64,
+  /// Pollers woken because their ring had something (client command rings).
+  pub poller_wakes: u64,
+  /// Idle spins that ran out and parked.
+  pub spin_misses: u64,
+  /// Idle spins ended by a timer falling due.
+  pub spin_deadlines: u64,
+  /// The measured scheduler overrun, nanoseconds ([`ShardContext::scheduler_overrun_ns`]).
+  pub scheduler_overrun_ns: u64,
+  /// 1 when the OS refused the core the shard's placement fixed it to, so the shard runs wherever the
+  /// scheduler puts it: a fault on Linux and Windows, where the placement names only cores the process
+  /// owns (`slates_machine::placement`); on macOS the affinity hint Apple silicon refuses by design.
+  pub pin_refused: u64,
+  /// Readiness completions that found no registration waiting on their descriptor, because its future was
+  /// dropped before the descriptor fired (A-149). Such a completion wakes no one.
+  pub interests_unclaimed: u64,
+  /// Asks for room the target took: a task whose send a full control channel refused, asking to be told when that
+  /// channel next has room ([`ShardContext::want_room`], [`crate::room`]). An ask refused because the target is gone
+  /// is not counted: nothing waits on it.
+  pub room_waits: u64,
+  /// Tasks woken because a shard they asked for room drained its control channel, or left its loop
+  /// ([`crate::room`]): the room wake's non-vacuity count.
+  pub room_wakes: u64,
+}
+
+/// Shape: the exponential-forgetting shift of the measured scheduler overrun — a wait's overrun that
+/// is not renewed decays by `1/8` (`>> 3`) at each later wait, so a starvation spike lingers about
+/// eight waits (under a second of a fleet shard's timer-paced waits on a quiet host) and then
+/// recovers as the load lifts, rather than pinning detection windows open for good.
+const OVERRUN_FORGET_SHIFT: u32 = 3;
+
+/// What a shard is built from: everything is `Send`, so the runtime assembles seeds on its own
+/// thread and each shard thread builds its context from one.
+pub struct ShardSeed {
+  /// The registered id.
+  pub id: u16,
+  /// Builds the driver on the shard's thread.
+  pub driver: DriverSeed,
+  /// The kick the driver answers to.
+  pub kick: Kick,
+  /// The control channel's receiving end.
+  pub control: Receiver<Control>,
+  /// The configuration.
+  pub config: RuntimeConfig,
+  outbound: Vec<Option<ring::Producer<'static>>>,
+  inbound: Vec<ring::Consumer<'static>>,
+}
+
+impl std::fmt::Debug for ShardSeed {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ShardSeed").field("id", &self.id).finish()
+  }
+}
+
+impl ShardSeed {
+  /// Registers a shard over `driver` in the process registry and returns its seed.
+  pub(crate) fn register(
+    config: &RuntimeConfig,
+    driver: DriverSeed,
+    kick: registry::RegisterKick,
+  ) -> Result<ShardSeed, RtError> {
+    // A task's slot is packed into its wake word, whose slot field carries an interest word's mark above
+    // `Encoded::MAX_TASK_SLOT` (A-149): an arena past that would issue slots no wake could name. Refused before
+    // anything is claimed.
+    if u32::try_from(config.tasks_per_shard).map_or(true, |tasks| {
+      tasks > Encoded::MAX_TASK_SLOT.saturating_add(1)
+    }) {
+      return Err(RtError::BadConfig {
+        what: "tasks_per_shard: more task slots than a wake word can name",
+      });
+    }
+    let (id, control) = registry::register_slot(config.ring_entries, config.tasks_per_shard, kick)?;
+    let kick = registry::with_entry(id, |entry| entry.kick).unwrap_or(Kick::None);
+    Ok(ShardSeed {
+      id,
+      driver,
+      kick,
+      control,
+      config: config.clone(),
+      outbound: std::iter::repeat_with(|| None).take(MAX_SHARDS).collect(),
+      inbound: Vec::new(),
+    })
+  }
+
+  /// Gives this shard the producer half of the pair ring it sends on to `target` (the ring's only
+  /// producer, held for the context's life).
+  pub(crate) fn set_outbound(&mut self, target: u16, producer: ring::Producer<'static>) {
+    if let Some(slot) = self.outbound.get_mut(usize::from(target)) {
+      *slot = Some(producer);
+    }
+  }
+
+  /// Gives this shard the consumer half of a pair ring it receives on (the ring's only consumer).
+  pub(crate) fn set_inbound(&mut self, consumer: ring::Consumer<'static>) {
+    self.inbound.push(consumer);
+  }
+}
+
+/// A poller: a task that owns an inbound ring the loop cannot see (a client's command ring
+/// in shared memory, §4.3 "drain inbound rings (client command rings, ...)"). The loop asks
+/// `ready` each step and during the idle spin, and wakes the task when it says so; the task
+/// yields with [`crate::futures::idle`] and is polled again only when woken. `ready` may consume
+/// its signal when asked (the daemon's doorbell flag does), so every asker wakes the task on a
+/// yes — the step and the spin both go through `wake_ready_pollers`, never a bare `ready()`.
+pub struct Poller {
+  slot: u32,
+  generation: u32,
+  ready: Box<dyn Fn() -> bool>,
+}
+
+impl std::fmt::Debug for Poller {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Poller").field("slot", &self.slot).finish()
+  }
+}
+
+/// The mutable state behind the borrow.
+pub struct ShardInner {
+  arena: Slab<TaskSlot>,
+  timers: Wheel,
+  driver: Box<dyn Driver>,
+  control: Receiver<Control>,
+  config: RuntimeConfig,
+  counters: Counters,
+  shutting_down: bool,
+  fired: Vec<u64>,
+  completions: Vec<Completion>,
+  pollers: Vec<Poller>,
+  /// Work the shard does in its idle time, a slice a call, before it parks ([`ShardContext::set_idle_work`]): `None`
+  /// when none is registered, and while a slice of it runs.
+  idle_work: Option<Box<dyn FnMut() -> bool>>,
+  /// The consumer of the entry's foreign wake ring, claimed at build and held for the context's life (the
+  /// ring's only consumer, AUD-29-33); `None` for a context with no entry.
+  foreign: Option<slates_mem::mpsc::Consumer<'static>>,
+  /// Task slots whose sleep found the wheel full, in the order they asked, each slot at most once
+  /// (`timer_waiter_queued`), so the queue never exceeds the arena's slots (AUD-29-39). A freed timer wakes
+  /// the oldest slot's task, whose sleep then arms; a slot whose task ended meanwhile wakes its new occupant,
+  /// if any, spuriously — which every future tolerates.
+  timer_waiters: std::collections::VecDeque<u32>,
+  /// Whether each slot is in `timer_waiters`, grown to the highest slot that waited (below the arena's
+  /// capacity).
+  timer_waiter_queued: Vec<bool>,
+  /// The tasks waiting to be told that another shard's full control channel has room ([`ShardContext::want_room`]):
+  /// keyed by that shard and the task's slot, each at most once, with the task's generation, so the map never holds
+  /// more than the arena's slots for each shard asked ([`crate::room`]). A shard's tell takes its waiters out and wakes
+  /// those still live; a waiter whose task ended meanwhile is dropped then, unwoken.
+  room_waiters: std::collections::BTreeMap<(u16, u32), u32>,
+  /// The task the shard runs alone while it lives ([`ShardContext::spawn_alone`]): until its future ends, each step
+  /// polls it and no other task, which stay queued in order. `None` when no task holds the shard.
+  alone: Option<Handle<TaskSlot>>,
+}
+
+impl ShardInner {
+  /// Entries per inbound ring.
+  pub fn ring_entries(&self) -> usize {
+    self.config.ring_entries
+  }
+}
+
+/// The shard's context: what its thread, its wakers and its tasks see.
+pub struct ShardContext {
+  /// The shard id.
+  pub id: u16,
+  /// The local run queue.
+  pub local: LocalQueue,
+  /// The producer half of each pair ring this shard sends on, by target shard.
+  outbound: Vec<Option<ring::Producer<'static>>>,
+  /// The consumer half of each pair ring this shard receives on.
+  inbound: Vec<ring::Consumer<'static>>,
+  current_task: Cell<Option<u32>>,
+  exited: Cell<bool>,
+  /// When the server last served a client's work on this shard (its clock), opening the idle window the
+  /// shard spins in before it parks ([`ShardContext::note_activity`]); `None` until the first.
+  activity_ns: Cell<Option<u64>>,
+  pair_full_events: Cell<u64>,
+  nested_borrows: Cell<u64>,
+  /// The shard's readiness registrations, by descriptor and direction: which task waits on each, and whether
+  /// its descriptor fired (A-149, `crate::interest`). Kept apart from `inner`, because a wake can arrive while
+  /// `inner` is borrowed: the simulation wakes from inside the driver's registration when a datagram already
+  /// waits.
+  interests: RefCell<Interests>,
+  /// The absolute deadline the shard last waited for — parked in its driver, or idle-spinning — and
+  /// has not stepped since; the next [`step`](Self::step) takes it and measures how late it runs
+  /// against it ([`Self::scheduler_overrun_ns`]). `None` while running, or after an unbounded wait.
+  waited_for_ns: Cell<Option<u64>>,
+  /// The exponentially-forgetting maximum of how late a step ran after the wait before it, nanoseconds
+  /// (the measurement [`Self::scheduler_overrun_ns`] describes).
+  scheduler_overrun_ns: Cell<u64>,
+  /// The online wake estimate (§4.1, §4.3): seeded with the boot probe's mean and fed each kicked park's
+  /// kick-to-running latency ([`Self::note_wake`]); the step quantum and the idle spin follow it. `None`
+  /// when the configuration carries no measured prior to track ([`crate::runtime::WakeTracking`]).
+  wake: Cell<Option<WakeEstimate>>,
+  /// The idle spin window as a multiple of the wake estimate, while tracking.
+  idle_ratio: u64,
+  /// The configured step budget and idle spin, the quantum and the spin when not tracking.
+  fixed_quantum_ns: u64,
+  fixed_spin_ns: u64,
+  /// Whether the driver's clock is real time: the simulation's is not the kicker's clock nor the thread's
+  /// CPU clock, so a simulated shard neither measures its wakes nor judges polls by CPU time (it stays
+  /// deterministic).
+  real_time: bool,
+  /// Who held each long poll: the attribution windows and when the shard reads the thread's account
+  /// ([`crate::attribution::Tracker`]). Unused on a simulated shard, whose polls are the task's alone.
+  attribution: Cell<Tracker>,
+  entry: Option<&'static Entry>,
+  /// Which registration this context is (its slot and the slot's generation, never repeated in the
+  /// process — AUD-29-11): a [`Kept`] handle names it, so a handle of an ended context is refused, never
+  /// resolved against a later one on the same slot or thread.
+  incarnation: Option<registry::SlotHolder>,
+  inner: RefCell<ShardInner>,
+  /// Declared after `inner`, so it drops after the tasks: a task may hold a kept value's handle (a task
+  /// cancelled while the shard runs still reaches the value through it; at teardown no shard runs, and the
+  /// handle answers `None`).
+  kept: KeptValues,
+}
+
+/// Values a shard owns for its life and drops with its context, after its tasks (§4.3: a per-shard
+/// singleton — a socket's demultiplexer, a fleet identity — shared by the shard's tasks). Each is named by a
+/// [`Kept`] handle, never lent as a reference that could outlive the context (AUD-29-08). Shape: filled at
+/// boot only (one entry per socket or identity a shard serves), never per operation, so it needs no bound
+/// of its own; dropped last-in-first-out so a value kept later (a demultiplexer naming an identity) goes
+/// before what it names.
+#[derive(Default)]
+struct KeptValues(RefCell<Vec<Box<dyn std::any::Any>>>);
+
+impl Drop for KeptValues {
+  fn drop(&mut self) {
+    let mut values = self.0.borrow_mut();
+    while let Some(value) = values.pop() {
+      drop(value);
+    }
+  }
+}
+
+/// A value a shard keeps for its life ([`ShardContext::keep`]), named by its context's registration and
+/// its place among the kept values — a generational handle whose every use validates it (AUD-29-08). It is
+/// `Copy` and `'static`, so tasks share it freely, and it can be held anywhere (another thread, past the
+/// runtime's end) without harm: the value is reached only inside [`Kept::with`] or [`Kept::with_in`],
+/// which lend `&T` for a closure's span and only while a borrow of the owning context proves it alive, and
+/// answer `None` for a context that ended or is not the one running here. Until 2026-09-30 `keep` returned
+/// a `&'static T` that safe code could keep past the context's free — sent to another thread, or held on
+/// this one after the runtime dropped — and read freed memory.
+///
+/// The lend cannot leave its closure (AUD-29-08's compile-time acceptance):
+///
+/// ```compile_fail,E0521
+/// fn escape(kept: slates_rt::shard::Kept<String>) -> Option<&'static String> {
+///   kept.with(|value| value)
+/// }
+/// ```
+pub struct Kept<T: 'static> {
+  context: registry::SlotHolder,
+  index: usize,
+  value: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for Kept<T> {
+  fn clone(&self) -> Self {
+    *self
+  }
+}
+
+impl<T> Copy for Kept<T> {}
+
+impl<T> PartialEq for Kept<T> {
+  fn eq(&self, other: &Self) -> bool {
+    self.context == other.context && self.index == other.index
+  }
+}
+
+impl<T> Eq for Kept<T> {}
+
+impl<T> std::fmt::Debug for Kept<T> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Kept")
+      .field("shard", &self.context.shard())
+      .field("index", &self.index)
+      .finish()
+  }
+}
+
+impl<T: 'static> Kept<T> {
+  /// Runs `f` on the value, on the shard running on this thread: `None` when no shard runs here, when the
+  /// one running is not the value's (another shard's, or a later context on the same slot), or when its
+  /// kept values are being changed. The reference cannot leave `f`.
+  pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> Option<R> {
+    registry::with_current(|context| self.with_in(context, f)).flatten()
+  }
+
+  /// Runs `f` on the value through a borrow of its context (a test or an owner between steps, holding
+  /// `LocalRuntime::context`): `None` when `context` is not the value's.
+  pub fn with_in<R>(self, context: &ShardContext, f: impl FnOnce(&T) -> R) -> Option<R> {
+    if context.incarnation != Some(self.context) {
+      return None;
+    }
+    let values = context.kept.0.try_borrow().ok()?;
+    let value = values.get(self.index)?.downcast_ref::<T>()?;
+    Some(f(value))
+  }
+}
+
+impl std::fmt::Debug for ShardContext {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ShardContext")
+      .field("id", &self.id)
+      .finish()
+  }
+}
+
+impl ShardContext {
+  /// Builds the context from its seed on the calling thread (which builds the driver too). The
+  /// `&'static` returned is the owner's alone — the multi-thread worker's frame, `LocalRuntime` and
+  /// `SimRuntime` keep it private — and it is not leaked: its slot keeps the box's raw pointer and the
+  /// same thread frees it once its loop has returned (`registry::reclaim_context`; the worker after
+  /// `run`, `LocalRuntime` and `SimRuntime` in `Drop`). Everything outside the owner reaches the context
+  /// through a borrow of the owner or of a step's span (`registry::with_current`), never the `'static`
+  /// (AUD-29-08). No other thread ever dereferences a context (a wake routes by id through the registry
+  /// entry). Before 2026-09-14 the box was leaked outright.
+  pub(crate) fn build(seed: ShardSeed) -> Result<&'static ShardContext, RtError> {
+    let config = seed.config;
+    let driver = (seed.driver)(seed.kick)?;
+    // The foreign wake ring's one consumer, claimed for the context's life (the entry outlives it: the slot
+    // is retired only after the context is reclaimed).
+    let foreign = match registry::entry(seed.id) {
+      Some(entry) => Some(
+        entry
+          .inbound
+          .consumer()
+          .ok_or(RtError::RingClaimed { shard: seed.id })?,
+      ),
+      None => None,
+    };
+    // The arena's generations continue from where the slot's previous holder left them, so a wake
+    // word minted for that shard can never name a task of this one (registry slot reuse, §4.3).
+    let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
+    // A task's handle is packed into a wake word of 24 generation bits: a slot retires at that limit
+    // rather than issue a generation the word would truncate into an alias (AUD-29-11).
+    let mut arena = Slab::with_generation_base(
+      config.tasks_per_shard.min(config.segment_tasks()),
+      config.tasks_per_shard,
+      generation_base,
+    )
+    .with_generation_limit(Encoded::TASK_GENERATION_LIMIT);
+    arena.reserve_segments(
+      config
+        .tasks_per_shard
+        .div_ceil(config.segment_tasks().max(1)),
+    );
+    let timers = Wheel::new(
+      config.timer_tick_ns,
+      config.timers_per_shard,
+      driver.now_ns(),
+    );
+    // Only a shard that tracks an estimate on a real clock times its wakes; the simulation's parks and
+    // kicks read no host clock (D-20), so its instruction counts stay free of OS calls.
+    let times_wakes = config.wake_tracking.is_some() && driver.kind() != DriverKind::Simulation;
+    let context = Box::into_raw(Box::new(ShardContext {
+      id: seed.id,
+      local: LocalQueue::new(config.tasks_per_shard),
+      outbound: seed.outbound,
+      inbound: seed.inbound,
+      current_task: Cell::new(None),
+      exited: Cell::new(false),
+      activity_ns: Cell::new(None),
+      pair_full_events: Cell::new(0),
+      nested_borrows: Cell::new(0),
+      interests: RefCell::new(Interests::default()),
+      waited_for_ns: Cell::new(None),
+      scheduler_overrun_ns: Cell::new(0),
+      wake: Cell::new(
+        config
+          .wake_tracking
+          .map(|tracking| WakeEstimate::new(tracking.prior_ns, tracking.shift)),
+      ),
+      idle_ratio: config
+        .wake_tracking
+        .map_or(1, |tracking| tracking.idle_ratio),
+      fixed_quantum_ns: config.step_budget_ns,
+      fixed_spin_ns: config.spin_ns,
+      real_time: driver.kind() != DriverKind::Simulation,
+      attribution: Cell::new(Tracker::default()),
+      entry: registry::entry(seed.id),
+      incarnation: registry::entry(seed.id).map(Entry::holder),
+      inner: RefCell::new(ShardInner {
+        arena,
+        timers,
+        driver,
+        control: seed.control,
+        fired: Vec::with_capacity(config.timers_per_shard),
+        completions: Vec::with_capacity(config.ring_entries),
+        config,
+        counters: Counters::default(),
+        shutting_down: false,
+        pollers: Vec::new(),
+        idle_work: None,
+        foreign,
+        timer_waiters: std::collections::VecDeque::new(),
+        timer_waiter_queued: Vec::new(),
+        room_waiters: std::collections::BTreeMap::new(),
+        alone: None,
+      }),
+      kept: KeptValues::default(),
+    }));
+    let id = seed.id;
+    registry::attach_context(id, context);
+    if times_wakes && let Some(entry) = registry::entry(id) {
+      entry.parking.time_wakes();
+    }
+    // SAFETY: `context` came from `Box::into_raw` just above — valid, aligned, uniquely owned — and
+    // is freed only by `registry::reclaim_context`, which this thread calls after its loop returned
+    // and every reference derived here is gone.
+    Ok(unsafe { &*context })
+  }
+
+  /// Gives the shard `value` to own for its life and hands back its [`Kept`] handle: the form a per-shard
+  /// singleton takes (a socket's demultiplexer, the fleet identity its sessions present), shared by every
+  /// task of the shard. Dropped with the context — on the owning thread after its loop returned and every
+  /// task is gone — last kept first. Call it at boot, once per singleton; it is not for per-operation
+  /// values. Refused (`KeptInUse`) inside a [`Kept::with`] on this shard, and (`NotOnShardThread`) for a
+  /// context with no registration to name.
+  pub fn keep<T: 'static>(&self, value: T) -> Result<Kept<T>, RtError> {
+    self.keep_with(|_| value)
+  }
+
+  /// [`keep`](Self::keep) for a value that names itself (a demultiplexer whose sessions route back to it):
+  /// `build` receives the handle the value will have. Refused (`KeptInUse`) if `build` kept another value
+  /// meanwhile, the built value then dropped.
+  pub fn keep_with<T: 'static>(
+    &self,
+    build: impl FnOnce(Kept<T>) -> T,
+  ) -> Result<Kept<T>, RtError> {
+    let context = self.incarnation.ok_or(RtError::NotOnShardThread)?;
+    let in_use = RtError::KeptInUse { shard: self.id };
+    let index = self.kept.0.try_borrow().map_err(|_| in_use.clone())?.len();
+    let kept = Kept {
+      context,
+      index,
+      value: std::marker::PhantomData,
+    };
+    let value = build(kept);
+    let mut values = self.kept.0.try_borrow_mut().map_err(|_| in_use.clone())?;
+    if values.len() != index {
+      return Err(in_use);
+    }
+    values.push(Box::new(value));
+    Ok(kept)
+  }
+
+  /// Runs `f` with the mutable state, or refuses a nested borrow (counted).
+  pub fn with_inner<R>(&self, f: impl FnOnce(&mut ShardInner) -> R) -> Option<R> {
+    match self.inner.try_borrow_mut() {
+      Ok(mut inner) => Some(f(&mut inner)),
+      Err(_) => {
+        self
+          .nested_borrows
+          .set(self.nested_borrows.get().saturating_add(1));
+        None
+      }
+    }
+  }
+
+  /// Marks one period of forward progress of an application loop on this shard, for an observer on
+  /// any thread (`registry::Pulse::progress`).
+  pub fn beat_progress(&self) {
+    if let Some(entry) = self.entry {
+      entry.pulse.beat();
+    }
+  }
+
+  /// Whether the shard left its loop.
+  pub fn exited(&self) -> bool {
+    self.exited.get()
+  }
+
+  /// Notes that the server just served a client's work on this shard — a request from its ring, a verb
+  /// forwarded from another shard, a mount's call (§4.7 "Shards poll rings while any client has activity
+  /// within the measured idle window"): the shard spins out the idle window from now before it parks, so
+  /// the client's next request within it costs no kernel wake. Called on the shard's own thread.
+  pub fn note_activity(&self) {
+    self.activity_ns.set(Some(self.now_ns()));
+  }
+
+  /// Whether any inbound ring holds a word (a check without a syscall).
+  pub fn has_inbound(&self) -> bool {
+    if self
+      .entry
+      .is_some_and(|e| !e.inbound.is_empty() || e.control_pending.is_pending())
+    {
+      return true;
+    }
+    self.inbound.iter().any(|consumer| !consumer.is_empty())
+  }
+
+  /// The task being polled on this shard right now.
+  pub fn current_task(&self) -> Option<TaskId> {
+    let slot = self.current_task.get()?;
+    let generation = self
+      .with_inner(|inner| inner.arena.generation_at(slot))
+      .flatten()?;
+    Encoded::pack(self.id, slot, generation).map(TaskId)
+  }
+
+  /// One past the highest task-arena generation this shard has issued: what the registry slot's
+  /// next holder starts from, so a wake word minted for this shard never names a task of the next
+  /// (slot reuse, §4.3).
+  pub fn arena_generation_high(&self) -> u32 {
+    self
+      .with_inner(|inner| inner.arena.generation_high())
+      .unwrap_or(0)
+  }
+
+  /// Records that the OS refused the core this shard's placement fixed it to ([`Counters::pin_refused`]).
+  pub fn note_pin_refused(&self) {
+    self.with_inner(|inner| inner.counters.pin_refused = 1);
+  }
+
+  /// The counters.
+  pub fn counters(&self) -> Counters {
+    let mut c = self.with_inner(|inner| inner.counters).unwrap_or_default();
+    c.nested_borrows = self.nested_borrows.get();
+    c.scheduler_overrun_ns = self.scheduler_overrun_ns.get();
+    c.interests_unclaimed = self
+      .interests
+      .try_borrow()
+      .map_or(0, |interests| interests.unclaimed());
+    c.wake_cost_ns = self.wake_cost_ns();
+    c
+  }
+
+  /// This shard's **measured scheduler quantum** (§4.8 "SWIM period = max(k × RTT p99, scheduler
+  /// quantum)"), in nanoseconds: the exponentially-forgetting maximum of how far past a wait's
+  /// deadline the shard's next step ran. Only an idle shard waits — parked in its driver or spinning
+  /// for its timer ([`run`](Self::run)); a busy one never reaches either, and its late timers fire
+  /// from the step's expiry without passing here — so a step that runs late after a wait is time the
+  /// operating system left the shard off a core with nothing else to do: the descheduling the shard
+  /// suffers, not the latency of serving its own tasks. Roughly zero on a quiet host (a park wakes
+  /// within a tick), seconds on an oversubscribed one. Forgotten by [`OVERRUN_FORGET_SHIFT`] at each
+  /// later wait so a spike recovers once the load lifts. The fleet's failure detector reads it through
+  /// [`crate::futures::scheduler_overrun_ns`] to floor its windows at the starvation this node itself
+  /// observes; an observer on another thread reads the mirror in the registry pulse.
+  pub fn scheduler_overrun_ns(&self) -> u64 {
+    self.scheduler_overrun_ns.get()
+  }
+
+  /// Folds one finished wait into the measured scheduler overrun ([`Self::scheduler_overrun_ns`]):
+  /// the shard waited for the absolute `deadline_ns` and this step is the first to run after it.
+  fn note_wait_overrun(&self, inner: &ShardInner, deadline_ns: u64) {
+    let overrun = inner.driver.now_ns().saturating_sub(deadline_ns);
+    let held = self.scheduler_overrun_ns.get();
+    let forgotten = held.saturating_sub(held >> OVERRUN_FORGET_SHIFT);
+    let measured = forgotten.max(overrun);
+    self.scheduler_overrun_ns.set(measured);
+    if let Some(entry) = self.entry {
+      entry.pulse.record_scheduler_overrun(measured);
+    }
+  }
+
+  /// The driver's clock.
+  pub fn now_ns(&self) -> u64 {
+    self.with_inner(|inner| inner.driver.now_ns()).unwrap_or(0)
+  }
+
+  /// Times a shard-pair ring was full and the sender spun.
+  pub fn pair_full_events(&self) -> u64 {
+    self.pair_full_events.get()
+  }
+
+  /// Sends a word to `target` over the pair ring, if one exists; kicks the target. A full ring is
+  /// retried only while the target is live and has not left its loop: a target that exited never
+  /// drains the ring again, so the wake is counted stale and the send reports `false` rather than
+  /// spinning for good (the same fault `registry::send_foreign` had: a shutdown in which one shard
+  /// left before a peer's last wakes to it would have hung the peer, and the join).
+  pub fn send_to(&self, target: u16, word: u64) -> registry::PairSend {
+    let Some(Some(ring)) = self.outbound.get(usize::from(target)) else {
+      return registry::PairSend::NoRing;
+    };
+    let producer = ring;
+    let mut pending = word;
+    loop {
+      match producer.push(pending) {
+        Ok(()) => break,
+        Err(back) => {
+          pending = back;
+          self
+            .pair_full_events
+            .set(self.pair_full_events.get().saturating_add(1));
+          let live = registry::with_entry(target, |entry| {
+            entry.kick.kick();
+            !entry.exited.load(std::sync::atomic::Ordering::Acquire)
+          });
+          if live != Some(true) {
+            registry::count_stale(target);
+            return registry::PairSend::Gone;
+          }
+          self.drain_while_waiting();
+        }
+      }
+    }
+    let _ = registry::with_entry(target, |entry| entry.kick.kick());
+    registry::PairSend::Sent
+  }
+
+  /// The multi-producer path from a shard thread to a shard it keeps no pair ring to (another
+  /// runtime's): the same turns as a foreign thread's send, but draining this shard's own rings
+  /// between them, so it never blocks its peers while it waits ([`Self::drain_while_waiting`]).
+  pub fn send_foreign_draining(&self, target: u16, word: u64) {
+    let mut pending = word;
+    loop {
+      match registry::try_send_foreign(target, pending) {
+        registry::TrySend::Landed | registry::TrySend::Gone => return,
+        registry::TrySend::Full(back) => {
+          pending = back;
+          self.drain_while_waiting();
+        }
+      }
+    }
+  }
+
+  /// One waiting turn of a shard whose send found a full ring: drain what its own peers sent it (so
+  /// a peer spinning on a full ring *to this shard* is released — two shards saturating each other's
+  /// rings would otherwise each wait for the other to drain, for good), then yield. Skipped when the
+  /// state is borrowed (a wake from inside a borrow): the next turn drains.
+  fn drain_while_waiting(&self) {
+    let _ = self.with_inner(|inner| self.drain_inbound(inner));
+    // The poll waits for its peer here, not on the CPU: the window marks it (`attribution`).
+    self.update_attribution(Tracker::yielded_in_poll);
+    std::thread::yield_now();
+  }
+
+  // ------------------------------------------------------------------ admission
+
+  /// Admits a spawn request (from any thread's message, or the runtime): detached. The request's
+  /// receipt, if it carries one, is answered with the outcome.
+  pub fn spawn_request(&self, request: SpawnRequest) -> Result<TaskId, RtError> {
+    let SpawnRequest {
+      future,
+      parent,
+      receipt,
+    } = request;
+    let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
+    let admitted = self.admit(future, parent, false);
+    receipt.answer(match &admitted {
+      Ok(task) => Admission::Admitted(*task),
+      Err(refusal) => Admission::Refused(refusal.clone()),
+    });
+    admitted
+  }
+
+  /// Admits a local future under `parent`, joinable.
+  pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
+    self.admit(future, parent, true)
+  }
+
+  /// Admits a local future, joinable, that the shard runs alone until its future ends: each step polls it and no other
+  /// task. Tasks queued before it, spawned or woken meanwhile stay queued in their order and run once it ends, as they
+  /// would behind one long poll. It may yield as often as it likes, and every yield ends a step, so the shard's
+  /// steps, its pulse and its inbox go on (what a watchdog judging steps sees). Refused [`RtError::ShardHeld`] while
+  /// another task holds the shard. A shard held by a task that waits on something other than itself does nothing
+  /// else until that comes.
+  pub fn spawn_alone(&self, future: BoxedFuture) -> Result<TaskId, RtError> {
+    let held = self
+      .with_inner(|inner| live_alone(inner).map(|handle| handle.index()))
+      .ok_or(RtError::NotOnShardThread)?;
+    if let Some(slot) = held {
+      return Err(RtError::ShardHeld { slot });
+    }
+    let id = self.admit(future, None, true)?;
+    self
+      .with_inner(|inner| inner.alone = Some(handle_of(id)))
+      .ok_or(RtError::NotOnShardThread)?;
+    Ok(id)
+  }
+
+  /// Whether a task holds the shard alone now ([`Self::spawn_alone`]).
+  fn held_alone(&self) -> bool {
+    self
+      .with_inner(|inner| live_alone(inner).is_some())
+      .unwrap_or(false)
+  }
+
+  fn admit(
+    &self,
+    future: BoxedFuture,
+    parent: Option<u32>,
+    joinable: bool,
+  ) -> Result<TaskId, RtError> {
+    let id = self
+      .with_inner(|inner| -> Result<TaskId, RtError> {
+        let handle = match inner.arena.insert(TaskSlot::new(future, parent, joinable)) {
+          Ok(h) => h,
+          Err(slates_mem::MemError::SlabFull { capacity }) => {
+            inner.counters.admission_refused = inner.counters.admission_refused.saturating_add(1);
+            return Err(RtError::TooManyTasks { capacity });
+          }
+          Err(e) => return Err(RtError::Mem(e)),
+        };
+        let slot = handle.index();
+        if let Some(p) = parent {
+          link_child(&mut inner.arena, p, slot);
+        }
+        if let Ok(task) = inner.arena.get_mut(handle) {
+          task.state = State::Queued;
+        }
+        inner.counters.spawns = inner.counters.spawns.saturating_add(1);
+        Encoded::pack(self.id, slot, handle.generation())
+          .map(TaskId)
+          .ok_or(RtError::TooManyTasks {
+            capacity: inner.config.tasks_per_shard,
+          })
+      })
+      .ok_or(RtError::NotOnShardThread)??;
+    self.local.push(id.0.slot());
+    Ok(id)
+  }
+
+  /// Requests cancellation; the task terminates at its next poll boundary.
+  pub fn cancel(&self, id: TaskId) -> Result<(), RtError> {
+    let handle = handle_of(id);
+    self
+      .with_inner(|inner| -> Result<(), RtError> {
+        let task = inner.arena.get_mut(handle).map_err(|_| stale(id))?;
+        task.cancel_requested = true;
+        Ok(())
+      })
+      .ok_or(RtError::NotOnShardThread)??;
+    self.local.push(id.0.slot());
+    Ok(())
+  }
+
+  /// Marks a joinable task detached: its slot is reaped at termination (or now, if terminal).
+  pub fn detach(&self, id: TaskId) -> Result<(), RtError> {
+    let handle = handle_of(id);
+    self
+      .with_inner(|inner| -> Result<(), RtError> {
+        let task = inner.arena.get_mut(handle).map_err(|_| stale(id))?;
+        task.joinable = false;
+        if task.is_done() {
+          let parent = task.parent;
+          if let Some(p) = parent {
+            unlink_child(&mut inner.arena, p, id.0.slot());
+          }
+          let _ = inner.arena.remove(handle);
+        }
+        Ok(())
+      })
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Polls a join: `Ready(outcome)` once the task is terminal (its slot is reaped then), else
+  /// `Pending` with `waker` recorded.
+  pub fn poll_join(&self, id: TaskId, waker: &std::task::Waker) -> Poll<Result<Outcome, RtError>> {
+    let handle = handle_of(id);
+    self
+      .with_inner(|inner| match inner.arena.get_mut(handle) {
+        Err(_) => Poll::Ready(Err(stale(id))),
+        Ok(task) if task.is_done() => {
+          let outcome = task.outcome.unwrap_or(Outcome::Cancelled);
+          let parent = task.parent;
+          if let Some(p) = parent {
+            unlink_child(&mut inner.arena, p, id.0.slot());
+          }
+          let _ = inner.arena.remove(handle);
+          Poll::Ready(Ok(outcome))
+        }
+        Ok(task) => {
+          task.join_waker = Some(waker.clone());
+          Poll::Pending
+        }
+      })
+      .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
+  }
+
+  /// Arms a timer for `word` at `deadline_ns`.
+  pub fn arm_timer(&self, deadline_ns: u64, word: u64) -> Result<crate::timer::TimerId, RtError> {
+    self
+      .with_inner(|inner| inner.timers.insert(deadline_ns, word))
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Registers one-shot interest in a descriptor's readiness with the shard's driver (§4.10a, §4.6). The
+  /// driver is handed the registration's interest word ([`Encoded::interest`]) rather than the task's. So when
+  /// the descriptor is next ready its completion names the descriptor, and [`Self::deliver`] marks this
+  /// registration fired and wakes `word`'s task (A-149). Returns the registration's token, which the waiting
+  /// future passes to [`Self::take_interest`] and [`Self::forget_interest`]. The path every readiness future
+  /// takes; mirrors [`Self::arm_timer`], but on the driver rather than the wheel.
+  pub(crate) fn register_interest(
+    &self,
+    raw: i32,
+    direction: Direction,
+    word: u64,
+  ) -> Result<u64, RtError> {
+    // The table is released before the driver is called: the simulation wakes from inside its registration
+    // when a datagram already waits, and that wake reaches the table through `deliver`.
+    let token = self
+      .with_interests(|interests| interests.register(raw, direction, word))
+      .ok_or(RtError::NotOnShardThread)?
+      .ok_or(RtError::InterestsExhausted { shard: self.id })?;
+    let interest = Encoded::interest(self.id, raw.cast_unsigned(), direction.writable()).word();
+    let registered = self
+      .with_inner(|inner| match direction {
+        Direction::Readable => inner.driver.register_readable(raw, interest),
+        Direction::Writable => inner.driver.register_writable(raw, interest),
+      })
+      .unwrap_or(Err(RtError::NotOnShardThread));
+    if registered.is_err() {
+      self.forget_interest(raw, direction, token);
+    }
+    registered.map(|()| token)
+  }
+
+  /// Registers one-shot interest in `raw`'s readability for the task whose word is `word` (§4.10a): the
+  /// registration [`Self::register_interest`] makes, for a caller that names a descriptor directly rather than
+  /// through a readiness future (the runtime's retirement test arms many listeners this way). Returns the
+  /// registration's token.
+  pub fn register_readable(&self, raw: i32, word: u64) -> Result<u64, RtError> {
+    self.register_interest(raw, Direction::Readable, word)
+  }
+
+  /// What registration `token` of `raw`'s `direction` finds: fired (and taken), still waiting, or lost to a
+  /// later registration of the same descriptor and direction.
+  pub(crate) fn take_interest(&self, raw: i32, direction: Direction, token: u64) -> Taken {
+    // A refused nested borrow (counted) leaves the registration as it is: still waiting, its record kept for
+    // the next poll.
+    self
+      .with_interests(|interests| interests.take(raw, direction, token))
+      .unwrap_or(Taken::Waiting)
+  }
+
+  /// Forgets registration `token` of `raw`'s `direction`, because its future was dropped: a completion that
+  /// arrives for it later wakes no one (counted, `Counters::interests_unclaimed`).
+  pub(crate) fn forget_interest(&self, raw: i32, direction: Direction, token: u64) {
+    self.with_interests(|interests| interests.forget(raw, direction, token));
+  }
+
+  /// Wakes the task a word names (§4.3). An interest word marks its registration fired and wakes the task
+  /// waiting on it (A-149); any other word is a task's own and wakes its slot. Every path that turns a word
+  /// into a wake goes through here, so an interest word is never taken for a task's. Those paths are the
+  /// driver's completions, a same-shard wake, and a word from another shard.
+  pub(crate) fn deliver(&self, word: u64) {
+    let word = Encoded::from_word(word);
+    match word.as_interest() {
+      Some((raw, writable)) => {
+        let task = self
+          .with_interests(|interests| {
+            interests.fire(raw.cast_signed(), Direction::from_writable(writable))
+          })
+          .flatten();
+        if let Some(task) = task {
+          self.local.push(Encoded::from_word(task).slot());
+        }
+      }
+      None => self.local.push(word.slot()),
+    }
+  }
+
+  /// Runs `f` with the readiness registrations, or refuses a nested borrow (counted, as [`Self::with_inner`]
+  /// counts its own). None of the table's users calls out while it holds the borrow, so a refusal is a bug
+  /// signal.
+  fn with_interests<R>(&self, f: impl FnOnce(&mut Interests) -> R) -> Option<R> {
+    match self.interests.try_borrow_mut() {
+      Ok(mut interests) => Some(f(&mut interests)),
+      Err(_) => {
+        self
+          .nested_borrows
+          .set(self.nested_borrows.get().saturating_add(1));
+        None
+      }
+    }
+  }
+
+  /// Takes a Windows pipe end into this shard's driver (A-179, `crate::pipe::PipeEnd::adopt`).
+  #[cfg(windows)]
+  pub(crate) fn adopt_pipe(
+    &self,
+    raw: i32,
+    handle: usize,
+    sizes: (usize, usize),
+  ) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| inner.driver.adopt_pipe(raw, handle, sizes))
+      .unwrap_or(Err(RtError::NotOnShardThread))
+  }
+
+  /// Releases a Windows pipe end from this shard's driver (its `Drop`).
+  #[cfg(windows)]
+  pub(crate) fn release_pipe(&self, raw: i32) {
+    self.with_inner(|inner| inner.driver.release_pipe(raw));
+  }
+
+  /// A try to read a Windows pipe end.
+  #[cfg(windows)]
+  pub(crate) fn pipe_read(
+    &self,
+    raw: i32,
+    out: &mut [u8],
+  ) -> Result<crate::pipe_state::PipeRead, RtError> {
+    self
+      .with_inner(|inner| inner.driver.pipe_read(raw, out))
+      .unwrap_or(Err(RtError::NotOnShardThread))
+  }
+
+  /// A try to write a Windows pipe end.
+  #[cfg(windows)]
+  pub(crate) fn pipe_write(
+    &self,
+    raw: i32,
+    bytes: &[u8],
+  ) -> Result<crate::pipe_state::PipeWrite, RtError> {
+    self
+      .with_inner(|inner| inner.driver.pipe_write(raw, bytes))
+      .unwrap_or(Err(RtError::NotOnShardThread))
+  }
+
+  /// Whether this shard runs the simulation driver (so a `UdpSocket` uses the in-memory fabric).
+  pub fn driver_is_sim(&self) -> bool {
+    self
+      .with_inner(|inner| inner.driver.is_sim())
+      .unwrap_or(false)
+  }
+
+  /// Disarms a timer.
+  pub fn disarm_timer(&self, id: crate::timer::TimerId) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| {
+        inner.timers.cancel(id)?;
+        self.wake_timer_waiters(inner, 1);
+        Ok(())
+      })
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Asks shard `target` to tell this shard when its control channel next has room, for the task being polled here,
+  /// whose send to it was refused `ControlFull` (§4.3 "admission limit"; [`crate::room`]). The task is woken once
+  /// `target` drains a message after this call, or leaves its loop. The caller tries its send again after this returns,
+  /// and waits for any wake only if that try is refused too: the try either finds the room a drain made meanwhile, or
+  /// that drain finds this ask. Asking again before the wake replaces nothing: the task waits on `target` once.
+  /// Refused `ShardGone` when `target` has left its loop or its slot is free (no room will come; its sends are refused
+  /// the same way), and `NotOnShardThread` outside a task's poll on this shard.
+  pub fn want_room(&self, target: u16) -> Result<(), RtError> {
+    let task = self.current_task().ok_or(RtError::NotOnShardThread)?;
+    let key = (target, task.0.slot());
+    self
+      .with_inner(|inner| inner.room_waiters.insert(key, task.0.generation()))
+      .ok_or(RtError::NotOnShardThread)?;
+    // The mark, then the fence, then (the caller's) second try: the asking half of `crate::room`'s protocol. An exit
+    // marked before the fence is seen here; one after it takes this mark and tells this shard (`registry::note_exited`).
+    let exited = registry::with_entry(target, |entry| {
+      entry.room_wanted.insert(self.id);
+      fence(Ordering::SeqCst);
+      entry.exited.load(Ordering::Acquire)
+    });
+    if exited == Some(false) {
+      self.with_inner(|inner| {
+        inner.counters.room_waits = inner.counters.room_waits.saturating_add(1);
+      });
+      return Ok(());
+    }
+    // Refused: the waiter is withdrawn, so no task waits on a shard that will never drain. A refused borrow here (a
+    // nested one, counted) leaves it recorded, still one per task slot and shard asked, until a tell for that id.
+    let _ = self.with_inner(|inner| inner.room_waiters.remove(&key));
+    Err(RtError::ShardGone { shard: target })
+  }
+
+  /// Queues the task `word` names to be woken when a timer frees — the path of a sleep that found the wheel
+  /// full (AUD-29-39): it waits, never completing before its deadline, and arms on the poll that follows.
+  /// A slot already queued is not queued twice. A word naming no live task is refused.
+  pub fn wait_for_timer(&self, word: u64) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| {
+        let word = Encoded::from_word(word);
+        let stale = RtError::StaleTask {
+          slot: word.slot(),
+          generation: word.generation(),
+        };
+        if !inner
+          .arena
+          .contains(Handle::from_raw(word.slot(), word.generation()))
+        {
+          return Err(stale);
+        }
+        let index = usize::try_from(word.slot()).map_err(|_| stale.clone())?;
+        if inner.timer_waiter_queued.len() <= index {
+          inner
+            .timer_waiter_queued
+            .resize(index.checked_add(1).ok_or(stale)?, false);
+        }
+        if let Some(queued) = inner.timer_waiter_queued.get_mut(index)
+          && !*queued
+        {
+          *queued = true;
+          inner.timer_waiters.push_back(word.slot());
+          inner.counters.timer_waits = inner.counters.timer_waits.saturating_add(1);
+        }
+        Ok(())
+      })
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Wakes the tasks of up to `freed` slots waiting for a timer, oldest first (a slot with no live task is
+  /// skipped).
+  fn wake_timer_waiters(&self, inner: &mut ShardInner, freed: usize) {
+    let mut woken = 0;
+    while woken < freed {
+      let Some(slot) = inner.timer_waiters.pop_front() else {
+        return;
+      };
+      if let Some(queued) = usize::try_from(slot)
+        .ok()
+        .and_then(|index| inner.timer_waiter_queued.get_mut(index))
+      {
+        *queued = false;
+      }
+      let live = inner
+        .arena
+        .generation_at(slot)
+        .is_some_and(|generation| inner.arena.contains(Handle::from_raw(slot, generation)));
+      if live {
+        self.local.push(slot);
+        woken = woken.saturating_add(1);
+      }
+    }
+  }
+
+  /// Live tasks in the arena.
+  pub fn live_tasks(&self) -> usize {
+    self.with_inner(|inner| inner.arena.len()).unwrap_or(0)
+  }
+
+  // ------------------------------------------------------------------ the loop
+
+  /// Runs the loop on the calling thread until shutdown completes. When idle within the window a
+  /// client's last activity opened, the shard spins out the window checking its rings, pollers and
+  /// driver before it parks: a wake that lands during the spin costs a cache-line transfer instead of
+  /// a kernel wake. Outside every window it parks at once, so an idle daemon's own timers never keep it
+  /// spinning (docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md).
+  pub fn run(&self) {
+    let entered = registry::enter(self);
+    // Driver I/O completions are harvested only when the shard waits ([`park`]). Under continuous task
+    // readiness the loop below never reaches `park` — a shard whose client never lets `serve_round` go
+    // idle re-queues its serve task every step — so without this an I/O-bound task (a fleet node's
+    // datagram demux, whose socket readiness only `wait` delivers) would starve indefinitely behind the
+    // CPU-bound one, and its peers' packets would sit unread in the kernel while the shard spins. So a
+    // run that stays busy without ever waiting harvests the driver without blocking once it has gone a
+    // step budget (`step_budget_ns`, "a step longer than a peer's wake starves the shard" — §4.3) since
+    // its last wait: I/O then keeps pace with tasks under any load, and an idle shard (which reaches
+    // `park` every loop) pays nothing for it.
+    let mut last_wait_ns = self.now_ns();
+    loop {
+      let outcome = self.step();
+      if outcome.exit {
+        // The slot's next holder starts its task generations past this shard's (slot reuse), and a
+        // sender still spinning on this shard's full ring learns nothing will drain it.
+        registry::note_arena_generation(self.id, self.arena_generation_high());
+        registry::note_exited(self.id);
+        break;
+      }
+      if outcome.did_work {
+        let now = self.now_ns();
+        if now.saturating_sub(last_wait_ns) >= self.quantum_ns() {
+          let _ = self.harvest_io();
+          last_wait_ns = now;
+        }
+        continue;
+      }
+      if self.spin_after_activity(outcome.next_deadline_ns) {
+        continue;
+      }
+      // Idle: one slice of the registered idle work, then the loop looks for work again; it parks once the idle
+      // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time").
+      if self.idle_slice() {
+        continue;
+      }
+      self.park(outcome.next_deadline_ns);
+      last_wait_ns = self.now_ns();
+    }
+    drop(entered);
+    self.exited.set(true);
+  }
+
+  /// Harvests the driver's ready I/O completions **without blocking** (a zero timeout) and queues their
+  /// tasks: for a continuously busy [`Self::run`] that would otherwise never reach [`Self::park`] where I/O is
+  /// harvested, and on every turn of the idle spin ([`Self::spin_for_work`]), whose socket readiness
+  /// would otherwise wait out the window. True when a completion was queued. Unlike `park` it does not
+  /// set the parked flag: the shard is not waiting, so a concurrent kick must not believe it is. A
+  /// driver error other than loss is left for the next real wait to surface; loss is likewise deferred
+  /// (this is a best-effort poll, not the loop's liveness point).
+  fn harvest_io(&self) -> bool {
+    self
+      .with_inner(|inner| {
+        let mut completions = std::mem::take(&mut inner.completions);
+        let result = inner.driver.wait(Some(0), &mut completions);
+        let harvested = !completions.is_empty();
+        for c in completions.drain(..) {
+          inner.counters.completions = inner.counters.completions.saturating_add(1);
+          self.deliver(c.user_data);
+        }
+        inner.completions = completions;
+        if matches!(result, Err(RtError::DriverLost)) {
+          inner.counters.driver_lost = inner.counters.driver_lost.saturating_add(1);
+        }
+        harvested
+      })
+      .unwrap_or(false)
+  }
+
+  /// Spins out the rest of the idle window the last client activity opened
+  /// ([`ShardContext::note_activity`]), watching the rings, the pollers and the driver; true when
+  /// something arrived or a timer fell due during the spin (either is work for the next step), false
+  /// when the window ran out, or had already, with nothing to do. The window is measured from the
+  /// activity, not from this idle moment: timers that fire after a client has gone quiet do not open a
+  /// fresh one each.
+  fn spin_after_activity(&self, deadline_ns: Option<u64>) -> bool {
+    let Some(activity) = self.activity_ns.get() else {
+      return false;
+    };
+    let window_end = activity.saturating_add(self.spin_window_ns());
+    if self.now_ns() >= window_end {
+      return false;
+    }
+    self.update_attribution(Tracker::wait_began);
+    let found = self.spin_for_work(window_end, deadline_ns);
+    if found {
+      self.wait_ended();
+    }
+    found
+  }
+
+  /// The spin itself: true when work arrived or `deadline_ns` fell due before `spin_end`. Each turn
+  /// asks the rings, the pollers and the driver: a socket's readiness is work as much as a ring's
+  /// message, and no driver can tell it without a (non-blocking) poll — without one a request arriving
+  /// on a socket waited until the window ended and the shard parked (`tests/tcp.rs`).
+  fn spin_for_work(&self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
+    loop {
+      // A poller's question may consume its signal (the daemon's doorbell flag is swapped to false
+      // when asked), so the spin wakes the pollers it finds ready rather than only reporting them:
+      // asked here and dropped, a ring would be lost until the next one (`tests/pollers.rs`).
+      if self.has_inbound()
+        || self
+          .with_inner(|inner| inner.driver.has_pending() || self.wake_ready_pollers(inner))
+          .unwrap_or(false)
+        || self.harvest_io()
+      {
+        self.with_inner(|inner| {
+          inner.counters.spin_hits = inner.counters.spin_hits.saturating_add(1)
+        });
+        return true;
+      }
+      let now = self.now_ns();
+      if let Some(deadline) = deadline_ns
+        && now >= deadline
+      {
+        self.with_inner(|inner| {
+          inner.counters.spin_deadlines = inner.counters.spin_deadlines.saturating_add(1)
+        });
+        // The spin waited for this deadline as a park would have; the next step measures its lateness.
+        self.waited_for_ns.set(Some(deadline));
+        return true;
+      }
+      if now >= spin_end {
+        self.with_inner(|inner| {
+          inner.counters.spin_misses = inner.counters.spin_misses.saturating_add(1)
+        });
+        return false;
+      }
+      std::hint::spin_loop();
+    }
+  }
+
+  /// Steps until no task, timer or message is pending, parking for timers as needed; returns
+  /// when the shard is idle or has exited. The driver is polled only when it may hold something
+  /// (a zero-timeout poll costs a syscall the idle path must not pay for nothing).
+  pub fn run_until_idle(&self) {
+    let _entered = registry::enter(self);
+    loop {
+      let outcome = self.step();
+      if outcome.exit {
+        self.exited.set(true);
+        break;
+      }
+      if outcome.did_work {
+        continue;
+      }
+      match outcome.next_deadline_ns {
+        Some(deadline) => self.park(Some(deadline)),
+        None => {
+          let pending = self
+            .with_inner(|inner| inner.driver.has_pending())
+            .unwrap_or(false);
+          if !pending {
+            break;
+          }
+          self.park(Some(self.now_ns()));
+          if !self.step().did_work {
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  /// One loop iteration without blocking.
+  pub fn step(&self) -> StepOutcome {
+    if self.exited.get() {
+      return StepOutcome {
+        did_work: false,
+        next_deadline_ns: None,
+        exit: true,
+      };
+    }
+    let _entered = registry::enter(self);
+    // While a long poll has gone unattributed, each step opens a window at its start, so the next long
+    // poll is judged by the step's own CPU alone; an unarmed shard reads neither clock.
+    if self.real_time {
+      self.update_attribution(|tracker| tracker.step_began(|| self.account_now()));
+    }
+    let mut did_work = false;
+    let (drained, batch, alone) = self
+      .with_inner(|inner| {
+        inner.counters.steps = inner.counters.steps.saturating_add(1);
+        // The pulse an observer on another thread reads (`registry::Pulse`): a handful of plain stores on a
+        // line this core owns, so a stall diagnosis sees the arena saturating (`admission_refused`) or a
+        // long poll (`longest_step_ns`) without a shard round-trip.
+        if let Some(entry) = self.entry {
+          entry.pulse.record(
+            inner.counters.steps,
+            inner.counters.spawns,
+            inner.counters.completed,
+            inner.counters.admission_refused,
+            inner.counters.longest_step_ns,
+          );
+        }
+        // The first step after a wait: how late it runs against the deadline the wait was for is the
+        // shard's measured scheduler overrun (`scheduler_overrun_ns`).
+        if let Some(deadline) = self.waited_for_ns.take() {
+          self.note_wait_overrun(inner, deadline);
+        }
+        let mut work = self.drain_control(inner);
+        work |= self.drain_inbound(inner);
+        work |= self.expire_timers(inner);
+        work |= self.wake_ready_pollers(inner);
+        (work, inner.config.batch, live_alone(inner))
+      })
+      .unwrap_or((false, 1, None));
+    did_work |= drained;
+    // At most one batch, oldest first: a step costs its batch, not the ready set (`LocalQueue`). A shard a task holds
+    // alone polls that task only, when it is ready ([`Self::spawn_alone`]).
+    let ready = match alone {
+      Some(holder) => self.local.take_slot(holder.index()),
+      None => self.local.take_ready(batch.max(1)),
+    };
+    for (polled, slot) in ready.iter().enumerate() {
+      did_work = true;
+      self.poll_slot(*slot);
+      // A task this poll ran began to hold the shard alone: the rest of the batch waits for it, in its order.
+      if alone.is_none() && self.held_alone() {
+        self
+          .local
+          .put_back(ready.get(polled.saturating_add(1)..).unwrap_or_default());
+        break;
+      }
+    }
+    self.local.finish_drain(ready);
+    let (exit, next_deadline_ns) = self
+      .with_inner(|inner| {
+        (
+          inner.shutting_down && inner.arena.is_empty(),
+          inner.timers.next_deadline_ns(),
+        )
+      })
+      .unwrap_or((false, None));
+    if exit {
+      self.exited.set(true);
+    }
+    self.update_attribution(|tracker| tracker.step_ended(did_work));
+    StepOutcome {
+      did_work,
+      next_deadline_ns,
+      exit,
+    }
+  }
+
+  /// Parks in the driver until a kick, a completion or `deadline_ns`. The parking announcement
+  /// comes first and the inbox re-check second, so a message that landed between the loop's last
+  /// look and here is seen now, and one that lands after sees the announcement and kicks (the
+  /// protocol and its loom model: [`crate::parking`]).
+  pub fn park(&self, deadline_ns: Option<u64>) {
+    let _entered = registry::enter(self);
+    // What this wait is for; the next step measures how late it runs against it (`scheduler_overrun_ns`).
+    self.waited_for_ns.set(deadline_ns);
+    self.update_attribution(Tracker::wait_began);
+    let mut lost = false;
+    match self.entry {
+      Some(entry) => {
+        // A tracking shard counts its voluntary switches as the wait begins, so a kicked park can tell a
+        // wait that slept from one that found the kick pending (`note_wake`); the shard is idle here, so
+        // the read delays nothing.
+        let learns = self.real_time && self.wake.get().is_some();
+        let mut switches_before_wait = None;
+        let parked = entry.parking.park_unless_pending(
+          || self.has_inbound(),
+          || {
+            if learns {
+              switches_before_wait = attribution::voluntary_switches_now();
+            }
+            lost = self.wait_in_driver(deadline_ns);
+          },
+        );
+        if let Parked::Waited(Some(woken)) = parked {
+          self.note_wake(entry, woken, switches_before_wait);
+        }
+      }
+      None => lost = self.wait_in_driver(deadline_ns),
+    }
+    self.wait_ended();
+    if lost {
+      self.fail_all();
+    }
+  }
+
+  /// The step quantum now (§4.3, "a step longer than a peer's wake starves the shard"): the online wake
+  /// estimate while the shard tracks one, else the configured step budget. What the I/O harvest cadence,
+  /// the long-step count and the daemon's cooperative slices ([`crate::futures::step_budget_ns`]) read.
+  pub fn quantum_ns(&self) -> u64 {
+    self
+      .wake
+      .get()
+      .map_or(self.fixed_quantum_ns, |estimate| estimate.mean_ns())
+      .max(1)
+  }
+
+  /// The idle spin window now: the online wake estimate times the configured idle ratio while the shard
+  /// tracks one (the 2-competitive spin, §4.3), else the configured spin.
+  fn spin_window_ns(&self) -> u64 {
+    self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
+      estimate.mean_ns().saturating_mul(self.idle_ratio)
+    })
+  }
+
+  /// The online wake estimate now, nanoseconds (the configured step budget when not tracking).
+  pub fn wake_cost_ns(&self) -> u64 {
+    self.quantum_ns()
+  }
+
+  /// Folds a park's measured wake into the online estimate (§4.3): the kick-to-running latency of a park
+  /// a kick ended asleep ([`Woken::latency_ns`]) — the event the boot probe times, a sleeper woken. A
+  /// stamp from before the park's announcement is counted stale; one from the park's setup, or (Linux) a
+  /// wait across which the thread never switched out (`switches_before_wait` against now), found the
+  /// shard awake and is counted unslept; both are dropped. A park a timer or a completion ended teaches
+  /// nothing. Only a tracking shard on a real clock learns: the simulation's clock is not the kicker's.
+  fn note_wake(&self, entry: &Entry, woken: Woken, switches_before_wait: Option<u64>) {
+    let Some(mut estimate) = self.wake.get() else {
+      return;
+    };
+    if !self.real_time {
+      return;
+    }
+    if woken.stale() {
+      self.with_inner(|inner| {
+        inner.counters.wake_stale = inner.counters.wake_stale.saturating_add(1)
+      });
+      return;
+    }
+    let Some(latency) = woken.latency_ns() else {
+      if woken.early() {
+        self.with_inner(|inner| {
+          inner.counters.wake_unslept = inner.counters.wake_unslept.saturating_add(1)
+        });
+      }
+      return;
+    };
+    // Where the thread's voluntary switches are counted, a wait that never switched never slept: the
+    // kick was pending when the wait began (or landed before the kernel put the thread to sleep).
+    if let (Some(before), Some(after)) =
+      (switches_before_wait, attribution::voluntary_switches_now())
+      && after == before
+    {
+      self.with_inner(|inner| {
+        inner.counters.wake_unslept = inner.counters.wake_unslept.saturating_add(1)
+      });
+      return;
+    }
+    estimate.record(latency);
+    self.wake.set(Some(estimate));
+    let mean = estimate.mean_ns();
+    self.with_inner(|inner| {
+      inner.counters.wake_samples = inner.counters.wake_samples.saturating_add(1);
+      inner.counters.wake_cost_ns = mean;
+    });
+    entry.pulse.record_wake_cost(mean);
+  }
+
+  /// Attributes a poll against the step quantum (§4.3's long-step count): within it by the wall clock it
+  /// is within; past it, the attribution windows decide whose it was ([`crate::attribution`]). A
+  /// simulated shard's clock is not the thread's, and nothing preempts a simulation, so its long polls
+  /// are the task's.
+  fn attribute_poll(&self, poll_started_ns: u64, ended_ns: u64) -> Option<Attribution> {
+    let quantum = self.quantum_ns();
+    if ended_ns.saturating_sub(poll_started_ns) <= quantum {
+      return None;
+    }
+    if !self.real_time {
+      return Some(Attribution::Long);
+    }
+    let end = attribution::thread_account();
+    let mut tracker = self.attribution.get();
+    let attributed = tracker.long_poll(poll_started_ns, ended_ns, end, quantum);
+    self.attribution.set(tracker);
+    Some(attributed)
+  }
+
+  /// A wait ended: while a long poll has gone unattributed, a window opens now.
+  fn wait_ended(&self) {
+    if self.real_time {
+      self.update_attribution(|tracker| tracker.wait_ended(|| self.account_now()));
+    }
+  }
+
+  /// The thread's account and the shard clock now: an attribution window's start.
+  fn account_now(&self) -> Option<(attribution::ThreadAccount, u64)> {
+    attribution::thread_account().map(|account| (account, self.now_ns()))
+  }
+
+  /// Applies `change` to the attribution tracker.
+  fn update_attribution(&self, change: impl FnOnce(&mut Tracker)) {
+    let mut tracker = self.attribution.get();
+    change(&mut tracker);
+    self.attribution.set(tracker);
+  }
+
+  /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions
+  /// queued; true when the driver was lost.
+  fn wait_in_driver(&self, deadline_ns: Option<u64>) -> bool {
+    self
+      .with_inner(|inner| {
+        inner.counters.waits = inner.counters.waits.saturating_add(1);
+        if let Some(entry) = self.entry {
+          entry.pulse.record_waits(inner.counters.waits);
+        }
+        let timeout = deadline_ns.map(|d| d.saturating_sub(inner.driver.now_ns()));
+        let mut completions = std::mem::take(&mut inner.completions);
+        let result = inner.driver.wait(timeout, &mut completions);
+        for c in completions.drain(..) {
+          inner.counters.completions = inner.counters.completions.saturating_add(1);
+          self.deliver(c.user_data);
+        }
+        inner.completions = completions;
+        match result {
+          Ok(()) => false,
+          Err(RtError::DriverLost) => {
+            inner.counters.driver_lost = inner.counters.driver_lost.saturating_add(1);
+            true
+          }
+          Err(_) => {
+            inner.counters.driver_errors = inner.counters.driver_errors.saturating_add(1);
+            false
+          }
+        }
+      })
+      .unwrap_or(false)
+  }
+
+  /// Cancels every task with a terminal completion and exits: the driver is gone.
+  fn fail_all(&self) {
+    self.with_inner(|inner| {
+      inner.shutting_down = true;
+      cancel_all(&mut inner.arena, &self.local);
+    });
+    let mut bound = self.live_tasks().saturating_mul(2).saturating_add(1);
+    while !self.exited.get() && bound > 0 {
+      let outcome = self.step();
+      bound = bound.saturating_sub(1);
+      if outcome.exit {
+        break;
+      }
+    }
+    self.exited.set(true);
+  }
+
+  fn drain_control(&self, inner: &mut ShardInner) -> bool {
+    let Some(entry) = self.entry else {
+      return false;
+    };
+    // Take (read and clear in one atomic step) before draining: a send that lands during the drain
+    // publishes the flag again and is seen on the next step at the latest (`parking::ControlFlag`).
+    if !entry.control_pending.take() {
+      return false;
+    }
+    // A shard that drained since this one asked it for room says so by this flag, as a message does (`crate::room`).
+    let mut woke = false;
+    if entry.room_given.maybe_any() {
+      entry
+        .room_given
+        .take_each(|target| woke |= self.wake_room_waiters(inner, target));
+    }
+    let drained = self.take_control_batch(inner, entry);
+    if drained > 0 {
+      // Room made: the shards that asked for it are told. The fence orders this drain's taking of messages before the
+      // look at who asked, as each asker fences between its mark and its second try (`crate::room`).
+      fence(Ordering::SeqCst);
+      if entry.room_wanted.maybe_any() {
+        entry
+          .room_wanted
+          .take_each(|origin| registry::give_room(origin, self.id));
+      }
+    }
+    drained > 0 || woke
+  }
+
+  /// Takes at most one batch of control messages and handles each; how many it took.
+  fn take_control_batch(&self, inner: &mut ShardInner, entry: &Entry) -> usize {
+    let batch = inner.config.batch.max(1);
+    let mut drained = 0;
+    while drained < batch {
+      let Ok(message) = inner.control.try_recv() else {
+        break;
+      };
+      drained = drained.saturating_add(1);
+      inner.counters.controls = inner.counters.controls.saturating_add(1);
+      self.handle_control(inner, message);
+    }
+    if drained == batch {
+      // A whole batch drained may have left messages behind it: re-arm the flag, so the next step
+      // drains again. Before 2026-09-17 nothing did, and a burst larger than one batch — a flood of
+      // submissions behind a long poll — sat undrained until some later send happened to set the flag:
+      // a spawn queued behind it was never admitted, and a shutdown refused by the still-full channel
+      // was retried against a shard that had parked for good (`tests/burst.rs`,
+      // `docs/bugs/2026-09-17-control-drain-forgets-a-burst-past-one-batch.md`).
+      entry.control_pending.rearm();
+    }
+    drained
+  }
+
+  /// Wakes this shard's tasks waiting for room on `target` ([`crate::room`]): each is taken out of the waiters and, if
+  /// its task still lives, queued to run, where it tries its send again. Whether any was woken.
+  fn wake_room_waiters(&self, inner: &mut ShardInner, target: u16) -> bool {
+    let waiting: Vec<(u32, u32)> = inner
+      .room_waiters
+      .range((target, 0)..=(target, u32::MAX))
+      .map(|(&(_, slot), &generation)| (slot, generation))
+      .collect();
+    let mut woke = false;
+    for (slot, generation) in waiting {
+      inner.room_waiters.remove(&(target, slot));
+      if inner.arena.contains(Handle::from_raw(slot, generation)) {
+        self.local.push(slot);
+        inner.counters.room_wakes = inner.counters.room_wakes.saturating_add(1);
+        woke = true;
+      }
+    }
+    woke
+  }
+
+  fn drain_inbound(&self, inner: &mut ShardInner) -> bool {
+    let mut any = false;
+    let batch = inner.config.batch.max(1);
+    for _ in 0..batch {
+      let Some(word) = inner
+        .foreign
+        .as_ref()
+        .and_then(slates_mem::mpsc::Consumer::pop)
+      else {
+        break;
+      };
+      any = true;
+      inner.counters.wakes_foreign = inner.counters.wakes_foreign.saturating_add(1);
+      self.handle_wake(inner, Encoded::from_word(word));
+    }
+    for consumer in &self.inbound {
+      for _ in 0..batch {
+        let Some(word) = consumer.pop() else { break };
+        any = true;
+        inner.counters.wakes_pair = inner.counters.wakes_pair.saturating_add(1);
+        self.handle_wake(inner, Encoded::from_word(word));
+      }
+    }
+    any
+  }
+
+  /// Registers `work` as this shard's idle work (§4.2's pre-fault task on idle time; the daemon's reserve refill,
+  /// A-214), replacing any before it. When a step finds nothing to do and the idle spin has run out, the loop calls it
+  /// once, and looks for work again before it calls it next; `work` does a slice bounded by the shard's quantum and
+  /// says whether it did anything, and the shard parks once it says no. It runs outside every task, so it may not
+  /// await. Refused off the shard's thread.
+  pub fn set_idle_work(&self, work: Box<dyn FnMut() -> bool>) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| inner.idle_work = Some(work))
+      .ok_or(RtError::NotOnShardThread)
+  }
+
+  /// One slice of the registered idle work: whether it did anything. The work is taken out of the shard's state while
+  /// it runs, so it may use the shard's other services without a nested borrow, and put back after unless it was
+  /// replaced meanwhile.
+  fn idle_slice(&self) -> bool {
+    let Some(mut work) = self.with_inner(|inner| inner.idle_work.take()).flatten() else {
+      return false;
+    };
+    let did = work();
+    self.with_inner(|inner| {
+      if inner.idle_work.is_none() {
+        inner.idle_work = Some(work);
+      }
+    });
+    did
+  }
+
+  /// Registers `task` as a poller with `ready`; the loop wakes it whenever `ready` says so.
+  /// Refused when the task is not live on this shard.
+  pub fn register_poller(&self, task: TaskId, ready: Box<dyn Fn() -> bool>) -> Result<(), RtError> {
+    let slot = task.0.slot();
+    let generation = task.0.generation();
+    self
+      .with_inner(|inner| {
+        if !inner
+          .arena
+          .generation_at(slot)
+          .is_some_and(|g| g == generation)
+        {
+          return Err(RtError::StaleTask { slot, generation });
+        }
+        inner.pollers.push(Poller {
+          slot,
+          generation,
+          ready,
+        });
+        Ok(())
+      })
+      .unwrap_or(Err(RtError::NotOnShardThread))
+  }
+
+  /// Forgets a poller.
+  pub fn unregister_poller(&self, task: TaskId) {
+    let slot = task.0.slot();
+    self.with_inner(|inner| inner.pollers.retain(|p| p.slot != slot));
+  }
+
+  /// Wakes every poller whose ring is ready; a poller whose task ended is dropped.
+  fn wake_ready_pollers(&self, inner: &mut ShardInner) -> bool {
+    let mut any = false;
+    inner.pollers.retain(|p| {
+      inner
+        .arena
+        .generation_at(p.slot)
+        .is_some_and(|g| g == p.generation)
+    });
+    for p in &inner.pollers {
+      if (p.ready)() {
+        any = true;
+        inner.counters.poller_wakes = inner.counters.poller_wakes.saturating_add(1);
+        self.local.push(p.slot);
+      }
+    }
+    any
+  }
+
+  fn handle_wake(&self, inner: &mut ShardInner, word: Encoded) {
+    // An interest word from another shard (the simulation's fabric wakes through the registry) names a
+    // readiness registration, not a task: it is delivered through the table (A-149).
+    if word.as_interest().is_some() {
+      self.deliver(word.word());
+      return;
+    }
+    // A slot-only word (a 32-bit target's waker) wakes the slot's current occupant, as a same-shard wake
+    // does; a full word wakes only the task it names.
+    if inner
+      .arena
+      .generation_at(word.slot())
+      .is_some_and(|g| g == word.generation() || word.generation() == Encoded::ANY_GENERATION)
+    {
+      self.local.push(word.slot());
+    } else {
+      inner.counters.stale_wakes = inner.counters.stale_wakes.saturating_add(1);
+    }
+  }
+
+  fn handle_control(&self, inner: &mut ShardInner, message: Control) {
+    match message {
+      Control::Spawn(request) => {
+        let SpawnRequest {
+          future,
+          parent,
+          receipt,
+        } = *request;
+        if inner.shutting_down {
+          // A shard shutting down admits nothing new — its arena drains to empty and the loop exits
+          // — so the request is refused unadmitted: its receipt answered, its future dropped here.
+          inner.counters.refused_at_shutdown = inner.counters.refused_at_shutdown.saturating_add(1);
+          receipt.answer(Admission::Terminated);
+          return;
+        }
+        let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
+        match inner.arena.insert(TaskSlot::new(future, parent, false)) {
+          Ok(handle) => {
+            if let Some(p) = parent {
+              link_child(&mut inner.arena, p, handle.index());
+            }
+            if let Ok(task) = inner.arena.get_mut(handle) {
+              task.state = State::Queued;
+            }
+            inner.counters.spawns = inner.counters.spawns.saturating_add(1);
+            self.local.push(handle.index());
+            receipt.answer(
+              match Encoded::pack(self.id, handle.index(), handle.generation()) {
+                Some(word) => Admission::Admitted(TaskId(word)),
+                None => Admission::Refused(RtError::TooManyTasks {
+                  capacity: inner.config.tasks_per_shard,
+                }),
+              },
+            );
+          }
+          Err(slates_mem::MemError::SlabFull { capacity }) => {
+            inner.counters.admission_refused = inner.counters.admission_refused.saturating_add(1);
+            receipt.answer(Admission::Refused(RtError::TooManyTasks { capacity }));
+          }
+          Err(e) => {
+            inner.counters.admission_refused = inner.counters.admission_refused.saturating_add(1);
+            receipt.answer(Admission::Refused(RtError::Mem(e)));
+          }
+        }
+      }
+      Control::Cancel(word) => {
+        if let Ok(task) = inner
+          .arena
+          .get_mut(Handle::from_raw(word.slot(), word.generation()))
+        {
+          task.cancel_requested = true;
+          self.local.push(word.slot());
+        }
+      }
+      Control::Shutdown => {
+        inner.shutting_down = true;
+        cancel_all(&mut inner.arena, &self.local);
+        release_finished(&mut inner.arena);
+      }
+    }
+  }
+
+  fn expire_timers(&self, inner: &mut ShardInner) -> bool {
+    let now = inner.driver.now_ns();
+    let mut fired = std::mem::take(&mut inner.fired);
+    inner.timers.advance(now, &mut fired);
+    let any = !fired.is_empty();
+    let freed = fired.len();
+    for word in fired.drain(..) {
+      inner.counters.timers_fired = inner.counters.timers_fired.saturating_add(1);
+      self.local.push(Encoded::from_word(word).slot());
+    }
+    inner.fired = fired;
+    self.wake_timer_waiters(inner, freed);
+    any
+  }
+
+  fn poll_slot(&self, slot: u32) {
+    self.local.clear_pending(slot);
+    let taken = self.with_inner(|inner| take_future(inner, slot)).flatten();
+    let Some((mut future, generation, cancelled)) = taken else {
+      return;
+    };
+    if cancelled {
+      // The future is dropped outside any borrow: destructors may wake other tasks.
+      drop(future);
+      self.with_inner(|inner| finish(inner, &self.local, slot, Outcome::Cancelled));
+      return;
+    }
+    let word = Encoded::pack(self.id, slot, generation).unwrap_or(Encoded::from_word(0));
+    let waker = waker_for(word);
+    let mut cx = Context::from_waker(&waker);
+    self.current_task.set(Some(slot));
+    let start = self.now_ns();
+    let poll = future.as_mut().poll(&mut cx);
+    let ended = self.now_ns();
+    self.current_task.set(None);
+    let done = matches!(poll, Poll::Ready(()));
+    let attributed = self.attribute_poll(start, ended);
+    let dropped = self.with_inner(|inner| {
+      after_poll(
+        inner,
+        &self.local,
+        PollDone {
+          slot,
+          future,
+          elapsed: ended.saturating_sub(start),
+          done,
+          attributed,
+        },
+      )
+    });
+    drop(dropped);
+  }
+}
+
+fn handle_of(id: TaskId) -> Handle<TaskSlot> {
+  Handle::from_raw(id.0.slot(), id.0.generation())
+}
+
+fn stale(id: TaskId) -> RtError {
+  RtError::StaleTask {
+    slot: id.0.slot(),
+    generation: id.0.generation(),
+  }
+}
+
+fn handle_at(arena: &Slab<TaskSlot>, slot: u32) -> Option<Handle<TaskSlot>> {
+  arena.generation_at(slot).map(|g| Handle::from_raw(slot, g))
+}
+
+/// Takes the future out of a live slot: `(future, generation, cancelled)`.
+fn take_future(inner: &mut ShardInner, slot: u32) -> Option<(BoxedFuture, u32, bool)> {
+  let handle = handle_at(&inner.arena, slot)?;
+  let task = inner.arena.get_mut(handle).ok()?;
+  if matches!(task.state, State::Finishing | State::Done | State::Running) {
+    return None;
+  }
+  let future = task.future.take()?;
+  if task.cancel_requested {
+    task.state = State::Finishing;
+    return Some((future, handle.generation(), true));
+  }
+  task.state = State::Running;
+  Some((future, handle.generation(), false))
+}
+
+/// One finished poll, as `after_poll` records it.
+struct PollDone {
+  slot: u32,
+  future: BoxedFuture,
+  elapsed: u64,
+  done: bool,
+  /// Who held it, when it ran past the step quantum by the wall clock ([`ShardContext::attribute_poll`]).
+  attributed: Option<Attribution>,
+}
+
+/// Records the poll and either stores the future back or finishes the task; returns a future to
+/// drop outside the borrow, if any.
+fn after_poll(inner: &mut ShardInner, local: &LocalQueue, poll: PollDone) -> Option<BoxedFuture> {
+  let PollDone {
+    slot,
+    future,
+    elapsed,
+    done,
+    attributed,
+  } = poll;
+  let long = attributed.is_some_and(Attribution::is_tasks);
+  inner.counters.polls = inner.counters.polls.saturating_add(1);
+  if let Some(attributed) = attributed {
+    count_long_poll(&mut inner.counters, attributed);
+  }
+  inner.counters.longest_step_ns = inner.counters.longest_step_ns.max(elapsed);
+  let Some(handle) = handle_at(&inner.arena, slot) else {
+    return Some(future);
+  };
+  let Ok(task) = inner.arena.get_mut(handle) else {
+    return Some(future);
+  };
+  task.polls = task.polls.saturating_add(1);
+  if long {
+    task.long_steps = task.long_steps.saturating_add(1);
+  }
+  task.longest_step_ns = task.longest_step_ns.max(elapsed);
+  if done {
+    finish(inner, local, slot, Outcome::Completed);
+    return Some(future);
+  }
+  if task.cancel_requested {
+    finish(inner, local, slot, Outcome::Cancelled);
+    return Some(future);
+  }
+  task.future = Some(future);
+  task.state = State::Idle;
+  None
+}
+
+/// Counts a poll past the step quantum by the wall clock under whoever held it.
+fn count_long_poll(counters: &mut Counters, attributed: Attribution) {
+  if attributed.is_tasks() {
+    counters.long_steps = counters.long_steps.saturating_add(1);
+  }
+  if attributed == Attribution::Blocked {
+    counters.blocked_steps = counters.blocked_steps.saturating_add(1);
+  }
+  if attributed == Attribution::Preempted {
+    counters.preempted_steps = counters.preempted_steps.saturating_add(1);
+  }
+  if attributed.is_unattributed() {
+    counters.unattributed_steps = counters.unattributed_steps.saturating_add(1);
+  }
+}
+
+/// Moves a task to `Finishing`, joins its children (cancelling the live ones, reaping the done
+/// ones), and completes it when none is live.
+fn finish(inner: &mut ShardInner, local: &LocalQueue, slot: u32, outcome: Outcome) {
+  let Some(handle) = handle_at(&inner.arena, slot) else {
+    return;
+  };
+  // A task that held the shard alone lets it go as its future ends, whether it completed or was cancelled.
+  if inner.alone == Some(handle) {
+    inner.alone = None;
+  }
+  let (children, first_child) = match inner.arena.get_mut(handle) {
+    Ok(task) => {
+      task.state = State::Finishing;
+      task.outcome = Some(outcome);
+      task.future = None;
+      (task.children, task.first_child)
+    }
+    Err(_) => return,
+  };
+  match outcome {
+    Outcome::Completed => inner.counters.completed = inner.counters.completed.saturating_add(1),
+    Outcome::Cancelled => inner.counters.cancelled = inner.counters.cancelled.saturating_add(1),
+  }
+  let mut child = first_child;
+  while child != NO_LINK {
+    let Some(child_handle) = handle_at(&inner.arena, child) else {
+      break;
+    };
+    let (next, done) = match inner.arena.get_mut(child_handle) {
+      Ok(task) => {
+        task.joinable = false;
+        task.cancel_requested = true;
+        (task.next_sibling, task.is_done())
+      }
+      Err(_) => (NO_LINK, false),
+    };
+    if done {
+      unlink_child(&mut inner.arena, slot, child);
+      let _ = inner.arena.remove(child_handle);
+    } else {
+      local.push(child);
+    }
+    child = next;
+  }
+  if children == 0 {
+    complete(inner, slot);
+  }
+}
+
+/// Marks a task terminal, wakes its joiner, unlinks it from its parent when detached, reaps it if
+/// detached, and completes the parent if it was waiting on this child.
+fn complete(inner: &mut ShardInner, slot: u32) {
+  let mut current = Some(slot);
+  while let Some(slot) = current {
+    current = None;
+    let Some(handle) = handle_at(&inner.arena, slot) else {
+      break;
+    };
+    let (parent, joinable, joiner) = match inner.arena.get_mut(handle) {
+      Ok(task) => {
+        task.state = State::Done;
+        (task.parent, task.joinable, task.join_waker.take())
+      }
+      Err(_) => break,
+    };
+    if let Some(waker) = joiner {
+      waker.wake();
+    }
+    if let Some(p) = parent {
+      // A joinable task keeps its parent link until it is joined or its parent finishes, so the
+      // parent can reap it; a detached one leaves the list now.
+      if !joinable {
+        unlink_child(&mut inner.arena, p, slot);
+      }
+      if let Some(parent_task) =
+        handle_at(&inner.arena, p).and_then(|h| inner.arena.get_mut(h).ok())
+      {
+        parent_task.children = parent_task.children.saturating_sub(1);
+        if parent_task.state == State::Finishing && parent_task.children == 0 {
+          current = Some(p);
+        }
+      }
+    }
+    // A shard shutting down releases a finished joinable task too: every task, any joiner among them, has been
+    // cancelled, so no join is coming, and the slot would hold the shard's exit (it leaves only an empty arena).
+    // A joiner already waiting was woken above and reads the task as gone.
+    if !joinable || inner.shutting_down {
+      if joinable && let Some(p) = parent {
+        unlink_child(&mut inner.arena, p, slot);
+      }
+      let _ = inner.arena.remove(handle);
+    }
+  }
+}
+
+/// Releases every task that has already finished, joinable or not: called as a shutdown begins, when no join can come
+/// (every task has been cancelled). Before 2026-10-06 a finished joinable task nobody joined kept its slot, and the
+/// shard, which leaves its loop only with an empty arena, never shut down (`tests/admission.rs`
+/// `a_shutdown_completes_beside_a_finished_task_nobody_joined`). Admissions are refused from now on, so no slot is
+/// reused under a stale parent link.
+fn release_finished(arena: &mut Slab<TaskSlot>) {
+  let finished: Vec<(u32, Option<u32>)> = arena
+    .iter()
+    .filter(|(_, task)| task.is_done())
+    .map(|(handle, task)| (handle.index(), task.parent))
+    .collect();
+  for (slot, parent) in finished {
+    if let Some(p) = parent {
+      unlink_child(arena, p, slot);
+    }
+    if let Some(handle) = handle_at(arena, slot) {
+      let _ = arena.remove(handle);
+    }
+  }
+}
+
+/// The task holding the shard alone, if its future has not ended ([`ShardContext::spawn_alone`]). A hold whose task is
+/// gone without passing through [`finish`] (its slot freed or reused) is let go here, so a stale hold never starves the
+/// shard.
+fn live_alone(inner: &mut ShardInner) -> Option<Handle<TaskSlot>> {
+  let holder = inner.alone?;
+  let live = inner
+    .arena
+    .get(holder)
+    .is_ok_and(|task| !matches!(task.state, State::Finishing | State::Done));
+  if !live {
+    inner.alone = None;
+    return None;
+  }
+  Some(holder)
+}
+
+fn cancel_all(arena: &mut Slab<TaskSlot>, local: &LocalQueue) {
+  let slots: Vec<u32> = arena.iter().map(|(h, _)| h.index()).collect();
+  for slot in slots {
+    if let Some(task) = handle_at(arena, slot).and_then(|h| arena.get_mut(h).ok()) {
+      task.cancel_requested = true;
+    }
+    local.push(slot);
+  }
+}
+
+fn link_child(arena: &mut Slab<TaskSlot>, parent: u32, child: u32) {
+  let old_first = match handle_at(arena, parent).and_then(|h| arena.get_mut(h).ok()) {
+    Some(p) => {
+      let old = p.first_child;
+      p.first_child = child;
+      p.children = p.children.saturating_add(1);
+      old
+    }
+    None => return,
+  };
+  if let Some(c) = handle_at(arena, child).and_then(|h| arena.get_mut(h).ok()) {
+    c.next_sibling = old_first;
+    c.prev_sibling = NO_LINK;
+  }
+  if old_first != NO_LINK
+    && let Some(next) = handle_at(arena, old_first).and_then(|h| arena.get_mut(h).ok())
+  {
+    next.prev_sibling = child;
+  }
+}
+
+fn unlink_child(arena: &mut Slab<TaskSlot>, parent: u32, child: u32) {
+  let (prev, next) = match handle_at(arena, child).and_then(|h| arena.get_mut(h).ok()) {
+    Some(c) => (c.prev_sibling, c.next_sibling),
+    None => return,
+  };
+  if prev == NO_LINK {
+    if let Some(p) = handle_at(arena, parent).and_then(|h| arena.get_mut(h).ok()) {
+      p.first_child = next;
+    }
+  } else if let Some(pv) = handle_at(arena, prev).and_then(|h| arena.get_mut(h).ok()) {
+    pv.next_sibling = next;
+  }
+  if next != NO_LINK
+    && let Some(nx) = handle_at(arena, next).and_then(|h| arena.get_mut(h).ok())
+  {
+    nx.prev_sibling = prev;
+  }
+}
+
+/// Pins a boxed future for admission.
+pub fn boxed<F: std::future::Future<Output = ()> + 'static>(future: F) -> BoxedFuture {
+  Box::pin(future) as Pin<Box<dyn std::future::Future<Output = ()>>>
+}

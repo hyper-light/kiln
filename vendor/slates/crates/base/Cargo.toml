@@ -1,0 +1,32 @@
+[package]
+name = "slates-base"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "The read-only host side of the base plane: listings, opens, fingerprints, reads and watcher hints over the operating system (design §4.5, §4.15, D-25)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-vfs = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The kernel's mount table without contacting any filesystem (`getfsstat(MNT_NOWAIT)`), by which a mount this daemon
+# serves is named (A-227, `own_mounts`).
+slates-bridge-oci = { workspace = true }
+
+[dev-dependencies]
+slates-mem = { workspace = true }
+# The differential's other leg for the clean-file digest (§4.15): the standard library's bytes hashed here.
+blake3 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lints]
+workspace = true

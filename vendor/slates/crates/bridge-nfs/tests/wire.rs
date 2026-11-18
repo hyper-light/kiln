@@ -1,0 +1,288 @@
+//! Tests for the NFS bridge's wire codec (§4.6; Phase 4). XDR values round-trip with correct
+//! four-byte padding and refuse hostile lengths; ONC RPC records frame and deframe, a partial
+//! stream is `Incomplete` (not an error), an oversized record is refused, a call header parses, and
+//! a reply builds to the exact bytes the kernel expects. All pure, every host — no socket, no mount.
+
+use proptest::prelude::*;
+use slates_bridge_nfs::rpc::{
+  AcceptStatus, RpcError, finish_success_record, parse_call, read_record, reply_bytes,
+  reply_record, success_record_head, write_record,
+};
+use slates_bridge_nfs::xdr::{XdrError, XdrReader, XdrWriter};
+
+/// XDR scalars round-trip.
+#[test]
+fn xdr_scalars_round_trip() {
+  let mut w = XdrWriter::new();
+  w.u32(0x1122_3344);
+  w.i32(-5);
+  w.u64(0x0102_0304_0506_0708);
+  w.bool(true);
+  w.bool(false);
+  let bytes = w.into_bytes();
+  let mut r = XdrReader::new(&bytes);
+  assert_eq!(r.u32().unwrap(), 0x1122_3344);
+  assert_eq!(r.i32().unwrap(), -5);
+  assert_eq!(r.u64().unwrap(), 0x0102_0304_0506_0708);
+  assert!(r.bool().unwrap());
+  assert!(!r.bool().unwrap());
+  assert_eq!(r.remaining(), 0);
+}
+
+/// A variable opaque is length-prefixed and padded to four bytes; the reader skips the padding.
+#[test]
+fn xdr_opaque_is_length_prefixed_and_padded() {
+  let mut w = XdrWriter::new();
+  w.opaque(b"hello"); // 4 (len) + 5 + 3 (pad) = 12
+  w.u32(0x99); // must land right after the padding
+  let bytes = w.into_bytes();
+  assert_eq!(bytes.len(), 16);
+  assert_eq!(&bytes[0..4], &5u32.to_be_bytes());
+  let mut r = XdrReader::new(&bytes);
+  assert_eq!(r.opaque(64).unwrap(), b"hello");
+  assert_eq!(r.u32().unwrap(), 0x99, "the reader skipped the padding");
+}
+
+/// A string round-trips and non-UTF-8 is refused.
+#[test]
+fn xdr_string_round_trips_and_rejects_non_utf8() {
+  let mut w = XdrWriter::new();
+  w.opaque("readme.md".as_bytes());
+  let bytes = w.into_bytes();
+  assert_eq!(XdrReader::new(&bytes).string(255).unwrap(), "readme.md");
+
+  let mut bad = XdrWriter::new();
+  bad.opaque(&[0xff, 0xfe, 0xfd, 0xfc]);
+  assert_eq!(
+    XdrReader::new(&bad.into_bytes()).string(255),
+    Err(XdrError::BadLength)
+  );
+}
+
+/// A hostile opaque length is refused before allocating, and a truncated buffer is refused.
+#[test]
+fn xdr_refuses_hostile_and_truncated_input() {
+  // A length of u32::MAX with only a few bytes present.
+  let mut w = XdrWriter::new();
+  w.u32(u32::MAX);
+  w.fixed(b"xx");
+  assert_eq!(
+    XdrReader::new(&w.into_bytes()).opaque(64),
+    Err(XdrError::BadLength)
+  );
+  // A length past the caller's cap.
+  let mut over = XdrWriter::new();
+  over.opaque(&[0u8; 40]);
+  assert_eq!(
+    XdrReader::new(&over.into_bytes()).opaque(8),
+    Err(XdrError::BadLength)
+  );
+  // A truncated scalar.
+  assert_eq!(XdrReader::new(&[0u8; 2]).u32(), Err(XdrError::Truncated));
+}
+
+/// A record frames and deframes, returning the body and the bytes consumed.
+#[test]
+fn rpc_record_round_trips() {
+  let body = b"\x00\x01\x02\x03some rpc message".to_vec();
+  let framed = write_record(&body);
+  assert_eq!(framed.len(), body.len() + 4);
+  assert_eq!(framed[0] & 0x80, 0x80, "last-fragment bit set");
+  let (message, consumed) = read_record(&framed).unwrap();
+  assert_eq!(message, body);
+  assert_eq!(consumed, framed.len());
+}
+
+/// A stream that does not yet hold the whole record is `Incomplete`, not an error.
+#[test]
+fn rpc_partial_record_is_incomplete() {
+  let framed = write_record(b"a whole message here");
+  assert_eq!(read_record(&framed[..3]), Err(RpcError::Incomplete)); // header not even complete
+  assert_eq!(read_record(&framed[..8]), Err(RpcError::Incomplete)); // body not complete
+}
+
+/// A record marker claiming more than the message cap is refused (a hostile or corrupt length).
+#[test]
+fn rpc_oversized_record_is_refused() {
+  let marker = (0x7fff_ffffu32 | 0x8000_0000).to_be_bytes();
+  assert_eq!(read_record(&marker), Err(RpcError::RecordTooLarge));
+}
+
+/// T-4.3, §4.6 hostile RPC framing; AUD-03: empty nonfinal fragments must consume a bounded
+/// framing budget even though they add no payload. A maximum-size byte-fragmented record fits.
+#[test]
+fn rpc_empty_fragments_cannot_extend_a_record_without_limit() {
+  // The published server message limit is `MAX_MESSAGE`. Allow one marker per payload byte and a terminal
+  // marker; one further marker must be refused even when no payload has arrived.
+  let payload_limit = slates_bridge_nfs::rpc::MAX_MESSAGE;
+  let markers = vec![0; (payload_limit + 2) * size_of::<u32>()];
+  assert_eq!(read_record(&markers), Err(RpcError::RecordTooLarge));
+}
+
+/// T-4.3, §4.6 record marking; AUD-03: deliver a maximally byte-fragmented payload in irregular
+/// TCP chunks, then another record. Expect both bodies exactly once, including split markers.
+#[test]
+fn rpc_incremental_records_preserve_maximal_fragmentation_and_stream_boundaries() {
+  use slates_bridge_nfs::rpc::RecordReader;
+  let payload = vec![42; slates_bridge_nfs::rpc::MAX_MESSAGE];
+  let mut wire = Vec::new();
+  for byte in &payload {
+    wire.extend_from_slice(&1u32.to_be_bytes());
+    wire.push(*byte);
+  }
+  wire.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+  wire.extend_from_slice(&write_record(b"following record"));
+  let mut reader = RecordReader::default();
+  let mut messages = Vec::new();
+  for chunk in wire.chunks(4093) {
+    let mut rest = chunk;
+    while !rest.is_empty() {
+      let (message, consumed) = reader.read(rest).unwrap();
+      assert!(
+        consumed > 0,
+        "the incremental reader consumes every input prefix"
+      );
+      if let Some(message) = message {
+        messages.push(message);
+      }
+      rest = &rest[consumed..];
+    }
+  }
+  assert_eq!(messages, vec![payload, b"following record".to_vec()]);
+}
+
+/// T-4.3, §4.6; AUD-03: an empty-fragment attack split across reads must be refused at the same
+/// bound as one delivered all at once. Consuming a TCP chunk cannot reset the framing budget.
+#[test]
+fn rpc_fragment_budget_survives_tcp_read_boundaries() {
+  use slates_bridge_nfs::rpc::RecordReader;
+  let mut reader = RecordReader::default();
+  let fragments = slates_bridge_nfs::rpc::MAX_MESSAGE + 1;
+  for _ in 0..fragments {
+    assert_eq!(reader.read(&[0; 4]), Ok((None, 4)));
+  }
+  assert_eq!(reader.read(&[0; 4]), Err(RpcError::RecordTooLarge));
+}
+
+/// A NFSv3 NULL call header parses to its program, version and procedure.
+#[test]
+fn rpc_parses_a_call_header() {
+  let mut w = XdrWriter::new();
+  w.u32(0x1122_3344); // xid
+  w.u32(0); // CALL
+  w.u32(2); // rpcvers
+  w.u32(100_003); // NFS program
+  w.u32(3); // version 3
+  w.u32(0); // NULL procedure
+  w.u32(0); // cred flavor AUTH_NONE
+  w.opaque(&[]); // cred body
+  w.u32(0); // verf flavor AUTH_NONE
+  w.opaque(&[]); // verf body
+  let body = w.into_bytes();
+  let (call, args) = parse_call(&body).unwrap();
+  assert_eq!(call.xid, 0x1122_3344);
+  assert_eq!(call.program, 100_003);
+  assert_eq!(call.version, 3);
+  assert_eq!(call.procedure, 0);
+  assert_eq!(args.remaining(), 0, "NULL has no arguments");
+}
+
+/// A message that is not a version-2 call is refused, and garbage does not panic.
+#[test]
+fn rpc_refuses_a_non_call() {
+  let mut w = XdrWriter::new();
+  w.u32(1); // xid
+  w.u32(1); // REPLY, not CALL
+  let body = w.into_bytes();
+  assert!(matches!(parse_call(&body), Err(RpcError::NotACall)));
+  assert!(
+    parse_call(&[0u8; 3]).is_err(),
+    "a short body is refused, not a panic"
+  );
+}
+
+/// A successful reply builds to the exact bytes the kernel expects (a golden vector).
+#[test]
+fn rpc_success_reply_is_a_golden_vector() {
+  let results = 7u32.to_be_bytes();
+  let reply = reply_bytes(0xaabb_ccdd, AcceptStatus::Success, &results);
+  let expected: Vec<u8> = [
+    &0xaabb_ccddu32.to_be_bytes()[..], // xid
+    &1u32.to_be_bytes(),               // MSG_REPLY
+    &0u32.to_be_bytes(),               // MSG_ACCEPTED
+    &0u32.to_be_bytes(),               // verf flavor AUTH_NONE
+    &0u32.to_be_bytes(),               // verf body length 0
+    &0u32.to_be_bytes(),               // accept_stat SUCCESS
+    &results,                          // the procedure results
+  ]
+  .concat();
+  assert_eq!(reply, expected);
+}
+
+/// A program-mismatch reply carries the supported version range and no results.
+#[test]
+fn rpc_prog_mismatch_reply_carries_the_range() {
+  let reply = reply_bytes(
+    1,
+    AcceptStatus::ProgMismatch { low: 3, high: 3 },
+    &[9, 9, 9, 9],
+  );
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), 1); // xid
+  assert_eq!(r.u32().unwrap(), 1); // MSG_REPLY
+  assert_eq!(r.u32().unwrap(), 0); // MSG_ACCEPTED
+  assert_eq!(r.u32().unwrap(), 0); // verf flavor
+  assert_eq!(r.opaque(400).unwrap(), b""); // verf body
+  assert_eq!(r.u32().unwrap(), 2); // accept_stat PROG_MISMATCH
+  assert_eq!(r.u32().unwrap(), 3); // low
+  assert_eq!(r.u32().unwrap(), 3); // high
+  assert_eq!(r.remaining(), 0, "no results on a mismatch");
+}
+
+/// Every accept status, a mismatch with any version range.
+#[allow(clippy::disallowed_types)] // proptest's `prop_oneof!` holds its arms in an `Arc` (D-8's test-harness exception).
+fn accept_status() -> impl Strategy<Value = AcceptStatus> {
+  prop_oneof![
+    Just(AcceptStatus::Success),
+    Just(AcceptStatus::ProgUnavail),
+    (any::<u32>(), any::<u32>()).prop_map(|(low, high)| AcceptStatus::ProgMismatch { low, high }),
+    Just(AcceptStatus::ProcUnavail),
+    Just(AcceptStatus::GarbageArgs),
+    Just(AcceptStatus::SystemErr),
+  ]
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(2000), .. ProptestConfig::default() }))]
+
+  /// A reply built as its own record is the reply framed (2026-10-09: the server builds READ replies this way to skip
+  /// two copies of their data). Do: build replies of every accept status with random xids and results, both ways.
+  /// Expect: `reply_record` is byte for byte `write_record(&reply_bytes(..))`.
+  #[test]
+  fn a_reply_built_as_a_record_is_the_reply_framed(
+    xid in any::<u32>(),
+    status in accept_status(),
+    results in prop::collection::vec(any::<u8>(), 0..512),
+  ) {
+    prop_assert_eq!(
+      reply_record(xid, status, &results),
+      write_record(&reply_bytes(xid, status, &results))
+    );
+  }
+
+  /// A successful reply encoded after reserved room is framed in place (2026-10-09: the server frames NFSv4 replies
+  /// this way, never copying a READ's data to frame it). Do: append random results to `success_record_head` and frame
+  /// it with `finish_success_record`. Expect: byte for byte `reply_record(xid, Success, results)`.
+  #[test]
+  fn a_reply_framed_in_place_is_the_reply_framed(
+    xid in any::<u32>(),
+    results in prop::collection::vec(any::<u8>(), 0..512),
+  ) {
+    let mut record = success_record_head();
+    record.extend_from_slice(&results);
+    prop_assert_eq!(
+      finish_success_record(xid, record),
+      reply_record(xid, AcceptStatus::Success, &results)
+    );
+  }
+}

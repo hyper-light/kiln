@@ -1,0 +1,63 @@
+[package]
+name = "slates-client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The Rust client: the rendezvous, one request in flight over the rings with spin-then-park, request ids with exactly-once retries across a daemon restart, and the lifecycle verbs of §4.4 as typed calls (design §4.4, §4.7, §4.9; Phase 2 task 5)."
+
+[features]
+# Forwards blake3's pure-Rust backend (no C build script) so a downstream crate can cross-lint for a
+# Windows target from a host that has no MSVC assembler. Off by default; production uses the SIMD C
+# path. See `crates/machine`'s `pure-hash`.
+pure-hash = ["slates-machine/pure-hash"]
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-ipc = { workspace = true }
+slates-wire = { workspace = true }
+# The same-kernel direct map (§4.6, A-171, A-173, A-175) maps the daemon's copy of a file read-only and loads it
+# through atomics on every platform: slates-mem's `PeerView` holds the map, so the racy-memory rule and its unsafe stay
+# in that one crate.
+slates-mem = { workspace = true }
+
+[dev-dependencies]
+slates-server = { workspace = true }
+# The edit-and-submit oracle's generated histories (A-225), persisted through the reviewed-seed wrapper.
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
+slates-anchor = { workspace = true }
+# Test-only: the async-core test polls the completion fd for readiness (the fd an event loop would
+# poll), which needs `poll(2)`; rustix is the crate's syscall wrapper, a normal dep of `slates-ipc`.
+rustix = { workspace = true }
+# The canonical scheduling attribution (`crates/vfs/examples/vfs_bench.rs`): `getrusage`'s involuntary
+# context-switch count tells a step the scheduler preempted from one our own code held.
+libc = { workspace = true }
+slates-mem = { workspace = true }
+slates-db = { workspace = true }
+# The image tests read a built image back and write a guest's edits into it (A-160), sized by the store's chunk.
+slates-image = { workspace = true }
+slates-vfs = { workspace = true }
+# The Shards stream test speaks FUSE through the end it is handed (A-161), with the codec's ABI constants.
+slates-bridge-fuse = { workspace = true }
+
+# The Windows hostile test (A-175) uses the handle a direct map duplicated into it as a hostile peer would:
+# `DuplicateHandle`, `MapViewOfFile`, `VirtualProtect`.
+[target.'cfg(target_os = "linux")'.dependencies]
+# The rendezvous seal (§4.7, A-187): every Linux rendezvous's messages cross under it, and `slates-ipc` takes it from
+# its caller since it builds where aws-lc-rs cannot.
+slates-seal = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true }
+
+# The many-client load test's pacing (its exponential pauses) and its account of the clients' time are unit-tested in
+# the example itself, so `cargo test -p slates-client` runs them.
+[[example]]
+name = "load_bench"
+test = true
+
+[lints]
+workspace = true

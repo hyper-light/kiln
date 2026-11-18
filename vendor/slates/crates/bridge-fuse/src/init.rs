@@ -1,0 +1,236 @@
+//! `FUSE_INIT` negotiation (§4.6 "Cache posture"). The kernel sends its ABI version and the
+//! flags it supports; the daemon replies with its version and the intersection of what it wants
+//! and what the kernel offers, plus the sizes it will use. The negotiation is pure: it takes
+//! the kernel's numbers and returns the reply's, so it is unit-tested without a mount.
+
+use crate::abi::{FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, Opcode, flags};
+use crate::error::FuseError;
+use crate::wire::{Reader, Writer};
+use slates_bridge_core::{CacheCoherence, DaxOffer};
+
+/// The maximum write the daemon accepts in one request; public because it is the anchor of the
+/// virtio-fs device's readable-bytes cap (`slates-bridge-virtiofs`): the largest request a guest
+/// kernel can send is a full write, so the two must be the same number.
+/// Shape: one arena chunk (256 KiB at a 4 KiB page, the FUSE big-write convention and the ramp's
+/// ceiling); the kernel is told this at INIT and never sends a larger write.
+pub const MAX_WRITE: u32 = 256 * 1024;
+/// The read-ahead ceiling the daemon offers.
+///
+/// It is a **ceiling, not a request**: the reply carries `min(kernel's max_readahead, this)`, and the kernel
+/// then sets the mount's window to `min(its own default, what we sent)`. Raising this number therefore buys
+/// nothing — measured 2026-10-19, with 256 KiB offered here the mount's `read_ahead_kb` was still **128** and
+/// every READ request was 128 KiB whatever the caller's buffer. The 128 kB default lives in
+/// `/sys/class/bdi/<maj:min>/read_ahead_kb`, which is root-owned, so lifting it is a host's doing and not the
+/// daemon's (R10). Do not reach for this constant to make reads larger; it cannot.
+///
+/// Shape: one arena chunk, the same ceiling as [`MAX_WRITE`].
+const MAX_READAHEAD: u32 = 256 * 1024;
+/// Format: the kernel's own ceiling on `max_pages` (`FUSE_MAX_MAX_PAGES`, `fs/fuse/fuse_i.h`); it clamps
+/// anything larger, so asking past it would be asking for a number the kernel will not use.
+const KERNEL_MAX_PAGES: u32 = 256;
+/// Shape: the page size assumed only when the host cannot be asked for its own — the smallest page any
+/// platform slates builds for uses, so a failed query yields more and smaller requests rather than a request
+/// larger than a page count the kernel would accept. `page_size()` returning something past `u32` is the only
+/// way to reach it, which no supported host does.
+const ASSUMED_PAGE_BYTES: u32 = 4096;
+
+/// Derived: how many pages the largest write slates accepts occupies on *this* kernel's page size —
+/// `MAX_WRITE / page_size`, bounded by the kernel's own [`KERNEL_MAX_PAGES`]. Sent as `max_pages` when the
+/// kernel offers `FUSE_MAX_PAGES`.
+///
+/// Without it the kernel splits every request at its default of 32 pages whatever `max_write` says, so the
+/// 256 KiB slates advertises is unreachable and a 1 MiB write costs eight round trips rather than four. The
+/// page size is read at run time rather than assumed: a 4 KiB-page host wants 64 here and a 16 KiB-page
+/// arm64 host wants 16, and hard-coding either would silently halve or quadruple the request size on the
+/// other.
+pub fn max_pages() -> u16 {
+  let page = host_page_bytes().max(1);
+  let pages = MAX_WRITE.div_ceil(page).clamp(1, KERNEL_MAX_PAGES);
+  u16::try_from(pages).unwrap_or(u16::MAX)
+}
+
+/// The page size this host serves requests on.
+#[cfg(unix)]
+fn host_page_bytes() -> u32 {
+  u32::try_from(rustix::param::page_size()).unwrap_or(ASSUMED_PAGE_BYTES)
+}
+
+/// The paired arm for a platform with no `/dev/fuse`, so no kernel is ever told this number — it exists
+/// because this codec is built and its golden vectors checked on every platform, and `rustix`'s `param`
+/// module is Unix-only (the Windows cross-lint was the first compiler to see that: 2026-10-19).
+#[cfg(not(unix))]
+fn host_page_bytes() -> u32 {
+  ASSUMED_PAGE_BYTES
+}
+/// Shape: the time granularity the daemon reports: one nanosecond (times are monotonic ns).
+const TIME_GRAN_NS: u32 = 1;
+
+/// What the daemon decided at `FUSE_INIT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitNegotiation {
+  /// The major version (always `FUSE_KERNEL_VERSION`; a lower kernel major is refused).
+  pub major: u32,
+  /// The minor version: the lesser of the kernel's and slates'.
+  pub minor: u32,
+  /// The minor version the kernel offered, before it was lowered to slates' own: what the kernel can be sent outside
+  /// the agreed version's messages. A kernel answers a notification by its own version, not the agreed one (it took
+  /// `FUSE_NOTIFY_RESEND`, 7.40, on connections agreed at 7.31 since A-61), so this is what says whether it knows a
+  /// newer one, such as `FUSE_NOTIFY_INC_EPOCH` (7.44; [`crate::session::Session::kernel_bumps_epoch`]).
+  pub kernel_minor: u32,
+  /// The flags the connection keeps (the intersection of wanted and offered).
+  pub flags: u64,
+  /// The maximum write per request.
+  pub max_write: u32,
+  /// The pages one request may carry ([`max_pages`]); zero when the kernel did not offer `FUSE_MAX_PAGES`,
+  /// in which case it splits at its own default and the field is ignored.
+  pub max_pages: u16,
+  /// The read-ahead suggested.
+  pub max_readahead: u32,
+  /// Whether the kernel's major is one slates cannot speak (the caller replies with its own
+  /// version so the kernel can retry, per the ABI).
+  pub version_mismatch: bool,
+  /// Whether the kernel offered [`flags::HAS_RESEND`]: it can resend the requests a daemon read but never
+  /// answered, which a restarted daemon serving a held device asks for (§4.6 "restore from the anchor's held
+  /// fd"). Advertised by the kernel only, so it is kept apart from the flags the reply echoes.
+  pub kernel_resends: bool,
+  /// The reply's `map_alignment`: log2 of the host's page, which a DAX mapping's offsets keep, where the connection
+  /// kept [`flags::MAP_ALIGNMENT`]; zero otherwise.
+  pub map_alignment: u16,
+}
+
+/// The flags slates asks for (the connection keeps whatever the kernel also offers). Each is a
+/// capability slates implements completely: readdirplus has its handler, explicit data invalidation
+/// and expire-only entries their notifications. `INIT_EXT` is echoed so the kernel reads the reply's
+/// second word at all (`process_init_reply` takes `flags2` only from a reply whose `flags` carry
+/// `FUSE_INIT_EXT`); without it no second-word capability reaches the kernel however the intersection
+/// came out. **Writeback cache is never asked for** (§4.6 "Cache posture": a transport that cannot
+/// implement the requested coherence refuses that guarantee): under `FUSE_WRITEBACK_CACHE` the kernel
+/// owns a regular file's size, mtime and ctime (`fs/fuse/dir.c` `fuse_get_cache_mask`) and neither
+/// re-fetches them nor takes the daemon's, so a change made through another attachment — the SDK, a
+/// second mount, an outsider beneath a base — stays invisible to `stat` even after an accepted
+/// `FUSE_NOTIFY_INVAL_INODE`; measured on Linux 6.12 (2026-09-19,
+/// `docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`). Write-through
+/// also keeps a `write`'s bytes in the daemon before the call returns (D-18).
+/// What a transport that delivers no invalidation asks for instead (AUD-29-79): no explicit invalidation and
+/// no expire-only entries (it sends neither), and `AUTO_INVAL_DATA`, so cached pages are dropped when a
+/// revalidation shows a change.
+fn wanted(coherence: CacheCoherence) -> u64 {
+  let common = flags::PARALLEL_DIROPS
+    | flags::DO_READDIRPLUS
+    | flags::READDIRPLUS_AUTO
+    | flags::BIG_WRITES
+    | flags::MAX_PAGES
+    | flags::DONT_MASK
+    | flags::INIT_EXT;
+  match coherence {
+    CacheCoherence::Invalidated => common | flags::EXPLICIT_INVAL_DATA | flags::HAS_EXPIRE_ONLY,
+    CacheCoherence::Revalidated => common | flags::AUTO_INVAL_DATA,
+  }
+}
+
+/// Negotiates from a `fuse_init_in` body (major, minor, max_readahead, flags, then flags2 and
+/// padding when the kernel set `INIT_EXT`). A body shorter than the fixed part is refused. No DAX is offered.
+pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiation, FuseError> {
+  negotiate_offering(body, coherence, DaxOffer::Withheld)
+}
+
+/// The DAX flags a transport offering per-inode DAX asks for ([`DaxOffer::PerInode`]): the alignment its mappings keep
+/// and the per-file choice; none where it offers none.
+fn dax_wanted(dax: DaxOffer) -> u64 {
+  match dax {
+    DaxOffer::Withheld => 0,
+    DaxOffer::PerInode { .. } => flags::MAP_ALIGNMENT | flags::HAS_INODE_DAX,
+  }
+}
+
+/// [`negotiate`], keeping the kernel's DAX flags where the transport offers per-inode DAX as `dax` says (the Shards
+/// route, part 3): `FUSE_HAS_INODE_DAX`, and `FUSE_MAP_ALIGNMENT` with the host's page as the alignment.
+pub fn negotiate_offering(
+  body: &[u8],
+  coherence: CacheCoherence,
+  dax: DaxOffer,
+) -> Result<InitNegotiation, FuseError> {
+  let opcode = Opcode::Init.to_wire();
+  let mut r = Reader::new(body);
+  let major = r.u32(opcode)?;
+  let minor = r.u32(opcode)?;
+  let kernel_readahead = r.u32(opcode)?;
+  let mut kernel_flags = u64::from(r.u32(opcode)?);
+  // The kernel's second flags word, `flags2`, follows `flags` directly when the kernel set
+  // INIT_EXT and the body carries it (7.36+; `struct fuse_init_in { major, minor, max_readahead,
+  // flags, flags2, unused[11] }`); slates reads it only to intersect, never requires it. Until
+  // 2026-09-14 the codec skipped a word it took for reserved padding and read `unused[0]` — always
+  // zero — so no second-word capability could ever be negotiated; the independent header vector
+  // (`tests/abi.rs`) found it.
+  // Format: the high half of the flags word is `flags2`.
+  const HIGH_HALF_SHIFT: u32 = 32;
+  if kernel_flags & flags::INIT_EXT != 0 && r.remaining() >= size_of::<u32>() {
+    kernel_flags |= u64::from(r.u32(opcode)?) << HIGH_HALF_SHIFT;
+  }
+  if major < FUSE_KERNEL_VERSION {
+    return Ok(InitNegotiation {
+      major: FUSE_KERNEL_VERSION,
+      minor: FUSE_KERNEL_MINOR_VERSION,
+      // A minor of an older major names none of this major's messages.
+      kernel_minor: 0,
+      flags: 0,
+      max_write: MAX_WRITE,
+      max_pages: 0,
+      max_readahead: MAX_READAHEAD,
+      version_mismatch: true,
+      kernel_resends: false,
+      map_alignment: 0,
+    });
+  }
+  let kept = (wanted(coherence) | dax_wanted(dax)) & kernel_flags;
+  Ok(InitNegotiation {
+    major: FUSE_KERNEL_VERSION,
+    minor: minor.min(FUSE_KERNEL_MINOR_VERSION),
+    kernel_minor: minor,
+    flags: kept,
+    max_write: MAX_WRITE,
+    // Only meaningful when the intersection kept the flag: a kernel that did not offer it ignores the field.
+    max_pages: if wanted(coherence) & kernel_flags & flags::MAX_PAGES != 0 {
+      max_pages()
+    } else {
+      0
+    },
+    max_readahead: kernel_readahead.min(MAX_READAHEAD),
+    version_mismatch: false,
+    kernel_resends: kernel_flags & flags::HAS_RESEND != 0,
+    map_alignment: if kept & flags::MAP_ALIGNMENT != 0 {
+      u16::try_from(host_page_bytes().max(1).trailing_zeros()).unwrap_or(0)
+    } else {
+      0
+    },
+  })
+}
+
+impl InitNegotiation {
+  /// Writes the `fuse_init_out` reply body in field order: major, minor, max_readahead,
+  /// flags, max_background, congestion_threshold, max_write, time_gran, max_pages,
+  /// map_alignment, flags2, then reserved words (left zero).
+  pub fn to_bytes(&self) -> Vec<u8> {
+    /// Shape: the reserved trailer of `fuse_init_out` slates leaves zero (seven 32-bit words).
+    const RESERVED_WORDS: usize = 7 * 4;
+    let mut w = Writer::new();
+    w.u32(self.major);
+    w.u32(self.minor);
+    w.u32(self.max_readahead);
+    // Format: the flags word splits into a low and a high 32-bit half (flags and flags2).
+    const HIGH_HALF_SHIFT: u32 = 32;
+    let low = u32::try_from(self.flags & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    let high = u32::try_from(self.flags >> HIGH_HALF_SHIFT).unwrap_or(u32::MAX);
+    w.u32(low);
+    w.u32(0); // max_background + congestion_threshold (two u16, both zero: kernel defaults)
+    w.u32(self.max_write);
+    w.u32(TIME_GRAN_NS);
+    // max_pages (low u16) + map_alignment (high u16: log2 of the alignment a DAX mapping keeps, zero without DAX).
+    // Format: the shift that puts `map_alignment` in the word's high half.
+    const HIGH_U16_SHIFT: u32 = 16;
+    w.u32(u32::from(self.max_pages) | (u32::from(self.map_alignment) << HIGH_U16_SHIFT));
+    w.u32(high); // flags2
+    w.pad(RESERVED_WORDS);
+    w.into_bytes()
+  }
+}

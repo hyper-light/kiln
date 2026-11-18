@@ -1,0 +1,94 @@
+[package]
+name = "slates-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The daemon: shards over the runtime, the control shard's rendezvous, the lifecycle verbs of §4.4 with completion records, leases, attachments and quotas, recovery through the anchor segment (design §2.5, §2.6, §4.4, §4.7, §4.8, §4.13; Phase 2 task 4)."
+
+[dependencies]
+# A grant's SSH signature (R10, D-22; `crate::grant_signature`): Ed25519 and SHA-2 from AWS-LC, the one crypto library
+# (A-66), which rustls already links here on every platform.
+aws-lc-rs = { workspace = true }
+# The membership plane's exporter label and key types (A-67 H-2).
+hyper-datagram = { workspace = true }
+# Sealing at rest (A-92): the node root, tenant and lineage keys in locked memory.
+hyper-seal = { workspace = true }
+slates-machine = { workspace = true }
+slates-mem = { workspace = true }
+slates-rt = { workspace = true }
+slates-wire = { workspace = true }
+slates-vfs = { workspace = true }
+# A volume's disk-image form (§4.6, A-160): the build and merge verbs plan and read ext2 images.
+slates-image = { workspace = true }
+slates-base = { workspace = true }
+slates-anchor = { workspace = true }
+slates-db = { workspace = true }
+slates-cluster = { workspace = true }
+slates-archive = { workspace = true }
+slates-transport = { workspace = true }
+slates-ipc = { workspace = true }
+slates-land = { workspace = true }
+slates-merge = { workspace = true }
+slates-bridge-core = { workspace = true }
+blake3 = { workspace = true }
+rustls = { workspace = true }
+
+# The FUSE codec: the Linux FUSE transport the daemon serves (`crate::fuse`; §4.6 "Linux", AUD-29-64), and the
+# Shards fs transport (`crate::shards`; §4.6, A-161), which carries FUSE requests over a stream from a Linux, a macOS
+# or a Windows host (A-179).
+slates-bridge-fuse = { workspace = true }
+# The NFS server (`crate::nfs`): the macOS mount's loopback transport, and on every platform the network export, over
+# the runtime's TCP (A-182).
+slates-bridge-nfs = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+# The virtio-fs guest device (§4.6 A-9): its loop rides the runtime's Unix descriptor readiness, and a
+# Linux guest is hosted from a Linux or macOS host, so the daemon's guest transport (`crate::virtiofs`)
+# is Unix-only too.
+slates-bridge-virtiofs = { workspace = true }
+# The OCI attachment form (§4.6 A-9): a bind of the host mount (NFS loopback on macOS, FUSE on Linux)
+# verified against the kernel's mount table; there is no host mount on Windows to bind.
+slates-bridge-oci = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The rendezvous seal (§4.7, A-187): every Linux rendezvous's messages cross under it, and `slates-ipc` takes it from
+# its caller since it builds where aws-lc-rs cannot.
+slates-seal = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+# The WinFsp mount host (§4.6 "Windows"; `crate::winfsp`): the daemon serves a volume at a drive letter.
+slates-bridge-winfsp = { workspace = true }
+
+[dev-dependencies]
+# self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).
+rcgen = { workspace = true }
+# The guest-device test builds the FUSE requests a guest kernel would (the codec's ABI constants).
+slates-bridge-fuse = { workspace = true }
+# The typed client, for the recovery oracle (§4.8 A-9, AC-2.12): it drives the same verbs a session
+# drives across a daemon restart (create, snapshot, clone, status, the exactly-once retry). Its lib
+# depends only on machine/ipc/wire, so this is not a cycle.
+slates-client = { workspace = true }
+# The live guest's workloads (AC-9.7): the conformance roster's scripts and its run comparison, so the guest is
+# judged by exactly the rules the host and container legs are. Its lib depends only on serde/blake3.
+slates-conformance = { workspace = true }
+# The work-charge model test (generated edit histories against a recount, `src/work_charge.rs`).
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
+
+# The crash-dump test (`tests/dump_exclusion.rs`, A-239): the crashing child reads and clears the error mode it inherited
+# (`GetErrorMode`, `SetErrorMode`), since a mode with `SEM_NOGPFAULTERRORBOX` keeps Windows Error Reporting from its crash.
+[target.'cfg(unix)'.dev-dependencies]
+# The starved shard of `tests/liveness.rs` (A-228): `sched_setscheduler` and `sched_getcpu` on Linux, the QoS class on
+# macOS, which rustix does not have.
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug"] }
+
+[lints]
+workspace = true

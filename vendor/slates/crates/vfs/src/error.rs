@@ -1,0 +1,193 @@
+//! The closed refusal taxonomy of the volume core: the POSIX errnos a bridge maps one to one, and
+//! the volume-level refusals of §4.4. An uncategorized refusal is a bug.
+
+use std::fmt;
+
+/// A typed refusal from the volume core; never a panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VfsError {
+  /// `ENOENT`.
+  NotFound,
+  /// `EEXIST` (including a name that folds equal under the volume's policy).
+  AlreadyExists,
+  /// `ENOTDIR`.
+  NotDirectory,
+  /// `EISDIR`.
+  IsDirectory,
+  /// `ENOTEMPTY`.
+  NotEmpty,
+  /// `EINVAL` (a rename into its own subtree, an invalid argument).
+  Invalid,
+  /// The extended attribute is not set: `ENOATTR` on macOS and the BSDs, `ENODATA` on Linux (the
+  /// same condition under each host's name; a bridge maps it to its host's code).
+  NoAttribute,
+  /// `EPERM` (a hard link to a directory).
+  NotPermitted,
+  /// `EROFS`: the file system is read-only to this caller, an attachment that may read but not write, or a snapshot's
+  /// view. Refused at the first change it asks for, an open for writing included, as POSIX's read-only file system is.
+  ReadOnly,
+  /// `EACCES`: a symlink whose target leaves the volume, followed by a caller who does not own it (A-107, Linux's
+  /// `protected_symlinks` rule applied at the volume's edge).
+  LinkProtected,
+  /// `EOPNOTSUPP`: regular-file I/O or host landing on a FIFO/socket name (A-26).
+  SpecialFileOperation,
+  /// `EINVAL`: a name that is not a path component (empty, `.`, `..`, or holding a separator or NUL).
+  InvalidName,
+  /// `ENAMETOOLONG`: a component longer than `NAME_MAX` bytes, refused by every call that takes a name,
+  /// lookups included (POSIX.1-2017 §2.3). Before 2026-10-01 it was folded into `InvalidName`, which the FUSE
+  /// bridge answered `EINVAL`, and a lookup never judged the length (`ENOENT`).
+  NameTooLong,
+  /// `EMLINK`.
+  TooManyLinks,
+  /// `ENOSPC`: the quota, or the pressure source, refused the bytes; nothing changed.
+  NoSpace,
+  /// `EFBIG`: an offset or length beyond what the volume addresses.
+  FileTooLarge,
+  /// `EXDEV`: a move across volumes.
+  CrossVolumeMove,
+  /// A handle or number that no longer names anything (a freed inode, a destroyed snapshot).
+  StaleHandle,
+  /// The volume is being destroyed.
+  Destroying,
+  /// The snapshot is pinned by a live clone; destroy the clone (and unpin) first.
+  Pinned,
+  /// A guest maps the file in a way the change cannot keep its map equal to, so the change is refused until the
+  /// mapping ends (Shards part 3, step 4): a guest's writable map over the file's backing holds stores not yet written
+  /// back, which a `rewitness` would have to discard.
+  DaxMapped,
+  /// The base beneath an overlay entry cannot be served: the host's errno.
+  BaseUnavailable(i32),
+  /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
+  /// than return torn bytes; `status` lists the drift.
+  BaseDrift,
+  /// A base-plane verb on a scratch volume, or a path the base does not hold.
+  NotOverlay,
+  /// No clean digest exists for the entry (§4.15): it is not an untouched regular base file — the
+  /// volume created it, copied it up (a write, truncate, chmod, link or rename), pinned it or lost
+  /// it to drift, or it is a symlink — so a digest would name bytes that are not the disk's. Read
+  /// and hash the bytes instead.
+  DigestNotClean,
+  /// The file changed on the disk while it was being digested (§4.15 "verified current"): nothing
+  /// stale is exported; retry.
+  DigestUnverified,
+  /// The shard's digest cache is at its derived bound (§4.15 "bounded cache discovery", §4.2): a
+  /// fresh digest is exported but not kept. Raised by the cache's admission only, counted by the
+  /// plane, never surfaced by `digest` itself.
+  DigestCacheFull,
+  /// A resource a recovery needs is missing or unreadable: a truncated or corrupt volume image,
+  /// or a body this recovery slice does not yet capture (a base-backed entry). §4.8 (A-9)
+  /// requires this over an empty success — a partial recovery must refuse, never silently
+  /// present a smaller volume than was acknowledged.
+  RecoveryIncomplete,
+  /// The volume is archived.
+  Archived,
+  /// The name-equivalence policy of the two volumes differs (clone into a policy is refused).
+  PolicyMismatch,
+  /// The tree nests deeper than an archive carries (`slates_archive::manifest::MAX_DEPTH` path
+  /// components): refused at the export, never emitted for every reader to refuse. The bound is a resource
+  /// bound — a restore keys each entry by its whole path, so a chain `d` deep costs `O(d²)` path bytes.
+  TreeTooDeep {
+    /// The most components an archived path may have.
+    limit: usize,
+  },
+  /// A memory refusal beneath the volume (arena exhausted, slab full).
+  Memory(slates_mem::MemError),
+  /// The arena is out of room while freed blocks wait for the shard's next recovery publication, which the
+  /// committed image may still name (A-64). Nothing changed; the operation succeeds once a publication commits.
+  /// The shard publishes before work whenever its free arena is below the operation headroom with blocks
+  /// deferred, so only one operation larger than the headroom can meet this.
+  PublishNeeded,
+  /// The file is delegated to an NFSv4 client (RFC 8881 §10.4; A-79): nothing changed, its recall was asked for, and
+  /// the change succeeds once the delegation is returned or revoked (the caller retries: `NFS3ERR_JUKEBOX`,
+  /// `NFS4ERR_DELAY`, `EAGAIN`).
+  Delegated,
+  /// A sealed chunk's segment did not open (A-99): its bytes or its tag changed in RAM, or the key it names is gone.
+  /// Nothing is returned for it, never bytes that did not authenticate.
+  Integrity,
+  /// A snapshot, submit or detach barrier could not close an attachment's generation: a request
+  /// admitted into it is still in flight — a consumer lost mid-request, until its explicit
+  /// failed-consumer cleanup (§4.4 A-9 `BarrierIncomplete{attachment, generation}`; §4.6 "A
+  /// failed participant gives a typed incomplete barrier, not a clean snapshot").
+  BarrierIncomplete {
+    /// The attachment's process-local key (`AttachmentId::key`).
+    attachment: u64,
+    /// The generation that could not close.
+    generation: u64,
+  },
+  /// The journal no longer holds every record since the point a reader asked from (§4.16): retention dropped the
+  /// oldest of them, so what they recorded is unknown. An ops document derived from what is left would describe part of
+  /// the work as all of it, so the derivation refuses instead.
+  JournalIncomplete {
+    /// The first sequence the reader needed: the one after its snapshot's.
+    needed: u64,
+    /// The oldest sequence the journal still holds.
+    oldest: u64,
+  },
+}
+
+impl VfsError {
+  /// The refusal a verb returns after undoing what it started (`undo`): its own, unless the undo was refused too; then
+  /// the undo's, which names the worse state (something the verb made could not be taken back, so the store holds
+  /// it). An undo's refusal was dropped at every rollback site before 2026-10-07; `xattr`'s `abandon_attribute` was
+  /// the one that kept it, and this is its rule, once.
+  pub(crate) fn after_undo<T, E: Into<VfsError>>(self, undo: Result<T, E>) -> VfsError {
+    match undo {
+      Ok(_) => self,
+      Err(refusal) => refusal.into(),
+    }
+  }
+
+  /// The POSIX errno name, for bridges and the differential harness.
+  pub const fn errno_name(&self) -> &'static str {
+    match self {
+      Self::NotFound => "ENOENT",
+      Self::AlreadyExists => "EEXIST",
+      Self::NotDirectory => "ENOTDIR",
+      Self::IsDirectory => "EISDIR",
+      Self::NotEmpty => "ENOTEMPTY",
+      Self::Invalid => "EINVAL",
+      Self::NoAttribute => "ENOATTR",
+      Self::NotPermitted => "EPERM",
+      Self::ReadOnly => "EROFS",
+      Self::LinkProtected => "EACCES",
+      Self::SpecialFileOperation => "EOPNOTSUPP",
+      Self::InvalidName => "EINVAL",
+      Self::NameTooLong | Self::TreeTooDeep { .. } => "ENAMETOOLONG",
+      Self::TooManyLinks => "EMLINK",
+      Self::NoSpace => "ENOSPC",
+      Self::FileTooLarge => "EFBIG",
+      Self::CrossVolumeMove => "EXDEV",
+      Self::StaleHandle => "ESTALE",
+      Self::Destroying | Self::Archived | Self::Pinned | Self::DaxMapped => "EBUSY",
+      Self::BaseUnavailable(_)
+      | Self::BaseDrift
+      | Self::RecoveryIncomplete
+      | Self::Integrity
+      | Self::JournalIncomplete { .. } => "EIO",
+      Self::NotOverlay => "ENODEV",
+      Self::DigestNotClean => "ENODATA",
+      Self::DigestUnverified | Self::PublishNeeded | Self::Delegated => "EAGAIN",
+      Self::DigestCacheFull => "ENOSPC",
+      Self::PolicyMismatch => "EINVAL",
+      Self::Memory(_) => "ENOMEM",
+      Self::BarrierIncomplete { .. } => "EBUSY",
+    }
+  }
+}
+
+impl fmt::Display for VfsError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Memory(e) => write!(f, "{} ({e})", self.errno_name()),
+      other => f.write_str(other.errno_name()),
+    }
+  }
+}
+
+impl std::error::Error for VfsError {}
+
+impl From<slates_mem::MemError> for VfsError {
+  fn from(e: slates_mem::MemError) -> Self {
+    Self::Memory(e)
+  }
+}

@@ -1,0 +1,27 @@
+[package]
+name = "slates-mcp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The MCP surface (§4.12, Phase 6 task 8): the JSON-RPC tools a coding agent drives — the merge tools over the client SDK, no grant verb (R10)."
+
+[dependencies]
+slates-client = { workspace = true }
+slates-ipc = { workspace = true }
+# The loopback HTTP edge runs on a slates shard (AUD-29-23): its accept loop and connections are tasks.
+slates-rt = { workspace = true }
+serde_json = { workspace = true }
+# SHA-256 of each skill file for the Skills extension's manifest digests (SEP-2640), from the one crypto library.
+aws-lc-rs = { workspace = true }
+
+[dev-dependencies]
+slates-server = { workspace = true }
+# The recovery budget the test clients derive their deadlines from, as the command does.
+slates-db = { workspace = true }
+slates-machine = { workspace = true }
+
+[lints]
+workspace = true

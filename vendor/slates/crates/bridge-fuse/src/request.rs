@@ -1,0 +1,591 @@
+//! Parsing the kernel's requests (§4.6, §4.9's hostile-input rule). Every request is the fixed
+//! `fuse_in_header` (40 bytes) then an opcode-specific body; the header's `len` bounds the
+//! whole message. Fields are read in order through the bounds-checked [`crate::wire::Reader`],
+//! so a truncated or oversized message is a typed refusal, never a panic or an out-of-bounds
+//! read; no byte offset appears as a literal.
+
+use crate::abi::{IN_HEADER_LEN, Opcode};
+use crate::error::FuseError;
+use crate::wire::Reader;
+
+/// The fixed FUSE request header (`struct fuse_in_header`): len, opcode, unique, nodeid, uid,
+/// gid, pid, then a padding word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InHeader {
+  /// The whole message's length, header included.
+  pub len: u32,
+  /// The opcode's wire value.
+  pub opcode: u32,
+  /// The request's unique id; the reply echoes it.
+  pub unique: u64,
+  /// The inode the request is about (the FUSE node id).
+  pub nodeid: u64,
+  /// The caller's user id.
+  pub uid: u32,
+  /// The caller's group id.
+  pub gid: u32,
+  /// The caller's process id.
+  pub pid: u32,
+}
+
+impl InHeader {
+  /// Parses the header from the front of a message; refuses a message shorter than the header
+  /// or whose `len` is smaller than the header or larger than the buffer.
+  pub fn parse(message: &[u8]) -> Result<InHeader, FuseError> {
+    if message.len() < IN_HEADER_LEN {
+      return Err(FuseError::ShortHeader {
+        have: message.len(),
+        need: IN_HEADER_LEN,
+      });
+    }
+    let mut r = Reader::new(message);
+    // The header can never be short here (checked above), so the opcode passed to the reader
+    // for its refusals is only cosmetic; use zero.
+    let len = r.u32(0)?;
+    let opcode = r.u32(0)?;
+    let unique = r.u64(0)?;
+    let nodeid = r.u64(0)?;
+    let uid = r.u32(0)?;
+    let gid = r.u32(0)?;
+    let pid = r.u32(0)?;
+    let claimed = usize::try_from(len).unwrap_or(usize::MAX);
+    if claimed < IN_HEADER_LEN || claimed > message.len() {
+      return Err(FuseError::BadLength {
+        claimed: len,
+        have: message.len(),
+      });
+    }
+    Ok(InHeader {
+      len,
+      opcode,
+      unique,
+      nodeid,
+      uid,
+      gid,
+      pid,
+    })
+  }
+}
+
+/// A parsed request: the header, the opcode (when slates serves it), and the body bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct Request<'a> {
+  /// The header.
+  pub header: InHeader,
+  /// The opcode, or `None` when slates does not serve it (reply `ENOSYS`).
+  pub opcode: Option<Opcode>,
+  /// The opcode-specific body.
+  pub body: &'a [u8],
+}
+
+impl<'a> Request<'a> {
+  /// Parses a whole message; the body is the bytes between the header and the header's `len`,
+  /// so trailing bytes in an over-read buffer are ignored.
+  pub fn parse(message: &'a [u8]) -> Result<Request<'a>, FuseError> {
+    let header = InHeader::parse(message)?;
+    let end = usize::try_from(header.len).unwrap_or(message.len());
+    // `InHeader::parse` refused a `len` below the header or past the buffer, so this always holds.
+    let body = message
+      .get(IN_HEADER_LEN..end)
+      .ok_or(FuseError::BadLength {
+        claimed: header.len,
+        have: message.len(),
+      })?;
+    Ok(Request {
+      header,
+      opcode: Opcode::from_wire(header.opcode),
+      body,
+    })
+  }
+}
+
+/// A `LOOKUP`, `UNLINK`, `RMDIR` body: a single NUL-terminated name.
+pub fn parse_name(body: &[u8]) -> Result<&str, FuseError> {
+  let end = body
+    .iter()
+    .position(|b| *b == 0)
+    .ok_or(FuseError::UnterminatedName)?;
+  name_of(body.get(..end).ok_or(FuseError::UnterminatedName)?)
+}
+
+/// A name's bytes as a character string, or the typed refusal of one that is not UTF-8.
+fn name_of(bytes: &[u8]) -> Result<&str, FuseError> {
+  std::str::from_utf8(bytes).map_err(|_| FuseError::NameNotUtf8)
+}
+
+/// A `READ`/`READDIR` body (`struct fuse_read_in`): fh, offset, size, then the read flags, the lock
+/// owner and, from protocol 7.9, the handle's open flags, then padding. The fields slates reads are
+/// fh, offset, size and the open flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadIn {
+  /// The open file handle.
+  pub fh: u64,
+  /// The offset to read from.
+  pub offset: u64,
+  /// The bytes to read.
+  pub size: u32,
+  /// The handle's open flags as the kernel holds them now (`file->f_flags`, so an `fcntl` that set
+  /// `O_DIRECT` shows): whether the read may bypass the kernel's page cache (A-144). `None` for a
+  /// body from before protocol 7.9, which has no such field.
+  pub flags: Option<u32>,
+}
+
+/// Format: the bytes of `fuse_read_in` between `size` and the open flags: the read flags (4) and
+/// the lock owner (8).
+const READ_IN_BEFORE_FLAGS: usize = size_of::<u32>() + size_of::<u64>();
+/// Format: the bytes of `fuse_read_in` from just past `size` through the open flags, which a body
+/// from protocol 7.9 on carries.
+const READ_IN_THROUGH_FLAGS: usize = READ_IN_BEFORE_FLAGS + size_of::<u32>();
+
+impl ReadIn {
+  /// Parses a read body; refuses one too short for its handle, offset and size.
+  pub fn parse(opcode: u32, body: &[u8]) -> Result<ReadIn, FuseError> {
+    let mut r = Reader::new(body);
+    let fh = r.u64(opcode)?;
+    let offset = r.u64(opcode)?;
+    let size = r.u32(opcode)?;
+    let flags = if r.remaining() >= READ_IN_THROUGH_FLAGS {
+      r.skip(READ_IN_BEFORE_FLAGS, opcode)?;
+      Some(r.u32(opcode)?)
+    } else {
+      None
+    };
+    Ok(ReadIn {
+      fh,
+      offset,
+      size,
+      flags,
+    })
+  }
+}
+
+/// The fields of a `SETATTR` body (`struct fuse_setattr_in`): a `valid` bitmask, then every
+/// settable field. The mask says which the kernel set; the edge applies each set field through the
+/// seam and never acknowledges one it ignored (§4.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetAttrIn {
+  /// Which fields the kernel set (the `FATTR_*` bits).
+  pub valid: u32,
+  /// The new size (when `valid` has [`SetAttrIn::FATTR_SIZE`]).
+  pub size: u64,
+  /// The new mode (when `valid` has [`SetAttrIn::FATTR_MODE`]).
+  pub mode: u32,
+  /// The new owner uid (when `valid` has [`SetAttrIn::FATTR_UID`]).
+  pub uid: u32,
+  /// The new owner gid (when `valid` has [`SetAttrIn::FATTR_GID`]).
+  pub gid: u32,
+  /// The new access time in nanoseconds since the Unix epoch (when `valid` has
+  /// [`SetAttrIn::FATTR_ATIME`]).
+  pub atime: i64,
+  /// The new modification time in nanoseconds since the Unix epoch (when `valid` has
+  /// [`SetAttrIn::FATTR_MTIME`]).
+  pub mtime: i64,
+  /// The new change time in nanoseconds since the Unix epoch (when `valid` has
+  /// [`SetAttrIn::FATTR_CTIME`] — a kernel flushing the timestamps it kept under a writeback cache).
+  pub ctime: i64,
+}
+
+impl SetAttrIn {
+  /// Format: `FATTR_MODE`, the `valid` bit for the mode.
+  pub const FATTR_MODE: u32 = 1 << 0;
+  /// Format: `FATTR_UID`, the `valid` bit for the owner uid.
+  pub const FATTR_UID: u32 = 1 << 1;
+  /// Format: `FATTR_GID`, the `valid` bit for the owner gid.
+  pub const FATTR_GID: u32 = 1 << 2;
+  /// Format: `FATTR_SIZE`, the `valid` bit for the size.
+  pub const FATTR_SIZE: u32 = 1 << 3;
+  /// Format: `FATTR_ATIME`, the `valid` bit for the access time.
+  pub const FATTR_ATIME: u32 = 1 << 4;
+  /// Format: `FATTR_MTIME`, the `valid` bit for the modification time.
+  pub const FATTR_MTIME: u32 = 1 << 5;
+  /// Format: `FATTR_FH`, the `valid` bit saying `fh` names the open file the change is through (a
+  /// qualifier, not a field to apply).
+  pub const FATTR_FH: u32 = 1 << 6;
+  /// Format: `FATTR_ATIME_NOW`, the `valid` bit saying the access time is "now" (`UTIME_NOW`): the
+  /// edge resolves it through the volume's own clock, not the value the kernel filled in.
+  pub const FATTR_ATIME_NOW: u32 = 1 << 7;
+  /// Format: `FATTR_MTIME_NOW`, the `valid` bit saying the modification time is "now".
+  pub const FATTR_MTIME_NOW: u32 = 1 << 8;
+  /// Format: `FATTR_LOCKOWNER`, the `valid` bit saying `lock_owner` is set (a qualifier for POSIX
+  /// locks, which slates does not serve; carries no field to apply).
+  pub const FATTR_LOCKOWNER: u32 = 1 << 9;
+  /// Format: `FATTR_CTIME`, the `valid` bit for the change time (`include/uapi/linux/fuse.h`).
+  pub const FATTR_CTIME: u32 = 1 << 10;
+  /// Format: `FATTR_KILL_SUIDGID`, the `valid` bit asking the filesystem to clear the set-user-id
+  /// and set-group-id bits with this change (a truncate by a caller without `CAP_FSETID`; sent by
+  /// kernels that negotiated `FUSE_HANDLE_KILLPRIV_V2`).
+  pub const FATTR_KILL_SUIDGID: u32 = 1 << 11;
+  /// Format: every `valid` bit the edge honours — each is applied, resolved or refused, never
+  /// acknowledged and ignored (§4.6). A mask with a bit outside this set is refused before the seam.
+  pub const FATTR_HONOURED: u32 = Self::FATTR_MODE
+    | Self::FATTR_UID
+    | Self::FATTR_GID
+    | Self::FATTR_SIZE
+    | Self::FATTR_ATIME
+    | Self::FATTR_MTIME
+    | Self::FATTR_FH
+    | Self::FATTR_ATIME_NOW
+    | Self::FATTR_MTIME_NOW
+    | Self::FATTR_LOCKOWNER
+    | Self::FATTR_CTIME
+    | Self::FATTR_KILL_SUIDGID;
+
+  /// Reads the fields from `fuse_setattr_in`, in wire order. The struct is valid (4), padding (4),
+  /// fh (8), size (8), lock_owner (8), atime (8), mtime (8), ctime (8), atimensec (4), mtimensec
+  /// (4), ctimensec (4), mode (4), unused4 (4), uid (4), gid (4), unused5 (4). Times are seconds
+  /// plus a nanosecond part, combined into the volume core's nanosecond form.
+  fn parse_fields(body: &[u8]) -> Option<SetAttrIn> {
+    let mut r = Reader::new(body);
+    let op = Opcode::SetAttr.to_wire();
+    let valid = r.u32(op).ok()?;
+    r.skip(size_of::<u32>().saturating_add(size_of::<u64>()), op)
+      .ok()?; // padding, fh
+    let size = r.u64(op).ok()?;
+    r.skip(size_of::<u64>(), op).ok()?; // lock_owner
+    let atime_sec = r.u64(op).ok()?;
+    let mtime_sec = r.u64(op).ok()?;
+    let ctime_sec = r.u64(op).ok()?;
+    let atime_nsec = r.u32(op).ok()?;
+    let mtime_nsec = r.u32(op).ok()?;
+    let ctime_nsec = r.u32(op).ok()?;
+    let mode = r.u32(op).ok()?;
+    r.skip(size_of::<u32>(), op).ok()?; // unused4
+    let uid = r.u32(op).ok()?;
+    let gid = r.u32(op).ok()?;
+    Some(SetAttrIn {
+      valid,
+      size,
+      mode,
+      uid,
+      gid,
+      atime: combine_time(atime_sec, atime_nsec),
+      mtime: combine_time(mtime_sec, mtime_nsec),
+      ctime: combine_time(ctime_sec, ctime_nsec),
+    })
+  }
+
+  /// Format: `sizeof(struct fuse_setattr_in)` — the whole struct the kernel sends; a shorter body
+  /// is malformed and refused, even where the fields read happen to fit (§4.9's hostile-input
+  /// rule: a parser of external bytes checks the length against the class before use).
+  pub const LEN: usize = 88;
+
+  /// Parses a setattr body; refuses one shorter than the struct.
+  pub fn parse(body: &[u8]) -> Result<SetAttrIn, FuseError> {
+    let short = FuseError::ShortBody {
+      opcode: Opcode::SetAttr.to_wire(),
+      have: body.len(),
+      need: Self::LEN,
+    };
+    if body.len() < Self::LEN {
+      return Err(short);
+    }
+    Self::parse_fields(body).ok_or(short)
+  }
+}
+
+/// Combines a POSIX `(seconds, nanoseconds)` time into nanoseconds since the Unix epoch, the
+/// volume core's form, saturating rather than overflowing on a far-future value.
+fn combine_time(seconds: u64, nanoseconds: u32) -> i64 {
+  /// Format: nanoseconds per second.
+  const NS_PER_SEC: i64 = 1_000_000_000;
+  i64::try_from(seconds)
+    .unwrap_or(i64::MAX)
+    .saturating_mul(NS_PER_SEC)
+    .saturating_add(i64::from(nanoseconds))
+}
+
+/// A `RENAME` body (`struct fuse_rename_in`: newdir (8), then oldname\0 newname\0) or a
+/// `RENAME2` body (newdir (8), flags (4), padding (4), then the names). The parsed target
+/// directory and the two names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenameIn<'a> {
+  /// The destination directory (a FUSE node id).
+  pub newdir: u64,
+  /// The `renameat2` flags (`RENAME2` only; zero for an ordinary rename).
+  pub flags: u32,
+  /// The old name.
+  pub old_name: &'a str,
+  /// The new name.
+  pub new_name: &'a str,
+}
+
+impl RenameIn<'_> {
+  /// Format: `RENAME_NOREPLACE`, fail if the destination exists (`include/uapi/linux/fs.h`).
+  pub const RENAME_NOREPLACE: u32 = 1 << 0;
+  /// Format: `RENAME_EXCHANGE`, atomically exchange the two paths.
+  pub const RENAME_EXCHANGE: u32 = 1 << 1;
+  /// Format: `RENAME_WHITEOUT`, leave a whiteout at the source — an overlayfs-only flag the FUSE
+  /// kernel client never forwards; named so the edge's refusal of it is tested against the header.
+  pub const RENAME_WHITEOUT: u32 = 1 << 2;
+  /// Format: the `renameat2` flags the edge carries to the seam; any other bit is refused
+  /// `EINVAL` before the seam, never dropped (§4.6 "never ... discard a `renameat2` flag").
+  pub const RENAME_CARRIED: u32 = Self::RENAME_NOREPLACE | Self::RENAME_EXCHANGE;
+}
+
+impl<'a> RenameIn<'a> {
+  /// Parses a rename body; `flagged` is true for `RENAME2` (which has the extra flags word).
+  pub fn parse(opcode: u32, body: &'a [u8], flagged: bool) -> Result<RenameIn<'a>, FuseError> {
+    let head = if flagged {
+      size_of::<u64>().saturating_add(size_of::<u32>().saturating_mul(2))
+    } else {
+      size_of::<u64>()
+    };
+    if body.len() < head {
+      return Err(FuseError::ShortBody {
+        opcode,
+        have: body.len(),
+        need: head,
+      });
+    }
+    let newdir = u64::from_le_bytes(
+      body
+        .get(..size_of::<u64>())
+        .and_then(|word| word.try_into().ok())
+        .unwrap_or_default(),
+    );
+    // `fuse_rename2_in` carries the flags word right after `newdir`; an ordinary rename has none.
+    let flags = if flagged {
+      u32::from_le_bytes(
+        body
+          .get(size_of::<u64>()..size_of::<u64>().saturating_add(size_of::<u32>()))
+          .and_then(|word| word.try_into().ok())
+          .unwrap_or_default(),
+      )
+    } else {
+      0
+    };
+    let names = body.get(head..).unwrap_or_default();
+    let old_name = parse_name(names)?;
+    let rest = names
+      .get(old_name.len().saturating_add(1)..)
+      .unwrap_or_default();
+    let new_name = parse_name(rest)?;
+    Ok(RenameIn {
+      newdir,
+      flags,
+      old_name,
+      new_name,
+    })
+  }
+}
+
+/// A `WRITE` body (`struct fuse_write_in` then the data): fh, offset, size, write_flags, then
+/// fields slates does not use, then `size` bytes of data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteIn<'a> {
+  /// The open file handle.
+  pub fh: u64,
+  /// The offset to write at.
+  pub offset: u64,
+  /// The write's flags; [`crate::abi::WRITE_CACHE`] marks the kernel writing a cached page back.
+  pub write_flags: u32,
+  /// The data.
+  pub data: &'a [u8],
+}
+
+impl<'a> WriteIn<'a> {
+  /// Shape: the fields of `fuse_write_in` after `write_flags` that slates skips (lock_owner, flags,
+  /// padding: four 32-bit words).
+  const SKIP_AFTER_FLAGS: usize = 16;
+
+  /// Parses a write body; refuses one shorter than the header plus the declared data size.
+  pub fn parse(opcode: u32, body: &'a [u8]) -> Result<WriteIn<'a>, FuseError> {
+    let mut r = Reader::new(body);
+    let fh = r.u64(opcode)?;
+    let offset = r.u64(opcode)?;
+    let size = usize::try_from(r.u32(opcode)?).unwrap_or(usize::MAX);
+    let write_flags = r.u32(opcode)?;
+    r.skip(Self::SKIP_AFTER_FLAGS, opcode)?;
+    let Some(data) = r.rest().get(..size) else {
+      return Err(FuseError::ShortBody {
+        opcode,
+        have: body.len(),
+        need: body
+          .len()
+          .saturating_add(size.saturating_sub(r.remaining())),
+      });
+    };
+    Ok(WriteIn {
+      fh,
+      offset,
+      write_flags,
+      data,
+    })
+  }
+}
+
+/// A `FUSE_FALLOCATE` body (`fuse_fallocate_in`, A-108).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FallocateIn {
+  /// The open file handle.
+  pub fh: u64,
+  /// The range's first byte.
+  pub offset: u64,
+  /// The range's length.
+  pub length: u64,
+  /// The `fallocate(2)` mode bits (`FALLOC_FL_*`).
+  pub mode: u32,
+}
+
+impl FallocateIn {
+  /// Parses a fallocate body; refuses one shorter than the four fields.
+  pub fn parse(opcode: u32, body: &[u8]) -> Result<FallocateIn, FuseError> {
+    let mut r = Reader::new(body);
+    Ok(FallocateIn {
+      fh: r.u64(opcode)?,
+      offset: r.u64(opcode)?,
+      length: r.u64(opcode)?,
+      mode: r.u32(opcode)?,
+    })
+  }
+}
+
+/// Format: the `fuse_setupmapping_in` flag asking for a writable DAX mapping (`FUSE_SETUPMAPPING_FLAG_WRITE`);
+/// `1 << 1` is the read flag. slates copies a file up before a writable mapping
+/// (`slates_bridge_core::dax_backing::DaxBackingSession::ask`), so a writable request is the one that must not land on
+/// immutable or snapshot-shared content.
+pub const SETUPMAPPING_FLAG_WRITE: u64 = 1 << 0;
+
+/// The fields of a `FUSE_SETUPMAPPING` body (`struct fuse_setupmapping_in`): the open handle, the file offset and
+/// length to map, the flags (bit 0 writable), and the offset in the guest's DAX window to place the mapping at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetupMappingIn {
+  /// The open file handle.
+  pub fh: u64,
+  /// The first file byte to map.
+  pub foffset: u64,
+  /// The length to map.
+  pub len: u64,
+  /// The flags (`SETUPMAPPING_FLAG_WRITE` asks for a writable mapping).
+  pub flags: u64,
+  /// The offset in the DAX window the guest wants the mapping placed at.
+  pub moffset: u64,
+}
+
+impl SetupMappingIn {
+  /// Parses a setupmapping body; refuses one shorter than its five fields.
+  pub fn parse(opcode: u32, body: &[u8]) -> Result<SetupMappingIn, FuseError> {
+    let mut r = Reader::new(body);
+    Ok(SetupMappingIn {
+      fh: r.u64(opcode)?,
+      foffset: r.u64(opcode)?,
+      len: r.u64(opcode)?,
+      flags: r.u64(opcode)?,
+      moffset: r.u64(opcode)?,
+    })
+  }
+
+  /// Whether the guest asked for a writable mapping.
+  #[must_use]
+  pub fn writable(&self) -> bool {
+    self.flags & SETUPMAPPING_FLAG_WRITE != 0
+  }
+}
+
+/// One entry of a `FUSE_REMOVEMAPPING` body (`struct fuse_removemapping_one`): a window offset and length to unmap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoveMappingOne {
+  /// The window offset to unmap.
+  pub moffset: u64,
+  /// The length to unmap.
+  pub len: u64,
+}
+
+/// The fields of a `FUSE_REMOVEMAPPING` body (`struct fuse_removemapping_in`): a count, then that many
+/// `fuse_removemapping_one` entries. A count claiming more entries than the body carries is refused `ShortBody`
+/// (the per-entry `u64` read below bounds-checks), so a hostile count never over-reads or over-allocates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoveMappingIn {
+  /// The window ranges to unmap.
+  pub entries: Vec<RemoveMappingOne>,
+}
+
+impl RemoveMappingIn {
+  /// Parses a removemapping body; refuses one whose count claims more entries than the body carries.
+  pub fn parse(opcode: u32, body: &[u8]) -> Result<RemoveMappingIn, FuseError> {
+    let mut r = Reader::new(body);
+    let count = r.u32(opcode)?;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+      entries.push(RemoveMappingOne {
+        moffset: r.u64(opcode)?,
+        len: r.u64(opcode)?,
+      });
+    }
+    Ok(RemoveMappingIn { entries })
+  }
+}
+
+#[cfg(test)]
+mod dax_mapping_parse_tests {
+  use super::{RemoveMappingIn, RemoveMappingOne, SetupMappingIn};
+  use crate::abi::Opcode;
+
+  /// A well-formed SETUPMAPPING body parses to its five fields and reports writability from the flag.
+  #[test]
+  fn a_well_formed_setupmapping_parses_and_reads_the_write_flag() {
+    let op = Opcode::SetupMapping.to_wire();
+    let mut body = Vec::new();
+    for field in [7u64, 4096, 8192, super::SETUPMAPPING_FLAG_WRITE, 0x10_0000] {
+      body.extend_from_slice(&field.to_le_bytes());
+    }
+    let parsed = SetupMappingIn::parse(op, &body).expect("a full setupmapping body parses");
+    assert_eq!(parsed.fh, 7);
+    assert_eq!(parsed.foffset, 4096);
+    assert_eq!(parsed.len, 8192);
+    assert_eq!(parsed.moffset, 0x10_0000);
+    assert!(parsed.writable(), "the write flag is read");
+    // A read-only (flags = 0) request is not writable.
+    body[24..32].copy_from_slice(&0u64.to_le_bytes());
+    assert!(!SetupMappingIn::parse(op, &body).unwrap().writable());
+  }
+
+  /// A SETUPMAPPING body shorter than its five fields is refused, never read past its end.
+  #[test]
+  fn a_short_setupmapping_is_refused() {
+    let op = Opcode::SetupMapping.to_wire();
+    assert!(
+      SetupMappingIn::parse(op, &[0u8; 39]).is_err(),
+      "39 bytes is one short of the five u64s"
+    );
+    assert!(
+      SetupMappingIn::parse(op, &[]).is_err(),
+      "an empty body is refused"
+    );
+  }
+
+  /// REMOVEMAPPING parses its count's worth of entries; a count larger than the body is refused, never
+  /// over-read or over-allocated.
+  #[test]
+  fn removemapping_parses_its_entries_and_refuses_a_count_past_the_body() {
+    let op = Opcode::RemoveMapping.to_wire();
+    let mut body = 2u32.to_le_bytes().to_vec();
+    for (moffset, len) in [(0u64, 4096u64), (8192, 4096)] {
+      body.extend_from_slice(&moffset.to_le_bytes());
+      body.extend_from_slice(&len.to_le_bytes());
+    }
+    let parsed = RemoveMappingIn::parse(op, &body).expect("two entries parse");
+    assert_eq!(
+      parsed.entries,
+      vec![
+        RemoveMappingOne {
+          moffset: 0,
+          len: 4096
+        },
+        RemoveMappingOne {
+          moffset: 8192,
+          len: 4096
+        },
+      ]
+    );
+    // A count of 1000 with only two entries' worth of bytes is refused, not over-read.
+    let mut lying = 1000u32.to_le_bytes().to_vec();
+    lying.extend_from_slice(&body[4..]);
+    assert!(
+      RemoveMappingIn::parse(op, &lying).is_err(),
+      "a count past the body is refused"
+    );
+    // A huge count does not over-allocate before it refuses.
+    assert!(RemoveMappingIn::parse(op, &u32::MAX.to_le_bytes()).is_err());
+  }
+}

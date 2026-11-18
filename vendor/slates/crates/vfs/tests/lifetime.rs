@@ -1,0 +1,464 @@
+//! Inode lifetime under references (§4.6, the inode-addressed-io design): a file unlinked while a
+//! transport holds it open keeps its content until the last reference drops (POSIX
+//! unlink-while-open), and its content is reclaimed exactly at that last reference. Driven against
+//! an in-memory scratch volume on every host.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
+
+use slates_vfs::ids::RefOwner;
+
+use common::{store, volume};
+use slates_vfs::ids::InodeNo;
+
+/// An inode unlinked while a reference is held keeps its content until the last reference drops,
+/// then is reclaimed. Without the deferral this fails: `drop_link` releases the content at
+/// `nlink == 0` regardless of open references (the gap Ada identified at `drop_link`).
+#[test]
+fn an_unlinked_referenced_inode_survives_until_the_last_reference() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, file, 0, b"hello").unwrap();
+
+  // A transport holds the file open.
+  vol.reference(&store, file).unwrap();
+  // It is unlinked from the namespace.
+  vol.unlink_no(&mut store, root, "f").unwrap();
+  assert!(
+    vol.lookup_no(&store, root, "f").is_err(),
+    "the name is gone after unlink"
+  );
+
+  // The open object still serves its content.
+  let mut buf = [0u8; 5];
+  let read = vol.read(&store, file, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..read],
+    b"hello",
+    "an unlinked-but-open file keeps its content"
+  );
+
+  // The last close reclaims it.
+  vol.unreference(&mut store, file).unwrap();
+  assert!(
+    vol.read(&store, file, 0, &mut buf).is_err(),
+    "the content is reclaimed after the last reference"
+  );
+}
+
+/// A file replaced by a rename while it is held open keeps its own content until the last
+/// reference drops; the name resolves to the renamed file.
+#[test]
+fn rename_over_an_open_file_preserves_it() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let a = vol.create_file_no(&mut store, root, "a", 0o644).unwrap();
+  vol.write(&mut store, a, 0, b"aaa").unwrap();
+  let b = vol.create_file_no(&mut store, root, "b", 0o644).unwrap();
+  vol.write(&mut store, b, 0, b"bbb").unwrap();
+
+  // Hold b open, then rename a over b, so b's inode leaves the namespace.
+  vol.reference(&store, b).unwrap();
+  vol.rename_no(&mut store, root, "a", root, "b").unwrap();
+
+  // b's replaced inode still serves its own content.
+  let mut buf = [0u8; 3];
+  let read = vol.read(&store, b, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..read],
+    b"bbb",
+    "the replaced-but-open file keeps its content"
+  );
+  // The name now resolves to the renamed file.
+  assert_eq!(
+    vol.lookup_no(&store, root, "b").unwrap().inode,
+    a,
+    "the name resolves to the renamed file"
+  );
+
+  // The last close reclaims the replaced inode.
+  vol.unreference(&mut store, b).unwrap();
+  assert!(
+    vol.read(&store, b, 0, &mut buf).is_err(),
+    "the replaced inode is reclaimed after the last reference"
+  );
+}
+
+/// With several references, the content is reclaimed only at the last unreference, not the first.
+#[test]
+fn content_reclaims_only_at_the_last_of_several_references() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, file, 0, b"data").unwrap();
+
+  vol.reference(&store, file).unwrap();
+  vol.reference(&store, file).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  let mut buf = [0u8; 4];
+  vol.unreference(&mut store, file).unwrap();
+  assert_eq!(
+    vol.read(&store, file, 0, &mut buf).unwrap(),
+    4,
+    "still alive with one reference remaining"
+  );
+  vol.unreference(&mut store, file).unwrap();
+  assert!(
+    vol.read(&store, file, 0, &mut buf).is_err(),
+    "reclaimed at the last reference"
+  );
+}
+
+/// Writes reach an unlinked-but-open file, not just reads (POSIX unlink-while-open covers both).
+#[test]
+fn writes_reach_an_unlinked_open_file() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, file, 0, b"hello").unwrap();
+  vol.reference(&store, file).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  vol.write(&mut store, file, 5, b" world").unwrap();
+  let mut buf = [0u8; 11];
+  let read = vol.read(&store, file, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..read],
+    b"hello world",
+    "a write reaches an unlinked open file"
+  );
+
+  vol.unreference(&mut store, file).unwrap();
+  assert!(
+    vol.read(&store, file, 0, &mut buf).is_err(),
+    "reclaimed after the last reference"
+  );
+}
+
+/// A reference to an inode number no inode holds is refused, so the reference map cannot grow past
+/// the inode table's cap (hardening: references are validated, not arbitrary).
+#[test]
+fn a_reference_to_an_absent_inode_is_refused() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  assert!(
+    vol.reference(&store, InodeNo(999_999)).is_err(),
+    "cannot reference an inode that does not exist"
+  );
+}
+
+/// Reclamation frees the inode's content bytes for reuse; while the inode is orphaned (unlinked
+/// but open) its bytes remain charged, since the content is still alive in RAM (Ada review point
+/// 6: reusable capacity after reclamation).
+#[test]
+fn reclamation_frees_capacity_for_reuse() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, file, 0, &[7u8; 4096]).unwrap();
+  let used_before = vol.accounting().referenced_bytes;
+  assert!(used_before >= 4096, "the write is accounted");
+
+  vol.reference(&store, file).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+  // While the inode is orphaned its content is alive, so its bytes are still charged.
+  assert_eq!(
+    vol.accounting().referenced_bytes,
+    used_before,
+    "an unlinked-but-open file still occupies its capacity"
+  );
+
+  // The last reference reclaims the content, freeing the capacity.
+  vol.unreference(&mut store, file).unwrap();
+  assert!(
+    vol.accounting().referenced_bytes < used_before,
+    "reclamation frees the capacity for reuse"
+  );
+}
+
+/// A teardown sweep releases exactly the references one attachment holds and reclaims the inodes
+/// that reach zero references and no links — a whole attachment's references dropped in one batch,
+/// without a per-inode forget (FUSE does not guarantee one at unmount, §3).
+#[test]
+fn a_sweep_releases_an_attachments_references_and_reclaims() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f, 0, b"data").unwrap();
+
+  // Attachment 7 references the file, then it is unlinked (deferred — the reference holds it).
+  vol.reference_for(&store, f, RefOwner::Process(7)).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+  assert!(vol.stat(&store, f).is_ok(), "held open across unlink");
+
+  // Tearing down attachment 7 sweeps its reference; the unlinked inode is reclaimed.
+  vol
+    .sweep_attachment(&mut store, RefOwner::Process(7))
+    .unwrap();
+  assert!(
+    vol.stat(&store, f).is_err(),
+    "reclaimed at the attachment teardown sweep"
+  );
+  // Sweeping an attachment that holds nothing is a no-op.
+  vol
+    .sweep_attachment(&mut store, RefOwner::Process(7))
+    .unwrap();
+}
+
+/// The corruption guard: two attachments reference the same inode; sweeping one must NOT reclaim it
+/// while the other still holds it. Per-attachment accounting (global == sum of per-attachment
+/// counts) makes a sweep drop only its own share. A naive per-inode sweep would reclaim a live
+/// object another attachment is still serving — data loss for that holder.
+#[test]
+fn a_sweep_does_not_reclaim_an_inode_another_attachment_holds() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol
+    .create_file_no(&mut store, root, "shared", 0o644)
+    .unwrap();
+  vol.write(&mut store, f, 0, b"shared").unwrap();
+
+  // Two attachments (e.g. two mounts of the volume) both reference the same inode.
+  vol
+    .reference_for(&store, f, RefOwner::Process(100))
+    .unwrap();
+  vol
+    .reference_for(&store, f, RefOwner::Process(200))
+    .unwrap();
+  vol.unlink_no(&mut store, root, "shared").unwrap();
+
+  // Attachment 100 tears down: its share is released, but 200 still holds the inode alive.
+  vol
+    .sweep_attachment(&mut store, RefOwner::Process(100))
+    .unwrap();
+  let mut buf = [0u8; 6];
+  let read = vol.read(&store, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..read],
+    b"shared",
+    "the inode survives one attachment's teardown — attachment 200 still holds it"
+  );
+
+  // Attachment 200 tears down: now no reference remains, so it is reclaimed.
+  vol
+    .sweep_attachment(&mut store, RefOwner::Process(200))
+    .unwrap();
+  assert!(
+    vol.read(&store, f, 0, &mut buf).is_err(),
+    "reclaimed at the last attachment's teardown"
+  );
+}
+
+/// `forget_for` drops only the forgetting attachment's share: a FORGET from one attachment (even one
+/// asking to drop more than it holds) leaves another attachment's references — and the object —
+/// intact, until that attachment forgets too.
+#[test]
+fn a_forget_drops_only_the_owners_share() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+
+  vol.reference_for(&store, f, RefOwner::Process(1)).unwrap();
+  vol.reference_for(&store, f, RefOwner::Process(2)).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  // Attachment 1 forgets more than it holds — capped at its own one reference; 2's remains.
+  vol
+    .forget_for(&mut store, f, RefOwner::Process(1), 99)
+    .unwrap();
+  assert!(vol.stat(&store, f).is_ok(), "attachment 2 still holds it");
+
+  // Attachment 2 forgets its reference — now reclaimed.
+  vol
+    .forget_for(&mut store, f, RefOwner::Process(2), 1)
+    .unwrap();
+  assert!(
+    vol.stat(&store, f).is_err(),
+    "reclaimed once both attachments forgot"
+  );
+}
+
+/// §4.6 the reference model, at the extreme (the FUSE FORGET-underflow class, a kernel that lies about its
+/// `nlookup`): a forget of `u64::MAX` for a node an attachment holds once drops exactly one — `forget_for`
+/// caps the drop at what the owner holds (`min(n, owned)` over a `u64→u32` saturation), so the count never
+/// underflows or wraps. The node reclaims once (no other holder), and a *second* `u64::MAX` forget of the now
+/// reclaimed node is a safe no-op (owned is zero): it never underflows the count negative, never resurrects or
+/// corrupts a freed inode, never panics.
+#[test]
+fn a_u64_max_forget_drops_only_what_is_held_and_a_repeat_is_inert() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.reference_for(&store, f, RefOwner::Process(1)).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  // A colossal forget caps at the one reference held: the inode reclaims exactly once.
+  vol
+    .forget_for(&mut store, f, RefOwner::Process(1), u64::MAX)
+    .unwrap();
+  assert!(
+    vol.stat(&store, f).is_err(),
+    "the single reference was dropped exactly once"
+  );
+
+  // A repeat colossal forget of the reclaimed node is inert — no underflow, no resurrection, no panic.
+  vol
+    .forget_for(&mut store, f, RefOwner::Process(1), u64::MAX)
+    .unwrap();
+  assert!(
+    vol.stat(&store, f).is_err(),
+    "the reclaimed inode stays gone, never resurrected"
+  );
+}
+
+/// A directory removed while a transport still holds it — a kernel's lookup of a directory it made, kept until
+/// its forget (2026-10-01: `rm -r` through the daemon's FUSE mount, after which every barrier on the volume was
+/// refused and the kernel answered `EIO`). Do: hold a reference on a directory, empty it, remove it; image
+/// the volume, list the removed directory, create in it; drop the reference and image again. Expect: the
+/// directory stays a valid, empty directory until the last reference — the volume images, it lists empty, a
+/// create or mkdir inside it is refused `NotFound` (POSIX `ENOENT` for a removed directory) — and the last
+/// reference reclaims it. Before, `rmdir` freed the directory's node at once, so the orphan named a freed
+/// node and every image walk met a stale handle.
+#[test]
+fn a_directory_removed_while_referenced_stays_valid_and_empty_until_its_last_reference() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let dir = vol.mkdir_no(&mut store, root, "d", 0o755).unwrap();
+  vol.reference(&store, dir).unwrap();
+  vol.create_file_no(&mut store, dir, "f", 0o644).unwrap();
+  vol.unlink_no(&mut store, dir, "f").unwrap();
+  vol.rmdir_no(&mut store, root, "d").unwrap();
+  assert!(
+    vol.to_image(&store, None).is_ok(),
+    "the volume images with the removed directory held"
+  );
+  assert!(
+    vol.readdir_no(&store, dir).unwrap().is_empty(),
+    "the removed directory lists empty"
+  );
+  assert_eq!(
+    vol.create_file_no(&mut store, dir, "g", 0o644),
+    Err(slates_vfs::VfsError::NotFound),
+    "no entry is made in a removed directory"
+  );
+  assert_eq!(
+    vol.mkdir_no(&mut store, dir, "h", 0o755),
+    Err(slates_vfs::VfsError::NotFound)
+  );
+  vol.unreference(&mut store, dir).unwrap();
+  assert!(
+    vol.to_image(&store, None).is_ok(),
+    "the volume images after the last reference"
+  );
+  assert!(
+    vol.readdir_no(&store, dir).is_err(),
+    "the last reference reclaimed it"
+  );
+}
+
+/// The same through a rename that replaces an empty directory a transport holds. Do: hold the target, rename a
+/// directory over it, image the volume, drop the reference. Expect: the volume images throughout.
+#[test]
+fn a_directory_replaced_by_a_rename_while_referenced_stays_valid_until_its_last_reference() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  vol.mkdir_no(&mut store, root, "a", 0o755).unwrap();
+  let target = vol.mkdir_no(&mut store, root, "b", 0o755).unwrap();
+  vol.reference(&store, target).unwrap();
+  vol.rename_no(&mut store, root, "a", root, "b").unwrap();
+  assert!(vol.to_image(&store, None).is_ok());
+  assert!(vol.readdir_no(&store, target).unwrap().is_empty());
+  vol.unreference(&mut store, target).unwrap();
+  assert!(vol.to_image(&store, None).is_ok());
+}
+
+/// An `O_TMPFILE` named by `linkat` (FUSE `TMPFILE`, then `LINK`). Do: create and write a file, hold it open, unlink it
+/// (an orphan) after a snapshot pinned its bytes, link it under a new name, drop the last reference, then unlink the new name. Expect: the named file
+/// keeps its bytes after its last close (it is no longer an orphan to reclaim); unlinking it then reclaims it; and, the
+/// snapshot destroyed, the shard budget's committed and retained bytes end where they began, so the retention the first unlink secured went
+/// back at the relink rather than leaking.
+#[test]
+fn an_orphan_named_again_survives_its_last_close_and_leaks_nothing() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let budget_before = (store.budget.committed(), store.budget.retained());
+  let file = vol.create_file_no(&mut store, root, "tmp", 0o600).unwrap();
+  // Several chunk windows, so the snapshot pins chunks (inline bytes need no retention).
+  let body: Vec<u8> = (0..3 * store.content.chunk_bytes())
+    .map(|n| u8::try_from(n % 251).unwrap())
+    .collect();
+  vol.write(&mut store, file, 0, &body).unwrap();
+  // A snapshot pins the content, so the unlink must secure retention for it (§4.2).
+  let snapshot = vol.snapshot(&mut store).unwrap();
+  vol.reference(&store, file).unwrap();
+  vol.unlink_no(&mut store, root, "tmp").unwrap();
+  vol.link_no(&mut store, root, "named", file).unwrap();
+  vol.unreference(&mut store, file).unwrap();
+  let named = vol.lookup_no(&store, root, "named").unwrap();
+  let mut buf = vec![0u8; body.len()];
+  assert_eq!(named.inode, file, "the new name names the same inode");
+  let read = vol.read(&store, file, 0, &mut buf).unwrap();
+  assert!(
+    buf[..read] == body[..],
+    "the named file outlives its last close"
+  );
+  vol.unlink_no(&mut store, root, "named").unwrap();
+  assert!(
+    vol.read(&store, file, 0, &mut buf).is_err(),
+    "unlinked with no reference, it is reclaimed"
+  );
+  vol.destroy_snapshot(&mut store, snapshot).unwrap();
+  assert_eq!(
+    (store.budget.committed(), store.budget.retained()),
+    budget_before,
+    "the budget ends where it began"
+  );
+}
+
+/// CVE-2026-77179 class (CVSS 9.4: a macOS virtio-fs host server reopened an unlinked file *by name* and followed a
+/// symlink swapped in at that name, escaping the share). slates never reopens by name — I/O is inode-addressed and
+/// an unlinked-but-referenced inode is held, so a handle opened before an unlink reaches the ORIGINAL inode, never a
+/// new object (or a symlink) created at the same name afterwards. Create f="AAA", hold a reference (the open
+/// handle), unlink it, create a NEW f="BBB": a read through the original inode still returns "AAA", and the new name
+/// is a distinct inode holding "BBB" — the open handle is never re-resolved through the name.
+#[test]
+fn an_open_handle_survives_unlink_and_recreate_reaching_the_original_inode() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f, 0, b"AAA").unwrap();
+  vol.reference_for(&store, f, RefOwner::Process(1)).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  let f2 = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f2, 0, b"BBB").unwrap();
+  assert_ne!(
+    f, f2,
+    "the recreated name is a distinct inode, never the held one"
+  );
+
+  let mut original = vec![0u8; 3];
+  vol.read(&store, f, 0, &mut original).unwrap();
+  assert_eq!(
+    &original, b"AAA",
+    "the handle opened before the unlink reaches the original inode, never a reopen-by-name"
+  );
+  let mut recreated = vec![0u8; 3];
+  vol.read(&store, f2, 0, &mut recreated).unwrap();
+  assert_eq!(&recreated, b"BBB", "the new name is the new file");
+}

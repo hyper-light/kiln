@@ -82,6 +82,10 @@ hex-node = "=0.1.0"
 hex-quic = "=0.1.0"
 hex-core = "=0.1.0"
 hex-api = "=0.1.0"
+# Slates, agents' workspaces of their own (docs/agentic.md, W): its library, which kiln drives Slates through, never
+# its command line, and with it Slates' anchor and daemon, which kiln's own executable runs (`kiln slates-role`,
+# `workspace::slates`). Vendored at vendor/slates; the name is patched to its copy in the root manifest.
+slates-api = "=0.1.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 # A capacity keeper's chain.pem and roots.pem, encoded as Hex's `hex_quic::enroll::store::finish` writes them
 # (`capacity::issue_keeper`); the copy hex-quic takes.
