@@ -705,19 +705,104 @@ async fn land(cx: Cx, v: Value) -> Out {
     if info.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
         return Err((StatusCode::CONFLICT, format!("{} works in its folder itself: what it changed is there already", info.name)));
     }
-    let Some(manifest) = v.get("manifest").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned) else {
-        let plan = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Plan).await?;
-        return Ok(plan);
-    };
-    // Writing to a person's folder waits on a person (docs/agentic.md: no agent answers what waits on one).
-    if cx.caller.agent.is_some() || cx.caller.kind == crate::authz::gate::Kind::Agent {
-        return Err((StatusCode::FORBIDDEN, "writing an agent's work to disk is a person's to say: they do it from the agent's Changes, or with this operation themselves".to_owned()));
+    // A volume lands whole, so an agent working in another's lands nothing of its own while that one works: its work
+    // lands with the volume's owner's (docs/agentic.md W2, W6). Once the owner has ended, the last of them lands it.
+    if let Some(owner) = info.workspace.as_ref().and_then(|w| w.owner.as_deref()).and_then(|o| cx.hub.harness.info(o)) {
+        return Err((StatusCode::CONFLICT, format!("{} works in {}'s volume ({}): it lands whole, with that agent's work, from that agent's Changes", info.name, owner.name, lineage::short(&owner.id))));
     }
+    let manifest = v.get("manifest").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()).map(str::to_owned);
+    // A person reads the plan, then writes it; an agent lands as its mode lets it (the person's rule, 2026-11-18;
+    // docs/agentic.md W6): at once in a mode that edits unasked, its plan written as it stands when it names none;
+    // after its person's click in one that asks (`crate::confirms` asks it, and the call the click allows comes here
+    // as the person's); never in one that only plans.
+    let by = landing_by(&cx, &info)?;
+    if by == LandingBy::Asking && manifest.is_some() {
+        return Err((StatusCode::PRECONDITION_REQUIRED, format!("writing {}'s work to disk waits on its person's click, as its mode asks before it edits: kiln asks them when the call comes in their chat turn", info.name)));
+    }
+    let manifest = match manifest {
+        Some(m) => m,
+        None => {
+            let plan = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Plan).await?;
+            let manifest = plan.pointer("/plan/manifest").and_then(Value::as_str).map(str::to_owned);
+            match manifest {
+                // Its plan, written as it stands: under the same manifest, so what it saw is what lands.
+                Some(m) if by == LandingBy::Writing && plan.get("can_write") == Some(&Value::Bool(true)) => m,
+                Some(_) if by == LandingBy::Writing => {
+                    let why = plan.get("why_not").and_then(Value::as_str).unwrap_or("this machine can't write it");
+                    return Err((StatusCode::CONFLICT, format!("{}'s work can't be written to disk here: {why}", info.name)));
+                }
+                // To read (a person's, or an agent's whose mode asks), or nothing that waits on a grant.
+                _ => return Ok(typed_landing(plan)),
+            }
+        }
+    };
     let landed = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Land { manifest }).await?;
     if landed.get("landed").is_some() {
         cx.hub.store.audit(cx.caller.name.clone(), "agent.land".into(), format!("{} ({}): its workspace written to {}", info.name, lineage::short(&info.id), info.workspace.as_ref().and_then(|w| w.over.clone()).unwrap_or_default())).await;
     }
-    Ok(landed)
+    Ok(typed_landing(landed))
+}
+
+/// Who lands, as `agents.land` treats the call: a person (who reads the plan, then writes it), or an agent whose mode
+/// writes at once or asks first (`crate::workspace::landing_policy`, the lower of the asker's mode and that of the
+/// agent whose work it is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandingBy {
+    Person,
+    Writing,
+    Asking,
+}
+
+/// Who lands for this call of `agents.land` on `info`'s workspace. An agent kiln doesn't run has no mode kiln knows, so
+/// it lands nothing; one whose mode only plans is refused, saying whose mode it is.
+fn landing_by(cx: &Cx, info: &Info) -> Result<LandingBy, Fail> {
+    if cx.caller.agent.is_none() && cx.caller.kind != crate::authz::gate::Kind::Agent {
+        return Ok(LandingBy::Person);
+    }
+    let Some(asker) = cx.caller.agent.as_deref().and_then(|a| cx.hub.harness.info(a)) else {
+        return Err((StatusCode::FORBIDDEN, "an agent kiln doesn't run has no mode kiln knows, so it writes nothing to disk: a person does, from the agent's Changes".to_owned()));
+    };
+    match crate::workspace::landing_policy(&asker, info) {
+        crate::workspace::WritePolicy::Write => Ok(LandingBy::Writing),
+        crate::workspace::WritePolicy::Approve => Ok(LandingBy::Asking),
+        crate::workspace::WritePolicy::Refuse => {
+            // Only a mode that plans refuses: the asker's, or else the one whose work it is.
+            let planner = if lineage::level(&asker.kind, &asker.mode) == Some(lineage::Level::Plan) { &asker } else { info };
+            Err((StatusCode::FORBIDDEN, format!("{}'s mode plans and changes nothing, so it writes nothing to disk: a person lands {}'s work from its Changes, or gives {} a mode that edits", planner.name, info.name, planner.name)))
+        }
+    }
+}
+
+/// A machine's answer to a landing, with its outcome named for whoever acts on it (docs/agents.md, "Workspaces of
+/// their own"): `written` (Slates' outcome, as `landed` has it), or `approval_required` (the plan to read and approve
+/// by its manifest: what was asked for, or the new plan when what was approved moved on, as `changed` says). The
+/// fields the machine answered stay as they were.
+fn typed_landing(mut answer: Value) -> Value {
+    // Slates' own outcome, inside its answer when nothing waited on a grant (`{grant_required: false, outcome}`).
+    let outcome_of = |said: Value| said.get("outcome").cloned().unwrap_or(said);
+    let plan = answer.get("plan").cloned();
+    let (outcome, field, value) = match (answer.get("landed").cloned(), plan) {
+        (Some(written), _) => ("written", "written", outcome_of(written)),
+        (None, Some(plan)) if plan.get("grant_required") == Some(&Value::Bool(false)) => ("written", "written", outcome_of(plan)),
+        (None, Some(plan)) => (
+            "approval_required",
+            "approval",
+            json!({
+                "manifest": plan.get("manifest"),
+                "summary": plan.get("summary"),
+                "conflicts": plan.get("conflicts").cloned().unwrap_or_else(|| json!([])),
+                "excludes": answer.get("excludes"),
+                "can_write": answer.get("can_write"),
+                "why_not": answer.get("why_not"),
+            }),
+        ),
+        (None, None) => return answer,
+    };
+    if let Some(o) = answer.as_object_mut() {
+        o.insert("outcome".into(), json!(outcome));
+        o.insert(field.into(), value);
+    }
+    answer
 }
 
 async fn changes(cx: Cx, v: Value) -> Out {
@@ -1167,7 +1252,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agents.land",
-            summary: "Write an agent's workspace of its own back to the folder it's laid over. Without `manifest`: the plan (what it would create, replace and delete, and any file changed on disk since, which it won't overwrite), for a person to read. With the plan's `manifest`: written exactly as that plan says, or, if anything changed since, nothing written and the new plan back (`changed`) — only a person can write, never an agent. Build output and what git ignores stay out, and so does `.git`.",
+            summary: "Write an agent's workspace of its own back to the folder it's laid over. Without `manifest`: the plan (what it would create, replace and delete, and any file changed on disk since, which it won't overwrite), to read. With the plan's `manifest`: written exactly as that plan says, or, if anything changed since, nothing written and the new plan back (`changed`). A person writes it; an agent writes as its mode lets it (the lower of its own and that of the agent whose work it is): at once in a mode that edits unasked (accept edits, auto, bypass), after its person's click in one that asks (428 until they confirm; then the same call again), never in one that only plans (403). Build output and what git ignores stay out, and so does `.git`. An agent working in another's volume lands nothing of its own while that one works: the volume lands whole, from its owner.",
             read_only: false,
             destructive: true,
             input: Input::of::<input::AgentsLand>(),

@@ -325,3 +325,123 @@ fn p5_6_s6_attention_places_are_operations_held_to_the_gate() -> anyhow::Result<
         Ok(())
     })
 }
+
+/// A session on runner `box` in `mode`, acting for the owner, the agent `parent` started (none: a person did), working
+/// in a volume laid over `/src/project`: its own, or `sharing`'s (none: its own, `v-<id>`), whose owner it names.
+async fn in_volume(hub: &Hub, id: &str, parent: Option<&str>, mode: &str, sharing: Option<&str>) -> anyhow::Result<()> {
+    let volume = sharing.unwrap_or(id);
+    let made = crate::workspace::slates::Made { volume: format!("v-{volume}"), name: format!("kiln-{volume}"), mount: format!("/w/kiln-{volume}") };
+    let workspace = crate::workspace::Workspace { kind: "volume".into(), over: Some("/src/project".into()), made: Some(made), owner: sharing.map(str::to_owned), ..Default::default() };
+    let info = crate::harness::session::Info {
+        id: id.into(),
+        kind: "claude".into(),
+        name: id.into(),
+        target: "agent:box".into(),
+        parent: parent.map(str::to_owned),
+        mode: mode.into(),
+        workspace: Some(workspace),
+        ..Default::default()
+    };
+    hub.harness.ingest(&Location::Machine("box".into()), id, crate::harness::core::Update::Open { info: Box::new(info), since: None }).await;
+    hub.store.kv_set(crate::mcp::opener_key(id), "owner".to_owned()).await?;
+    Ok(())
+}
+
+/// Whether a landing went past every policy and reached its agent's machine: the fixture's `box` isn't connected, which
+/// the landing itself then says (502).
+fn reached_the_machine(r: &Result<Value, Fail>) -> bool {
+    code(r) == 502 && r.as_ref().err().is_some_and(|(_, m)| m.contains("not connected"))
+}
+
+/// docs/agentic.md W6, the person's rule of 2026-11-18 (kiln goal 01a1ec34599974448aed2672bafaf9a2): an agent writes
+/// its work to disk as its mode lets it. In a mode that edits unasked (accept edits, bypass) its landing, of its plan as
+/// it stands or of a manifest, goes past every policy at once and reaches its machine, nothing asked of anyone; in one
+/// that only plans it is refused, and so is a landing of another agent's work by one that only plans; in one that asks
+/// it reads its plan at once, but writing waits on its person's click: outside a person's turn there's no one to ask
+/// (403), in the owner's turn it waits (428, one ask, which says where it writes), and the owner's click lets the same
+/// call through once, as the owner. A parent in bypass landing its child's work in a mode that asks waits on the click
+/// too: the lower of the two modes decides.
+#[test]
+fn w6_an_agents_landing_follows_its_mode() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+        hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+        in_volume(&hub, "planner", None, "plan", None).await?;
+        in_volume(&hub, "asker", None, "default", None).await?;
+        in_volume(&hub, "editor", None, "acceptEdits", None).await?;
+        in_volume(&hub, "bold", None, "bypassPermissions", None).await?;
+        in_volume(&hub, "kid", Some("bold"), "default", None).await?;
+        let as_agent = |who: &'static str| {
+            let hub = Arc::clone(&hub);
+            async move { agent(&hub, who).await }
+        };
+
+        // Modes that edit unasked: at once, its plan as it stands or a manifest.
+        for who in ["editor", "bold"] {
+            for input in [json!({"agent": who}), json!({"agent": who, "manifest": "ab12"})] {
+                let r = call(as_agent(who).await?, "agents.land", input.clone()).await;
+                anyhow::ensure!(reached_the_machine(&r), "{who} {input}: {r:?}");
+            }
+        }
+        anyhow::ensure!(asked(&hub).await?.is_empty(), "nothing asked of anyone");
+
+        // A mode that only plans: refused, its own landing and another's work it lands.
+        for input in [json!({"agent": "planner"}), json!({"agent": "planner", "manifest": "ab12"})] {
+            let r = call(as_agent("planner").await?, "agents.land", input).await;
+            anyhow::ensure!(code(&r) == 403 && r.as_ref().err().is_some_and(|(_, m)| m.contains("planner's mode plans and changes nothing")), "{r:?}");
+        }
+
+        // A mode that asks: its plan at once (to read), writing waits on its person's click.
+        let read = call(as_agent("asker").await?, "agents.land", json!({"agent": "asker"})).await;
+        anyhow::ensure!(reached_the_machine(&read), "its plan, read at once: {read:?}");
+        let alone = call(as_agent("asker").await?, "agents.land", json!({"agent": "asker", "manifest": "ab12"})).await;
+        anyhow::ensure!(code(&alone) == 403 && alone.as_ref().err().is_some_and(|(_, m)| m.contains("isn't serving a person's chat turn")), "no one to ask: {alone:?}");
+        says(&hub, "asker").await;
+        let waits = call(as_agent("asker").await?, "agents.land", json!({"agent": "asker", "manifest": "ab12"})).await;
+        anyhow::ensure!(code(&waits) == 428 && waits.as_ref().err().is_some_and(|(_, m)| m.contains("waiting on owner's click")), "{waits:?}");
+        let list = asked(&hub).await?;
+        let ask = list.iter().find(|a| a.get("op") == Some(&json!("agents.land"))).cloned().unwrap_or_default();
+        anyhow::ensure!(list.len() == 1 && ask.get("says").and_then(Value::as_str).is_some_and(|s| s.contains("written to /src/project") && s.contains("ab12")), "one ask, saying where it writes: {list:?}");
+        let id = ask.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+        call(person(&hub), "confirms.answer", json!({"id": id, "yes": true})).await.map_err(|(c, m)| anyhow::anyhow!("{c}: {m}"))?;
+        let other = call(as_agent("asker").await?, "agents.land", json!({"agent": "asker", "manifest": "cd34"})).await;
+        anyhow::ensure!(code(&other) == 428, "another manifest asks anew: {other:?}");
+        let clicked = call(as_agent("asker").await?, "agents.land", json!({"agent": "asker", "manifest": "ab12"})).await;
+        anyhow::ensure!(reached_the_machine(&clicked), "the click lets it through, as the owner's: {clicked:?}");
+        let again = call(as_agent("asker").await?, "agents.land", json!({"agent": "asker", "manifest": "ab12"})).await;
+        anyhow::ensure!(code(&again) == 428, "once: {again:?}");
+
+        // A parent in bypass, its child in a mode that asks: the lower decides.
+        let parent = call(as_agent("bold").await?, "agents.land", json!({"agent": "kid", "manifest": "ab12"})).await;
+        anyhow::ensure!(code(&parent) == 403 && parent.as_ref().err().is_some_and(|(_, m)| m.contains("isn't serving a person's chat turn")), "{parent:?}");
+        // A person: the plan to read, and a manifest written, whatever the agent's mode.
+        for of in ["planner", "asker"] {
+            for input in [json!({"agent": of}), json!({"agent": of, "manifest": "ab12"})] {
+                let r = call(person(&hub), "agents.land", input.clone()).await;
+                anyhow::ensure!(reached_the_machine(&r), "the owner's {input}: {r:?}");
+            }
+        }
+        Ok(())
+    })
+}
+
+/// docs/agentic.md W2 and W6: a volume lands whole, so an agent working in another's lands nothing of its own while
+/// that one works, whoever asks (409, naming whose it is); once the owner has gone, the agent left working in it lands
+/// it.
+#[test]
+fn w6_an_agent_in_anothers_volume_lands_nothing_of_its_own_while_that_one_works() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+        hub.put_agent(crate::hub::tests::live_runner("box", "linux", "x86_64"));
+        in_volume(&hub, "maker", None, "bypassPermissions", None).await?;
+        in_volume(&hub, "helper", Some("maker"), "bypassPermissions", Some("maker")).await?;
+        in_volume(&hub, "orphan", None, "bypassPermissions", Some("gone")).await?;
+        for caller in [person(&hub), agent(&hub, "helper").await?] {
+            let r = call(caller, "agents.land", json!({"agent": "helper", "manifest": "ab12"})).await;
+            anyhow::ensure!(code(&r) == 409 && r.as_ref().err().is_some_and(|(_, m)| m.contains("works in maker's volume")), "{r:?}");
+        }
+        let left = call(agent(&hub, "orphan").await?, "agents.land", json!({"agent": "orphan"})).await;
+        anyhow::ensure!(reached_the_machine(&left), "its owner gone, the last in it lands it: {left:?}");
+        Ok(())
+    })
+}
