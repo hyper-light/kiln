@@ -561,7 +561,8 @@ pub fn placed_here(m: &Made) -> anyhow::Result<Made> {
 
 /// [`placed_here`] with this machine's place for workspaces `root`.
 fn placed_under(m: &Made, root: &Path) -> anyhow::Result<Made> {
-    if m.mount.is_empty() || Path::new(&m.mount).starts_with(root) {
+    let mount = Path::new(&m.mount);
+    if m.mount.is_empty() || mount.starts_with(root) || mount.starts_with(super::place::real(root)) {
         return Ok(m.clone());
     }
     let point = super::place::points(root, &m.name).into_iter().next().ok_or_else(|| anyhow::anyhow!(super::place::NO_POINT))?;
@@ -1542,13 +1543,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn k4_a_workspace_that_moved_here_is_placed_under_this_machines_own_place() -> anyhow::Result<()> {
-        let root = Path::new("/home/kiln/.local/state/kiln/workspaces");
-        let moved = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/Users/ada/Library/kiln/workspaces/kiln-a".into() };
-        let placed = placed_under(&moved, root)?;
-        assert_eq!(placed, Made { mount: "/home/kiln/.local/state/kiln/workspaces/kiln-a".into(), ..moved.clone() });
-        assert_eq!(placed_under(&placed, root)?, placed, "placed here already");
+        let scratch = tempfile::tempdir()?;
+        let root = scratch.path().join("workspaces");
+        let moved = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into() };
+        let placed = placed_under(&moved, &root)?;
+        let here = super::super::place::real(&root).join("kiln-a");
+        assert_eq!(placed, Made { mount: here.to_string_lossy().into_owned(), ..moved.clone() });
+        assert_eq!(placed_under(&placed, &root)?, placed, "placed here already");
         let unmounted = Made { mount: String::new(), ..moved };
-        assert_eq!(placed_under(&unmounted, root)?, unmounted);
+        assert_eq!(placed_under(&unmounted, &root)?, unmounted);
         Ok(())
     }
 
