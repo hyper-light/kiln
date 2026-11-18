@@ -382,9 +382,13 @@ Built toward it (kiln goal 95101ef3…, its first piece, 2026-11-18): each runne
 of kiln's Slates fleet (`workspace::slates_fleet`): its key made on the runner and never sent, its
 certificate from kiln's CA (`POST /api/agents/slates-fleet`, the machine's proof as a second runner
 process gives it) for the fleet's name and the runner's own failure domain alone, kept as Slates'
-fleet manifest reads it, with kiln's CA as the fleet's enrollment root. Still owed: the runners'
-discovery and manifest, the operator's choice of which runners join, starting a runner's Slates
-with the fleet, and the move itself.
+fleet manifest reads it, with kiln's CA as the fleet's enrollment root. Its second piece: discovery
+(`POST /api/agents/slates-fleet/members`: a runner says where its node is reached, taken only for
+its own machine's node and an address Slates can dial, and hears of every node whose runner is
+connected) and Slates' fleet manifest written beside the node's files (every node's address, failure
+domain and certificate, this node's key, kiln's CA as the root). Still owed: the operator's choice of
+which runners join and the fleet's fault tolerance, starting a runner's Slates with the fleet, and
+the move itself.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.

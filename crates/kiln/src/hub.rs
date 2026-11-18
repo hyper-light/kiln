@@ -798,6 +798,9 @@ pub struct Hub {
     /// Reach: the links between runners this server relays, and their identities (`crate::reach`):
     /// one owner changes them, the hub's `relay_loop`, started on first use ([`Hub::relay`]).
     pub reach: crate::reach::relay::Owner,
+    /// kiln's Slates fleet: the nodes runners said they hold, by machine (`crate::workspace::slates_fleet`; kiln goal
+    /// 95101ef3…, K2), in memory: each runner says it again as its Slates joins.
+    pub slates_fleet: crate::workspace::slates_fleet::Directory,
     /// What kiln takes from relays and relays itself, checked and numbered (docs/ci.md W27-R08's
     /// relays: `crate::relays`).
     pub(crate) relays: crate::relays::Relays,
@@ -1012,6 +1015,7 @@ impl Hub {
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
             reach: crate::reach::relay::Owner::default(),
+            slates_fleet: crate::workspace::slates_fleet::Directory::default(),
             relays: crate::relays::Relays::default(),
             custody_in: crate::custody::runners::Intake::default(),
             copies,
