@@ -83,6 +83,23 @@ pub fn sharing(cwd: &str, live: &[(String, Workspace)]) -> Option<Workspace> {
     })
 }
 
+/// The workspaces agents on one machine work in now (`infos`, its sessions): each made one with its agent's id, what
+/// [`sharing`] judges a folder against.
+pub fn live(infos: Vec<crate::harness::session::Info>) -> Vec<(String, Workspace)> {
+    infos.into_iter().filter_map(|i| i.workspace.filter(|w| w.made.is_some()).map(|w| (i.id, w))).collect()
+}
+
+/// What a start on a person's shell takes from it once its machine has read the shell (`harness::host::shell_context`:
+/// its folder `cwd` and its environment `env`): the folder and the environment where the start named none.
+pub fn from_shell(spec: &mut crate::harness::session::Spec, (cwd, env): (Option<String>, Vec<(String, String)>), _live: &[(String, Workspace)]) {
+    if spec.cwd.is_none() {
+        spec.cwd = cwd;
+    }
+    if spec.env.is_empty() {
+        spec.env = env;
+    }
+}
+
 /// Whether `a` and `b` are workspaces in one volume.
 pub fn same_volume(a: Option<&Workspace>, b: Option<&Workspace>) -> bool {
     match (a.and_then(|w| w.made.as_ref()), b.and_then(|w| w.made.as_ref())) {
@@ -787,6 +804,41 @@ mod tests {
         // One not yet made shares nothing.
         let unmade = vec![("c".to_owned(), Workspace { kind: "volume".into(), ..Workspace::default() })];
         assert_eq!(sharing("/state/workspaces/kiln-c", &unmade), None);
+    }
+
+    /// W2 (ledger row W's owed line, 2026-11-18): an agent started in a person's shell whose folder lies in another
+    /// agent's mount works in that agent's volume, at the same path, as one started in that folder does. The server
+    /// chooses a start's workspace before its machine reads the shell's folder, so it had chosen a volume of its own,
+    /// and laying that over the other agent's mount was refused by Slates (its A-227). Do: a start the server left
+    /// asking for a volume of its own takes a shell whose folder lies in agent `a`'s mount. Expect `a`'s volume, `a` its
+    /// owner, the shell's place beneath the mount, and the shell's own folder and environment. A shell's folder outside
+    /// every mount keeps the volume of its own, a person's choice of the folder itself is kept, and a start that named
+    /// its folder keeps it.
+    #[test]
+    fn w2_an_agent_started_in_a_shell_inside_another_agents_mount_works_in_its_volume() {
+        let parent = volume_at("v1", "/state/workspaces/kiln-a", "/home/ada/src/kiln");
+        let live = vec![("a".to_owned(), parent.clone())];
+        let own = || Some(Workspace { kind: "volume".into(), ..Workspace::default() });
+        let env = vec![("OLDPWD".to_owned(), "/home/ada".to_owned())];
+        let shell = |cwd: &str| (Some(cwd.to_owned()), env.clone());
+        let started = |workspace: Option<Workspace>, cwd: Option<&str>, at: &str| {
+            let mut spec = crate::harness::session::Spec { workspace, cwd: cwd.map(str::to_owned), ..Default::default() };
+            from_shell(&mut spec, shell(at), &live);
+            spec
+        };
+        let inside = started(own(), None, "/state/workspaces/kiln-a/crates/kiln");
+        let w = inside.workspace.clone().unwrap_or_default();
+        assert_eq!(w.made, parent.made, "the other agent's volume, not one of its own laid over its mount");
+        assert_eq!(w.owner.as_deref(), Some("a"));
+        assert_eq!(w.over, parent.over, "laid over the folder that agent's is");
+        assert_eq!(w.sub, "crates/kiln");
+        assert_eq!(inside.cwd.as_deref(), Some("/state/workspaces/kiln-a/crates/kiln"), "at the shell's own folder");
+        assert_eq!(inside.env, env, "with the shell's environment");
+        assert_eq!(started(own(), None, "/home/ada/src/kiln").workspace, own(), "outside every mount: its own volume");
+        let folder = Some(Workspace { kind: "folder".into(), ..Workspace::default() });
+        assert_eq!(started(folder.clone(), None, "/state/workspaces/kiln-a/src").workspace, folder, "a person's folder choice");
+        let named = started(own(), Some("/home/ada/elsewhere"), "/state/workspaces/kiln-a");
+        assert_eq!((named.cwd.as_deref(), named.workspace), (Some("/home/ada/elsewhere"), own()), "a folder the start named");
     }
 
     /// W2 on Windows (judged on any server): a volume is mounted at a drive letter, and a folder on that drive, written
