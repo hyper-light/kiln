@@ -727,17 +727,26 @@ impl Looks {
     }
 }
 
-/// Drives both agents ([`Mode::ALL`]) on `engine` (`image`: the microVM's), each in its own volume over a project of its
-/// own under `dir`, through kiln's REST API, and checks them end to end (the module's 1 to 5). `dir`: the drive's
-/// folder, where its runner keeps its state.
-pub fn drive(f: &vm_e2e::Fixture, dir: &Path, instance: &Instance, engine: Engine, image: Option<&str>) -> anyhow::Result<()> {
-    links_pinned(f)?;
+/// Where a drive runs: its fixture (its server and runner), its folder (where its runner keeps its state, and its
+/// projects), its own Slates instance, the engine its agents run on, and in a microVM the image they boot.
+pub struct Drive<'a> {
+    pub f: &'a vm_e2e::Fixture,
+    pub dir: &'a Path,
+    pub instance: &'a Instance,
+    pub engine: Engine,
+    pub image: Option<&'a str>,
+}
+
+/// Drives both agents ([`Mode::ALL`]) on the drive's engine, each in its own volume over a project of its own under
+/// the drive's folder, through kiln's REST API, and checks them end to end (the module's 1 to 5).
+pub fn drive(d: &Drive<'_>) -> anyhow::Result<()> {
+    links_pinned(d.f)?;
     let mut looks = Looks::default();
     for mode in Mode::ALL {
-        let project = Project::new(&dir.join(mode.word()))?;
-        drive_agent(f, dir, &project, instance, engine, image, mode, &mut looks)?;
+        let project = Project::new(&d.dir.join(mode.word()))?;
+        drive_agent(d, &project, mode, &mut looks)?;
     }
-    looks.check().map_err(|e| anyhow::anyhow!("{engine:?}: {e}\n{}", f.runner_log()))
+    looks.check().map_err(|e| anyhow::anyhow!("{:?}: {e}\n{}", d.engine, d.f.runner_log()))
 }
 
 /// The runner links the Slates this checkout vendors, at its pinned commit ([`links_the_pin`]).
@@ -747,10 +756,10 @@ pub fn links_pinned(f: &vm_e2e::Fixture) -> anyhow::Result<()> {
     links_the_pin(said.as_deref(), vendored_slates(&manifest).as_deref()).map_err(|e| anyhow::anyhow!("{e}\n{}", f.runner_log()))
 }
 
-/// Drives one agent in `mode` on `engine`, in its own volume over `project`, and checks it end to end; `looks`
-/// gathers what the drive saw at the host.
-#[allow(clippy::too_many_arguments, reason = "a drive's parts, each its own: kept apart rather than bundled for one caller")]
-pub fn drive_agent(f: &vm_e2e::Fixture, dir: &Path, project: &Project, instance: &Instance, engine: Engine, image: Option<&str>, mode: Mode, looks: &mut Looks) -> anyhow::Result<()> {
+/// Drives one agent in `mode` on the drive's engine, in its own volume over `project`, and checks it end to end;
+/// `looks` gathers what the drive saw at the host.
+pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Looks) -> anyhow::Result<()> {
+    let Drive { f, dir, instance, engine, image } = *d;
     let before = tree(&project.path())?;
     let git_before = project.git_state()?;
     let probe = vm_e2e::probe_name();
@@ -1354,7 +1363,8 @@ mod bare_metal {
         if !workspaces_ready(&f)? {
             return Ok(());
         }
-        drive(&f, &canonical(dir.path()), &instance, Engine::BareMetal, None)
+        let dir = canonical(dir.path());
+        drive(&Drive { f: &f, dir: &dir, instance: &instance, engine: Engine::BareMetal, image: None })
     }
 
     /// W6's drift, in either mode: a file the agent changed in its volume, then changed on disk by a person, is drift
@@ -1438,6 +1448,7 @@ mod microvm {
         }
         let kept = vm_e2e::keep_stub(&f, "claude")?;
         let image = format!("agentfile:{}", kept.id);
-        drive(&f, &canonical(dir.path()), &instance, Engine::MicroVm, Some(image.as_str()))
+        let dir = canonical(dir.path());
+        drive(&Drive { f: &f, dir: &dir, instance: &instance, engine: Engine::MicroVm, image: Some(image.as_str()) })
     }
 }
