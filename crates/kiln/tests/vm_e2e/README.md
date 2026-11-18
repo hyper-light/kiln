@@ -108,7 +108,7 @@ for a run (`PUT /api/runners/<machine>/headroom` with `{"enabled": false}`) and 
 | Name | Client end | Server end | Owed by |
 |---|---|---|---|
 | `server-runner` | the runner's own view of its link to the server | the server's view of that runner's connection | kiln plan 01a1d2c1ef09707daafe3fe9b77754e6 step 2 (AES-256-GCM alone there, each end on kiln's API, read from step 16's `Endpoint::negotiated`) |
-| `agent-control` | Shards' `control::controller` in kiln | the agent-control endpoint's own report | Hex: a `Runtime` call reporting a box's agent-control link, then kiln's `HexRun::link` mapped to it (owed item 1). Until then kiln reports no `/runs/control`, and the drive fails the links by that name (`vm_e2e::LinkGap`) |
+| `agent-control` | Shards' `control::controller` in kiln | the agent-control endpoint's own report | Hex's `Runtime::link`, which kiln's `HexRun::link` maps (kiln 100b707e9; owed item 1); a run whose session reports no `/runs/control` fails the links by that name (`vm_e2e::LinkGap`) |
 | `mcp` | the harness's client | kiln's MCP as the microVM reaches it | Decided (2026-11-13, Shards D254) and built: kiln's MCP rides the agent-control link as its own `mcp:<member>` lane (step 11 with step 18), so no network grant names it. Its suite and its lane are read from the agent-control link's report, owed as that link's are |
 
 No `kiln-hex` link (2026-11-16): the plan drew one, kiln to a Hex node, but kiln's runner holds Hex's image
@@ -201,7 +201,8 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    of it (`Runtime::link`, on Shards' `Linked::report`, 8c9c03cc4; in the Hex kiln vendors since
    992c5a33a), which `HexRun::link` maps; that link carries none of its stdio, which Hex takes from the
    image channel. `in_microvm` checks the links after every other check and fails missing ones by that
-   name (`vm_e2e::LinkGap`, gaps.json's `link_report` gaps). Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
+   name (`vm_e2e::LinkGap`); gaps.json lists no `link_report` gap since `HexRun::link` maps Hex's report.
+   Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
    `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch
    (`p/s17-launch-seam-v1`, 64dfab21f) reads its process's `host_pid()` inside (`session.rs` 4328 and
    4724) and says none of it; Shards' `control::Controller` (`crates/remote/src/control/drive.rs`)
