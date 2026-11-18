@@ -248,7 +248,8 @@ impl Kind {
     /// image's command gives it. kiln's own tools aren't given it (its MCP server and its hooks are
     /// reached through this machine's runner's socket, which no microVM reaches: plan step 18 brings
     /// them in), nor this machine's environment, nor kiln's own variables: only the locale and time
-    /// zone the session was given, and what kiln fixes for the harness.
+    /// zone the session was given, its environment's `machine` and `value` variables, and what kiln
+    /// fixes for the harness.
     pub fn elsewhere(&self, spec: &Spec) -> anyhow::Result<Elsewhere> {
         let all = match self.protocol {
             Protocol::Terminal => anyhow::bail!("{} has no structured mode; run it in a terminal ({})", self.name, self.program),
@@ -264,12 +265,24 @@ impl Kind {
         let base = self.base_args();
         let args = all.strip_prefix(base.as_slice()).ok_or_else(|| anyhow::anyhow!("kiln starts {} with {all:?}, not past its image's command ({base:?})", self.name))?.to_vec();
         let mut env: Vec<(String, String)> = spec.env.iter().filter(|(k, _)| locale_or_zone(k)).cloned().collect();
-        match self.protocol {
-            Protocol::ClaudeStreamJson => env.extend(super::claude::FIXED_ENV.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))),
-            // Cursor's sign-in opens no browser (its link is shown wherever the person is).
-            Protocol::Acp(_) if self.id == "cursor" => env.push(("NO_OPEN_BROWSER".to_owned(), "1".to_owned())),
-            _ => {}
+        // Its environment's `machine` and `value` variables, as they are (docs/agents.md, "Where they
+        // apply"): a `machine` one read from this machine's user; one they haven't, or an `unset` one,
+        // sets nothing over its image's.
+        for (k, v) in spec.agentenv.as_ref().map(|e| super::agentenv::layer(e, &super::agentenv::said())).unwrap_or_default() {
+            env.retain(|(e, _)| *e != k);
+            if let Some(v) = v {
+                env.push((k, v));
+            }
         }
+        // What kiln fixes for its harness, over all of that.
+        let fixed: Vec<(String, String)> = match self.protocol {
+            Protocol::ClaudeStreamJson => super::claude::FIXED_ENV.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            // Cursor's sign-in opens no browser (its link is shown wherever the person is).
+            Protocol::Acp(_) if self.id == "cursor" => vec![("NO_OPEN_BROWSER".to_owned(), "1".to_owned())],
+            _ => Vec::new(),
+        };
+        env.retain(|(e, _)| !fixed.iter().any(|(f, _)| f == e));
+        env.extend(fixed);
         Ok(Elsewhere { member: self.id, args, env })
     }
 
@@ -563,44 +576,67 @@ fn joined_path(first: Option<&std::ffi::OsStr>, then: Option<&std::ffi::OsStr>) 
     std::env::join_paths(dirs).ok().filter(|p| !p.is_empty())
 }
 
-/// The session's environment over its user's login shell's, over the machine's: what its shell had
-/// (minus the shell's own terminal plumbing), with no `KILN_*` variable of any but those kiln gives
-/// it, and without what a Claude Code session sets for its children.
+/// The session's environment (docs/agents.md, "Where they apply"), top wins: kiln's own; its
+/// environment's variables (`Spec::agentenv`); what its shell had (`Spec::env`, minus the shell's own
+/// terminal plumbing); its base, the machine's user's environment (`agentenv::said`) or, `clean`, only
+/// what a harness needs of it; the runner's own. No `KILN_*` variable of any but those kiln gives it,
+/// and without what a Claude Code session sets for its children.
 fn set_env(p: &mut Process, spec: &Spec) {
-    set_env_over(p, spec, &crate::reach::serve::login_said().unwrap_or_default());
+    set_env_over(p, spec, &super::agentenv::said());
 }
 
-/// [`set_env`], with `login` the variables the login shell said.
-fn set_env_over(p: &mut Process, spec: &Spec, login: &[(String, String)]) {
-    // kiln's own variables are the server's or the runner's that starts it (its data folder, its
-    // config, its supervisor's socket, its admin token), or those of the shell `kiln spawn` took the
-    // environment of, which a kiln terminal has from the server: none goes on to the agent, which
-    // gets its own from kiln (its sockets here, its mark and its tools' as it starts). A test server
-    // an agent started opened production's database through its KILN_DATA_DIR (2026-11-06).
-    for (k, _) in std::env::vars_os() {
-        if kilns(&k) {
-            p.env_remove(k);
-        }
-    }
-    // What its user's login shell sets, as `kiln run`'s commands have it (`crate::reach::serve`):
-    // a harness signs in by an API key there too (docs/agents.md, "Signing harnesses in and
-    // out"), which a runner's service never read. Without it, a session started from Mission
-    // control or a goal ran Claude Code on the subscription it was signed in to, and paused at
-    // that account's usage limits, while one `kiln spawn` started from a terminal used the key that
-    // terminal had.
-    for (k, v) in login {
-        if !kilns(std::ffi::OsStr::new(k)) && !matches!(k.as_str(), "TERM" | "COLUMNS" | "LINES") {
+/// [`set_env`], with `user` the machine's user's environment.
+fn set_env_over(p: &mut Process, spec: &Spec, user: &[(String, String)]) {
+    let agentenv = spec.agentenv.as_ref();
+    if agentenv.is_some_and(|e| e.base == super::agentenv::Base::Clean) {
+        // Nothing of the runner's own, nor the rest of its user's: only what a harness needs, as
+        // its user has it.
+        p.env_clear();
+        for (k, v) in super::agentenv::clean(user) {
             p.env(k, v);
         }
+    } else {
+        // kiln's own variables are the server's or the runner's that starts it (its data folder, its
+        // config, its supervisor's socket, its admin token), or those of the shell `kiln spawn` took the
+        // environment of, which a kiln terminal has from the server: none goes on to the agent, which
+        // gets its own from kiln (its sockets here, its mark and its tools' as it starts). A test server
+        // an agent started opened production's database through its KILN_DATA_DIR (2026-11-06).
+        for (k, _) in std::env::vars_os() {
+            if kilns(&k) {
+                p.env_remove(k);
+            }
+        }
+        // What its user has (`agentenv::read`: on Unix their login shell's, as `kiln run`'s commands
+        // have it, over launchd's or their user manager's; on Windows the registry's as it is now): a
+        // harness signs in by an API key there too (docs/agents.md, "Signing harnesses in and
+        // out"), which a runner's service never read. Without it, a session started from Mission
+        // control or a goal ran Claude Code on the subscription it was signed in to, and paused at
+        // that account's usage limits, while one `kiln spawn` started from a terminal used the key that
+        // terminal had.
+        for (k, v) in user {
+            if !kilns(std::ffi::OsStr::new(k)) && !matches!(k.as_str(), "TERM" | "COLUMNS" | "LINES") {
+                p.env(k, v);
+            }
+        }
     }
-    // The PATH it was found on, so what it starts (its interpreter, its tools) is found too.
-    if let Some(path) = search_path() {
+    // The PATH it was found on, so what it starts (its interpreter, its tools) is found too, then the
+    // folders only its user's has (on Windows, those the registry's Path gained since the runner
+    // started).
+    let users = user.iter().rev().find(|(k, _)| if cfg!(windows) { k.eq_ignore_ascii_case("PATH") } else { k == "PATH" }).map(|(_, v)| std::ffi::OsStr::new(v.as_str()));
+    if let Some(path) = joined_path(search_path().as_deref(), users) {
         p.env("PATH", path);
     }
     for (k, v) in &spec.env {
         if !kilns(std::ffi::OsStr::new(k)) && !matches!(k.as_str(), "TERM" | "COLUMNS" | "LINES") {
             p.env(k, v);
         }
+    }
+    // Its environment's variables, each set or taken away in order (`agentenv::layer`).
+    for (k, v) in agentenv.map(|e| super::agentenv::layer(e, user)).unwrap_or_default() {
+        match v {
+            Some(v) => p.env(k, v),
+            None => p.env_remove(k),
+        };
     }
     // `kiln run` in the agent's shell reaches other runners through this machine's runner.
     if let Some(sock) = crate::reach::local::socket() {
@@ -626,19 +662,24 @@ fn kilns(name: &std::ffi::OsStr) -> bool {
     name.as_encoded_bytes().starts_with(b"KILN_")
 }
 
-/// Where Claude Code keeps its configuration for this session: `CLAUDE_CONFIG_DIR` from the
-/// session's environment, its user's login shell's or the machine's, as [`set_env`] layers them,
-/// else `~/.claude`.
+/// Where Claude Code keeps its configuration for this session: `CLAUDE_CONFIG_DIR` as [`set_env`]
+/// layers it (its environment's, the session's shell's, its user's unless its base is `clean`), else
+/// `~/.claude`.
 fn claude_config_dir(spec: &Spec) -> String {
-    spec.env
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
-        .map(|(_, v)| v.clone())
-        .or_else(|| crate::reach::serve::login_said()?.into_iter().rev().find(|(k, _)| k == "CLAUDE_CONFIG_DIR").map(|(_, v)| v))
-        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
-        .filter(|d| !d.trim().is_empty())
-        .unwrap_or_else(|| crate::os::home_dir().join(".claude").to_string_lossy().into_owned())
+    config_dir_over(spec, &super::agentenv::said())
+}
+
+/// [`claude_config_dir`], with `user` the machine's user's environment.
+fn config_dir_over(spec: &Spec, user: &[(String, String)]) -> String {
+    const NAME: &str = "CLAUDE_CONFIG_DIR";
+    let from_agentenv = spec.agentenv.as_ref().and_then(|e| super::agentenv::layer(e, user).into_iter().rev().find(|(k, _)| k == NAME).map(|(_, v)| v));
+    let clean = spec.agentenv.as_ref().is_some_and(|e| e.base == super::agentenv::Base::Clean);
+    let dir = match from_agentenv {
+        // Set by its environment, or taken away there: Claude Code's own default.
+        Some(v) => v,
+        None => spec.env.iter().rev().find(|(k, _)| k == NAME).map(|(_, v)| v.clone()).or_else(|| user.iter().rev().find(|(k, _)| k == NAME && !clean).map(|(_, v)| v.clone())),
+    };
+    dir.filter(|d| !d.trim().is_empty()).unwrap_or_else(|| crate::os::home_dir().join(".claude").to_string_lossy().into_owned())
 }
 
 /// A harness adapter: turns the harness's output into the normalized model and commands into
@@ -1643,6 +1684,98 @@ mod tests {
         let mut p = Process::new("claude");
         set_env_over(&mut p, &spec, &[]);
         assert!(p.get_envs().all(|(k, _)| k != "ANTHROPIC_API_KEY"));
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+    }
+
+    fn agentenv(base: super::super::agentenv::Base, vars: Vec<(&str, super::super::agentenv::Set)>) -> super::super::agentenv::Resolved {
+        super::super::agentenv::Resolved { id: "e1".into(), name: "work".into(), version: 1, base, vars: vars.into_iter().map(|(k, v)| (k.to_owned(), v)).collect() }
+    }
+
+    /// docs/agents.md, "Where they apply": its environment's variables over the shell `kiln spawn` took
+    /// the environment of, over its user's; an `unset` one taken away, a `machine` one read from its
+    /// user's; kiln's own never set from it, and what kiln scrubs scrubbed whatever it says.
+    #[test]
+    fn an_environments_variables_win_over_the_sessions_shell_and_its_user_under_kilns_own() {
+        use super::super::agentenv::{Base, Set};
+        let env = agentenv(
+            Base::User,
+            vec![
+                ("SET_BY_ALL", Set::Value("environment".into())),
+                ("EDITOR", Set::Unset),
+                ("ANTHROPIC_API_KEY", Set::Machine("WORK_KEY".into())),
+                ("KILN_HARNESS_SOCK", Set::Value("/not-kilns".into())),
+                ("CLAUDECODE", Set::Value("1".into())),
+            ],
+        );
+        let spec = Spec { kind: "claude".into(), env: pairs(&[("SET_BY_ALL", "shell"), ("SHELL_ONLY", "s")]), agentenv: Some(env), ..Spec::default() };
+        let user = pairs(&[("ANTHROPIC_API_KEY", "fake-login"), ("WORK_KEY", "fake-work"), ("EDITOR", "vi"), ("SET_BY_ALL", "user")]);
+        let mut p = Process::new("claude");
+        set_env_over(&mut p, &spec, &user);
+        let env: std::collections::HashMap<_, _> = p.get_envs().collect();
+        let var = |k: &str| env.get(std::ffi::OsStr::new(k)).copied();
+        assert_eq!(var("SET_BY_ALL"), Some(Some(std::ffi::OsStr::new("environment"))));
+        assert_eq!(var("SHELL_ONLY"), Some(Some(std::ffi::OsStr::new("s"))));
+        assert_eq!(var("EDITOR"), Some(None), "unset: taken away");
+        assert_eq!(var("ANTHROPIC_API_KEY"), Some(Some(std::ffi::OsStr::new("fake-work"))));
+        assert_ne!(var("KILN_HARNESS_SOCK"), Some(Some(std::ffi::OsStr::new("/not-kilns"))));
+        assert_eq!(var("CLAUDECODE"), Some(None));
+    }
+
+    /// Claude Code's configuration folder is where its environment puts it, else where the session's
+    /// shell or its user does; base `clean` has none of its user's; one its environment takes away is
+    /// Claude Code's own default.
+    #[test]
+    fn claude_code_keeps_its_configuration_where_its_environment_says() {
+        use super::super::agentenv::{Base, Set};
+        let user = pairs(&[("CLAUDE_CONFIG_DIR", "/u/.claude-user")]);
+        let default = crate::os::home_dir().join(".claude").to_string_lossy().into_owned();
+        let with = |base, vars: Vec<(&str, Set)>| Spec { kind: "claude".into(), agentenv: Some(agentenv(base, vars)), ..Spec::default() };
+        assert_eq!(config_dir_over(&Spec::default(), &user), "/u/.claude-user");
+        assert_eq!(config_dir_over(&with(Base::User, vec![("CLAUDE_CONFIG_DIR", Set::Value("/e".into()))]), &user), "/e");
+        assert_eq!(config_dir_over(&with(Base::User, vec![("CLAUDE_CONFIG_DIR", Set::Unset)]), &user), default);
+        assert_eq!(config_dir_over(&with(Base::Clean, Vec::new()), &user), default);
+        assert_eq!(config_dir_over(&with(Base::User, Vec::new()), &user), "/u/.claude-user");
+    }
+
+    /// Base `clean`: the harness's process has its user's home, search path and locale, and nothing
+    /// else, neither the rest of its user's nor the runner's own (cargo's `CARGO_*`, here).
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_environment_gives_a_harness_only_what_it_needs() -> anyhow::Result<()> {
+        use super::super::agentenv::{Base, Set};
+        let spec = Spec { kind: "claude".into(), agentenv: Some(agentenv(Base::Clean, vec![("ADDED", Set::Value("a".into()))])), ..Spec::default() };
+        let user = pairs(&[("HOME", "/home/clean"), ("LANG", "C.UTF-8"), ("PATH", "/usr/bin:/bin"), ("USERS_OWN", "x")]);
+        let mut p = Process::new("/usr/bin/env");
+        set_env_over(&mut p, &spec, &user);
+        anyhow::ensure!(std::env::vars().any(|(k, _)| k.starts_with("CARGO")), "the runner here has cargo's variables");
+        let out = String::from_utf8(p.output()?.stdout)?;
+        let names: Vec<&str> = out.lines().filter_map(|l| l.split_once('=').map(|(k, _)| k)).collect();
+        for k in ["HOME", "LANG", "PATH", "ADDED"] {
+            anyhow::ensure!(names.contains(&k), "{k} missing: {names:?}");
+        }
+        anyhow::ensure!(!names.iter().any(|k| *k == "USERS_OWN" || k.starts_with("CARGO")), "more than it needs: {names:?}");
+        Ok(())
+    }
+
+    /// In a microVM: its environment's `value` variables over the session's locale, an `unset` one
+    /// setting nothing, and what kiln fixes for Claude Code over both, each name once.
+    #[test]
+    fn an_isolated_harness_takes_its_environments_variables_under_what_kiln_fixes() -> anyhow::Result<()> {
+        use super::super::agentenv::{Base, Set};
+        let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+        let (fixed, _) = super::super::claude::FIXED_ENV.first().copied().ok_or_else(|| anyhow::anyhow!("nothing fixed"))?;
+        let env = agentenv(Base::User, vec![("LANG", Set::Value("de_DE.UTF-8".into())), ("GOOSE_PROVIDER", Set::Value("groq".into())), ("TZ", Set::Unset), (fixed, Set::Value("0".into()))]);
+        let spec = Spec { kind: "claude".into(), env: pairs(&[("LANG", "C"), ("TZ", "UTC"), ("NOT_LOCALE", "x")]), agentenv: Some(env), ..Spec::default() };
+        let run = claude.elsewhere(&spec)?;
+        let get = |k: &str| run.env.iter().filter(|(n, _)| n == k).map(|(_, v)| v.as_str()).collect::<Vec<_>>();
+        assert_eq!(get("LANG"), ["de_DE.UTF-8"]);
+        assert_eq!(get("GOOSE_PROVIDER"), ["groq"]);
+        assert!(get("TZ").is_empty() && get("NOT_LOCALE").is_empty());
+        assert_eq!(get(fixed), ["1"]);
+        Ok(())
     }
 
     #[test]

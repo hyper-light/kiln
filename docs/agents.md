@@ -162,8 +162,11 @@ that login shell's environment as well, as reach's runs do, kiln's own `KILN_*` 
 terminal ones (`TERM`, `COLUMNS`, `LINES`) left out: a runner's service (launchd, systemd) never
 reads `~/.zshrc` or `~/.profile`, so an API key a harness signs in by exported there
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) reaches it only this way. Without it, Claude Code ran on
-the subscription it was signed in to and paused at that account's usage limits. An agent started
-from a kiln shell (`kiln spawn`) has that shell's environment over the login shell's.
+the subscription it was signed in to and paused at that account's usage limits. Under the login
+shell's, it has what its user's other places hold as it starts (launchd's user domain, the systemd
+user manager, PAM's files; on Windows, which has no login shell, the registry's environment as it is
+then: "What a machine's user has", below), which the runner read only as it started, if ever. An
+agent started from a kiln shell (`kiln spawn`) has that shell's environment over its user's.
 
 ## Environments
 
@@ -218,7 +221,7 @@ refuse them or warn about them (decided by the user, 2026-11-18).
 The server keeps which environment each session runs with, and opens it again (its newest version,
 its secrets read again) whenever the session's harness starts: started, restarted, resumed after a
 crash or a runner's restart, moved. An environment applied to a running session starts its harness
-again at once, unless it is told to wait for its next start (`restart: false`). An environment some
+again at once, or once the turn under way ends, unless it is told to wait for its next start (`restart: false`). An environment some
 session runs with can't be deleted: the refusal names those sessions.
 
 ### What a machine's user has
@@ -229,7 +232,7 @@ A runner says which variables its user has and where each is set, by name alone,
 | System | Where it looks | `sources` |
 |---|---|---|
 | macOS | the login shell (`$SHELL -l -i`, above); launchd's user domain (`launchctl getenv`, for the names `launchctl` reports set) | `login_shell`, `launchd` |
-| Linux | the login shell; the systemd user manager (`systemctl --user show-environment`: `environment.d`, `systemctl --user set-environment`); PAM's (`/etc/environment`, `~/.pam_environment`) | `login_shell`, `systemd_user`, `pam` |
+| Linux | the login shell; the systemd user manager, where one answers (`systemctl --user show-environment`: `environment.d`, `systemctl --user set-environment`); PAM's `pam_env`, where a PAM stack loads it (`/etc/security/pam_env.conf`, `/etc/environment`, each from `/usr/etc` where `/etc` has none; `~/.pam_environment` where a stack sets `user_readenv=1`) | `login_shell`, `systemd_user`, `pam` |
 | Windows | the user's and the system's environment in the registry (`HKCU\Environment`, `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`), `REG_EXPAND_SZ` expanded as Windows does | `user_registry`, `system_registry` |
 | every | the runner's own process | `runner` |
 
