@@ -1,6 +1,7 @@
 //! Where a machine's user's variables are set (docs/agents.md, "What a machine's user has"), read from
 //! what each place says: pure functions of its text, so each is tested on every system. Reading the
-//! places themselves (a command, a file, the registry) is the parent's, behind its system's `cfg`.
+//! places themselves (a command, a file, the registry) is the parent's, behind its system's `cfg`: what
+//! one system reads alone is dead code on the others (`allow(dead_code)` there), tested everywhere.
 
 use super::Source;
 
@@ -19,10 +20,12 @@ impl Env {
         Self { vars: Vec::new(), fold }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn same(&self, a: &str, b: &str) -> bool {
         if self.fold { a.eq_ignore_ascii_case(b) } else { a == b }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn get(&self, name: &str) -> Option<&str> {
         self.vars.iter().find(|(k, _)| self.same(k, name)).map(|(_, v)| v.as_str())
     }
@@ -35,6 +38,7 @@ impl Env {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn remove(&mut self, name: &str) {
         let fold = self.fold;
         self.vars.retain(|(k, _)| if fold { !k.eq_ignore_ascii_case(name) } else { k != name });
@@ -79,6 +83,7 @@ impl Composed {
 /// each of which the runner read only as it started, if ever); over those, what the login shell's
 /// startup files set (`login`, its answer: a variable it has otherwise than the runner, which it
 /// inherited from). `None` in a place takes a variable away (pam_env's bare name).
+#[cfg_attr(windows, allow(dead_code))]
 pub fn compose_unix(runner: &[(String, String)], places: &[(Source, Vec<(String, Option<String>)>)], login: &[(String, String)]) -> Composed {
     let mut c = Composed::from_runner(runner, false);
     for (source, vars) in places {
@@ -102,6 +107,7 @@ pub fn compose_unix(runner: &[(String, String)], places: &[(Source, Vec<(String,
 /// caller's context" (launchctl(1)). Its output "is NOT API" (launchctl(1), `print`): names alone
 /// are taken from it, each read again with `launchctl getenv`, which is; a block it no longer shows
 /// so finds none.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn launchd_names(print: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut inside = false;
@@ -126,6 +132,7 @@ pub fn launchd_names(print: &str) -> Vec<String> {
 
 /// `launchctl getenv NAME`'s answer: its value and the newline it ends with; none when it prints
 /// nothing (no such variable).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn launchd_value(out: &str) -> Option<String> {
     let v = out.strip_suffix('\n').unwrap_or(out);
     (!v.is_empty()).then(|| v.to_owned())
@@ -135,6 +142,7 @@ pub fn launchd_value(out: &str) -> Option<String> {
 /// manager spawns" (`environment.d` and `systemctl --user set-environment` among it), one
 /// `VARIABLE=value` a line, a value with whitespace or characters special to the shell written
 /// `VARIABLE=$'value'`, dollar-single-quote escaped (systemctl(1), `show-environment`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn systemd_environment(text: &str) -> Vec<(String, Option<String>)> {
     text.lines()
         .filter_map(|line| line.split_once('='))
@@ -145,6 +153,7 @@ pub fn systemd_environment(text: &str) -> Vec<(String, Option<String>)> {
 
 /// A `$'…'` string's escapes, as bash reads them (bash(1), QUOTING: `\a \b \e \E \f \n \r \t \v \\
 /// \' \" \?`, `\nnn` octal, `\xHH` hexadecimal); any other backslash is kept.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn unescape_dollar_single(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(s.len());
     let b = s.as_bytes();
@@ -201,6 +210,7 @@ fn unescape_dollar_single(s: &str) -> String {
 /// ending the line wherever it is, an `export ` before the key dropped, a key of letters, digits and
 /// `_` alone; an opening quote dropped, and a quote that ends the line; a bare `KEY` takes it away
 /// (`None`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn pam_environment(text: &str) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -236,6 +246,7 @@ pub fn pam_environment(text: &str) -> Vec<(String, Option<String>)> {
 /// user's from `passwd` (`home`, `shell`), and `\$`, `\@`, `\\` themselves; OVERRIDE's when it's not
 /// empty, else DEFAULT's (pam_env.conf(5); `_parse_config_file`, `_expand_arg`,
 /// `_define_var`). One that's neither, or empty unquoted, sets nothing.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn pam_conf(text: &str, set: &[(String, String)], home: &str, shell: &str) -> Vec<(String, Option<String>)> {
     let mut out: Vec<(String, Option<String>)> = Vec::new();
     let joined = text.replace("\\\n", "");
@@ -264,6 +275,7 @@ pub fn pam_conf(text: &str, set: &[(String, String)], home: &str, shell: &str) -
 
 /// The value of `KEY=` in `rest` (one quoted in `"…"` whole may hold blanks), and whether it was
 /// quoted.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn conf_option(rest: &str, key: &str) -> Option<(String, bool)> {
     let at = rest.find(key).filter(|&at| at == 0 || rest.as_bytes().get(at - 1).is_some_and(u8::is_ascii_whitespace))?;
     let v = rest.get(at + key.len()..)?;
@@ -274,6 +286,7 @@ fn conf_option(rest: &str, key: &str) -> Option<(String, bool)> {
 }
 
 /// `${VAR}`, `@{HOME}`, `@{SHELL}` and the escapes of pam_env's configuration format.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn conf_expand(v: &str, known: &dyn Fn(&str) -> String, home: &str, shell: &str) -> String {
     let mut out = String::with_capacity(v.len());
     let mut chars = v.chars().peekable();
@@ -305,6 +318,7 @@ fn conf_expand(v: &str, known: &dyn Fn(&str) -> String, home: &str, shell: &str)
 /// loads it at all (`pam_env.so`; Alpine's logins, with no PAM, never do), and whether one reads the
 /// user's own file (`user_readenv=1`; off by default and deprecated since Linux-PAM 1.5.0,
 /// pam_env(8)).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn pam_env_use<'a>(files: impl IntoIterator<Item = &'a str>) -> (bool, bool) {
     let mut used = (false, false);
     for text in files {
@@ -319,6 +333,7 @@ pub fn pam_env_use<'a>(files: impl IntoIterator<Item = &'a str>) -> (bool, bool)
 }
 
 /// One value of a registry key of variables: `REG_SZ`, or `REG_EXPAND_SZ` (`expand`).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct RegValue {
     pub name: String,
     pub data: String,
@@ -335,6 +350,7 @@ pub struct RegValue {
 /// Microsoft says (KB 100843, "Environment variables in Windows NT": "The User path is appended to
 /// the system path"). A runner's task keeps the environment it started with: a variable set since in
 /// System Properties is in the registry alone.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn compose_windows(runner: &[(String, String)], system: &[RegValue], user: &[RegValue]) -> Composed {
     let mut c = Composed::from_runner(runner, true);
     let mut system_path = false;
@@ -361,6 +377,7 @@ pub fn compose_windows(runner: &[(String, String)], system: &[RegValue], user: &
 /// `%NAME%` in `text` replaced by `env`'s value of `NAME`, its case ignored; one `env` hasn't left
 /// as it is ("If the name is not found, the %variableName% portion is left unexpanded", Microsoft
 /// Learn, `ExpandEnvironmentStringsW`).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn expand_windows(text: &str, env: &Env) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
