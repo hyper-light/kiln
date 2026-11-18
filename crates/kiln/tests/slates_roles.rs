@@ -20,6 +20,9 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 const GONE_WITHIN: Duration = Duration::from_secs(30);
 /// How often the process table is looked at while waited on.
 const LOOK_EVERY: Duration = Duration::from_millis(100);
+/// How long a destroyed volume may take to leave its instance's list: the daemon answers a destroy and tears the
+/// volume down in cooperative slices after (Slates' `Instance::destroy`), so it is listed until the last slice.
+const TORN_DOWN_WITHIN: Duration = Duration::from_secs(30);
 /// The most the test's volume holds: far more than its two small files.
 const ROOM: u64 = 64 << 20;
 /// A file's mode as the test writes it in the volume.
@@ -206,7 +209,11 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
         let made = made.clone();
         async move { slates::remove(&made).await }
     })?;
-    assert!(library.list()?.iter().all(|v| v.id != volume), "the volume outlived its removal");
+    let until = Instant::now() + TORN_DOWN_WITHIN;
+    while library.list()?.iter().any(|v| v.id == volume) {
+        anyhow::ensure!(Instant::now() < until, "the volume outlived its removal by {}s", TORN_DOWN_WITHIN.as_secs());
+        std::thread::sleep(LOOK_EVERY);
+    }
     drop(library);
 
     // Stopped by its anchor's process group, every process of the instance goes.
