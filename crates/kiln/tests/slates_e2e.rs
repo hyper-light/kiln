@@ -476,7 +476,7 @@ pub fn approval_said(lines: &[String]) -> Option<String> {
 /// ask, never refused outright (neither mode forbids writing).
 pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), String> {
     for want in [format!("WROTE {probe}"), format!("APPENDED {}", APPENDED.0), format!("REMOVED {}", REMOVED.0)] {
-        if !lines.iter().any(|l| *l == want) {
+        if !lines.contains(&want) {
             return Err(format!("the harness never said {want:?}: {lines:?}"));
         }
     }
@@ -877,7 +877,7 @@ mod checks {
         std::fs::create_dir_all(&without)?;
         std::fs::write(with.join(if cfg!(windows) { "slates.exe" } else { "slates" }), "")?;
         let path = std::env::join_paths([&without, &with])?.to_string_lossy().into_owned();
-        assert_eq!(holding_cli(&path), [with.clone()]);
+        assert_eq!(holding_cli(&path), std::slice::from_ref(&with));
         let clean = std::env::join_paths([&without])?.to_string_lossy().into_owned();
         assert!(holding_cli(&clean).is_empty());
         Ok(())
