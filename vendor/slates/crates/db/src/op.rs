@@ -1,0 +1,536 @@
+//! The operations: every local mutation of a partition, as the log records it (§4.8 `OpLog`
+//! "every local mutation"). An operation carries what `apply` needs and nothing it decides:
+//! the guard (`Partition::check`) runs before the append, so a recorded operation applies
+//! unconditionally and replay is deterministic.
+
+use slates_wire::Wire;
+
+use crate::catalog::{
+  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
+  GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
+  LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
+  PlacementState, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  VolumeState,
+};
+
+/// One mutation.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum Op {
+  /// A volume was created.
+  VolumeCreated {
+    /// The record.
+    record: VolumeRecord,
+  },
+  /// A volume changed state.
+  VolumeStateChanged {
+    /// The volume.
+    id: VolumeId,
+    /// The state.
+    state: VolumeState,
+  },
+  /// A volume was resized.
+  VolumeResized {
+    /// The volume.
+    id: VolumeId,
+    /// The size class.
+    size: SizeClass,
+  },
+  /// A volume's accounting was recorded.
+  VolumeAccounted {
+    /// The volume.
+    id: VolumeId,
+    /// Bytes referenced.
+    referenced_bytes: u64,
+    /// Bytes unique.
+    unique_bytes: u64,
+  },
+  /// A volume's head advanced (a snapshot was taken).
+  VolumeHeadAdvanced {
+    /// The volume.
+    id: VolumeId,
+    /// The head snapshot.
+    head: SnapshotId,
+    /// The head epoch.
+    epoch: u64,
+  },
+  /// A volume's access list changed.
+  AccessChanged {
+    /// The volume.
+    id: VolumeId,
+    /// The list.
+    access: Vec<AccessEntry>,
+  },
+  /// A volume was destroyed (its record becomes a tombstone).
+  VolumeDestroyed {
+    /// The volume.
+    id: VolumeId,
+  },
+  /// A snapshot was recorded.
+  SnapshotTaken {
+    /// The record.
+    record: SnapshotRecord,
+  },
+  /// A snapshot's placement changed.
+  SnapshotPlaced {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    id: SnapshotId,
+    /// The placement.
+    placed: PlacementState,
+  },
+  /// A snapshot was destroyed.
+  SnapshotDestroyed {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    id: SnapshotId,
+  },
+  /// A lineage edge was recorded.
+  LineageAdded {
+    /// The edge.
+    edge: LineageEdge,
+  },
+  /// A lease was taken or renewed.
+  LeaseTaken {
+    /// The volume.
+    volume: VolumeId,
+    /// The lease.
+    lease: LeaseRecord,
+  },
+  /// A lease was released or expired.
+  LeaseReleased {
+    /// The volume.
+    volume: VolumeId,
+  },
+  /// An attachment was added.
+  AttachmentAdded {
+    /// The record.
+    record: AttachmentRecord,
+  },
+  /// An attachment was removed.
+  AttachmentRemoved {
+    /// The attachment.
+    id: u64,
+  },
+  /// A host mount's attachment was bound to the path the mount was established at (§4.4
+  /// `Binding → Bound`; GAP-A9-4): its form becomes `ChosenPath { path }`, a scoped mount's keeps its scope and a
+  /// bound mount's its identity and scope (A-115). Appended.
+  AttachmentBound {
+    /// The attachment.
+    id: u64,
+    /// The mount point, as the mounting process established it.
+    path: String,
+  },
+  /// A completion was recorded.
+  CompletionRecorded {
+    /// The record.
+    record: CompletionRecord,
+  },
+  /// A client acknowledged completions.
+  CompletionsAcknowledged {
+    /// The host id (`HostId.0`) whose client this is (this node for a local client; the authenticated origin
+    /// for a forwarded one) — the high half of the globally-unique completion key.
+    origin: u64,
+    /// The client.
+    client: u32,
+    /// Every sequence up to and including this one, except `owed`.
+    up_to: u32,
+    /// The ids at or below `up_to` the client still owes (awaited, or held for a resend under the same id): kept open
+    /// rather than released (§4.9). An open id this does not name is closed; a closed one is never reopened.
+    owed: Vec<u32>,
+  },
+  /// A grant was issued.
+  GrantIssued {
+    /// The record.
+    record: GrantRecord,
+  },
+  /// A grant changed state.
+  GrantStateChanged {
+    /// The grant.
+    id: u64,
+    /// The state.
+    state: GrantState,
+  },
+  /// A landing lease was taken.
+  LandingLeaseTaken {
+    /// The record.
+    record: LandingLeaseRecord,
+  },
+  /// A landing lease was released.
+  LandingLeaseReleased {
+    /// The target.
+    target: String,
+  },
+  /// A landing was recorded.
+  LandingRecorded {
+    /// The record.
+    record: LandingRecord,
+  },
+  /// A landing changed state.
+  LandingStateChanged {
+    /// The landing.
+    id: u64,
+    /// The state.
+    state: LandingState,
+    /// Entries written.
+    written: u32,
+    /// Entries in conflict.
+    conflicts: u32,
+  },
+  /// An audit record was appended.
+  AuditAppended {
+    /// The record.
+    record: AuditRecord,
+  },
+  /// A green volume's merge chain advanced by one accepted increment (§4.16 "the merge record is a
+  /// partition log append"; §4.8). The bytes are the merge crate's encoded increment; the database
+  /// stores them opaquely (it never parses a merge structure) and the server replays them on recovery
+  /// to rebuild the green. Appended at the end of the operation set for append-only evolution.
+  GreenAdvanced {
+    /// The green volume.
+    green: VolumeId,
+    /// The encoded increment (identity, base, ops document and post-state).
+    increment: Vec<u8>,
+  },
+  /// A snapshot's content identity was computed (§4.10, D-17): the BLAKE3 root of its archive's
+  /// manifest — the value the fleet's holders verify and a reader fetches the content by. A snapshot
+  /// is taken O(1) with no identity (`SnapshotTaken` records `None`); the identity is recorded once the
+  /// content plane has archived it. Appended at the end of the operation set for append-only evolution.
+  SnapshotIdentified {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    id: SnapshotId,
+    /// The manifest identity.
+    identity: [u8; 32],
+  },
+  /// A consumer was enrolled under an account by the human surface (§4.13). Appended at the end for
+  /// append-only evolution.
+  ConsumerEnrolled {
+    /// The record.
+    record: ConsumerRecord,
+  },
+  /// A consumer's enrollment was revoked by the human surface (§4.13).
+  ConsumerRevoked {
+    /// The consumer.
+    consumer: u64,
+  },
+  /// A green volume's origin — its version-0 state, captured from a complete immutable base — was
+  /// recorded (§4.16 "the origin version from a snapshot"; the A-9 requirement that a chain starts
+  /// "from scratch or a complete immutable base"). The bytes are the merge crate's encoded origin;
+  /// the database stores them opaquely (it never parses a merge structure) and the server replays
+  /// them before the chain on recovery, so a green seeded from a base recovers to the same state as
+  /// one still running. Recorded once, before any increment; counted against the same byte budget
+  /// as the chain. Appended at the end of the operation set for append-only evolution.
+  GreenOriginated {
+    /// The green volume.
+    green: VolumeId,
+    /// The encoded origin.
+    origin: Vec<u8>,
+  },
+  /// Reserve a client identity before handoff (§4.7, §4.9). The control partition retains
+  /// the highest issued id so a restarted listener cannot reuse a completion identity.
+  ClientIdReserved {
+    /// The highest client id issued so far.
+    client: u32,
+  },
+  /// An NFSv4 open was recorded or changed at its file's owner (§4.6 A-37). Appended at the end for
+  /// append-only evolution, as are the NFSv4 operations after it.
+  NfsOpenSet {
+    /// The record.
+    record: NfsOpenRecord,
+  },
+  /// An NFSv4 open was closed or freed.
+  NfsOpenCleared {
+    /// The state id's `other`.
+    other: [u8; 12],
+  },
+  /// An NFSv4 lock state was recorded or changed at its file's owner.
+  NfsLockSet {
+    /// The record.
+    record: NfsLockRecord,
+  },
+  /// An NFSv4 lock state was freed, or went with its open.
+  NfsLockCleared {
+    /// The state id's `other`.
+    other: [u8; 12],
+  },
+  /// Every open and lock state of an NFSv4 client at this owner was dropped (its lease lapsed, it
+  /// rebooted, or it was destroyed).
+  NfsClientStateCleared {
+    /// The client id.
+    clientid: u64,
+  },
+  /// An NFSv4 client was recorded or changed at the listener (§4.6 A-37).
+  NfsClientSet {
+    /// The record.
+    record: NfsClientRecord,
+  },
+  /// An NFSv4 client was dropped at the listener.
+  NfsClientCleared {
+    /// The client id.
+    clientid: u64,
+  },
+  /// This partition's NFSv4 instance advanced (§4.6 A-37): once per daemon life, before its first
+  /// NFSv4 id is minted, so every client, session and state id the partition mints names an instance
+  /// no earlier life used, and no id is ever minted twice.
+  NfsInstanceAdvanced {
+    /// The new instance.
+    instance: u32,
+  },
+  /// A volume took a base: a landing made a scratch volume an overlay over the directory it landed on
+  /// (§4.15 step 9), so a recovery reacquires that directory for it. Appended.
+  VolumeRebased {
+    /// The volume.
+    id: VolumeId,
+    /// What it now sits on.
+    base: BaseRecord,
+  },
+  /// A takeover successor adopted a destroyed volume's tombstone (AUD-29-43): it owes the tombstone and its
+  /// retirement to the volume's candidate holders exactly as the destroying owner did. Appended.
+  TombstoneAdopted {
+    /// The tombstone.
+    tombstone: Tombstone,
+  },
+  /// Every candidate holder holds a destroyed volume's retirement (AUD-29-43): nothing is owed any more and
+  /// the tombstone gives its slot back. Appended.
+  TombstoneRetired {
+    /// The destroyed volume.
+    id: VolumeId,
+  },
+  /// A snapshot mount was re-pinned (§4.4 `Bound → Advancing → Bound`; AUD-29-76): the attachment, and every
+  /// container bind borrowing it, now presents `snapshot`. Appended.
+  AttachmentRepinned {
+    /// The attachment.
+    id: u64,
+    /// The snapshot it now presents.
+    snapshot: crate::catalog::SnapshotId,
+  },
+  /// An NFSv4 delegation was granted or changed at its file's owner (§4.6 A-78). Appended.
+  NfsDelegationSet {
+    /// The record.
+    record: NfsDelegationRecord,
+  },
+  /// An NFSv4 delegation was returned or revoked. Appended.
+  NfsDelegationCleared {
+    /// The state id's `other`.
+    other: [u8; 12],
+  },
+  /// A sealing key was made and recorded wrapped by its parent (A-92). Appended.
+  SealKeySet {
+    /// The record.
+    record: crate::catalog::SealKeyRecord,
+  },
+  /// A sealing key was destroyed: its one wrapped copy is gone, so everything sealed under it is erased (seal.md
+  /// §3.1, cryptographic erase). Appended.
+  SealKeyDestroyed {
+    /// Whose key.
+    owner: crate::catalog::SealKeyOwner,
+  },
+  /// An NFSv4.1 session was recorded or changed at its client's listener (A-127). Appended.
+  NfsSessionSet {
+    /// The record.
+    record: crate::catalog::NfsSessionRecord,
+  },
+  /// An NFSv4.1 session was destroyed at its client's listener (A-127). Appended.
+  NfsSessionCleared {
+    /// Format: the session id (16 bytes).
+    sessionid: [u8; 16],
+  },
+  /// An NFSv4.1 call record was recorded or replaced with the file-state change one of its calls made (A-127).
+  /// Appended.
+  NfsCallSet {
+    /// The record.
+    record: crate::catalog::NfsCallRecord,
+  },
+  /// Every call record of a destroyed NFSv4.1 session was dropped (A-127). Appended.
+  NfsCallsCleared {
+    /// Format: the session id (16 bytes).
+    sessionid: [u8; 16],
+  },
+  /// An NFSv4 purge became owed to every owner, with the drop that made it (2026-10-10). Appended.
+  NfsPurgeOwed {
+    /// The purge.
+    record: crate::catalog::NfsPurgeRecord,
+  },
+  /// An owed NFSv4 purge was acknowledged by every owner (2026-10-10). Appended.
+  NfsPurgeSettled {
+    /// The purge.
+    record: crate::catalog::NfsPurgeRecord,
+  },
+  /// A volume's live shipping was turned on or off (§4.10, A-200; 2026-11-04). Appended.
+  LiveShippingChanged {
+    /// The volume.
+    id: VolumeId,
+    /// Whether it is live-shipped now.
+    live_shipped: bool,
+  },
+  /// A work volume's change since its last restatement, as the verb applied it (A-207; §4.16; D-18: a local
+  /// acknowledgement promises daemon-restart survival only when it is recoverable from anchor-owned RAM). The entry
+  /// is the server's encoded work-log entry (an edit or a declaration); the database stores it opaquely, appended to
+  /// the work's log, and the server replays the log onto the recovered work. Counted against the merge byte budget the
+  /// green chains share. Appended (2026-11-04).
+  WorkLogged {
+    /// The work volume.
+    work: VolumeId,
+    /// The encoded entry.
+    entry: Vec<u8>,
+  },
+  /// A green volume's origin, recorded as a reference to the complete immutable snapshot it starts from (A-217;
+  /// §4.16; the A-9 requirement that a chain starts "from scratch or a complete immutable base"): the base volume,
+  /// the snapshot, and the identity of the origin walked from it, so recovery walks the same snapshot again and
+  /// refuses one that no longer gives the same origin. The green holds the snapshot while it lives, so nothing frees
+  /// it under the reference. Recorded once, before any increment. Appended (2026-11-05).
+  GreenOriginHeld {
+    /// The green volume.
+    green: VolumeId,
+    /// The snapshot it names.
+    origin: crate::partition::OriginRef,
+  },
+  /// A work volume restated whole (§4.16): its base, the files it holds of its own and its journal, after an accepted
+  /// submit or a rebase. Replaces the work's log with this one entry. Appended (2026-11-04).
+  WorkRestated {
+    /// The work volume.
+    work: VolumeId,
+    /// The encoded restatement.
+    entry: Vec<u8>,
+  },
+  /// A name was reserved at its name's partition for a clone another partition is about to make (A-236): the name is
+  /// held from here, and resolves nothing until confirmed. Appended.
+  NameAliasReserved {
+    /// The alias, unconfirmed.
+    record: NameAliasRecord,
+  },
+  /// A reserved name's clone was made: the alias resolves from here (A-236). Appended.
+  NameAliasConfirmed {
+    /// The name.
+    name: String,
+  },
+  /// A name's alias was released: its clone was destroyed, never made, or no longer holds the name (A-236). Appended.
+  NameAliasReleased {
+    /// The name.
+    name: String,
+  },
+  /// A CLI attachment's term was renewed by a verb naming it (A-230). Appended.
+  AttachmentRenewed {
+    /// The attachment.
+    id: u64,
+    /// When its renewed term lapses.
+    expires_ns: u64,
+  },
+  /// A CLI attachment's term lapsed: it is removed, and its id kept among the expired so a later use is refused by kind
+  /// (A-230). Appended.
+  AttachmentExpired {
+    /// The attachment.
+    id: u64,
+  },
+  /// A green's checkpoint (W3; §4.16 "Deltas older than the derived retention fold into checkpoint deltas"): the
+  /// green's state at `version` beyond its origin, encoded (`slates_merge::checkpoint`), held in place of every
+  /// increment up to `version`, which applying it drops. Refused at or below the checkpoint held and past the head.
+  /// Appended (2026-11-06).
+  GreenCheckpointed {
+    /// The green volume.
+    green: VolumeId,
+    /// The version the checkpoint is the green's state at.
+    version: u64,
+    /// The encoded checkpoint.
+    checkpoint: Vec<u8>,
+  },
+  /// A live-shipped volume's shipper committed its holder set (A-240): carried by the catalog register to `f + 1`
+  /// before the shipper's first entry. Appended (2026-11-06).
+  LiveHoldersCommitted {
+    /// The volume.
+    id: VolumeId,
+    /// The shipper's epoch and holders.
+    holders: crate::catalog::LiveHolders,
+  },
+  /// A request ran and waits for a version of a green to commit before it completes (§4.16 "Commit", A-252): logged with
+  /// the version's append, in one transaction, so a resend under its id after a restart meets the wait and never runs
+  /// again. Its completion, recorded at the commit, replaces it. Appended (2026-11-08).
+  CompletionAwaiting {
+    /// The completion key's origin: this node for a local client, the authenticated forwarding peer for a forward.
+    origin: u64,
+    /// The client.
+    client: u32,
+    /// The sequence.
+    sequence: u32,
+    /// The green.
+    green: VolumeId,
+    /// The version it waits for.
+    version: u64,
+  },
+}
+
+impl Op {
+  /// The operation's name, for counters and the audit.
+  pub fn name(&self) -> &'static str {
+    match self {
+      Op::VolumeCreated { .. } => "volume_created",
+      Op::WorkLogged { .. } => "work_logged",
+      Op::GreenOriginHeld { .. } => "green_origin_held",
+      Op::WorkRestated { .. } => "work_restated",
+      Op::GreenCheckpointed { .. } => "green_checkpointed",
+      Op::VolumeStateChanged { .. } => "volume_state_changed",
+      Op::VolumeResized { .. } => "volume_resized",
+      Op::VolumeAccounted { .. } => "volume_accounted",
+      Op::VolumeHeadAdvanced { .. } => "volume_head_advanced",
+      Op::AccessChanged { .. } => "access_changed",
+      Op::VolumeDestroyed { .. } => "volume_destroyed",
+      Op::TombstoneAdopted { .. } => "tombstone_adopted",
+      Op::TombstoneRetired { .. } => "tombstone_retired",
+      Op::SnapshotTaken { .. } => "snapshot_taken",
+      Op::SnapshotPlaced { .. } => "snapshot_placed",
+      Op::SnapshotIdentified { .. } => "snapshot_identified",
+      Op::ConsumerEnrolled { .. } => "consumer_enrolled",
+      Op::ConsumerRevoked { .. } => "consumer_revoked",
+      Op::SnapshotDestroyed { .. } => "snapshot_destroyed",
+      Op::LineageAdded { .. } => "lineage_added",
+      Op::LeaseTaken { .. } => "lease_taken",
+      Op::LeaseReleased { .. } => "lease_released",
+      Op::AttachmentAdded { .. } => "attachment_added",
+      Op::AttachmentRemoved { .. } => "attachment_removed",
+      Op::AttachmentBound { .. } => "attachment_bound",
+      Op::CompletionRecorded { .. } => "completion_recorded",
+      Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
+      Op::GrantIssued { .. } => "grant_issued",
+      Op::GrantStateChanged { .. } => "grant_state_changed",
+      Op::LandingLeaseTaken { .. } => "landing_lease_taken",
+      Op::LandingLeaseReleased { .. } => "landing_lease_released",
+      Op::LandingRecorded { .. } => "landing_recorded",
+      Op::LandingStateChanged { .. } => "landing_state_changed",
+      Op::AuditAppended { .. } => "audit_appended",
+      Op::GreenAdvanced { .. } => "green_advanced",
+      Op::GreenOriginated { .. } => "green_originated",
+      Op::ClientIdReserved { .. } => "client_id_reserved",
+      Op::NfsOpenSet { .. } => "nfs_open_set",
+      Op::NfsOpenCleared { .. } => "nfs_open_cleared",
+      Op::NfsLockSet { .. } => "nfs_lock_set",
+      Op::NfsLockCleared { .. } => "nfs_lock_cleared",
+      Op::NfsClientStateCleared { .. } => "nfs_client_state_cleared",
+      Op::NfsClientSet { .. } => "nfs_client_set",
+      Op::NfsClientCleared { .. } => "nfs_client_cleared",
+      Op::NfsInstanceAdvanced { .. } => "nfs_instance_advanced",
+      Op::VolumeRebased { .. } => "volume_rebased",
+      Op::AttachmentRepinned { .. } => "attachment_repinned",
+      Op::NfsDelegationSet { .. } => "nfs_delegation_set",
+      Op::NfsDelegationCleared { .. } => "nfs_delegation_cleared",
+      Op::SealKeySet { .. } => "seal_key_set",
+      Op::SealKeyDestroyed { .. } => "seal_key_destroyed",
+      Op::NfsSessionSet { .. } => "nfs_session_set",
+      Op::NfsSessionCleared { .. } => "nfs_session_cleared",
+      Op::NfsCallSet { .. } => "nfs_call_set",
+      Op::NfsCallsCleared { .. } => "nfs_calls_cleared",
+      Op::NfsPurgeOwed { .. } => "nfs_purge_owed",
+      Op::NfsPurgeSettled { .. } => "nfs_purge_settled",
+      Op::NameAliasReserved { .. } => "name_alias_reserved",
+      Op::NameAliasConfirmed { .. } => "name_alias_confirmed",
+      Op::NameAliasReleased { .. } => "name_alias_released",
+      Op::AttachmentRenewed { .. } => "attachment_renewed",
+      Op::AttachmentExpired { .. } => "attachment_expired",
+      Op::LiveShippingChanged { .. } => "live_shipping_changed",
+      Op::LiveHoldersCommitted { .. } => "live_holders_committed",
+      Op::CompletionAwaiting { .. } => "completion_awaiting",
+    }
+  }
+}

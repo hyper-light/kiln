@@ -1,0 +1,1118 @@
+//! The microbenchmarks of §4.1: syscall cost, fault cost per page class, core-to-core ring round
+//! trip, memcpy throughput by size, hash throughput, codec throughput per candidate level, and the
+//! lock capacity the OS grants. The park/unpark latency has its own module, [`crate::wake`]: its
+//! event, placement and statistic are a design of their own (2026-09-22).
+//!
+//! Method: lmbench's baselines-and-subtraction for the fault probe (the map/unmap cost is
+//! measured on its own and subtracted) [A: McVoy & Staelin, USENIX'96]; the Kalibera-Jones
+//! stopping rule from [`crate::bench`] for every probe [A: Kalibera & Jones, ISMM'13]; pinned
+//! partner threads for the core matrix where the OS pins (Linux, Windows) and an affinity hint
+//! where it does not (macOS, recorded as such).
+//!
+//! Every probe takes its wall budget from the caller and reports `quick` when it stopped early.
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::bench::{Measurement, bytes_per_second, measure};
+use crate::facts::{CoreFacts, Facts, PageFacts};
+use crate::stats::Xorshift;
+
+/// Fault costs per page class, in nanoseconds per page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultCosts {
+  /// Nanoseconds per base-page fault when touching an anonymous mapping (map/unmap subtracted).
+  pub base_ns: u64,
+  /// The measurement behind `base_ns`, per region.
+  pub base_region: Measurement,
+  /// The map-and-unmap cost of the region alone, the subtracted baseline.
+  pub map_unmap_region: Measurement,
+  /// Nanoseconds per base page when the OS pre-populates the mapping (Linux `MAP_POPULATE`),
+  /// `None` where the OS has no such call.
+  pub populated_ns: Option<u64>,
+  /// Nanoseconds per base page inside a transparent-huge-page region, `None` where unavailable.
+  pub huge_ns: Option<u64>,
+  /// How many base pages each region held.
+  pub pages_per_region: u64,
+}
+
+/// The ring round trip between two cores: one cache line handed back and forth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorePairRtt {
+  /// The first core's id.
+  pub a: u32,
+  /// The second core's id.
+  pub b: u32,
+  /// The round trip, in nanoseconds.
+  pub rtt: Measurement,
+}
+
+/// How a probe's threads were placed (the core matrix's, the wake probe's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Pinning {
+  /// The OS pinned each thread to its core.
+  Pinned,
+  /// The OS took the placement as a hint only (macOS).
+  Hint,
+  /// Nothing was pinned by design: production does not fix its threads here (the process shares its
+  /// cores in time, [`crate::placement::Placement`]), so the OS placed the probe's threads as it places the
+  /// shards — the placement production runs under, not a refusal.
+  Scheduled,
+  /// Pinning was refused; threads ran wherever the scheduler put them.
+  Refused,
+}
+
+/// One point on the memcpy curve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemcpyPoint {
+  /// The copy size in bytes.
+  pub bytes: u64,
+  /// Bytes per second at that size.
+  pub bytes_per_second: u64,
+  /// The per-copy measurement.
+  pub per_copy: Measurement,
+}
+
+/// Hash throughput.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HashThroughput {
+  /// The buffer size hashed, in bytes.
+  pub bytes: u64,
+  /// BLAKE3 bytes per second.
+  pub blake3_bytes_per_second: u64,
+  /// The per-buffer measurement.
+  pub per_buffer: Measurement,
+}
+
+/// One codec at one level over the synthetic corpus.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodecPoint {
+  /// `lz4` or `zstd`.
+  pub codec: String,
+  /// The level (0 for LZ4, which has one).
+  pub level: i32,
+  /// Compression throughput in input bytes per second.
+  pub compress_bytes_per_second: u64,
+  /// Decompression throughput in output bytes per second.
+  pub decompress_bytes_per_second: u64,
+  /// Compressed size as parts per thousand of the input.
+  pub ratio_permille: u64,
+  /// The corpus size in bytes.
+  pub bytes: u64,
+  /// True when either direction's measurement stopped early.
+  pub quick: bool,
+}
+
+/// What the OS will let this process lock in RAM.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockCapacity {
+  /// Bytes the process may lock, as the OS's limit states it (0 when locking is refused).
+  pub bytes: u64,
+  /// Where the number came from.
+  pub source: String,
+  /// Whether a small confirming lock succeeded.
+  pub confirmed: bool,
+}
+
+/// Shape: the fault probe's region in base pages. Enough faults that two map/unmap syscalls are
+/// a small part of a sample, small enough that the region stays within any L2 (GAPS §5).
+pub const FAULT_REGION_PAGES: u64 = 256;
+
+/// Shape: above this many cores the ring matrix samples pairs with core 0 instead of all pairs
+/// (§4.1: "every core pair, or a sampled subset above 32 cores").
+pub const FULL_MATRIX_CORE_LIMIT: usize = 32;
+
+/// Shape: the zstd candidate levels the cost model chooses among: the fast preset, the default,
+/// the high preset, and the maximum (§4.11, D-13).
+pub const ZSTD_LEVELS: &[i32] = &[1, 3, 9, 19];
+
+/// Measures the cost of a system call that does nothing.
+pub fn syscall(budget: Duration) -> Measurement {
+  measure(platform::null_syscall, budget)
+}
+
+/// Measures fault costs per page class.
+pub fn faults(page: &PageFacts, budget: Duration) -> FaultCosts {
+  let region = page.base.saturating_mul(FAULT_REGION_PAGES);
+  // Shape: the three sub-probes (map/unmap baseline, base pages, populated pages) share the budget.
+  let per_probe = budget.checked_div(3).unwrap_or_default();
+  let map_unmap_region = measure(
+    || platform::map_touch_unmap(region, page.base, Touch::None),
+    per_probe,
+  );
+  let base_region = measure(
+    || platform::map_touch_unmap(region, page.base, Touch::Every),
+    per_probe,
+  );
+  let base_ns = base_region
+    .median_ns()
+    .saturating_sub(map_unmap_region.median_ns())
+    / FAULT_REGION_PAGES;
+  let populated_ns = platform::populated(region, page.base, per_probe)
+    .map(|m| m.median_ns().saturating_sub(map_unmap_region.median_ns()) / FAULT_REGION_PAGES);
+  let huge_ns =
+    platform::huge(page, per_probe).map(|(m, pages)| m.median_ns().checked_div(pages).unwrap_or(0));
+  FaultCosts {
+    base_ns,
+    base_region,
+    map_unmap_region,
+    populated_ns,
+    huge_ns,
+    pages_per_region: FAULT_REGION_PAGES,
+  }
+}
+
+/// How a region is touched after mapping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Touch {
+  /// Map and unmap only.
+  None,
+  /// Write one byte in every page.
+  Every,
+}
+
+/// Measures the ring round trip for every core pair (or the sampled subset above the limit). Each pair
+/// pins the calling thread to one core; the affinity the thread came in with is put back when the matrix
+/// is done, because a process spawned afterwards inherits the calling thread's mask — the anchor measures
+/// the profile and then spawns the daemon, and a daemon born on a one-core mask counted one core, computed
+/// a different machine identity and refused the anchor's segment
+/// (docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md). A mask that cannot be put
+/// back is reported as `Pinning::Refused`: the thread is then mis-pinned and the placement of nothing
+/// measured after it can be vouched for.
+pub fn core_matrix(cores: &[CoreFacts], budget: Duration) -> (Vec<CorePairRtt>, Pinning) {
+  let pairs = pair_list(cores);
+  if pairs.is_empty() {
+    return (Vec::new(), Pinning::Refused);
+  }
+  let came_in_with = platform::current_affinity();
+  let per_pair = budget
+    .checked_div(u32::try_from(pairs.len()).unwrap_or(u32::MAX).max(1))
+    .unwrap_or_default();
+  let mut pinning = Pinning::Pinned;
+  let mut out = Vec::with_capacity(pairs.len());
+  for (a, b) in pairs {
+    let (rtt, how) = ring_round_trip(a, b, per_pair);
+    pinning = weaker(pinning, how);
+    out.push(CorePairRtt { a, b, rtt });
+  }
+  if let Some(affinity) = came_in_with
+    && !platform::restore_affinity(&affinity)
+  {
+    pinning = Pinning::Refused;
+  }
+  (out, pinning)
+}
+
+/// The weaker of two placements: refused beats a hint beats a pin.
+pub(crate) fn weaker(x: Pinning, y: Pinning) -> Pinning {
+  match (x, y) {
+    (Pinning::Refused, _) | (_, Pinning::Refused) => Pinning::Refused,
+    (Pinning::Hint, _) | (_, Pinning::Hint) => Pinning::Hint,
+    (Pinning::Scheduled, _) | (_, Pinning::Scheduled) => Pinning::Scheduled,
+    _ => Pinning::Pinned,
+  }
+}
+
+fn pair_list(cores: &[CoreFacts]) -> Vec<(u32, u32)> {
+  let ids: Vec<u32> = cores.iter().map(|c| c.id).collect();
+  let mut pairs = Vec::new();
+  if ids.len() <= FULL_MATRIX_CORE_LIMIT {
+    let mut rest = ids.as_slice();
+    while let Some((a, later)) = rest.split_first() {
+      pairs.extend(later.iter().map(|b| (*a, *b)));
+      rest = later;
+    }
+  } else if let Some((first, rest)) = ids.split_first() {
+    pairs.extend(rest.iter().map(|b| (*first, *b)));
+  }
+  pairs
+}
+
+/// One pair: the caller's thread is placed on `a`, a partner on `b`; they hand a word back and
+/// forth; the per-round-trip time is measured with the harness on the caller's side.
+fn ring_round_trip(a: u32, b: u32, budget: Duration) -> (Measurement, Pinning) {
+  let turn = AtomicU32::new(0);
+  let stop = AtomicBool::new(false);
+  let mut pinning = platform::pin_current(a);
+  let mut result = None;
+  let partner_pin = AtomicU32::new(0);
+  std::thread::scope(|scope| {
+    scope.spawn(|| {
+      partner_pin.store(pinning_code(platform::pin_current(b)), Ordering::Release);
+      while !stop.load(Ordering::Acquire) {
+        if turn.load(Ordering::Acquire) == 1 {
+          turn.store(2, Ordering::Release);
+        } else {
+          std::hint::spin_loop();
+        }
+      }
+    });
+    let m = measure(
+      || {
+        turn.store(1, Ordering::Release);
+        while turn.load(Ordering::Acquire) != 2 {
+          std::hint::spin_loop();
+        }
+        turn.store(0, Ordering::Release);
+      },
+      budget,
+    );
+    stop.store(true, Ordering::Release);
+    pinning = weaker(
+      pinning,
+      pinning_from_code(partner_pin.load(Ordering::Acquire)),
+    );
+    result = Some(m);
+  });
+  (
+    result.unwrap_or(Measurement {
+      interval: crate::stats::Interval {
+        median: 0,
+        lower: 0,
+        upper: 0,
+      },
+      p99_ns: 0,
+      min_ns: 0,
+      samples: 0,
+      batch: 0,
+      quick: true,
+    }),
+    pinning,
+  )
+}
+
+/// A placement as the word a probe thread publishes it in (the core matrix's partner, the wake probe's
+/// waiter).
+pub(crate) fn pinning_code(p: Pinning) -> u32 {
+  match p {
+    Pinning::Pinned => 0,
+    Pinning::Hint => 1,
+    Pinning::Refused => 2,
+    // Format: the next word after the three a published placement had before `Scheduled`.
+    Pinning::Scheduled => 3,
+  }
+}
+
+/// The placement a published word names; an unknown word is a refusal (nothing vouches for it).
+pub(crate) fn pinning_from_code(c: u32) -> Pinning {
+  match c {
+    0 => Pinning::Pinned,
+    1 => Pinning::Hint,
+    // Format: `Scheduled`'s word ([`pinning_code`]).
+    3 => Pinning::Scheduled,
+    _ => Pinning::Refused,
+  }
+}
+
+/// Measures memcpy throughput at each power-of-two size from the cache line up to `cap`.
+pub fn memcpy_curve(cache_line: u64, cap: u64, budget: Duration) -> Vec<MemcpyPoint> {
+  let mut sizes = Vec::new();
+  let mut size = cache_line.max(1).next_power_of_two();
+  while size <= cap {
+    sizes.push(size);
+    size = size.saturating_mul(2);
+    if size == 0 {
+      break;
+    }
+  }
+  if sizes.is_empty() {
+    return Vec::new();
+  }
+  let per_point = budget
+    .checked_div(u32::try_from(sizes.len()).unwrap_or(u32::MAX).max(1))
+    .unwrap_or_default();
+  let largest = usize::try_from(*sizes.last().unwrap_or(&0)).unwrap_or(0);
+  let (Some(mut src), Some(mut dst)) = (scratch(largest), scratch(largest)) else {
+    return Vec::new();
+  };
+  fill(&mut src, Xorshift::SEED);
+  sizes
+    .into_iter()
+    .map(|bytes| {
+      let n = usize::try_from(bytes).unwrap_or(0);
+      let per_copy = measure(
+        || {
+          if let (Some(to), Some(from)) = (dst.get_mut(..n), src.get(..n)) {
+            to.copy_from_slice(from);
+          }
+        },
+        per_point,
+      );
+      std::hint::black_box(&dst);
+      MemcpyPoint {
+        bytes,
+        bytes_per_second: bytes_per_second(bytes, per_copy.median_ns()),
+        per_copy,
+      }
+    })
+    .collect()
+}
+
+/// Measures BLAKE3 throughput over a buffer of `bytes`.
+pub fn hash(bytes: u64, budget: Duration) -> HashThroughput {
+  // A refused mapping hashes nothing and reports the zero bytes it hashed, never the size it asked for.
+  let mut mapped = scratch(usize::try_from(bytes).unwrap_or(0));
+  let buf: &mut [u8] = mapped.as_deref_mut().unwrap_or_default();
+  fill(buf, Xorshift::SEED);
+  let bytes = u64::try_from(buf.len()).unwrap_or(0).min(bytes);
+  let per_buffer = measure(
+    || {
+      std::hint::black_box(blake3::hash(buf));
+    },
+    budget,
+  );
+  HashThroughput {
+    bytes,
+    blake3_bytes_per_second: bytes_per_second(bytes, per_buffer.median_ns()),
+    per_buffer,
+  }
+}
+
+/// Measures LZ4 and zstd at each candidate level over a synthetic corpus of `bytes`: half
+/// text-like (words drawn by a seeded generator) and half incompressible, so both ends of the
+/// cost model's input space are represented. Without the `codecs` feature the list is empty and
+/// the profile's notes say so.
+#[cfg(feature = "codecs")]
+pub fn codecs(bytes: u64, budget: Duration) -> Vec<CodecPoint> {
+  let corpus = corpus(usize::try_from(bytes).unwrap_or(0));
+  let points = ZSTD_LEVELS.len().saturating_add(1);
+  let per_point = budget
+    .checked_div(u32::try_from(points).unwrap_or(u32::MAX).max(1))
+    .unwrap_or_default();
+  let mut out = Vec::with_capacity(points);
+  out.push(lz4_point(&corpus, per_point));
+  for level in ZSTD_LEVELS {
+    out.push(zstd_point(&corpus, *level, per_point));
+  }
+  out
+}
+
+/// The codec probe when the codecs were not compiled in.
+#[cfg(not(feature = "codecs"))]
+pub fn codecs(_bytes: u64, _budget: Duration) -> Vec<CodecPoint> {
+  Vec::new()
+}
+
+#[cfg(feature = "codecs")]
+fn lz4_point(corpus: &[u8], budget: Duration) -> CodecPoint {
+  let compressed = lz4_flex::block::compress_prepend_size(corpus);
+  let compress = measure(
+    || {
+      std::hint::black_box(lz4_flex::block::compress_prepend_size(corpus));
+    },
+    budget.checked_div(2).unwrap_or_default(),
+  );
+  let decompress = measure(
+    || {
+      std::hint::black_box(
+        lz4_flex::block::decompress_size_prepended(&compressed).unwrap_or_default(),
+      );
+    },
+    budget.checked_div(2).unwrap_or_default(),
+  );
+  point("lz4", 0, corpus, &compressed, compress, decompress)
+}
+
+#[cfg(feature = "codecs")]
+fn zstd_point(corpus: &[u8], level: i32, budget: Duration) -> CodecPoint {
+  let compressed = zstd::bulk::compress(corpus, level).unwrap_or_default();
+  let compress = measure(
+    || {
+      std::hint::black_box(zstd::bulk::compress(corpus, level).unwrap_or_default());
+    },
+    budget.checked_div(2).unwrap_or_default(),
+  );
+  let capacity = corpus.len();
+  let decompress = measure(
+    || {
+      std::hint::black_box(zstd::bulk::decompress(&compressed, capacity).unwrap_or_default());
+    },
+    budget.checked_div(2).unwrap_or_default(),
+  );
+  point("zstd", level, corpus, &compressed, compress, decompress)
+}
+#[cfg(feature = "codecs")]
+fn point(
+  codec: &str,
+  level: i32,
+  corpus: &[u8],
+  compressed: &[u8],
+  c: Measurement,
+  d: Measurement,
+) -> CodecPoint {
+  let bytes = u64::try_from(corpus.len()).unwrap_or(u64::MAX);
+  /// Format: parts per thousand.
+  const PERMILLE: u128 = 1000;
+  let ratio = if corpus.is_empty() {
+    0
+  } else {
+    u64::try_from(
+      u128::from(u64::try_from(compressed.len()).unwrap_or(0))
+        .saturating_mul(PERMILLE)
+        .checked_div(u128::from(bytes))
+        .unwrap_or(0),
+    )
+    .unwrap_or(u64::MAX)
+  };
+  CodecPoint {
+    codec: codec.to_owned(),
+    level,
+    compress_bytes_per_second: bytes_per_second(bytes, c.median_ns()),
+    decompress_bytes_per_second: bytes_per_second(bytes, d.median_ns()),
+    ratio_permille: ratio,
+    bytes,
+    quick: c.quick || d.quick,
+  }
+}
+
+/// A probe buffer of `len` bytes in its own anonymous mapping, zeroed, given back to the OS when it is dropped. A heap
+/// buffer is not: the allocator caches a freed large allocation, and macOS kept the memcpy probe's two 128 MiB buffers
+/// dirty for the life of the anchor that ran the profile (272 MB of its 275 MB footprint, 2026-10-06). `None` when the
+/// OS refuses the mapping; the probe then measures nothing.
+fn scratch(len: usize) -> Option<memmap2::MmapMut> {
+  memmap2::MmapMut::map_anon(len.max(1)).ok()
+}
+
+/// Fills `buf` with the seeded generator's bytes, as [`filled`] makes them.
+fn fill(buf: &mut [u8], seed: u64) {
+  let mut rng = Xorshift::new(seed);
+  for piece in buf.chunks_mut(size_of::<u64>()) {
+    let word = rng.next_u64().to_le_bytes();
+    piece.copy_from_slice(word.get(..piece.len()).unwrap_or(&word));
+  }
+}
+
+/// A buffer of pseudo-random bytes from a seeded generator.
+pub fn filled(len: usize, seed: u64) -> Vec<u8> {
+  let mut rng = Xorshift::new(seed);
+  let mut out = Vec::with_capacity(len);
+  while out.len() < len {
+    let word = rng.next_u64().to_le_bytes();
+    let take = len.saturating_sub(out.len());
+    out.extend_from_slice(word.get(..take).unwrap_or(&word));
+  }
+  out
+}
+
+/// The synthetic corpus: the first half text-like, the second half incompressible.
+pub fn corpus(len: usize) -> Vec<u8> {
+  /// Shape: a small vocabulary of source-like tokens; what matters is repetition with
+  /// structure, which is what real code and text have and random bytes do not.
+  const WORDS: &[&str] = &[
+    "fn ",
+    "let ",
+    "mut ",
+    "self",
+    "return ",
+    "match ",
+    "struct ",
+    "impl ",
+    "pub ",
+    "async ",
+    "await",
+    "Result<",
+    "Option<",
+    "Vec<u8>",
+    "&mut ",
+    "->",
+    "{\n",
+    "}\n",
+    "  ",
+    "// ",
+    "use std::",
+    "::new(",
+    ");\n",
+    "if ",
+    "else ",
+    "for ",
+    "in ",
+    "while ",
+    "loop ",
+    "break;",
+    "true",
+    "false",
+    "0",
+    "1",
+    "buffer",
+    "offset",
+    "length",
+    "index",
+  ];
+  let half = len / 2;
+  let mut rng = Xorshift::new(Xorshift::SEED);
+  let mut out = Vec::with_capacity(len);
+  while out.len() < half {
+    let word = WORDS
+      .get(rng.below(WORDS.len()))
+      .copied()
+      .unwrap_or_default()
+      .as_bytes();
+    if word.is_empty() {
+      break;
+    }
+    let take = half.saturating_sub(out.len());
+    out.extend_from_slice(word.get(..take).unwrap_or(word));
+  }
+  out.extend_from_slice(&filled(
+    len.saturating_sub(out.len()),
+    Xorshift::SEED ^ u64::MAX,
+  ));
+  out
+}
+
+/// Pins the calling thread to `core` where the OS pins (Linux, Windows), hints where it only
+/// hints (macOS), and reports which.
+pub fn pin_current_thread(core: u32) -> Pinning {
+  platform::pin_current(core)
+}
+
+/// The calling thread's CPU affinity, kept so a probe that pins the thread can put it back: a process
+/// spawned afterwards inherits the calling thread's mask (the anchor measures, then spawns the daemon;
+/// docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md).
+pub(crate) struct SavedAffinity(Option<platform::Affinity>);
+
+impl SavedAffinity {
+  /// The calling thread's mask now.
+  pub(crate) fn of_calling_thread() -> SavedAffinity {
+    SavedAffinity(platform::current_affinity())
+  }
+
+  /// Puts the mask back; whether the OS took it (nothing to put back counts as done).
+  pub(crate) fn restore(&self) -> bool {
+    self.0.as_ref().is_none_or(platform::restore_affinity)
+  }
+}
+
+/// Queries the lock capacity: the OS's stated limit, confirmed with one small lock.
+pub fn lock_capacity(facts: &Facts) -> LockCapacity {
+  platform::lock_capacity(facts)
+}
+
+#[cfg(unix)]
+mod platform {
+  use super::{LockCapacity, Pinning, Touch};
+  use crate::bench::Measurement;
+  use crate::facts::{Facts, PageFacts};
+  use memmap2::MmapMut;
+  use std::time::Duration;
+
+  pub(super) fn null_syscall() {
+    std::hint::black_box(rustix::process::getppid());
+  }
+
+  fn touch_every(map: &mut MmapMut, page: usize) {
+    let mut at = 0;
+    while let Some(byte) = map.get_mut(at) {
+      *byte = 1;
+      at = at.saturating_add(page.max(1));
+    }
+    std::hint::black_box(&map[..]);
+  }
+
+  pub(super) fn map_touch_unmap(region: u64, page: u64, touch: Touch) {
+    let len = usize::try_from(region).unwrap_or(0);
+    let Ok(mut map) = MmapMut::map_anon(len) else {
+      return;
+    };
+    if touch == Touch::Every {
+      touch_every(&mut map, usize::try_from(page).unwrap_or(1));
+    }
+    drop(map);
+  }
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn populated(region: u64, page: u64, budget: Duration) -> Option<Measurement> {
+    use memmap2::MmapOptions;
+    let len = usize::try_from(region).unwrap_or(0);
+    let page = usize::try_from(page).unwrap_or(1);
+    MmapOptions::new().len(len).populate().map_anon().ok()?;
+    Some(crate::bench::measure(
+      || {
+        if let Ok(mut map) = MmapOptions::new().len(len).populate().map_anon() {
+          touch_every(&mut map, page);
+          drop(map);
+        }
+      },
+      budget,
+    ))
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  pub(super) fn populated(_region: u64, _page: u64, _budget: Duration) -> Option<Measurement> {
+    None
+  }
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn huge(page: &PageFacts, budget: Duration) -> Option<(Measurement, u64)> {
+    if !page.transparent_huge {
+      return None;
+    }
+    // Shape: the smallest transparent huge page on every Linux target we build for is 2 MiB;
+    // a region of two of them, over-mapped by one so it can be aligned, is the probe.
+    let huge = page.huge.first().copied().unwrap_or(2 * 1024 * 1024);
+    let huge_usize = usize::try_from(huge).ok()?;
+    let pages = huge
+      .checked_div(page.base.max(1))
+      .unwrap_or(0)
+      .saturating_mul(2);
+    // Shape: one huge page more than the two-page span, so the span can be aligned within it.
+    let len = huge_usize.saturating_mul(3);
+    let base = usize::try_from(page.base).ok()?;
+    Some((
+      crate::bench::measure(
+        || {
+          if let Ok(mut map) = MmapMut::map_anon(len) {
+            let _ = map.advise(memmap2::Advice::HugePage);
+            let start = map
+              .as_ptr()
+              .addr()
+              .next_multiple_of(huge_usize)
+              .saturating_sub(map.as_ptr().addr());
+            let span = huge_usize.saturating_mul(2);
+            let end = start.saturating_add(span);
+            let mut at = start;
+            while at < end
+              && let Some(byte) = map.get_mut(at)
+            {
+              *byte = 1;
+              at = at.saturating_add(base.max(1));
+            }
+            std::hint::black_box(&map[..]);
+            drop(map);
+          }
+        },
+        budget,
+      ),
+      pages,
+    ))
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  pub(super) fn huge(_page: &PageFacts, _budget: Duration) -> Option<(Measurement, u64)> {
+    None
+  }
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn pin_current(core: u32) -> Pinning {
+    use rustix::thread::{CpuSet, sched_setaffinity};
+    let index = usize::try_from(core).unwrap_or(usize::MAX);
+    if index >= CpuSet::MAX_CPU {
+      return Pinning::Refused;
+    }
+    let mut set = CpuSet::new();
+    set.set(index);
+    match sched_setaffinity(None, &set) {
+      Ok(()) => Pinning::Pinned,
+      Err(_) => Pinning::Refused,
+    }
+  }
+
+  /// The calling thread's CPU affinity as the OS holds it (Linux: the scheduler's mask), to be put back
+  /// after the matrix pinned the thread.
+  #[cfg(target_os = "linux")]
+  pub(super) struct Affinity(rustix::thread::CpuSet);
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn current_affinity() -> Option<Affinity> {
+    rustix::thread::sched_getaffinity(None).ok().map(Affinity)
+  }
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn restore_affinity(affinity: &Affinity) -> bool {
+    rustix::thread::sched_setaffinity(None, &affinity.0).is_ok()
+  }
+
+  #[cfg(target_os = "macos")]
+  unsafe extern "C" {
+    fn thread_policy_set(
+      thread: libc::mach_port_t,
+      flavor: libc::c_uint,
+      policy_info: *mut libc::c_int,
+      count: libc::c_uint,
+    ) -> libc::c_int;
+  }
+
+  /// Sets the calling thread's affinity tag (mach/thread_policy.h): a tag of zero means "no affinity",
+  /// any other groups threads that share it; a hint, not a pin. Returns whether the kernel took it.
+  #[cfg(target_os = "macos")]
+  fn set_affinity_tag(mut tag: libc::c_int) -> bool {
+    /// Format: THREAD_AFFINITY_POLICY, the affinity-tag hint (mach/thread_policy.h).
+    const THREAD_AFFINITY_POLICY: libc::c_uint = 4;
+    // SAFETY: the calling thread's own mach port and a one-integer policy of the stated count.
+    let rc = unsafe {
+      thread_policy_set(
+        libc::pthread_mach_thread_np(libc::pthread_self()),
+        THREAD_AFFINITY_POLICY,
+        &raw mut tag,
+        1,
+      )
+    };
+    rc == libc::KERN_SUCCESS
+  }
+
+  #[cfg(target_os = "macos")]
+  pub(super) fn pin_current(core: u32) -> Pinning {
+    // Cores are numbered from zero and zero is the null tag, so the tag is core + 1.
+    let tag = libc::c_int::try_from(core).unwrap_or(0).saturating_add(1);
+    if set_affinity_tag(tag) {
+      Pinning::Hint
+    } else {
+      Pinning::Refused
+    }
+  }
+
+  /// macOS holds no readable mask: the thread came in with the null tag (no affinity), which is what
+  /// is put back.
+  #[cfg(target_os = "macos")]
+  pub(super) struct Affinity;
+
+  #[cfg(target_os = "macos")]
+  pub(super) fn current_affinity() -> Option<Affinity> {
+    Some(Affinity)
+  }
+
+  /// Puts the null tag back. A kernel that refused the hint when pinning (Apple silicon:
+  /// `KERN_NOT_SUPPORTED`) refuses this the same way — the thread was never tagged then, and the
+  /// matrix already reports `Refused` for it.
+  #[cfg(target_os = "macos")]
+  pub(super) fn restore_affinity(_affinity: &Affinity) -> bool {
+    /// Format: THREAD_AFFINITY_TAG_NULL — no affinity (mach/thread_policy.h).
+    const NULL_TAG: libc::c_int = 0;
+    set_affinity_tag(NULL_TAG)
+  }
+
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  pub(super) fn pin_current(_core: u32) -> Pinning {
+    Pinning::Refused
+  }
+
+  /// Nothing pins here, so nothing is put back.
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  pub(super) struct Affinity;
+
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  pub(super) fn current_affinity() -> Option<Affinity> {
+    None
+  }
+
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  pub(super) fn restore_affinity(_affinity: &Affinity) -> bool {
+    true
+  }
+
+  pub(super) fn lock_capacity(facts: &Facts) -> LockCapacity {
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Memlock);
+    let (bytes, source) = match limit.current {
+      None => platform_wire_limit(facts),
+      Some(current) => (current, "RLIMIT_MEMLOCK soft limit".to_owned()),
+    };
+    let confirmed = confirm_lock(facts.page.base);
+    LockCapacity {
+      bytes,
+      source,
+      confirmed,
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  fn platform_wire_limit(facts: &Facts) -> (u64, String) {
+    match crate::facts::sysctl_u64(c"vm.user_wire_limit") {
+      Some(value) if value > 0 => (
+        value.min(facts.memory.total),
+        "vm.user_wire_limit".to_owned(),
+      ),
+      _ => (
+        facts.memory.available,
+        "RLIMIT_MEMLOCK unlimited; recorded available memory".to_owned(),
+      ),
+    }
+  }
+
+  #[cfg(not(target_os = "macos"))]
+  fn platform_wire_limit(facts: &Facts) -> (u64, String) {
+    (
+      facts.memory.available,
+      "RLIMIT_MEMLOCK unlimited; recorded available memory".to_owned(),
+    )
+  }
+
+  fn confirm_lock(page: u64) -> bool {
+    let len = usize::try_from(page).unwrap_or(0);
+    let Ok(map) = MmapMut::map_anon(len) else {
+      return false;
+    };
+    let ok = map.lock().is_ok();
+    if ok {
+      let _ = map.unlock();
+    }
+    ok
+  }
+}
+
+#[cfg(windows)]
+mod platform {
+  use super::{LockCapacity, Pinning, Touch};
+  use crate::bench::Measurement;
+  use crate::facts::{Facts, PageFacts};
+  use std::ffi::c_void;
+  use std::time::Duration;
+  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+  use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualLock,
+    VirtualUnlock,
+  };
+  use windows_sys::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, GetCurrentThread, GetProcessWorkingSetSize, SetEvent,
+    SetThreadAffinityMask,
+  };
+
+  fn event() -> HANDLE {
+    thread_local! {
+      static EVENT: HANDLE = {
+        // SAFETY: an anonymous auto-reset event; the handle lives for the thread.
+        unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) }
+      };
+    }
+    EVENT.with(|h| *h)
+  }
+
+  pub(super) fn null_syscall() {
+    // SAFETY: a valid event handle; SetEvent enters the kernel every call.
+    std::hint::black_box(unsafe { SetEvent(event()) });
+  }
+
+  fn alloc(len: usize) -> Option<*mut u8> {
+    // SAFETY: a fresh committed read/write region; the result is checked.
+    let p = unsafe {
+      VirtualAlloc(
+        std::ptr::null(),
+        len,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+      )
+    };
+    if p.is_null() {
+      None
+    } else {
+      Some(p.cast::<u8>())
+    }
+  }
+
+  fn free(p: *mut u8) {
+    // SAFETY: `p` came from VirtualAlloc.
+    unsafe { VirtualFree(p.cast::<c_void>(), 0, MEM_RELEASE) };
+  }
+
+  pub(super) fn map_touch_unmap(region: u64, page: u64, touch: Touch) {
+    let len = usize::try_from(region).unwrap_or(0);
+    let Some(p) = alloc(len) else { return };
+    if touch == Touch::Every {
+      let page = usize::try_from(page).unwrap_or(1).max(1);
+      let mut at = 0;
+      while at < len {
+        // SAFETY: `at < len` within a committed region.
+        unsafe { p.add(at).write_volatile(1) };
+        at = at.saturating_add(page);
+      }
+    }
+    free(p);
+  }
+
+  pub(super) fn populated(_region: u64, _page: u64, _budget: Duration) -> Option<Measurement> {
+    None
+  }
+
+  pub(super) fn huge(_page: &PageFacts, _budget: Duration) -> Option<(Measurement, u64)> {
+    None
+  }
+
+  /// Sets the calling thread's affinity mask; the previous mask, or zero when refused.
+  fn set_thread_affinity(mask: usize) -> usize {
+    // SAFETY: the calling thread's pseudo-handle and a mask within the process's.
+    unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) }
+  }
+
+  pub(super) fn pin_current(core: u32) -> Pinning {
+    if core >= usize::BITS {
+      return Pinning::Refused;
+    }
+    let mask: usize = 1usize << core;
+    if set_thread_affinity(mask) == 0 {
+      Pinning::Refused
+    } else {
+      Pinning::Pinned
+    }
+  }
+
+  /// The mask the calling thread came in with: the process's affinity mask, which a thread never pinned
+  /// before the matrix runs on (the anchor's main thread).
+  pub(super) struct Affinity(usize);
+
+  pub(super) fn current_affinity() -> Option<Affinity> {
+    crate::facts::process_affinity_mask().map(Affinity)
+  }
+
+  pub(super) fn restore_affinity(affinity: &Affinity) -> bool {
+    set_thread_affinity(affinity.0) != 0
+  }
+
+  pub(super) fn lock_capacity(facts: &Facts) -> LockCapacity {
+    let mut min: usize = 0;
+    let mut max: usize = 0;
+    // SAFETY: the current process pseudo-handle and two writable usize outputs.
+    let ok = unsafe { GetProcessWorkingSetSize(GetCurrentProcess(), &raw mut min, &raw mut max) };
+    let bytes = if ok == 0 {
+      0
+    } else {
+      u64::try_from(max)
+        .unwrap_or(u64::MAX)
+        .min(facts.memory.total)
+    };
+    let len = usize::try_from(facts.page.base).unwrap_or(0);
+    let confirmed = alloc(len).is_some_and(|p| {
+      // SAFETY: `p` is a committed region of `len` bytes.
+      let locked = unsafe { VirtualLock(p.cast::<c_void>(), len) } != 0;
+      if locked {
+        // SAFETY: the same region, locked above.
+        unsafe { VirtualUnlock(p.cast::<c_void>(), len) };
+      }
+      free(p);
+      locked
+    });
+    let _ = CloseHandle;
+    LockCapacity {
+      bytes,
+      source: "process maximum working set".to_owned(),
+      confirmed,
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::facts::Facts;
+
+  fn short() -> Duration {
+    Duration::from_millis(40)
+  }
+
+  #[test]
+  fn a_syscall_costs_something_and_is_measured_with_an_interval() {
+    let m = syscall(short());
+    assert!(m.median_ns() > 0, "{m:?}");
+    assert!(m.interval.lower <= m.interval.upper);
+  }
+
+  #[test]
+  fn faults_cost_more_than_map_and_unmap_alone() {
+    let facts = Facts::query();
+    let f = faults(&facts.page, short());
+    assert!(
+      f.base_region.median_ns() > f.map_unmap_region.median_ns(),
+      "{f:?}"
+    );
+    assert!(f.base_ns > 0, "{f:?}");
+    assert_eq!(f.pages_per_region, FAULT_REGION_PAGES);
+  }
+
+  #[test]
+  fn the_core_matrix_covers_every_pair_below_the_limit() {
+    let facts = Facts::query();
+    let n = facts.cores.len().min(4);
+    let (rtts, pinning) = core_matrix(&facts.cores[..n], short());
+    assert_eq!(rtts.len(), n * (n - 1) / 2);
+    assert!(rtts.iter().all(|p| p.rtt.median_ns() > 0), "{rtts:?}");
+    // Linux and Windows pin; macOS on Apple silicon refuses the affinity hint (KERN_NOT_SUPPORTED),
+    // and the profile records exactly that.
+    if cfg!(target_os = "macos") {
+      assert!(
+        matches!(pinning, Pinning::Hint | Pinning::Refused),
+        "{pinning:?}"
+      );
+    } else {
+      assert_eq!(pinning, Pinning::Pinned);
+    }
+  }
+
+  /// AC (§4.1; docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md): the matrix
+  /// pins the calling thread per pair and gives it its affinity back — a process spawned afterwards
+  /// inherits the calling thread's mask (the anchor spawns the daemon after measuring), and must see the
+  /// machine, not one core. Asserted on the visible fact: the parallelism the thread can use is the
+  /// same after the matrix as before. Where the OS pins (Linux, Windows) this failed before the restore
+  /// with a machine of two or more cores (the thread was left on the last measured core: 1 ≠ n); macOS
+  /// only hints, so the fact holds there by construction.
+  #[test]
+  fn the_core_matrix_gives_the_calling_thread_its_affinity_back() {
+    let facts = Facts::query();
+    let before = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let n = facts.cores.len().min(4);
+    let (_, pinning) = core_matrix(&facts.cores[..n], short());
+    let after = std::thread::available_parallelism().map_or(1, |n| n.get());
+    assert_eq!(
+      after, before,
+      "the calling thread's usable parallelism is unchanged by the matrix ({pinning:?})"
+    );
+  }
+
+  #[test]
+  fn above_the_limit_pairs_are_sampled_from_core_zero() {
+    let cores: Vec<CoreFacts> = (0..40)
+      .map(|id| CoreFacts {
+        id,
+        class: crate::facts::CoreClass::Unknown,
+        level: 0,
+        numa: 0,
+        l2_bytes: 0,
+        physical: id,
+      })
+      .collect();
+    let pairs = pair_list(&cores);
+    assert_eq!(pairs.len(), 39);
+    assert!(pairs.iter().all(|(a, _)| *a == 0));
+  }
+
+  #[test]
+  fn the_memcpy_curve_is_ascending_in_size_and_every_point_has_throughput() {
+    let points = memcpy_curve(64, 64 * 1024, short());
+    assert_eq!(points.len(), 11);
+    assert!(points.windows(2).all(|w| w[0].bytes < w[1].bytes));
+    assert!(points.iter().all(|p| p.bytes_per_second > 0), "{points:?}");
+  }
+
+  #[test]
+  #[cfg(feature = "codecs")]
+  fn hashing_and_codecs_report_throughput_and_a_ratio_between_the_halves() {
+    let h = hash(64 * 1024, short());
+    assert!(h.blake3_bytes_per_second > 0, "{h:?}");
+    let c = codecs(64 * 1024, Duration::from_millis(200));
+    assert_eq!(c.len(), 1 + ZSTD_LEVELS.len());
+    for p in &c {
+      assert!(
+        p.compress_bytes_per_second > 0 && p.decompress_bytes_per_second > 0,
+        "{p:?}"
+      );
+      // Half the corpus is incompressible, so the ratio sits between one half and one.
+      assert!(p.ratio_permille > 500 && p.ratio_permille <= 1000, "{p:?}");
+    }
+  }
+
+  #[test]
+  fn the_corpus_halves_are_distinct_and_deterministic() {
+    let a = corpus(4096);
+    let b = corpus(4096);
+    assert_eq!(a, b);
+    assert!(a[..2048].iter().all(u8::is_ascii));
+    assert!(a[2048..].iter().any(|b| !b.is_ascii()));
+  }
+
+  #[test]
+  fn lock_capacity_reports_a_source_and_a_confirmation() {
+    let facts = Facts::query();
+    let l = lock_capacity(&facts);
+    assert!(!l.source.is_empty());
+    assert!(l.confirmed, "{l:?}");
+  }
+}

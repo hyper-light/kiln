@@ -2505,6 +2505,7 @@ dependencies = [
  "shards-agentfile",
  "shards-api",
  "shards-image",
+ "slates-api",
  "socket2",
  "str0m",
  "sysinfo",
@@ -2550,7 +2551,7 @@ dependencies = [
  "hyper-durable",
  "hyper-log",
  "hyper-raft",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "mimalloc",
  "mlua",
  "parking_lot",
@@ -2859,6 +2860,15 @@ checksum = "1db548b001f0b7da416daf0ffae963912bae6cad1799fa9f4eaba09da6dba837"
 dependencies = [
  "cc",
  "which",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13591d77a9b6d941f7e6fcade7f9dfd9e801308752bde50c0a9bb5852778c22c"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -3943,6 +3953,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls"
+version = "0.23.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
+dependencies = [
+ "aws-lc-rs",
+ "once_cell",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4476,6 +4500,337 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slates-anchor"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "slates-ipc",
+ "slates-machine",
+ "slates-mem",
+ "slates-wire",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-api"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "serde_json",
+ "slates-anchor",
+ "slates-bridge-nfs",
+ "slates-bridge-winfsp",
+ "slates-client",
+ "slates-db",
+ "slates-ipc",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-server",
+ "slates-vfs",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-archive"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lz4_flex 0.11.7",
+ "zstd",
+]
+
+[[package]]
+name = "slates-base"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "slates-bridge-oci",
+ "slates-machine",
+ "slates-vfs",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-bridge-core"
+version = "0.1.0"
+dependencies = [
+ "slates-db",
+ "slates-machine",
+ "slates-mem",
+ "slates-vfs",
+]
+
+[[package]]
+name = "slates-bridge-fuse"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "slates-base",
+ "slates-bridge-core",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-vfs",
+]
+
+[[package]]
+name = "slates-bridge-nfs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "slates-bridge-core",
+ "slates-db",
+ "slates-rt",
+ "slates-vfs",
+]
+
+[[package]]
+name = "slates-bridge-oci"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
+name = "slates-bridge-virtiofs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "memmap2",
+ "rustix",
+ "slates-bridge-core",
+ "slates-bridge-fuse",
+ "slates-db",
+ "slates-ipc",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-vfs",
+ "slates-wire",
+]
+
+[[package]]
+name = "slates-bridge-winfsp"
+version = "0.1.0"
+dependencies = [
+ "loom",
+ "slates-bridge-core",
+ "slates-ipc",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-vfs",
+ "slates-wire",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-client"
+version = "0.1.0"
+dependencies = [
+ "slates-ipc",
+ "slates-machine",
+ "slates-mem",
+ "slates-seal",
+ "slates-wire",
+]
+
+[[package]]
+name = "slates-cluster"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hyper-datagram",
+ "hyper-seal",
+ "hyper-swim",
+ "hyper-timing",
+ "slates-archive",
+ "slates-db",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-transport",
+ "slates-wire",
+]
+
+[[package]]
+name = "slates-db"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "slates-anchor",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-wire",
+]
+
+[[package]]
+name = "slates-image"
+version = "0.1.0"
+
+[[package]]
+name = "slates-ipc"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "blake3",
+ "libc",
+ "loom",
+ "rustix",
+ "slates-machine",
+ "slates-mem",
+ "slates-wire",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-land"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libc",
+ "rustix",
+ "slates-base",
+ "slates-machine",
+ "slates-mem",
+ "slates-vfs",
+]
+
+[[package]]
+name = "slates-machine"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libc",
+ "lz4_flex 0.11.7",
+ "memmap2",
+ "rustix",
+ "serde",
+ "serde_json",
+ "windows-sys 0.60.2",
+ "zstd",
+]
+
+[[package]]
+name = "slates-mem"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "loom",
+ "memmap2",
+ "rustix",
+ "slates-machine",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-merge"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
+name = "slates-rt"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "loom",
+ "rustix",
+ "slates-machine",
+ "slates-mem",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-seal"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "slates-ipc",
+]
+
+[[package]]
+name = "slates-server"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "blake3",
+ "hyper-datagram",
+ "hyper-seal",
+ "rustix",
+ "rustls",
+ "slates-anchor",
+ "slates-archive",
+ "slates-base",
+ "slates-bridge-core",
+ "slates-bridge-fuse",
+ "slates-bridge-nfs",
+ "slates-bridge-oci",
+ "slates-bridge-virtiofs",
+ "slates-bridge-winfsp",
+ "slates-cluster",
+ "slates-db",
+ "slates-image",
+ "slates-ipc",
+ "slates-land",
+ "slates-machine",
+ "slates-mem",
+ "slates-merge",
+ "slates-rt",
+ "slates-seal",
+ "slates-transport",
+ "slates-vfs",
+ "slates-wire",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-transport"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "rustls",
+ "slates-machine",
+ "slates-rt",
+]
+
+[[package]]
+name = "slates-vfs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "slates-archive",
+ "slates-image",
+ "slates-machine",
+ "slates-mem",
+ "slates-wire",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "slates-wire"
+version = "0.1.0"
+dependencies = [
+ "slates-machine",
+ "slates-wire-derive",
+]
+
+[[package]]
+name = "slates-wire-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "smallvec"
@@ -5339,6 +5694,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "unicode-width"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5812,7 +6176,16 @@ version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
 dependencies = [
- "windows-targets",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.60.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
+dependencies = [
+ "windows-targets 0.53.5",
 ]
 
 [[package]]
@@ -5830,14 +6203,31 @@ version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973"
 dependencies = [
- "windows_aarch64_gnullvm",
- "windows_aarch64_msvc",
- "windows_i686_gnu",
- "windows_i686_gnullvm",
- "windows_i686_msvc",
- "windows_x86_64_gnu",
- "windows_x86_64_gnullvm",
- "windows_x86_64_msvc",
+ "windows_aarch64_gnullvm 0.52.6",
+ "windows_aarch64_msvc 0.52.6",
+ "windows_i686_gnu 0.52.6",
+ "windows_i686_gnullvm 0.52.6",
+ "windows_i686_msvc 0.52.6",
+ "windows_x86_64_gnu 0.52.6",
+ "windows_x86_64_gnullvm 0.52.6",
+ "windows_x86_64_msvc 0.52.6",
+]
+
+[[package]]
+name = "windows-targets"
+version = "0.53.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
+dependencies = [
+ "windows-link",
+ "windows_aarch64_gnullvm 0.53.1",
+ "windows_aarch64_msvc 0.53.1",
+ "windows_i686_gnu 0.53.1",
+ "windows_i686_gnullvm 0.53.1",
+ "windows_i686_msvc 0.53.1",
+ "windows_x86_64_gnu 0.53.1",
+ "windows_x86_64_gnullvm 0.53.1",
+ "windows_x86_64_msvc 0.53.1",
 ]
 
 [[package]]
@@ -5856,10 +6246,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
 
 [[package]]
+name = "windows_aarch64_gnullvm"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
+
+[[package]]
 name = "windows_aarch64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
+
+[[package]]
+name = "windows_aarch64_msvc"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -5868,10 +6270,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
 
 [[package]]
+name = "windows_i686_gnu"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3"
+
+[[package]]
 name = "windows_i686_gnullvm"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
+
+[[package]]
+name = "windows_i686_gnullvm"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
 
 [[package]]
 name = "windows_i686_msvc"
@@ -5880,10 +6294,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
 
 [[package]]
+name = "windows_i686_msvc"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
+
+[[package]]
 name = "windows_x86_64_gnu"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
+
+[[package]]
+name = "windows_x86_64_gnu"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499"
 
 [[package]]
 name = "windows_x86_64_gnullvm"
@@ -5892,10 +6318,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
 
 [[package]]
+name = "windows_x86_64_gnullvm"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
+
+[[package]]
 name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "windows_x86_64_msvc"
+version = "0.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winnow"
@@ -6153,3 +6591,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50adf04cf3ec914b0b9905c9dde90c80fe74bfd701e331fc80a39c512c525278"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498d94ad68720c89b4fbe41b9090850651e68cb2dd9210ce7ffbff3a94653819"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.3+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

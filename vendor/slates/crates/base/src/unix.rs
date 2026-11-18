@@ -1,0 +1,728 @@
+//! The Unix host: descriptors from rustix, bulk listings from `getdents` with one stat per entry (`statx` on Linux,
+//! the only call that reports a file's birth time there; `statat` on macOS, whose `st_birthtime` carries it: A-151),
+//! and hints from inotify (Linux) or `EVFILT_VNODE` on a kqueue (macOS, BSD).
+
+use std::collections::BTreeMap;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+#[cfg(not(target_os = "linux"))]
+use rustix::fs::Stat;
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{Statx, StatxFlags};
+use slates_vfs::host::{
+  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
+};
+use slates_vfs::inode::Fingerprint;
+
+use crate::{FsKind, UNIX_NAME_BREAKS, granularity_for, one_entry};
+
+/// Format: nanoseconds per second.
+const NS_PER_S: i64 = 1_000_000_000;
+
+/// The Unix host.
+pub struct OsHost {
+  /// Each kept directory and its mount id, read once as it is kept (A-227's crossing check).
+  dirs: BTreeMap<u64, (OwnedFd, u64)>,
+  files: BTreeMap<u64, OwnedFd>,
+  next: u64,
+  watcher: watch::Watcher,
+}
+
+impl std::fmt::Debug for OsHost {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("OsHost")
+      .field("dirs", &self.dirs.len())
+      .field("files", &self.files.len())
+      .finish()
+  }
+}
+
+fn refusal(e: rustix::io::Errno) -> HostError {
+  match e {
+    rustix::io::Errno::NOENT => HostError::NotFound,
+    rustix::io::Errno::NOTDIR => HostError::NotDirectory,
+    rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR => HostError::NotFile,
+    other => HostError::Unavailable(other.raw_os_error()),
+  }
+}
+
+/// The fingerprint of a `stat` result (macOS): device, inode, size, both timestamps in nanoseconds, the mode, the
+/// owner, and the birth time `st_birthtime` (A-151).
+#[cfg(not(target_os = "linux"))]
+fn fingerprint(st: &Stat) -> Fingerprint {
+  Fingerprint {
+    dev: u64::try_from(i128::from(st.st_dev)).unwrap_or(0),
+    ino: u64::try_from(i128::from(st.st_ino)).unwrap_or(0),
+    size: u64::try_from(st.st_size).unwrap_or(0),
+    mtime_ns: stamp_ns(widen(st.st_mtime), widen(st.st_mtime_nsec)),
+    ctime_ns: stamp_ns(widen(st.st_ctime), widen(st.st_ctime_nsec)),
+    mode: mode_word(st.st_mode),
+    uid: st.st_uid,
+    gid: st.st_gid,
+    birth_ns: stamp_ns(widen(st.st_birthtime), widen(st.st_birthtime_nsec)),
+    // A Unix file system holds no Windows attribute bits (A-262).
+    windows: 0,
+  }
+}
+
+/// The fingerprint of a `statx` result (Linux): what `stat` gives elsewhere, and the birth time, which only `statx`
+/// reports there; zero when the filesystem records none (`STATX_BTIME` unset in the answer's mask) (A-151). The device
+/// is `makedev` of its two halves, as `stat`'s `st_dev` packs them.
+#[cfg(target_os = "linux")]
+fn fingerprint(st: &Statx) -> Fingerprint {
+  let born = StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::BTIME);
+  Fingerprint {
+    dev: rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor),
+    ino: st.stx_ino,
+    size: st.stx_size,
+    mtime_ns: stamp_ns(st.stx_mtime.tv_sec, widen(st.stx_mtime.tv_nsec)),
+    ctime_ns: stamp_ns(st.stx_ctime.tv_sec, widen(st.stx_ctime.tv_nsec)),
+    mode: u32::from(st.stx_mode),
+    uid: st.stx_uid,
+    gid: st.stx_gid,
+    birth_ns: if born {
+      stamp_ns(st.stx_btime.tv_sec, widen(st.stx_btime.tv_nsec))
+    } else {
+      0
+    },
+
+    // A Unix file system holds no Windows attribute bits (A-262).
+    windows: 0,
+  }
+}
+
+/// What every Linux fingerprint asks `statx` for: the fields `stat` gives, and the birth time (A-151).
+#[cfg(target_os = "linux")]
+const FINGERPRINT_FIELDS: StatxFlags = StatxFlags::BASIC_STATS.union(StatxFlags::BTIME);
+
+/// The fingerprint of the entry `name` under `dir` itself, never following a symlink: `statx` on Linux, which alone
+/// reports the birth time there (A-151).
+#[cfg(target_os = "linux")]
+fn fingerprint_at<P: rustix::path::Arg>(
+  dir: BorrowedFd<'_>,
+  name: P,
+) -> rustix::io::Result<Fingerprint> {
+  rustix::fs::statx(dir, name, AtFlags::SYMLINK_NOFOLLOW, FINGERPRINT_FIELDS)
+    .map(|st| fingerprint(&st))
+}
+
+/// The fingerprint of the entry `name` under `dir` itself, never following a symlink (`statat`).
+#[cfg(not(target_os = "linux"))]
+fn fingerprint_at<P: rustix::path::Arg>(
+  dir: BorrowedFd<'_>,
+  name: P,
+) -> rustix::io::Result<Fingerprint> {
+  rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map(|st| fingerprint(&st))
+}
+
+/// The fingerprint of an open descriptor: `statx` of the descriptor itself on Linux (A-151).
+#[cfg(target_os = "linux")]
+fn fingerprint_of(fd: BorrowedFd<'_>) -> rustix::io::Result<Fingerprint> {
+  rustix::fs::statx(fd, c"", AtFlags::EMPTY_PATH, FINGERPRINT_FIELDS).map(|st| fingerprint(&st))
+}
+
+/// The fingerprint of an open descriptor (`fstat`).
+#[cfg(not(target_os = "linux"))]
+fn fingerprint_of(fd: BorrowedFd<'_>) -> rustix::io::Result<Fingerprint> {
+  rustix::fs::fstat(fd).map(|st| fingerprint(&st))
+}
+
+/// A `stat` mode as `u32`, whatever width the platform gives it (`u16` on macOS). Linux's `statx` gives a `u16`
+/// mode, widened where it is read.
+#[cfg(not(target_os = "linux"))]
+fn mode_word<T: Into<u32>>(mode: T) -> u32 {
+  mode.into()
+}
+
+/// A `stat` time field as `i64`, whatever width or sign the platform gives it (`c_long` is 32
+/// bits on i686; rustix's raw Linux backend carries the nanosecond fields unsigned); a value
+/// past `i64` saturates.
+fn widen<T: TryInto<i64>>(x: T) -> i64 {
+  x.try_into().unwrap_or(i64::MAX)
+}
+
+/// Seconds and nanoseconds as one nanosecond count, saturating at the type's edges (year 2262).
+fn stamp_ns(seconds: i64, nanos: i64) -> i64 {
+  seconds.saturating_mul(NS_PER_S).saturating_add(nanos)
+}
+
+fn kind_of(file_type: FileType) -> HostKind {
+  match file_type {
+    FileType::RegularFile => HostKind::File,
+    FileType::Directory => HostKind::Dir,
+    FileType::Symlink => HostKind::Symlink,
+    _ => HostKind::Other,
+  }
+}
+
+/// The base directory's descriptor: every component is walked first and none that is a mount this daemon serves is
+/// entered (`crate::own_mounts`, A-227).
+fn open_root_fd(path: &Path) -> Result<OwnedFd, HostError> {
+  crate::own_mounts::open_checked_root(
+    path,
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+  )
+}
+
+/// The mount id of a directory this host just opened, read once (A-227); zero where none is kept.
+#[cfg(target_os = "linux")]
+fn mount_of(fd: BorrowedFd<'_>) -> Result<u64, HostError> {
+  crate::own_mounts::mount_id_of(fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_of(_fd: BorrowedFd<'_>) -> Result<u64, HostError> {
+  Ok(0)
+}
+
+/// Refuses an entry of `dir` (on mount `dir_mount`) that lies on a mount this daemon serves, before anything touches it
+/// (A-227: every crossing below a base is checked, so a slates mount made inside a base later is never entered).
+#[cfg(target_os = "linux")]
+fn check_crossing(
+  dir: BorrowedFd<'_>,
+  dir_mount: u64,
+  name: &(impl AsRef<std::ffi::OsStr> + ?Sized),
+) -> Result<(), HostError> {
+  crate::own_mounts::check_child_in(dir, dir_mount, name.as_ref())
+}
+
+/// macOS names a crossing by the kernel's path of `dir` and the mount points of this daemon's own mounts, so the
+/// directory's mount (none kept) plays no part.
+#[cfg(target_os = "macos")]
+fn check_crossing(
+  dir: BorrowedFd<'_>,
+  _dir_mount: u64,
+  name: &(impl AsRef<std::ffi::OsStr> + ?Sized),
+) -> Result<(), HostError> {
+  crate::own_mounts::check_child(dir, name.as_ref())
+}
+
+/// Whether a listed entry can be a mount root: this daemon mounts only directories (`check_mount_point`), so only a
+/// directory, or an entry whose type the listing does not give, is checked (A-227).
+fn may_be_a_mount(file_type: FileType) -> bool {
+  matches!(file_type, FileType::Directory | FileType::Unknown)
+}
+
+impl OsHost {
+  /// Opens a base directory (`O_DIRECTORY|O_NOFOLLOW`): the one path this host ever resolves.
+  pub fn open_root(path: &Path) -> Result<(Self, HostDir), HostError> {
+    let fd = open_root_fd(path)?;
+    let mut host = Self {
+      dirs: BTreeMap::new(),
+      files: BTreeMap::new(),
+      next: 1,
+      watcher: watch::Watcher::new(),
+    };
+    let root = host.keep_dir(fd)?;
+    Ok((host, root))
+  }
+
+  /// The next handle id. Ids are never reused, so one is never recycled onto a handle still held; once the
+  /// id space is spent the host refuses as it would past its descriptor limit (`EMFILE`). (At one open a
+  /// nanosecond, a `u64` lasts 584 years.)
+  fn allocate(&mut self) -> Result<u64, HostError> {
+    let h = self.next;
+    self.next = h.checked_add(1).ok_or(HostError::Unavailable(
+      rustix::io::Errno::MFILE.raw_os_error(),
+    ))?;
+    Ok(h)
+  }
+
+  fn keep_dir(&mut self, fd: OwnedFd) -> Result<HostDir, HostError> {
+    let mount = mount_of(fd.as_fd())?;
+    let h = self.allocate()?;
+    self.dirs.insert(h, (fd, mount));
+    Ok(HostDir(h))
+  }
+
+  /// The kept directory's mount id.
+  fn dir_mount(&self, dir: HostDir) -> Result<u64, HostError> {
+    self
+      .dirs
+      .get(&dir.0)
+      .map(|(_, mount)| *mount)
+      .ok_or(HostError::StaleHandle)
+  }
+
+  fn dir(&self, dir: HostDir) -> Result<&OwnedFd, HostError> {
+    self
+      .dirs
+      .get(&dir.0)
+      .map(|(fd, _)| fd)
+      .ok_or(HostError::StaleHandle)
+  }
+
+  fn file(&self, file: HostFile) -> Result<&OwnedFd, HostError> {
+    self.files.get(&file.0).ok_or(HostError::StaleHandle)
+  }
+
+  /// Open handles, for leak checks.
+  pub fn open_handles(&self) -> usize {
+    self.dirs.len().saturating_add(self.files.len())
+  }
+
+  /// The descriptor behind a directory handle, for the landing crate's write verbs.
+  pub fn dir_fd(&self, dir: HostDir) -> Result<BorrowedFd<'_>, HostError> {
+    self.dir(dir).map(AsFd::as_fd)
+  }
+
+  /// The descriptor behind a file handle.
+  pub fn file_fd(&self, file: HostFile) -> Result<BorrowedFd<'_>, HostError> {
+    self.file(file).map(AsFd::as_fd)
+  }
+
+  /// The fingerprint of the entry `name` under `dir` itself — a symlink's own, not its target's (`statat`
+  /// without following): the landing's check of an entry it moved aside (AUD-29-04). A read, like
+  /// [`HostFs::list`]'s own per-entry `statat`.
+  pub fn entry_fingerprint(&self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
+    let name = one_entry(name, UNIX_NAME_BREAKS)?;
+    check_crossing(self.dir(dir)?.as_fd(), self.dir_mount(dir)?, name)?;
+    fingerprint_at(self.dir(dir)?.as_fd(), name).map_err(refusal)
+  }
+
+  /// Takes ownership of a directory descriptor the caller opened (with containment); refused `EMFILE` once
+  /// the handle ids are spent ([`OsHost::allocate`]).
+  pub fn adopt_dir(&mut self, fd: OwnedFd) -> Result<HostDir, HostError> {
+    self.keep_dir(fd)
+  }
+
+  /// Takes ownership of a file descriptor the caller opened (a temporary); refused `EMFILE` once the
+  /// handle ids are spent ([`OsHost::allocate`]).
+  pub fn adopt_file(&mut self, fd: OwnedFd) -> Result<HostFile, HostError> {
+    let h = self.allocate()?;
+    self.files.insert(h, fd);
+    Ok(HostFile(h))
+  }
+}
+
+impl HostFs for OsHost {
+  fn facts(&mut self, dir: HostDir) -> Result<HostFacts, HostError> {
+    let fd = self.dir(dir)?;
+    let fs = rustix::fs::fstatfs(fd).map_err(refusal)?;
+    let resolution = rustix::time::clock_getres(rustix::time::ClockId::Realtime);
+    let clock_ns = u64::try_from(resolution.tv_nsec).unwrap_or(1).max(1);
+    Ok(HostFacts {
+      timestamp_granularity_ns: granularity_for(fs_kind(&fs)).max(clock_ns),
+    })
+  }
+
+  fn now_ns(&mut self) -> i64 {
+    // The clock `stat` stamps files from (`CLOCK_REALTIME`), in the fingerprints' nanoseconds.
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    stamp_ns(widen(now.tv_sec), widen(now.tv_nsec))
+  }
+
+  fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
+    fingerprint_of(self.dir(dir)?.as_fd()).map_err(refusal)
+  }
+
+  fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
+    let mount = self.dir_mount(dir)?;
+    let fd = self.dir(dir)?;
+    let reader = Dir::read_from(fd).map_err(refusal)?;
+    let mut out = Vec::new();
+    for entry in reader {
+      let entry = entry.map_err(refusal)?;
+      let raw = entry.file_name();
+      if raw.to_bytes() == b"." || raw.to_bytes() == b".." {
+        continue;
+      }
+      let Ok(name) = raw.to_str() else {
+        // Not UTF-8: listed as something the volume never serves.
+        out.push(BaseEntry {
+          name: raw.to_string_lossy().into_owned().into(),
+          kind: HostKind::Other,
+          fingerprint: Fingerprint::default(),
+        });
+        continue;
+      };
+      if may_be_a_mount(entry.file_type()) {
+        check_crossing(
+          fd.as_fd(),
+          mount,
+          std::ffi::OsStr::from_bytes(raw.to_bytes()),
+        )?;
+      }
+      let fingerprint = match fingerprint_at(fd.as_fd(), raw) {
+        Ok(fingerprint) => fingerprint,
+        // Gone between the listing and the stat: the disk is the truth, it is not there.
+        Err(rustix::io::Errno::NOENT) => continue,
+        Err(e) => return Err(refusal(e)),
+      };
+      out.push(BaseEntry {
+        name: name.into(),
+        kind: kind_of(entry.file_type()),
+        fingerprint,
+      });
+    }
+    Ok(out)
+  }
+
+  fn open_dir(&mut self, parent: HostDir, name: &str) -> Result<HostDir, HostError> {
+    let name = one_entry(name, UNIX_NAME_BREAKS)?;
+    check_crossing(self.dir(parent)?.as_fd(), self.dir_mount(parent)?, name)?;
+    let fd = rustix::fs::openat(
+      self.dir(parent)?,
+      name,
+      OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+      Mode::empty(),
+    )
+    .map_err(|e| match e {
+      rustix::io::Errno::LOOP => HostError::NotDirectory,
+      other => refusal(other),
+    })?;
+    self.keep_dir(fd)
+  }
+
+  fn open_file(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let name = one_entry(name, UNIX_NAME_BREAKS)?;
+    check_crossing(self.dir(dir)?.as_fd(), self.dir_mount(dir)?, name)?;
+    let fd = rustix::fs::openat(
+      self.dir(dir)?,
+      name,
+      OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+      Mode::empty(),
+    )
+    .map_err(refusal)?;
+    let st = rustix::fs::fstat(&fd).map_err(refusal)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+      return Err(HostError::NotFile);
+    }
+    let h = self.allocate()?;
+    self.watcher.add_file(dir, name, &fd);
+    self.files.insert(h, fd);
+    Ok(HostFile(h))
+  }
+
+  fn fstat(&mut self, file: HostFile) -> Result<Fingerprint, HostError> {
+    fingerprint_of(self.file(file)?.as_fd()).map_err(refusal)
+  }
+
+  fn read_at(&mut self, file: HostFile, off: u64, buf: &mut [u8]) -> Result<usize, HostError> {
+    let fd = self.file(file)?;
+    rustix::io::pread(fd, buf, off).map_err(refusal)
+  }
+
+  fn read_link(&mut self, dir: HostDir, name: &str) -> Result<Box<str>, HostError> {
+    let name = one_entry(name, UNIX_NAME_BREAKS)?;
+    let fd = self.dir(dir)?;
+    check_crossing(fd.as_fd(), self.dir_mount(dir)?, name)?;
+    let target = rustix::fs::readlinkat(fd, name, Vec::new()).map_err(refusal)?;
+    target
+      .to_str()
+      .map(|s| s.into())
+      .map_err(|_| HostError::Unavailable(rustix::io::Errno::ILSEQ.raw_os_error()))
+  }
+
+  fn close_file(&mut self, file: HostFile) {
+    if let Some(fd) = self.files.remove(&file.0) {
+      self.watcher.forget_file(&fd);
+    }
+  }
+
+  fn close_dir(&mut self, dir: HostDir) {
+    if let Some((fd, _)) = self.dirs.remove(&dir.0) {
+      self.watcher.forget(dir, &fd);
+    }
+  }
+
+  fn watch(&mut self, dir: HostDir) -> WatchState {
+    match self.dirs.get(&dir.0) {
+      Some((fd, _)) => self.watcher.add(dir, fd),
+      None => WatchState::Unavailable,
+    }
+  }
+
+  fn hints(&mut self) -> Vec<Hint> {
+    self.watcher.drain()
+  }
+}
+
+/// The filesystem class beneath a descriptor, from `fstatfs`.
+#[cfg(target_os = "linux")]
+fn fs_kind(fs: &rustix::fs::StatFs) -> FsKind {
+  /// Format: `statfs(2)`'s `f_type` magic for ext2/3/4.
+  const EXT4: i64 = 0xEF53;
+  /// Format: the magic for XFS.
+  const XFS: i64 = 0x5846_5342;
+  /// Format: the magic for Btrfs.
+  const BTRFS: i64 = 0x9123_683E;
+  /// Format: the magic for tmpfs.
+  const TMPFS: i64 = 0x0102_1994;
+  /// Format: the magic for FAT (msdos/vfat).
+  const MSDOS: i64 = 0x4d44;
+  /// Format: the magic for exFAT.
+  const EXFAT: i64 = 0x2011_BAB0;
+  /// Format: the magic for NTFS.
+  const NTFS: i64 = 0x5346_544e;
+  /// Format: the magic for HFS+.
+  const HFSPLUS: i64 = 0x482b;
+  match widen(fs.f_type) {
+    EXT4 | XFS | BTRFS | TMPFS => FsKind::Nanosecond,
+    NTFS => FsKind::HundredNanoseconds,
+    HFSPLUS => FsKind::Second,
+    MSDOS | EXFAT => FsKind::TwoSeconds,
+    _ => FsKind::Unknown,
+  }
+}
+
+/// The filesystem class beneath a descriptor, from `fstatfs`'s type name.
+#[cfg(not(target_os = "linux"))]
+fn fs_kind(fs: &rustix::fs::StatFs) -> FsKind {
+  let name: Vec<u8> = fs
+    .f_fstypename
+    .iter()
+    .take_while(|c| **c != 0)
+    .map(|c| u8::try_from(i32::from(*c)).unwrap_or(b'?'))
+    .collect();
+  match name.as_slice() {
+    b"apfs" => FsKind::Nanosecond,
+    b"hfs" => FsKind::Second,
+    b"msdos" | b"exfat" => FsKind::TwoSeconds,
+    b"ntfs" => FsKind::HundredNanoseconds,
+    _ => FsKind::Unknown,
+  }
+}
+
+#[cfg(target_os = "linux")]
+mod watch {
+  //! inotify: one instance, one watch per directory through `/proc/self/fd`, drained without
+  //! blocking; `IN_Q_OVERFLOW` is the overflow hint.
+
+  use std::collections::BTreeMap;
+  use std::mem::MaybeUninit;
+  use std::os::fd::{AsRawFd, OwnedFd};
+
+  use rustix::fs::inotify::{CreateFlags, ReadFlags, Reader, WatchFlags};
+  use slates_vfs::host::{Hint, HostDir, WatchState};
+
+  /// Derived: the read buffer holds one page of events, the smallest buffer `read(2)` on an
+  /// inotify descriptor accepts for a full event with the longest name (`sizeof(inotify_event)
+  /// + NAME_MAX + 1` = 272 bytes) fifteen times over.
+  const BUFFER_BYTES: usize = 4096;
+
+  pub(super) struct Watcher {
+    inotify: Option<OwnedFd>,
+    by_wd: BTreeMap<i32, HostDir>,
+    wd_of: BTreeMap<HostDir, i32>,
+  }
+
+  impl Watcher {
+    pub(super) fn new() -> Self {
+      Self {
+        inotify: rustix::fs::inotify::init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC).ok(),
+        by_wd: BTreeMap::new(),
+        wd_of: BTreeMap::new(),
+      }
+    }
+
+    pub(super) fn add(&mut self, dir: HostDir, fd: &OwnedFd) -> WatchState {
+      let Some(inotify) = &self.inotify else {
+        return WatchState::Unavailable;
+      };
+      let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+      let flags = WatchFlags::CREATE
+        | WatchFlags::DELETE
+        | WatchFlags::MODIFY
+        | WatchFlags::MOVED_FROM
+        | WatchFlags::MOVED_TO
+        | WatchFlags::ATTRIB
+        | WatchFlags::CLOSE_WRITE
+        | WatchFlags::DELETE_SELF
+        | WatchFlags::MOVE_SELF;
+      match rustix::fs::inotify::add_watch(inotify, path, flags) {
+        Ok(wd) => {
+          self.by_wd.insert(wd, dir);
+          self.wd_of.insert(dir, wd);
+          WatchState::Live
+        }
+        Err(_) => WatchState::Unavailable,
+      }
+    }
+
+    /// Nothing on Linux: the directory's watch already reports a write to any file in it (`IN_MODIFY`).
+    pub(super) fn add_file(&mut self, _dir: HostDir, _name: &str, _fd: &OwnedFd) {}
+
+    /// Nothing on Linux (see [`Self::add_file`]).
+    pub(super) fn forget_file(&mut self, _fd: &OwnedFd) {}
+
+    pub(super) fn forget(&mut self, dir: HostDir, _fd: &OwnedFd) {
+      if let (Some(inotify), Some(wd)) = (&self.inotify, self.wd_of.remove(&dir)) {
+        let _ = rustix::fs::inotify::remove_watch(inotify, wd);
+        self.by_wd.remove(&wd);
+      }
+    }
+
+    pub(super) fn drain(&mut self) -> Vec<Hint> {
+      let Some(inotify) = &self.inotify else {
+        return Vec::new();
+      };
+      let mut buf = [MaybeUninit::<u8>::uninit(); BUFFER_BYTES];
+      let mut reader = Reader::new(inotify, &mut buf);
+      let mut out = Vec::new();
+      while let Ok(event) = reader.next() {
+        if event.events().contains(ReadFlags::QUEUE_OVERFLOW) {
+          out.push(Hint::Overflow);
+        } else if let Some(dir) = self.by_wd.get(&event.wd()) {
+          // inotify names the child an event on a watched directory is about; an event on the directory itself
+          // (moved, deleted) names none.
+          out.push(
+            match event.file_name().and_then(|name| name.to_str().ok()) {
+              Some(name) if !name.is_empty() => Hint::Entry(*dir, name.into()),
+              _ => Hint::Changed(*dir),
+            },
+          );
+        }
+      }
+      out.dedup();
+      out
+    }
+  }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod watch {
+  //! kqueue: one queue, one `EVFILT_VNODE` registration per directory descriptor (the
+  //! descriptor stays open for the listing anyway), drained with a zero timeout. kqueue does
+  //! not report lost events; a registration failure is `Unavailable`.
+
+  use std::collections::{BTreeMap, BTreeSet};
+  use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+
+  use rustix::event::kqueue::{Event, EventFilter, EventFlags, VnodeEvents, kevent, kqueue};
+  use slates_vfs::host::{Hint, HostDir, WatchState};
+
+  /// Shape: events drained per call; the queue is drained again on the next call.
+  const DRAIN: usize = 64;
+
+  pub(super) struct Watcher {
+    queue: Option<OwnedFd>,
+    /// Each registered descriptor (a watched directory's, or an opened file's) and the directory its events hint, with
+    /// the file's name for a file.
+    by_fd: BTreeMap<i32, (HostDir, Option<Box<str>>)>,
+    /// The directories registered, so a file is watched only beneath a watched directory.
+    watched: BTreeSet<HostDir>,
+  }
+
+  impl Watcher {
+    pub(super) fn new() -> Self {
+      Self {
+        queue: kqueue().ok(),
+        by_fd: BTreeMap::new(),
+        watched: BTreeSet::new(),
+      }
+    }
+
+    /// Registers `fd` for `flags` with events hinting `dir`; whether the kernel took it.
+    fn register(
+      &mut self,
+      (dir, name): (HostDir, Option<Box<str>>),
+      fd: &OwnedFd,
+      flags: VnodeEvents,
+    ) -> bool {
+      let Some(queue) = &self.queue else {
+        return false;
+      };
+      let change = Event::new(
+        EventFilter::Vnode {
+          vnode: fd.as_fd().as_raw_fd(),
+          flags,
+        },
+        EventFlags::ADD | EventFlags::CLEAR,
+        std::ptr::null_mut(),
+      );
+      let mut none: Vec<Event> = Vec::new();
+      // SAFETY: the change list is one event on a descriptor this host owns; the output list is
+      // empty and stays empty (its capacity is zero), so the kernel writes nothing.
+      let registered = unsafe { kevent(queue, &[change], &mut none, None) };
+      if registered.is_ok() {
+        self.by_fd.insert(fd.as_raw_fd(), (dir, name));
+      }
+      registered.is_ok()
+    }
+
+    pub(super) fn add(&mut self, dir: HostDir, fd: &OwnedFd) -> WatchState {
+      let flags = VnodeEvents::WRITE
+        | VnodeEvents::DELETE
+        | VnodeEvents::RENAME
+        | VnodeEvents::ATTRIBUTES
+        | VnodeEvents::EXTEND
+        | VnodeEvents::LINK;
+      if self.register((dir, None), fd, flags) {
+        self.watched.insert(dir);
+        WatchState::Live
+      } else {
+        WatchState::Unavailable
+      }
+    }
+
+    /// Watches a file opened beneath a watched directory, its events hinting the directory (A-122): `EVFILT_VNODE` on
+    /// a directory reports namespace changes only, so an outsider's in-place write to an existing file is seen only on
+    /// the file's own descriptor. A file beneath an unwatched directory, or one the kernel refuses, is not watched; the
+    /// lookup's live-disk check still sees the change.
+    pub(super) fn add_file(&mut self, dir: HostDir, name: &str, fd: &OwnedFd) {
+      if !self.watched.contains(&dir) {
+        return;
+      }
+      let flags = VnodeEvents::WRITE
+        | VnodeEvents::EXTEND
+        | VnodeEvents::ATTRIBUTES
+        | VnodeEvents::DELETE
+        | VnodeEvents::RENAME;
+      self.register((dir, Some(name.into())), fd, flags);
+    }
+
+    /// Forgets an opened file, before its descriptor closes (closing removes the kernel's registration; the number may
+    /// be reused at once).
+    pub(super) fn forget_file(&mut self, fd: &OwnedFd) {
+      self.by_fd.remove(&fd.as_raw_fd());
+    }
+
+    pub(super) fn forget(&mut self, dir: HostDir, fd: &OwnedFd) {
+      // Closing the descriptor removes its registration.
+      self.by_fd.remove(&fd.as_raw_fd());
+      self.watched.remove(&dir);
+    }
+
+    pub(super) fn drain(&mut self) -> Vec<Hint> {
+      let Some(queue) = &self.queue else {
+        return Vec::new();
+      };
+      let mut events: Vec<Event> = Vec::with_capacity(DRAIN);
+      // The kernel fills the vector's spare capacity and rustix sets its length from the count
+      // returned. A bare `&mut events` hands rustix 1.x the vector's *length* (zero) as the event
+      // list's size, so the kernel reported nothing and no hint was ever delivered here
+      // (docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md).
+      // SAFETY: no changes are submitted; the output buffer is the vector's spare capacity, which
+      // the kernel may fill up to its length; a zero timeout never blocks.
+      let drained = unsafe {
+        kevent(
+          queue,
+          &[],
+          rustix::buffer::spare_capacity(&mut events),
+          Some(std::time::Duration::ZERO),
+        )
+      };
+      if drained.is_err() {
+        return Vec::new();
+      }
+      let mut out: Vec<Hint> = events
+        .iter()
+        .filter_map(|e| match e.filter() {
+          EventFilter::Vnode { vnode, .. } => {
+            self.by_fd.get(&vnode).map(|(dir, name)| match name {
+              Some(name) => Hint::Entry(*dir, name.clone()),
+              None => Hint::Changed(*dir),
+            })
+          }
+          _ => None,
+        })
+        .collect();
+      out.dedup();
+      out
+    }
+  }
+}

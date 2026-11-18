@@ -1,0 +1,544 @@
+//! Observation delivery (§4.14 "observability"; `slates_server::observe`): what a question asked of a
+//! daemon from another thread reports at each stage it can end in — a full control channel, a receptive
+//! channel with a full arena, a target that stops while the question is pending and whose registry slot a
+//! later daemon reuses, a budget that elapses before a late reply, an unavailable shard told apart from an
+//! observed zero — and the two pure rules the fleet harness's waits rest on: the verdict of an observation,
+//! and the progress charge under unequal starts with one daemon stalled. Every history drives a real
+//! daemon (one shard, a laptop: no fleet) through the public observation entry points.
+
+// Test harness code: an unwrap here is a failed test, which is what it should be.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod common;
+
+use std::sync::mpsc::channel;
+use std::time::{Duration, Instant};
+
+use common::wait::{ProgressCharge, Verdict, verdict};
+use slates_rt::RtError;
+use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
+use slates_server::observe::{OBSERVE_LATE_REPLY, ObserveError, ObserveStage};
+use slates_server::state::ShardState;
+use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+/// Derived: how long a held control shard spins — two anchor liveness budgets ([`LIVENESS_BUDGET_NS`]),
+/// long past the short budget below, so a question submitted behind the hold is judged while the hold
+/// still stands, and short enough that a history stays a few seconds.
+const HOLD_NS: u64 = 2 * LIVENESS_BUDGET_NS;
+/// Derived: a budget an observation is given to fail inside a hold — three tenths of a liveness budget,
+/// many paces of the observation's retry cadence (a tenth of a heartbeat), so a refused submission is
+/// attempted several times before the deadline names it.
+const SHORT_BUDGET_NS: u64 = LIVENESS_BUDGET_NS * 3 / 10;
+/// Shape: how many short budgets the wedged question sleeps — well past the bound it must end within.
+const WEDGE_BUDGETS: u64 = 5;
+/// Shape: the budgets a wedged shard's observation must end within — the window it wedged in (read as working, since
+/// the shard ran the task's start there), the window that shows no CPU, and one more for the deadline's lateness under
+/// a loaded runner; still two budgets short of the wedge.
+const ENDED_WITHIN_BUDGETS: u64 = 3;
+/// Derived: how much of its shard's own CPU time a deliberately slow question spins ([`spin_shard_time`]) — twice the short budget, so its
+/// answer is late by construction.
+const SLOW_QUESTION_NS: u64 = 2 * SHORT_BUDGET_NS;
+/// Spins on the calling shard until it has run `ns` of its own CPU time — the clock an observation's budget is
+/// counted in (A-65) — so a question is late by construction however little CPU a loaded machine gives the shard.
+/// Spinning by the wall clock was not: a shard given under half a core finished a two-budget wall spin having run
+/// less than one budget, and was rightly answered (load average 20-64, 2026-10-04). Where the platform has no
+/// thread clock (Miri), the wall budget stands alone, so the spin is by the wall clock there.
+fn spin_shard_time(ns: u64) {
+  let cpu = || {
+    slates_rt::registry::current_shard()
+      .and_then(slates_rt::registry::holder_of)
+      .and_then(slates_rt::registry::shard_cpu)
+      .map(|reading| reading.spent_ns)
+  };
+  match cpu() {
+    Some(began) => {
+      let end = began.saturating_add(ns);
+      while cpu().is_some_and(|spent| spent < end) {
+        std::hint::spin_loop();
+      }
+    }
+    None => {
+      let end = slates_rt::futures::now_ns().saturating_add(ns);
+      while slates_rt::futures::now_ns() < end {
+        std::hint::spin_loop();
+      }
+    }
+  }
+}
+
+/// Shape: how long a late reply is waited for to be counted, or a stopped daemon's pending question to
+/// end — the whole observe budget, the bound past which either is a failure.
+const SETTLE: Duration = Duration::from_nanos(OBSERVE_BUDGET_NS);
+
+/// The observation histories each hold or fill a daemon's control shard, so they run one at a time —
+/// the test-harness exception to R2's no-`Mutex` rule (D-8 exception 3), as the fleet tests do.
+#[allow(clippy::disallowed_types)]
+static OBSERVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialize() -> std::sync::MutexGuard<'static, ()> {
+  OBSERVE_TEST_LOCK
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A one-shard laptop daemon (no fleet) named for the history.
+fn laptop(name: &str) -> Daemon {
+  let profile = common::machine_profile();
+  let instance = format!("observe-{name}-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", &format!("observe-{name}")),
+    },
+  )
+  .expect("the laptop daemon starts")
+}
+
+/// A question with a fixed answer, so a delivered answer is told from a stranger's.
+fn answer(token: u8) -> impl FnOnce(&mut ShardState) -> u8 + Clone + Send + 'static {
+  move |_state| token
+}
+
+/// Waits, bounded by [`SETTLE`], until the daemon's late-reply count reaches `expected`; the count seen.
+fn late_replies_reach(daemon: &Daemon, expected: u64) -> u64 {
+  let began = Instant::now();
+  loop {
+    let late = daemon
+      .fleet_refusals()
+      .map(|refusals| refusals.get(OBSERVE_LATE_REPLY).copied().unwrap_or(0))
+      .unwrap_or(0);
+    if late >= expected || began.elapsed() > SETTLE {
+      return late;
+    }
+    std::thread::yield_now();
+  }
+}
+
+/// A full control channel: the submission meets `ControlFull`, is retried inside the one budget, and the
+/// deadline names the submission stage and that refusal; once the shard drains, the same question answers.
+///
+/// **Wedged, not starved.** An observation's budget is the shard's own CPU time, so a shard that is working
+/// gets more wall time and only one that is not running deadlines (§4.14, A-65). A *spinning* hold reaches the
+/// budget only on a machine idle enough to spin at the wall clock's pace: under twenty-four CPU burners on
+/// 2026-10-18 a two-second spin advanced the shard's clock by 153 ms against a 300 ms budget, the submission
+/// eventually got a drained slot, and this ended in the admission stage carrying the right refusal.
+#[test]
+fn a_full_control_channel_is_retried_then_named_by_the_deadline() {
+  let _serial = serialize();
+  common::supervised::run(
+    "a_full_control_channel_is_retried_then_named_by_the_deadline_role",
+    "observe-control-full",
+    1,
+  );
+}
+
+/// The role [`a_full_control_channel_is_retried_then_named_by_the_deadline`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_full_control_channel_is_retried_then_named_by_the_deadline as a supervised child"]
+fn a_full_control_channel_is_retried_then_named_by_the_deadline_role() {
+  let Some((daemon, _)) =
+    common::supervised::daemon("a_full_control_channel_is_retried_then_named_by_the_deadline_role")
+  else {
+    return;
+  };
+  // Wedged, the shard drains nothing: the flood fills its control channel to the bound.
+  let hold = daemon
+    .wedge_control_shard(HOLD_NS)
+    .expect("the hold is admitted");
+  let queued = daemon
+    .flood_control_channel()
+    .expect("the flood is submitted");
+  assert!(queued >= 1, "the channel took the flood before refusing");
+  let refused = daemon.observe_control(SHORT_BUDGET_NS, answer(7));
+  assert!(
+    matches!(
+      &refused,
+      Err(ObserveError::Deadline {
+        stage: ObserveStage::Submission,
+        attempts,
+        last_refusal: Some(RtError::ControlFull { .. }),
+        ..
+      }) if *attempts >= 2
+    ),
+    "the deadline names the submission stage and the full channel, after retries: {refused:?}"
+  );
+  let held_ns = hold.answer().expect("the hold reports its span");
+  assert!(
+    held_ns >= HOLD_NS,
+    "the hold held for its span: {held_ns} ns"
+  );
+  assert_eq!(
+    daemon.observe_control(OBSERVE_BUDGET_NS, answer(7)),
+    Ok(7),
+    "once the shard drains, the same question is answered"
+  );
+  daemon.stop();
+}
+
+/// A receptive control channel and a full arena: the submission lands, the receipt reports the admission
+/// refused, the refusal is retried inside the budget, and the deadline names the admission stage and the
+/// full arena; once the fillers are released, the same question is admitted and answered.
+#[test]
+fn a_full_arena_refuses_admission_on_the_receipt_then_admits_after_release() {
+  let _serial = serialize();
+  let daemon = laptop("arena-full");
+  let mut fill = daemon.fill_task_arena().expect("the fill is submitted");
+  assert!(
+    fill.reached_the_bound(),
+    "the arena's bound was met ({} fillers admitted)",
+    fill.admitted()
+  );
+  let refused = daemon.observe_control(SHORT_BUDGET_NS, answer(3));
+  assert!(
+    matches!(
+      &refused,
+      Err(ObserveError::Deadline {
+        stage: ObserveStage::Admission,
+        attempts,
+        last_refusal: Some(RtError::TooManyTasks { .. }),
+        ..
+      }) if *attempts >= 2
+    ),
+    "the deadline names the admission stage and the full arena, after retries: {refused:?}"
+  );
+  fill.release();
+  assert_eq!(
+    daemon.observe_control(OBSERVE_BUDGET_NS, answer(3)),
+    Ok(3),
+    "once the fillers end, the same question is admitted and answered"
+  );
+  daemon.stop();
+}
+
+/// A daemon stopped while a question is pending on it answers the question terminated (or gone) well
+/// inside its budget, never leaves it waiting; a question begun on it and run only after a later daemon
+/// took its registry slot is refused as gone, and the later daemon never runs it.
+#[test]
+fn a_stopped_target_terminates_its_pending_question_and_its_reused_slot_never_answers_a_stranger() {
+  let _serial = serialize();
+  let daemon = laptop("stop-pending");
+  let hold = daemon
+    .starve_control_shard(HOLD_NS)
+    .expect("the hold is admitted");
+  // Pending on another thread: it submits behind the hold and waits on its receipt.
+  let pending = daemon
+    .observation_on_control(OBSERVE_BUDGET_NS, answer(11))
+    .expect("the observation begins");
+  let (tx, rx) = channel();
+  let began = Instant::now();
+  std::thread::spawn(move || {
+    let _ = tx.send(pending.wait());
+  });
+  // Begun before the stop, run only after a stranger holds the slot: refused as gone.
+  let stale = daemon
+    .observation_on_control(OBSERVE_BUDGET_NS, |state: &mut ShardState| {
+      *state.refusals.entry("observe.stranger").or_insert(0) += 1;
+    })
+    .expect("the stale observation begins");
+  drop(hold);
+  daemon.stop();
+  let ended = rx
+    .recv_timeout(SETTLE)
+    .expect("the pending question ended inside its budget");
+  assert!(
+    matches!(
+      ended,
+      Err(ObserveError::Terminated { .. }) | Err(ObserveError::ShardGone { .. })
+    ),
+    "the stop ended the pending question typed, after {:?}: {ended:?}",
+    began.elapsed()
+  );
+  let stranger = laptop("stranger");
+  assert!(
+    matches!(
+      stale.wait(),
+      Err(ObserveError::ShardGone {
+        stage: ObserveStage::Submission,
+        ..
+      })
+    ),
+    "a question pinned to the stopped daemon's registration is refused once its slot is free or reused"
+  );
+  assert_eq!(
+    stranger
+      .fleet_refusals()
+      .map(|refusals| refusals.contains_key("observe.stranger")),
+    Ok(false),
+    "the stranger never ran the stopped daemon's question"
+  );
+  assert_eq!(
+    stranger.observe_control(OBSERVE_BUDGET_NS, answer(5)),
+    Ok(5)
+  );
+  stranger.stop();
+}
+
+/// A budget that elapses first is named by the stage it elapsed at — admission, for a question queued
+/// behind a hold; execution, for a question admitted but still running — and the reply that arrives after
+/// it is discarded and counted, never delivered to a later question.
+///
+/// The hold **wedges** rather than starves, because the budget is the shard's own CPU time: a shard that is
+/// working is given more wall time and answers (§4.14, A-65). With a spinning hold this test read `Ok(42)`
+/// under load on 2026-10-18 — the question waited out the hold and was answered, which is the rule working,
+/// not failing.
+#[test]
+fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted() {
+  let _serial = serialize();
+  common::supervised::run(
+    "a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role",
+    "observe-late-reply",
+    1,
+  );
+}
+
+/// The role [`a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted as a supervised child"]
+fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role() {
+  let Some((daemon, _)) = common::supervised::daemon(
+    "a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_counted_role",
+  ) else {
+    return;
+  };
+  let hold = daemon
+    .wedge_control_shard(HOLD_NS)
+    .expect("the hold is admitted");
+  let queued = daemon.observe_control(SHORT_BUDGET_NS, answer(42));
+  assert!(
+    matches!(
+      queued,
+      Err(ObserveError::Deadline {
+        stage: ObserveStage::Admission,
+        last_refusal: None,
+        ..
+      })
+    ),
+    "a question queued behind the hold ends at its deadline in the admission stage: {queued:?}"
+  );
+  hold.answer().expect("the hold reports its span");
+  // The shard drained the queued question late: its reply met a dropped channel and was counted.
+  assert_eq!(
+    daemon.observe_control(OBSERVE_BUDGET_NS, answer(43)),
+    Ok(43),
+    "a later question gets its own answer, never the late one"
+  );
+  assert_eq!(late_replies_reach(&daemon, 1), 1);
+  // Admitted at once on the idle shard, the slow question is still running at the deadline.
+  let slow = daemon
+    .observation_on_control(SHORT_BUDGET_NS, |_state: &mut ShardState| {
+      spin_shard_time(SLOW_QUESTION_NS);
+      9u8
+    })
+    .expect("the slow observation begins")
+    .admit()
+    .expect("the slow question is admitted at once");
+  let late = slow.answer();
+  assert!(
+    matches!(
+      late,
+      Err(ObserveError::Deadline {
+        stage: ObserveStage::Execution,
+        ..
+      })
+    ),
+    "a question still running at its deadline ends in the execution stage: {late:?}"
+  );
+  assert_eq!(late_replies_reach(&daemon, 2), 2);
+  daemon.stop();
+}
+
+/// An unavailable shard is told apart from an observed zero, and a poll's verdict sorts the three ways an
+/// ask can end: observed (the zero), unavailable (a shard that is not running, the wait continues), terminal
+/// (a daemon that stopped, the wait ends).
+///
+/// "Unavailable" is the product's own meaning and not merely "busy": an observation's budget is the shard's
+/// CPU time, so a shard the host is starving keeps its budget and is answered late rather than refused (§4.14,
+/// A-65, `docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md`). The hold therefore wedges.
+/// Said the other way with a spinning hold, this test asserted that a busy shard is unavailable, which the
+/// product deliberately denies — and it read `Ok(0)` under load on 2026-10-18.
+#[test]
+fn an_unavailable_shard_is_told_apart_from_an_observed_zero() {
+  let _serial = serialize();
+  common::supervised::run(
+    "an_unavailable_shard_is_told_apart_from_an_observed_zero_role",
+    "observe-zero",
+    1,
+  );
+}
+
+/// The role [`an_unavailable_shard_is_told_apart_from_an_observed_zero`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by an_unavailable_shard_is_told_apart_from_an_observed_zero as a supervised child"]
+fn an_unavailable_shard_is_told_apart_from_an_observed_zero_role() {
+  let Some((daemon, _)) =
+    common::supervised::daemon("an_unavailable_shard_is_told_apart_from_an_observed_zero_role")
+  else {
+    return;
+  };
+  let repairs = |state: &mut ShardState| state.repairs;
+  let observed = daemon.observe_control(OBSERVE_BUDGET_NS, repairs);
+  assert_eq!(
+    observed,
+    Ok(0),
+    "a laptop has repaired nothing: an observed zero"
+  );
+  assert_eq!(verdict(observed.map(|count| count > 0)), Verdict::Observed);
+  let hold = daemon
+    .wedge_control_shard(HOLD_NS)
+    .expect("the hold is admitted");
+  let unavailable = daemon.observe_control(SHORT_BUDGET_NS, repairs);
+  assert!(
+    matches!(unavailable, Err(ObserveError::Deadline { .. })),
+    "the held shard is unavailable, not zero: {unavailable:?}"
+  );
+  assert!(matches!(
+    verdict(unavailable.map(|count| count > 0)),
+    Verdict::Unavailable(_)
+  ));
+  hold.answer().expect("the hold reports its span");
+  let after_stop = daemon
+    .observation_on_control(OBSERVE_BUDGET_NS, repairs)
+    .expect("the observation begins");
+  daemon.stop();
+  let gone = after_stop.wait();
+  assert!(matches!(
+    verdict(gone.map(|count| count > 0)),
+    Verdict::Terminal(ObserveError::ShardGone { .. })
+  ));
+}
+
+/// The wait's progress charge under unequal starts with one daemon stalled: each daemon's advance is
+/// counted from its own start and the wait is charged the least, so a daemon that began far ahead never
+/// pays for one that stopped moving.
+#[test]
+fn a_wait_is_charged_the_least_advance_from_each_daemons_own_start() {
+  let charge = ProgressCharge::begin([100, 5_000]);
+  // The first daemon ran 4,000 periods; the second stalled at 5,000: the wait is charged nothing. The
+  // rule this replaced charged the least absolute count's advance — 4,100 − 100 — and would have spent
+  // the whole period budget here on a daemon that never moved.
+  assert_eq!(charge.each([4_100, 5_000]), vec![4_000, 0]);
+  assert_eq!(charge.advanced([4_100, 5_000]), 0);
+  assert_eq!(charge.advanced([4_100, 5_001]), 1);
+  // A coordinator behind its start (restarted) counts as no advance, never a wrap.
+  assert_eq!(charge.advanced([50, 6_000]), 0);
+  assert_eq!(ProgressCharge::begin([]).advanced([]), 0);
+}
+
+/// Format: the slice a simulated starved shard sleeps between its bursts of work.
+const STARVED_SLEEP: std::time::Duration = std::time::Duration::from_millis(1);
+/// Shape: the share of each slice the simulated starved shard works — a tenth, as a shard given a tenth of a core.
+const STARVED_WORK_NS: u64 = 100_000;
+
+/// §4.14 (an observation's budget is the shard's own time). Do: ask a question that runs three short budgets of wall
+/// time while working only about a tenth of it — sleeping a millisecond, then working a tenth of one, over and over,
+/// as a shard starved of CPU runs. Expect: the answer, not a deadline: the shard kept working, and ran far less than the
+/// budget. Under the wall budget alone this ended at the first deadline
+/// (`docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md`).
+#[test]
+fn a_starved_but_working_shard_is_answered_past_the_wall_budget() {
+  let _serial = serialize();
+  let daemon = laptop("starved");
+  let answered = daemon.observe_control(SHORT_BUDGET_NS, |_state: &mut ShardState| {
+    let end = slates_rt::futures::now_ns().saturating_add(3 * SHORT_BUDGET_NS);
+    while slates_rt::futures::now_ns() < end {
+      // The question blocks its shard off the CPU on purpose: the starvation this test stands for.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(STARVED_SLEEP);
+      let burst = slates_rt::futures::now_ns().saturating_add(STARVED_WORK_NS);
+      while slates_rt::futures::now_ns() < burst {
+        std::hint::spin_loop();
+      }
+    }
+    7u8
+  });
+  assert_eq!(answered, Ok(7), "a working shard is answered");
+  daemon.stop();
+}
+
+/// §4.14, A-65. Do: ask a question that only sleeps for five short budgets — a shard that consumes no CPU once the
+/// question starts, as a wedged one. Expect: a deadline in the execution stage before three budgets, long before the
+/// question ends. The shard ran the task's start inside the first window, so the rule reads that window as working and
+/// grants one more; the window after it shows no CPU and ends the observation (CI run 37178742493: 656 ms against a
+/// 300 ms budget, where an earlier bound of two budgets left no room for the deadline's own lateness).
+#[test]
+fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does() {
+  let _serial = serialize();
+  common::supervised::run(
+    "a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role",
+    "observe-wedged",
+    1,
+  );
+}
+
+/// The role [`a_wedged_shard_ends_the_observation_long_before_its_wedge_does`] runs as a supervised daemon's process: it keeps its shard wedged past a window, which only
+/// an anchored daemon lives through (A-232).
+#[test]
+#[ignore = "a role: run by a_wedged_shard_ends_the_observation_long_before_its_wedge_does as a supervised child"]
+fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role() {
+  let Some((daemon, _)) = common::supervised::daemon(
+    "a_wedged_shard_ends_the_observation_long_before_its_wedge_does_role",
+  ) else {
+    return;
+  };
+  let switches_before = slates_machine::bench::involuntary_switches();
+  let started = std::time::Instant::now();
+  // The wedge reports the moment it took the shard. The claim is about what happens *from there* — how long
+  // the question waited to be submitted and admitted is the host's scheduling, and under a loaded runner it
+  // can exceed the wedge's whole sleep on its own.
+  let (began, began_at) = channel::<Instant>();
+  let ended = daemon.observe_control(SHORT_BUDGET_NS, move |_state: &mut ShardState| {
+    let _ = began.send(Instant::now());
+    // The question blocks its shard off the CPU on purpose: a wedged shard.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_nanos(
+      WEDGE_BUDGETS * SHORT_BUDGET_NS,
+    ));
+    8u8
+  });
+  let returned = Instant::now();
+  assert!(
+    matches!(
+      ended,
+      Err(ObserveError::Deadline {
+        stage: ObserveStage::Execution,
+        ..
+      })
+    ),
+    "a shard consuming no CPU ends at its deadline: {ended:?}"
+  );
+  let took = started.elapsed();
+  let switches = slates_machine::bench::involuntary_switches_since(switches_before);
+  let wedge = std::time::Duration::from_nanos(WEDGE_BUDGETS * SHORT_BUDGET_NS);
+  // What must hold on any machine: measured from the moment the shard took the wedge, the observation ended
+  // before the wedge's own sleep did — so the deadline is what ended it, not the sleep running out. A wedge
+  // that never got the shard at all is stronger still: the deadline came before the question even began.
+  let from_wedge = began_at
+    .recv_timeout(SETTLE)
+    .ok()
+    .map(|at| returned.saturating_duration_since(at));
+  assert!(
+    from_wedge.is_none_or(|waited| waited < wedge),
+    "the deadline ended it, not the {WEDGE_BUDGETS}-budget wedge running out: {from_wedge:?} from the wedge"
+  );
+  println!(
+    "wedge: ended after {took:?} ({from_wedge:?} from the wedge), involuntary switches {switches:?}"
+  );
+  // The tighter claim, on the same from-the-wedge basis: the deadline fired within its own windows. Measured
+  // against the whole call it was a claim about how long the host took to admit the question — at load 158 on
+  // 2026-10-18 that was 4.875 s end to end, of which 963 ms was from the wedge.
+  assert!(
+    from_wedge
+      .is_none_or(|waited| waited < Duration::from_nanos(ENDED_WITHIN_BUDGETS * SHORT_BUDGET_NS))
+      || switches.is_none_or(|switches| switches > 0),
+    "within two windows and the deadline's lateness: {from_wedge:?} from the wedge, with no involuntary \
+     switch to blame"
+  );
+  // The sleeping question still finishes and is counted late before the daemon stops.
+  assert_eq!(late_replies_reach(&daemon, 1), 1);
+  daemon.stop();
+}

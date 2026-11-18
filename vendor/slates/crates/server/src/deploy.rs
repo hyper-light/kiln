@@ -1,0 +1,1161 @@
+//! Fleet deployment from **one shared manifest** (§2.6 boot step 6; §4.8 "Membership" and "TLS 1.3 via
+//! rustls with certificates provisioned by the operator"). An operator writes a single manifest naming the
+//! fleet, its fault tolerance `f`, and every node — its name, its advertised address, and its certificate —
+//! and starts every node from that same file (`slates daemon --fleet PATH --node NAME`). From it, every
+//! node computes the same facts, so no node has to be told anything about the others that the others were
+//! not told about it:
+//!
+//! - **Stable anchors from certificates.** A node's anchor ([`HostId`]) is the leading eight bytes of the
+//!   BLAKE3 hash of its DER certificate ([`host_id_of_certificate`]). The certificate is what every peer
+//!   pins for the mutual-TLS session, so it is the one fact about a node every other node holds, and the
+//!   anchor follows from it without a registry (D-14). The live member id adds a fresh boot nonce
+//!   (§4.8, AUD-07); manifest seeds only route discovery. Two manifest entries sharing a certificate
+//!   would claim one trusted node; the plan refuses that (`DuplicateCertificate`).
+//! - **The socket layout.** A node serves every peer on one socket per plane
+//!   (`slates_transport::demux`: sessions are told apart by the connection id in each packet), so it
+//!   advertises one base port and owns the next: it serves probes on `base` and records on `base + 1`
+//!   ([`serve_port`]), and every peer dials it there. A fleet with an operator authority also serves its network
+//!   export (§4.6, AUD-29-75) on `base` over TCP, a separate port namespace from the UDP planes, so the block stays
+//!   two numbers wide. A base at the very end of the port range is refused
+//!   (`PortBlockOverflows`), never wrapped.
+//! - **Binding elsewhere than advertised (A-277).** A node's advertised address is where its peers dial it,
+//!   and by default where it binds. A node behind a port mapping (a NAT's port forward, a container runtime's
+//!   published ports, the chaos harness's fault relay in `crates/cli/tests/live_chaos.rs`) also names its own
+//!   `bind` address: an IPv4 literal and the base of the same two-port block. It binds there; every peer still
+//!   dials the advertised ports, and the mapping between them is the operator's. A bind block past the port
+//!   range is refused as the advertised one is.
+//! - **Addresses by IP or by name.** A node's advertised address is an IPv4 literal or a DNS name
+//!   ([`NodeAddress`]). A name is resolved by the dialer at every fresh dial ([`crate::dns`]), never here:
+//!   in the Kubernetes deployment (`docs/deploy.md`) each node is its per-pod DNS name, whose address is not
+//!   known when the manifest is written and changes when the pod is rescheduled — so the name is what the
+//!   manifest carries and the address is a fact of the moment of the dial. A named node binds its own serve
+//!   sockets on every interface (its own address is likewise not the manifest's to know). A manifest with a
+//!   named node needs the resolver configuration the command read from the host (`NoResolver` otherwise).
+//!
+//! This module is pure: it takes the manifest as values (the certificate and key bytes already read) and
+//! returns the [`FleetMembership`] the placement authority is built over and the [`FleetTransport`] the
+//! membership loop drives. Reading the manifest, the DER files and the resolver configuration from the
+//! operator's disk is the command's job (`slates-cli`, a reader of host paths under R1), so this crate still
+//! names no host path. A laptop has no manifest and no fleet; `f = 0` solo is the same code path (R8).
+
+// Re-exported so the command that reads the operator's DER files builds the manifest's values without
+// naming the TLS crate itself.
+pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use slates_db::HostId;
+use slates_db::register::{DomainId, Quorum, RegionId};
+use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
+use slates_transport::handshake::Identity;
+
+use crate::config::{DurabilityBound, FleetMembership};
+use crate::dns::{self, Resolver};
+use crate::fleet::{FleetPeer, FleetTransport, ServeAddresses};
+
+/// A node's advertised address as the manifest states it, with the node's **base** port: an IPv4 literal,
+/// or a DNS name the dialer resolves at every fresh dial ([`crate::dns`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeAddress {
+  /// An IPv4 address and the port: dialed as it is.
+  Ip(SocketAddrV4),
+  /// A DNS hostname and the port: resolved to an IPv4 address when dialed.
+  Name {
+    /// The hostname (a fully qualified name may carry its trailing dot).
+    host: String,
+    /// The port.
+    port: u16,
+  },
+}
+
+impl NodeAddress {
+  /// Parses `host:port` — `host` an IPv4 literal or a DNS hostname, `port` a decimal port — or says what
+  /// is wrong with the text, in the words the manifest reader prints.
+  pub fn parse(text: &str) -> Result<NodeAddress, &'static str> {
+    if let Ok(address) = text.parse::<SocketAddrV4>() {
+      return Ok(NodeAddress::Ip(address));
+    }
+    let Some((host, port_text)) = text.rsplit_once(':') else {
+      return Err(
+        "an IPv4 address or a DNS name with the base port, like `10.0.0.1:7000` or `slates-0.slates.default.svc.cluster.local:7000`",
+      );
+    };
+    let port = port_text
+      .parse::<u16>()
+      .map_err(|_| "a base port between 0 and 65535 after the colon")?;
+    dns::check_hostname(host).map_err(|_| {
+      "a DNS hostname before the colon: labels of letters, digits and hyphens joined by dots, at most 253 bytes"
+    })?;
+    Ok(NodeAddress::Name {
+      host: host.to_owned(),
+      port,
+    })
+  }
+
+  /// The port.
+  pub fn port(&self) -> u16 {
+    match self {
+      NodeAddress::Ip(address) => address.port(),
+      NodeAddress::Name { port, .. } => *port,
+    }
+  }
+
+  /// The same host at `port`.
+  pub fn with_port(&self, port: u16) -> NodeAddress {
+    match self {
+      NodeAddress::Ip(address) => NodeAddress::Ip(SocketAddrV4::new(*address.ip(), port)),
+      NodeAddress::Name { host, .. } => NodeAddress::Name {
+        host: host.clone(),
+        port,
+      },
+    }
+  }
+
+  /// Where this node binds its own serve socket for `port`: the literal address when it is one, every
+  /// interface when the node is known by a name (its own address is not the manifest's to know).
+  pub fn bind(&self, port: u16) -> SocketAddrV4 {
+    match self {
+      NodeAddress::Ip(address) => SocketAddrV4::new(*address.ip(), port),
+      NodeAddress::Name { .. } => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port),
+    }
+  }
+
+  /// Whether the address is a name the dialer must resolve.
+  pub fn is_named(&self) -> bool {
+    matches!(self, NodeAddress::Name { .. })
+  }
+}
+
+impl From<SocketAddrV4> for NodeAddress {
+  fn from(address: SocketAddrV4) -> NodeAddress {
+    NodeAddress::Ip(address)
+  }
+}
+
+impl std::fmt::Display for NodeAddress {
+  fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      NodeAddress::Ip(address) => write!(out, "{address}"),
+      NodeAddress::Name { host, port } => write!(out, "{host}:{port}"),
+    }
+  }
+}
+
+/// One node of the shared manifest: what every node knows about every node.
+#[derive(Clone, Debug)]
+pub struct FleetNodeEntry {
+  /// The operator's name for the node — what `--node NAME` selects. Unique within the manifest.
+  pub node: String,
+  /// The node's advertised address: the IP or DNS name its peers dial, and the **base** of its two ports
+  /// (see the module doc: probes on it, records on the next).
+  pub address: NodeAddress,
+  /// Where the node binds its own two serve sockets when that is not its advertised address (A-277): an IPv4
+  /// literal and the base of the two ports. Set only where something between the node and its peers maps the
+  /// advertised ports there (a NAT's port forward, a container runtime's published ports, the chaos harness's
+  /// relay). `None`, the default, binds the advertised address ([`NodeAddress::bind`]).
+  pub bind: Option<SocketAddrV4>,
+  /// The node's operator-provisioned certificate (DER): what its peers pin, and what its member id is
+  /// derived from.
+  pub certificate: CertificateDer<'static>,
+  /// The node's failure domain (a rack, zone or machine id the operator assigns), so placement forms
+  /// copysets across distinct domains (D-14). `None` — the default — makes the node its own domain
+  /// (unique-per-host); the operator declares one only for a real topology (co-located nodes sharing a
+  /// domain). Never derived from the address: several nodes deliberately share one host (and IP) in a test
+  /// or dev fleet, and collapsing them into one domain would leave an object no distinct-domain co-holder.
+  pub domain: Option<DomainId>,
+  /// The node's **region** (the operator assigns it), so the root group across regions agrees on which
+  /// regions exist and routes cross-region (§4.8, D-14). `None` — the default — puts the node in the sole
+  /// region `RegionId(0)`, which collapses to a single-region fleet whose root group is the degenerate
+  /// self-leading group (R8); the operator declares one only for a genuine multi-region deployment.
+  pub region: Option<RegionId>,
+}
+
+/// The shared manifest, as values: the fleet's TLS name, its fault tolerance and its nodes in manifest
+/// order (the order fixes the port layout, so every node must read the same manifest).
+#[derive(Clone, Debug)]
+pub struct FleetManifest {
+  /// Operator trust anchors for automatic enrollment beyond the seed nodes.
+  pub enrollment_roots: Vec<CertificateDer<'static>>,
+  /// The TLS server name every node's certificate carries and every peer verifies the session against.
+  pub name: String,
+  /// The fault tolerance `f`: a write commits at `f + 1` acknowledgements of `2f + 1` candidates (§4.8).
+  pub quorum: Quorum,
+  /// The operator's durability policy, if declared (§4.8 "the copyset count check at every configuration
+  /// change"): a fleet-wide accepted coincident-loss probability under a stated failure count. `None` leaves
+  /// the check disabled (the default). Every node reads the same policy from the same manifest.
+  pub durability: Option<DurabilityBound>,
+  /// Each region's designated mirror (§4.8 "region loss promotes the mirror through the root group"), region
+  /// id → mirror region id. Empty by default (no region has a mirror). A lost region with a mirror is failed
+  /// over to it by a deliberate operator promotion.
+  pub region_mirrors: std::collections::BTreeMap<RegionId, RegionId>,
+  /// Every node, in manifest order.
+  pub nodes: Vec<FleetNodeEntry>,
+}
+
+/// A node's deployment plan: the membership policy its placement authority is built over and the
+/// transport material its membership loop drives.
+pub struct FleetPlan {
+  /// The quorum, this node's member id, and its peers' ids — the config's fleet membership.
+  pub membership: FleetMembership,
+  /// This node's identity, the fleet's TLS name, each peer with its dial addresses, and this node's own
+  /// serve addresses — bound by [`FleetTransport::bind`] when the daemon starts, never by planning.
+  pub transport: FleetTransport<ServeAddresses>,
+}
+
+/// Which of a node's two serve sockets: the SWIM probe plane or the register record plane (the two ride
+/// separate sockets because their wire formats are not distinguished by content on a shared stream).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plane {
+  /// SWIM probes and their acknowledgements.
+  Probe,
+  /// Register record commits, promotions and content exchanges.
+  Record,
+}
+
+/// Why a manifest yields no plan. Each names what the operator must fix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeployError {
+  /// `--node NAME` names no entry of the manifest.
+  UnknownNode {
+    /// The name given.
+    node: String,
+  },
+  /// Two entries carry one name, so `--node` could select either.
+  DuplicateNode {
+    /// The repeated name.
+    node: String,
+  },
+  /// Two entries carry one certificate, so they would be one member (one id, one pinned peer).
+  DuplicateCertificate {
+    /// The first entry with it.
+    first: String,
+    /// The second.
+    second: String,
+  },
+  /// A node's two ports, from its base, run past the port range.
+  PortBlockOverflows {
+    /// The node.
+    node: String,
+    /// Its base port.
+    base: u16,
+    /// The ports its block needs.
+    needed: u16,
+  },
+  /// Fewer nodes than a commit needs acknowledgements (`f + 1`): nothing could ever place.
+  QuorumUnreachable {
+    /// The nodes listed.
+    nodes: usize,
+    /// The fault tolerance asked for.
+    f: u32,
+  },
+  /// The manifest lists no node at all.
+  NoNodes,
+  /// A node is addressed by a DNS name, but no resolver configuration was given (the host has no usable
+  /// `/etc/resolv.conf`, or the caller passed none), so the name could never be dialed.
+  NoResolver {
+    /// The first named node.
+    node: String,
+  },
+  /// This node's key and certificate, or a peer's pinned certificate, cannot be used by the TLS stack
+  /// (a key shape the provider does not take, a key that does not match the certificate, a certificate
+  /// that cannot be a trust anchor). Checked once at boot so it is a refusal by name here, not a mesh
+  /// that never forms with only `fleet.accept` refusal counts in `status` to show for it.
+  Identity {
+    /// The node whose material was checked.
+    node: String,
+    /// The TLS stack's reason.
+    reason: String,
+  },
+}
+
+impl std::fmt::Display for DeployError {
+  fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::UnknownNode { node } => write!(out, "the manifest has no node named `{node}`"),
+      Self::DuplicateNode { node } => write!(out, "the manifest names `{node}` twice"),
+      Self::DuplicateCertificate { first, second } => write!(
+        out,
+        "nodes `{first}` and `{second}` carry the same certificate; they would be one member"
+      ),
+      Self::PortBlockOverflows { node, base, needed } => write!(
+        out,
+        "node `{node}` needs {needed} ports from its base {base}, past the end of the port range"
+      ),
+      Self::QuorumUnreachable { nodes, f } => write!(
+        out,
+        "{nodes} node(s) can never reach f + 1 = {} acknowledgements at f = {f}",
+        f.saturating_add(1)
+      ),
+      Self::NoNodes => out.write_str("the manifest lists no nodes"),
+      Self::NoResolver { node } => write!(
+        out,
+        "node `{node}` is addressed by a DNS name, but no nameserver is configured to resolve it"
+      ),
+      Self::Identity { node, reason } => write!(
+        out,
+        "node `{node}`'s key, certificate or pins cannot be used for TLS: {reason}"
+      ),
+    }
+  }
+}
+
+impl std::error::Error for DeployError {}
+
+/// Format: a node serves on two ports, one per plane — probes on its base, records on the next.
+const PORTS_PER_NODE: u16 = 2;
+
+/// A node's member id: the leading eight bytes of the BLAKE3 hash of its DER certificate, little-endian
+/// (the same cut `daemon::host_id_of` takes of the machine identity's hash on a laptop). Every node of a
+/// fleet derives every member's id from the certificate it pins, so the ids agree fleet-wide without a
+/// registry.
+pub fn host_id_of_certificate(certificate: &CertificateDer<'_>) -> HostId {
+  let hash = blake3::hash(certificate.as_ref());
+  let bytes = hash.as_bytes();
+  HostId(u64::from_le_bytes([
+    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+  ]))
+}
+
+/// A fresh voting identity, derived from the stable certificate anchor and a random nonce per
+/// daemon start (§4.8, AUD-07). The stable anchor authenticates TLS and keys completion origins;
+/// the member id names ownership and consensus. Losing RAM never recreates the old voter.
+/// A peer checks the derivation on authenticated contact. Nonces have no numeric age ordering.
+/// `boot_nonce = 0` names a manifest routing placeholder, never an initial voting configuration.
+pub fn member_id(anchor: HostId, boot_nonce: u64) -> HostId {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&anchor.0.to_le_bytes());
+  hasher.update(&boot_nonce.to_le_bytes());
+  let bytes = *hasher.finalize().as_bytes();
+  HostId(u64::from_le_bytes([
+    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+  ]))
+}
+
+/// The port a node with base port `base` serves `plane` on (`base` for probes, `base + 1` for records),
+/// or the overflow when it runs past `u16`.
+pub fn serve_port(base: u16, plane: Plane) -> Option<u16> {
+  let plane_offset = match plane {
+    Plane::Probe => 0,
+    Plane::Record => 1,
+  };
+  base.checked_add(plane_offset)
+}
+
+/// Checks what must hold for any node's plan: at least one node, a quorum some set of nodes can reach,
+/// unique names, unique certificates, every block inside the port range, and a resolver when any node is
+/// addressed by name. Returns the index of `node`.
+fn validate(
+  manifest: &FleetManifest,
+  node: &str,
+  resolver: Option<&Resolver>,
+) -> Result<usize, DeployError> {
+  if manifest.nodes.is_empty() {
+    return Err(DeployError::NoNodes);
+  }
+  if resolver.is_none()
+    && let Some(named) = manifest.nodes.iter().find(|entry| entry.address.is_named())
+  {
+    return Err(DeployError::NoResolver {
+      node: named.node.clone(),
+    });
+  }
+  let needed_acks = usize::try_from(manifest.quorum.f)
+    .ok()
+    .and_then(|f| f.checked_add(1))
+    .unwrap_or(usize::MAX);
+  if manifest.enrollment_roots.is_empty() && manifest.nodes.len() < needed_acks {
+    return Err(DeployError::QuorumUnreachable {
+      nodes: manifest.nodes.len(),
+      f: manifest.quorum.f,
+    });
+  }
+  for (index, entry) in manifest.nodes.iter().enumerate() {
+    for other in manifest.nodes.iter().take(index) {
+      if other.node == entry.node {
+        return Err(DeployError::DuplicateNode {
+          node: entry.node.clone(),
+        });
+      }
+      if other.certificate == entry.certificate {
+        return Err(DeployError::DuplicateCertificate {
+          first: other.node.clone(),
+          second: entry.node.clone(),
+        });
+      }
+    }
+    // The node's last port must exist: `base + 1`.
+    if serve_port(entry.address.port(), Plane::Record).is_none() {
+      return Err(DeployError::PortBlockOverflows {
+        node: entry.node.clone(),
+        base: entry.address.port(),
+        needed: PORTS_PER_NODE,
+      });
+    }
+    // A node that binds elsewhere (A-277) needs the same block there: its bind's `base + 1` must exist too.
+    if let Some(bind) = entry.bind
+      && serve_port(bind.port(), Plane::Record).is_none()
+    {
+      return Err(DeployError::PortBlockOverflows {
+        node: entry.node.clone(),
+        base: bind.port(),
+        needed: PORTS_PER_NODE,
+      });
+    }
+  }
+  manifest
+    .nodes
+    .iter()
+    .position(|entry| entry.node == node)
+    .ok_or_else(|| DeployError::UnknownNode {
+      node: node.to_owned(),
+    })
+}
+
+/// The address manifest entry `server` serves `plane` on, as its peers dial it: its IP or name and the
+/// plane's port. `validate` proved every node's ports fit, so the overflow arm is unreachable after it; it
+/// is kept typed rather than panicked (banned item 6).
+fn serve_address(server: &FleetNodeEntry, plane: Plane) -> Option<NodeAddress> {
+  serve_port(server.address.port(), plane).map(|port| server.address.with_port(port))
+}
+
+/// Where manifest entry `server` binds its own serve socket for `plane`: its `bind` block when it names one
+/// (A-277), else its literal address, or every interface when it is known by a name.
+fn bind_address(server: &FleetNodeEntry, plane: Plane) -> Option<SocketAddrV4> {
+  match server.bind {
+    Some(bind) => serve_port(bind.port(), plane).map(|port| SocketAddrV4::new(*bind.ip(), port)),
+    None => serve_port(server.address.port(), plane).map(|port| server.address.bind(port)),
+  }
+}
+
+/// Checks, once, that the TLS stack can build this node's server side from its identity with every
+/// peer's certificate pinned — the same construction the membership loop's `Endpoint::accept` makes per
+/// peer at boot — so a key the provider rejects, a key that does not match the certificate, or a pin
+/// that cannot be a trust anchor is refused here by name. A solo node has no pins; its own certificate
+/// stands in (it is what a peer would pin), since the verifier needs one anchor to build at all.
+fn check_identity(
+  node: &str,
+  identity: &Identity,
+  own: &CertificateDer<'static>,
+  pins: &[CertificateDer<'static>],
+) -> Result<(), DeployError> {
+  let anchors: &[CertificateDer<'static>] = if pins.is_empty() {
+    std::slice::from_ref(own)
+  } else {
+    pins
+  };
+  slates_transport::handshake::server_config(identity, anchors)
+    .map(|_| ())
+    .map_err(|e| DeployError::Identity {
+      node: node.to_owned(),
+      reason: e.to_string(),
+    })
+}
+
+/// This node's plan from the shared manifest: `node` selects its entry, `key` is its private key (the
+/// one secret the manifest does not carry — each node reads only its own), `resolver` the host's resolver
+/// configuration when any node is addressed by name (the command reads it; `None` is refused then). Every
+/// peer's dial addresses are that peer's two serve ports, and this node's serve binds are its own two, so
+/// the two sides of every session agree by construction. The identity and the pins are checked against
+/// the TLS stack before the plan is returned.
+pub fn plan(
+  manifest: &FleetManifest,
+  node: &str,
+  key: PrivateKeyDer<'static>,
+  resolver: Option<Resolver>,
+) -> Result<FleetPlan, DeployError> {
+  let this = validate(manifest, node, resolver.as_ref())?;
+  let entry = manifest
+    .nodes
+    .get(this)
+    .ok_or_else(|| DeployError::UnknownNode {
+      node: node.to_owned(),
+    })?;
+  // Seed ids route discovery and retain each certificate's declared domain and region. They
+  // authorize no votes: every daemon announces a fresh id, then joins an initialized group.
+  let origin_anchor = host_id_of_certificate(&entry.certificate);
+  let host = member_id(origin_anchor, 0);
+  let overflow = |node: &FleetNodeEntry| DeployError::PortBlockOverflows {
+    node: node.node.clone(),
+    base: node.address.port(),
+    needed: PORTS_PER_NODE,
+  };
+  let (Some(probe_bind), Some(record_bind)) = (
+    bind_address(entry, Plane::Probe),
+    bind_address(entry, Plane::Record),
+  ) else {
+    // The block that did not fit is the one the node binds: its `bind` when it names one (A-277).
+    return Err(DeployError::PortBlockOverflows {
+      node: entry.node.clone(),
+      base: entry.bind.map_or(entry.address.port(), |bind| bind.port()),
+      needed: PORTS_PER_NODE,
+    });
+  };
+  let mut peers = Vec::with_capacity(manifest.nodes.len().saturating_sub(1));
+  let mut peer_hosts = Vec::with_capacity(peers.capacity());
+  for (index, peer) in manifest.nodes.iter().enumerate() {
+    if index == this {
+      continue;
+    }
+    let (Some(address), Some(record_address)) = (
+      serve_address(peer, Plane::Probe),
+      serve_address(peer, Plane::Record),
+    ) else {
+      return Err(overflow(peer));
+    };
+    let peer_anchor = host_id_of_certificate(&peer.certificate);
+    let peer_host = member_id(peer_anchor, 0);
+    peer_hosts.push(peer_host);
+    peers.push(FleetPeer {
+      anchor: peer_anchor,
+      host: peer_host,
+      address,
+      record_address,
+      certificate: peer.certificate.clone(),
+    });
+  }
+  // The fleet's failure-domain map: every node that declares one, keyed by member id. A node without a
+  // declaration is absent — its own domain (unique-per-host), the safe default `candidates_for` falls back
+  // to. Built from the whole manifest so any owner can form copysets across its neighbourhood's domains.
+  let domains: std::collections::BTreeMap<HostId, DomainId> = manifest
+    .nodes
+    .iter()
+    .filter_map(|n| {
+      n.domain
+        .map(|domain| (member_id(host_id_of_certificate(&n.certificate), 0), domain))
+    })
+    .collect();
+  // The fleet's region map: every node that declares one, keyed by member id. A node without a declaration
+  // is absent — the sole region `RegionId(0)`, the default `region_of` falls back to. Built from the whole
+  // manifest so the root group agrees on which regions exist and each node knows every peer's region.
+  let regions: std::collections::BTreeMap<HostId, RegionId> = manifest
+    .nodes
+    .iter()
+    .filter_map(|n| {
+      n.region
+        .map(|region| (member_id(host_id_of_certificate(&n.certificate), 0), region))
+    })
+    .collect();
+  if !manifest.enrollment_roots.is_empty() {
+    let checked = || -> Result<(), String> {
+      slates_transport::handshake::verify_enrolled_certificate(
+        &entry.certificate,
+        &manifest.enrollment_roots,
+      )
+      .map_err(|error| error.to_string())?;
+      let parsed = rustls::server::ParsedCertificate::try_from(&entry.certificate)
+        .map_err(|error| error.to_string())?;
+      let domain = entry
+        .domain
+        .ok_or_else(|| "automatic enrollment requires an explicit failure domain".to_owned())?;
+      let scope = crate::discovery::scope_name(
+        &manifest.name,
+        entry.region.map_or(0, |region| region.0),
+        domain,
+      );
+      let name =
+        rustls::pki_types::ServerName::try_from(scope).map_err(|error| error.to_string())?;
+      rustls::client::verify_server_name(&parsed, &name).map_err(|error| error.to_string())
+    };
+    checked().map_err(|reason| DeployError::Identity {
+      node: entry.node.clone(),
+      reason,
+    })?;
+  }
+  let identity = Identity::from_der(entry.certificate.clone(), key);
+  let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
+  check_identity(&entry.node, &identity, &entry.certificate, &pins)?;
+  Ok(FleetPlan {
+    membership: FleetMembership {
+      quorum: manifest.quorum,
+      peers: peer_hosts,
+      host,
+      origin_anchor,
+      domains,
+      regions,
+      durability: manifest.durability,
+      region_mirrors: manifest.region_mirrors.clone(),
+    },
+    transport: FleetTransport {
+      advertise: entry.address.clone(),
+      enrollment_roots: manifest.enrollment_roots.clone(),
+      identity,
+      name: manifest.name.clone(),
+      serve: ServeAddresses {
+        probe: probe_bind,
+        record: record_bind,
+        // The network export (§4.6, AUD-29-75) listens on the probe plane's address over TCP, and only where
+        // NFS runs and an operator authority exists to verify its clients.
+        export: (cfg!(unix) && !manifest.enrollment_roots.is_empty()).then_some(probe_bind),
+      },
+      peers,
+      resolver,
+    },
+  })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use slates_rt::udp::Ipv4Addr;
+
+  /// Shape: the fleet's TLS name in these tests; every minted certificate carries it.
+  const NAME: &str = "slates-fleet";
+
+  /// A self-signed identity minted with `rcgen`, as the fleet tests mint them: the certificate (what a
+  /// manifest carries and peers pin) and the key (what only the node itself reads).
+  fn mint() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let key = rcgen::KeyPair::generate().expect("a key pair");
+    let cert = rcgen::CertificateParams::new(vec![NAME.to_owned()])
+      .expect("certificate params")
+      .self_signed(&key)
+      .expect("a self-signed certificate");
+    (
+      cert.der().clone(),
+      PrivateKeyDer::try_from(key.serialize_der()).expect("a PKCS#8 key"),
+    )
+  }
+
+  /// AC-8.1, §4.8: distinct boot nonces derive distinct member ids over a stable certificate
+  /// anchor. Nonce zero is a deterministic routing seed, not a special voting lifetime.
+  #[test]
+  fn the_member_id_is_ephemeral_per_boot_nonce_over_a_stable_certificate() {
+    let (cert_a, _) = mint();
+    let (cert_b, _) = mint();
+    let anchor_a = host_id_of_certificate(&cert_a);
+    let anchor_b = host_id_of_certificate(&cert_b);
+
+    let boot0 = member_id(anchor_a, 0);
+    let boot1 = member_id(anchor_a, 1);
+    assert_ne!(
+      boot0, boot1,
+      "a different nonce is a new member id (a restart is a join)"
+    );
+    assert_ne!(
+      boot0, anchor_a,
+      "the ephemeral member id is distinct from the stable cert anchor (auth + the RIFL origin)"
+    );
+    assert_ne!(
+      member_id(anchor_a, 0),
+      member_id(anchor_b, 0),
+      "distinct anchors give distinct member ids"
+    );
+    assert_eq!(
+      member_id(anchor_a, 0),
+      boot0,
+      "nonce zero is deterministic (the manifest routing placeholder)"
+    );
+  }
+
+  fn entry(node: &str, port: u16, certificate: CertificateDer<'static>) -> FleetNodeEntry {
+    FleetNodeEntry {
+      node: node.to_owned(),
+      address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into(),
+      // Bound where advertised by default; the A-277 test sets a bind block explicitly.
+      bind: None,
+      certificate,
+      // Undeclared by default (unique-per-host); a test that exercises domains sets it explicitly.
+      domain: None,
+      // Undeclared by default (the sole region); a test that exercises regions sets it explicitly.
+      region: None,
+    }
+  }
+
+  /// A three-node manifest with minted identities; each node's key beside it, in manifest order.
+  fn manifest() -> (FleetManifest, Vec<PrivateKeyDer<'static>>) {
+    let minted: Vec<(CertificateDer<'static>, PrivateKeyDer<'static>)> =
+      (0..3).map(|_| mint()).collect();
+    let mut keys = Vec::new();
+    let mut certs = Vec::new();
+    for (cert, key) in minted {
+      certs.push(cert);
+      keys.push(key);
+    }
+    let manifest = FleetManifest {
+      enrollment_roots: Vec::new(),
+      name: NAME.to_owned(),
+      quorum: Quorum { f: 1 },
+      durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
+      nodes: vec![
+        entry("a", 40_000, certs[0].clone()),
+        entry("b", 41_000, certs[1].clone()),
+        entry("c", 42_000, certs[2].clone()),
+      ],
+    };
+    (manifest, keys)
+  }
+
+  /// The key of the node named `node` in a manifest built by [`manifest`].
+  fn key_of(keys: &[PrivateKeyDer<'static>], node: &str) -> PrivateKeyDer<'static> {
+    let index = ["a", "b", "c"]
+      .iter()
+      .position(|n| *n == node)
+      .expect("a known node");
+    keys[index].clone_key()
+  }
+
+  /// The manifest index of the node `peer` names (by its certificate-derived id).
+  fn index_of(manifest: &FleetManifest, host: HostId) -> usize {
+    manifest
+      .nodes
+      .iter()
+      .position(|n| member_id(host_id_of_certificate(&n.certificate), 0) == host)
+      .expect("the host is a manifest node")
+  }
+
+  /// §4.6 "Kubernetes publication without privilege" (AUD-29-75). Do: plan node a of a manifest without an
+  /// operator authority, then of the same manifest with one. Expect: no export without it (nothing could
+  /// authenticate a client), and with it the export on the probe plane's address and port (TCP beside UDP).
+  #[test]
+  fn the_plan_exports_exactly_when_an_operator_authority_exists() {
+    let (mut manifest, keys) = manifest();
+    let without = plan(&manifest, "a", key_of(&keys, "a"), None).expect("a valid plan");
+    assert_eq!(without.transport.serve.export, None);
+    // An authority, and nodes enrolled under it: each certificate names its failure domain (`r0.d<domain>`),
+    // which planning under an authority requires, and each node states that domain.
+    let issuer_key = rcgen::KeyPair::generate().expect("a key pair");
+    let mut issuer_params = rcgen::CertificateParams::new(vec![NAME.to_owned()]).expect("params");
+    issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let issuer = issuer_params
+      .self_signed(&issuer_key)
+      .expect("the authority");
+    let mut keys = Vec::new();
+    for (domain, node) in (0u64..).zip(manifest.nodes.iter_mut()) {
+      let key = rcgen::KeyPair::generate().expect("a key pair");
+      let cert =
+        rcgen::CertificateParams::new(vec![NAME.to_owned(), format!("r0.d{domain}.{NAME}")])
+          .expect("params")
+          .signed_by(&key, &issuer, &issuer_key)
+          .expect("an enrolled certificate");
+      node.certificate = cert.der().clone();
+      node.domain = Some(domain);
+      keys.push(PrivateKeyDer::try_from(key.serialize_der()).expect("a key"));
+    }
+    manifest.enrollment_roots = vec![issuer.der().clone()];
+    let with = plan(&manifest, "a", key_of(&keys, "a"), None).expect("a valid plan");
+    assert_eq!(
+      with.transport.serve.export,
+      cfg!(unix).then_some(with.transport.serve.probe),
+      "the export listens on the probe plane's address, over TCP, where NFS runs"
+    );
+  }
+
+  /// AC (§4.8, D-14): the plan carries each node's declared failure domain to the membership, keyed by the
+  /// certificate-derived member id, so placement forms copysets across distinct domains. A node that
+  /// declares none is absent — its own domain (unique-per-host, the default).
+  #[test]
+  fn the_plan_carries_declared_failure_domains_to_the_membership() {
+    let (mut manifest, keys) = manifest();
+    // a and b share failure domain 7 (co-located, e.g. one rack); c declares none.
+    manifest.nodes[0].domain = Some(7);
+    manifest.nodes[1].domain = Some(7);
+    let plan = plan(&manifest, "a", key_of(&keys, "a"), None).expect("a valid plan");
+    let a = member_id(host_id_of_certificate(&manifest.nodes[0].certificate), 0);
+    let b = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    let c = member_id(host_id_of_certificate(&manifest.nodes[2].certificate), 0);
+    assert_eq!(
+      plan.membership.domains.get(&a),
+      Some(&7),
+      "a's declared domain reached the membership under its member id"
+    );
+    assert_eq!(
+      plan.membership.domains.get(&b),
+      Some(&7),
+      "b shares a's domain"
+    );
+    assert_eq!(
+      plan.membership.domains.get(&c),
+      None,
+      "an undeclared node is absent from the map — its own domain (unique-per-host)"
+    );
+  }
+
+  /// AC (§4.8, D-14): the plan carries each node's declared region to the membership, keyed by the
+  /// certificate-derived member id, so the root group agrees on which regions exist. A node that declares
+  /// none is absent — the sole region 0, the default.
+  #[test]
+  fn the_plan_carries_declared_regions_to_the_membership() {
+    let (mut manifest, keys) = manifest();
+    // a and b are in region 1; c declares none (so it falls to the sole region 0).
+    manifest.nodes[0].region = Some(RegionId(1));
+    manifest.nodes[1].region = Some(RegionId(1));
+    let plan = plan(&manifest, "a", key_of(&keys, "a"), None).expect("a valid plan");
+    let a = member_id(host_id_of_certificate(&manifest.nodes[0].certificate), 0);
+    let b = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    let c = member_id(host_id_of_certificate(&manifest.nodes[2].certificate), 0);
+    assert_eq!(
+      plan.membership.regions.get(&a),
+      Some(&RegionId(1)),
+      "a's declared region reached the membership under its member id"
+    );
+    assert_eq!(
+      plan.membership.regions.get(&b),
+      Some(&RegionId(1)),
+      "b shares a's region"
+    );
+    assert_eq!(
+      plan.membership.regions.get(&c),
+      None,
+      "an undeclared node is absent from the map — the sole region 0"
+    );
+  }
+
+  /// The two sides of every session agree: my dial addresses for a peer are that peer's own serve binds,
+  /// on both planes, for every ordered pair — and every peer's id is the certificate-derived one every
+  /// other node computes.
+  #[test]
+  fn every_pair_of_plans_agrees_on_its_sockets_and_ids() {
+    let (manifest, keys) = manifest();
+    let plans: Vec<FleetPlan> = ["a", "b", "c"]
+      .iter()
+      .map(|node| plan(&manifest, node, key_of(&keys, node), None).expect("a plan"))
+      .collect();
+    for (i, mine) in plans.iter().enumerate() {
+      let my_host = member_id(host_id_of_certificate(&manifest.nodes[i].certificate), 0);
+      assert_eq!(mine.membership.host, my_host);
+      assert_eq!(mine.membership.peers.len(), 2);
+      assert!(!mine.membership.peers.contains(&my_host));
+      for peer in &mine.transport.peers {
+        let j = index_of(&manifest, peer.host);
+        assert_ne!(j, i);
+        let theirs = &plans[j].transport;
+        assert_eq!(
+          peer.address,
+          theirs.serve.probe.into(),
+          "probe: dial == their bind"
+        );
+        assert_eq!(
+          peer.record_address,
+          theirs.serve.record.into(),
+          "record: dial == their bind"
+        );
+      }
+    }
+  }
+
+  /// The layout by number: node a (base 40 000) serves probes on 40 000 and records on 40 001, and dials
+  /// b (base 41 000) at 41 000/41 001 — `base` and `base + 1`.
+  #[test]
+  fn the_port_layout_is_the_base_and_the_next() {
+    let (manifest, keys) = manifest();
+    let a = plan(&manifest, "a", key_of(&keys, "a"), None).expect("a plan");
+    assert_eq!(a.transport.serve.probe.port(), 40_000);
+    assert_eq!(a.transport.serve.record.port(), 40_001);
+    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    let to_b = a
+      .transport
+      .peers
+      .iter()
+      .find(|p| p.host == b_host)
+      .expect("b");
+    assert_eq!(to_b.address.port(), 41_000);
+    assert_eq!(to_b.record_address.port(), 41_001);
+    assert_eq!(serve_port(u16::MAX, Plane::Record), None);
+  }
+
+  /// A-277, §4.8 "Deployment": a node that names a `bind` block serves its two sockets there, while every peer still
+  /// dials its advertised address and the next port, as through a NAT's port forward or the chaos harness's relay. Do:
+  /// give node b a bind block apart from its advertised one, and named node a one too. Expect: b binds 127.0.0.1:51000
+  /// and :51001 and advertises :41000; a and c dial b at :41000 and :41001, never at the bind; named a binds its block,
+  /// not every interface, and is still dialed by name; c, with no bind, binds where it advertises.
+  #[test]
+  fn a_node_that_binds_elsewhere_serves_there_and_is_dialed_where_it_advertises() {
+    let (mut manifest, keys) = manifest();
+    let b_bind = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51_000);
+    manifest.nodes[1].bind = Some(b_bind);
+    manifest.nodes[0].address = NodeAddress::Name {
+      host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+      port: 7000,
+    };
+    let a_bind = SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 9000);
+    manifest.nodes[0].bind = Some(a_bind);
+
+    let b = plan(&manifest, "b", key_of(&keys, "b"), Some(resolver())).expect("b's plan");
+    assert_eq!(b.transport.serve.probe, b_bind, "b's probes bind its block");
+    assert_eq!(
+      b.transport.serve.record,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 51_001),
+      "b's records bind the next port of its block"
+    );
+    assert_eq!(
+      b.transport.advertise,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
+      "b still advertises where its peers dial it"
+    );
+
+    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    for dialer in ["a", "c"] {
+      let theirs =
+        plan(&manifest, dialer, key_of(&keys, dialer), Some(resolver())).expect("a plan");
+      let to_b = theirs
+        .transport
+        .peers
+        .iter()
+        .find(|peer| peer.host == b_host)
+        .expect("b is a peer");
+      assert_eq!(
+        to_b.address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_000).into(),
+        "{dialer} dials b's advertised probe port, never its bind"
+      );
+      assert_eq!(
+        to_b.record_address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41_001).into(),
+        "{dialer} dials b's advertised record port, never its bind"
+      );
+    }
+
+    let a = plan(&manifest, "a", key_of(&keys, "a"), Some(resolver())).expect("a's plan");
+    assert_eq!(
+      a.transport.serve.probe, a_bind,
+      "a named node with a bind block binds it, not every interface"
+    );
+    assert_eq!(
+      a.transport.serve.record,
+      SocketAddrV4::new(Ipv4Addr::new(10, 1, 2, 3), 9001)
+    );
+    let c = plan(&manifest, "c", key_of(&keys, "c"), Some(resolver())).expect("c's plan");
+    let a_host = member_id(host_id_of_certificate(&manifest.nodes[0].certificate), 0);
+    let to_a = c
+      .transport
+      .peers
+      .iter()
+      .find(|peer| peer.host == a_host)
+      .expect("a is a peer");
+    assert_eq!(
+      to_a.address,
+      NodeAddress::Name {
+        host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+        port: 7000
+      },
+      "a is still dialed by its advertised name"
+    );
+    assert_eq!(
+      c.transport.serve.probe,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42_000),
+      "a node without a bind binds where it advertises"
+    );
+  }
+
+  /// A resolver for the named-address tests: one nameserver, the documented defaults.
+  fn resolver() -> Resolver {
+    Resolver {
+      nameservers: vec![SocketAddrV4::new(Ipv4Addr::new(10, 96, 0, 10), 53)],
+      timeout_ns: 5_000_000_000,
+      attempts: 2,
+    }
+  }
+
+  /// AC (§4.8 "Deployment"; the Kubernetes deployment of `docs/deploy.md`): a node addressed by a DNS name
+  /// keeps the **name** in every peer's dial addresses (each with the plane's port) — resolved at dial time,
+  /// never at plan time — and binds its own serve sockets on every interface; a manifest naming a node with
+  /// no resolver to hand is refused by name at boot, not at the first dial.
+  #[test]
+  fn a_named_node_is_dialed_by_name_and_binds_every_interface() {
+    let (mut manifest, keys) = manifest();
+    manifest.nodes[0].address = NodeAddress::Name {
+      host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+      port: 7000,
+    };
+    manifest.nodes[1].address = NodeAddress::Name {
+      host: "slates-1.slates.default.svc.cluster.local".to_owned(),
+      port: 7002,
+    };
+    assert_eq!(
+      plan(&manifest, "a", key_of(&keys, "a"), None).err(),
+      Some(DeployError::NoResolver {
+        node: "a".to_owned()
+      }),
+      "a named node with no resolver is refused at plan time"
+    );
+    let a = plan(&manifest, "a", key_of(&keys, "a"), Some(resolver())).expect("a plan");
+    assert_eq!(
+      a.transport.serve.probe,
+      SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 7000),
+      "a named node binds every interface on its base port"
+    );
+    assert_eq!(
+      a.transport.serve.record,
+      SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 7001)
+    );
+    assert_eq!(a.transport.resolver, Some(resolver()));
+    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    let to_b = a
+      .transport
+      .peers
+      .iter()
+      .find(|p| p.host == b_host)
+      .expect("b");
+    assert_eq!(
+      to_b.address,
+      NodeAddress::Name {
+        host: "slates-1.slates.default.svc.cluster.local".to_owned(),
+        port: 7002
+      },
+      "the peer is dialed by name on its base port"
+    );
+    assert_eq!(
+      to_b.record_address,
+      NodeAddress::Name {
+        host: "slates-1.slates.default.svc.cluster.local".to_owned(),
+        port: 7003
+      },
+      "and on the next for records"
+    );
+    let c_host = member_id(host_id_of_certificate(&manifest.nodes[2].certificate), 0);
+    let to_c = a
+      .transport
+      .peers
+      .iter()
+      .find(|p| p.host == c_host)
+      .expect("c");
+    assert_eq!(
+      to_c.address,
+      SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42_000).into(),
+      "a literal peer in the same fleet is dialed as written"
+    );
+  }
+
+  /// The address text the manifest carries: an IPv4 literal or a hostname, each with its port; anything
+  /// else is refused with the words the manifest reader prints.
+  #[test]
+  fn an_address_parses_as_an_ip_or_a_name() {
+    assert_eq!(
+      NodeAddress::parse("10.0.0.1:7000"),
+      Ok(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 7000).into())
+    );
+    assert_eq!(
+      NodeAddress::parse("slates-0.slates.default.svc.cluster.local:7000"),
+      Ok(NodeAddress::Name {
+        host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+        port: 7000
+      })
+    );
+    let named = NodeAddress::parse("slates-0.svc:7000").expect("parses");
+    assert_eq!(named.with_port(7001).port(), 7001);
+    assert_eq!(named.to_string(), "slates-0.svc:7000");
+    assert_eq!(
+      named.bind(7001),
+      SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 7001)
+    );
+  }
+
+  /// An address text that is neither is refused: no port, a port out of range or not a number, a host
+  /// that is not a hostname, an empty host.
+  #[test]
+  fn a_bad_address_is_refused() {
+    for (text, why) in [
+      ("slates-0", "no port"),
+      ("slates-0:70000", "port out of range"),
+      ("slates-0:x", "port not a number"),
+      ("bad_name:7000", "not a hostname"),
+      (":7000", "empty host"),
+    ] {
+      assert!(NodeAddress::parse(text).is_err(), "{why}: `{text}`");
+    }
+  }
+
+  /// Each refusal names what the operator must fix.
+  #[test]
+  fn a_bad_manifest_is_refused_by_name() {
+    let (mut duplicate_name, keys) = manifest();
+    duplicate_name.nodes[2].node = "a".to_owned();
+    assert_eq!(
+      plan(&duplicate_name, "b", key_of(&keys, "b"), None).err(),
+      Some(DeployError::DuplicateNode {
+        node: "a".to_owned()
+      })
+    );
+    let (mut duplicate_cert, keys) = manifest();
+    duplicate_cert.nodes[2].certificate = duplicate_cert.nodes[0].certificate.clone();
+    assert_eq!(
+      plan(&duplicate_cert, "b", key_of(&keys, "b"), None).err(),
+      Some(DeployError::DuplicateCertificate {
+        first: "a".to_owned(),
+        second: "c".to_owned()
+      })
+    );
+    let (unknown, keys) = manifest();
+    assert_eq!(
+      plan(&unknown, "d", key_of(&keys, "a"), None).err(),
+      Some(DeployError::UnknownNode {
+        node: "d".to_owned()
+      })
+    );
+    let (mut overflow, keys) = manifest();
+    overflow.nodes[1].address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, u16::MAX).into();
+    assert_eq!(
+      plan(&overflow, "a", key_of(&keys, "a"), None).err(),
+      Some(DeployError::PortBlockOverflows {
+        node: "b".to_owned(),
+        base: u16::MAX,
+        needed: 2
+      })
+    );
+    // A-277: a bind block past the port range is refused as an advertised one is, naming the bind's base, though
+    // the advertised block fits.
+    let (mut bind_overflow, keys) = manifest();
+    bind_overflow.nodes[1].bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, u16::MAX));
+    assert_eq!(
+      plan(&bind_overflow, "a", key_of(&keys, "a"), None).err(),
+      Some(DeployError::PortBlockOverflows {
+        node: "b".to_owned(),
+        base: u16::MAX,
+        needed: 2
+      })
+    );
+    let (mut too_few, keys) = manifest();
+    too_few.quorum = Quorum { f: 3 };
+    assert_eq!(
+      plan(&too_few, "a", key_of(&keys, "a"), None).err(),
+      Some(DeployError::QuorumUnreachable { nodes: 3, f: 3 })
+    );
+    let empty = FleetManifest {
+      enrollment_roots: Vec::new(),
+      name: "x".to_owned(),
+      quorum: Quorum { f: 0 },
+      durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
+      nodes: Vec::new(),
+    };
+    assert_eq!(
+      plan(&empty, "a", key_of(&keys, "a"), None).err(),
+      Some(DeployError::NoNodes)
+    );
+  }
+
+  /// Material the TLS stack cannot use is refused at plan time, naming the node: another node's key
+  /// (it does not match this node's certificate), and bytes that are not a key at all.
+  #[test]
+  fn an_unusable_identity_is_refused_at_plan_time() {
+    let (manifest, keys) = manifest();
+    let wrong_key = plan(&manifest, "a", key_of(&keys, "b"), None);
+    assert!(
+      matches!(wrong_key, Err(DeployError::Identity { ref node, .. }) if node == "a"),
+      "another node's key is refused: {:?}",
+      wrong_key.err()
+    );
+    let garbage = PrivateKeyDer::try_from(vec![0x30, 0x03, 0x02, 0x01, 0x01]).expect("a DER shape");
+    let not_a_key = plan(&manifest, "a", garbage, None);
+    assert!(
+      matches!(not_a_key, Err(DeployError::Identity { ref node, .. }) if node == "a"),
+      "bytes that are not a key are refused: {:?}",
+      not_a_key.err()
+    );
+  }
+
+  /// A one-node manifest at `f = 0` is the laptop: no peers, the node its own only member (R8).
+  #[test]
+  fn a_single_node_manifest_is_the_solo_degenerate() {
+    let (cert, key) = mint();
+    let solo = FleetManifest {
+      enrollment_roots: Vec::new(),
+      name: NAME.to_owned(),
+      quorum: Quorum { f: 0 },
+      durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
+      nodes: vec![entry("only", 50_000, cert)],
+    };
+    let plan = plan(&solo, "only", key, None).expect("a plan");
+    assert!(plan.transport.peers.is_empty());
+    assert!(plan.membership.peers.is_empty());
+    assert_eq!(plan.membership.quorum, Quorum { f: 0 });
+  }
+}

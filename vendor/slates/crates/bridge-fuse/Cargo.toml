@@ -1,0 +1,35 @@
+[package]
+name = "slates-bridge-fuse"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The Linux FUSE bridge: the /dev/fuse ABI codec, FUSE_INIT negotiation, per-shard channels and the driver that turns kernel requests into shard operations (design §4.6, D-1, D-2, D-3; Phase 3)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-vfs = { workspace = true }
+slates-bridge-core = { workspace = true }
+slates-mem = { workspace = true }
+# A join a shard waits on, marked so the watchdog reads it as the joined thread runs (A-228's transitive wait).
+slates-rt = { workspace = true }
+slates-base = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+slates-db = { workspace = true }
+slates-vfs = { workspace = true }
+# The dirty-page write-back rule's fetch-point oracle (`src/coherence.rs`): generated fetch histories against a
+# per-byte model.
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
+# `mincore(2)`, which rustix does not bind: whether the kernel still caches a mapped file's pages
+# (`tests/coherence_mount.rs`).
+libc = { workspace = true }
+
+[lints]
+workspace = true

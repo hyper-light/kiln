@@ -10,7 +10,8 @@ export type Workspaces = {
  */
 available: boolean, 
 /**
- * The Slates binary.
+ * The Slates kiln links (`slates <commit>`: the revision it vendors), whose anchor and daemon are
+ * kiln's own executable.
  */
 slates: string | null, 
 /**

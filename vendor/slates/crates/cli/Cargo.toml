@@ -1,0 +1,79 @@
+[package]
+name = "slates-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The `slates` command: the anchor process that owns the segment and supervises the daemon, the daemon itself, and the lifecycle verbs over the Rust client (design §2.5, §2.6, §4.4, §4.12; Phase 2 task 5)."
+
+[[bin]]
+name = "slates"
+path = "src/main.rs"
+
+[dependencies]
+# The codec probe is requested here, by the binary that measures the profile, because the
+# workspace root declares `slates-machine` with `default-features = false` so a cross-target
+# lint from a host with no C toolchain resolves no zstd (GAPS §8, 2026-09-05). That switch is
+# right for the library crates and wrong for the product: it also compiled the probe out of
+# `slates`, so `probes::codecs` returned the empty stub, `codec_policy` derived
+# `CodecPolicy::raw_only()` and the daemon stored every archive chunk raw — D-17's ratio codec
+# dead in every build, measured 2026-10-20. Asking for it here restores it for the product and
+# leaves the library crates' cross-lint C-free, since `slates-cli` is not in those graphs.
+slates-machine = { workspace = true, features = ["codecs"] }
+slates-anchor = { workspace = true }
+slates-db = { workspace = true }
+slates-ipc = { workspace = true }
+slates-server = { workspace = true }
+slates-client = { workspace = true }
+# The library an embedding host drives slates through (A-278): the CLI's mount, issuer and grant term are its, so the
+# command and a host such as kiln mount and grant through one implementation.
+slates-api = { workspace = true }
+# The MCP HTTP edge's bearer token comes from the platform's secure random (AUD-29-24).
+slates-transport = { workspace = true }
+slates-mcp = { workspace = true }
+# The MCP HTTP edge runs on a slates shard, whose TCP every platform has (A-182).
+slates-rt = { workspace = true }
+serde_json = { workspace = true }
+slates-vfs = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+# The macOS mount fetches the root handle over loopback and passes it to mount(2) (§4.6 A-34).
+slates-bridge-nfs = { workspace = true }
+slates-bridge-oci = { workspace = true }
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+# The WinFsp mounts' purge client, a role of this binary (§4.6: no daemon thread opens a volume it serves); the tests
+# also read `notify::MAX_PATH_UNITS`, the name reserve the live ladder holds equal to the limit it measures (A-206).
+slates-bridge-winfsp = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The names of the status counters slates' own virtio-fs device adds while a guest uses its DAX window, which the real
+# guest test holds non-vacuous (`tests/guest_vhost.rs`, A-168).
+slates-bridge-virtiofs = { workspace = true }
+
+[dev-dependencies]
+# `init::MAX_WRITE`: the in-flight resend test writes one page of it, the largest write the mount advertises, so the
+# daemon is serving one for as long as a single write can hold it when the kill lands (A-61 / T-3.5; Linux, as that
+# test is). And the FUSE ABI's opcodes and header lengths for the reader `slates shards` hands a stream end, on every
+# platform (A-161; Windows, A-179).
+slates-bridge-fuse = { workspace = true }
+# The archive's codec decision, so the codec gate can ask the policy the daemon derived what it
+# would actually do with a compressible chunk rather than stopping at "a candidate exists".
+slates-archive = { workspace = true }
+# Self-signed fleet identities for the multi-process deployment test (as the server's fleet tests mint them).
+rcgen = { workspace = true }
+# The RPC-with-TLS client a node's NFS client stands in for in the anchored export test (§4.6, AUD-29-75).
+rustls = { workspace = true }
+# The line protocol the guest's /init speaks, for the guest-over-the-mount test (`tests/guest_dax.rs`).
+slates-guest-probe = { workspace = true }
+# A pseudo-terminal for a VMM that reads its serial console only from an interactive terminal (Cloud Hypervisor's
+# `--serial tty`; `tests/vm/mod.rs`, `Guest::start_on_terminal`).
+rustix = { workspace = true, features = ["pty"] }
+
+[lints]
+workspace = true

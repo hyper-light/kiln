@@ -285,6 +285,33 @@ take = [
 exclude = ["vendor/patches/firecracker", "vendor/patches/shards-gpu"]
 own = ["UPSTREAM.md"]
 
+# Slates, agents' workspaces of their own (docs/agentic.md, W; kiln plan 01a157fdefce75f698e67bc147f47586, CP-T4.1):
+# an agent's folder is a Slates volume laid over the real one. kiln is to drive Slates through its library, linked from
+# here, never through its command line (the person, 2026-11-18). Upstream's tree less what no build of kiln reads: its
+# docs, CI and deployment stay in Slates' repository, and its vendor/ (its copies of hyper-raft's crates, at aa82ada,
+# and of aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0 with Mantle's changes) is left out for kiln's own copies
+# (vendor/hyper-raft, vendor/aws-lc-rs), as Mantle's is (vendor/slates/UPSTREAM.md). Its own workspace, toolchain and
+# lints, as upstream's.
+[projects.slates]
+kind = "git"
+repository = "https://github.com/hyper-light/slates"
+commit = "dbf53afa21bf0e88f7099247c00c2c252ff96b1b"
+path = "vendor/slates"
+take = [
+  "Cargo.toml",
+  "LICENSE",
+  "README.md",
+  "clippy.toml",
+  "crates",
+  "ratchets.toml",
+  "rust-toolchain.toml",
+  "rustfmt.toml",
+  "skills",
+  "unsafe-budget.toml",
+  "xtask",
+]
+own = ["UPSTREAM.md"]
+
 # cuda-rust (NVIDIA): hex-gpu loads NVML at run time by its CUDA driver loader's policy (library names
 # per OS, WSL's own path, the library kept for the process, a library missing told from a symbol
 # missing), adapted from cuda-bindings' dyn_load.rs and compiled from this copy by path
