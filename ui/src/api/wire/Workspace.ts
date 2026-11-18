@@ -8,7 +8,7 @@ import type { Made } from "./Made";
 export type Workspace = { 
 /**
  * `volume`: a Slates volume laid over its folder (its own, or another agent's it works in: `owner`); `folder`:
- * the folder itself, as a person asked, or because its machine can't make a volume (`why_not`).
+ * the folder itself, as a person asked.
  */
 kind: string, 
 /**
@@ -28,9 +28,4 @@ made?: Made,
  * machine (a child in its parent's folder), so it works there, as two agents in one folder do ([`sharing`]). The
  * volume goes when the last agent working in it ends, and only its owner's change request takes everything in it.
  */
-owner?: string, 
-/**
- * Why it works in its folder though its start named no workspace: its machine can't make a volume, as it said
- * ([`by_default`]).
- */
-why_not?: string, };
+owner?: string, };

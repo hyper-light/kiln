@@ -353,6 +353,7 @@ pub enum WorkspaceMissing {
     /// `/dev/fuse`, or its user's right to read and write it (Linux).
     FuseDevice,
     /// WinFsp (Windows: winfsp.dev).
+    #[serde(rename = "winfsp")]
     WinFsp,
     /// `mount_nfs` on the PATH (a BSD).
     MountNfs,
