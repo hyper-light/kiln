@@ -25,6 +25,12 @@ use super::slates::{Made, call};
 /// How long the whole test may take: an instance's start, three captures of a small folder, a review, a landing and the
 /// ends, on a loaded machine.
 const WITHIN: Duration = Duration::from_secs(600);
+/// How long the instance this test started may take to stop once asked: its anchor stops its daemon first, ending it
+/// past the anchor's own bound (Slates' `Anchor::stop`). One still answering after this is said loudly and ended
+/// outright, which is safe as the test mounted nothing.
+const STOPS_WITHIN: Duration = Duration::from_secs(60);
+/// How often the instance is asked whether it still answers while its stop is waited on.
+const LOOK_EVERY: Duration = Duration::from_millis(100);
 
 /// Git, in `dir`, with no person's configuration: its output, or what it refused.
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -72,12 +78,32 @@ fn k5_a_fleet_workspace_is_a_captured_clone_whose_review_and_landing_are_the_age
     let answered = rx.recv_timeout(WITHIN);
     // It mounted nothing, so its instance goes whatever happened.
     if let Some(pid) = super::slates::started_anchor() {
-        let said = Command::new(if cfg!(windows) { "taskkill" } else { "kill" }).args(if cfg!(windows) { vec!["/PID".to_owned(), pid.to_string(), "/T".to_owned(), "/F".to_owned()] } else { vec!["-TERM".to_owned(), pid.to_string()] }).output();
-        if let Err(e) = said {
-            eprintln!("Slates' anchor (pid {pid}) couldn't be stopped: {e}");
-        }
+        stop(pid);
     }
     answered.map_err(|_| anyhow::anyhow!("the workspaces hung"))?
+}
+
+/// Stops the anchor `pid` this test started (`SIGTERM`, as Slates' `Anchor::stop` asks; on Windows its tree ended) and
+/// waits until its instance answers no more, at most [`STOPS_WITHIN`], saying how long it took; one still answering then
+/// is said loudly and ended outright (`SIGKILL`: its daemon follows its parent's end).
+fn stop(pid: u32) {
+    let signal = |how: &str| {
+        let args: Vec<String> = if cfg!(windows) { vec!["/PID".to_owned(), pid.to_string(), "/T".to_owned(), "/F".to_owned()] } else { vec![how.to_owned(), pid.to_string()] };
+        if let Err(e) = Command::new(if cfg!(windows) { "taskkill" } else { "kill" }).args(&args).output() {
+            eprintln!("Slates' anchor (pid {pid}) couldn't be signalled {how}: {e}");
+        }
+    };
+    signal("-TERM");
+    let began = std::time::Instant::now();
+    while slates_api::Instance::attach(&super::slates::instance()).is_ok() {
+        if began.elapsed() >= STOPS_WITHIN {
+            eprintln!("SLOW STOP: Slates' anchor (pid {pid}) still served its instance {STOPS_WITHIN:?} after SIGTERM: ended outright");
+            signal("-KILL");
+            return;
+        }
+        std::thread::sleep(LOOK_EVERY);
+    }
+    eprintln!("Slates' anchor (pid {pid}) stopped its instance {:?} after it was asked", began.elapsed());
 }
 
 /// The file at `path` of `volume` written with `bytes`, or removed with none, through Slates' own file verbs under a write

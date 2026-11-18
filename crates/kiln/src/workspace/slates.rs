@@ -818,7 +818,7 @@ pub(super) async fn ask_move(volume: &str, member: u64) -> anyhow::Result<Result
 }
 
 /// A pause between two asks of a move, of a mount of a volume that just moved here, of a capture, or of a destroy's end.
-#[allow(clippy::disallowed_methods)] // (e) a move's measured pause
+#[allow(clippy::disallowed_methods)] // (c) Slates' own derived pause between two asks: no notification of the end
 pub(super) async fn pause_for_move(pause: Duration) {
     crate::rt::sleep(pause).await;
 }
