@@ -790,6 +790,9 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}", f.runner_log(), slates_log(dir));
     check_edits(&lines, &probe).map_err(fail)?;
     let made = workspace_of(&info).map_err(fail)?;
+    // From here a failure says what Slates says of the volume and its shards, and so does a kiln operation refused.
+    let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}\n{}", f.runner_log(), slates_log(dir), slates_state(&instance.name, &made.volume));
+    let op = |name: &str, input: &Value| op(f, name, input).map_err(|e| anyhow::anyhow!("{e:#}\n{}", slates_state(&instance.name, &made.volume)));
     anyhow::ensure!(canonical(Path::new(&made.over)) == project.path(), "{what}: its volume lies over {}, not its project {}", made.over, project.dir);
     let said_cwd = vm_e2e::cwd_said(&lines).ok_or_else(|| fail(format!("its harness never said its folder: {lines:?}")))?;
     let mounts_of = match engine {
@@ -818,7 +821,7 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
         // Its work, and its own landing held for a person's approval, left the project's folder as it was.
         anyhow::ensure!(tree(&project.path())? == before, "{what}: the project's folder changed before any approval: {:?}", changes(&before, &tree(&project.path())?));
         // Review, which needs no landing: its change request holds exactly its changes.
-        let changed = op(f, "agents.change", &json!({"agent": id, "title": "g266 end to end"}))?;
+        let changed = op("agents.change", &json!({"agent": id, "title": "g266 end to end"}))?;
         let branch = changed.pointer("/change_request/branch").and_then(Value::as_str).ok_or_else(|| fail(format!("its change request names no branch: {changed}")))?.to_owned();
         let proposed = changes(&project.tree_at("main")?, &project.tree_at(&branch)?);
         anyhow::ensure!(proposed == expected(&probe), "{what}: its change request {branch} holds {proposed:?}, not its harness's changes {:?}", expected(&probe));
@@ -831,11 +834,11 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     if mode == Mode::Ask {
         // The person is shown the request its agent was answered, which writes nothing, and approves it.
         let asked = approval_said(&lines).ok_or_else(|| fail(format!("its harness never said the manifest it was held for: {lines:?}")))?;
-        let shown = approval_manifest(&op(f, "agents.land", &json!({"agent": id}))?).map_err(fail)?;
+        let shown = approval_manifest(&op("agents.land", &json!({"agent": id}))?).map_err(fail)?;
         anyhow::ensure!(shown == asked, "{what}: the person was shown request {shown}, not the one its agent was answered, {asked}");
         anyhow::ensure!(tree(&project.path())? == before, "{what}: showing a person the approval request wrote to the project's folder");
         eprintln!("PROVEN: {what}: the person was shown request {shown}, the one its agent was answered");
-        written(&op(f, "agents.land", &json!({"agent": id, "manifest": shown}))?).map_err(fail)?;
+        written(&op("agents.land", &json!({"agent": id, "manifest": shown}))?).map_err(fail)?;
     }
     // Its landing written: at once where its mode asks nothing, as its turn said; on the person's approval where it asks.
     let after = tree(&project.path())?;
@@ -862,6 +865,35 @@ pub fn slates_log(dir: &Path) -> String {
     let Ok(entries) = std::fs::read_dir(dir) else { return String::new() };
     let logs = entries.flatten().map(|e| e.path().join("slates-anchor.log")).filter(|p| p.is_file());
     logs.map(|p| format!("--- the end of {} ---\n{}", p.display(), common::tail(&p, SLATES_LOG_LINES))).collect::<Vec<_>>().join("\n")
+}
+
+/// What Slates itself says of the drive's own instance `instance` and a session's volume `volume` when a step fails,
+/// asked through its library as an operator would (attached to the instance by name): the volume's status, and each
+/// shard's reserve, charges, maps, version slots and refusals, so a refusal names the bound that fired.
+pub fn slates_state(instance: &str, volume: &str) -> String {
+    let mut i = match slates_api::Instance::attach(instance) {
+        Ok(i) => i,
+        Err(e) => return format!("--- Slates' own state: attaching to instance {instance}: {e}"),
+    };
+    let status = match kiln::workspace::slates::volume_id(volume) {
+        Ok(v) => i.status(v).map_or_else(|e| format!("status of {volume}: {e}"), |s| format!("status of {volume}: referenced {} B, unique {} B, attachments {}, snapshots {}", s.referenced_bytes, s.unique_bytes, s.attachments, s.snapshots)),
+        Err(e) => format!("status of {volume}: {e:#}"),
+    };
+    let shards = match i.daemon_status() {
+        Ok(d) => d
+            .shards
+            .iter()
+            .map(|s| {
+                format!(
+                    "shard {}: volumes {}, reserve {} B, committed {} B, version slots {}, committed versions {}, retained {} B / {} versions, metadata {} B, committed metadata {} B, mapped {} B, locked {} B, refusals {:?}",
+                    s.partition, s.volumes, s.reserve_bytes, s.committed_bytes, s.version_slots, s.committed_versions, s.retained_bytes, s.retained_versions, s.metadata_bytes, s.committed_metadata, s.mapped_bytes, s.locked_bytes, s.refusals
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("daemon status: {e}"),
+    };
+    format!("--- Slates' own state ---\n{status}\n{shards}")
 }
 
 /// Waits, a bounded while ([`OP_WITHIN`]), for the Slates mount at `at` to leave the host's table, as an ended session's
