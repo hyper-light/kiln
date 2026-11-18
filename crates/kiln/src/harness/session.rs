@@ -7559,6 +7559,49 @@ for line in sys.stdin:
         })
     }
 
+    /// Live, with the Claude Code installed here and its user's API key exported in their shell's
+    /// startup file (as `ANTHROPIC_API_KEY` in `~/.zshrc`): a session with no environment of its own
+    /// signs in by that key, which a runner's service never read (it ran on the subscription and paused
+    /// at its usage limits, 2026-11-18); one whose environment takes the key away signs in as the
+    /// Claude account it's logged in to. Nothing is asked of it: Claude Code says how it signed in as
+    /// it starts (its `initialize`), before a turn.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "starts the Claude Code installed here, signed in, with its user's API key in their shell"]
+    fn live_claude_signs_in_by_the_users_key_unless_its_environment_takes_it_away() -> anyhow::Result<()> {
+        use super::super::agentenv::{Base, Resolved, Set};
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let plan = async |agentenv: Option<Resolved>| -> anyhow::Result<Option<String>> {
+                // Its user's environment as a session's start reads it.
+                super::super::agentenv::refresh().await;
+                let (sink, updates) = async_channel::unbounded();
+                let s = start(crate::util::new_id(), Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), reach: Some("off".into()), agentenv, ..Spec::default() }, sink, Arc::new(|| {}), attachment_files(dir.path().to_owned()))?;
+                let said = crate::rt::timeout(Duration::from_secs(90), async {
+                    loop {
+                        if let (_, Update::State { state }) = updates.recv().await?
+                            && state.plan.is_some()
+                        {
+                            return anyhow::Ok(state.plan);
+                        }
+                    }
+                })
+                .await;
+                s.close();
+                let _ = crate::rt::timeout(Duration::from_secs(10), async { while !matches!(updates.recv().await, Ok((_, Update::Closed)) | Err(_)) {} }).await;
+                said.map_err(|_| anyhow::anyhow!("Claude Code said no plan in 90 s"))?
+            };
+            let keyed = plan(None).await?;
+            println!("LIVE no environment: {keyed:?}");
+            anyhow::ensure!(keyed.as_deref() == Some("API key"), "a session with its user's environment signed in as {keyed:?}");
+            let without = Resolved { id: "e".into(), name: "no key".into(), version: 1, base: Base::User, vars: vec![("ANTHROPIC_API_KEY".into(), Set::Unset)] };
+            let account = plan(Some(without)).await?;
+            println!("LIVE environment without the key: {account:?}");
+            anyhow::ensure!(account.is_some() && account.as_deref() != Some("API key"), "with the key taken away it signed in as {account:?}");
+            Ok(())
+        })
+    }
+
     /// A stand-in session of `program` (an ACP agent, as `gemini`), with `env`.
     #[cfg(unix)]
     fn acp_stand_in(dir: &std::path::Path, program: &std::path::Path, env: Vec<(String, String)>) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<(String, Update)>)> {
