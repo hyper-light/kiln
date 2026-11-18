@@ -1,0 +1,85 @@
+/* The Engine tab's Environments (engine-envs.tsx): cards as its agents' are (definition.css
+   [data-list="agents-tab"]): nothing in them folds, so nothing is indented for an arrow. */
+[data-list="envs-tab"],
+[data-list="envs-tab"] .ms-tree-rows {
+  --dd-lane: 0px;
+  --dd-content: 0px;
+  --dd-body: 0px;
+}
+[data-list="envs-tab"] li.ms-node {
+  padding-right: 0;
+}
+[data-list="envs-tab"] > .ms-tree + .df-defrow,
+[data-list="envs-tab"] > .df-body + .df-defrow,
+[data-list="envs-tab"] > .ev-new + .ms-tree {
+  border-top: 1px solid #25272c;
+}
+/* Its lists (variables, sessions): the card's width, a row each. */
+.ev-rows {
+  justify-self: stretch;
+}
+/* A variable: its name, where it comes from, what it gives (a value, a secret's name, the machine's variable). */
+.sb-row.ev-var {
+  grid-template-columns: minmax(0, 2fr) 64px minmax(0, 3fr);
+}
+.ev-gives {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #d4d6dc;
+}
+.ev-gives > svg {
+  flex: none;
+  color: #d8cbb0;
+}
+.ev-var[data-from="unset"] .ev-gives {
+  color: #7b7e88;
+}
+/* A session running with it: its name, then its machine. */
+.sb-row.ev-session {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.ev-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+/* Asked again in place (apply, delete): its words wrap at a phone's width. */
+.ms-node.ev-ask {
+  display: block;
+  padding: 6px 0 10px;
+}
+.ev-confirm {
+  flex-wrap: wrap;
+  padding: 4px 4px 4px 12px;
+  border-radius: 16px;
+  white-space: normal;
+}
+/* The form: a variable two rows (its name, where from and its moves; then what it takes). */
+.ev-form {
+  padding-top: 4px;
+}
+.ev-k {
+  margin-top: 6px;
+}
+.ev-vrow {
+  display: grid;
+  gap: 6px;
+  padding: 6px 0 8px;
+  border-bottom: 1px solid #191b1f;
+}
+.ev-vname {
+  flex: 1 1 140px;
+}
+.ev-vacts {
+  margin-left: auto;
+}
+.ev-base,
+.ev-src {
+  font-size: 12px;
+}
+.ev-src {
+  flex-basis: 100%;
+}

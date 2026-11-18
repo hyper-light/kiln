@@ -41,6 +41,7 @@ import { handleAgentdefs } from "./agentdefs.ts";
 import { handleMicrovms, sessionOf, sessionsOn } from "./microvms.ts";
 import { handleOverrides } from "./overrides.ts";
 import { handleMySecrets } from "./secrets-mine.ts";
+import { handleAgentenvs } from "./agentenvs.ts";
 import { handlePeersOpen, handleRunnersCi } from "./runners-ci.ts";
 import { handleAgentPage } from "./agent-page.ts";
 import { handleOps } from "./ops.ts";
@@ -1851,6 +1852,8 @@ const server = http.createServer(async (req, res) => {
     if (await handlePipelines(req, res, url, { json })) return;
     if (await handleShip(req, res, url, { json, liveJob, liveRun, push: () => void startRun(repos.find((r) => r.name === "hyper-light/kiln") ?? repos[0]!, { branch: "main", event: "push" }) }))
       return;
+    // A person's environments, and a session's applied (docs/agents.md, "Environments"), before the sessions' own.
+    if (await handleAgentenvs(req, res, url, { json, body })) return;
     // A session's live overrides (the server's routes: overrides.ts), before the sessions' own.
     if (await handleOverrides(req, res, url, { json, body, session: sessionOf })) return;
     if (await handleFamily(req, res, url, () => [...demoInfos(), longInfo(), ...fastInfos(), ...fleetInfos(), ...reviewInfos()])) return;
