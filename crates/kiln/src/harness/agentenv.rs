@@ -325,13 +325,23 @@ pub fn layer(env: &Resolved, user: &[(String, String)]) -> Vec<(String, Option<S
         .filter(|(k, _)| !kilns(k))
         .map(|(k, set)| {
             let v = match set {
-                Set::Value(v) => Some(v.clone()),
+                Set::Value(v) | Set::Secret(v) => Some(v.clone()),
                 Set::Machine(of) => lookup(user, of).map(str::to_owned),
                 Set::Unset => None,
             };
             (k.clone(), v)
         })
         .collect()
+}
+
+/// The refusal's code where a microVM's environment has a secret (docs/agents.md, "Operations").
+pub const SECRET_IN_MICROVM: &str = "agentenv_secret_in_microvm";
+
+/// `env`'s `secret` variables, by name: none goes into a microVM, where a secret is granted by name,
+/// never by value (docs/agents.md, "Where they apply"). The server refuses them there first; its
+/// runner refuses them again, as every check is made where a session is set up and where it runs.
+pub fn secrets(env: &Resolved) -> Vec<&str> {
+    env.vars.iter().filter(|(_, set)| matches!(set, Set::Secret(_))).map(|(k, _)| k.as_str()).collect()
 }
 
 /// `env`'s `machine` variables the machine's user (`user`) hasn't: each its name, and the machine's
@@ -434,5 +444,133 @@ mod tests {
         let shown = format!("{r:?}");
         assert!(!shown.contains("sk-ant-secret") && !shown.contains("sk-ant-other") && shown.contains("Secret(..)"), "{shown}");
         assert!(shown.contains("HOME"), "{shown}");
+    }
+}
+
+/// Live, on the machine it runs on: a variable set where this system keeps its user's environment
+/// is said by [`answer`] with where it's set, and reaches a session through a `machine` variable;
+/// taken away, it's gone. Run by hand on each system (`--ignored`): it changes the user's
+/// environment for a moment, under a name of its own, and puts it back however it ends.
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Where this system lets a test set a user variable, how, and how to take it away.
+    struct Place {
+        source: Source,
+        set: Box<dyn Fn(&str, &str) -> anyhow::Result<()> + Send + Sync>,
+        unset: Box<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
+        /// What a session's variable reads, set to `value` there (Windows expands `%VAR%`).
+        reads: Box<dyn Fn(&str) -> String + Send + Sync>,
+    }
+
+    fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        // As `unix_places` reaches the user manager from a runner without XDG_RUNTIME_DIR.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+            cmd.env("XDG_RUNTIME_DIR", format!("/run/user/{}", nix::unistd::getuid()));
+        }
+        let o = cmd.output()?;
+        anyhow::ensure!(o.status.success(), "{program} {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn places() -> Vec<Place> {
+        vec![Place {
+            source: Source::Launchd,
+            set: Box::new(|k, v| run("/bin/launchctl", &["setenv", k, v])),
+            unset: Box::new(|k| run("/bin/launchctl", &["unsetenv", k])),
+            reads: Box::new(str::to_owned),
+        }]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn places() -> Vec<Place> {
+        let mut out = Vec::new();
+        // The systemd user manager, where one answers.
+        if run("systemctl", &["--user", "show-environment"]).is_ok() {
+            out.push(Place {
+                source: Source::SystemdUser,
+                set: Box::new(|k, v| run("systemctl", &["--user", "set-environment", &format!("{k}={v}")])),
+                unset: Box::new(|k| run("systemctl", &["--user", "unset-environment", k])),
+                reads: Box::new(str::to_owned),
+            });
+        }
+        // PAM's /etc/environment, where a stack loads pam_env and this user may write it (root in a
+        // distribution's container): a line added, then the file as it was.
+        let stacks: Vec<String> = ["/etc/pam.d", "/usr/lib/pam.d", "/usr/etc/pam.d"].iter().flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten()).filter_map(|e| std::fs::read_to_string(e.path()).ok()).collect();
+        let writable = std::fs::OpenOptions::new().append(true).create(true).open("/etc/environment").is_ok();
+        if places::pam_env_use(stacks.iter().map(String::as_str)).0 && writable {
+            let was = std::fs::read_to_string("/etc/environment").unwrap_or_default();
+            let back = was.clone();
+            out.push(Place {
+                source: Source::Pam,
+                set: Box::new(move |k, v| Ok(std::fs::write("/etc/environment", format!("{was}{}{k}={v}\n", if was.is_empty() || was.ends_with('\n') { "" } else { "\n" }))?)),
+                unset: Box::new(move |_| Ok(std::fs::write("/etc/environment", &back)?)),
+                reads: Box::new(str::to_owned),
+            });
+        }
+        out
+    }
+
+    #[cfg(windows)]
+    fn places() -> Vec<Place> {
+        vec![Place {
+            source: Source::UserRegistry,
+            set: Box::new(|k, v| run("reg", &["add", r"HKCU\Environment", "/v", k, "/t", "REG_EXPAND_SZ", "/d", v, "/f"])),
+            unset: Box::new(|k| run("reg", &["delete", r"HKCU\Environment", "/v", k, "/f"])),
+            reads: Box::new(|v| v.replace("%SystemRoot%", &std::env::var("SystemRoot").unwrap_or_default())),
+        }]
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    fn places() -> Vec<Place> {
+        Vec::new()
+    }
+
+    /// Takes the variable away however the test ends.
+    struct Unset<'a>(&'a Place, &'a str);
+    impl Drop for Unset<'_> {
+        fn drop(&mut self) {
+            let _ = (self.0.unset)(self.1);
+        }
+    }
+
+    #[test]
+    #[ignore = "changes this machine's user environment for a moment"]
+    fn live_a_variable_set_where_the_system_keeps_it_reaches_a_session() -> anyhow::Result<()> {
+        let places = places();
+        crate::rt::block_on(async move {
+            let said = answer(Ask {}).await;
+            let sources: std::collections::BTreeSet<Source> = said.vars.iter().flat_map(|v| v.sources.iter().copied()).collect();
+            println!("LIVE {} {}: {} variables, sources {sources:?}; places to set: {:?}", std::env::consts::OS, std::env::consts::ARCH, said.vars.len(), places.iter().map(|p| p.source).collect::<Vec<_>>());
+            anyhow::ensure!(sources.contains(&Source::Runner), "the runner's own are always said");
+            anyhow::ensure!(said.vars.iter().all(|v| !v.name.starts_with("KILN_")), "kiln's own are never said");
+            for place in &places {
+                let name = format!("AGENTENV_LIVE_{}", std::process::id());
+                let value = if cfg!(windows) { r"%SystemRoot%\agentenv-live".to_owned() } else { "agentenv-live".to_owned() };
+                (place.set)(&name, &value)?;
+                let guard = Unset(place, &name);
+                let said = answer(Ask {}).await;
+                let found = said.vars.iter().find(|v| v.name == name).map(|v| v.sources.clone());
+                anyhow::ensure!(found.as_ref().is_some_and(|s| s.contains(&place.source)), "{:?}: {name} said as {found:?}", place.source);
+                let env = Resolved { id: "e".into(), name: "live".into(), version: 1, base: Base::User, vars: vec![("PROBE".into(), Set::Machine(name.clone()))] };
+                let got = layer(&env, &said_now());
+                anyhow::ensure!(got == vec![("PROBE".to_owned(), Some((place.reads)(&value)))], "{:?}: a session reads {got:?}", place.source);
+                drop(guard);
+                let after = answer(Ask {}).await;
+                anyhow::ensure!(after.vars.iter().all(|v| v.name != name), "{:?}: {name} still said once taken away", place.source);
+                println!("LIVE {:?}: set, said, resolved, taken away", place.source);
+            }
+            Ok(())
+        })
+    }
+
+    /// What [`refresh`] read last ([`said`]).
+    fn said_now() -> Vec<(String, String)> {
+        said()
     }
 }

@@ -6,7 +6,7 @@
  * (`agentenv` in `agents.start`) or applied to one that runs, which starts its harness again on its
  * conversation.
  *
- * The types mirror the Rust structs as they go on the wire (written here until ts-rs makes them).
+ * The types are the server's (ts-rs, `ui/src/api/wire/Agentenv*`).
  */
 import type { Res } from "@/lib/data";
 import { invalidate } from "@/lib/resource";
@@ -14,57 +14,20 @@ import { ApiError, request } from "./client";
 
 const enc = encodeURIComponent;
 
-/** What its variables go over (`agentenv::Base`). */
-export type AgentenvBase = "user" | "clean";
+import type { Agentenv } from "./wire/Agentenv";
+import type { AgentenvApplied } from "./wire/AgentenvApplied";
+import type { AgentenvBase } from "./wire/AgentenvBase";
+import type { AgentenvBrief } from "./wire/AgentenvBrief";
+import type { AgentenvMachineVar } from "./wire/AgentenvMachineVar";
+import type { AgentenvVar } from "./wire/AgentenvVar";
 
-/** Where a variable's value comes from (`agentenv::From`). */
-export type AgentenvFrom = "machine" | "value" | "secret" | "unset";
-
-/** One variable as its owner wrote it (`agentenv::Var`): a secret by its name, never its value. */
-export interface AgentenvVar {
-  name: string;
-  from: AgentenvFrom;
-  /** `machine`: the machine's variable it takes, when not its own name. */
-  of?: string;
-  /** `value`: its value. */
-  value?: string;
-  /** `secret`: the owner's secret's name. */
-  secret?: string;
-}
-
-/** An environment as `agentenvs.list` and `.get` answer. */
-export interface Agentenv {
-  id: string;
-  owner: string;
-  name: string;
-  description?: string;
-  base: AgentenvBase;
-  /** In order: a later one of a name wins. */
-  vars: AgentenvVar[];
-  /** Up with each change; a session says the version it started with. */
-  version: number;
-  /** Unix seconds. */
-  created_at: number;
-  updated_at: number;
-  /** The ids of the sessions running with it. */
-  sessions: string[];
-}
-
-/** Where a machine's user's variable is set (`agentenv::Source`). */
-export type AgentenvSource = "login_shell" | "launchd" | "systemd_user" | "pam" | "user_registry" | "system_registry" | "runner";
-
-/** A variable a machine's user has, by name alone (`agentenv::MachineVar`). */
-export interface MachineVar {
-  name: string;
-  sources: AgentenvSource[];
-}
-
+export type { Agentenv, AgentenvBase, AgentenvVar };
+export type { AgentenvFrom } from "./wire/AgentenvFrom";
+export type { AgentenvSource } from "./wire/AgentenvSource";
+/** A variable a machine's user has, by name alone. */
+export type MachineVar = AgentenvMachineVar;
 /** A session's environment, as `AgentInfo.agentenv` says it. */
-export interface AgentenvRef {
-  id: string;
-  name: string;
-  version: number;
-}
+export type AgentenvRef = AgentenvBrief;
 
 /** What `agentenvs.create` takes. */
 export interface AgentenvAsk {
@@ -75,11 +38,7 @@ export interface AgentenvAsk {
 }
 
 /** What `agentenvs.apply` answers. */
-export interface Applied {
-  agent: unknown;
-  agentenv: AgentenvRef | null;
-  restarted: boolean;
-}
+export type Applied = AgentenvApplied;
 
 /** A refusal's kind (docs/agents.md, "Operations"): its words, the error's, are the UI's to show. */
 export type AgentenvRefusal = "agentenv_unknown" | "agentenv_name_taken" | "agentenv_stale" | "agentenv_in_use" | "agentenv_secret_missing" | "agentenv_secret_in_microvm" | "agentenv_bad_var";

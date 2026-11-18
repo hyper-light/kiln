@@ -264,6 +264,9 @@ impl Kind {
         };
         let base = self.base_args();
         let args = all.strip_prefix(base.as_slice()).ok_or_else(|| anyhow::anyhow!("kiln starts {} with {all:?}, not past its image's command ({base:?})", self.name))?.to_vec();
+        if let Some(names) = spec.agentenv.as_ref().map(super::agentenv::secrets).filter(|n| !n.is_empty()) {
+            anyhow::bail!("{}: a secret goes into a microVM by name alone, never its value; refused: {}", super::agentenv::SECRET_IN_MICROVM, names.join(", "));
+        }
         let mut env: Vec<(String, String)> = spec.env.iter().filter(|(k, _)| locale_or_zone(k)).cloned().collect();
         // Its environment's `machine` and `value` variables, as they are (docs/agents.md, "Where they
         // apply"): a `machine` one read from this machine's user; one they haven't, or an `unset` one,
@@ -1779,6 +1782,22 @@ mod tests {
         assert_eq!(get("GOOSE_PROVIDER"), ["groq"]);
         assert!(get("TZ").is_empty() && get("NOT_LOCALE").is_empty());
         assert_eq!(get(fixed), ["1"]);
+        Ok(())
+    }
+
+    /// A secret's value never goes into a microVM: its runner refuses the start, naming it, as the
+    /// server did before it (docs/agents.md, "Where they apply").
+    #[test]
+    fn an_isolated_harness_is_refused_its_environments_secrets() -> anyhow::Result<()> {
+        use super::super::agentenv::{Base, Set};
+        let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+        let spec = Spec { kind: "claude".into(), agentenv: Some(agentenv(Base::User, vec![("REGION", Set::Value("us-west-2".into())), ("GH_TOKEN", Set::Secret("not-a-real-token".into()))])), ..Spec::default() };
+        let refused = claude.elsewhere(&spec).err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(refused.contains(super::super::agentenv::SECRET_IN_MICROVM) && refused.contains("GH_TOKEN"), "{refused}");
+        assert!(!refused.contains("not-a-real-token") && !refused.contains("REGION"), "{refused}");
+        // On the host it's set like any value.
+        let user: Vec<(String, String)> = Vec::new();
+        assert_eq!(super::super::agentenv::layer(spec.agentenv.as_ref().ok_or_else(|| anyhow::anyhow!("none"))?, &user).into_iter().find(|(k, _)| k == "GH_TOKEN").and_then(|(_, v)| v), Some("not-a-real-token".to_owned()));
         Ok(())
     }
 
