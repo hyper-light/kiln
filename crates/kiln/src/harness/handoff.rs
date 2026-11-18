@@ -1775,6 +1775,19 @@ mod tests {
         assert!(matches!(b.entries.last(), Some(Entry::Assistant(t)) if t == "step 39"));
     }
 
+    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (Windows): a Windows workspace's harness works at a drive of its own
+    /// (`K:\src`), and Claude Code keeps that folder's sessions where it keeps any Windows folder's: its path with the
+    /// drive's colon and every separator each a `-` (`C:\Users\...` is `C--Users-...` on a Windows machine, anthropics/
+    /// claude-code issue 44056), so a hand-off to a Claude Code there writes where it reads.
+    #[test]
+    fn a_windows_workspaces_sessions_go_where_claude_code_looks_on_windows() {
+        let config = Path::new("config");
+        assert_eq!(claude_project_dir(config, r"K:\src"), config.join("projects").join("K--src"));
+        assert_eq!(claude_project_dir(config, r"K:\"), config.join("projects").join("K--"), "a drive's top");
+        assert_eq!(claude_project_dir(config, r"C:\Users\me\my app"), config.join("projects").join("C--Users-me-my-app"));
+        assert_eq!(claude_project_dir(config, "K:/src"), config.join("projects").join("K--src"), "either separator");
+    }
+
     #[test]
     fn transcripts_go_where_claude_code_looks() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
