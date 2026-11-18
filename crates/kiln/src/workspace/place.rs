@@ -16,8 +16,8 @@
 //! from its parent's (Unix), or the drive is there and Windows names its file system Slates' (`slates`, the name its
 //! WinFsp volume gives). A point is named as the kernel's mount table names the mount, by its real path ([`points`]),
 //! and whether a workspace is still mounted as it's taken down is that table's word, read without touching the mount
-//! ([`listed`]), never a stat of a hard NFS mount that waits on its server. Whether a machine can mount at all, and why not, is Slates' library's word
-//! (`slates_api::mount::available`, through `super::slates::facts`).
+//! (`listed`), never a stat of a hard NFS mount that waits on its server. Whether a machine can mount at all, and why
+//! not, is Slates' library's word (`slates_api::mount::available`, through `super::slates::facts`).
 
 use std::path::{Path, PathBuf};
 
@@ -158,12 +158,14 @@ pub fn mount_table() -> anyhow::Result<Vec<PathBuf>> {
 
 /// The mount points a Linux `/proc/self/mountinfo` lists: each line's fifth field, which the kernel writes with a
 /// space, a tab, a newline and a backslash as octal escapes (proc(5)).
+#[cfg(any(unix, test))]
 fn linux_points(text: &str) -> Vec<PathBuf> {
     let unescape = |field: &str| field.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\");
     text.lines().filter(|line| line.contains(" - ")).filter_map(|line| line.split(' ').nth(4)).map(|at| PathBuf::from(unescape(at))).collect()
 }
 
 /// The mount points BSD's `mount` lists, macOS's among them: `<source> on <point> (<type>, <options>…)`.
+#[cfg(any(unix, test))]
 fn bsd_points(text: &str) -> Vec<PathBuf> {
     text.lines()
         .filter_map(|line| {
