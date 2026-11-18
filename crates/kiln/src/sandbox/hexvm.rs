@@ -976,7 +976,7 @@ pub(crate) mod tests {
     use kiln_seams::records::{Consistency, SimRecords};
     use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Link, Output, Refusal, Run, Sandbox as _, Signal};
 
-    use super::{Charge, Charged, HexVms, USE, Used, host_cpu_ns};
+    use super::{Charge, Charged, HexVms, NO_SERVER, USE, Used, host_cpu_ns};
 
     /// The sandbox over Hex's simulator, its boxes numbered as a runner process of epoch 7 numbers those of its runs
     /// that reserve nothing.
@@ -1896,7 +1896,7 @@ pub(crate) mod tests {
             let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
             let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
             let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
-            assert_eq!(image.served, [ServedMount { source: "0123456789abcdef0123456789abcdef".into(), destination: "/work".into(), read_only: false, members: vec![harness] }]);
+            assert_eq!(image.served, [hex_api::ServedMount { source: "0123456789abcdef0123456789abcdef".into(), destination: "/work".into(), read_only: false, members: vec![harness] }]);
             assert!(image.shares.is_empty(), "its folder, in a served folder, is no share of the machine's: {:?}", image.shares);
             assert_eq!(servers.made().map_err(|e| anyhow::anyhow!("{e}"))?, 1, "its stream asked of the server once, as its box booted");
             let other = vms.launch(Launch { served: vec![served(&["helper"])], ..launch(Egress::Only(Vec::new())) }).await.err();
