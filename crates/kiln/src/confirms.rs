@@ -172,7 +172,7 @@ fn landing_click(cx: &Cx, me: &str, input: &Value) -> Option<Option<(String, Str
     let workspace = target.workspace.as_ref().filter(|w| w.made.is_some() && w.owner.as_deref().is_none_or(|o| cx.hub.harness.info(o).is_none()));
     let asker = cx.hub.harness.info(me);
     let (Some(manifest), Some(workspace), Some(asker)) = (manifest, workspace, asker) else { return Some(None) };
-    if crate::workspace::landing_policy(&asker, &target) != crate::workspace::WritePolicy::Approve {
+    if crate::workspace::landing_policy(&asker, &target) != slates_api::WriteMode::Ask {
         return Some(None);
     }
     let over = workspace.over.as_deref().unwrap_or_default();

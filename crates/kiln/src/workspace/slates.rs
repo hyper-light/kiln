@@ -486,6 +486,13 @@ pub async fn set_policy(m: &Made, policy: WritePolicy) -> anyhow::Result<()> {
     .await
 }
 
+/// Workspace `m`'s write policy as Slates keeps it (none set: Slates' unset policy, which asks).
+#[cfg(test)]
+pub(crate) async fn policy(m: &Made) -> anyhow::Result<Option<WritePolicy>> {
+    let volume = volume_id(&m.volume)?;
+    call("write policy", move |i| i.write_policy(PolicySubject::Volume(volume))).await
+}
+
 /// What every landing leaves out: git's own directory.
 pub const EXCLUDES: &[&str] = &["/.git"];
 

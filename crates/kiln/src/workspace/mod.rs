@@ -99,43 +99,27 @@ pub fn same_volume(a: Option<&Workspace>, b: Option<&Workspace>) -> bool {
     }
 }
 
-/// What an agent's own landing does, by the mode its person gave its harness (the person's rule, 2026-11-18: writing
-/// to disk follows the permission granted to the harness or agent asking to write; kiln goal
-/// 01a1ec34599974448aed2672bafaf9a2; docs/agentic.md W6). A landing writes what the agent changed into the folder its
-/// volume is laid over: what its mode would have let it write there unasked had it worked in the folder itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WritePolicy {
-    /// Its mode edits files unasked (accept edits, auto, bypass): its landing writes at once.
-    Write,
-    /// Its mode asks before it edits: its landing waits on its person's click (`crate::confirms`).
-    Approve,
-    /// Its mode changes nothing (plan): it lands nothing.
-    Refuse,
-}
-
-impl WritePolicy {
-    /// The policy of a mode at `level`; a mode kiln can't place asks, as `lineage::ceiling` takes it.
-    pub fn of(level: Option<crate::harness::lineage::Level>) -> Self {
-        use crate::harness::lineage::Level;
-        match level.unwrap_or(Level::Ask) {
-            Level::Plan => Self::Refuse,
-            Level::Ask => Self::Approve,
-            Level::AcceptEdits | Level::Auto | Level::Bypass => Self::Write,
-        }
+/// The write mode of a permission mode at `level` (the person's rule, 2026-11-18: writing to disk follows the
+/// permission granted to the harness or agent asking to write; kiln goal 01a1ec34599974448aed2672bafaf9a2;
+/// docs/agentic.md W6), as Slates' consumer contract names it. A landing writes what the agent changed into the folder
+/// its volume is laid over, so a mode that edits files unasked (accept edits, auto, bypass) lands at once (`Bypass`);
+/// one that asks before it edits waits on an approval (`Ask`); one that only plans lands nothing (`Forbid`). A mode
+/// kiln can't place asks, as `lineage::ceiling` takes it.
+pub fn write_mode(level: Option<crate::harness::lineage::Level>) -> slates_api::WriteMode {
+    use crate::harness::lineage::Level;
+    match level.unwrap_or(Level::Ask) {
+        Level::Plan => slates_api::WriteMode::Forbid,
+        Level::Ask => slates_api::WriteMode::Ask,
+        Level::AcceptEdits | Level::Auto | Level::Bypass => slates_api::WriteMode::Bypass,
     }
 }
 
-/// The policy of agent `asker`'s landing of agent `target`'s workspace (`target` itself, or an agent below the one
-/// asking): the lower of their two modes, so a landing never writes past the grant of the agent asking or of the
+/// The write mode of agent `asker`'s landing of agent `target`'s workspace (`target` itself, or an agent below the one
+/// asking): the stricter of their two modes, so a landing never writes past the grant of the agent asking or of the
 /// agent whose work it is.
-pub fn landing_policy(asker: &crate::harness::session::Info, target: &crate::harness::session::Info) -> WritePolicy {
-    let level = |i: &crate::harness::session::Info| crate::harness::lineage::level(&i.kind, &i.mode);
-    let lower = match (level(asker), level(target)) {
-        (Some(a), Some(t)) => Some(a.min(t)),
-        // One kiln can't place: the policy of a mode that asks, at most.
-        (a, t) => a.or(t).map(|l| l.min(crate::harness::lineage::Level::Ask)),
-    };
-    WritePolicy::of(lower)
+pub fn landing_policy(asker: &crate::harness::session::Info, target: &crate::harness::session::Info) -> slates_api::WriteMode {
+    let mode = |i: &crate::harness::session::Info| write_mode(crate::harness::lineage::level(&i.kind, &i.mode));
+    mode(asker).stricter(mode(target))
 }
 
 /// A drive letter's path (`K:`), the mount of a Windows workspace.
@@ -202,6 +186,13 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     // share their beginnings (Slates' names are unique on the machine).
     let whole: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
     let made = slates::make(&format!("kiln-{whole}"), &over).await?;
+    // Its landings follow the mode its agent starts in (the person's rule, 2026-11-18; W6), as kiln, the launcher, sets
+    // the volume's write policy; no agent can raise it. Where kiln can't set one (an instance it started under a systemd
+    // unit), Slates' unset policy holds: its landings ask, and kiln's own `agents.land` judges each by the agent's mode.
+    let mode = write_mode(crate::harness::lineage::level(&spec.kind, spec.mode.as_deref().unwrap_or_default()));
+    if let Err(e) = slates::set_policy(&made, slates_api::WritePolicy { merge: mode, land: mode, require_signed_merges: false }).await {
+        tracing::info!(volume = %made.volume, error = %format!("{e:#}"), "a workspace's write policy wasn't set: its landings ask, as Slates' unset policy does");
+    }
     let top = place::top(&made.mount);
     let here = if sub.is_empty() { top } else { top.join(&sub) };
     spec.cwd = Some(here.to_string_lossy().into_owned());
@@ -577,27 +568,28 @@ mod tests {
     #[test]
     fn w6_a_landing_writes_as_far_as_the_lower_of_the_two_modes_lets_it() {
         use crate::harness::lineage::Level;
-        assert_eq!(WritePolicy::of(Some(Level::Plan)), WritePolicy::Refuse);
-        assert_eq!(WritePolicy::of(Some(Level::Ask)), WritePolicy::Approve);
+        use slates_api::WriteMode;
+        assert_eq!(write_mode(Some(Level::Plan)), WriteMode::Forbid);
+        assert_eq!(write_mode(Some(Level::Ask)), WriteMode::Ask);
         for edits in [Level::AcceptEdits, Level::Auto, Level::Bypass] {
-            assert_eq!(WritePolicy::of(Some(edits)), WritePolicy::Write, "{edits:?}");
+            assert_eq!(write_mode(Some(edits)), WriteMode::Bypass, "{edits:?}");
         }
-        assert_eq!(WritePolicy::of(None), WritePolicy::Approve, "a mode kiln can't place asks");
+        assert_eq!(write_mode(None), WriteMode::Ask, "a mode kiln can't place asks");
         let agent = |kind: &str, mode: &str| crate::harness::session::Info { kind: kind.into(), mode: mode.into(), ..Default::default() };
         let (bypass, asks, plans) = (agent("claude", "bypassPermissions"), agent("claude", "default"), agent("claude", "plan"));
-        assert_eq!(landing_policy(&bypass, &bypass), WritePolicy::Write);
-        assert_eq!(landing_policy(&agent("claude", "acceptEdits"), &agent("codex", "full-access")), WritePolicy::Write);
-        assert_eq!(landing_policy(&agent("codex", ""), &agent("codex", "")), WritePolicy::Write, "Codex's own default works unasked in its folder");
-        assert_eq!(landing_policy(&agent("claude", ""), &agent("claude", "")), WritePolicy::Approve, "Claude Code's own default asks");
-        assert_eq!(landing_policy(&bypass, &asks), WritePolicy::Approve, "a parent in bypass can't write past its child's mode");
-        assert_eq!(landing_policy(&asks, &bypass), WritePolicy::Approve, "nor a child past its own");
-        assert_eq!(landing_policy(&plans, &bypass), WritePolicy::Refuse);
-        assert_eq!(landing_policy(&bypass, &plans), WritePolicy::Refuse);
+        assert_eq!(landing_policy(&bypass, &bypass), WriteMode::Bypass);
+        assert_eq!(landing_policy(&agent("claude", "acceptEdits"), &agent("codex", "full-access")), WriteMode::Bypass);
+        assert_eq!(landing_policy(&agent("codex", ""), &agent("codex", "")), WriteMode::Bypass, "Codex's own default works unasked in its folder");
+        assert_eq!(landing_policy(&agent("claude", ""), &agent("claude", "")), WriteMode::Ask, "Claude Code's own default asks");
+        assert_eq!(landing_policy(&bypass, &asks), WriteMode::Ask, "a parent in bypass can't write past its child's mode");
+        assert_eq!(landing_policy(&asks, &bypass), WriteMode::Ask, "nor a child past its own");
+        assert_eq!(landing_policy(&plans, &bypass), WriteMode::Forbid);
+        assert_eq!(landing_policy(&bypass, &plans), WriteMode::Forbid);
         let unplaced = agent("nonesuch", "anything");
-        assert_eq!(landing_policy(&unplaced, &bypass), WritePolicy::Approve, "unplaced: it asks at most");
-        assert_eq!(landing_policy(&bypass, &unplaced), WritePolicy::Approve);
-        assert_eq!(landing_policy(&unplaced, &plans), WritePolicy::Refuse);
-        assert_eq!(landing_policy(&unplaced, &unplaced), WritePolicy::Approve);
+        assert_eq!(landing_policy(&unplaced, &bypass), WriteMode::Ask, "unplaced: it asks at most");
+        assert_eq!(landing_policy(&bypass, &unplaced), WriteMode::Ask);
+        assert_eq!(landing_policy(&unplaced, &plans), WriteMode::Forbid);
+        assert_eq!(landing_policy(&unplaced, &unplaced), WriteMode::Ask);
     }
 
     /// W2: an agent in its folder, whatever the reason, has no workspace of its own to ask about.

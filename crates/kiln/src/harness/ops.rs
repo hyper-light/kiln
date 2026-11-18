@@ -763,9 +763,9 @@ fn landing_by(cx: &Cx, info: &Info) -> Result<LandingBy, Fail> {
         return Err((StatusCode::FORBIDDEN, "an agent kiln doesn't run has no mode kiln knows, so it writes nothing to disk: a person does, from the agent's Changes".to_owned()));
     };
     match crate::workspace::landing_policy(&asker, info) {
-        crate::workspace::WritePolicy::Write => Ok(LandingBy::Writing),
-        crate::workspace::WritePolicy::Approve => Ok(LandingBy::Asking),
-        crate::workspace::WritePolicy::Refuse => {
+        slates_api::WriteMode::Bypass => Ok(LandingBy::Writing),
+        slates_api::WriteMode::Ask => Ok(LandingBy::Asking),
+        slates_api::WriteMode::Forbid => {
             // Only a mode that plans refuses: the asker's, or else the one whose work it is.
             let planner = if lineage::level(&asker.kind, &asker.mode) == Some(lineage::Level::Plan) { &asker } else { info };
             Err((StatusCode::FORBIDDEN, format!("{}'s mode plans and changes nothing, so it writes nothing to disk: a person lands {}'s work from its Changes, or gives {} a mode that edits", planner.name, info.name, planner.name)))

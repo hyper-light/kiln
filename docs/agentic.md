@@ -309,8 +309,9 @@ typed outcome, written, held for approval, conflicted or refused. A landing foll
 the agent asking to write was given (the person's rule, 2026-11-18, kiln goals 01a1ec34… and
 01a1ec34…569750…): kiln, the launcher, decides it from the lower of the asking agent's permission mode
 and that of the agent whose work it is (an agent lands its own work, or the work of one it started;
-`workspace::landing_policy`) and sets it as the workspace's policy (`workspace::slates::set_policy`),
-so a landing is written at once in a mode that edits unasked (accept edits, auto, bypass), held as an
+`workspace::landing_policy`) and sets the mode its agent starts in as the workspace's policy when it
+makes the volume (`workspace::slates::set_policy`; a person's later change of the agent's mode is what
+`agents.land` judges by), so a landing is written at once in a mode that edits unasked (accept edits, auto, bypass), held as an
 approval request in one that asks (Claude Code's default, ask), and refused in one that only plans;
 no agent can set or raise its own. `agents.land` follows the same rule: an agent in a mode that edits
 unasked lands at once, its plan as it stands or the manifest it names; one in a mode that asks reads

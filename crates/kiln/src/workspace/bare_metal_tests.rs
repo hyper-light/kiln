@@ -12,8 +12,9 @@
 //! - Landing, as each agent's mode lets it (the person's rule, 2026-11-18): the plan leaves out what git ignores and
 //!   git's own directory; an agent whose mode asks reads its plan and its writing waits on its person's click, then the
 //!   person writes it; one whose mode edits unasked writes its own at once; each into the folder, its repository's
-//!   HEAD as it was (where this machine's Slates takes a grant from kiln: not Linux yet, Slates' GAP-A9-10, and there
-//!   the plan and each write say so).
+//!   HEAD as it was, approved with kiln's launcher secret (an instance kiln started under a systemd unit can't take
+//!   one yet, and there the plan and each write say so); each volume's write policy is its agent's mode, as kiln set
+//!   it.
 //!
 //! The test owns the instance it starts: it ends every agent it started, then stops the anchor kiln started for it (by
 //! the pid kiln kept, `super::slates::started_anchor`) only once none of its volumes is mounted. A mount whose server is
@@ -242,13 +243,17 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
     // Landing, as each agent's mode lets it (docs/agentic.md W6, the person's rule of 2026-11-18), what git ignores and
     // git's own directory left out: one whose mode asks reads its plan, and its writing waits on its person's click (no
     // person's turn here: refused, nothing written), then the person writes it; one whose mode edits unasked writes its
-    // own at once. Each under a grant where this machine's Slates takes one from kiln (not Linux yet, Slates'
-    // GAP-A9-10, and there the plan and each write say so).
+    // own at once. Each approved with kiln's launcher secret, which an instance under a systemd unit can't take yet.
     let now = |i: &Info| hub.harness.info(&i.id).unwrap_or_else(|| i.clone());
     let others: Vec<Info> = each.iter().skip(1).map(now).collect();
     let policy = |i: &Info| super::landing_policy(i, i);
-    let asking = others.iter().find(|i| policy(i) == super::WritePolicy::Approve).cloned().ok_or_else(|| anyhow::anyhow!("no harness whose own default mode asks"))?;
-    let writing = others.iter().find(|i| policy(i) == super::WritePolicy::Write).cloned().ok_or_else(|| anyhow::anyhow!("no harness whose own default mode edits unasked"))?;
+    let asking = others.iter().find(|i| policy(i) == slates_api::WriteMode::Ask).cloned().ok_or_else(|| anyhow::anyhow!("no harness whose own default mode asks"))?;
+    let writing = others.iter().find(|i| policy(i) == slates_api::WriteMode::Bypass).cloned().ok_or_else(|| anyhow::anyhow!("no harness whose own default mode edits unasked"))?;
+    // Each volume's write policy is its agent's mode, as kiln, the launcher, set it when it made the volume.
+    for (who, want) in [(&asking, slates_api::WriteMode::Ask), (&writing, slates_api::WriteMode::Bypass)] {
+        let set = super::slates::policy(&made_of(who)?).await?;
+        anyhow::ensure!(set.is_some_and(|p| p.land == want && p.merge == want), "{}: its volume's policy is {set:?}, not {want:?}", who.name);
+    }
     let as_agent = |i: &Info| {
         let (hub, id) = (Arc::clone(hub), i.id.clone());
         async move { Ok::<_, anyhow::Error>(Cx { caller: crate::mcp::session_caller(&hub, &id, None).await.map_err(anyhow::Error::msg)?, hub }) }
@@ -274,14 +279,15 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
         anyhow::ensure!(std::fs::read_to_string(src.join("wrote.rs"))? == "wrote\n", "the folder holds its own landing");
         anyhow::ensure!(git(work.path(), &["rev-parse", "HEAD"])? == head, "its HEAD as it was");
     } else {
-        // Slates' issuer surface on Linux is owed (GAP-A9-10): the plan and each write say so.
-        anyhow::ensure!(cfg!(target_os = "linux"), "only Linux may refuse a grant from kiln: {plan}");
+        // Only an instance kiln started under a systemd unit takes no launcher secret yet (Linux): the plan and each
+        // write say so.
+        anyhow::ensure!(cfg!(target_os = "linux"), "only Linux's systemd units refuse kiln's approvals: {plan}");
         let why = get(&plan, "/why_not").as_str().unwrap_or_default().to_owned();
-        anyhow::ensure!(why.contains("Linux"), "{plan}");
+        anyhow::ensure!(why.contains("systemd"), "{plan}");
         let refused = call(cx.clone(), "agents.land", json!({"agent": asking.id, "manifest": manifest})).await.err().map(|(_, m)| m).unwrap_or_default();
-        anyhow::ensure!(refused.contains("Linux"), "{refused}");
+        anyhow::ensure!(refused.contains("systemd"), "{refused}");
         let refused = call(as_agent(&writing).await?, "agents.land", json!({"agent": writing.id})).await.err().map(|(_, m)| m).unwrap_or_default();
-        anyhow::ensure!(refused.contains("Linux"), "{refused}");
+        anyhow::ensure!(refused.contains("systemd"), "{refused}");
     }
 
     // The parent ends: its volume stays while its child works in it, and goes with the child.
