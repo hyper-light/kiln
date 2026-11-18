@@ -354,8 +354,11 @@ unasked lands at once, its plan as it stands or the manifest it names; one in a 
 its plan, and its writing waits on its person's click (`crate::confirms`: asked in their chat turn, 428
 until they confirm, then the same call runs once as theirs; outside a turn there's no one to ask, and
 it's refused); one that only plans lands nothing (403). Its answer names the outcome (`outcome`:
-`written` with Slates' outcome, or `approval_required` with the plan to approve by its manifest),
-beside the fields the UI reads. A volume lands whole, so an agent working in another agent's volume
+`written` with Slates' outcome, `approval_required` with the plan to approve by its manifest,
+`conflicted` with each conflict typed, or `refused` with the policy's refusal), beside the fields
+the UI reads. A landing whose plan meets conflicts (a file the agent changed that a person changed on
+disk since) writes nothing whoever asks, a mode that edits unasked included: a conflict never writes
+over the person's bytes, and there is no manifest to approve until a person settles it. A volume lands whole, so an agent working in another agent's volume
 lands nothing of its own while that one works (409, naming whose it is). Setting a policy and
 approving are the launcher's acts, proven by a secret of kiln's own: made once, kept 0600 in its
 state (`slates-launcher.key`), and handed to the anchor at every start on its standard input, so

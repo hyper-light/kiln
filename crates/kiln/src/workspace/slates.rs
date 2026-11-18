@@ -910,11 +910,13 @@ pub fn outcome_json(o: &LandOutcome) -> Value {
 
 /// A presentation as kiln's plan shows it (`agents.land` with no manifest): the plan an approval
 /// binds (its manifest, what it writes), the conflicts that hold it back with no manifest to
-/// approve, how it went when nothing needed an approval, or the policy's refusal.
+/// approve (their paths, which the UI lists, and each typed in `conflicted`, which the server
+/// answers as the landing's outcome), how it went when nothing needed an approval, or the policy's
+/// refusal.
 fn plan_json(o: &LandOutcome) -> Value {
     match o {
         LandOutcome::ApprovalRequired(a) => json!({"grant_required": true, "landing": a.presentation, "manifest": a.manifest_text(), "summary": summary_json(&a.summary), "conflicts": []}),
-        LandOutcome::Conflicted(conflicts) => json!({"grant_required": true, "conflicts": conflicts.iter().map(|c| c.path.clone()).collect::<Vec<_>>()}),
+        LandOutcome::Conflicted(conflicts) => json!({"grant_required": true, "conflicts": conflicts.iter().map(|c| c.path.clone()).collect::<Vec<_>>(), "conflicted": conflicts_json(conflicts)}),
         LandOutcome::Written(report) => json!({"grant_required": false, "outcome": report_json(report)}),
         LandOutcome::Refused(refusal) => json!({"grant_required": true, "refused": refusal_json(refusal)}),
     }

@@ -773,17 +773,24 @@ fn landing_by(cx: &Cx, info: &Info) -> Result<LandingBy, Fail> {
 }
 
 /// A machine's answer to a landing, with its outcome named for whoever acts on it (docs/agents.md, "Workspaces of
-/// their own"): `written` (Slates' outcome, as `landed` has it), or `approval_required` (the plan to read and approve
-/// by its manifest: what was asked for, or the new plan when what was approved moved on, as `changed` says). The
-/// fields the machine answered stay as they were.
+/// their own"), as Slates' typed outcome names it: `written` (Slates' outcome, as `landed` has it); `conflicted`
+/// (`conflicts`, each typed: the disk changed entries the volume changed too, so nothing was written, whoever asked
+/// and whatever their mode, and there's no manifest to approve until a person settles them); `refused` (the policy's
+/// `refusal`); or `approval_required` (the plan to read and approve by its manifest: what was asked for, or the new
+/// plan when what was approved moved on, as `changed` says). The fields the machine answered stay as they were.
 fn typed_landing(mut answer: Value) -> Value {
     // Slates' own outcome, inside its answer when nothing waited on a grant (`{grant_required: false, outcome}`).
     let outcome_of = |said: Value| said.get("outcome").cloned().unwrap_or(said);
     let plan = answer.get("plan").cloned();
-    let (outcome, field, value) = match (answer.get("landed").cloned(), plan) {
-        (Some(written), _) => ("written", "written", outcome_of(written)),
-        (None, Some(plan)) if plan.get("grant_required") == Some(&Value::Bool(false)) => ("written", "written", outcome_of(plan)),
-        (None, Some(plan)) => (
+    // A policy's refusal, and the conflicts a plan met that holds no manifest to approve.
+    let refused = plan.as_ref().and_then(|p| p.get("refused")).filter(|r| !r.is_null()).cloned();
+    let met = plan.as_ref().filter(|p| p.get("manifest").and_then(Value::as_str).is_none()).and_then(conflicts_in);
+    let (outcome, field, value) = match (answer.get("landed").cloned(), plan, refused, met) {
+        (Some(written), ..) => ("written", "written", outcome_of(written)),
+        (None, Some(plan), ..) if plan.get("grant_required") == Some(&Value::Bool(false)) => ("written", "written", outcome_of(plan)),
+        (None, Some(_), Some(refusal), _) => ("refused", "refusal", refusal),
+        (None, Some(_), None, Some(conflicts)) => ("conflicted", "conflicts", conflicts),
+        (None, Some(plan), None, None) => (
             "approval_required",
             "approval",
             json!({
@@ -795,13 +802,23 @@ fn typed_landing(mut answer: Value) -> Value {
                 "why_not": answer.get("why_not"),
             }),
         ),
-        (None, None) => return answer,
+        (None, None, ..) => return answer,
     };
     if let Some(o) = answer.as_object_mut() {
         o.insert("outcome".into(), json!(outcome));
         o.insert(field.into(), value);
     }
     answer
+}
+
+/// The conflicts a landing's plan met, each typed (`conflicted`: its path and class, as Slates' `LandingConflict` has
+/// them); a runner older than that names each by its path alone (`conflicts`). None when it met none.
+fn conflicts_in(plan: &Value) -> Option<Value> {
+    let nonempty = |key: &str| plan.get(key).and_then(Value::as_array).filter(|c| !c.is_empty());
+    match nonempty("conflicted") {
+        Some(typed) => Some(Value::Array(typed.clone())),
+        None => nonempty("conflicts").map(|paths| Value::Array(paths.iter().map(|path| json!({"path": path})).collect())),
+    }
 }
 
 async fn changes(cx: Cx, v: Value) -> Out {
