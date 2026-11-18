@@ -196,7 +196,7 @@ pub async fn facts() -> Facts {
 /// Runs `f` against the machine's instance on kiln's blocking pool, on a client of its own that
 /// ends with the call: what it answered, or what refused it (`verb` names the call). A client
 /// that ends abandons what it alone held, such as a landing it presented (Slates' A-46).
-async fn call<R, F>(verb: &'static str, f: F) -> anyhow::Result<R>
+pub(crate) async fn call<R, F>(verb: &'static str, f: F) -> anyhow::Result<R>
 where
     R: Send + 'static,
     F: FnOnce(&mut Instance) -> Result<R, slates_api::Error> + Send + 'static,
@@ -333,7 +333,7 @@ pub struct Made {
 
 /// A volume's id from its text (Slates' 32 hexadecimal digits, as [`slates_api::volume_id_text`]
 /// writes it).
-fn volume_id(text: &str) -> anyhow::Result<VolumeId> {
+pub fn volume_id(text: &str) -> anyhow::Result<VolumeId> {
     Ok(VolumeId { bytes: hex_bytes(text).ok_or_else(|| anyhow::anyhow!("{text:?} isn't a Slates volume id: 32 hexadecimal digits"))? })
 }
 
@@ -378,6 +378,16 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     Ok(m)
 }
 
+/// A new workspace `name` laid over `over` with no mount (kiln goal 01a1ec34599974448f6b7663ddb07001): an isolated
+/// session's, whose microVM Slates serves the volume itself over Slates' own virtio-fs device (`crate::sandbox::served`),
+/// so nothing of it is on this machine's disk or in its mount table. Its `mount` is empty.
+pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
+    ensure_up().await?;
+    let spec = VolumeSpec::overlay(name, over, volume_max());
+    let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new() })
+}
+
 /// Whether something is mounted at `dir` (its device differs from its parent's).
 #[cfg(unix)]
 fn is_mount(dir: &Path) -> bool {
@@ -394,6 +404,10 @@ fn is_mount(_dir: &Path) -> bool {
 /// Workspace `m` is mounted where it says (again, after the machine's mount went away while its
 /// volume stayed).
 pub async fn mounted(m: &Made) -> anyhow::Result<()> {
+    // One made with no mount (an isolated session's, [`make_unmounted`]) has none to make again.
+    if m.mount.is_empty() {
+        return Ok(());
+    }
     let dir = PathBuf::from(&m.mount);
     if is_mount(&dir) {
         return Ok(());
@@ -438,7 +452,8 @@ async fn let_go(path: String) -> anyhow::Result<()> {
 /// on Linux, and its volume destroyed all the same: nothing is kept for an agent that has ended.
 pub async fn remove(m: &Made) -> anyhow::Result<()> {
     let dir = PathBuf::from(&m.mount);
-    if is_mount(&dir)
+    if !m.mount.is_empty()
+        && is_mount(&dir)
         && let Err(e) = unmount(m.mount.clone()).await
     {
         tracing::info!(mount = %m.mount, error = %format!("{e:#}"), "an ended agent's workspace is still in use: let go lazily");
@@ -448,7 +463,9 @@ pub async fn remove(m: &Made) -> anyhow::Result<()> {
     }
     let volume = volume_id(&m.volume)?;
     call("volume destroy", move |i| i.destroy(volume)).await?;
-    let _ = std::fs::remove_dir(&dir);
+    if !m.mount.is_empty() {
+        let _ = std::fs::remove_dir(&dir);
+    }
     Ok(())
 }
 
@@ -532,8 +549,17 @@ fn planned_files(plan: &Value) -> usize {
 /// Whether `plan` writes only what git sees changed in workspace `m`: with `.git` the one path
 /// left out, anything more is something git ignores (build output, dependencies), which kiln
 /// won't write into a person's folder.
-pub async fn writable(m: &Made, plan: &Value) -> Result<(), String> {
+pub async fn writable(m: &Made, over: &str, plan: &Value) -> Result<(), String> {
     let planned = planned_files(plan);
+    // One with no mount has no working tree for git to look at: what git ignores among what its landing writes is read
+    // from its entries and its own `.gitignore` files (kiln goal 01a1ec34…, `super::review::ignored_writes`).
+    if m.mount.is_empty() {
+        let ignored = super::review::ignored_writes(m, over).await.map_err(|e| format!("{e:#}"))?;
+        return match ignored {
+            0 => Ok(()),
+            n => Err(format!("it would also write {n} file{} git ignores (build output, dependencies) into the folder: kiln leaves out only .git, so put the work up for review instead", if n == 1 { "" } else { "s" })),
+        };
+    }
     let changed = git_changed(m).await.map_err(|e| format!("{e:#}"))?;
     if planned <= changed {
         return Ok(());
@@ -741,7 +767,7 @@ pub async fn land(m: &Made, over: &str, manifest: &str) -> anyhow::Result<Landed
             _ => Landed::Changed(shown),
         });
     }
-    writable(m, &shown).await.map_err(anyhow::Error::msg)?;
+    writable(m, over, &shown).await.map_err(anyhow::Error::msg)?;
     Ok(match approve(m, over, manifest).await? {
         LandOutcome::Written(report) => Landed::Written(json!({"grant_required": false, "outcome": report_json(&report)})),
         other => Landed::Changed(plan_json(&other)),

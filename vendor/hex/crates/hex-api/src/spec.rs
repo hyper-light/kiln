@@ -370,6 +370,35 @@ pub struct ShardsImage {
     /// by default. After the sign-ins (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<ImageVolume>,
+    /// Its shares another server serves (Shards' D286; kiln goal 01a1ec34599974448f6b7663ddb07001): each a
+    /// [`ServedMount`], which the node's server of such shares serves on a stream it makes as the box starts
+    /// ([`crate::serve::Servers`]), put in a share slot of its microVM after its shares', no host directory between the
+    /// guest and that server. None by default. After the volumes (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub served: Vec<ServedMount>,
+}
+
+/// A share another server serves a Shards image's guest ([`ShardsImage::served`]; Shards' D286, `shards_api::image::
+/// ServedShare`): the server answers its guest's file requests on a stream of its own (a slates volume, served on its
+/// virtio-fs stream, for kiln's agents), and the mappings of its share slot's DAX window where it has one (Shards'
+/// D189), with no host directory or mount between them. Mounted and given its members as a share is ([`Mount`]); its
+/// files run from it, as every share's of the class do. Its run boots on a run host of its own, never a warm one
+/// (Shards' D286: a warm host's share process starts before its run's streams come), and no save is made of it (its
+/// server keeps its state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedMount {
+    /// What the node's server serves, in that server's own words (for kiln's, the name of a slates volume of its
+    /// instance): the name its stream is asked by as the box starts ([`crate::serve::Servers::stream`]). Not empty, no
+    /// NUL; what else it may be is the server's to refuse.
+    pub source: String,
+    /// Where the guest sees it: absolute, no `..`, never the guest's root, at no share's, volume's or other served
+    /// share's place.
+    pub destination: String,
+    pub read_only: bool,
+    /// The members given it as they start (Shards' D277), as a share's are ([`Mount::members`]): none, the run's own
+    /// root alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<crate::Member>,
 }
 
 /// A volume of the node's Shards home a Shards image's members are given as its run starts
@@ -417,6 +446,31 @@ impl ImageVolume {
             )));
         }
         named_once(&format!("volumes[{at}].members"), &self.members)
+    }
+}
+
+impl ServedMount {
+    /// Whether Shards can be asked to put it in a share slot, told by its place: a source its server can be asked by (not
+    /// empty, no NUL; the rest is that server's to refuse), where the guest sees it checked as a share's is (absolute, no
+    /// `..`, never the guest's root, which it would hide), and its members each named as a grant's member is and once.
+    fn check(&self, at: usize) -> Result<(), Refusal> {
+        if self.source.is_empty() || self.source.contains('\0') {
+            return Err(invalid_image(format!(
+                "served[{at}].source {:?} names nothing its server serves",
+                self.source
+            )));
+        }
+        let field = format!("served[{at}].destination");
+        container_path(&field, &self.destination).map_err(|e| match e {
+            Refusal::Invalid { why, .. } => invalid_image(why),
+            other => other,
+        })?;
+        if path_parts(&self.destination).all(|part| part.is_empty() || part == ".") {
+            return Err(invalid_image(format!(
+                "{field} is the guest's root, which a share would hide"
+            )));
+        }
+        named_once(&format!("served[{at}].members"), &self.members)
     }
 }
 
@@ -519,6 +573,7 @@ impl ShardsImage {
             credentials: Vec::new(),
             sign_ins: Vec::new(),
             volumes: Vec::new(),
+            served: Vec::new(),
         }
     }
 
@@ -530,8 +585,10 @@ impl ShardsImage {
     /// the name's grammar is Shards' to refuse as it resolves the image, and a grant Shards can't hold
     /// exactly is the runtime's to refuse as it programs the boot. Its volumes each checked as [`ImageVolume`]
     /// checks one, at no share's or other volume's place; their bounds against its box's admitted disk are the
-    /// runtime's to hold as it creates the box. Its credentials, last, as [`crate::check_credentials`] takes them over
-    /// its grants (refused naming `credentials`).
+    /// runtime's to hold as it creates the box. Its shares another server serves each checked as [`ServedMount`] checks
+    /// one, at no share's, volume's or other served share's place; whether its node can serve them is the runtime's to
+    /// say as it creates the box. Its credentials, last, as [`crate::check_credentials`] takes them over its grants
+    /// (refused naming `credentials`).
     pub fn check(&self) -> Result<(), Refusal> {
         check_pinned("shards image", &self.image)?;
         if let Some(command) = &self.command {
@@ -618,6 +675,30 @@ impl ShardsImage {
                 return Err(invalid_image(format!(
                     "volumes[{at}].at {:?} is a share's or another volume's place too",
                     volume.at
+                )));
+            }
+        }
+        // Its shares another server serves (Shards' D286), each checked as a share's place and members are, and each at a
+        // place of its own, no share's, volume's or other served share's however its path is spelled.
+        for (at, served) in self.served.iter().enumerate() {
+            served.check(at)?;
+            let taken = self
+                .shares
+                .iter()
+                .map(|s| s.destination.as_str())
+                .chain(self.volumes.iter().map(|v| v.at.as_str()))
+                .chain(
+                    self.served
+                        .get(..at)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|s| s.destination.as_str()),
+                )
+                .any(|place| same_place(place, &served.destination));
+            if taken {
+                return Err(invalid_image(format!(
+                    "served[{at}].destination {:?} is a share's, a volume's or another served share's place too",
+                    served.destination
                 )));
             }
         }
@@ -1800,6 +1881,96 @@ mod tests {
             ),
         ] {
             match with(vec![cache.clone(), bad.clone()]).check() {
+                Err(Refusal::Invalid { what, why }) => assert_eq!(
+                    (what, why.contains(field)),
+                    ("shards image", true),
+                    "{bad:?}: {why}"
+                ),
+                other => panic!("{bad:?}: not refused as Invalid: {other:?}"),
+            }
+        }
+    }
+
+    /// Shards' D286 (kiln goal 01a1ec34…; shards-image-class.md §2b): the shares another server serves an image VM's
+    /// guest. Do check a VM given one writable into its harness and one read-only into no member, beside a share and a
+    /// volume, and one given none. Expect both to pass and read back whole from JSON, none left out of it when there
+    /// are none. Do give a served share no source, a source with a NUL, a place that is relative, the guest's root,
+    /// through `..`, the share's place, the volume's, the first served share's spelled with a trailing separator, a
+    /// member twice and a member's name Shards' parser refuses. Expect each refused as Invalid naming the served
+    /// share's field, by its place.
+    #[test]
+    fn d286_an_image_vms_served_shares_are_checked_by_field() {
+        let harness = crate::Member {
+            kind: crate::MemberKind::Harness,
+            name: "claude".to_owned(),
+        };
+        let served = |source: &str, destination: &str, members: Vec<crate::Member>| ServedMount {
+            source: source.to_owned(),
+            destination: destination.to_owned(),
+            read_only: false,
+            members,
+        };
+        let project = served("kiln-01a1ec34", "/srv/one", vec![harness.clone()]);
+        let reference = ServedMount {
+            read_only: true,
+            ..served("kiln-reference", "/srv/reference", Vec::new())
+        };
+        let with = |served: Vec<ServedMount>| ShardsImage {
+            shares: vec![Mount {
+                source: PathBuf::from("/srv/projects/hex"),
+                destination: "/work/hex".to_owned(),
+                read_only: false,
+                members: Vec::new(),
+            }],
+            volumes: vec![ImageVolume {
+                name: "kiln-agent-cache".to_owned(),
+                bound: NonZeroU64::new(1 << 30).unwrap(),
+                at: "/volumes/cache".to_owned(),
+                members: vec![harness.clone()],
+                read_only: false,
+            }],
+            served,
+            ..ShardsImage::new(crate::sim::SIM_IMAGE)
+        };
+        let given = with(vec![project.clone(), reference]);
+        given.check().unwrap();
+        let json = serde_json::to_value(&given).unwrap();
+        assert_eq!(serde_json::from_value::<ShardsImage>(json).unwrap(), given);
+        let none = with(Vec::new());
+        none.check().unwrap();
+        assert!(serde_json::to_value(&none).unwrap().get("served").is_none());
+        let shouty = crate::Member {
+            kind: crate::MemberKind::Harness,
+            name: "Claude".to_owned(),
+        };
+        for (bad, field) in [
+            (served("", "/srv/x", Vec::new()), "served[1].source"),
+            (served("a\0b", "/srv/x", Vec::new()), "served[1].source"),
+            (served("x", "srv/x", Vec::new()), "served[1].destination"),
+            (served("x", "/", Vec::new()), "served[1].destination"),
+            (
+                served("x", "/srv/../etc", Vec::new()),
+                "served[1].destination",
+            ),
+            (
+                served("x", "/work/hex", Vec::new()),
+                "served[1].destination",
+            ),
+            (
+                served("x", "/volumes/cache", Vec::new()),
+                "served[1].destination",
+            ),
+            (
+                served("x", "/srv/one/", Vec::new()),
+                "served[1].destination",
+            ),
+            (
+                served("x", "/srv/x", vec![harness.clone(), harness.clone()]),
+                "served[1].members[1]",
+            ),
+            (served("x", "/srv/x", vec![shouty]), "served[1].members[0]"),
+        ] {
+            match with(vec![project.clone(), bad.clone()]).check() {
                 Err(Refusal::Invalid { what, why }) => assert_eq!(
                     (what, why.contains(field)),
                     ("shards image", true),

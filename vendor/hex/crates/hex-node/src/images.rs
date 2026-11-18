@@ -132,6 +132,14 @@ impl ImageRuntime {
         self.class.bind_room(room)
     }
 
+    /// The server its VMs' shares another server serves are asked of, `servers`, its orchestrator's, bound once
+    /// ([`ImageClass::bind_servers`]; Shards' D286, kiln goal 01a1ec34…): from then on a box naming one is created, and
+    /// each one's stream asked of it as the box boots. A runtime given none refuses such a box as it is created,
+    /// `Unconfigured` ([`hex_api::serve::unconfigured`]).
+    pub fn bind_servers(&self, servers: Arc<dyn hex_api::serve::Servers>) -> Result<(), Refusal> {
+        self.class.bind_servers(servers)
+    }
+
     /// Whether box `id`'s turn is free now, held by no transaction: what the tests of the runtime's turns read.
     #[cfg(test)]
     fn turn_free(&self, id: &BoxId) -> bool {
