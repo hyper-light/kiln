@@ -1304,7 +1304,7 @@ mod tests {
             kind: "volume".into(),
             over: Some(top_s.clone()),
             sub: "crates/kiln".into(),
-            made: Some(crate::workspace::slates::Made { volume: "0123456789abcdef0123456789abcdef".into(), name: "kiln-x".into(), mount: mount.into() }),
+            made: Some(crate::workspace::slates::Made { volume: "0123456789abcdef0123456789abcdef".into(), name: "kiln-x".into(), mount: mount.into(), ..Default::default() }),
             ..Default::default()
         };
         let spec = Spec { kind: "codex".into(), cwd: Some(sub_s.clone()), isolation: Some(microvm(None)), workspace: Some(workspace("")), ..Spec::default() };
