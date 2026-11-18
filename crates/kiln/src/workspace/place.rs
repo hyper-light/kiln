@@ -201,4 +201,24 @@ mod tests {
     fn elsewhere_a_workspace_is_mounted_at_a_folder_of_its_own() {
         assert_eq!(points(Path::new("/state/workspaces"), "kiln-a"), vec![PathBuf::from("/state/workspaces/kiln-a")]);
     }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a workspace's mount point is named as the kernel's mount table
+    /// names the mount, its real path, though its state folder is reached through a link (macOS's `/var` is a link to
+    /// `/private/var`, where every temporary folder lies), whether the workspaces folder is there yet or not. The
+    /// bare-metal drive on macOS read kiln's mount as `/var/folders/…/kiln-<id>` and the table's as
+    /// `/private/var/folders/…/kiln-<id>` (kiln eba1841e, 2026-11-18), and the volume stayed mounted after its agent ended.
+    #[test]
+    #[cfg(unix)]
+    fn w3_a_mount_point_is_named_as_the_kernels_mount_table_names_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = std::fs::canonicalize(dir.path())?.join("state");
+        std::fs::create_dir_all(&real)?;
+        let link = dir.path().join("linked-state");
+        std::os::unix::fs::symlink(&real, &link)?;
+        let want = vec![real.join("workspaces").join("kiln-a")];
+        assert_eq!(points(&link.join("workspaces"), "kiln-a"), want, "no workspaces folder yet");
+        std::fs::create_dir_all(real.join("workspaces"))?;
+        assert_eq!(points(&link.join("workspaces"), "kiln-a"), want, "its workspaces folder there");
+        Ok(())
+    }
 }
