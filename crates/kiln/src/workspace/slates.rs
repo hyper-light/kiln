@@ -250,19 +250,22 @@ fn linked_in(manifest: &str) -> Option<String> {
 }
 
 /// This machine's workspace facts, looked at now: whether Slates' library can mount here, and why
-/// not, as the library says.
+/// not, as the library says. A kiln that keeps no workspaces says so before what mount it lacks: it
+/// makes none, mounted or served to a microVM (whose instance starts in that place too), so a lack
+/// of a host mount alone means the rest a served volume needs is here (`harness::lineage::WorkspaceUse`).
 pub async fn facts() -> Facts {
     let slates = linked();
-    let mount = match slates_api::mount::available() {
+    let mount = slates_api::mount::available();
+    if HERE.get().is_none() {
+        return Facts { slates, mount: mount.ok().and_then(mount_word).map(str::to_owned), why_not: Some("this kiln keeps no workspaces".to_owned()), missing: Some(WorkspaceMissing::Workspaces), ..Facts::default() };
+    }
+    let mount = match mount {
         Ok(kind) => mount_word(kind),
         Err(fault) => return Facts { slates, why_not: Some(fault.to_string()), missing: Some(missing_of(&fault)), ..Facts::default() },
     };
     let Some(mount) = mount else {
         return Facts { slates, why_not: Some("Slates offers no mount here that kiln makes".to_owned()), missing: Some(WorkspaceMissing::Mount), ..Facts::default() };
     };
-    if HERE.get().is_none() {
-        return Facts { slates, mount: Some(mount.to_owned()), why_not: Some("this kiln keeps no workspaces".to_owned()), missing: Some(WorkspaceMissing::Workspaces), ..Facts::default() };
-    }
     Facts { available: true, slates, mount: Some(mount.to_owned()), running: up().await, why_not: None, missing: None }
 }
 
