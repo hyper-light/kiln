@@ -1,5 +1,5 @@
 //! A box's network grants as Shards' image boot (D231) takes them (joint plan step 15; docs/design/network-grants.md
-//! N4 and N6): exactly what Shards at the revision vendor/shards pins can hold, its run host holding each member to its
+//! N4 and N6): exactly what Shards at the revision Hex's Cargo.toml pins can hold, its run host holding each member to its
 //! reach of the names kept (D246), or a typed refusal naming the capability Hex awaits. Pure: the Shards image class hands [`ImageNetwork`] to
 //! `shards_api::image::ImageSpec` as it boots, and holds the run to its grants as the boot returns ([`bound`]).
 

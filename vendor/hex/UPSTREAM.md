@@ -3,7 +3,7 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `3af377b93b1296d286317361aa7b41371093dbdf`
+- **Upstream:** https://github.com/hyper-light/hex, commit `8b870b6e33a837af893bec50a78fea4e18d2800c`
   (2026-11-18), MIT (`LICENSE`): its branch `p/v080-vendor`, with Shards' v0.8.0 tag vendored. Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
   Shards deleted the 16550 at `35e2de91e`; Hex's D261, D262), its Shards image class in a process that links Hex
   (`hex_node::images::ImageRuntime::new`, and `ImageRuntime::leasing`, made with its orchestrator's lessors), a member's
@@ -46,9 +46,6 @@ Each change is recorded in `vendor/patches/hex/`, applied in this order on upstr
 |---|---|---|---|
 | `vendor/patches/hyper-raft/` | Hex's records of hyper-raft's changes made kiln's. Its hyper-raft and Shards pins have been kiln's own at each re-vendor since Hex `414aa30d` (at this revision `e0613f52` and `aa819b058`), so this change's pin parts dropped out as upstream's own | kiln holds one copy of each project, with one record of its changes, and Hex must build on it: one Shards revision serves Hex and kiln (the joint plan's step 16) | `0001-hex-builds-on-kiln-s-shards-and-hyper-raft.patch` |
 | `crates/hex-sim/src/lib.rs`, `crates/hex-gpu/src/nvml.rs`, `crates/hex-gpu/src/adl.rs`, `crates/hex-gpu/src/amd.rs` | the files Hex includes by path (hyper-swim's `coordinates.rs`, cuda-rust's loader, all-smi's AMD readers) named at kiln's copies (`vendor/hyper-raft`, `vendor/cuda-rust`, `vendor/all-smi`) | kiln's copy leaves Hex's own copies of them out | `0002-files-hex-includes-by-path-from-kiln-s-copies.patch` |
-| `vendor/MANIFEST.toml` | its `shards-gpu` entry left out | it names the GPU renderer build Hex's `scripts/shards-gpu/build.sh` makes, which Hex compiles nothing of and kiln's copy holds nothing of; kiln carries no GPU VM process (docs/shards.md) | `0003-no-gpu-renderer-build-of-hex-s-in-kiln-s-copy.patch` |
-| `crates/hex-runtime/Cargo.toml`, `crates/hex-client/Cargo.toml`, `crates/hex-node/Cargo.toml` | their path dependencies on Shards' crates (`shards-abi`, `shards-remote`, `shards-ipc`, `shards-afunix`, `shards-testdir`) named at kiln's copy (`vendor/shards`) | kiln's copy leaves Hex's own copy of Shards out, and a path dependency can't be patched | `0004-hex-s-path-dependencies-on-shards-crates-from-kiln-s-copy.patch` |
-| `vendor/patches/shards/0002-hex-s-vendored-shards-names-no-shards-testwait-among-shards.patch` | Removed: kiln's copy of Hex records no Shards change 0002, kiln's layout alone | Hex's 0002 drops `shards-testwait` from its own vendored Shards' dev-dependencies, which take no `crates/testwait`; kiln's Shards takes it, and Hex in kiln builds on kiln's Shards (0004): kiln's changes to Shards must be the product's | `0005-kiln-s-copy-of-hex-records-no-shards-change-0002-its-dev.patch` |
 
 The second, third and fourth changes are kiln's layout alone (`Kiln-only:`). The first is offered to Hex as it stands,
 with what it leaves for Hex and kiln to agree on:

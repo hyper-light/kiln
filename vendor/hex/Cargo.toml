@@ -29,10 +29,16 @@ hex-gpu = { path = "crates/hex-gpu", version = "0.1.0" }
 hex-afunix = { path = "crates/hex-afunix", version = "0.1.0" }
 hex-quic = { path = "crates/hex-quic", version = "0.1.0" }
 hex-wait = { path = "crates/hex-wait", version = "0.1.0" }
-# Shards' guests (docs/design/shards-guest.md §2, Appendix A): the oci class's Linux guest on macOS and
-# Windows. By name and version, patched below to a copy of Shards' draft until Shards lands it, then to
-# vendor/shards as every other vendored project (vendor/shards/Cargo.toml says which).
-shards-api = "0.1"
+# Shards, Hex's microVMs (docs/design/shards-guest.md, shards-image-class.md): its crates by git at the one revision Hex
+# builds on, never a copy of Hex's own; kiln, which vendors Hex and Shards both, builds Hex on its own copy of Shards.
+# The revision is Shards' v0.8.0 (aa819b058) with the change that lets an image run take shares another server serves
+# (branch agents/g265-kiln-shards-microvm-served-image-share-v080), until Shards' main holds it.
+shards-api = { git = "https://github.com/hyper-light/shards", rev = "74d1bc82ff63be13235d83a2dcf1f59e159c3e03" }
+shards-abi = { git = "https://github.com/hyper-light/shards", rev = "74d1bc82ff63be13235d83a2dcf1f59e159c3e03" }
+shards-afunix = { git = "https://github.com/hyper-light/shards", rev = "74d1bc82ff63be13235d83a2dcf1f59e159c3e03" }
+shards-ipc = { git = "https://github.com/hyper-light/shards", rev = "74d1bc82ff63be13235d83a2dcf1f59e159c3e03" }
+shards-remote = { git = "https://github.com/hyper-light/shards", rev = "74d1bc82ff63be13235d83a2dcf1f59e159c3e03" }
+shards-testdir = { git = "https://github.com/hyper-light/shards", rev = "74d1bc82ff63be13235d83a2dcf1f59e159c3e03" }
 flate2 = "1.1.10"
 # hyper-swim's failure detector and the timing it runs on, for hex-sim's crash class (hyper-raft,
 # vendored at vendor/hyper-raft, vendor/MANIFEST.toml): by name, patched to that copy below, as kiln
@@ -172,7 +178,6 @@ hyper-swim = { path = "vendor/hyper-raft/crates/hyper-swim" }
 hyper-timing = { path = "vendor/hyper-raft/crates/hyper-timing" }
 hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }
 hyper-transport = { path = "vendor/hyper-raft/crates/hyper-transport" }
-shards-api = { path = "vendor/shards/crates/api" }
 # shards-api's controller of a run's agent-control endpoint (shards-remote, D238 and D252) takes hyper-quic from
 # hyper-raft by git upstream: here it is the one vendored copy above, so hex builds one hyper-quic and fetches none.
 [patch."https://github.com/hyper-light/hyper-raft"]
