@@ -1065,8 +1065,8 @@ it lacks) or `folder` (the folder itself, a person's explicit choice); in a resu
 and `null` for one isolated in a microVM or one started before volumes were the default (one started in a person's
 shell works on a volume too, its folder and environment moved onto the mount, its `PWD` the folder it starts in, and so
 does a conversation taken up, `resume`, its harness's record of it moved to where the harness looks from the mount's
-folder; when an agent on a volume ends, its conversation goes back to its person's folder's project, where they resume
-it); `branch` and
+folder; when an agent on a volume ends, its conversation goes back to its person's folder's project once its processes
+have ended, where they resume it); `branch` and
 `change_request` are `null` until it has a change request.
 
 An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,

@@ -118,11 +118,12 @@ def where():
 
 
 def write(name):
-    """`name` written in its folder (a bare file name: no path of another folder), its words its name."""
+    """`name` written in its folder (a bare file name: no path of another folder), its words its name. Its bytes are
+    its words alone on every OS (`newline=""`: text mode would end the line with `\\r\\n` on Windows)."""
     if name in (".", "..") or os.sep in name:
         return "WRITE_FAIL %r is no bare file name" % name
     try:
-        with open(name, "w") as f:
+        with open(name, "w", newline="") as f:
             f.write(name + "\n")
         return "WROTE " + name
     except OSError as e:
@@ -131,11 +132,12 @@ def write(name):
 
 def append(name):
     """The line `APPENDED <name>` added to the end of `name`, a file already in its folder (a bare file name):
-    opened for reading and writing, so a file that isn't there is refused, never made."""
+    opened for reading and writing, so a file that isn't there is refused, never made. Its line's bytes are its words
+    alone on every OS, as `write`'s are."""
     if name in (".", "..") or os.sep in name:
         return "APPEND_FAIL %r is no bare file name" % name
     try:
-        with open(name, "r+") as f:
+        with open(name, "r+", newline="") as f:
             f.seek(0, os.SEEK_END)
             f.write("APPENDED %s\n" % name)
         return "APPENDED " + name

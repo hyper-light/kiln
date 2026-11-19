@@ -30,7 +30,7 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 | P | A plan run as one agent per step | O (W for parallel steps' isolation) | built: P1–P4: each met step's work goes up as one diff on the diff of the step met before it, so the run ends as a stack (P-AC1, tested in process against kiln's own git hosting). Since 2026-10-21 a run follows its steps' `needs` (a graph): steps that don't wait for each other run side by side, as many at once as there's room for, sharing one folder unless given folders or machines of their own (their isolation, W5, held with Slates); a step can go on the main agent's own goal stack rather than to an agent of its own; and the agent holding a step splits its goal into its acceptance criteria and tests (`goals_split`) and says each met (`goals_done`). Tested in process: a five-step graph run side by side and blocked by one unmet step until retried, `max_parallel`, and a step given to the main agent. Checked live 2026-10-21 on a throwaway server with real Claude Code agents: a four-step graph (step 1 given to a Sonnet main agent, which split it into its two criteria and its test and said each met with `goals_done`; steps 2 and 3 side by side on Haiku agents of their own, met by Claude Code's `/goal`; step 4 after both) ran to done in 74 s, as four commits in the order met, each by its step's agent with only its own file; and since 2026-10-22 a goal turns into a plan (`goals_plan`): planned first (research inside and outside, each finding graded by kiln from its sources: docs/research.md), its steps then the goal's parts or a run, the goal met once every step is; plan runs and goal stacks draw where each step stands as the conversation draws work |
 | G | Goal stacks as a graph, run side by side on subagents | O, P | in progress (docs/goals.md, "What a goal waits for"). The person's decisions, 2026-10-24: order is inferred as far as it can be, then goals fan out; while subagents are in play the stack's agent coordinates, and otherwise it does the work itself; a plan is a subgraph drawing on the same pool, filled greedily; with no Subagents setting there's no maximum; a goal's subagent ends once its goal is met; every subagent at work draws on the session's pool. G1 (built): what a goal waits for (`needs` on `goals_add` and `goals_update`, `goals_order` for several at once), with loops refused, a goal taken out passing on what it waited for, and the next goal the first one ready (in the stack's order where nothing says otherwise). G2: the ready goals out to subagents, with the agent coordinating, and goals that say nothing ordered by the agent first. Built of G2 (2026-11-05; docs/goals.md, "Goals side by side" and "Several goals under way at once"): several goals of a stack under way at once, each ending alone; the agent sets goals under way itself for its own harness's subagents (`goals_update` `active`), beside its goal under way, which stays the one kiln sends it and holds it to; and on a stack that runs side by side (`side_by_side`), its goals ready together that say what they wait for go each to a subagent of the agent's (P2's subagents, under way there and here), as many as its Subagents setting leaves room for, the rest waiting for room while the agent coordinates; a goal's parts that say what they wait for (a plan inside it) fan out the same way; met there is met here, not met comes back to the agent, and pauses, removals, clears and restarts are followed as P2's are. Not built: kiln asking the agent to order the goals that say nothing (today they go in turn, on the agent). G3: a plan's steps as a subgraph of the same pool (with P2's subagents). G4: one pool per session. G5: docs, metrics and G-AC1, a live check |
 | R | Runners: diagnostics, upgrades and repair, by agents and people | O | built: R1–R5 (docs/releases.md, "Diagnosing and repairing a runner"; docs/agents.md, "Attached agents"): R4 is an agent attached to the runners, woken by a failed upgrade, a failing check or a machine offline (the CI's `runner.offline`), held to `diagnose` and `manage-runners`, its incident on the runner's row in System → Updates. R-AC1 passed 2026-10-19 on a throwaway server and runner (a self-build without npm failed; Claude Code as the runner doctor diagnosed it as a missing dependency, retried by download with a person approving its calls, the runner upgraded, and the doctor resolved its incident once told the upgrade went through: in the lab by hand, the message kiln now sends itself) |
-| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk by the write mode kiln gives its volume, approved with kiln's own launcher secret: everywhere kiln starts Slates itself). Since 2026-11-18 kiln vendors Slates (`vendor/slates`) and drives it through its library alone, never its command line: kiln's own executable is the instance's anchor and daemon, so no machine installs Slates. Since 2026-11-18 (the person's decision, kiln goal 01a1ec34…) a volume is what every agent on a machine's host gets unless a person chooses its folder (W2), an agent started in another agent's folder works in that agent's volume, which goes with the last of them, an agent lands as its granted mode lets it and never raises its own permission (W6), and a Windows machine with WinFsp mounts each workspace at a drive letter of its own (W1; its run on Windows owed). **Held** (2026-10-19: Slates is far from complete): W5 merging between agents. Moving an agent with its volume to another machine is built inside kiln's Slates fleet (W7, kiln goal 95101ef3 K4, 2026-11-18): by Slates' own move, refused by kind where it can't be; a listed runner's workspace is a clone of its folder's captured base, so it moves (K5, 2026-11-18), and one laid over its folder elsewhere is refused `not_plain`. Since 2026-11-18 an agent started in a person's shell whose folder lies in another agent's mount works in that agent's volume, as one started in another agent's folder does: its machine, reading the shell's folder after the server chose a volume of its own for it, takes the volume it is in (`workspace::from_shell`), where it was laid over that mount and Slates refused it (A-227). Since kiln took Slates at ce9b6905e (contract 42, Slates' A-507) its library's unmount runs no program on macOS (`unmount(2)`, where it ran `umount` by name, so a runner whose `PATH` lacked `/sbin` couldn't take a workspace's mount down) and is believed only when the kernel's mount table agrees; kiln still keeps a volume whose mount stays rather than destroy it beneath its mount. W8 built as far as Shards' D286 on its branch allows: an isolated session's volume served to its microVM with no mount, its change request from the volume's own changes (its real-VM run owed). W9, an agent in a container of its own on its volume, bound from the host's mount (UI goal 88, 2026-11-18): designed on Linux, macOS and Windows; its first piece is Slates' (the bind as a library verb, Slates' A-520), the engine itself owed. W10, the Kubernetes engine, designed 2026-11-19 (kiln goal 28e73c34's part 01a1f124…): an agent's pod works in its home runner's volume through kubelet's mount of that runner's Slates export over RPC-with-TLS (no copy on a node, no CSI driver, no privilege); built of it: a listed runner's node certificate names the host it's listed at, so a node's RPC-with-TLS client can verify the export, and (2026-11-19) a client of kiln's server takes a certificate kiln's CA issued only in the server's role, the server's own or a front door's, so neither a node's nor a capacity holder's stands in for the server at a name they share |
+| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk by the write mode kiln gives its volume, approved with kiln's own launcher secret: everywhere kiln starts Slates itself). Since 2026-11-18 kiln vendors Slates (`vendor/slates`) and drives it through its library alone, never its command line: kiln's own executable is the instance's anchor and daemon, so no machine installs Slates. Since 2026-11-18 (the person's decision, kiln goal 01a1ec34…) a volume is what every agent on a machine's host gets unless a person chooses its folder (W2), an agent started in another agent's folder works in that agent's volume, which goes with the last of them, an agent lands as its granted mode lets it and never raises its own permission (W6), and a Windows machine with WinFsp mounts each workspace at a drive letter of its own (W1; its run on Windows owed: kiln's `workspace::bare_metal_tests`, and since 2026-11-19 `slates_e2e`'s bare-metal drive, which ran on Unix alone). **Held** (2026-10-19: Slates is far from complete): W5 merging between agents. Moving an agent with its volume to another machine is built inside kiln's Slates fleet (W7, kiln goal 95101ef3 K4, 2026-11-18): by Slates' own move, refused by kind where it can't be; a listed runner's workspace is a clone of its folder's captured base, so it moves (K5, 2026-11-18), and one laid over its folder elsewhere is refused `not_plain`. Since 2026-11-18 an agent started in a person's shell whose folder lies in another agent's mount works in that agent's volume, as one started in another agent's folder does: its machine, reading the shell's folder after the server chose a volume of its own for it, takes the volume it is in (`workspace::from_shell`), where it was laid over that mount and Slates refused it (A-227). Since kiln took Slates at ce9b6905e (contract 42, Slates' A-507) its library's unmount runs no program on macOS (`unmount(2)`, where it ran `umount` by name, so a runner whose `PATH` lacked `/sbin` couldn't take a workspace's mount down) and is believed only when the kernel's mount table agrees; kiln still keeps a volume whose mount stays rather than destroy it beneath its mount. W8 built as far as Shards' D286 on its branch allows: an isolated session's volume served to its microVM with no mount, its change request from the volume's own changes (its real-VM run owed). On Linux KVM and Windows WHP (W8's plan, UI goal 88, 2026-11-18) the VMM and the device are the same, a Windows stream a pipe whose DAX asks Slates judges by a live holder; built of it: an isolated start's volume needs no host mount, so a WHP host without WinFsp or a KVM host without FUSE gives one (`lineage::WorkspaceUse`). W9, an agent in a container of its own on its volume, bound from the host's mount (UI goal 88, 2026-11-18): designed on Linux, macOS and Windows; its first piece is Slates' (the bind as a library verb, Slates' A-520), the engine itself owed. W10, the Kubernetes engine, designed 2026-11-19 (kiln goal 28e73c34's part 01a1f124…): an agent's pod works in its home runner's volume through kubelet's mount of that runner's Slates export over RPC-with-TLS (no copy on a node, no CSI driver, no privilege); built of it: a listed runner's node certificate names the host it's listed at, so a node's RPC-with-TLS client can verify the export, and (2026-11-19) a client of kiln's server takes a certificate kiln's CA issued only in the server's role, the server's own or a front door's, so neither a node's nor a capacity holder's stands in for the server at a name they share |
 | C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI; a plan run's steps go up as a stack, one diff per step (P4). A comment's message tells the agent how to answer in its thread once W14's `ci.diffs.reply` is there (the CI work's, on its way to main); until then agents answer with a new version |
 | K | Agentic control of CI/CD, whatever the provider | W20 (ci.md), the provider model | K1: W20-R02's operations, the CI work's (in progress there, `ci.diffs.*` included); K2 built: attachments and incidents (W20-R08 to R10, `crate::ci::attach`; docs/agents.md, "Attached agents"), Agents → Attached, Mission Control grouping an attachment's agents under it; their questions come to Needs you and notifications as any agent's do |
 
@@ -280,7 +280,10 @@ person's explicit choice, kept as made, in Mission control's composer (More opti
 choice made) and `agents.start`. Several agents on one folder each get their own. An agent started in another
 agent's folder on that agent's machine (a child placed in its parent's folder, above all) works in that agent's
 volume, as two agents in one folder did (`workspace.owner` names whose it is): a volume is never laid over a volume,
-which Slates refuses (its A-227). An isolated agent's workspace is its microVM's boundary's to share (W8). A
+which Slates refuses (its A-227). An isolated agent's workspace is its microVM's boundary's to share (W8); a volume
+asked for one is served to its microVM and never mounted, so a machine that lacks only a host mount (WinFsp,
+`fusermount3`, `/dev/fuse`, `mount_nfs`) gives it one, and refuses one only for its agents on its host
+(`lineage::WorkspaceUse`). A
 conversation taken up (`resume`: a found session taken over or continued) works on a volume like any other, its
 harness's record of it moved to where the harness looks from the mount's folder before it starts: Claude Code's
 transcript (and its session's own files beside it) to the project folder Claude Code keeps for the mount's folder,
@@ -288,8 +291,9 @@ where `--resume` looks; Gemini CLI's chat to the project it keeps for that folde
 record of it, not two, as a move to another machine keeps it. A branch of one (`--fork-session`) reads a copy there,
 the conversation itself staying where the person may go on with it. Codex goes on by its thread's id, given the
 mount's folder (`thread/resume`), and an ACP agent is given that folder in `session/load`; a record that can't be
-moved refuses the start, saying why. When any agent on a volume ends, its conversation goes back the other way before
-its mount goes (the project its harness kept for the mount's folder goes with the volume): Claude Code's transcript
+moved refuses the start, saying why. When any agent on a volume ends, its conversation goes back the other way once
+its processes have ended (its harness writes the record until it ends: W3) and before its mount goes (the project its
+harness kept for the mount's folder goes with the volume): Claude Code's transcript
 and its session's own files, and Gemini CLI's chat and its subagents' folder, to the project its harness keeps for its
 person's folder, where they resume it from where they work; one already there is written over in neither place, both
 stay, and kiln logs why (`homes::NotMoved`), and a branch's copy of another conversation stays where it is. An agent
@@ -317,12 +321,21 @@ What the agent hasn't touched is read from the folder as it is now; what it chan
 (edits, build output, git's own writes) is held in the volume alone, so the folder and other
 agents never see it. Ended for good, the agent's volume goes with it, once no other agent works in it: the last
 of the agents working in one ends it (on its machine's runner process), and an agent that couldn't start after all
-takes only a volume made for it alone with it. Its mount goes first, asked again while what the agent left behind
-still holds it for as long as the agent's own end took, then let go: detached on Linux, forced off on macOS (Slates'
-`mount::unmount_busy`, contract 36), kiln saying what held it where it stays. Its volume is destroyed only once the
-kernel's mount table no longer holds its point (an unmount that answers done is believed only when the table agrees);
-one whose mount stays is kept, refused typed (`MountStays`, with the unmount's and the let-go's words and what holds
-it), never destroyed beneath a live mount, which would leave the mount with nothing behind it. kiln reads that table
+takes only a volume made for it alone with it. Its mount goes first, once every process kiln started for the agent has
+ended: its harness, which works in the mount, and its group (every process that started, followed as the agent's), each
+end as the OS tells it (a pidfd on Linux, kqueue on macOS, a process handle on Windows), never a clock. Then the mount
+is asked to go once. Its volume is destroyed only once the kernel's mount table no longer holds its point (an unmount
+that answers done is believed only when the table agrees); one whose mount stays is kept, never destroyed beneath a
+live mount, which would leave the mount with nothing behind it, and never let go by force: what holds it once the
+agent's processes have ended is another's (a person's shell or editor there), which a forced unmount would cut off.
+kiln refuses it by kind (`MountStays`), as Slates' contract 42 types the unmount's answer (its A-507): busy, which the
+OS says itself on macOS (`MountFault::Busy`, its `EBUSY`) and Linux's `fusermount3 -u` doesn't (an exit code alone, so
+there a refusal while `lsof` names processes holding the mount), naming each process that holds it as `lsof` does (the
+system's own, `/usr/sbin/lsof`, on macOS); refused for another reason, in the refusal's words and `lsof`'s; or
+answered done while the table still lists it (`MountFault::StillMounted`). Before, kiln asked again on a clock for as
+long as the agent's own end had taken, then let the mount go (detached on Linux, forced off on macOS: Slates'
+`mount::unmount_busy`, contract 36);
+kiln's clippy refuses a clock there (`rt::sleep`), and the let-go cut off whoever still worked in it. kiln reads that table
 with the system's own `mount` (`/sbin/mount`) on macOS, never a program found on `PATH`. kiln names a mount by its real path, as
 the kernel's mount table names it (macOS reaches `/var`, where temporary folders lie, through a link to
 `/private/var`), and judges whether it's still there by that table, never by looking into the mount, which on a hard
@@ -503,6 +516,68 @@ which a working tree's `git -C` at an empty mount would read; a mode change git 
 Owed: its real-VM run (`tests/slates_e2e.rs`'s
 `microvm::` drive); Shards' D286 on Shards' main (carried as a recorded change of vendor/shards until then).
 
+**W8 on Linux KVM and Windows WHP (UI goal 88, kiln goal part 01a1f1249c5e75b5bc82c9eb011550f4; planned
+2026-11-18).** What runs on macOS (Hypervisor.framework: the microVM drive's review step, run r1697) is the same kiln
+code on Linux and Windows. Where the hosts differ:
+
+- **The VMM: Shards' own, everywhere.** Every microVM is Shards' VM process (`shards-vm`), its hypervisor chosen as it
+  is built (`vendor/shards/crates/vmm/build.rs`: `hvf` for macOS arm64, `kvm` for Linux x86_64 and aarch64, `whp` for
+  Windows x86_64 and aarch64), each backend with the share slot's DAX window (`crates/vmm/src/hv/`,
+  `devices/virtio/fs/window.rs`). kiln carries it built for its own platform (`ci/shards/pack.sh <target>`; Linux's
+  VM and network processes static, musl), and a runner says whether its host runs it in Shards' words
+  (`sandbox::facts_of`, `shards_api::host_check`: `/dev/kvm` missing or not this user's; the Windows Hypervisor
+  Platform off). Owed (docs/shards.md): kiln's releases packing Shards for Linux and Windows, which carry none yet.
+- **The device route: the same device, another stream.** Slates' own virtio-fs device in that VM answers on the
+  stream kiln asks of its instance (`sandbox::served`, `Instance::serve_shards`) and Hex hands Shards' run host
+  (D286). On Linux, as on macOS, the stream is a Unix socket passed as a descriptor, and a DAX map's copy rides the
+  stream itself. On Windows it is a duplex pipe's end that Slates' daemon duplicated into kiln's process, Hex into
+  the run host and the run host into its VM (`--slates-fs-handle`; Slates' A-179), and a DAX ask is answered with a
+  section duplicated into the asking process only once its handle proves to be the same pipe as a live known
+  holder's (Slates' A-180): the attaching client, kiln's runner process, or the last claimant that passed. kiln's
+  copy goes as the boot answers (Hex lets it go), so a VM whose first DAX ask comes later is refused it (`EACCES`)
+  and its read through the map fails. So on Windows kiln keeps the stream it attached until its run ends, handing Hex
+  a duplicate (piece 3). Below kiln this route is proven: a Shards guest on GitHub's windows-2025 mapped a Slates file
+  through its WHP window over the daemon's stream (2026-10-27, Slates §4.6).
+- **Windows' volume: no WinFsp for a microVM.** A Windows host's own agents work in a WinFsp drive (W1), but an
+  isolated agent's volume is made with no mount and served over the stream, so a host without WinFsp (jupiter, a WHP
+  host, has none) holds isolated agents on volumes of their own, as a Linux host without FUSE does. Its review is the
+  volume's own entries (A-287) and its landing Slates' Windows writer (A-519, A-527), neither through a mount.
+- **Windows' paths.** A Windows project is seen in its guest at `/work/<its name>` (`sandbox::isolated::guest_path`).
+  A served project's place is the volume's top as git names it, `C:/…` with forward slashes as Git for Windows prints
+  `--show-toplevel`, while `Seen::said` matches that top as text against Windows' own spelling (`C:\…`), so a
+  harness there would be told its folder as the host spells it.
+
+In order, each its own piece:
+
+1. **Built (this plan's first piece, 2026-11-18): an isolated start's volume needs no host mount.** Its workspace is
+   judged by what a served volume needs (`lineage::WorkspaceUse::Served`: Slates and kiln's workspaces, no host
+   mount) at both doors: `agents.start` by the boundary it places it in, `/api/harness/sessions` by the boundary the
+   registry will give it (`Registry::isolation_for`, the rule `Registry::open_as` decides by). A runner's facts say
+   that its kiln keeps no workspaces before what mount it lacks (`workspace::slates::facts`), so a host mount's lack
+   alone means the rest is there. Test: `harness::lineage`'s
+   `w8_an_isolated_agents_volume_needs_no_host_mount_so_a_runner_without_winfsp_or_fuse_serves_one`.
+2. **Windows' paths** (kiln, tested on every host): `Seen` matches a project's top by its parts, either separator and
+   a drive's letter in either case, and `served_project` places the harness's folder by git's own prefix
+   (`Workspace::sub`), as a mounted workspace's is, never by how the folder is spelled; its test a git-spelled top
+   (`C:/src/app`) under a folder spelled `C:\src\app\crates`.
+3. **Windows' known holder** (kiln, Windows only, so built for main's Windows run): `served::SlatesVolumes` keeps the
+   handle Slates' daemon gave kiln's process for each box until that box's run ends and hands Hex a duplicate, so
+   every DAX ask of the VM's is judged against a live holder (A-180); its end closes the kept handle, after which the
+   attachment lasts while the VM's copy does.
+4. **Where a served volume is offered.** `/api/harness/workspaces` says per machine whether it gives a volume served
+   to a microVM beside whether it gives a mounted one, so the composer offers Own volume for an isolated agent on a
+   host without WinFsp, and the e2e microVM drive's readiness reads it.
+5. **The drive on Windows.** `tests/slates_e2e.rs`'s `microvm::` drive is still `#[cfg(unix)]`, where its bare-metal
+   sibling runs on Windows since 2026-11-19 (a drive letter judged Slates' by `slates_mounted_at`, the host's
+   processes read through CIM's `Win32_Process` as `vm_e2e` reads them); its stand-in runs in the guest, so opening
+   its gate is those looks over a session with no mount, which no drive letter may show.
+6. **The runs, main's:** the `microvm::` drive on adacachy (KVM, now) and on jupiter (WHP, once 2, 3 and 5 are in),
+   each through `kiln run` on a kiln carrying Shards packed for that host.
+
+Owed on every host alike: Slates hands a successor daemon's fresh stream to a device over its resync channel (A-316,
+A-339; Windows A-427), which `served::SlatesVolumes` drops (it hands Hex the stream alone, which is all D286 takes), so
+a Slates daemon's restart ends a microVM's share.
+
 **W9 Containers (UI goal 88, kiln goal 01a1f124…; designed 2026-11-18, Slates' A-520).** An agent whose runner runs
 its sessions in containers works in an OCI container of its own on its Slates volume: the same volume W2 and W3 make (an
 overlay over its folder; on a runner in kiln's Slates fleet a clone of the folder's captured base), mounted on its
@@ -521,8 +596,9 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    bind's source resolves on the engine's host; the engine's kind, version and security options; judged by Slates'
    `slates_bridge_oci::runtime::judge`): a profile a container workload has run through, with how a container's ids
    reach the volume and how hard links behave through it, or a typed refusal (a remote engine, a profile no workload has
-   run through), which refuses the start in Slates' words before anything is made. The handshake is Slates' command
-   line's today (`slates oci-runtime`) and becomes a library call (A-520's next piece).
+   run through), which refuses the start in Slates' words before anything is made. The handshake is Slates' library
+   call `container_engine::engine_profile(runtime)` (A-520, contract 47; its command line's `slates oci-runtime` makes
+   the same call), whose `EngineFault::Untested` names the engine and profile it refused.
 2. **The mount, on the host.** `Instance::mount` at the workspace's place (W3: `workspaces/kiln-<id>` under the
    runner's state, by the real path the kernel's mount table names), shared with other users only where the profile
    needs it. A rootful Linux engine reaches the mount as users other than the person (the engine itself, as root, and
@@ -535,9 +611,9 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    exactly this volume's mount (on Linux its own mount, by its record: A-227), records the binding, which lasts until
    it's detached or its mount goes, and answers the runtime's `mounts` entry: a non-recursive `bind`, `ro` or `rw` by the
    intent, `private`, `nosuid` and `nodev`. kiln never makes a bind of its own: it hands the engine that entry word for
-   word, just after Slates' check that the source is still the mount it verified (`slates oci-check`, a library call
-   to come with the handshake: a mount gone or replaced in between is never bound, where the engine would bind the
-   bare folder left there). It binds with `--mount` and never `-v`, which makes a missing source on the host (Docker's
+   word, just after Slates' check that the source is still the mount it verified (`ContainerBind::check_source`, by
+   the kernel's table and the mount id it never reuses, contract 47: a mount gone or replaced in between is never
+   bound, where the engine would bind the bare folder left there). It binds with `--mount` and never `-v`, which makes a missing source on the host (Docker's
    bind-mount documentation), so a mount gone is the engine's refusal (`bind source path does not exist`), never an
    agent writing into the person's disk: Docker's `type=bind,bind-recursive=disabled,bind-propagation=private`, and
    `readonly` for a read; podman's `bind-nonrecursive` and `ro=true`. Docker's `--mount` has no word for `nosuid` and
@@ -547,7 +623,8 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    means the same inside (the agent's folder, its environment moved onto the mount (W2), a child started in its folder
    working in its volume): nothing is translated. Where the profile forwards a container's ids as the host's own (a
    rootful Linux engine), the container runs as the person's uid and gid, so what the agent makes is theirs and the
-   permission bits hold.
+   permission bits hold; under rootless podman (`ContainerRootAsMountingUser`) it runs as the container's root, which
+   the engine maps to the person, the one id an unshared mount admits.
 5. **Its end.** The container goes first (its engine lets go of the files it held open), then the binding is detached,
    then the mount comes down as W3's does.
 
@@ -557,8 +634,10 @@ On each platform:
   rootful Docker Engine over a shared mount (its T-4.13 Linux leg, its linux-oci CI lane) and with rootless podman (a
   program in the container mapping a Slates file through the bound mount: its G-mount step 3, 2026-10-25). Slates' judge
   holds the rootful Docker Engine's profile (`ContainerIdsAsHostIds`; every name of a hard-linked file served at once)
-  and still refuses a rootless engine (`UserNamespaceUntested`) and podman's command line (`RuntimeUnsupported`), which
-  Slates has run since: their profiles are Slates' to add (A-520).
+  and, since its A-520 third piece (contract 48), rootless podman's on its own Linux host (`engine_profile("podman")`:
+  `ContainerRootAsMountingUser` over an unshared mount, which needs no `user_allow_other`), the case that needs no
+  privilege anywhere; it still refuses a rootless Docker engine, podman run as root and a remote podman, each typed.
+  Rootless podman's live check (the container's other ids refused, its hard links) is Slates' run, filed.
 - **macOS.** Docker Desktop runs its engine in a Linux VM, and a bind's source resolves there, through Desktop's file
   sharing, which carries the Mac's folders into the VM over the Virtualization framework's virtio-fs device (Slates
   measured `virtiofs0 /run/host_virtiofs/Users` on 2026-10-27; `/private` is shared as `/run/host_mark/private`,
@@ -587,9 +666,9 @@ On each platform:
   says the share reaches it (A-520). If it doesn't, the route is the volume's network export (Slates' NFS server runs on
   Windows: its A-184), mounted in the VM by the engine, which is its own measurement.
 
-Owed, in order, each a piece: Slates' library calls (the bind is built, A-520: `Instance::bind_into_container`; the
+Owed, in order, each a piece: Slates' library calls are built (A-520: `Instance::bind_into_container`, contract 44; the
 engine's profile and the check before a bind, moved from Slates' command line into its library as the mount was, its
-A-278); kiln's re-vendor of Slates at contract 44 or later; a runner's `container` engine beside `host` and `microvm`
+A-278, contract 47); kiln's re-vendor of Slates at contract 47 or later; a runner's `container` engine beside `host` and `microvm`
 (`harness::engine`: its facts, placement and drain) and its launch through the seam's `Boundary::Container`, an
 implementation over the machine's engine (`sandbox::container`): its image, and its harness's structured session over
 the container's stdio; `nosuid` and `nodev` under Docker, which its `--mount` can't say: measured first (a setuid file

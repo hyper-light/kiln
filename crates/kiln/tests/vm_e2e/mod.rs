@@ -2622,7 +2622,7 @@ pub fn stub_host_env(dir: &Path) -> anyhow::Result<Vec<(&'static str, String)>> 
 /// The Python 3 the stand-in runs on, by its own word (`sys.executable`): the launcher's (`py -3`), else
 /// `python`'s or `python3`'s. The Store's `python.exe` alias, which only offers to install one, says none.
 #[cfg(windows)]
-fn stub_python() -> anyhow::Result<PathBuf> {
+pub fn stub_python() -> anyhow::Result<PathBuf> {
     for (program, first) in [("py", Some("-3")), ("python", None), ("python3", None)] {
         let Ok(out) = std::process::Command::new(program).args(first).args(["-c", "import sys; print(sys.executable)"]).output() else { continue };
         let exe = String::from_utf8_lossy(&out.stdout).trim().to_owned();
