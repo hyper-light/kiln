@@ -406,7 +406,8 @@ mod tests {
         git(&["update-index", "--chmod=+x", "bin/tool"])?;
         let tracked: HashSet<String> = ["bin/run.sh".to_owned(), "bin/tool".to_owned()].into_iter().collect();
         let modes_of = |top: &std::path::Path| -> anyhow::Result<FileModes> {
-            let (trusted, executable) = crate::rt::block_on(super::super::git::file_modes(top))?;
+            let top = top.to_path_buf();
+            let (trusted, executable) = crate::rt::block_on(async move { super::super::git::file_modes(&top).await })?;
             Ok(FileModes { trusted, executable })
         };
         let rewrite = |path: &str, mode: u32| PlannedEntry { path: format!("/{path}"), action: PlannedAction::Replace, content: None, mode: Some(mode), witnessed: true, conflict: None };
