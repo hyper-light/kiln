@@ -521,8 +521,9 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    bind's source resolves on the engine's host; the engine's kind, version and security options; judged by Slates'
    `slates_bridge_oci::runtime::judge`): a profile a container workload has run through, with how a container's ids
    reach the volume and how hard links behave through it, or a typed refusal (a remote engine, a profile no workload has
-   run through), which refuses the start in Slates' words before anything is made. The handshake is Slates' command
-   line's today (`slates oci-runtime`) and becomes a library call (A-520's next piece).
+   run through), which refuses the start in Slates' words before anything is made. The handshake is Slates' library
+   call `container_engine::engine_profile(runtime)` (A-520, contract 47; its command line's `slates oci-runtime` makes
+   the same call), whose `EngineFault::Untested` names the engine and profile it refused.
 2. **The mount, on the host.** `Instance::mount` at the workspace's place (W3: `workspaces/kiln-<id>` under the
    runner's state, by the real path the kernel's mount table names), shared with other users only where the profile
    needs it. A rootful Linux engine reaches the mount as users other than the person (the engine itself, as root, and
@@ -535,9 +536,9 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    exactly this volume's mount (on Linux its own mount, by its record: A-227), records the binding, which lasts until
    it's detached or its mount goes, and answers the runtime's `mounts` entry: a non-recursive `bind`, `ro` or `rw` by the
    intent, `private`, `nosuid` and `nodev`. kiln never makes a bind of its own: it hands the engine that entry word for
-   word, just after Slates' check that the source is still the mount it verified (`slates oci-check`, a library call
-   to come with the handshake: a mount gone or replaced in between is never bound, where the engine would bind the
-   bare folder left there). It binds with `--mount` and never `-v`, which makes a missing source on the host (Docker's
+   word, just after Slates' check that the source is still the mount it verified (`ContainerBind::check_source`, by
+   the kernel's table and the mount id it never reuses, contract 47: a mount gone or replaced in between is never
+   bound, where the engine would bind the bare folder left there). It binds with `--mount` and never `-v`, which makes a missing source on the host (Docker's
    bind-mount documentation), so a mount gone is the engine's refusal (`bind source path does not exist`), never an
    agent writing into the person's disk: Docker's `type=bind,bind-recursive=disabled,bind-propagation=private`, and
    `readonly` for a read; podman's `bind-nonrecursive` and `ro=true`. Docker's `--mount` has no word for `nosuid` and
@@ -587,9 +588,9 @@ On each platform:
   says the share reaches it (A-520). If it doesn't, the route is the volume's network export (Slates' NFS server runs on
   Windows: its A-184), mounted in the VM by the engine, which is its own measurement.
 
-Owed, in order, each a piece: Slates' library calls (the bind is built, A-520: `Instance::bind_into_container`; the
+Owed, in order, each a piece: Slates' library calls are built (A-520: `Instance::bind_into_container`, contract 44; the
 engine's profile and the check before a bind, moved from Slates' command line into its library as the mount was, its
-A-278); kiln's re-vendor of Slates at contract 44 or later; a runner's `container` engine beside `host` and `microvm`
+A-278, contract 47); kiln's re-vendor of Slates at contract 47 or later; a runner's `container` engine beside `host` and `microvm`
 (`harness::engine`: its facts, placement and drain) and its launch through the seam's `Boundary::Container`, an
 implementation over the machine's engine (`sandbox::container`): its image, and its harness's structured session over
 the container's stdio; `nosuid` and `nodev` under Docker, which its `--mount` can't say: measured first (a setuid file
