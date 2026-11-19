@@ -1144,6 +1144,75 @@ pub enum RequestBody {
     /// Whether unlocked memory refuses, as a create's.
     require_locked: bool,
   },
+  /// Create repository `name` (§4.17.1 "The repository and its greens"; A-575) on the partition its name hashes to: its
+  /// record and its lineage's root green, bound to `default_branch`. The root is `green`, an unbound green of that
+  /// partition that joins as it stands, or a new empty green. Answered `GreenCreated` with the root. Appended.
+  CreateRepository {
+    /// The repository's name, unique everywhere.
+    name: String,
+    /// The tool it serves.
+    tool: VcsTool,
+    /// How it names its objects.
+    format: ObjectFormat,
+    /// The branch its root is bound to, and the one a client gets when it names none.
+    default_branch: String,
+    /// The green that becomes its root, when not a new empty one.
+    green: Option<VolumeId>,
+  },
+  /// Make branch `name` of repository `repository` at `version` of branch `from` (its head when `None`), sharing every
+  /// node of `from`'s state, so what it costs is what changed after `version` (§4.17.1 item 4, A-575). Answered
+  /// `GreenCreated` with the new green. Appended.
+  CreateBranch {
+    /// The repository.
+    repository: String,
+    /// The new branch's name.
+    name: String,
+    /// The branch it is made from.
+    from: String,
+    /// The version of `from` it is made at; its head when `None`.
+    version: Option<u64>,
+  },
+  /// Bind branch `name` of repository `repository` to `green`, a member of the repository's lineage no name binds:
+  /// what restores a retired branch (§4.17.1 item 5; A-575). Answered `Acknowledged`. Appended.
+  BindBranch {
+    /// The repository.
+    repository: String,
+    /// The branch's name.
+    name: String,
+    /// The green.
+    green: VolumeId,
+  },
+  /// Retire branch `name` of repository `repository`: the name leaves the namespace and its green stays a member of
+  /// the lineage, so binding the name to it again restores the branch (§4.17.1 item 5; A-575). Answered
+  /// `Acknowledged`. Appended.
+  RetireBranch {
+    /// The repository.
+    repository: String,
+    /// The branch's name.
+    name: String,
+  },
+}
+
+/// The tool a repository serves (§4.17; A-575), as `CreateRepository` names it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VcsTool {
+  /// git.
+  Git,
+  /// Mercurial.
+  Mercurial,
+  /// Subversion.
+  Subversion,
+}
+
+/// How a repository names its objects (§4.17.1 item 1; A-575), as `CreateRepository` names it: fixed at creation.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectFormat {
+  /// SHA-1 names: git's default and Mercurial's node ids.
+  Sha1,
+  /// SHA-256 names: git's `object-format=sha256`.
+  Sha256,
+  /// Revision numbers: Subversion's.
+  Revisions,
 }
 
 /// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
@@ -1919,6 +1988,11 @@ impl RequestBody {
       | RequestBody::CaptureBase { volume }
       | RequestBody::ArchiveExport { volume, .. } => Some(*volume),
       RequestBody::ArchiveImport { archive, .. } => Some(*archive),
+      // A repository's verbs are served on the partition its name hashes to, as a create by name is (A-575).
+      RequestBody::CreateRepository { .. }
+      | RequestBody::CreateBranch { .. }
+      | RequestBody::BindBranch { .. }
+      | RequestBody::RetireBranch { .. } => None,
     }
   }
 
@@ -1929,6 +2003,8 @@ impl RequestBody {
       self,
       RequestBody::Create { .. }
         | RequestBody::CreateGreen { .. }
+        | RequestBody::CreateRepository { .. }
+        | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
@@ -3397,10 +3473,16 @@ pub enum HostAnswer {
   NotFile,
   /// A handle the host no longer holds.
   StaleHandle,
-  /// The host's errno.
+  /// The host's errno (Linux, macOS), never a Win32 code (A-539: `Win32`).
   Errno {
     /// The errno.
     errno: i32,
+  },
+  /// The host's Win32 error code (Windows), in Win32's own numbering: never an errno, whatever its number (A-539).
+  /// `Errno` carries an errno alone. Appended.
+  Win32 {
+    /// The Win32 error code.
+    code: u32,
   },
 }
 
@@ -3414,7 +3496,8 @@ pub enum LandingDegradation {
   },
   /// Media durability was not asked for: barriers only, the supported level.
   BarriersOnly,
-  /// The host stopped answering (a crash-like errno); the landing aborted and advanced nothing.
+  /// The host stopped answering (a crash-like errno; a Win32 code is `CrashedWin32`, A-539); the landing aborted and
+  /// advanced nothing.
   Crashed {
     /// The errno.
     errno: i32,
@@ -3451,6 +3534,12 @@ pub enum LandingDegradation {
     path: String,
     /// The path it is kept at.
     kept: String,
+  },
+  /// The host stopped answering with a Win32 error code (Windows), in Win32's own numbering (A-539); the landing
+  /// aborted and advanced nothing. `Crashed` carries an errno alone. Appended.
+  CrashedWin32 {
+    /// The Win32 error code.
+    code: u32,
   },
 }
 
@@ -3590,7 +3679,8 @@ pub enum Refusal {
   InvalidName,
   /// A policy the base does not allow.
   PolicyMismatch,
-  /// The base directory is unavailable.
+  /// The base directory is unavailable: the host's errno, 0 where it named none (a Win32 code is
+  /// `BaseUnavailableWin32`, A-539).
   BaseUnavailable {
     /// The path.
     path: String,
@@ -3607,9 +3697,11 @@ pub enum Refusal {
   /// The shard's client or task capacity is reached.
   TooManyClients,
   /// A shard's cross-shard queue is at its bound; the request was not started and may be
-  /// retried (the client's credit bounds what it can have in flight).
+  /// retried (the client's credit bounds what it can have in flight). A listing, the grants or a status, gathered from
+  /// every shard, answers it too when a shard's part could not be sent there or came home unserved, that shard's state
+  /// refusing to serve it (fenced, or never started): the answer is never given without that shard's part (A-557).
   Overloaded {
-    /// The shard whose queue is full.
+    /// The shard whose queue is full, or whose part a gathered answer lacks.
     shard: u16,
   },
   /// A malformed request.
@@ -3940,7 +4032,8 @@ pub enum Refusal {
   /// silence the reply still waits, never a false success. The verb's effects stay committed on the owner and nothing
   /// claims them durable; this is the request's recorded outcome (§4.9), so a retry under the same id meets it, and the
   /// verb runs again only under a new id. Until 2026-11-18 such a reply was held for good when what it waited for could
-  /// not happen. Appended.
+  /// not happen. A consensus operation (a bootstrap, a recovery) answers it too when it ran on the control shard but
+  /// a shard of the daemon did not apply its publication within that shard's own time (A-566). Appended.
   DurabilityPending {
     /// How long the reply was held before it was told this, nanoseconds.
     held_ns: u64,
@@ -3963,6 +4056,14 @@ pub enum Refusal {
   ArchiveRefused {
     /// Why.
     fault: ArchiveFault,
+  },
+  /// The base directory is unavailable: the host's Win32 error code (Windows), in Win32's own numbering (A-539).
+  /// `BaseUnavailable` carries an errno alone. Appended.
+  BaseUnavailableWin32 {
+    /// The path.
+    path: String,
+    /// The Win32 error code.
+    code: u32,
   },
 }
 
@@ -4006,9 +4107,9 @@ pub enum TargetRefusal {
     /// The owner's uid.
     owner: Option<u32>,
   },
-  /// The host refused the path: its OS error number.
+  /// The host refused the path: its errno (a Win32 code is `HostWin32`, A-539).
   Host {
-    /// The OS error number.
+    /// The errno.
     errno: i32,
   },
   /// The kernel's mount table names no mount of this daemon's there.
@@ -4044,6 +4145,12 @@ pub enum TargetRefusal {
   TooLong {
     /// The longest path the daemon takes there, in bytes.
     longest: u64,
+  },
+  /// The host refused the path: its Win32 error code (Windows), in Win32's own numbering (A-539). `Host` carries an
+  /// errno alone. Appended.
+  HostWin32 {
+    /// The Win32 error code.
+    code: u32,
   },
 }
 
@@ -4979,6 +5086,7 @@ pub fn pack<M: Wire>(
     kind: SlotKind::Bulk,
     request,
     payload: payload.to_vec(),
+    stamp: 0,
   })
 }
 
@@ -5023,6 +5131,7 @@ pub fn owned(region: &ClientRegion, slot: Slot) -> Result<Slot, IpcError> {
     kind: SlotKind::Inline,
     request: slot.request,
     payload: bulk_body(region, &slot.payload)?,
+    stamp: slot.stamp,
   })
 }
 
