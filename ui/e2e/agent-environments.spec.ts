@@ -136,6 +136,43 @@ test("one made, changed in place, applied to this session, refused deletion whil
   expect(said, said.join("\n")).toEqual([]);
 });
 
+test("a card's head is edited in place: renamed, tagged and untagged, described; each saved at once over its version", async ({ page }) => {
+  const said = errors(page);
+  const { list } = await engine(page);
+  const card = list.locator(":scope > li.df-defrow", { hasText: "clean-ci" });
+  const patched = () => page.waitForRequest((r) => r.method() === "PATCH" && r.url().includes("/api/agentenvs/"));
+  // Renamed: the name pressed is a field in its place (the card then holds no "clean-ci" text, so it's found in the list); Enter saves.
+  await card.getByRole("button", { name: "Rename clean-ci" }).click();
+  const name = list.getByRole("textbox", { name: "clean-ci's name" });
+  await name.fill("ci-clean");
+  let sent = patched();
+  await name.press("Enter");
+  expect((await sent).postDataJSON()).toEqual({ version: 1, name: "ci-clean" });
+  const renamed = list.locator(":scope > li.df-defrow", { hasText: "ci-clean" });
+  await expect(renamed).toContainText("Clean base · v2");
+  // A tag added beside the name, then one taken away.
+  await list.getByRole("button", { name: "Add a tag to ci-clean" }).click();
+  sent = patched();
+  await list.getByRole("textbox", { name: "New tag for ci-clean" }).fill("nightly");
+  await list.getByRole("textbox", { name: "New tag for ci-clean" }).press("Enter");
+  expect((await sent).postDataJSON()).toEqual({ version: 2, tags: ["ci", "nightly"] });
+  const tags = list.getByRole("list", { name: "ci-clean's tags" });
+  await expect(tags).toContainText("nightly");
+  sent = patched();
+  await tags.getByRole("button", { name: "Remove tag ci" }).click();
+  expect((await sent).postDataJSON()).toEqual({ version: 3, tags: ["nightly"] });
+  await expect(tags.getByRole("listitem")).toHaveText([/^nightly/]);
+  await expect(renamed).toContainText("Clean base · v4");
+  // Described in place; Escape leaves it as it was.
+  const tree = list.getByRole("list", { name: "ci-clean: variables and sessions" });
+  await tree.getByRole("button", { name: "Describe ci-clean" }).click();
+  await tree.getByRole("textbox", { name: "ci-clean's description" }).fill("throwaway");
+  await tree.getByRole("textbox", { name: "ci-clean's description" }).press("Escape");
+  await expect(tree.getByRole("button", { name: "Describe ci-clean" })).toHaveText("Like CI: only PATH");
+  expect(await sideways(page)).toBe(0);
+  expect(said, said.join("\n")).toEqual([]);
+});
+
 test("the composer's Environment row: the machine's user's by default, one of the person's carried into the start as `agentenv`, and kept", async ({ page }) => {
   const said = errors(page);
   await page.request.post("/api/mock/agentenvs");

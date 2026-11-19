@@ -48,6 +48,8 @@ pub struct Agentenv {
     pub base: Base,
     /// In order: a later one of a name wins.
     pub vars: Vec<Var>,
+    /// Its owner's own labels for it, in the order given: found by the Engine tab's filter.
+    pub tags: Vec<String>,
     /// Up by one with each change.
     pub version: i64,
     pub created_at: i64,
@@ -198,6 +200,7 @@ pub struct Draft {
     pub description: Option<String>,
     pub base: Base,
     pub vars: Vec<Var>,
+    pub tags: Vec<String>,
 }
 
 /// A change: what's given changes (`description: Some(None)` takes it out).
@@ -207,6 +210,22 @@ pub struct Patch {
     pub description: Option<Option<String>>,
     pub base: Option<Base>,
     pub vars: Option<Vec<Var>>,
+    pub tags: Option<Vec<String>>,
+}
+
+/// `tags` as kept: each trimmed, the empty dropped, each once (the first of those that differ only in
+/// case); refused, saying which, where one holds a control character (a line break among them).
+fn tags_of(tags: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags.into_iter().map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()) {
+        if t.chars().any(char::is_control) {
+            return Err(format!("the tag {t:?} has a control character"));
+        }
+        if !out.iter().any(|o| o.to_lowercase() == t.to_lowercase()) {
+            out.push(t);
+        }
+    }
+    Ok(out)
 }
 
 /// What's wrong with `name` as an environment's, if anything: some words, on one line.
@@ -288,15 +307,16 @@ struct Record {
     description: Option<String>,
     base: String,
     vars: String,
+    tags: String,
     version: i64,
     created_at: i64,
     updated_at: i64,
 }
 
-const COLUMNS: &str = "id, owner, name, description, base, vars, version, created_at, updated_at";
+const COLUMNS: &str = "id, owner, name, description, base, vars, tags, version, created_at, updated_at";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
-    Ok(Record { id: r.get(0)?, owner: r.get(1)?, name: r.get(2)?, description: r.get(3)?, base: r.get(4)?, vars: r.get(5)?, version: r.get(6)?, created_at: r.get(7)?, updated_at: r.get(8)? })
+    Ok(Record { id: r.get(0)?, owner: r.get(1)?, name: r.get(2)?, description: r.get(3)?, base: r.get(4)?, vars: r.get(5)?, tags: r.get(6)?, version: r.get(7)?, created_at: r.get(8)?, updated_at: r.get(9)? })
 }
 
 impl Record {
@@ -304,7 +324,8 @@ impl Record {
     fn read(self, sessions: Vec<String>) -> anyhow::Result<Agentenv> {
         let base: Base = serde_json::from_value(serde_json::Value::String(self.base.clone())).map_err(|e| anyhow::anyhow!("environment {}'s base {:?} isn't one: {e}", self.id, self.base))?;
         let vars: Vec<Var> = serde_json::from_str(&self.vars).map_err(|e| anyhow::anyhow!("environment {}'s variables can't be read: {e}", self.id))?;
-        Ok(Agentenv { id: self.id, owner: self.owner, name: self.name, description: self.description, base, vars, version: self.version, created_at: self.created_at, updated_at: self.updated_at, sessions })
+        let tags: Vec<String> = serde_json::from_str(&self.tags).map_err(|e| anyhow::anyhow!("environment {}'s tags can't be read: {e}", self.id))?;
+        Ok(Agentenv { id: self.id, owner: self.owner, name: self.name, description: self.description, base, vars, tags, version: self.version, created_at: self.created_at, updated_at: self.updated_at, sessions })
     }
 }
 
@@ -396,6 +417,7 @@ pub async fn create(hub: &Hub, person: &str, draft: Draft) -> R<Agentenv> {
     }
     checked(hub, person, &draft.vars).await?;
     let vars = serde_json::to_string(&draft.vars).map_err(anyhow::Error::from)?;
+    let tags = serde_json::to_string(&tags_of(draft.tags).map_err(Refusal::BadVar)?).map_err(anyhow::Error::from)?;
     let (id, owner, now) = (crate::util::new_id(), person.to_owned(), crate::util::now_unix());
     let (i, n, d, b) = (id.clone(), name.clone(), draft.description.clone(), base_text(draft.base));
     let made = hub
@@ -405,7 +427,7 @@ pub async fn create(hub: &Hub, person: &str, draft: Draft) -> R<Agentenv> {
             if named_in(&tx, &owner, &n, &i)? {
                 return Ok(None);
             }
-            tx.execute("INSERT INTO agentenvs (id, owner, name, description, base, vars, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)", params![i, owner, n, d, b, vars, now])?;
+            tx.execute("INSERT INTO agentenvs (id, owner, name, description, base, vars, tags, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)", params![i, owner, n, d, b, vars, tags, now])?;
             let r = get_in(&tx, &i)?;
             tx.commit()?;
             Ok(r)
@@ -430,10 +452,15 @@ pub async fn update(hub: &Hub, person: &str, id: &str, version: i64, patch: Patc
     checked(hub, person, &vars).await?;
     let description = patch.description.unwrap_or_else(|| old.description.clone());
     let base = patch.base.unwrap_or(old.base);
-    if name == old.name && description == old.description && base == old.base && vars == old.vars {
+    let tags = match patch.tags {
+        Some(t) => tags_of(t).map_err(Refusal::BadVar)?,
+        None => old.tags.clone(),
+    };
+    if name == old.name && description == old.description && base == old.base && vars == old.vars && tags == old.tags {
         return Ok(old);
     }
     let json = serde_json::to_string(&vars).map_err(anyhow::Error::from)?;
+    let tags = serde_json::to_string(&tags).map_err(anyhow::Error::from)?;
     let (i, n, now, b) = (id.to_owned(), name.clone(), crate::util::now_unix(), base_text(base));
     let written = hub
         .store
@@ -447,7 +474,7 @@ pub async fn update(hub: &Hub, person: &str, id: &str, version: i64, patch: Patc
             if named_in(&tx, &now_is.owner, &n, &i)? {
                 return Ok(Written::Taken);
             }
-            tx.execute("UPDATE agentenvs SET name = ?2, description = ?3, base = ?4, vars = ?5, version = ?6, updated_at = ?7 WHERE id = ?1", params![i, n, description, b, json, version.saturating_add(1), now])?;
+            tx.execute("UPDATE agentenvs SET name = ?2, description = ?3, base = ?4, vars = ?5, tags = ?6, version = ?7, updated_at = ?8 WHERE id = ?1", params![i, n, description, b, json, tags, version.saturating_add(1), now])?;
             let r = get_in(&tx, &i)?;
             tx.commit()?;
             Ok(r.map_or(Written::Missing, Written::Done))

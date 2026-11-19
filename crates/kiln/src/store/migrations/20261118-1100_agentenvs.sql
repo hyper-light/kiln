@@ -1,7 +1,8 @@
 -- Environments for agent sessions (`crate::agentenvs`, docs/agents.md "Environments"; decided by the
 -- user, 2026-11-18): each its owner's (`owner`, the server's owner, or `user:<id>`), named once among
 -- that owner's, its variables kept as written (`vars`: JSON, each `{name, from, of?, value?, secret?}`,
--- a secret by its name, never its value), its version up with each change. New tables: an older kiln
+-- a secret by its name, never its value), its own tags (`tags`: JSON, in order), its version up
+-- with each change. New tables: an older kiln
 -- never names them.
 CREATE TABLE agentenvs (
     id TEXT PRIMARY KEY,
@@ -10,6 +11,7 @@ CREATE TABLE agentenvs (
     description TEXT,
     base TEXT NOT NULL,
     vars TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '[]',
     version INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,

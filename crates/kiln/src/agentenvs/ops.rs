@@ -48,6 +48,7 @@ async fn create(cx: Cx, v: Value) -> Out {
         description: field::<Option<String>>(&v, "description")?.flatten(),
         base: field::<Base>(&v, "base")?.unwrap_or_default(),
         vars: field::<Vec<Var>>(&v, "vars")?.unwrap_or_default(),
+        tags: field::<Vec<String>>(&v, "tags")?.unwrap_or_default(),
     };
     let made = super::create(&cx.hub, &p, draft).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentenv.create".into(), format!("{} ({}) v{}", made.name, made.id, made.version)).await;
@@ -58,7 +59,7 @@ async fn update(cx: Cx, v: Value) -> Out {
     let p = person(&cx)?;
     let id = text(&v, "id")?;
     let version = v.get("version").and_then(Value::as_i64).ok_or_else(|| (StatusCode::BAD_REQUEST, "`version` is the version your change is made over: its `version` as you read it".to_owned()))?;
-    let patch = Patch { name: field(&v, "name")?, description: field(&v, "description")?, base: field(&v, "base")?, vars: field(&v, "vars")? };
+    let patch = Patch { name: field(&v, "name")?, description: field(&v, "description")?, base: field(&v, "base")?, vars: field(&v, "vars")?, tags: field(&v, "tags")? };
     let changed = super::update(&cx.hub, &p, &id, version, patch).await.map_err(fail)?;
     cx.hub.store.audit(cx.caller.name.clone(), "agentenv.update".into(), format!("{} ({}) v{}", changed.name, changed.id, changed.version)).await;
     json_of(&changed)
@@ -277,6 +278,9 @@ pub mod input {
         pub base: AgentenvBase,
         /// In order: a later one of a name wins.
         pub vars: Vec<AgentenvVar>,
+        /// Your own labels for it, in order.
+        #[serde(default)]
+        pub tags: Vec<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -293,6 +297,8 @@ pub mod input {
         pub description: Option<Option<String>>,
         pub base: Option<AgentenvBase>,
         pub vars: Option<Vec<AgentenvVar>>,
+        /// Your own labels for it, in order: all of them, as they're to be.
+        pub tags: Option<Vec<String>>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

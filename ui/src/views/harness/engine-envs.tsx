@@ -176,7 +176,7 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
       {/* Its line: its name (this session's marked), its base and version, its pencil. */}
       <li className="ms-node df-defrow df-head" data-stand={e.sessions.length > 0 ? "working" : "done"} data-depth={0} data-env={e.id}>
         <span className="df-head-main">
-          <span className="df-strong df-defname">{e.name}</span>
+          <Inline value={e.name} action={`Rename ${e.name}`} label={`${e.name}'s name`} className="df-strong df-defname" onSave={(name) => change(e, { name }, setWhy)} />
           {here && <span className="df-head-v df-this">this session</span>}
         </span>
         <span className="df-head-end">
@@ -196,11 +196,29 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
             <EnvForm e={e} at={at} onDone={() => setEditing(false)} />
           ) : (
             <>
-              {e.description && (
-                <li className="ms-node df-body" data-depth={2}>
-                  <span className="df-note">{e.description}</span>
-                </li>
-              )}
+              <li className="ms-node df-body ev-tagrow" data-depth={2}>
+                <span className="ev-tags" role="list" aria-label={`${e.name}'s tags`}>
+                  {e.tags.map((t) => (
+                    <span role="listitem" key={t} className="ev-tag">
+                      {t}
+                      <button type="button" className="ev-tag-x" aria-label={`Remove tag ${t}`} onClick={() => change(e, { tags: e.tags.filter((x) => x !== t) }, setWhy)}>
+                        <X size={10} />
+                      </button>
+                    </span>
+                  ))}
+                  <AddTag name={e.name} onAdd={(t) => change(e, { tags: [...e.tags, t] }, setWhy)} />
+                </span>
+              </li>
+              <li className="ms-node df-body ev-desc" data-depth={2}>
+                <Inline
+                  value={e.description ?? ""}
+                  action={`Describe ${e.name}`}
+                  label={`${e.name}'s description`}
+                  placeholder="Add a description"
+                  className="df-note"
+                  onSave={(d) => change(e, { description: d || null }, setWhy)}
+                />
+              </li>
               <GroupHead label="Variables" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.vars.length}</span>} />
               <li className="ms-node df-body" data-depth={2}>
                 {e.vars.length === 0 ? (
@@ -257,6 +275,84 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
         </ul>
       </li>
     </>
+  );
+}
+
+/** `e` changed as `patch` says, shown at once and saved over the version shown; a refusal puts it back and says why. */
+function change(e: Agentenv, patch: Partial<Pick<Agentenv, "name" | "tags">> & { description?: string | null }, why: (w: string | null) => void) {
+  setData<Agentenv[]>(agentenvsRes.key, (l) => l.map((x) => (x.id === e.id ? { ...x, ...patch, description: patch.description === null ? undefined : (patch.description ?? x.description) } : x)));
+  why(null);
+  agentenvsApi.update(e.id, { version: e.version, ...patch }).then(
+    (saved) => setData<Agentenv[]>(agentenvsRes.key, (l) => l.map((x) => (x.id === saved.id ? saved : x))),
+    (err: unknown) => {
+      relist();
+      why(errorMessage(err));
+    },
+  );
+}
+
+/** Text edited where it's shown: pressed, a field in its place; Enter or leaving it saves, Escape doesn't. */
+function Inline({ value, action, label, placeholder, className, onSave }: { value: string; action: string; label: string; placeholder?: string; className?: string; onSave: (v: string) => void }) {
+  const [text, setText] = React.useState<string | null>(null);
+  if (text === null)
+    return (
+      <button type="button" className={`ev-inline ${className ?? ""}`} aria-label={action} title={action} onClick={() => setText(value)}>
+        {value || <span className="ev-placeholder">{placeholder}</span>}
+      </button>
+    );
+  const done = (save: boolean) => {
+    const t = text.trim();
+    setText(null);
+    if (save && t !== value) onSave(t);
+  };
+  return (
+    <input
+      ref={(el) => el?.focus()}
+      className={`sb-in ev-inline-in ${className ?? ""}`}
+      value={text}
+      placeholder={placeholder}
+      aria-label={label}
+      spellCheck={false}
+      onChange={(x) => setText(x.target.value)}
+      onKeyDown={(k) => {
+        if (k.key === "Enter") done(true);
+        if (k.key === "Escape") done(false);
+      }}
+      onBlur={() => done(true)}
+    />
+  );
+}
+
+/** A tag added where the tags are: + opens a field; Enter or leaving it adds what's typed. */
+function AddTag({ name, onAdd }: { name: string; onAdd: (t: string) => void }) {
+  const [text, setText] = React.useState<string | null>(null);
+  if (text === null)
+    return (
+      <button type="button" className="ev-tag ev-tag-add" aria-label={`Add a tag to ${name}`} onClick={() => setText("")}>
+        <Plus size={10} />
+        tag
+      </button>
+    );
+  const done = (save: boolean) => {
+    const t = text.trim();
+    setText(null);
+    if (save && t) onAdd(t);
+  };
+  return (
+    <input
+      ref={(el) => el?.focus()}
+      className="ev-tag ev-tag-in"
+      value={text}
+      placeholder="tag"
+      aria-label={`New tag for ${name}`}
+      spellCheck={false}
+      onChange={(x) => setText(x.target.value)}
+      onKeyDown={(k) => {
+        if (k.key === "Enter") done(true);
+        if (k.key === "Escape") done(false);
+      }}
+      onBlur={() => done(true)}
+    />
   );
 }
 
@@ -363,12 +459,17 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
   const label = e ? e.name : "the new environment";
   return (
     <li className="sb-form ev-form" aria-label={e ? `Edit ${e.name}` : "New environment"}>
-      <span className="sb-form-row">
-        <input className="sb-in sb-grow" value={d.name} placeholder="name" aria-label="Environment's name" spellCheck={false} onChange={(x) => setD({ ...d, name: x.target.value })} />
-      </span>
-      <span className="sb-form-row">
-        <input className="sb-in sb-grow" value={d.description} placeholder="Description (optional)" aria-label="Description" onChange={(x) => setD({ ...d, description: x.target.value })} />
-      </span>
+      {/* An existing one's name and description are edited in its header. */}
+      {!e && (
+        <>
+          <span className="sb-form-row">
+            <input className="sb-in sb-grow" value={d.name} placeholder="name" aria-label="Environment's name" spellCheck={false} onChange={(x) => setD({ ...d, name: x.target.value })} />
+          </span>
+          <span className="sb-form-row">
+            <input className="sb-in sb-grow" value={d.description} placeholder="Description (optional)" aria-label="Description" onChange={(x) => setD({ ...d, description: x.target.value })} />
+          </span>
+        </>
+      )}
       <span className="sb-form-row">
         <Segmented
           size="xs"

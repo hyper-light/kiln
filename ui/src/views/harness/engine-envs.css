@@ -97,3 +97,109 @@
 .ev-src {
   flex-basis: 100%;
 }
+
+/* Quiet rows: no rule under each variable or session, nor under the head and description. */
+[data-list="envs-tab"] li.ms-node,
+[data-list="envs-tab"] li.ms-tree,
+[data-list="envs-tab"] li.df-defrow,
+[data-list="envs-tab"] .ms-tree-rows > li,
+[data-list="envs-tab"] .sb-rows > .sb-row {
+  border-top: 0;
+  border-bottom: 0;
+}
+/* Each environment set apart by a clear rule and a gap; inside it, each section's head (Variables,
+   Sessions) between rules of its own. */
+[data-list="envs-tab"] > li.df-defrow {
+  margin-top: 18px;
+  border-top: 1px solid #3a3c43;
+}
+[data-list="envs-tab"] li.ms-node.df-group {
+  border-top: 1px solid #25272c;
+  border-bottom: 1px solid #25272c;
+}
+[data-list="envs-tab"] .sb-row.ev-var,
+[data-list="envs-tab"] .sb-row.ev-session {
+  min-height: 26px;
+}
+.ev-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.ev-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid #2a2d34;
+  border-radius: 999px;
+  color: #a9acb6;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.ev-tag-x {
+  display: inline-grid;
+  place-items: center;
+  margin-right: -3px;
+  padding: 1px;
+  border-radius: 50%;
+  color: #7b7e88;
+}
+.ev-tag-x:hover,
+.ev-tag-x:focus-visible {
+  color: #e6e7eb;
+}
+.ev-tag-add {
+  border-style: dashed;
+  background: none;
+  color: #7b7e88;
+  cursor: pointer;
+}
+.ev-tag-add:hover,
+.ev-tag-add:focus-visible {
+  color: #d4d6dc;
+}
+input.ev-tag-in {
+  width: 9ch;
+  background: none;
+  color: #e6e7eb;
+  outline: none;
+}
+/* Text edited where it's shown: it reads as text until pressed. */
+.ev-inline {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  text-align: left;
+  cursor: text;
+}
+.ev-inline.df-note {
+  font-size: 13px;
+  line-height: 19px;
+}
+.ev-inline:hover,
+.ev-inline:focus-visible {
+  text-decoration: underline dotted #6b6e78;
+  text-underline-offset: 3px;
+}
+.ev-inline.df-note {
+  color: #97999f;
+}
+.ev-tagrow {
+  padding-top: 2px;
+}
+.ev-placeholder {
+  color: #6b6e78;
+}
+input.ev-inline-in {
+  min-width: 12ch;
+  height: 26px;
+}

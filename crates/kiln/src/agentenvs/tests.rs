@@ -63,7 +63,7 @@ fn the_migration_makes_its_tables() -> anyhow::Result<()> {
             })
             .await?;
         anyhow::ensure!(
-            columns == [vec!["id", "owner", "name", "description", "base", "vars", "version", "created_at", "updated_at"], vec!["session", "agentenv_id", "applied_at", "applied_by"]],
+            columns == [vec!["id", "owner", "name", "description", "base", "vars", "tags", "version", "created_at", "updated_at"], vec!["session", "agentenv_id", "applied_at", "applied_by"]],
             "{columns:?}"
         );
         let dup = store
@@ -161,6 +161,26 @@ fn a_person_keeps_their_own() -> anyhow::Result<()> {
         let a = "user:u-ada".to_owned();
         anyhow::ensure!(told == [(a.clone(), id.clone(), false), (a.clone(), id.clone(), false), (a.clone(), id.clone(), false), (a, id.clone(), true)], "{told:?}");
         anyhow::ensure!(hears(&ada, "user:u-ada") && !hears(&bo, "user:u-ada") && !hears(&agent_for("u-ada"), "user:u-ada"));
+        Ok(())
+    })
+}
+
+/// Its own tags, as its owner gives them: each trimmed, the empty dropped, once whatever their case, in order; all of
+/// them replaced by a change that names them, kept by one that doesn't; one with a line break refused, saying so.
+#[test]
+fn an_environments_tags_are_kept_clean_in_order_and_changed_whole() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub().await?;
+        let ada = person("u-ada", &["developer"]);
+        let made = op(&hub, &ada, "agentenvs.create", json!({"name": "work", "base": "user", "vars": [], "tags": [" release ", "", "CI", "Release", "ci"]})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(made.get("tags") == Some(&json!(["release", "CI"])), "{made}");
+        let id = text_of(&made, "/id");
+        let named = op(&hub, &ada, "agentenvs.update", json!({"id": id, "version": 1, "name": "work2"})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(named.get("tags") == Some(&json!(["release", "CI"])) && named.get("version") == Some(&json!(2)), "{named}");
+        let retagged = op(&hub, &ada, "agentenvs.update", json!({"id": id, "version": 2, "tags": ["aws"]})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        anyhow::ensure!(retagged.get("tags") == Some(&json!(["aws"])) && retagged.get("version") == Some(&json!(3)), "{retagged}");
+        let bad = op(&hub, &ada, "agentenvs.update", json!({"id": id, "version": 3, "tags": ["two\nlines"]})).await;
+        anyhow::ensure!(matches!(&bad, Err((StatusCode::BAD_REQUEST, w)) if w.contains("control character")), "{bad:?}");
         Ok(())
     })
 }

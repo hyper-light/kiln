@@ -20,6 +20,10 @@ name: string, description?: string, base: AgentenvBase,
  */
 vars: Array<AgentenvVar>, 
 /**
+ * Its owner's own labels for it, in the order given: found by the Engine tab's filter.
+ */
+tags: Array<string>, 
+/**
  * Up by one with each change.
  */
 version: number, created_at: number, updated_at: number, 

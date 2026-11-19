@@ -9,7 +9,7 @@ import { startAsk } from "../src/api/harness.ts";
 import { askOf, changeOf, draftOf, ENV_ORDER, envFacets, envWords, facetsFor, givesOf, mineOf, moved, problemOf, shows, varOf, blankVar } from "../src/views/harness/agentenv-logic.ts";
 import { specOf } from "../src/views/harness/spawn-setup.ts";
 
-const env = (id: string, over: Partial<Agentenv> = {}): Agentenv => ({ id, owner: "ada", name: id, base: "user", vars: [], version: 1, created_at: 0, updated_at: 0, sessions: [], ...over });
+const env = (id: string, over: Partial<Agentenv> = {}): Agentenv => ({ id, owner: "ada", name: id, base: "user", vars: [], tags: [], version: 1, created_at: 0, updated_at: 0, sessions: [], ...over });
 
 const release = env("release", {
   created_at: 30,

@@ -190,6 +190,7 @@ kiln plan 01a1cd8e862e7169a074db3d5fa33f3d decision 6).
 | `description?` | |
 | `base` | `user`: the machine's user's environment (above), its variables over it; `clean`: only what the harness needs to run (its home, user, shell, search path, temporary folder, locale and time zone; on Windows also `SystemRoot`, `SystemDrive`, `ComSpec`, `PATHEXT`, `windir`, `APPDATA`, `LOCALAPPDATA`, `USERPROFILE`, `ProgramData`, `ProgramFiles`), its variables over that |
 | `vars` | in order, each `{name, from, of?, value?, secret?}`; a later one of a name wins |
+| `tags` | its owner's own labels for it, in order: each trimmed, once (case aside); found by the Engine tab's filter |
 | `version`, `created_at`, `updated_at` | its version goes up with each change; a session says the version it started with |
 
 A variable's `name` is a portable one (`[A-Za-z_][A-Za-z0-9_]*`; on Windows, names differ by more

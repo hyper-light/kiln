@@ -65,7 +65,7 @@ export function facetsFor<T>(all: readonly T[], wordsOf: (x: T) => string, q: st
 const USES_WORD: Record<string, string> = { machine: "Machine variables", value: "Values", secret: "Secrets" };
 const WHERE_WORD: Record<string, string> = { this: "This session", others: "Other sessions", none: "Unused" };
 
-/** Base, what it uses (machine variables, values, secrets) and where it runs (this session, others, none), for session `session`. */
+/** Base, what it uses (machine variables, values, secrets), where it runs (this session, others, none) and its tags, for session `session`. */
 export function envFacets(session: string): FacetOf<Agentenv>[] {
   return [
     { id: "base", label: "Base", of: (e) => [e.base], word: (v) => BASE_WORD[v as AgentenvBase] ?? v, order: ["user", "clean"] },
@@ -81,11 +81,12 @@ export function envFacets(session: string): FacetOf<Agentenv>[] {
       word: (v) => WHERE_WORD[v] ?? v,
       order: ["this", "others", "none"],
     },
+    { id: "tags", label: "Tags", of: (e) => e.tags, word: (v) => v },
   ];
 }
 
 /** An environment's words, for the filter's text: its name, description and variables' names, and the secrets it names. */
-export const envWords = (e: Agentenv) => [e.name, e.description ?? "", ...e.vars.map((v) => `${v.name} ${v.of ?? ""} ${v.secret ?? ""}`)].join(" ");
+export const envWords = (e: Agentenv) => [e.name, e.description ?? "", ...e.tags, ...e.vars.map((v) => `${v.name} ${v.of ?? ""} ${v.secret ?? ""}`)].join(" ");
 
 export type EnvSort = "newest" | "oldest" | "name" | "name-desc" | "vars" | "sessions";
 export const ENV_SORTS: { value: EnvSort; label: string }[] = [

@@ -44,6 +44,7 @@ function seed(): Map<string, Agentenv> {
       version: 3,
       created_at: t - 5 * DAY,
       updated_at: t - 2 * DAY,
+      tags: ["release", "github"],
       sessions: ["fam-docs"],
     },
     {
@@ -60,6 +61,7 @@ function seed(): Map<string, Agentenv> {
       version: 2,
       created_at: t - 12 * DAY,
       updated_at: t - 9 * DAY,
+      tags: ["aws"],
       sessions: ["fam-migr"],
     },
     {
@@ -76,6 +78,7 @@ function seed(): Map<string, Agentenv> {
       version: 1,
       created_at: t - 1 * DAY,
       updated_at: t - 1 * DAY,
+      tags: ["ci"],
       sessions: [],
     },
   ];
@@ -133,6 +136,9 @@ function badVars(vars: unknown): { code: string; error: string } | null {
   return null;
 }
 
+/** Tags as the server keeps them: each trimmed, the empty dropped, once whatever their case. */
+const tagsOf = (tags: string[]): string[] => tags.map((t) => t.trim()).filter((t, i, all) => t && all.findIndex((x) => x.toLowerCase() === t.toLowerCase()) === i);
+
 const clean = (vars: AgentenvVar[]): AgentenvVar[] =>
   vars.map((v) => ({
     name: v.name,
@@ -175,7 +181,7 @@ export async function handleAgentenvs(req: http.IncomingMessage, res: http.Serve
     return (ctx.json(res, 200, { agentenvs }), true);
   }
   if (p === "/api/agentenvs" && m === "POST") {
-    const b = await ctx.body<{ name?: string; description?: string; base?: string; vars?: AgentenvVar[] }>(req);
+    const b = await ctx.body<{ name?: string; description?: string; base?: string; vars?: AgentenvVar[]; tags?: string[] }>(req);
     const name = (b.name ?? "").trim();
     if (!name) return refuse(ctx, res, 400, "agentenv_bad_var", "an environment needs a name");
     if ([...kept.values()].some((e) => e.name === name)) return refuse(ctx, res, 409, "agentenv_name_taken", `you have an environment named ${name} already`);
@@ -189,6 +195,7 @@ export async function handleAgentenvs(req: http.IncomingMessage, res: http.Serve
       ...(b.description?.trim() ? { description: b.description.trim() } : {}),
       base: b.base === "clean" ? "clean" : "user",
       vars: clean(b.vars ?? []),
+      tags: tagsOf(b.tags ?? []),
       version: 1,
       created_at: t,
       updated_at: t,
@@ -209,7 +216,7 @@ export async function handleAgentenvs(req: http.IncomingMessage, res: http.Serve
   if (!e) return refuse(ctx, res, 404, "agentenv_unknown", `you have no environment ${decodeURIComponent(one[1]!)}`);
   if (m === "GET") return (ctx.json(res, 200, e), true);
   if (m === "PATCH") {
-    const b = await ctx.body<{ version?: number; name?: string; description?: string; base?: string; vars?: AgentenvVar[] }>(req);
+    const b = await ctx.body<{ version?: number; name?: string; description?: string | null; base?: string; vars?: AgentenvVar[]; tags?: string[] }>(req);
     if (b.version !== e.version) return refuse(ctx, res, 409, "agentenv_stale", `${e.name} is at v${e.version} now: it was saved since you read v${b.version ?? "?"}`, { current: e });
     const name = b.name?.trim();
     if (name !== undefined && !name) return refuse(ctx, res, 400, "agentenv_bad_var", "an environment needs a name");
@@ -218,14 +225,15 @@ export async function handleAgentenvs(req: http.IncomingMessage, res: http.Serve
       const bad = badVars(b.vars);
       if (bad) return refuse(ctx, res, 400, bad.code, bad.error);
     }
-    const changed = name !== undefined || b.description !== undefined || b.base !== undefined || b.vars !== undefined;
+    const changed = name !== undefined || b.description !== undefined || b.base !== undefined || b.vars !== undefined || b.tags !== undefined;
     if (name) e.name = name;
     if (b.description !== undefined) {
-      if (b.description.trim()) e.description = b.description.trim();
+      if (b.description?.trim()) e.description = b.description.trim();
       else delete e.description;
     }
     if (b.base === "user" || b.base === "clean") e.base = b.base;
     if (b.vars) e.vars = clean(b.vars);
+    if (b.tags) e.tags = tagsOf(b.tags);
     if (changed) {
       e.version += 1;
       e.updated_at = now();

@@ -32,9 +32,11 @@ export type AgentenvRef = AgentenvBrief;
 /** What `agentenvs.create` takes. */
 export interface AgentenvAsk {
   name: string;
-  description?: string;
+  description?: string | null;
   base: AgentenvBase;
   vars: AgentenvVar[];
+  /** Its own labels, in order. */
+  tags?: string[];
 }
 
 /** What `agentenvs.apply` answers. */
