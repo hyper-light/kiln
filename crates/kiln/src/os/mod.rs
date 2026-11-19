@@ -148,6 +148,10 @@ pub mod pressure;
 /// elsewhere there are none to turn off). Goal 11, plan 01a1a87b2e56 step 5.
 pub mod thp;
 
+/// A folder removed with all it holds, never going into a file system mounted inside it: a FUSE mount a test left
+/// behind, its server gone, held a leg's workspace's removal, and the runner, for ever (W06-R01).
+pub mod tree;
+
 /// What a reach run's group of processes is named with (`run-<id>`, `crate::reach::serve`): a
 /// person's or an agent's, never an agent's session.
 pub const RUN_GROUP: &str = "run-";
