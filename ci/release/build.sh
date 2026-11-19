@@ -16,7 +16,14 @@
 #
 # Expects ui/dist/client to exist (`npm run --prefix ui build`). Each binary carries the UI server
 # for its platform: Bun and the UI server's files, packed here first (ui/scripts/pack-ui-server.mjs,
-# vendor/bun/README.md; KILN_UI_SERVER=off builds without). Writes dist/kiln-<target>[.exe] and
+# vendor/bun/README.md; KILN_UI_SERVER=off builds without). Each carries Shards, its microVMs
+# (docs/shards.md), from target/shards-carried/<target>, where kiln's build finds it: packed here
+# (ci/shards/pack.sh) for each target whose Shards builds here, Linux's on Linux and macOS's on a
+# Mac, a failed pack failing the build. Windows's is packed on Windows, with MSVC as Shards builds
+# its own (.kiln/release.yaml's shards-windows job), and put in the folder of the target kiln is
+# cross-built as (x86_64-pc-windows-gnu). A target whose Shards neither builds here nor was put
+# there builds without it, saying so (a Mac's binary cross-built on Linux: crate::fleet's);
+# KILN_SHARDS=off packs none (a lab's build). Writes dist/kiln-<target>[.exe] and
 # dist/SHA256SUMS. KILN_DIST, KILN_MACOS_STUBS and KILN_MACOS_LINK_ARGS override the output
 # directory, the stubs and extra macOS link arguments (regen-macos-stubs.sh uses them).
 #
@@ -101,11 +108,39 @@ target_dir=${CARGO_TARGET_DIR:-$root/target}
 dist=${KILN_DIST:-$root/dist}
 mkdir -p "$dist"
 
+# The Shards each target carries (above), one folder per target: a KILN_SHARDS_DIR would give every
+# target of this build the same one.
+unset KILN_SHARDS_DIR
+shards=${KILN_SHARDS:-on}
+case $shards in
+  on | off) ;;
+  *) echo "KILN_SHARDS is on or off, not $shards" >&2; exit 1 ;;
+esac
+# Shards for target $1, built as $2 (its own triple unless given): packed here where it builds here,
+# and said whether its build carries it.
+shards_for() {
+  local t=$1 as=${2:-$1} exe="" f
+  [ "$shards" = on ] || return 0
+  case $t in
+    *-unknown-linux-musl) if ! $native_mac; then ci/shards/pack.sh "$t"; fi ;;
+    *-apple-darwin) if $native_mac; then ci/shards/pack.sh "$t"; fi ;;
+  esac
+  case $as in *-windows-*) exe=.exe ;; esac
+  for f in shards shards-vm shards-net; do
+    if [ ! -f "$root/target/shards-carried/$as/$f$exe" ]; then
+      echo "build.sh: kiln for $t is built without Shards: target/shards-carried/$as has no $f$exe (docs/shards.md)" >&2
+      return 0
+    fi
+  done
+  echo "build.sh: kiln for $t carries Shards (target/shards-carried/$as)"
+}
+
 # On a Mac: its own toolchain and SDK, no zig.
 if $native_mac; then
   for t in "${targets[@]}"; do
     echo "::: $t"
     rustup target add "$t" >/dev/null
+    shards_for "$t"
     MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --locked -p kiln --target "$t"
     cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
   done
@@ -170,6 +205,7 @@ for t in "${targets[@]}"; do
   case $t in
     *-unknown-linux-musl)
       rustup target add "$t" >/dev/null
+      shards_for "$t"
       alloc=()
       if [ "$linux_allocator" != musl ]; then
         alloc=(--features "$linux_allocator")
@@ -227,6 +263,7 @@ for t in "${targets[@]}"; do
       ;;
     *-apple-darwin)
       rustup target add "$t" >/dev/null
+      shards_for "$t"
       arch=${t%%-*}
       upper=$(echo "$t" | tr 'a-z-' 'A-Z_')
       env "CC_$t=$zig_home/macos11/cc-$arch" "AR_$t=$zig_home/macos11/ar" \
@@ -238,6 +275,7 @@ for t in "${targets[@]}"; do
       ;;
     x86_64-pc-windows-msvc)
       rustup target add x86_64-pc-windows-gnu >/dev/null
+      shards_for "$t" x86_64-pc-windows-gnu
       "$zigbuild" zigbuild --release --locked -p kiln --target x86_64-pc-windows-gnu
       cp "$target_dir/x86_64-pc-windows-gnu/release/kiln.exe" "$dist/kiln-$t.exe"
       ;;
