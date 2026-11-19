@@ -220,7 +220,7 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
     // Removed: its volume is gone from the instance.
     kiln::rt::block_on({
         let made = made.clone();
-        async move { slates::remove(&made, std::time::Duration::ZERO).await }
+        async move { slates::remove(&made).await }
     })?;
     let until = Instant::now() + TORN_DOWN_WITHIN;
     while library.list()?.iter().any(|v| v.id == volume) {

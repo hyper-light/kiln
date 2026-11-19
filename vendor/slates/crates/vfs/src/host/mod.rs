@@ -81,7 +81,9 @@ pub enum WatchState {
   Unavailable,
 }
 
-/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy.
+/// A host refusal, as the seam reports it; the volume maps it to its own taxonomy. A refusal the host gives a number is
+/// typed by the numbering it is in (A-527): an errno (`Unavailable`) or a Win32 error code (`Win32`), so a reader that
+/// tells refusals apart by an errno's number never reads a Win32 code as the errno of the same number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostError {
   /// The entry does not exist (any more).
@@ -92,12 +94,21 @@ pub enum HostError {
   NotFile,
   /// A handle the host no longer holds.
   StaleHandle,
-  /// The host cannot serve it: the errno.
+  /// The host cannot serve it: the errno, POSIX's numbering (Linux, macOS, and a Windows refusal the writer gives the
+  /// kind of an errno the landing tells apart: a name that exists, a full disk, a verb the filesystem lacks).
   Unavailable(i32),
+  /// The host cannot serve it: the Win32 error code (Windows), in Win32's own numbering, never read as an errno (A-527):
+  /// 17 is `ERROR_NOT_SAME_DEVICE` there and `EEXIST` in POSIX, 122 `ERROR_INSUFFICIENT_BUFFER` there and Linux's
+  /// `EDQUOT`.
+  Win32(u32),
   /// The path lies on a mount this daemon serves (§4.6: no daemon thread opens a path on a volume the daemon serves;
   /// A-227): nothing was opened, since the daemon would have waited on its own answer. The errno the platform names a
   /// deadlock avoided by.
   OwnMount(i32),
+  /// The host is fetching what the call needs and has not got it yet (an S3 base's miss, §4.15 "An S3 base", A-524):
+  /// nothing changed, and the same call is answered once the fetch lands. The caller parks the request and runs it
+  /// again then; a host that reads a local disk never answers it.
+  Pending,
 }
 
 impl std::fmt::Display for HostError {
@@ -108,7 +119,9 @@ impl std::fmt::Display for HostError {
       Self::NotFile => f.write_str("not a regular file"),
       Self::StaleHandle => f.write_str("stale host handle"),
       Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
+      Self::Win32(code) => write!(f, "host unavailable (Win32 error {code})"),
       Self::OwnMount(errno) => write!(f, "on a mount this daemon serves (errno {errno})"),
+      Self::Pending => f.write_str("the host's fetch is pending"),
     }
   }
 }
@@ -204,11 +217,14 @@ pub trait LandFs: HostFs {
   /// started where that never waits on the device (Linux `sync_file_range`), nothing more elsewhere. Never durability:
   /// the batch's barrier makes the file durable, off the shard (A-132). A change to the file after it needs another.
   fn write_out(&mut self, file: HostFile) -> Result<(), HostError>;
-  /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change,
-  /// taken to run elsewhere ([`Barrier::run`]): once it has run, every one is durable ahead of any write that follows,
-  /// so a placement after it never shows a name whose bytes a power loss could take (Linux the files' `fdatasync`s on
-  /// ⌈√n⌉ streams, merged by journal group commit; macOS each file's `fsync` and then one `F_BARRIERFSYNC` per device
-  /// among them; elsewhere every file's `fdatasync`). The outcome comes back through
+  /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change, and
+  /// of files whose metadata a landing's metadata entry set in place ([`LandFs::open_to_chmod`], A-472), each synced
+  /// whole (Linux `fsync`, since `fdatasync` need not write a mode; macOS `fsync`, which moves "all modified data and
+  /// attributes"; Windows `FlushFileBuffers`), taken to run elsewhere ([`Barrier::run`]): once it has run, every one is
+  /// durable ahead of any write that follows, so a placement after it never shows a name whose bytes a power loss could
+  /// take, and a metadata entry is reported only once its file is synced (Linux the temporaries' `fdatasync`s on ⌈√n⌉
+  /// streams, merged by journal group commit; macOS each file's `fsync` and then one `F_BARRIERFSYNC` per device among
+  /// them; elsewhere every temporary's `fdatasync`). The outcome comes back through
   /// [`LandFs::end_barrier`]; nothing of the batch may be placed before.
   fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError>;
   /// The outcome of the barrier [`LandFs::begin_barrier`] took for `files`, after it ran: the files are durable when it
@@ -218,6 +234,19 @@ pub trait LandFs: HostFs {
     files: &[HostFile],
     ran: Result<(), HostError>,
   ) -> Result<(), HostError>;
+  /// The existing file `name` under `dir`, opened so its mode and Windows bits can be set and nothing else (a landing's
+  /// metadata entry, A-458): never through a link, and refused `NotFile` for anything but a regular file. Unix opens it
+  /// to read, since `fchmod` asks for ownership, not write access; Windows asks its attributes and `FILE_WRITE_DATA`,
+  /// which its flush needs (A-472), and writes none of its data. It stays open for its batch's barrier
+  /// ([`LandFs::begin_barrier`]), then is closed with [`HostFs::close_file`].
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
+  /// The existing directory `name` under `dir`, opened as [`LandFs::open_to_chmod`] opens a file, to have its mode and
+  /// Windows bits set and its batch's barrier sync it whole (a base directory's metadata entry, A-501): never through a
+  /// link, and refused `NotDirectory` for anything but a directory. Unix opens it to read (`O_DIRECTORY|O_NOFOLLOW`), as a
+  /// listing does; Windows asks its attributes and `FILE_ADD_FILE`, a directory's `FILE_WRITE_DATA`, which its flush
+  /// needs. A file handle, closed with [`HostFs::close_file`]: `set_mode`, `set_windows`, `fstat` and the barrier take it
+  /// as they take a file's.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
   /// Gives the file the Windows attribute bits the volume keeps for it (A-262, at Windows' values: hidden, system,

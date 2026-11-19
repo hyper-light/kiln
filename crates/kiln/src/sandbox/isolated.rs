@@ -455,14 +455,16 @@ impl Seen {
     }
 
     /// `path`, a folder or file of this machine's, as the harness sees it: its project and what's beneath
-    /// it at its place in the microVM, with `/` between its parts; anything else as it is.
+    /// it at its place in the microVM, with `/` between its parts, however Windows spells it (`beneath`: git's
+    /// `C:/…` top and a shell's `C:\…` folder alike, docs/agentic.md W8 piece 2); anything else as it is.
     pub fn said(&self, path: &str) -> String {
-        match path.strip_prefix(self.host.as_str()) {
-            Some(rest) if rest.is_empty() || rest.starts_with(['\\', '/']) => {
-                let rest = rest.replace('\\', "/");
-                format!("{}{}", self.at, rest.trim_end_matches('/'))
-            }
-            _ => path.to_owned(),
+        match beneath(path, &self.host) {
+            Some(names) => names.iter().fold(self.at.clone(), |mut at, name| {
+                at.push('/');
+                at.push_str(name);
+                at
+            }),
+            None => path.to_owned(),
         }
     }
 
@@ -482,6 +484,25 @@ impl Seen {
             _ => path.to_owned(),
         }
     }
+}
+
+/// The names of `path`'s place beneath folder `top`, in order and in `path`'s own spelling: as Windows judges it for a
+/// Windows `top` (one that doesn't begin `/`, as [`guest_path`] tells them apart), whatever host judges it
+/// (`super::windows_path::beneath`: prefixes, separators, `.` and `..`, and case, as Windows takes them); by its
+/// components for a Unix one. None where it lies elsewhere, or names its place by something other than folders' names.
+fn beneath(path: &str, top: &str) -> Option<Vec<String>> {
+    if !top.starts_with('/') {
+        return super::windows_path::beneath(path, top).map(|names| names.into_iter().map(str::to_owned).collect());
+    }
+    let within = Path::new(path).strip_prefix(top).ok()?;
+    within
+        .components()
+        .filter(|part| !matches!(part, std::path::Component::CurDir))
+        .map(|part| match part {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `path` as the harness `seen` says where it sees its project ([`Seen::said`]); as it is for a harness
@@ -528,24 +549,19 @@ fn served_over(spec: &Spec) -> Option<(&crate::workspace::slates::Made, &str)> {
 /// An isolated `spec`'s project as Slates serves it to its microVM (kiln goal 01a1ec34599974448f6b7663ddb07001), where
 /// its workspace of its own is a Slates volume made with no mount (`crate::workspace::prepare`): the volume, by its id,
 /// writable and given to its `harness` as it starts, where its microVM sees the folder the volume lies over
-/// ([`guest_path`]); and its harness's folder, `cwd` at the same place in it. None for a session working in its folder
-/// itself, or in a mounted workspace, whose folder is shared ([`project_share`]). Why not, where `cwd` lies outside the
-/// folder the volume lies over.
+/// ([`guest_path`]); and its harness's folder, `cwd` at the same place in it, however Windows spells the two
+/// (`beneath`: git's `C:/…` top and a shell's `C:\…` folder alike). None for a session working in its folder itself,
+/// or in a mounted workspace, whose folder is shared ([`project_share`]). Why not, where `cwd` lies outside the folder
+/// the volume lies over.
 pub fn served_project(spec: &Spec, cwd: &str, harness: &kiln_seams::sandbox::Member) -> Result<Option<(kiln_seams::sandbox::Served, String)>, String> {
     let Some((made, over)) = served_over(spec) else { return Ok(None) };
     let at = guest_path(over)?;
-    let within = Path::new(cwd).strip_prefix(over).map_err(|_| format!("{cwd} lies outside {over}, the folder its workspace's volume lies over"))?;
-    let mut folder = at.clone();
-    for part in within.components() {
-        match part {
-            std::path::Component::Normal(name) => {
-                folder.push('/');
-                folder.push_str(&name.to_string_lossy());
-            }
-            std::path::Component::CurDir => {}
-            other => return Err(format!("{cwd}: {other:?} in its folder beneath {over}")),
-        }
-    }
+    let names = beneath(cwd, over).ok_or_else(|| format!("{cwd} lies outside {over}, the folder its workspace's volume lies over"))?;
+    let folder = names.iter().fold(at.clone(), |mut folder, name| {
+        folder.push('/');
+        folder.push_str(name);
+        folder
+    });
     let served = kiln_seams::sandbox::Served { source: made.volume.clone(), at, writable: true, members: vec![harness.clone()] };
     Ok(Some((served, folder)))
 }

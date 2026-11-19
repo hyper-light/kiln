@@ -1864,6 +1864,30 @@ pub(crate) fn inject_superseded(
   }
 }
 
+/// Test support (A-516; never reachable from the wire): `volume`, made and set live-shipped on this shard, ships from
+/// now on to two holders at `f = 1` that never answer, as an owner whose candidates are lost or cut off does: nothing
+/// published from now on becomes durable, so a reply held for its durability waits out its bound
+/// ([`wait_durable`]). The holders are the two hosts after this one's id, which no audit daemon's fleet has.
+#[cfg(test)]
+pub(crate) fn ship_to_silent_holders(state: &mut ShardState, volume: slates_db::catalog::VolumeId) {
+  let local = state.fleet.configuration().owner;
+  let holders = [
+    HostId(local.0.wrapping_add(1)),
+    HostId(local.0.wrapping_add(2)),
+  ];
+  let shipper = Shipper::new(
+    (local, ObjectId(volume.bytes), HostEpoch(1)),
+    slates_db::register::Quorum { f: 1 },
+    &holders,
+    None,
+    Bounds::default(),
+  );
+  state
+    .live
+    .shipping
+    .insert(volume.bytes, new_live_volume(shipper));
+}
+
 /// Counter: a superseded owner's fence that its learning could not publish at once (A-344); the next publication keeps
 /// it.
 /// Format: a counter name in the daemon's status report.
@@ -7159,6 +7183,7 @@ mod tests {
         write: None,
         write_version: 0,
         signers: Vec::new(),
+        carried: None,
       }
       .to_record_bytes()
     };
@@ -7463,31 +7488,9 @@ mod tests {
         position: 5,
         identity: [3; 32],
       };
-      let payloads: Vec<Vec<u8>> = (0..6u8)
-        .map(|n| vec![if n == 0 { KIND_WHOLE } else { KIND_DELTA }, n, n])
-        .collect();
-      let mut held = Held::for_test(HostId(1), object, 0);
-      let mut room = Room {
-        store: &mut s.store,
-        claimed: 1 << 20,
-      };
-      for payload in &payloads {
-        let whole = payload.first() == Some(&KIND_WHOLE);
-        keep(&mut held, &mut room, payload, 1 << 20, whole).unwrap();
-      }
-      held.replica.commit(HostEpoch(1), head);
-      held.replica.prepare(HostEpoch(2)).unwrap();
-      s.live.held.insert(object, held);
-      let laid_out = |s: &ShardState, slice_bytes: usize| {
-        let mut answer = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(2));
-        let mut turns = 0;
-        while !answer.lay_out(s, slice_bytes) {
-          turns += 1;
-        }
-        (turns + 1, answer.into_reply())
-      };
-      let (entry_a_turn, by_entry) = laid_out(s, 0);
-      let (at_once, whole) = laid_out(s, usize::MAX);
+      let payloads = keep_a_fenced_copy(s, object, head);
+      let (entry_a_turn, by_entry) = fetch_laid_out(s, object, 0);
+      let (at_once, whole) = fetch_laid_out(s, object, usize::MAX);
       assert_eq!((entry_a_turn, at_once), (payloads.len(), 1));
       assert_eq!(by_entry, whole, "the same answer");
       let (answered, mut log) = slates_db::live::FetchedLog::decode(by_entry, 1 << 20).unwrap();
@@ -7496,31 +7499,84 @@ mod tests {
         std::iter::from_fn(|| log.next_payload().map(|payload| payload.unwrap().to_vec()))
           .collect();
       assert_eq!(read, payloads, "every entry, in order");
-      let mut raised = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(2));
-      assert!(!raised.lay_out(s, 0));
-      s.live
-        .held
-        .get_mut(&object)
-        .unwrap()
-        .replica
-        .prepare(HostEpoch(3))
-        .unwrap();
-      assert!(raised.lay_out(s, 0), "a moved copy ends the answer");
-      assert_eq!(
-        slates_db::live::FetchedLog::decode(raised.into_reply(), 1 << 20).map(|(head, _)| head),
-        Err(LiveError::StaleEpoch {
-          current: HostEpoch(3)
-        })
-      );
-      let mut gone = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(3));
-      assert!(!gone.lay_out(s, 0));
-      s.live.held.remove(&object);
-      assert!(gone.lay_out(s, 0));
-      let (answered, mut log) =
-        slates_db::live::FetchedLog::decode(gone.into_reply(), 1 << 20).unwrap();
-      assert_eq!(answered, None, "the let-go copy's empty head");
-      assert!(log.next_payload().is_none(), "and no entries");
+      assert_a_raised_fence_ends_the_answer(s, object);
+      assert_a_let_go_copy_answers_the_empty_head(s, object);
     });
+  }
+
+  /// The fetch test's copy of `object`: six entries (a whole one, then deltas) kept at `head`, fenced at epoch 2.
+  /// Returns the entries' payloads in order.
+  fn keep_a_fenced_copy(
+    s: &mut crate::state::ShardState,
+    object: ObjectId,
+    head: Head,
+  ) -> Vec<Vec<u8>> {
+    let payloads: Vec<Vec<u8>> = (0..6u8)
+      .map(|n| vec![if n == 0 { KIND_WHOLE } else { KIND_DELTA }, n, n])
+      .collect();
+    let mut held = Held::for_test(HostId(1), object, 0);
+    let mut room = Room {
+      store: &mut s.store,
+      claimed: 1 << 20,
+    };
+    for payload in &payloads {
+      let whole = payload.first() == Some(&KIND_WHOLE);
+      keep(&mut held, &mut room, payload, 1 << 20, whole).unwrap();
+    }
+    held.replica.commit(HostEpoch(1), head);
+    held.replica.prepare(HostEpoch(2)).unwrap();
+    s.live.held.insert(object, held);
+    payloads
+  }
+
+  /// `object`'s fetch answer at epoch 2 laid out `slice_bytes` a turn: the turns it took, and the answer.
+  fn fetch_laid_out(
+    s: &crate::state::ShardState,
+    object: ObjectId,
+    slice_bytes: usize,
+  ) -> (usize, Vec<u8>) {
+    let mut answer = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(2));
+    let mut turns = 0;
+    while !answer.lay_out(s, slice_bytes) {
+      turns += 1;
+    }
+    (turns + 1, answer.into_reply())
+  }
+
+  /// A fetch answer begun at epoch 2 whose copy's fence rises to 3 between two turns ends with its stale-epoch refusal.
+  fn assert_a_raised_fence_ends_the_answer(s: &mut crate::state::ShardState, object: ObjectId) {
+    let mut raised = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(2));
+    assert!(!raised.lay_out(s, 0));
+    s.live
+      .held
+      .get_mut(&object)
+      .unwrap()
+      .replica
+      .prepare(HostEpoch(3))
+      .unwrap();
+    assert!(raised.lay_out(s, 0), "a moved copy ends the answer");
+    assert_eq!(
+      slates_db::live::FetchedLog::decode(raised.into_reply(), 1 << 20).map(|(head, _)| head),
+      Err(LiveError::StaleEpoch {
+        current: HostEpoch(3)
+      })
+    );
+  }
+
+  /// A fetch answer whose copy is let go between two turns answers the empty head, without entries, which a successor
+  /// finds is not the head it adopted.
+  fn assert_a_let_go_copy_answers_the_empty_head(
+    s: &mut crate::state::ShardState,
+    object: ObjectId,
+  ) {
+    let mut gone = FetchAnswer::of(s.live.held.get(&object).unwrap(), object, HostEpoch(3));
+    assert!(!gone.lay_out(s, 0));
+    s.live.held.remove(&object);
+    assert!(gone.lay_out(s, 0));
+    let (answered, mut log) =
+      slates_db::live::FetchedLog::decode(gone.into_reply(), 1 << 20).unwrap();
+    assert_eq!(answered, None, "the let-go copy's empty head");
+    assert!(log.next_payload().is_none(), "and no entries");
   }
 
   /// Format: the key generation the tests' keys carry.

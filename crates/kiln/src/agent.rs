@@ -4211,15 +4211,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             // made or started again, its workspace included.
                             (Some(h), _) if h.get(&session).is_some() => Ok(()),
                             (Some(h), mut spec) => {
-                                // Started on a shell: in that shell's directory and environment.
+                                // Started on a shell: in that shell's directory and environment, and in the volume of an
+                                // agent here whose mount that directory lies in (`workspace::from_shell`, W2).
                                 if let Some(pid) = spec.shell.as_ref().and_then(|t| terms.get(t)).and_then(|(pty, _)| pty.pid()) {
-                                    let (cwd, env) = crate::harness::host::shell_context(pid);
-                                    if spec.cwd.is_none() {
-                                        spec.cwd = cwd;
-                                    }
-                                    if spec.env.is_empty() {
-                                        spec.env = env;
-                                    }
+                                    crate::workspace::from_shell(&mut spec, crate::harness::host::shell_context(pid), &crate::workspace::live(h.list()));
                                 }
                                 if crate::workspace::needs_preparing(&spec) {
                                     // Its workspace first (a volume made and mounted), off this loop: then it starts there.
@@ -4233,7 +4228,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                                 // Nothing ran in it, so nothing of it is on its way out: asked to go once.
                                                 if opened.is_err()
                                                     && let Some(m) = made
-                                                    && let Err(gone) = crate::workspace::slates::remove(&m, std::time::Duration::ZERO).await
+                                                    && let Err(gone) = crate::workspace::slates::remove(&m).await
                                                 {
                                                     tracing::warn!(volume = %m.volume, error = %format!("{gone:#}"), "the workspace of an agent that couldn't start stayed");
                                                 }

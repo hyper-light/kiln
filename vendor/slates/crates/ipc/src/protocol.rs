@@ -2955,8 +2955,9 @@ pub enum AttachRequest {
   /// A host kernel mount the daemon's OS filesystem bridge serves (§4.6, §4.13; the `slates mount`
   /// flow): the attachment is the **mount's**, recorded under the bridge consumer, so it outlives the
   /// process that requested it (the CLI exits after `mount_nfs`) and the daemon (the anchor keeps the
-  /// listener across a restart), and ends only with the kernel's `UMNT` of the mount, an explicit
-  /// `detach`, or the volume's destroy. The reply's `token` is the capability the mount presents.
+  /// listener across a restart), and ends only when the kernel unmounts the mount (seen through the kernel's own
+  /// unmount event, A-511; a `UMNT` ends nothing), with an explicit `detach`, or with the volume's destroy. The
+  /// reply's `token` is the capability the mount presents.
   HostMount,
   /// A Linux FUSE mount of the volume at `mount_point` — an existing directory the caller owns — that the
   /// daemon establishes through the OS's `fusermount3` and serves on the volume's owner shard (§4.6
@@ -3205,6 +3206,8 @@ pub struct ActionTally {
   pub symlink: u64,
   /// Directories emptied and kept.
   pub clear: u64,
+  /// Files whose mode or Windows attribute bits alone are set, their bytes kept (A-458). Appended.
+  pub chmod: u64,
 }
 
 /// One entry of a presented landing's manifest (§4.15 step 2, "the full entry list on demand"): what the landing would
@@ -3252,6 +3255,16 @@ pub enum PlannedAction {
   },
   /// A directory the disk had, emptied of everything beneath it and kept (the volume removed it and made it again).
   Clear,
+  /// A file the disk had whose bytes the landing keeps and whose mode or Windows attribute bits it sets (A-458): the
+  /// entry's `mode` is the mode it lands with, beside what it had. Appended.
+  Chmod {
+    /// The permission bits it had (`0o7777` of its mode).
+    permissions_was: u32,
+    /// The Windows attribute bits it had (A-262, at Windows' values; none on Linux and macOS).
+    windows_was: u16,
+    /// The Windows attribute bits it lands with.
+    windows: u16,
+  },
 }
 
 /// A conflict class of §4.15 step 4's verdict table: why a landing would refuse an entry.

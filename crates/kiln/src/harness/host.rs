@@ -1696,9 +1696,8 @@ impl Host {
         }
         let mut pkg = pkg;
         // A workspace volume that moved here with it (K4): its mount re-placed under this machine's own place for
-        // workspaces and its folder there, mounted as the session starts (`workspace::mounted_for`); moved, unless an
-        // older runner process of this machine handed it over (K5: no landing of a moved clone before Slates' stage 2).
-        let volume_here = crate::workspace::arrived_here(&mut pkg.spec, !pkg.handover);
+        // workspaces and its folder there, mounted as the session starts (`workspace::mounted_for`).
+        let volume_here = crate::workspace::arrived_here(&mut pkg.spec);
         let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
         // Its folder isn't here (it wasn't a repository kiln keeps in step): it works in home. A
         // worktree it brings is made once its repository's files are here.
@@ -2808,8 +2807,9 @@ impl Host {
         let found = s.is_some();
         if let Some(s) = s {
             free_claim(s.spec.lock().claim.clone());
+            // Its harness as it runs here (none between its runs, or in a microVM): its end is awaited with its group's.
+            let harness = *s.pid.lock();
             s.close();
-            let closed = std::time::Instant::now();
             // Its workspace ends with it, once no other agent here works in it (a child in its parent's volume, or a
             // parent its child outlived: docs/agentic.md W3) and no archived one keeps it (an archive keeps its
             // agent's workspace for its restore, [`Host::archive`]): the last of them ends it.
@@ -2821,10 +2821,13 @@ impl Host {
                 let archives = self.archive_dir();
                 let ending = Arc::clone(&s);
                 crate::rt::spawn(async move {
-                    // Its processes gone first: its harness works in the mount, which can't come down under it
-                    // (macOS refused it busy, and there's no lazy unmount there). How long their end took, from its
-                    // close, is how long what they left behind may still hold it (`workspace::release`).
+                    // Its processes gone first. What holds a mount busy is a process with a file or its working
+                    // directory there, and an agent's are those kiln started for it: its harness, which works in the
+                    // mount, and its group. Its close stops them, and their ends, as the OS tells each
+                    // ([`processes_ended`]), come before anything of its mount moves: its conversation's record, which
+                    // its harness writes until it ends, and the mount itself, asked to go once (`workspace::release`).
                     ending.close_wait().await;
+                    processes_ended(&ending.id, harness).await;
                     // Its conversation back to its person's folder's project before its mount goes, whoever else still
                     // works in the volume: the project its harness kept for the mount's folder goes with the volume
                     // (docs/agentic.md W2).
@@ -2837,7 +2840,7 @@ impl Host {
                         // Unread, it's kept: an archived agent's work is never lost to a failed look.
                         let kept = crate::rt::blocking(move || archived_keep(archives.as_deref(), probe.workspace.as_ref())).await.unwrap_or(true);
                         if !kept {
-                            crate::workspace::release(&spec, closed.elapsed()).await;
+                            crate::workspace::release(&spec).await;
                         }
                     }
                 });
@@ -3873,6 +3876,69 @@ fn remap_handed(map: &mut HashMap<String, Box<session::Handed>>, carried: &[i64]
     }
 }
 
+/// Until every process kiln started for agent session `id` has ended, each end as the OS tells it
+/// (`os::watch::exited`: a pidfd on Linux, kqueue's `EVFILT_PROC` on macOS, its handle on Windows), never a clock: its
+/// harness `harness` where one ran on this machine, and every process its group follows (`os::contain::Group`), those
+/// forked while it ended among them, its group asked again after each round of ends until it holds none not seen to
+/// end. Its close stops them all, and its group's end kills whatever is left in it (`session::end_group`), so this ends
+/// with them. What holds a workspace's mount busy is a process with a file or its working directory there, and an
+/// agent's are these: its mount is asked to go after this, once (`workspace::release`). A process whose end the OS can't
+/// tell (refused by kind: no pidfd before Linux 5.3, descriptors exhausted) isn't waited on, which held the release until
+/// the runner restarted: it is said, and the mount's one unmount says whether it still holds it.
+pub(crate) async fn processes_ended(id: &str, harness: Option<u32>) {
+    let unwatched = processes_ended_by(&OsEnds, id, harness).await;
+    if !unwatched.is_empty() {
+        let said: Vec<String> = unwatched.iter().map(ToString::to_string).collect();
+        tracing::warn!(session = %id, unwatched = %said.join("; "), "an ended agent's processes the OS can't watch to their end aren't waited on: its workspace's mount is asked to go, and refused by kind where one still holds it");
+    }
+}
+
+/// What [`processes_ended`] asks of this machine, apart so a test holds a watch the OS refuses: the processes an
+/// agent's group follows now (`os::contain::Group`), and one process's end as the OS tells it (`os::watch::exited`).
+trait Ends {
+    async fn members(&self, session: &str) -> Vec<u32>;
+    async fn exited(&self, pid: u32) -> Result<(), Vec<crate::os::watch::Unwatched>>;
+}
+
+/// [`Ends`] on this machine.
+struct OsEnds;
+
+impl Ends for OsEnds {
+    async fn members(&self, session: &str) -> Vec<u32> {
+        let session = session.to_owned();
+        crate::rt::blocking(move || crate::os::contain::Group::existing(&session).map(|g| g.pids()).unwrap_or_default()).await.unwrap_or_default()
+    }
+
+    async fn exited(&self, pid: u32) -> Result<(), Vec<crate::os::watch::Unwatched>> {
+        crate::os::watch::exited(&[pid]).await
+    }
+}
+
+/// [`processes_ended`] by `ends`: what it couldn't wait on, each process the OS can't watch to its end, by kind. Such a
+/// process isn't waited on, since its end would never be told, and is counted with those ended, so the group's next
+/// reading doesn't ask after it again: the mount's one unmount then says, by kind, whether it still holds the mount.
+async fn processes_ended_by(ends: &impl Ends, id: &str, harness: Option<u32>) -> Vec<crate::os::watch::Unwatched> {
+    let mut ended: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut unwatched = Vec::new();
+    let mut next: Vec<u32> = harness.into_iter().collect();
+    loop {
+        next.extend(ends.members(id).await);
+        next.retain(|pid| !ended.contains(pid));
+        next.sort_unstable();
+        next.dedup();
+        if next.is_empty() {
+            return unwatched;
+        }
+        tracing::info!(session = %id, pids = ?next, "an ended agent's processes are awaited before its workspace's mount comes down");
+        for pid in next.drain(..) {
+            if let Err(refused) = ends.exited(pid).await {
+                unwatched.extend(refused);
+            }
+            ended.insert(pid);
+        }
+    }
+}
+
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.
 #[cfg(unix)]
 pub(crate) fn stop_process(pid: u32) {
@@ -4053,6 +4119,52 @@ mod tests {
         assert!(!archived_keep(Some(&dir.path().join("none")), Some(&ws("v1"))), "no archives yet");
         assert!(!archived_keep(None, Some(&ws("v1"))), "no durable record here");
         Ok(())
+    }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2): an ended agent's mount comes down once every process kiln started
+    /// for it has ended, each end as the OS tells it (`os::watch::exited`), never on a clock: the wait goes on while its
+    /// harness runs and is over once it has ended; with nothing of it running here it's over at once. kiln's clippy
+    /// found the clock its unmount's retries waited on instead (2026-11-18).
+    #[test]
+    fn w3_an_ended_agents_processes_are_awaited_by_their_ends() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            // A harness that runs until its input ends: `sort` reads to its end on every host.
+            let mut harness = std::process::Command::new("sort").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).spawn()?;
+            let mut ended = std::pin::pin!(processes_ended("w3-a-session-with-no-group", Some(harness.id())));
+            anyhow::ensure!(crate::rt::timeout(Duration::from_millis(500), ended.as_mut()).await.is_err(), "over while its harness still ran");
+            drop(harness.stdin.take());
+            crate::rt::timeout(Duration::from_secs(30), ended).await.map_err(|_| anyhow::anyhow!("not over once its harness had ended"))?;
+            anyhow::ensure!(harness.try_wait()?.is_some(), "over before its harness had ended");
+            crate::rt::timeout(Duration::from_secs(5), processes_ended("w3-a-session-with-nothing-running", None)).await.map_err(|_| anyhow::anyhow!("nothing of it ran here, yet it waited"))?;
+            Ok(())
+        })
+    }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2; UI goal 88): an ended agent's process the OS can't watch to its
+    /// end (refused by kind: no pidfd before Linux 5.3, `ENOSYS`; descriptors exhausted) is never waited on for ever,
+    /// which held its workspace's release until the runner restarted: the wait is over at once, each such process named
+    /// with why, its group asked again as ever, so its mount is asked to go, and refused by kind where one still holds
+    /// it. Asked once, no clock: the OS's refusal is the fake's at once.
+    #[test]
+    fn w3_an_ended_agents_process_the_os_cant_watch_holds_no_release() {
+        use crate::os::watch::{Unwatchable, Unwatched};
+        use futures::FutureExt as _;
+        /// An agent whose group holds `group`, on an OS that can watch no process's end (`ENOSYS`, a Linux before 5.3).
+        struct Refusing {
+            group: Vec<u32>,
+        }
+        impl Ends for Refusing {
+            async fn members(&self, _session: &str) -> Vec<u32> {
+                self.group.clone()
+            }
+            async fn exited(&self, pid: u32) -> Result<(), Vec<Unwatched>> {
+                Err(vec![Unwatched { pid, why: Unwatchable::Unsupported }])
+            }
+        }
+        let refusing = Refusing { group: vec![4243, 4244] };
+        let over = processes_ended_by(&refusing, "w3-a-session-the-os-cant-watch", Some(4242)).now_or_never();
+        let unwatched = |pid| Unwatched { pid, why: Unwatchable::Unsupported };
+        assert_eq!(over, Some(vec![unwatched(4242), unwatched(4243), unwatched(4244)]), "over at once, each process it couldn't watch named by kind");
     }
 
     /// A1 (step 30's follow-up): across a successor upgrade, the fresh runner gives each handed

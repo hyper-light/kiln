@@ -75,6 +75,13 @@ enum Since {
   },
   /// A file the head deleted since: a whiteout at `name` in directory `dir`.
   Deleted { dir: InodeNo, name: Box<str> },
+  /// A directory the head still holds whose mode or Windows bits it changed since (A-501), inode `no` at `name` in
+  /// directory `dir`.
+  ChangedDir {
+    no: InodeNo,
+    dir: InodeNo,
+    name: Box<str>,
+  },
   /// Anything else.
   Other,
 }
@@ -341,6 +348,18 @@ pub struct DigestStats {
   pub dropped_on_overflow: u64,
   /// Digests held now.
   pub cached: u64,
+  /// Entries a digest's identity check found the disk had given another file at their name, within the directory's
+  /// timestamp granularity so its listing could not tell (A-558): each inode left its name as A-151 has it, and the
+  /// digest went to the name's new entry. The non-vacuity count of that path.
+  pub replaced: u64,
+}
+
+/// What [`Overlay::verify_current`] found of a clean file (§4.15).
+enum Current {
+  /// The file the entry holds, as the disk holds it now: its descriptor and its fingerprint.
+  Verified(HostFile, Fingerprint),
+  /// The disk gave the entry's name to another file: the inode left the name (A-151), and the name is a new entry.
+  Replaced,
 }
 
 /// One kept digest: the directory the entry is homed in (a watcher hint names a directory), the
@@ -534,9 +553,14 @@ pub(crate) const GONE_DIRECTORY_ERRNO: i32 = 2;
 pub(crate) fn unavailable_errno(error: HostError) -> i32 {
   match error {
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => errno,
+    // The record keeps one number (A-527): a Win32 code as its own, which only a reader told it is Windows' reads.
+    HostError::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       GONE_DIRECTORY_ERRNO
     }
+    // A fetch under way is no errno: the directory is unavailable for no reason the host's errno names, as a base
+    // unavailable with no host at all is (`BaseUnavailable(0)`). Recovery over an S3 base is A-524's owed integration.
+    HostError::Pending => 0,
   }
 }
 
@@ -851,6 +875,9 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::NotFile => VfsError::IsDirectory,
     HostError::StaleHandle => VfsError::StaleHandle,
     HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
+    // One number past the seam (A-527): a Win32 code as its own.
+    HostError::Win32(code) => VfsError::BaseUnavailable(i32::try_from(code).unwrap_or(i32::MAX)),
+    HostError::Pending => VfsError::BasePending,
   }
 }
 
@@ -982,6 +1009,12 @@ impl Volume {
               found.push(Diverged {
                 path: path.clone(),
                 kind,
+              });
+            } else if witnessed(child.inode) {
+              // A base directory whose metadata alone the volume changed (A-501).
+              found.push(Diverged {
+                path: path.clone(),
+                kind: Divergence::Witnessed,
               });
             }
             deeper.push((path, h));
@@ -2641,6 +2674,9 @@ impl Overlay<'_> {
         .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
       return Ok(());
     }
+    if let Body::Directory(dir) = self.vol.inode(store, no)?.body {
+      return self.witness_directory(store, no, dir);
+    }
     let is_base = matches!(self.vol.inode(store, no)?.body, Body::Base(_));
     if !is_base {
       return Ok(());
@@ -2713,6 +2749,39 @@ impl Overlay<'_> {
     self
       .vol
       .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
+    Ok(())
+  }
+
+  /// A base directory's witness, taken before its metadata changes (A-501): its fingerprint on the disk now, through the
+  /// handle its listing holds; it has no bytes to hash. A landing judges the mode or bits it sets against it, as a file's
+  /// metadata entry is judged (A-458). Its home is its parent and its name, as a file's is: a status re-checks it there
+  /// ([`Overlay::check_drift`]) and a recovery keeps it with its parent's listing. A directory the volume made, moved or
+  /// replaced holds no base of its own (its entry lands it whole), and the root is the target itself, no entry of it, so
+  /// neither is witnessed.
+  fn witness_directory(
+    &mut self,
+    store: &Store,
+    no: InodeNo,
+    dir: Handle<DirNode>,
+  ) -> Result<(), VfsError> {
+    let node = store.dirs.get(self.vol.head_dir(store, dir)?)?;
+    let Some(parent) = node.parent else {
+      return Ok(());
+    };
+    if node.base != BaseDirState::Merged || node.origin.is_some() {
+      return Ok(());
+    }
+    let home = (parent, node.name.clone());
+    let host_dir = self.listing_dir(no)?;
+    let fingerprint = self.host.fingerprint_dir(host_dir).map_err(host_refusal)?;
+    let witness = Witness {
+      fingerprint,
+      identity: [0; 32],
+      witnessed_at: self.vol.clock.monotonic_ns(),
+      racy: false,
+    };
+    let at = self.vol.witness_clock();
+    self.plane()?.record_witness(no, witness, Some(home), at);
     Ok(())
   }
 
@@ -2894,6 +2963,23 @@ impl Overlay<'_> {
   /// (`DigestStart::Pending`), carrying the fingerprint the slices re-check against — no bytes are
   /// hashed yet, so `begin` itself is O(1).
   pub fn digest_begin(&mut self, store: &mut Store, path: &str) -> Result<DigestStart, VfsError> {
+    // The name is looked up again once when the first look finds the disk gave it another file (A-558): that inode
+    // left the name (A-151), and the name is a new entry now. Found so twice, the disk is changing it now.
+    match self.digest_begin_at(store, path)? {
+      Some(start) => Ok(start),
+      None => self
+        .digest_begin_at(store, path)?
+        .ok_or_else(|| self.count_digest_refusal(VfsError::DigestUnverified)),
+    }
+  }
+
+  /// One look of [`Self::digest_begin`]: `None` when the entry found at `path` left its name because the disk gave the
+  /// name another file ([`Current::Replaced`]).
+  fn digest_begin_at(
+    &mut self,
+    store: &mut Store,
+    path: &str,
+  ) -> Result<Option<DigestStart>, VfsError> {
     let located = self.resolve(store, path)?;
     let no = match located.child {
       Child::File(no) => no,
@@ -2910,7 +2996,10 @@ impl Overlay<'_> {
     if !self.is_clean(store, no) {
       return Err(VfsError::DigestNotClean);
     }
-    let (_file, fingerprint) = self.verify_current(store, no)?;
+    let fingerprint = match self.verify_current(store, no)? {
+      Current::Verified(_file, fingerprint) => fingerprint,
+      Current::Replaced => return Ok(None),
+    };
     // Discovery (§4.15): a kept digest is reused only after the disk re-verified the fingerprint
     // it was computed under — the fingerprint is the truth, the cache never is; a kept digest
     // the disk no longer matches is stale knowledge, dropped before anything else happens.
@@ -2923,23 +3012,23 @@ impl Overlay<'_> {
       if cached.fingerprint == fingerprint {
         let stats = &mut self.plane()?.digest_stats;
         stats.revalidated = stats.revalidated.saturating_add(1);
-        return Ok(DigestStart::Ready(Digest {
+        return Ok(Some(DigestStart::Ready(Digest {
           identity: cached.identity,
           size: fingerprint.size,
-        }));
+        })));
       }
       if self.plane()?.forget_digest(store, no) {
         let stats = &mut self.plane()?.digest_stats;
         stats.stale = stats.stale.saturating_add(1);
       }
     }
-    Ok(DigestStart::Pending(Box::new(PartialDigest {
+    Ok(Some(DigestStart::Pending(Box::new(PartialDigest {
       no,
       fingerprint,
       size: fingerprint.size,
       done: 0,
       hasher: blake3::Hasher::new(),
-    })))
+    }))))
   }
 
   /// Advances a [`PartialDigest`] by up to `budget` bytes (§4.15; clean-digest.md §7): re-opens the
@@ -2981,7 +3070,10 @@ impl Overlay<'_> {
     no: InodeNo,
     expected: Fingerprint,
   ) -> Result<HostFile, VfsError> {
-    let (file, fingerprint) = self.verify_current(store, no)?;
+    // A name the disk gave another file between the slices: the inode left it (A-151), and its hash is of no entry now.
+    let Current::Verified(file, fingerprint) = self.verify_current(store, no)? else {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    };
     if fingerprint != expected {
       return Err(self.count_digest_refusal(VfsError::DigestUnverified));
     }
@@ -3080,15 +3172,19 @@ impl Overlay<'_> {
   /// the path is opened afresh and its identity compared with the descriptor the volume holds,
   /// because a file replaced beneath a held descriptor inside the directory's timestamp
   /// granularity leaves the listing's fingerprint unchanged and the old inode alive behind the
-  /// descriptor — the one case the listing cannot tell. Two `fstat`s of one inode that disagree
-  /// mean it is changing now.
-  fn verify_current(
-    &mut self,
-    store: &mut Store,
-    no: InodeNo,
-  ) -> Result<(HostFile, Fingerprint), VfsError> {
+  /// descriptor — the one case the listing cannot tell. Then the name is a new entry and the inode
+  /// leaves it, as a relist would have it (A-151; [`Self::leave_name`]), answered
+  /// [`Current::Replaced`], as is an inode the validated listing itself took from its name. Two
+  /// `fstat`s of one inode that disagree mean it is changing now.
+  fn verify_current(&mut self, store: &mut Store, no: InodeNo) -> Result<Current, VfsError> {
     self.follow_live_disk(store, no)?;
-    let (dir, name) = self.home_of(store, no)?;
+    // The listing it validated may have found the disk gave the name another file, and the inode left the name then
+    // (A-151, [`Self::prune_unloaded`]): the name is a new entry, not a missing one.
+    let (dir, name) = match self.home_of(store, no) {
+      Ok(home) => home,
+      Err(VfsError::NotFound) => return Ok(Current::Replaced),
+      Err(other) => return Err(other),
+    };
     let fresh = self.host.open_file(dir, &name).map_err(host_refusal)?;
     let at_path = match self.host.fstat(fresh) {
       Ok(fp) => fp,
@@ -3104,7 +3200,7 @@ impl Overlay<'_> {
       .and_then(|b| b.descriptors.get(&no).copied());
     let Some(held) = held else {
       self.plane()?.descriptors.insert(no, fresh);
-      return Ok((fresh, at_path));
+      return Ok(Current::Verified(fresh, at_path));
     };
     let served = match self.host.fstat(held) {
       Ok(fp) => fp,
@@ -3114,27 +3210,47 @@ impl Overlay<'_> {
       }
     };
     if (served.dev, served.ino) != (at_path.dev, at_path.ino) {
-      // The path holds another inode now: the descriptor serves a file the disk has replaced.
-      // An untouched entry shows the live disk, so the volume adopts the new inode and rereads
-      // the directory at its next use (its listing still names the old fingerprint).
-      self.host.close_file(held);
-      self.plane()?.descriptors.insert(no, fresh);
+      // The path holds another inode now: the descriptor serves a file the disk has replaced. An untouched base inode
+      // is bound to the file it was made from (A-151), so it leaves the name, open or not, and the name is a new entry
+      // at its next lookup. Until A-558 the inode was pointed at the new file in place, so a handle opened on the old
+      // file read the outsider's bytes after a digest found the replacement.
+      self.host.close_file(fresh);
       if self.plane()?.forget_digest(store, no) {
         let stats = &mut self.plane()?.digest_stats;
         stats.stale = stats.stale.saturating_add(1);
       }
-      self.adopt_fingerprint(store, no, at_path)?;
-      // Another file serves the entry now, whatever its attributes say: its Shards backings are refilled (Shards part
-      // 3, step 4).
-      store.shards_backings.mark_stale(self.vol.prefix, no);
-      self.invalidate_listing_of(store, no);
-      return Ok((fresh, at_path));
+      self.leave_name(store, no)?;
+      let stats = &mut self.plane()?.digest_stats;
+      stats.replaced = stats.replaced.saturating_add(1);
+      return Ok(Current::Replaced);
     }
     self.host.close_file(fresh);
     if served != at_path {
       return Err(self.count_digest_refusal(VfsError::DigestUnverified));
     }
-    Ok((held, served))
+    Ok(Current::Verified(held, served))
+  }
+
+  /// An untouched entry whose name the disk gave another file leaves the name (A-151), as a relist has it
+  /// ([`Self::prune_unloaded`]): its descriptor is kept only while a handle holds it open ([`Self::release_detached`]),
+  /// its directory's listing is reread at its next use (the listing still names the old file's fingerprint), and the
+  /// name leaves the node, so the next lookup serves the disk's file as a new inode.
+  fn leave_name(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let home = self
+      .vol
+      .inode(store, no)?
+      .home
+      .ok_or(VfsError::NotOverlay)?;
+    let dir = self.vol.current_dir(store, home.parent())?;
+    let name = store
+      .dirs
+      .get(dir)?
+      .name_of(&store.blocks, home.hash, no)
+      .ok_or(VfsError::NotFound)?
+      .to_owned();
+    self.release_detached(no);
+    self.invalidate_listing_of(store, no);
+    self.drop_unloaded(store, dir, &name)
   }
 
   /// Marks the listing of an entry's home directory for a reread at its next use.
@@ -3222,6 +3338,9 @@ impl Overlay<'_> {
     let Some(witness) = self.vol.base.as_ref().and_then(|b| b.witness(no)) else {
       return Ok(());
     };
+    if matches!(self.vol.inode(store, no)?.body, Body::Directory(_)) {
+      return self.check_directory_drift(store, no, &witness);
+    }
     let lost = matches!(&self.vol.inode(store, no)?.body, Body::Base(b) if b.lost);
     if lost {
       return Err(VfsError::BaseDrift);
@@ -3277,6 +3396,48 @@ impl Overlay<'_> {
     Ok(())
   }
 
+  /// [`Overlay::check_drift`] of a witnessed base directory (A-501): the directory its home names now, judged by what its
+  /// witness is for, its identity and its own metadata (mode, owner, Windows bits): gone is `Deleted`, another object
+  /// `Replaced` or `TypeChanged`, another mode `Modified`. Its times and size move with every entry made or removed in
+  /// it, which the volume follows (its listing is merged), so they are no drift of its own.
+  fn check_directory_drift(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    witness: &Witness,
+  ) -> Result<(), VfsError> {
+    let at_path = match self.home_of(store, no) {
+      Ok((dir, name)) => match self.host.open_dir(dir, &name) {
+        Ok(opened) => {
+          let fp = self.host.fingerprint_dir(opened);
+          self.host.close_dir(opened);
+          Some(fp.map_err(host_refusal)?)
+        }
+        Err(HostError::NotFound) => None,
+        Err(HostError::NotFile | HostError::NotDirectory) => {
+          self.record_drift(store, no, DriftKind::TypeChanged);
+          return Ok(());
+        }
+        Err(e) => return Err(host_refusal(e)),
+      },
+      Err(_) => None,
+    };
+    let was = witness.fingerprint;
+    match at_path {
+      None => self.record_drift(store, no, DriftKind::Deleted),
+      Some(fp) if (fp.dev, fp.ino) != (was.dev, was.ino) => {
+        self.record_drift(store, no, DriftKind::Replaced);
+      }
+      Some(fp)
+        if (fp.mode, fp.uid, fp.gid, fp.windows) != (was.mode, was.uid, was.gid, was.windows) =>
+      {
+        self.record_drift(store, no, DriftKind::Modified);
+      }
+      Some(_) => {}
+    }
+    Ok(())
+  }
+
   /// The BLAKE3 of an open file's bytes.
   fn identity_of(&mut self, file: HostFile, size: u64) -> Result<[u8; 32], VfsError> {
     let bytes = self.read_whole(file, size)?;
@@ -3293,7 +3454,7 @@ impl Overlay<'_> {
       changed
     });
     if fresh {
-      let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+      let path = self.witnessed_path(store, no).unwrap_or_default();
       self
         .vol
         .record(&mut store.metadata, Op::Drift, path, Some(no), 0);
@@ -3439,9 +3600,17 @@ impl Overlay<'_> {
   /// An inode's path, or `inode N` where none names it, as `status` names it.
   fn path_or_inode(&self, store: &Store, no: InodeNo) -> String {
     self
+      .witnessed_path(store, no)
+      .unwrap_or_else(|| format!("inode {}", no.0))
+  }
+
+  /// The path of a witnessed entry in the head: a file's or a link's through its home, a base directory's through its own
+  /// name and parent chain (A-501), which no home names.
+  fn witnessed_path(&self, store: &Store, no: InodeNo) -> Option<String> {
+    self
       .vol
       .path_of_inode(store, no)
-      .unwrap_or_else(|| format!("inode {}", no.0))
+      .or_else(|| self.vol.path_of_dir(store, no))
   }
 
   /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.
@@ -3458,13 +3627,7 @@ impl Overlay<'_> {
       match self.check_drift(store, no) {
         // Drift found is recorded by the check itself and listed below.
         Ok(()) | Err(VfsError::BaseDrift) => {}
-        Err(refusal) => unverified.push((
-          self
-            .vol
-            .path_of_inode(store, no)
-            .unwrap_or_else(|| format!("inode {}", no.0)),
-          refusal,
-        )),
+        Err(refusal) => unverified.push((self.path_or_inode(store, no), refusal)),
       }
     }
     unverified.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3472,15 +3635,7 @@ impl Overlay<'_> {
     let mut drift: Vec<(String, DriftKind)> = plane
       .drift
       .iter()
-      .map(|(no, kind)| {
-        (
-          self
-            .vol
-            .path_of_inode(store, *no)
-            .unwrap_or_else(|| format!("inode {}", no.0)),
-          *kind,
-        )
-      })
+      .map(|(no, kind)| (self.path_or_inode(store, *no), *kind))
       .collect();
     drift.sort();
     Ok(BaseStatus {
@@ -3735,6 +3890,10 @@ impl Overlay<'_> {
         }
         Ok(())
       }
+      Since::ChangedDir { no, dir, name } => {
+        self.forget_landed(store, &landed.path)?;
+        self.rebase_directory(no, dir, &name, landed.written)
+      }
       Since::Other => Ok(()),
     }
   }
@@ -3804,7 +3963,20 @@ impl Overlay<'_> {
       (Some(Child::Dir(x)), Some(Child::Dir(y)))
         if store.dirs.get(x)?.inode == store.dirs.get(y)?.inode =>
       {
-        Since::Unchanged
+        let no = store.dirs.get(y)?.inode;
+        let (then, now) = (
+          self.vol.inode_in(store, id, no)?,
+          self.vol.inode(store, no)?,
+        );
+        if (then.attrs.mode, then.windows) == (now.attrs.mode, now.windows) {
+          Since::Unchanged
+        } else {
+          Since::ChangedDir {
+            no,
+            dir: dir_no,
+            name: name.into(),
+          }
+        }
       }
       (Some(Child::File(_)), Some(Child::File(no))) => Since::ChangedFile {
         no,
@@ -3817,6 +3989,37 @@ impl Overlay<'_> {
       },
       _ => Since::Other,
     })
+  }
+
+  /// A head directory whose mode or Windows bits changed since the landed snapshot, rebased onto what landed (A-501): once
+  /// the landed path left the overlay, its witness becomes the directory as the landing left it (`written`, its
+  /// fingerprint after the landing set it; else the disk's, through its listing), so the head's later change lands next
+  /// as a metadata entry from what landed. Forgotten with the landed entry, it would never land.
+  fn rebase_directory(
+    &mut self,
+    no: InodeNo,
+    dir: InodeNo,
+    name: &str,
+    written: Option<Witness>,
+  ) -> Result<(), VfsError> {
+    let fingerprint = match written {
+      Some(written) => written.fingerprint,
+      None => {
+        let listed = self.listing_dir(no)?;
+        self.host.fingerprint_dir(listed).map_err(host_refusal)?
+      }
+    };
+    let witness = Witness {
+      fingerprint,
+      identity: [0; 32],
+      witnessed_at: self.vol.clock.monotonic_ns(),
+      racy: false,
+    };
+    let at = self.vol.witness_clock();
+    self
+      .plane()?
+      .record_witness(no, witness, Some((dir, name.into())), at);
+    Ok(())
   }
 
   /// A head file changed since the landed snapshot, rebased onto what landed: its witness becomes the
@@ -3892,6 +4095,8 @@ impl Overlay<'_> {
         if let Some(plane) = self.vol.base.as_mut() {
           plane.forget_redirect(no, at);
           plane.forget_whiteout(dir_no, name, at);
+          // A landed metadata entry's witness (A-501): the directory follows the disk again.
+          plane.forget_witness(no, at);
           // The directory is on the disk now: its listing is read from there.
           if !plane.listings.contains_key(&no)
             && let Some(parent) = plane.listings.get(&dir_no).map(|l| l.dir)
@@ -4085,6 +4290,10 @@ impl Overlay<'_> {
     }
     let mut done = Vec::new();
     for no in targets {
+      if matches!(self.vol.inode(store, no)?.body, Body::Directory(_)) {
+        done.push(self.rewitness_directory(store, no)?);
+        continue;
+      }
       if let Some(f) = self.plane()?.descriptors.remove(&no) {
         self.host.close_file(f);
       }
@@ -4136,6 +4345,29 @@ impl Overlay<'_> {
       done.push(path);
     }
     Ok(done)
+  }
+
+  /// [`Overlay::rewitness`] of a base directory whose metadata the volume changed (A-501): its witness becomes the
+  /// directory its home names now, and its drift record clears; the volume's own mode and bits are left as they are, as a
+  /// file's content is. Answers its path.
+  fn rewitness_directory(&mut self, store: &mut Store, no: InodeNo) -> Result<String, VfsError> {
+    let (dir, name) = self.home_of(store, no)?;
+    let opened = self.host.open_dir(dir, &name).map_err(host_refusal)?;
+    let fingerprint = self.host.fingerprint_dir(opened);
+    self.host.close_dir(opened);
+    let witness = Witness {
+      fingerprint: fingerprint.map_err(host_refusal)?,
+      identity: [0; 32],
+      witnessed_at: self.vol.clock.monotonic_ns(),
+      racy: false,
+    };
+    let at = self.vol.witness_clock();
+    let plane = self.plane()?;
+    plane.record_witness(no, witness, None, at);
+    if plane.drift.remove(&no).is_some() {
+      plane.drift_writes = plane.drift_writes.saturating_add(1);
+    }
+    Ok(self.vol.path_of_dir(store, no).unwrap_or_default())
   }
 
   /// `pin`: read the named subtrees (the whole base when none are named) into the store and
@@ -4396,5 +4628,202 @@ impl Overlay<'_> {
       }
     }
     Ok(stale)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+
+  use super::BaseConfig;
+  use crate::clock::StepClock;
+  use crate::error::VfsError;
+  use crate::host::HostFs;
+  use crate::host::sim::{Interference, SimHost};
+  use crate::ids::{InodeNo, RefOwner};
+  use crate::names::NameEquivalence;
+  use crate::quota::Quota;
+  use crate::volume::{Store, StoreConfig, Volume, VolumeConfig};
+
+  /// Shape: the test store's page.
+  const PAGE: usize = 4096;
+  /// Shape: pages of content the test store maps (4 MiB).
+  const ARENA_PAGES: usize = 1024;
+  /// Shape: slots per slab in the test store.
+  const CAP: usize = 1 << 14;
+  /// Shape: the large-file class boundary, one chunk window, as the base plane's other tests use.
+  const LARGE: u64 = 65_536;
+  /// Shape: the attachment the test's kernel references and opens belong to.
+  const KERNEL: u64 = 41;
+  /// Shape: how far the simulated clock moves between the scene's steps: past the simulated filesystem's
+  /// one-nanosecond granularity, so the listing read after it is current and not racy (§4.5).
+  const STEP_NS: i64 = 10;
+  /// Shape: the bytes the handle opened.
+  const OPENED: &[u8] = b"the file the handle opened";
+  /// Shape: the bytes an outsider puts at the name.
+  const OUTSIDER: &[u8] = b"the outsider's file";
+  /// Shape: the most seam calls the scene's digest is raced at: past the calls a digest of a small file makes, so the
+  /// race is tried at each of them and the loop ends at the first that lands after the digest.
+  const CALLS: u64 = 64;
+
+  fn store() -> Store {
+    let mut arena = ChunkArena::new(PAGE);
+    arena
+      .add_region(Region::map(PAGE * ARENA_PAGES, PAGE, false).unwrap())
+      .unwrap();
+    Store::new(
+      &StoreConfig {
+        page: PAGE,
+        cache_line: 64,
+        max_dirs: CAP,
+        max_inodes: CAP,
+        max_chunks: CAP,
+        max_dir_blocks: CAP,
+        dir_cutover: 4,
+      },
+      arena,
+      0,
+    )
+  }
+
+  fn overlay(host: &mut SimHost, store: &mut Store) -> Volume {
+    let root = host.root();
+    let facts = host.facts(root).unwrap();
+    Volume::create_overlay(
+      store,
+      VolumeConfig {
+        prefix: 7,
+        names: NameEquivalence::Exact,
+        quota: Quota::Bounded { limit: 1 << 24 },
+        journal_bytes: 1 << 16,
+        clock: Box::new(StepClock::new(1_000_000, 1_000)),
+      },
+      BaseConfig {
+        root,
+        facts,
+        large_class_bytes: LARGE,
+      },
+    )
+    .unwrap()
+  }
+
+  /// Every byte of inode `no`, read by its number as a transport reads through a handle.
+  fn read_no(
+    vol: &mut Volume,
+    host: &mut SimHost,
+    store: &mut Store,
+    no: InodeNo,
+  ) -> Result<Vec<u8>, VfsError> {
+    let mut o = vol.with_host(host);
+    let size = o.stat(store, no)?.size;
+    let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+    let n = o.read(store, no, 0, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+  }
+
+  /// What one race showed: whether the replacement landed during the digest, the digest's answer, what the open handle
+  /// read after it, whether the name was a new inode after it, and the replacements a digest found at the name.
+  #[derive(Debug)]
+  struct Raced {
+    landed: bool,
+    digest: Result<[u8; 32], VfsError>,
+    opener: Result<Vec<u8>, VfsError>,
+    renamed: bool,
+    replaced: u64,
+  }
+
+  /// A base file opened as a mount's `OPEN` does, its directory's listing current, then a digest of its path with an
+  /// outsider's replacement of the file landing just before seam call `call` of the digest.
+  fn raced_at(call: u64) -> Raced {
+    let mut host = SimHost::new();
+    host.replace_file("/notes", OPENED);
+    host.advance_ns(STEP_NS);
+    let mut store = store();
+    let mut vol = overlay(&mut host, &mut store);
+    let no = vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/notes")
+      .unwrap()
+      .inode;
+    vol
+      .reference_for(&store, no, RefOwner::Attachment(KERNEL))
+      .unwrap();
+    vol.with_host(&mut host).open_base(&mut store, no).unwrap();
+    vol.open_for(no, RefOwner::Attachment(KERNEL));
+    host.advance_ns(STEP_NS);
+    host.interfere_at_call(
+      call,
+      Interference::Replace {
+        path: "/notes".to_owned(),
+        bytes: OUTSIDER.to_vec(),
+      },
+    );
+    let digest = vol
+      .with_host(&mut host)
+      .digest(&mut store, "/notes")
+      .map(|digest| digest.identity);
+    let landed = host.interfered();
+    let opener = read_no(&mut vol, &mut host, &mut store, no);
+    let renamed = vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/notes")
+      .is_ok_and(|located| located.inode != no);
+    let replaced = vol
+      .base_plane()
+      .map_or(0, |plane| plane.digest_stats().replaced);
+    Raced {
+      landed,
+      digest,
+      opener,
+      renamed,
+      replaced,
+    }
+  }
+
+  /// A-558 (A-151 in §4.15's `verify_current`): an untouched base file is bound to the file it was made from, so a
+  /// digest that finds another file at its name leaves the inode on its file and digests the name's new entry. Do: open a
+  /// base file, then digest its path with an outsider's replacement of the file landing at each seam call of the digest
+  /// in turn, each in a scene of its own, until one lands after the digest. Expect, wherever it landed: the open handle
+  /// still reading the file it opened; the digest naming the outsider's file, or the opened one where the replacement
+  /// landed after the digest's last check, or refused `DigestUnverified` when the file changed under the hash, never
+  /// torn bytes; the name a new inode; and at least one landing between the listing's check and the fresh open, the race
+  /// only `verify_current` sees (its count, `replaced`, moved). Before, that race pointed the inode at the outsider's
+  /// file, so the handle read bytes it never opened and the name kept the old number.
+  #[test]
+  fn a_digest_racing_a_replacement_leaves_the_opener_on_its_file_and_names_the_new_one() {
+    let outsider = *blake3::hash(OUTSIDER).as_bytes();
+    let opened = *blake3::hash(OPENED).as_bytes();
+    let mut raced = 0u64;
+    let mut reached = 0u64;
+    for call in 0..CALLS {
+      let seen = raced_at(call);
+      if !seen.landed {
+        break;
+      }
+      raced = raced.saturating_add(1);
+      reached = reached.saturating_add(seen.replaced);
+      assert_eq!(
+        seen.opener.as_deref(),
+        Ok(OPENED),
+        "landing at call {call}: the open handle reads the file it opened: {seen:?}"
+      );
+      assert!(
+        seen.digest == Ok(outsider)
+          || seen.digest == Ok(opened)
+          || seen.digest == Err(VfsError::DigestUnverified),
+        "landing at call {call}: the digest names the file at the name before or after the replacement, never \
+         torn bytes, or is refused: {seen:?}"
+      );
+      assert!(
+        seen.renamed,
+        "landing at call {call}: the name is a new inode: {seen:?}"
+      );
+    }
+    assert!(
+      raced > 0 && reached > 0,
+      "the replacement landed during {raced} digests, {reached} of them between the listing's check and the open"
+    );
   }
 }

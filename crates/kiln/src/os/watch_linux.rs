@@ -246,22 +246,28 @@ impl Shared {
 }
 
 /// Until one of `pids` exits (goal 9): each one's pidfd readable, as hyper-rt's readiness says; one
-/// already gone at once; one that can't be watched (a kernel before pidfds) is left out, and with
-/// none to watch, never.
-pub(super) async fn exited(pids: &[u32]) {
+/// already gone at once; one that can't be watched is left out, and with none to watch, never.
+/// Refused, each by kind, where it can watch none: a kernel before pidfds (`ENOSYS`, before Linux
+/// 5.3) can tell no process's end, and any other refusal of a pidfd is the OS's, its error number.
+pub(super) async fn exited(pids: &[u32]) -> Result<(), Vec<super::Unwatched>> {
     use nix::poll::{PollFd, PollFlags, PollTimeout};
     use std::os::fd::AsFd as _;
     let mut fds = Vec::new();
+    let mut unwatched = Vec::new();
     for pid in pids {
-        let Some(p) = i32::try_from(*pid).ok().and_then(rustix::process::Pid::from_raw) else { continue };
+        let Some(p) = i32::try_from(*pid).ok().and_then(rustix::process::Pid::from_raw) else {
+            unwatched.push(super::Unwatched { pid: *pid, why: super::Unwatchable::NotAPid });
+            continue;
+        };
         match rustix::process::pidfd_open(p, rustix::process::PidfdFlags::empty()) {
             Ok(fd) => fds.push(fd),
-            Err(rustix::io::Errno::SRCH) => return,
-            Err(_) => {}
+            Err(rustix::io::Errno::SRCH) => return Ok(()),
+            Err(rustix::io::Errno::NOSYS) => unwatched.push(super::Unwatched { pid: *pid, why: super::Unwatchable::Unsupported }),
+            Err(errno) => unwatched.push(super::Unwatched { pid: *pid, why: super::Unwatchable::Refused(errno.raw_os_error()) }),
         }
     }
     if fds.is_empty() {
-        return std::future::pending().await;
+        return if unwatched.is_empty() { std::future::pending().await } else { Err(unwatched) };
     }
     loop {
         let waits: Vec<_> = fds.iter().map(|fd| Box::pin(crate::os::proc::wait_readable(fd))).collect();
@@ -269,7 +275,7 @@ pub(super) async fn exited(pids: &[u32]) {
         // Readiness said so; the pidfd says whether it's so (a refused wait returns early).
         let mut polled: Vec<PollFd<'_>> = fds.iter().map(|fd| PollFd::new(fd.as_fd(), PollFlags::POLLIN)).collect();
         if nix::poll::poll(&mut polled, PollTimeout::ZERO).is_ok_and(|n| n > 0) {
-            return;
+            return Ok(());
         }
     }
 }

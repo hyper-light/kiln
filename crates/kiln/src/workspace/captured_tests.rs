@@ -132,7 +132,7 @@ async fn gone(volume: &str) -> anyhow::Result<bool> {
 async fn workspace(name: &str, top: &str) -> anyhow::Result<Made> {
     let (id, base) = super::slates::provision(name, Path::new(top), true).await?;
     anyhow::ensure!(base.is_some(), "a fleet runner's workspace {name} made no captured base");
-    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base, moved: false })
+    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base })
 }
 
 /// A review's changes as `path=bytes`, `path gone` or as Debug, in order.
@@ -207,11 +207,11 @@ async fn scenario() -> anyhow::Result<()> {
 
     // A base goes with the last workspace that's a clone of it.
     let (first, newer) = (a.base.clone().map(|b| b.volume).unwrap_or_default(), c.base.clone().map(|b| b.volume).unwrap_or_default());
-    super::slates::remove(&a, Duration::ZERO).await?;
+    super::slates::remove(&a).await?;
     anyhow::ensure!(!gone(&first).await?, "a base went while another workspace is a clone of it");
-    super::slates::remove(&b, Duration::ZERO).await?;
+    super::slates::remove(&b).await?;
     anyhow::ensure!(gone(&first).await?, "a base stayed after its last clone went");
-    super::slates::remove(&c, Duration::ZERO).await?;
+    super::slates::remove(&c).await?;
     anyhow::ensure!(gone(&newer).await?, "the folder's newest base stayed after its last clone went");
     Ok(())
 }

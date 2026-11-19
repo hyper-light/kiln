@@ -2,16 +2,21 @@
 //!
 //! **A call waits while its daemon lives, and fails `DaemonGone` once it is gone (§4.7, A-232).** One rule for every
 //! wait a call makes, the async driver's (`crate::driver`) and the two here: `round_trip`'s wait for its
-//! reply and `send`'s wait for a slot on a full command ring. Each reply deadline that passes asks the daemon's
-//! liveness, a cold-path question (`ClientEnd::daemon_gone`: the peer's close on Linux, the exit watch and the
-//! bootstrap stamp on macOS and Windows). Gone, the client reconnects under its id within the reconnect budget and
-//! the caller resends, or the call fails `DaemonGone` past it. Alive, the deadline re-arms and the wait goes on: a
-//! daemon answers every call it is given, however long the work (a granted landing, a forward across the fleet) or
-//! however starved its threads, and a daemon judged stuck is ended by its supervisor, or by its own watchdog when it
-//! runs alone, which the next deadline then finds gone. Until 2026-11-13 a live daemon's overdue call failed
-//! `Stalled` unless its request was one the daemon defers (`defers_reply`, now gone with it); a daemon starved at
-//! `cpu.weight` 1, alive by its own watchdog, had its calls failed so in 10 of 10 runs on both of CI's Linux runners
-//! (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
+//! reply and `send`'s wait for a slot on a full command ring. `round_trip`'s wait has no deadline: it ends at the
+//! reply or at the daemon's departure, which the end waits on beside the reply (`ClientEnd::wait_while_daemon_lives`,
+//! A-456: on Linux the control socket's close, on Windows the daemon's process handle, on macOS its exit watch looked
+//! at on a doubling schedule). The other two cannot see the departure yet (a slot that frees wakes nothing, and the
+//! async driver's loop polls only the completion descriptor), so each asks the daemon's liveness on the same doubling
+//! (`slates_ipc::looks`, A-523: first at twice the longer of the wait when first judged and the wake estimate, then at
+//! twice the time waited; until A-523 at each reply deadline that passed), a cold-path question
+//! (`ClientEnd::daemon_gone`: the peer's close on Linux, the exit watch and the bootstrap stamp on macOS and Windows). Gone, the client reconnects under its id while the instance's rendezvous has
+//! a holder, its anchor restarting the daemon (A-468), and the caller resends; with none, the call fails `DaemonGone`
+//! at once. Alive, the wait goes on: a daemon answers every call it is given, however long the work (a granted
+//! landing, a forward across the fleet) or however starved its threads, and a daemon judged stuck is ended by its
+//! supervisor, or by its own watchdog when it runs alone, which the wait then sees gone. Until 2026-11-13 a live
+//! daemon's overdue call failed `Stalled` unless its request was one the daemon defers (`defers_reply`, now gone with
+//! it); a daemon starved at `cpu.weight` 1, alive by its own watchdog, had its calls failed so in 10 of 10 runs on both
+//! of CI's Linux runners (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -33,7 +38,8 @@ use slates_ipc::protocol::{
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
-  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, begin_connect_as, connect_as,
+  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, Waited, begin_connect_as, connect_as,
+  holder_lives,
 };
 use slates_machine::{Derived, derived};
 use slates_wire::request::RequestId;
@@ -138,17 +144,24 @@ pub struct ArchiveImported {
 /// The client's deadlines, every one a derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlines {
-  /// How long a reply is waited for before the daemon's liveness is questioned.
+  /// How long a wait that cannot see the daemon's departure waits before it asks the daemon's liveness, and again
+  /// after each answer that it lives: the async driver's tick, the wait for a slot on a full ring, a delivery's read
+  /// and the macOS route's claim steps. The synchronous wait for a reply uses none: it ends at the reply or the
+  /// departure itself (A-456).
   pub reply_ns: u64,
-  /// How long a reconnect is tried after the daemon is found gone.
+  /// How long a request the daemon refused for now (an owner unreachable during a takeover, a lease not yet
+  /// confirmed, a stream's holder pending) is asked again, and held open for its resend under its own id; the pause
+  /// between such resends is at most a tenth of it. A reconnect itself waits while the instance's anchor lives and
+  /// fails at once with none, by no clock (A-468).
   pub reconnect_ns: u64,
 }
 
 impl Deadlines {
   /// Derived: the reply deadline is the anchor's liveness budget (a daemon silent longer than
   /// that is presumed dead by its own supervisor, so the client asks the same question then);
-  /// the reconnect budget is the recovery budget the restart is bounded by, plus one reply
-  /// deadline for the restarted daemon's first answer.
+  /// the reconnect budget is the recovery budget a restart is bounded by, plus one reply
+  /// deadline. Since A-468 it bounds only the waits on a fleet owner's takeover (`reconnect_ns`), whose
+  /// own bound, the failover delay the daemon reports, is owed (GAPS).
   pub fn derive(liveness_budget_ns: u64, recovery_budget_ns: u64) -> Derived<Deadlines> {
     derived!(
       Deadlines {
@@ -475,6 +488,8 @@ pub struct Client {
   /// The reconnect claim in flight (AUD-29-19): made by one [`Client::try_reconnect`], its answer read by
   /// the next, so no attempt waits on the daemon.
   reconnecting: Option<Claim>,
+  /// When the reconnect in flight began ([`Client::try_reconnect`]): what a `DaemonGone` it ends in reports.
+  reconnect_began: Option<Instant>,
 }
 
 /// The stream end a Windows daemon duplicated into this process for a Shards attach (A-179): the reply's handle,
@@ -518,6 +533,56 @@ impl std::fmt::Debug for Client {
   }
 }
 
+/// The synchronous send's wait for a slot on a full command ring (A-232, A-523): what it does next, `elapsed_ns` into
+/// the wait. It spins for the client's wake estimate, since the daemon drains its ring in microseconds; then it parks,
+/// each pause twice the last from the wake estimate and never past the next look at the daemon's life, which comes on
+/// A-443's doubling (`slates_ipc::looks`): first at twice the longer of the wait when first judged and the wake
+/// estimate, then at twice the time waited. Its pauses and looks are made of the wait's own length and this machine's
+/// measured wake, never a fixed time, and a wait of `t` wakes about `log2(t / wake)` times.
+#[derive(Debug, Default)]
+struct RoomWait {
+  /// When the wait next asks the daemon's liveness.
+  looks: slates_ipc::looks::Looks,
+  /// The last pause, nanoseconds; `None` before the first.
+  pause_ns: Option<u64>,
+}
+
+/// What a wait for a ring slot does next ([`RoomWait::next`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomStep {
+  /// Try the ring again at once.
+  Spin,
+  /// Ask the daemon's liveness, then try again.
+  Look,
+  /// Park this long, nanoseconds, then try again.
+  Park(u64),
+}
+
+impl RoomWait {
+  /// The next step, `elapsed_ns` into the wait, the client's wake estimate being `wake_ns`.
+  fn next(&mut self, elapsed_ns: u64, wake_ns: u64) -> RoomStep {
+    if elapsed_ns < wake_ns {
+      return RoomStep::Spin;
+    }
+    if self.looks.due(elapsed_ns, wake_ns) {
+      return RoomStep::Look;
+    }
+    let to_look_ns = self.looks.until(elapsed_ns).unwrap_or(wake_ns).max(1);
+    let pause_ns = self
+      .pause_ns
+      .map_or(wake_ns, |pause| pause.saturating_mul(2))
+      .max(1)
+      .min(to_look_ns);
+    self.pause_ns = Some(pause_ns);
+    RoomStep::Park(pause_ns)
+  }
+
+  /// A look made `elapsed_ns` into the wait found the daemon alive: the next comes at twice the time waited.
+  fn looked(&mut self, elapsed_ns: u64) {
+    self.looks.looked(elapsed_ns);
+  }
+}
+
 /// Derived: the first pause between reconnect attempts is the wake latency the daemon
 /// published as its spin window (the shortest wait that is not a spin); each pause doubles
 /// up to a tenth of the budget, so a restart is seen within a tenth of the budget at worst
@@ -525,8 +590,8 @@ impl std::fmt::Debug for Client {
 pub(crate) fn next_pause_ns(pause_ns: u64, budget_ns: u64) -> u64 {
   derived!(
     pause_ns.saturating_mul(2).min(budget_ns / 10).max(1),
-    "min(2 × pause, reconnect_ns / 10)",
-    ["pause_ns", "reconnect_ns"]
+    "min(2 × pause, budget / 10)",
+    ["pause_ns", "budget_ns"]
   )
   .get()
 }
@@ -1404,7 +1469,7 @@ impl Client {
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
     install_seal();
-    let connected = connect_as(instance, 0, deadlines.reconnect_ns)?;
+    let connected = connect_as(instance, 0)?;
     let mut client = Client::over(instance, connected, 0, deadlines, None)?;
     client.bind_delivered(delivered)?;
     Ok(client)
@@ -1416,7 +1481,7 @@ impl Client {
   pub fn begin_connect(instance: &str, deadlines: Deadlines) -> Result<Connecting, ClientError> {
     let delivered = delivered_capability()?;
     install_seal();
-    let claim = begin_connect_as(instance, 0, deadlines.reconnect_ns)?;
+    let claim = begin_connect_as(instance, 0)?;
     Ok(Connecting {
       instance: instance.to_owned(),
       deadlines,
@@ -1437,7 +1502,7 @@ impl Client {
   ) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
     install_seal();
-    let connected = connect_as(instance, session.client_id, deadlines.reconnect_ns)?;
+    let connected = connect_as(instance, session.client_id)?;
     let assigned = connected.region.client_id();
     if assigned != session.client_id {
       return Err(ClientError::SessionTaken { assigned });
@@ -1505,6 +1570,7 @@ impl Client {
       bound: false,
       rebinds: 0,
       reconnecting: None,
+      reconnect_began: None,
     })
   }
 
@@ -1607,6 +1673,12 @@ impl Client {
   /// Parks a wake ended with no reply waiting, so the client parked again.
   pub fn unanswered_wakes(&self) -> u64 {
     self.end.unanswered_wakes()
+  }
+
+  /// Parks a look at the daemon's life ended, the daemon found alive and the client parked again (macOS, Windows;
+  /// A-506; `ClientEnd::parks_ended_by_looks`).
+  pub fn parks_ended_by_looks(&self) -> u64 {
+    self.end.parks_ended_by_looks()
   }
 
   /// Sends `body` as the next request and returns the reply body, refusals typed.
@@ -2101,8 +2173,8 @@ impl Client {
   }
 
   /// Claims the stream end offered for `attachment` on the daemon's socket route with the offer's `secret` (macOS,
-  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step bounded by the client's
-  /// reply deadline.
+  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step waiting while the route's
+  /// connection lives (`slates_ipc::route::claim`, A-523).
   #[cfg(target_os = "macos")]
   fn claim_offer(
     &self,
@@ -2113,8 +2185,6 @@ impl Client {
       &self.instance,
       (slates_ipc::route::OfferKind::Stream, attachment),
       secret,
-      std::time::Duration::from_nanos(self.deadlines.reply_ns),
-      &mut || !self.end.daemon_gone(),
     )
     .map(|claimed| (claimed.descriptor, claimed.resync))
     .map_err(ClientError::Ipc)
@@ -2134,7 +2204,8 @@ impl Client {
   }
 
   /// Claims a direct map's copy offered on the daemon's socket route (§4.6, A-173, macOS): its descriptor, each step of
-  /// the claim waited for in reply deadlines while the daemon lives, as the map's own reply is (A-186).
+  /// the claim waiting while the route's connection lives, as the map's own reply waits while the daemon does (A-186,
+  /// A-523).
   #[cfg(target_os = "macos")]
   fn claim_map(
     &self,
@@ -2145,8 +2216,6 @@ impl Client {
       &self.instance,
       (slates_ipc::route::OfferKind::Map, mapping_id),
       secret,
-      std::time::Duration::from_nanos(self.deadlines.reply_ns),
-      &mut || !self.end.daemon_gone(),
     )
     .map(|claimed| claimed.descriptor)
     .map_err(ClientError::Ipc)
@@ -2165,16 +2234,17 @@ impl Client {
 
   /// Receives the descriptor the daemon sent over the control socket for the reply just read (§4.6: a content map,
   /// A-135; a stream end, A-161), the one `ours` recognises by what the reply named. The daemon sends it before the
-  /// ring reply, so it is already waiting; the loop only covers a kernel that makes the socket readable a scheduling
-  /// tick after the ring slot, bounded by the client's existing reply deadline (no new timeout). A delivery for an
-  /// earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never answers a later
-  /// call.
+  /// ring reply, and answers a typed refusal where the send failed, so it is waiting, or the socket turns readable a
+  /// scheduling tick after the ring slot: the loop waits on the socket itself, readable or hung up, with no clock
+  /// (`ClientEnd::wait_delivery`, A-523), and ends `ChannelLost` once the daemon is gone with nothing delivered. Until
+  /// A-523 it yielded until the client's reply deadline (a fixed second) and gave up `DeadlineExceeded` there. A
+  /// delivery for an earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never
+  /// answers a later call.
   #[cfg(unix)]
   fn recv_delivery(
     &self,
     ours: impl Fn(&ControlDelivery) -> bool,
   ) -> Result<ControlDelivery, ClientError> {
-    let start = Instant::now();
     loop {
       if let Some(delivery) = self.end.recv_delivery().map_err(ClientError::Ipc)? {
         if ours(&delivery) {
@@ -2182,10 +2252,10 @@ impl Client {
         }
         continue;
       }
-      if elapsed_ns(start) > self.deadlines.reply_ns {
-        return Err(ClientError::Ipc(IpcError::DeadlineExceeded));
+      if self.end.daemon_gone() {
+        return Err(ClientError::ChannelLost);
       }
-      std::thread::yield_now();
+      self.end.wait_delivery().map_err(ClientError::Ipc)?;
     }
   }
 
@@ -2372,8 +2442,9 @@ impl Client {
     })
   }
 
-  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon was found
-  /// gone and the client reconnected instead (the caller binds and resends).
+  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon departed and
+  /// the client reconnected instead (the caller binds and resends). The wait has no deadline: it ends at the reply or
+  /// at the daemon's departure, which the end waits on beside the reply (A-456; the module doc's rule).
   fn round_trip(
     &mut self,
     id: RequestId,
@@ -2383,8 +2454,12 @@ impl Client {
       return Ok(None);
     }
     loop {
-      match self.end.wait(Some(self.deadlines.reply_ns)) {
-        Ok(reply) => {
+      match self
+        .end
+        .wait_while_daemon_lives()
+        .map_err(ClientError::Ipc)?
+      {
+        Waited::Reply(reply) => {
           if reply.request != id.word() {
             // Another request's reply (an async call's, or an abandoned one's still in flight): kept for its
             // caller when one awaits it, else dropped and counted, as the async drain does (AUD-29-22); this wait
@@ -2395,15 +2470,12 @@ impl Client {
           }
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
         }
-        Err(IpcError::DeadlineExceeded) if self.end.daemon_gone() => {
+        // The daemon's process ended with the reply unwritten. A daemon that stops answering is ended by its supervisor,
+        // or by its own watchdog when it runs alone (A-232), so this is where every unanswered call's wait ends.
+        Waited::Departed => {
           self.reconnect()?;
           return Ok(None);
         }
-        // The daemon lives: the next wait re-arms the deadline (the module doc's rule, A-232). A daemon that stops
-        // answering is ended by its supervisor, or by its own watchdog when it runs alone, and a later deadline then
-        // finds it gone.
-        Err(IpcError::DeadlineExceeded) => {}
-        Err(e) => return Err(ClientError::Ipc(e)),
       }
     }
   }
@@ -2531,12 +2603,14 @@ impl Client {
 
   /// One step of a reconnect under the client's id, never waiting (AUD-29-19): the first step makes the
   /// claim, each later one reads its answer. `Ok(true)` connected (the fresh channel is bound to the
-  /// consumer on the next send); `Ok(false)` while the answer is due, or when no daemon answered (the
-  /// next step claims again). A live client holding the id is refused `SessionTaken`.
+  /// consumer on the next send); `Ok(false)` while the answer is due, or when the claim was refused for now while the
+  /// instance's rendezvous has a holder (the next step claims again); `DaemonGone` at once when it has none: no anchor
+  /// restarts the daemon (A-468). A live client holding the id is refused `SessionTaken`.
   pub fn try_reconnect(&mut self) -> Result<bool, ClientError> {
+    let began = *self.reconnect_began.get_or_insert_with(Instant::now);
     let polled = match self.reconnecting.as_mut() {
       Some(claim) => claim.poll(),
-      None => match begin_connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
+      None => match begin_connect_as(&self.instance, self.client_id) {
         Ok(claim) => self.reconnecting.insert(claim).poll(),
         Err(error) => Err(error),
       },
@@ -2544,23 +2618,42 @@ impl Client {
     if !matches!(polled, Ok(None)) {
       self.reconnecting = None;
     }
-    match polled {
-      Ok(None) => Ok(false),
-      Ok(Some(mut connected)) => {
-        let assigned = connected.region.client_id();
-        if assigned != self.client_id {
-          return Err(ClientError::SessionTaken { assigned });
-        }
-        connected.region.set_session_key(&self.session_key)?;
-        self.end = ClientEnd::connected(connected);
-        self.reconnects = self.reconnects.saturating_add(1);
-        self.bound = false;
-        self.attest_in_flight = None;
-        Ok(true)
-      }
-      Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => Ok(false),
+    let reconnected = match polled {
+      Ok(None) => return Ok(false),
+      Ok(Some(connected)) => self.adopt_reconnected(connected).map(|()| true),
+      Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => self.refused_reconnect(began),
       Err(e) => Err(ClientError::Ipc(e)),
+    };
+    if !matches!(reconnected, Ok(false)) {
+      self.reconnect_began = None;
     }
+    reconnected
+  }
+
+  /// A reconnect's claim refused: `Ok(false)` to claim again while the instance's rendezvous has a holder (the anchor
+  /// restarting its daemon, or a daemon holding its own; A-468), else `DaemonGone`, the time since the reconnect `began`.
+  fn refused_reconnect(&self, began: Instant) -> Result<bool, ClientError> {
+    if holder_lives(&self.instance)? {
+      return Ok(false);
+    }
+    Err(ClientError::DaemonGone {
+      after_ns: elapsed_ns(began),
+    })
+  }
+
+  /// Takes a reconnected channel as this client's: refused `SessionTaken` when the daemon gave another id; the session
+  /// key written into the fresh region, the reconnect counted, and the channel left to be bound to the consumer.
+  fn adopt_reconnected(&mut self, mut connected: Connected) -> Result<(), ClientError> {
+    let assigned = connected.region.client_id();
+    if assigned != self.client_id {
+      return Err(ClientError::SessionTaken { assigned });
+    }
+    connected.region.set_session_key(&self.session_key)?;
+    self.end = ClientEnd::connected(connected);
+    self.reconnects = self.reconnects.saturating_add(1);
+    self.bound = false;
+    self.attest_in_flight = None;
+    Ok(())
   }
 
   /// The client's derived budgets.
@@ -3591,32 +3684,31 @@ impl Client {
 
   /// Writes the request into the command ring, waiting for a slot under the module doc's rule (A-232): `true` once
   /// written; `false` when the daemon was found gone instead and the client reconnected (the caller binds and sends
-  /// again). Within the first reply deadline the wait spins, since the daemon drains its ring in microseconds; each
-  /// deadline that passes asks the daemon's liveness, and while it lives the wait goes on, paced as the reconnect
-  /// paces ([`next_pause_ns`] over the reply deadline: doubling from the wake estimate, at most a tenth of the
-  /// deadline), so a ring that a starved daemon does not drain costs this thread no core beside it.
+  /// again). The wait keeps [`RoomWait`]'s schedule (A-523): it spins for the client's wake estimate, since the daemon
+  /// drains its ring in microseconds, then parks, each pause twice the last and never past the next look at the
+  /// daemon's life, which comes on A-443's doubling; while the daemon lives the wait goes on, so a ring a starved daemon
+  /// does not drain costs this thread no core beside it. A slot that frees wakes nothing, so it is found at the next
+  /// try, within the time already waited. Until A-523 the wait spun for a whole reply deadline (a fixed second), asked
+  /// the daemon's liveness at each one, and paced its tries at a tenth of it.
   fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
-    let reply_ns = self.deadlines.reply_ns;
-    let mut armed = Instant::now();
-    // `None` while the first reply deadline runs; the pause between slot checks once one has passed.
-    let mut pause_ns: Option<u64> = None;
+    let started = Instant::now();
+    let mut wait = RoomWait::default();
     loop {
       match self.end.send_message(id.word(), body) {
         Ok(()) => return Ok(true),
         Err(IpcError::RingFull) => {
-          if elapsed_ns(armed) >= reply_ns {
-            if self.end.daemon_gone() {
-              self.reconnect()?;
-              return Ok(false);
+          let elapsed = elapsed_ns(started);
+          match wait.next(elapsed, self.end.wake_estimate_ns()) {
+            RoomStep::Spin => std::hint::spin_loop(),
+            RoomStep::Look => {
+              if self.end.daemon_gone() {
+                self.reconnect()?;
+                return Ok(false);
+              }
+              wait.looked(elapsed);
             }
-            armed = Instant::now();
-            pause_ns.get_or_insert(self.end.wake_estimate_ns().max(1));
-          }
-          match pause_ns {
-            None => std::hint::spin_loop(),
-            Some(pause) => {
-              std::thread::park_timeout(std::time::Duration::from_nanos(pause));
-              pause_ns = Some(next_pause_ns(pause, reply_ns));
+            RoomStep::Park(pause_ns) => {
+              std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
             }
           }
         }
@@ -3654,33 +3746,24 @@ impl Client {
     }
   }
 
-  /// Reconnects under the client's id inside the reconnect budget; refused when the budget
-  /// passes or a live client holds the id. The fresh channel is the account's until the client
-  /// binds it again (`rebind_if_needed`), which every send path does before sending.
+  /// Reconnects under the client's id while the instance's rendezvous has a holder (A-468): the anchor that restarts the
+  /// daemon, or a daemon that holds its own. Each claim waits while that holder lives, by no clock; a claim refused for
+  /// now (no slot free, the restarted daemon not yet published) is made again, paced as an async connect polls, and
+  /// with no holder left the reconnect fails `DaemonGone` at once. Refused too when a live client holds the id. The
+  /// fresh channel is the account's until the client binds it again (`rebind_if_needed`), which every send path does
+  /// before sending. Until A-468 the reconnect was tried for a budget (the recovery budget and a liveness window, two
+  /// seconds), which failed a client whose anchor took longer to restart its daemon and kept one whose daemon no
+  /// anchor would restart waiting out the whole budget.
   fn reconnect(&mut self) -> Result<(), ClientError> {
-    let started = Instant::now();
-    let budget = self.deadlines.reconnect_ns;
+    let began = Instant::now();
     let mut pause_ns = self.end.wake_estimate_ns().max(1);
     loop {
-      match connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
-        Ok(mut connected) => {
-          let assigned = connected.region.client_id();
-          if assigned != self.client_id {
-            return Err(ClientError::SessionTaken { assigned });
-          }
-          connected.region.set_session_key(&self.session_key)?;
-          self.end = ClientEnd::connected(connected);
-          self.reconnects = self.reconnects.saturating_add(1);
-          self.bound = false;
-          self.attest_in_flight = None;
-          return Ok(());
-        }
+      match connect_as(&self.instance, self.client_id) {
+        Ok(connected) => return self.adopt_reconnected(connected),
         Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => {
-          if elapsed_ns(started) >= budget {
-            return Err(ClientError::DaemonGone { after_ns: budget });
-          }
+          self.refused_reconnect(began)?;
           std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
-          pause_ns = next_pause_ns(pause_ns, budget);
+          pause_ns = next_pause_ns(pause_ns, CLAIM_WAIT_NS);
         }
         Err(e) => return Err(ClientError::Ipc(e)),
       }
@@ -4469,8 +4552,8 @@ impl Client {
   }
 
   /// Attaches for a host kernel mount of `volume` (§4.6, §4.13; the `slates mount` flow): the attachment
-  /// is the **mount's** — it outlives this client and the daemon, ending with the kernel's `UMNT` of the
-  /// mount, a `detach`, or the volume's destroy — and the reply's `token` is the capability the mount
+  /// is the **mount's** — it outlives this client and the daemon, ending when the kernel unmounts the mount
+  /// (A-511), with a `detach`, or with the volume's destroy — and the reply's `token` is the capability the mount
   /// presents (`/<name>@<attachment_hex>.<token_hex>`). A write intent takes the volume's write lease as
   /// any write attachment does (D-16; refused `LeaseHeld` while another principal holds it unexpired);
   /// a read intent records a read-only attachment, whose capability presents a read-only view.
@@ -5377,5 +5460,76 @@ fn fs_done(reply: ReplyBody, verb: &'static str) -> Result<u64, ClientError> {
   match reply {
     ReplyBody::FsDone { size } => Ok(size),
     _ => Err(ClientError::UnexpectedReply { verb }),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{RoomStep, RoomWait};
+
+  /// Shape: the client's wake estimate the wait is walked with: 3 µs, a wake measured on Apple silicon.
+  const WAKE_NS: u64 = 3_000;
+  /// Shape: how far one spin moves the clock in the walk: a tenth of the wake.
+  const SPIN_NS: u64 = WAKE_NS / 10;
+  /// Shape: the wait walked across: half again the reply deadline the wait spun through before A-523 (a second).
+  const WAIT_NS: u64 = 1_500_000_000;
+
+  /// A-523 (R3's class C). Do: walk a wait for a ring slot across 1.5 s from the first refusal, spinning, looking (the
+  /// daemon found alive each time) and parking as the schedule says. Expect: a spin only inside the wake estimate; each
+  /// pause no more than twice the last and never past the next look; the looks at twice the time waited from twice the
+  /// wake; and no more looks, nor parks between them, than the logarithm of the wait over the wake plus two. Before
+  /// A-523 the wait spun for a whole reply deadline, a second, and then paced its tries at a tenth of it.
+  #[test]
+  fn a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling() {
+    let mut wait = RoomWait::default();
+    let mut elapsed = 0;
+    let mut looks: Vec<u64> = Vec::new();
+    let mut parks: Vec<u64> = Vec::new();
+    while elapsed < WAIT_NS {
+      match wait.next(elapsed, WAKE_NS) {
+        RoomStep::Spin => {
+          assert!(
+            elapsed < WAKE_NS,
+            "spun at {elapsed} ns, past the wake estimate"
+          );
+          elapsed += SPIN_NS;
+        }
+        RoomStep::Look => {
+          looks.push(elapsed);
+          wait.looked(elapsed);
+        }
+        RoomStep::Park(pause) => {
+          let to_look = wait.looks.until(elapsed).unwrap();
+          assert!(
+            pause <= to_look,
+            "a {pause} ns pause past the next look, {to_look} ns on"
+          );
+          if let Some(last) = parks.last() {
+            assert!(pause <= 2 * last, "a {pause} ns pause after {last} ns");
+          }
+          parks.push(pause);
+          elapsed += pause;
+        }
+      }
+    }
+    assert_eq!(
+      looks.first(),
+      Some(&(2 * WAKE_NS)),
+      "the first look at twice the wake"
+    );
+    for pair in looks.windows(2) {
+      assert_eq!(pair[1], 2 * pair[0], "the looks at {looks:?}");
+    }
+    let bound = u64::from((WAIT_NS / WAKE_NS).ilog2()) + 2;
+    assert!(
+      u64::try_from(looks.len()).unwrap() <= bound,
+      "{} looks, past {bound}",
+      looks.len()
+    );
+    assert!(
+      u64::try_from(parks.len()).unwrap() <= bound,
+      "{} parks, past {bound}",
+      parks.len()
+    );
   }
 }

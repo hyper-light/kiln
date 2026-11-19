@@ -4573,7 +4573,7 @@ async fn enroll_slates_node(hub: &Hub, req: Request) -> R {
     if !known {
         return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
     }
-    let issued = crate::workspace::slates_fleet::issue(&hub.pki, &ask).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let issued = crate::workspace::slates_fleet::issue(&hub.pki, &ask, &hub.cfg.slates_fleet).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
     // Every certificate kiln issues is recorded first (W27-R01).
     let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(&issued.certificate) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::identities::record(&hub.store, "slates-node", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -6264,8 +6264,10 @@ async fn harness_workspaces(hub: &Hub) -> Response {
     let mut out = serde_json::Map::new();
     let mut targets = vec!["local".to_owned()];
     targets.extend(hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
+    // Mounted on each machine's host, as an agent there works in one (W2); a volume served to a microVM, which needs no
+    // host mount, is judged as its isolated start is made (`lineage::WorkspaceUse::Served`, W8).
     for t in targets {
-        let v = match crate::harness::lineage::workspaces_on(hub, &t).await {
+        let v = match crate::harness::lineage::workspaces_on(hub, &t, crate::harness::lineage::WorkspaceUse::Mounted).await {
             Ok(()) => json!({"available": true}),
             Err(no) => json!({"available": false, "why_not": no.said, "missing": no.missing}),
         };
@@ -6931,12 +6933,14 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     as_asked(&mut body.spec, caller.as_ref());
     // A workspace is asked for by its kind alone (its machine makes a volume), a volume only of a machine that can make
     // one: one that can't would let it work in the folder itself, unasked. Asked nothing, it gets a volume where its
-    // machine can make one (`Registry::open_as`); the folder itself is a choice kept as made.
+    // machine can make one (`Registry::open_as`); the folder itself is a choice kept as made. One that will run isolated,
+    // as the registry decides its boundary, has its volume served to its microVM, which needs no host mount (W8).
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
         None => {}
         Some("folder") => body.spec.workspace = Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }),
         Some("volume") => {
-            crate::harness::lineage::workspaces_on(hub, &body.target).await.map_err(|no| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
+            let used = crate::harness::lineage::WorkspaceUse::of(hub.harness.isolation_for(hub, &body.target, &body.spec).is_some());
+            crate::harness::lineage::workspaces_on(hub, &body.target, used).await.map_err(|no| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
             body.spec.workspace = Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });
         }
         Some(other) => return Err(err(StatusCode::BAD_REQUEST, format!("a workspace is \"folder\" or \"volume\", not {other:?}"))),

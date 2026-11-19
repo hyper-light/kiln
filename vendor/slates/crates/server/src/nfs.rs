@@ -35,8 +35,10 @@
 //! path, stamped into the root handle and every handle derived from it, and validated against the
 //! attachment record on every request. A bare `/` lists nothing and enters nothing. The attachment a
 //! host mount rides on is the **mount's** (`Consumer::Bridge`): it outlives the client that attached
-//! and a daemon restart (the kernel's handles must keep validating), and it ends with the kernel's
-//! `UMNT` of the mount path ([`unmount_capability`]), a `detach`, or the volume's destroy.
+//! and a daemon restart (the kernel's handles must keep validating), and it ends when the kernel unmounts the mount
+//! (seen through the kernel's own unmount event on the shard that holds it, A-511; on macOS, `own_nfs::watch`), with a
+//! `detach`, or with the volume's destroy. A `UMNT` ends nothing: it is a hint any local process can send, and the
+//! kernel sends none at a forced unmount.
 //!
 //! A volume appears under its **provisioned name** (§4.6 "Chosen path"): the slot carries the name
 //! ([`crate::state::VolumeSlot`]), [`ShardVolumeSet::entries`] lists it, and a root `LOOKUP`/`MNT` of a
@@ -107,7 +109,7 @@ use slates_bridge_nfs::{
   AcceptStatus, MultiExport, Nfsstat3, UnixGroups, VolumeSet, auth_sys_identity, parse_call,
   reply_record, request_volume, root_volume, serve_call,
 };
-use slates_db::catalog::{AttachForm, Consumer, Principal, VolumeId};
+use slates_db::catalog::{Principal, VolumeId};
 use slates_db::register::ObjectId;
 use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
@@ -852,8 +854,8 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
       let _dir = Nfsfh3::decode(&mut reader).ok()?;
       Some(reader.string(NFS_MAXNAMELEN).ok()?.to_owned())
     }
-    // A `MNT` and the kernel's `UMNT` of the same path both route to the name's owner: the mount is served
-    // there, and the unmount ends the mount's attachment there (AUD-01).
+    // A `MNT` routes to the name's owner, where the mount is served; the kernel's `UMNT` of the same path goes there
+    // too and is answered void (it ends nothing: the kernel's own unmount event does, A-511).
     MOUNT_PROGRAM if is_mount_request(program, procedure) => {
       let path = XdrReader::new(args).string(MNT_PATH_MAX).ok()?;
       let name = path.trim_matches('/');
@@ -871,136 +873,6 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
 /// (§4.13; AUD-01): the mount to be served under it, the unmount to end its attachment.
 fn is_mount_request(program: u32, procedure: u32) -> bool {
   program == MOUNT_PROGRAM && (procedure == MOUNTPROC3_MNT || procedure == MOUNTPROC3_UMNT)
-}
-
-/// The kernel's `UMNT` of `/<name>` ends the attachment of the mount it unmounts (§4.6, §4.13; AUD-01),
-/// once the kernel's mount table confirms that mount is gone. The path is the mount's source name, with
-/// no capability (§4.6 A-34), so a `UMNT` alone proves nothing: any local process could send one. On the
-/// name's owner shard every host mount (`Consumer::Bridge`) of the named volume bound to a mount point is
-/// watched by [`confirm_unmount`]: an attachment ends (as a `detach` would, `verbs::end_attachment`) when
-/// its mount point no longer holds this volume's mount, and one whose mount is still there when the
-/// deadline passes is a mount nobody unmounted, left as it is. `UMNT` has no status (RFC 1813 §5.2.3),
-/// so the reply is void; `args` is `/<name>`.
-fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
-  let Ok(path) = XdrReader::new(args).string(MNT_PATH_MAX) else {
-    return;
-  };
-  let name = path.trim_matches('/').to_owned();
-  if name.is_empty() || name.contains('@') {
-    return;
-  }
-  let mounts: Vec<(u64, String)> = state::with_state(|s| {
-    let Some(volume) = s.db.partition().volume_by_name(&name).map(|v| v.id) else {
-      return Vec::new();
-    };
-    s.db
-      .partition()
-      .attachments_of(volume)
-      .into_iter()
-      .filter_map(|record| match (&record.consumer, &record.form) {
-        (Consumer::Bridge, AttachForm::ChosenPath { path })
-        | (
-          Consumer::Bridge,
-          AttachForm::ScopedMount {
-            mount_point: Some(path),
-            ..
-          }
-          | AttachForm::BoundMount {
-            mount_point: Some(path),
-            ..
-          },
-        ) => Some((record.id, path.clone())),
-        _ => None,
-      })
-      .collect()
-  })
-  .unwrap_or_default();
-  if mounts.is_empty() {
-    let _ = state::with_state_counted(|s| s.count("nfs.unmount_refused", 1));
-    return;
-  }
-  match futures::spawn(confirm_unmount(name, mounts)) {
-    Ok(task) => {
-      let _ = futures::detach(task);
-    }
-    Err(_) => {
-      crate::fleet::count_refusal("nfs.unmount_refused");
-    }
-  }
-}
-
-/// Derived: how long a `UMNT` waits for its mount to leave the kernel's mount table: one liveness
-/// budget ([`crate::daemon::LIVENESS_BUDGET_NS`]). The kernel sends `UMNT` while it unmounts, so the
-/// mount leaves the table within the unmount's own few steps; one still there after the budget the
-/// anchor gives the daemon to beat was not being unmounted.
-const UNMOUNT_CONFIRM_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
-
-/// Ends each of `mounts` (attachment, mount point) whose point no longer holds `name`'s mount, checking at
-/// the fleet's poll interval for at most [`UNMOUNT_CONFIRM_NS`] ([`unmount_capability`]). The check stops
-/// early once one mount has gone: a `UMNT` is one unmount.
-async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
-  let began = futures::now_ns();
-  let poll = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-  loop {
-    let gone: Vec<u64> = mounts
-      .iter()
-      .filter(|(_, point)| !holds_mount_of(point, &name))
-      .map(|(attachment, _)| *attachment)
-      .collect();
-    if !gone.is_empty() {
-      let _ = state::with_state_counted(|s| {
-        for attachment in gone {
-          let ended = s
-            .db
-            .partition()
-            .attachment(attachment)
-            .cloned()
-            .is_some_and(|record| {
-              crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_ok()
-            });
-          if !ended {
-            s.count("nfs.unmount_refused", 1);
-          }
-        }
-      });
-      return;
-    }
-    if futures::now_ns().saturating_sub(began) >= UNMOUNT_CONFIRM_NS {
-      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
-      return;
-    }
-    if futures::sleep(poll).await.is_err() {
-      // Off a shard no poll can be timed: the confirmation is given up, counted, never spun on.
-      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
-      return;
-    }
-  }
-}
-
-/// Whether `mount_point` is still where `name`'s loopback mount is: the kernel's mount table
-/// (`getfsstat(MNT_NOWAIT)`, `slates_bridge_oci::mount_table`) lists a mount exactly there whose source is
-/// `slates:/<name>` (§4.6 A-34). The table is read, never the mount: a `statfs` of the point would send
-/// an NFS request to this very daemon, and on a single shard the shard that must answer is the one
-/// waiting (the hazard `slates-bridge-oci`'s module doc records). A table that cannot be read counts as
-/// the mount still being there, so nothing ends on a read error.
-#[cfg(target_os = "macos")]
-fn holds_mount_of(mount_point: &str, name: &str) -> bool {
-  let Ok(entries) = slates_bridge_oci::mount_table::mount_table() else {
-    return true;
-  };
-  let source = format!("slates:/{name}");
-  entries
-    .iter()
-    .rev()
-    .find(|entry| entry.mount_point.trim_end_matches('/') == mount_point.trim_end_matches('/'))
-    .is_some_and(|entry| entry.source == source)
-}
-
-/// Off macOS a loopback NFS mount is not how volumes are mounted (Linux uses FUSE, which ends its
-/// attachment when the kernel closes the device); a `UMNT` there is never taken as proof of an unmount.
-#[cfg(not(target_os = "macos"))]
-fn holds_mount_of(_mount_point: &str, _name: &str) -> bool {
-  true
 }
 
 /// Splits a mount path of the form `<name>@<attachment_hex>.<token_hex>` — or `@<attachment_hex>.<token_hex>`
@@ -1050,8 +922,8 @@ fn presented_capability(
 ) -> (Option<MountCapability>, Option<Vec<u8>>) {
   if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
     // The kernel's `UMNT` names the volume by the mount's source (`slates:/<name>` gives `/<name>`), with
-    // no capability (§4.6 A-34); it presents none, and the unmount is confirmed against the kernel's
-    // mount table before anything ends ([`unmount_capability`]).
+    // no capability (§4.6 A-34); it presents none, and it ends nothing: the kernel's own unmount event ends a
+    // mount's attachment (A-511).
     return (None, None);
   }
   if is_mount_request(program, procedure) {
@@ -1152,11 +1024,6 @@ fn serve_local(
     s.tracer
       .open_root(request, Chokepoint::BridgeRequest, start_ns)
   });
-  // The kernel's unmount ends the mount's attachment here, on the name's owner shard (AUD-01); the
-  // bridge then answers the void `UMNT` reply.
-  if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
-    unmount_capability(requester.capability, args);
-  }
   let requester_dialect = requester.dialect;
   let mut service = MultiExport::new(
     ShardVolumeSet {
@@ -3825,21 +3692,21 @@ mod tests {
     assert_eq!(received.try_recv().unwrap(), None);
   }
 
-  /// RFC 8881 §8.3, A-425. Do: on a daemon whose operator set the failover SLO to one liveness window, take the limits
-  /// its NFSv4 listener runs under and a client table of one under them; register a client, then have a second client
+  /// RFC 8881 §8.3, A-425. Do: on a shard whose failover delay is one liveness window, take the limits its NFSv4
+  /// listener runs under and a client table of one under them; register a client, then have a second client
   /// ask the full table for room just before the first's next renewal were it an idle Linux client (its renewal floor
   /// after its last renewal, delivered within a liveness window), and again once the first has been silent a whole
   /// lease. Expect: the first ask refused `NFS4ERR_DELAY` with the idle client kept, and the second granted in its
-  /// place. Before, the lease was the operator's failover SLO, so with a short one every idle Linux client lapsed
-  /// between two of its renewals, and a full table dropped a live client's state.
+  /// place. Before A-425, the lease was the operator's failover placeholder (gone since A-525), so with a short one
+  /// every idle Linux client lapsed between two of its renewals, and a full table dropped a live client's state.
   #[test]
-  fn an_idle_linux_client_keeps_its_nfs_v4_lease_whatever_the_failover_slo() {
+  fn an_idle_linux_client_keeps_its_nfs_v4_lease_whatever_the_failover_delay() {
     use slates_bridge_nfs::v4::session::{ExchangeId, Sessions};
     use slates_bridge_nfs::v4::types::VERIFIER_SIZE;
-    let limits = crate::daemon::audit_on_shard_configured(
-      |s| v4_limits(s),
-      |config| config.failover_slo_ns = crate::daemon::LIVENESS_BUDGET_NS,
-    );
+    let limits = crate::daemon::audit_on_shard(|s| {
+      s.failover_ns = crate::daemon::LIVENESS_BUDGET_NS;
+      v4_limits(s)
+    });
     let mut table = Sessions::new(
       1,
       Limits {

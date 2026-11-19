@@ -4541,7 +4541,9 @@ dependencies = [
  "rustix",
  "serde_json",
  "slates-anchor",
+ "slates-base",
  "slates-bridge-nfs",
+ "slates-bridge-oci",
  "slates-bridge-winfsp",
  "slates-client",
  "slates-db",
@@ -4570,10 +4572,14 @@ dependencies = [
 name = "slates-base"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "libc",
  "rustix",
+ "rustls",
  "slates-bridge-oci",
  "slates-machine",
+ "slates-rt",
+ "slates-transport",
  "slates-vfs",
  "windows-sys 0.60.2",
 ]
@@ -4759,7 +4765,6 @@ name = "slates-merge"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "slates-mem",
 ]
 
 [[package]]

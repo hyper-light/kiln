@@ -169,6 +169,12 @@ pub struct PartitionSnapshot {
   /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291; 2026-11-18; appended), by
   /// (volume, snapshot) order.
   pub captured_bases: Vec<CapturedBase>,
+  /// Each volume's carried capture (A-503; 2026-11-18; appended), by volume order.
+  pub carried_captures: Vec<crate::catalog::CarriedCaptureRecord>,
+  /// The repositories this partition holds (§4.17.1, A-515; appended), by id order.
+  pub repositories: Vec<crate::catalog::RepositoryRecord>,
+  /// Their namespaces' bindings (§4.17.1, A-515; appended), by (repository, name) order.
+  pub repository_branches: Vec<crate::catalog::BranchRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -252,8 +258,19 @@ pub struct Partition {
   leases_by_holder: Art<VolumeId>,
   lease_expiry: Wheel,
   lease_timers: BTreeMap<VolumeId, slates_rt::timer::TimerId>,
+  /// The earliest lease expiry entered in the wheel since the shard's deadline keeper last asked
+  /// ([`Partition::take_noted_lease`]): what tells the keeper a lease was set to lapse before the deadline it sleeps for
+  /// (A-536), whichever path recorded it (a take, a renewal, a replay).
+  lease_noted: Option<u64>,
   attachments: Slab<AttachmentRecord>,
   attachment_index: Art<Handle<AttachmentRecord>>,
+  /// The termed attachments (a CLI's, A-230) by when their term lapses, each `(expires_ns, id)`: derived from the
+  /// records, made again at a restore, one entry a termed attachment, so the lapsed are found without a walk of the
+  /// table (A-536).
+  termed_by_expiry: BTreeSet<(u64, u64)>,
+  /// The earliest term entered in [`Partition::termed_by_expiry`] since the shard's deadline keeper last asked
+  /// ([`Partition::take_noted_term`]), as `lease_noted` is for leases (A-536).
+  term_noted: Option<u64>,
   completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
   /// The completions a green's successor adopted from the green's merge records (A-255), each with the work whose submit
   /// it completes (A-288), by key `(origin, client, sequence)`: held while the client's window retains the completion,
@@ -303,6 +320,13 @@ pub struct Partition {
   /// base directory. Bounded by the snapshots (one entry a snapshot at most); an entry leaves with its snapshot or its
   /// volume.
   captured_bases: std::collections::BTreeSet<CapturedBase>,
+  /// Each captured clone's carried capture (A-503): what its move carried of its capture, shipped in its catalog, and
+  /// the snapshot here it is relative to (its mark). One entry a volume at most; an entry leaves with its volume, and its
+  /// mark with its snapshot.
+  carried: BTreeMap<VolumeId, (crate::catalog::CarriedRecord, Option<SnapshotId>)>,
+  /// The repositories and their namespaces (§4.17.1, A-515): repositories bounded by `caps.volumes`, bindings by the
+  /// greens each binds.
+  repositories: crate::repository::Repositories,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -389,6 +413,9 @@ impl Partition {
       leases_by_holder: Art::new(),
       lease_expiry: Wheel::new(caps.tick_ns, caps.timers, now_ns),
       lease_timers: BTreeMap::new(),
+      lease_noted: None,
+      termed_by_expiry: BTreeSet::new(),
+      term_noted: None,
       attachments: Slab::new(caps.segment_slots, caps.attachments),
       attachment_index: Art::new(),
       completions: BTreeMap::new(),
@@ -429,7 +456,25 @@ impl Partition {
       audit_received: BTreeMap::new(),
       grants_issued_through: 0,
       captured_bases: std::collections::BTreeSet::new(),
+      carried: BTreeMap::new(),
+      repositories: crate::repository::Repositories::new(),
       tombstones: BTreeMap::new(),
+    }
+  }
+
+  /// The repositories this partition holds and their namespaces (§4.17.1, A-515).
+  pub fn repositories(&self) -> &crate::repository::Repositories {
+    &self.repositories
+  }
+
+  /// What the catalog holds under `id`, as a repository's namespace asks it (§4.17.1: a namespace binds greens).
+  fn held(&self, id: VolumeId) -> crate::repository::Held {
+    match self.volume(id) {
+      None => crate::repository::Held::Absent,
+      Some(record) if matches!(record.policy.role, crate::catalog::Role::Green { .. }) => {
+        crate::repository::Held::Green
+      }
+      Some(_) => crate::repository::Held::NotGreen,
     }
   }
 
@@ -822,6 +867,18 @@ impl Partition {
       .contains(&CapturedBase { volume, snapshot })
   }
 
+  /// What a captured clone's move carried of its capture (A-503), with the snapshot here it is relative to (its mark),
+  /// when this node holds one.
+  pub fn carried(
+    &self,
+    volume: VolumeId,
+  ) -> Option<(&crate::catalog::CarriedRecord, Option<SnapshotId>)> {
+    self
+      .carried
+      .get(&volume)
+      .map(|(carried, mark)| (carried, *mark))
+  }
+
   /// A clone's lineage edge.
   pub fn lineage(&self, child: VolumeId) -> Option<&LineageEdge> {
     self.lineage.get(&child.bytes)
@@ -921,8 +978,53 @@ impl Partition {
       .attachment_index
       .remove(&id.to_be_bytes())
       .ok_or(DbError::NotFound)?;
-    self.attachments.remove(handle)?;
+    let record = self.attachments.remove(handle)?;
+    self.unindex_term(&record);
     Ok(())
+  }
+
+  /// Enters a termed attachment's lapse in [`Partition::termed_by_expiry`] and notes it for the keeper (A-536); any
+  /// other kind holds no term.
+  fn index_term(&mut self, record: &AttachmentRecord) {
+    if let Consumer::Termed { expires_ns } = record.consumer {
+      self.termed_by_expiry.insert((expires_ns, record.id));
+      self.term_noted = Some(
+        self
+          .term_noted
+          .map_or(expires_ns, |noted| noted.min(expires_ns)),
+      );
+    }
+  }
+
+  /// Takes a termed attachment's lapse out of [`Partition::termed_by_expiry`].
+  fn unindex_term(&mut self, record: &AttachmentRecord) {
+    if let Consumer::Termed { expires_ns } = record.consumer {
+      self.termed_by_expiry.remove(&(expires_ns, record.id));
+    }
+  }
+
+  /// The termed attachments whose term lapsed by `now_ns`, read from their index alone (A-536): the caller ends each.
+  pub fn lapsed_terms(&self, now_ns: u64) -> Vec<u64> {
+    self
+      .termed_by_expiry
+      .iter()
+      .take_while(|(expires_ns, _)| *expires_ns <= now_ns)
+      .map(|(_, id)| *id)
+      .collect()
+  }
+
+  /// When the next termed attachment lapses, the deadline the shard's keeper sleeps until for them (A-536).
+  pub fn next_term_lapse(&self) -> Option<u64> {
+    self
+      .termed_by_expiry
+      .first()
+      .map(|(expires_ns, _)| *expires_ns)
+  }
+
+  /// The earliest term entered since the last call, taken: the keeper wakes for it when it sleeps for a later deadline
+  /// (A-536).
+  pub fn take_noted_term(&mut self) -> Option<u64> {
+    self.term_noted.take()
   }
 
   /// The highest attachment id the partition holds, or `None` when it holds none (a walk of the table,
@@ -1371,6 +1473,22 @@ impl Partition {
         self.snapshot(*volume, *snapshot).ok_or(DbError::NotFound)?;
         Ok(())
       }
+      // A carried capture names a volume here, and its mark one of that volume's snapshots (A-503).
+      Op::CaptureCarried { volume, mark, .. } | Op::CaptureAdopted { volume, mark, .. } => {
+        self.volume(*volume).ok_or(DbError::NotFound)?;
+        if let Some(mark) = mark {
+          self.snapshot(*volume, *mark).ok_or(DbError::NotFound)?;
+        }
+        Ok(())
+      }
+      // A repository's record and namespace keep §4.17.1's rules (A-515): `crate::repository`.
+      Op::RepositoryCreated { .. }
+      | Op::RepositoryBranchAdded { .. }
+      | Op::RepositoryBranchRetired { .. }
+      | Op::RepositoryDefaultSet { .. }
+      | Op::RepositoryDestroyed { .. } => self
+        .repositories
+        .check(op, self.caps.volumes, |id| self.held(id)),
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1437,6 +1555,9 @@ impl Partition {
       }
       Op::AttachmentRemoved { id } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::AttachmentBound { id, .. } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
+      Op::AttachmentMountSeen { id, .. } => {
+        self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound)
+      }
       // Only an attachment presenting a snapshot is re-pinned; the head is not a version to move from.
       Op::AttachmentRepinned { id, .. } => self
         .attachment(*id)
@@ -1724,6 +1845,40 @@ impl Partition {
 
   // ------------------------------------------------------------------ the transition
 
+  /// [`Op::VolumeDestroyed`]'s effect: the tombstone takes the volume's slot, its sequence read before the record goes;
+  /// and the volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its one
+  /// wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
+  fn destroy_volume(&mut self, id: VolumeId) -> Result<(), DbError> {
+    let sequence = self.tombstone_sequence(id);
+    let tenant = self.volume(id).map(|volume| volume.owner.tenant());
+    self.remove_volume(id)?;
+    if let Some(sequence) = sequence {
+      self.tombstones.insert(id, sequence);
+    }
+    self.erase_volume_keys(id, tenant);
+    Ok(())
+  }
+
+  /// [`Op::SnapshotDestroyed`]'s effect: the record and its index entry go, with any capture base it was; and a carried
+  /// capture's mark goes with its snapshot (A-503), so its landings are refused from then on.
+  fn destroy_snapshot(&mut self, volume: VolumeId, id: SnapshotId) -> Result<(), DbError> {
+    let h = self
+      .snapshot_index
+      .remove(&snapshot_key(volume, id))
+      .ok_or(DbError::NotFound)?;
+    self.snapshots.remove(h)?;
+    self.captured_bases.remove(&CapturedBase {
+      volume,
+      snapshot: id,
+    });
+    if let Some((_, mark)) = self.carried.get_mut(&volume)
+      && *mark == Some(id)
+    {
+      *mark = None;
+    }
+    Ok(())
+  }
+
   /// Applies a recorded operation; unconditional, so replay is deterministic. A record the
   /// operation names that does not exist (a corrupted history) is a typed refusal.
   pub fn apply(&mut self, op: &Op) -> Result<(), DbError> {
@@ -1777,19 +1932,7 @@ impl Partition {
         v.policy.write_version = v.policy.write_version.saturating_add(1);
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
-      Op::VolumeDestroyed { id } => {
-        // The tombstone takes the volume's slot: its sequence is read before the record goes.
-        let sequence = self.tombstone_sequence(*id);
-        let tenant = self.volume(*id).map(|volume| volume.owner.tenant());
-        self.remove_volume(*id)?;
-        if let Some(sequence) = sequence {
-          self.tombstones.insert(*id, sequence);
-        }
-        // The volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its
-        // one wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
-        self.erase_volume_keys(*id, tenant);
-        Ok(())
-      }
+      Op::VolumeDestroyed { id } => self.destroy_volume(*id),
       Op::VolumeReleased { id } => self.release_volume(*id),
       Op::BaseCaptured { volume, snapshot } => {
         self.captured_bases.insert(CapturedBase {
@@ -1798,6 +1941,33 @@ impl Partition {
         });
         Ok(())
       }
+      // The catalog register carries it (A-503), so its version moves as the write policy's does.
+      Op::CaptureCarried {
+        volume,
+        carried,
+        mark,
+      } => {
+        self.update_volume(*volume, |v| {
+          v.catalog_version = v.catalog_version.saturating_add(1);
+        })?;
+        self.carried.insert(*volume, (carried.clone(), *mark));
+        Ok(())
+      }
+      // Adopted with the volume's catalog, which already carries it: its version stays (A-503).
+      Op::CaptureAdopted {
+        volume,
+        carried,
+        mark,
+      } => {
+        self.volume(*volume).ok_or(DbError::NotFound)?;
+        self.carried.insert(*volume, (carried.clone(), *mark));
+        Ok(())
+      }
+      Op::RepositoryCreated { .. }
+      | Op::RepositoryBranchAdded { .. }
+      | Op::RepositoryBranchRetired { .. }
+      | Op::RepositoryDefaultSet { .. }
+      | Op::RepositoryDestroyed { .. } => self.repositories.apply(op),
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -1829,18 +1999,7 @@ impl Partition {
         self.snapshots.get_mut(h)?.identity = Some(*identity);
         Ok(())
       }
-      Op::SnapshotDestroyed { volume, id } => {
-        let h = self
-          .snapshot_index
-          .remove(&snapshot_key(*volume, *id))
-          .ok_or(DbError::NotFound)?;
-        self.snapshots.remove(h)?;
-        self.captured_bases.remove(&CapturedBase {
-          volume: *volume,
-          snapshot: *id,
-        });
-        Ok(())
-      }
+      Op::SnapshotDestroyed { volume, id } => self.destroy_snapshot(*volume, *id),
       Op::LineageAdded { edge } => {
         self.lineage.insert(&edge.child.bytes, edge.clone());
         Ok(())
@@ -1850,6 +2009,7 @@ impl Partition {
       Op::AttachmentAdded { record } => {
         let h = self.attachments.insert(record.clone())?;
         self.attachment_index.insert(&record.id.to_be_bytes(), h);
+        self.index_term(record);
         Ok(())
       }
       Op::ClientIdReserved { client } => {
@@ -1881,9 +2041,17 @@ impl Partition {
           .get(&id.to_be_bytes())
           .ok_or(DbError::NotFound)?;
         let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
-        record.consumer = Consumer::Termed {
-          expires_ns: *expires_ns,
-        };
+        let lapsed_at = std::mem::replace(
+          &mut record.consumer,
+          Consumer::Termed {
+            expires_ns: *expires_ns,
+          },
+        );
+        let renewed = record.clone();
+        if let Consumer::Termed { expires_ns: before } = lapsed_at {
+          self.termed_by_expiry.remove(&(before, *id));
+        }
+        self.index_term(&renewed);
         Ok(())
       }
       Op::AttachmentExpired { id } => {
@@ -1950,6 +2118,15 @@ impl Partition {
             (None, None) => crate::catalog::AttachForm::ChosenPath { path: path.clone() },
           };
         }
+        Ok(())
+      }
+      Op::AttachmentMountSeen { id, mount } => {
+        let h = *self
+          .attachment_index
+          .get(&id.to_be_bytes())
+          .ok_or(DbError::NotFound)?;
+        let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
+        record.mount = Some(*mount);
         Ok(())
       }
       Op::AttachmentRepinned { id, snapshot } => {
@@ -2242,6 +2419,9 @@ impl Partition {
     }
     self.lineage.remove(&id.bytes);
     self.captured_bases.retain(|captured| captured.volume != id);
+    self.carried.remove(&id);
+    // A destroyed green leaves the namespace that bound it (§4.17.1, A-515).
+    self.repositories.green_removed(id);
     // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
     // a volume that no longer exists), returning its bytes to the chain budget.
     if let Some(chain) = self.green_chains.remove(&id) {
@@ -2297,7 +2477,24 @@ impl Partition {
         table: "lease timers",
       })?;
     self.lease_timers.insert(volume, timer);
+    // Noted as the wheel will report it, its tick at or after the expiry (`next_lease_expiry`), so the keeper's own arming
+    // for it reads as no earlier deadline.
+    let tick = self.lease_expiry.tick_ns().max(1);
+    let due = lease.expires_ns.div_ceil(tick).saturating_mul(tick);
+    self.lease_noted = Some(self.lease_noted.map_or(due, |noted| noted.min(due)));
     Ok(())
+  }
+
+  /// The earliest lease expiry entered since the last call, taken: the shard's keeper wakes for it when it sleeps for a
+  /// later deadline (A-536).
+  pub fn take_noted_lease(&mut self) -> Option<u64> {
+    self.lease_noted.take()
+  }
+
+  /// When the next lease lapses on the wheel, the deadline the shard's keeper sleeps until for leases (A-536): the
+  /// wheel's tick at or after the earliest expiry, so a pass at that moment finds the lease due.
+  pub fn next_lease_expiry(&mut self) -> Option<u64> {
+    self.lease_expiry.next_deadline_ns()
   }
 
   /// The volumes whose leases expired by `now_ns` (the caller records `LeaseReleased` for
@@ -2405,6 +2602,19 @@ impl Partition {
         .collect(),
       green_adoptions: self.green_adoptions.values().copied().collect(),
       captured_bases: self.captured_bases.iter().copied().collect(),
+      carried_captures: self
+        .carried
+        .iter()
+        .map(
+          |(volume, (carried, mark))| crate::catalog::CarriedCaptureRecord {
+            volume: *volume,
+            carried: carried.clone(),
+            mark: *mark,
+          },
+        )
+        .collect(),
+      repositories: self.repositories.repositories().cloned().collect(),
+      repository_branches: self.repositories.bindings().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2614,6 +2824,7 @@ impl Partition {
     for a in &snapshot.attachments {
       let h = p.attachments.insert(a.clone())?;
       p.attachment_index.insert(&a.id.to_be_bytes(), h);
+      p.index_term(a);
     }
     p.restore_completions(&snapshot.completions);
     for g in &snapshot.grants {
@@ -2643,6 +2854,15 @@ impl Partition {
     p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
     p.captured_bases = snapshot.captured_bases.iter().copied().collect();
+    p.carried = snapshot
+      .carried_captures
+      .iter()
+      .map(|record| (record.volume, (record.carried.clone(), record.mark)))
+      .collect();
+    p.repositories = crate::repository::Repositories::restore(
+      &snapshot.repositories,
+      &snapshot.repository_branches,
+    )?;
     Ok(p)
   }
 

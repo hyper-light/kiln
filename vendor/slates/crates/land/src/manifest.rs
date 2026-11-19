@@ -7,12 +7,15 @@
 //! ([`PlanWalk::against_capture`]): its source tree against the captured snapshot's, over the paths where the two part
 //! (`slates_vfs::captured`), every entry judged by content alone ([`Judged::Content`]). Its files hold no witness of
 //! the target (the capture made every body the volume's own, and the target is another folder than the one the
-//! capture read), so a witness there is the BLAKE3 of the bytes the capture held and nothing else.
+//! capture read), so a witness there is the BLAKE3 of the bytes the capture held and nothing else. A clone that moved
+//! to another member (A-503) is planned the same way against what its move carried of the capture and the head it
+//! handed over (`slates_vfs::captured::CaptureBase::Carried`): the capture's state at each path is the same either
+//! way, so the entries are too.
 
 use std::collections::BTreeMap;
 
 use slates_vfs::base::{Diverged, Divergence};
-use slates_vfs::captured::{ChangedPaths, FrozenTree, Held};
+use slates_vfs::captured::{CaptureBase, CaptureSearch, CapturedState, FrozenTree, Held};
 use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
@@ -35,13 +38,14 @@ const MAGIC: &[u8; 4] = b"SLMF";
 const VERSION: u16 = 3;
 /// Format: the encoding version of a manifest judged by content ([`Judged::Content`], A-291): the layout of
 /// [`VERSION`] with each witness tagged [`WITNESS_CONTENT`], so no grant of one binds a manifest of the other. 4 since
-/// A-451, with the bits, as [`VERSION`].
-const VERSION_CONTENT: u16 = 4;
+/// A-451, with the bits, as [`VERSION`]; 5 since A-466, each witness with the mode and Windows bits the capture held
+/// (`FileMeta`), which a replacement's metadata is judged against: a grant binds what it judges by.
+const VERSION_CONTENT: u16 = 5;
 /// Format: a witness tag: none.
 const WITNESS_NONE: u8 = 0;
 /// Format: a witness tag: a fingerprint and an identity ([`Judged::Witness`]).
 const WITNESS_FINGERPRINT: u8 = 1;
-/// Format: a witness tag: an identity alone ([`Judged::Content`]).
+/// Format: a witness tag: an identity and the metadata the capture held ([`Judged::Content`]; the metadata since A-466).
 const WITNESS_CONTENT: u8 = 2;
 /// Format: the action tags of the encoding, in the order the design lists the actions.
 const TAG_CREATE: u8 = 0;
@@ -59,6 +63,12 @@ const TAG_RMDIR: u8 = 5;
 const TAG_SYMLINK: u8 = 6;
 /// Format: see `TAG_CREATE`.
 const TAG_CLEAR: u8 = 7;
+/// Format: see `TAG_CREATE`; then the metadata the base held and the volume's, each a `FileMeta` (A-458). No manifest
+/// before A-458 held this tag, and every other entry encodes as it did, so the layouts' versions stand.
+const TAG_CHMOD: u8 = 8;
+/// Format: see `TAG_CREATE`; then a directory's metadata as the base held it and as the volume holds it, each a
+/// `FileMeta` (A-501). New with A-501, so every older manifest encodes as it did.
+const TAG_CHMOD_DIR: u8 = 9;
 /// Shape: the landing order of §4.15 step 5, lowest first: directories top-down, then creates,
 /// then replacements, then directory renames, then file deletes, then directory removals
 /// bottom-up, so a tool reading the tree mid-landing never sees a referenced entry missing.
@@ -73,6 +83,9 @@ const CLASS_RENAME: u8 = 3;
 const CLASS_DELETE: u8 = 4;
 /// Shape: see `CLASS_MKDIR`.
 const CLASS_RMDIR: u8 = 5;
+/// Shape: a base directory's metadata entries (A-501) come last, deepest first: a mode that bars writing into a
+/// directory, or searching it, never stands before an entry beneath it lands.
+const CLASS_DIR_META: u8 = 6;
 
 /// What the landing does to one path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +113,72 @@ pub enum Action {
   /// A base directory the overlay removed and recreated opaque: everything beneath it on the
   /// disk goes, the directory itself stays (T-1.12's "one recursive removal").
   Clear,
+  /// A file the base had whose bytes the volume kept and whose mode or Windows bits it changed (§4.15 step 1's "mode
+  /// changes", the data model's `Chmod`; A-458): each field the volume changed is set through the file's own handle
+  /// where the disk still holds it as the base did, and no byte is rewritten.
+  Chmod {
+    /// What the base held.
+    from: FileMeta,
+    /// What the volume holds.
+    to: FileMeta,
+  },
+  /// A base directory whose mode or Windows bits alone the volume changed (A-501): each field the volume changed is set
+  /// through the directory's own handle where the disk still holds it as the base did, after everything beneath it
+  /// landed.
+  ChmodDir {
+    /// What the base held (a directory's read-only among its Windows bits).
+    from: FileMeta,
+    /// What the volume holds.
+    to: FileMeta,
+  },
+}
+
+/// A file's metadata a landing carries beside its bytes (§4.15 step 1's "mode changes"; A-458): its mode's permission
+/// bits, and the Windows attribute bits a volume keeps for a file (A-262, at Windows' values: none on Linux and macOS,
+/// whose disks hold none). Its type bits are its kind, which a landing never changes in place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileMeta {
+  /// The permission bits ([`FileMeta::PERMISSIONS`] of the mode).
+  pub permissions: u32,
+  /// The Windows attribute bits, as `WindowsAttributes::kept` keeps them for a file (a file's read-only state is its
+  /// mode's).
+  pub windows: u16,
+}
+
+impl FileMeta {
+  /// Format: a POSIX mode's permission bits: each class's read, write and execute, setuid, setgid and sticky.
+  pub const PERMISSIONS: u32 = 0o7777;
+
+  /// A file of a volume: its `mode` and its Windows bits.
+  pub fn of_volume(mode: u32, windows: WindowsAttributes) -> FileMeta {
+    FileMeta {
+      permissions: mode & Self::PERMISSIONS,
+      windows: WindowsAttributes::kept(u32::from(windows.bits()), Kind::File).bits(),
+    }
+  }
+
+  /// A file of a disk, as its fingerprint holds it.
+  pub fn of_fingerprint(fingerprint: &Fingerprint) -> FileMeta {
+    Self::of_kind(fingerprint.mode, fingerprint.windows, Kind::File)
+  }
+
+  /// A directory of a volume: its `mode` and its Windows bits, its read-only among them (A-501).
+  pub fn of_volume_dir(mode: u32, windows: WindowsAttributes) -> FileMeta {
+    Self::of_kind(mode, windows.bits(), Kind::Dir)
+  }
+
+  /// A directory of a disk, as its fingerprint holds it (A-501).
+  pub fn of_dir_fingerprint(fingerprint: &Fingerprint) -> FileMeta {
+    Self::of_kind(fingerprint.mode, fingerprint.windows, Kind::Dir)
+  }
+
+  /// An object of `kind`: its mode's permission bits, and the Windows bits the volume keeps for that kind.
+  fn of_kind(mode: u32, windows: u16, kind: Kind) -> FileMeta {
+    FileMeta {
+      permissions: mode & Self::PERMISSIONS,
+      windows: WindowsAttributes::kept(u32::from(windows), kind).bits(),
+    }
+  }
 }
 
 /// What the overlay holds for a file: the identity of its bytes, its size, mode and mtime.
@@ -155,7 +234,8 @@ impl LandingEntry {
     match self.action {
       Action::Mkdir | Action::Clear => CLASS_MKDIR,
       Action::Create | Action::Symlink { .. } => CLASS_CREATE,
-      Action::Replace => CLASS_REPLACE,
+      Action::Replace | Action::Chmod { .. } => CLASS_REPLACE,
+      Action::ChmodDir { .. } => CLASS_DIR_META,
       Action::Rename { .. } => CLASS_RENAME,
       Action::Delete => CLASS_DELETE,
       Action::Rmdir => CLASS_RMDIR,
@@ -240,6 +320,16 @@ impl Manifest {
           put_str(&mut out, target);
         }
         Action::Clear => out.push(TAG_CLEAR),
+        Action::Chmod { from, to } => {
+          out.push(TAG_CHMOD);
+          put_meta(&mut out, from);
+          put_meta(&mut out, to);
+        }
+        Action::ChmodDir { from, to } => {
+          out.push(TAG_CHMOD_DIR);
+          put_meta(&mut out, from);
+          put_meta(&mut out, to);
+        }
       }
       match (&e.witnessed, e.judged) {
         (Some(w), Judged::Witness) => {
@@ -250,6 +340,7 @@ impl Manifest {
         (Some(w), Judged::Content) => {
           out.push(WITNESS_CONTENT);
           out.extend_from_slice(&w.identity);
+          put_meta(&mut out, &FileMeta::of_fingerprint(&w.fingerprint));
         }
         (None, _) => out.push(WITNESS_NONE),
       }
@@ -276,10 +367,15 @@ impl Manifest {
   /// [`Manifest::from_entries`] for a manifest whose entries are judged as `basis` says.
   pub fn from_judged(mut entries: Vec<LandingEntry>, filtered_out: usize, basis: Judged) -> Self {
     entries.sort_by(|a, b| a.class().cmp(&b.class()).then_with(|| a.path.cmp(&b.path)));
-    // Removals go bottom-up: deeper paths first within their class.
-    let (mut keep, mut removals): (Vec<LandingEntry>, Vec<LandingEntry>) = entries
-      .into_iter()
-      .partition(|e| !matches!(e.action, Action::Delete | Action::Rmdir));
+    // Removals go bottom-up, deeper paths first within their class, and directories' metadata entries after them, so
+    // (A-501): a directory's mode is set only once everything beneath it, and every directory beneath it, has landed.
+    let (mut keep, mut removals): (Vec<LandingEntry>, Vec<LandingEntry>) =
+      entries.into_iter().partition(|e| {
+        !matches!(
+          e.action,
+          Action::Delete | Action::Rmdir | Action::ChmodDir { .. }
+        )
+      });
     removals.sort_by(|a, b| {
       a.class()
         .cmp(&b.class())
@@ -307,6 +403,7 @@ impl Manifest {
         Action::Rmdir => "rmdir",
         Action::Symlink { .. } => "symlink",
         Action::Clear => "clear",
+        Action::Chmod { .. } | Action::ChmodDir { .. } => "chmod",
       };
       let actions = summary.by_action.entry(action.into()).or_insert(0);
       *actions = actions.saturating_add(1);
@@ -318,9 +415,12 @@ impl Manifest {
         .unwrap_or("");
       let tops = summary.by_top_level.entry(top.into()).or_insert(0);
       *tops = tops.saturating_add(1);
-      summary.bytes = summary
-        .bytes
-        .saturating_add(e.overlay.map_or(0, |o| o.size));
+      // A metadata entry writes no byte (A-458).
+      let written = match e.action {
+        Action::Chmod { .. } | Action::ChmodDir { .. } => 0,
+        _ => e.overlay.map_or(0, |o| o.size),
+      };
+      summary.bytes = summary.bytes.saturating_add(written);
     }
     let hash = *blake3::hash(&Self::encode(&entries, basis)).as_bytes();
     Self {
@@ -340,6 +440,11 @@ impl Manifest {
 fn put_str(out: &mut Vec<u8>, s: &str) {
   out.extend_from_slice(&u16::try_from(s.len()).unwrap_or(u16::MAX).to_le_bytes());
   out.extend_from_slice(s.as_bytes());
+}
+
+fn put_meta(out: &mut Vec<u8>, meta: &FileMeta) {
+  out.extend_from_slice(&meta.permissions.to_le_bytes());
+  out.extend_from_slice(&meta.windows.to_le_bytes());
 }
 
 fn put_fingerprint(out: &mut Vec<u8>, fp: &Fingerprint) {
@@ -395,16 +500,16 @@ enum PlanStage {
   },
   /// A clone of a captured base: the paths where its source parts from the capture, being found.
   CaptureChanges {
-    /// The captured snapshot's tree.
-    base: FrozenTree,
+    /// The capture: the captured snapshot's tree, or what a move carried of it (A-503).
+    base: CaptureBase,
     /// The source's tree (a snapshot's, for a sliced plan).
     source: FrozenTree,
     /// The search.
-    changed: ChangedPaths,
+    changed: CaptureSearch,
   },
   /// Each candidate judged against the capture, in path order.
   CaptureEntries {
-    base: FrozenTree,
+    base: CaptureBase,
     source: FrozenTree,
     paths: Vec<String>,
     next: usize,
@@ -430,23 +535,26 @@ impl PlanWalk {
 
   /// A plan of `source` judged against the captured base `base` (§4.15 `capture_base`, A-291's landing): the paths
   /// where `source` parts from the capture, each an entry judged by content ([`Judged::Content`]). For a clone of a
-  /// captured snapshot, which shares that snapshot's nodes; `base` must stay frozen while the plan runs (a capture is
-  /// pinned while a clone of it lives).
+  /// captured snapshot, which shares that snapshot's nodes, or a clone a move brought here with what it carried of the
+  /// capture and its mark, a snapshot of the clone itself (A-503); the trees must stay frozen while the plan runs (a
+  /// capture is pinned while a clone of it lives, and a mark is a snapshot the clone keeps).
   pub fn against_capture(
     vol: &Volume,
     source: Source,
-    base: FrozenTree,
+    base: impl Into<CaptureBase>,
   ) -> Result<PlanWalk, VfsError> {
     let tree = match source {
       Source::Head => vol.head_tree(),
       Source::Snapshot(id) => vol.frozen_tree(id)?,
     };
+    let base = base.into();
+    let changed = base.search(tree);
     Ok(PlanWalk {
       source,
       stage: PlanStage::CaptureChanges {
         base,
         source: tree,
-        changed: ChangedPaths::new(base, tree),
+        changed,
       },
     })
   }
@@ -547,8 +655,7 @@ impl PlanWalk {
           )));
         };
         if filter.keeps(path) {
-          let trees = (base, source);
-          entries.extend(capture_entries(store, vol.policy(), trees, path)?);
+          entries.extend(capture_entries(store, vol.policy(), (&base, source), path)?);
         } else {
           filtered_out = filtered_out.saturating_add(1);
         }
@@ -577,6 +684,20 @@ fn content_witness(identity: [u8; 32]) -> Witness {
   }
 }
 
+/// [`content_witness`] of a file the capture held as `meta` (A-466): the mode and Windows bits it held sit in the
+/// witness's fingerprint, the one place a content witness carries more than its identity, so a replacement's metadata is
+/// judged against them field by field (`crate::verdict::landed_meta`).
+fn content_witness_of(identity: [u8; 32], meta: FileMeta) -> Witness {
+  Witness {
+    fingerprint: Fingerprint {
+      mode: meta.permissions,
+      windows: meta.windows,
+      ..Fingerprint::default()
+    },
+    ..content_witness(identity)
+  }
+}
+
 /// The BLAKE3 of file `no`'s bytes in `tree`, read whole as the overlay's plan reads a file.
 fn tree_identity(
   store: &Store,
@@ -584,33 +705,22 @@ fn tree_identity(
   no: InodeNo,
   size: u64,
 ) -> Result<[u8; 32], VfsError> {
-  let mut bytes = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
-  let read = slates_vfs::captured::read_file(store, tree, no, 0, &mut bytes)?;
-  bytes.truncate(read);
-  Ok(*blake3::hash(&bytes).as_bytes())
-}
-
-/// What the capture held at a path, as a witness judged by content: a file's bytes' identity, a symlink's target's.
-fn captured_identity(store: &Store, base: FrozenTree, held: &Held) -> Result<[u8; 32], VfsError> {
-  match held {
-    Held::File { no, size, .. } => tree_identity(store, base, *no, *size),
-    Held::Symlink { target, .. } => Ok(*blake3::hash(target.as_bytes()).as_bytes()),
-    Held::Absent | Held::Dir { .. } | Held::Special => Ok([0; 32]),
-  }
+  slates_vfs::captured::file_identity(store, tree, no, size)
 }
 
 /// The entries one candidate path makes (§4.15 step 1 for a captured clone, A-291): none where the capture and the
-/// source hold the same, else what the source holds there written over what the capture held. A file or symlink of
+/// source hold the same, else what the source holds there written over what the capture held; a file whose bytes the
+/// source kept and whose mode or Windows bits it changed is a metadata entry (`Chmod`, A-458). A file or symlink of
 /// the capture the source no longer holds is removed (`Delete`), a directory of it removed once emptied (`Rmdir`); a
 /// name whose kind changed is both a removal and a making, which the landing's class order meets as a type conflict
 /// (owed: a kind change lands as one entry). A symlink pointed elsewhere is one `Symlink`, as an overlay's is.
 fn capture_entries(
   store: &Store,
   policy: NameEquivalence,
-  (base, source): (FrozenTree, FrozenTree),
+  (base, source): (&CaptureBase, FrozenTree),
   path: &str,
 ) -> Result<Vec<LandingEntry>, VfsError> {
-  let was = slates_vfs::captured::held_at(store, base, policy, path)?;
+  let was = base.state_at(store, policy, path)?;
   let now = slates_vfs::captured::held_at(store, source, policy, path)?;
   let entry = |action: Action,
                witnessed: Option<Witness>,
@@ -624,9 +734,45 @@ fn capture_entries(
     windows,
   };
   match (&was, &now) {
-    (Held::Absent, Held::Absent) | (Held::Dir { .. }, Held::Dir { .. }) => Ok(Vec::new()),
+    (CapturedState::Absent, Held::Absent) => Ok(Vec::new()),
     (
-      Held::File { .. },
+      CapturedState::Dir {
+        mode: was_mode,
+        windows: was_windows,
+      },
+      Held::Dir {
+        mode,
+        mtime_ns,
+        windows,
+      },
+    ) => {
+      // A directory both held, its mode or bits changed (A-501); an unchanged one makes nothing.
+      let was_windows = WindowsAttributes::from_image(*was_windows, Kind::Dir);
+      let from = FileMeta::of_volume_dir(*was_mode, was_windows);
+      let to = FileMeta::of_volume_dir(*mode, *windows);
+      Ok(if from == to {
+        Vec::new()
+      } else {
+        vec![entry(
+          Action::ChmodDir { from, to },
+          Some(content_witness_of([0; 32], from)),
+          Some(OverlayIdentity {
+            hash: [0; 32],
+            size: 0,
+            mode: *mode,
+            mtime_ns: *mtime_ns,
+          }),
+          *windows,
+        )]
+      })
+    }
+    (
+      CapturedState::File {
+        identity: captured,
+        mode: was_mode,
+        windows: was_windows,
+        ..
+      },
       Held::File {
         no,
         size,
@@ -635,26 +781,33 @@ fn capture_entries(
         windows,
       },
     ) => {
-      let captured = captured_identity(store, base, &was)?;
+      let captured = *captured;
+      let was_windows = WindowsAttributes::from_image(*was_windows, Kind::File);
       let hash = tree_identity(store, source, *no, *size)?;
-      Ok(if hash == captured {
-        Vec::new()
+      let overlay = Some(OverlayIdentity {
+        hash,
+        size: *size,
+        mode: *mode,
+        mtime_ns: *mtime_ns,
+      });
+      let from = FileMeta::of_volume(*was_mode, was_windows);
+      let to = FileMeta::of_volume(*mode, *windows);
+      let action = if hash != captured {
+        Action::Replace
+      } else if from != to {
+        Action::Chmod { from, to }
       } else {
-        vec![entry(
-          Action::Replace,
-          Some(content_witness(captured)),
-          Some(OverlayIdentity {
-            hash,
-            size: *size,
-            mode: *mode,
-            mtime_ns: *mtime_ns,
-          }),
-          *windows,
-        )]
-      })
+        return Ok(Vec::new());
+      };
+      Ok(vec![entry(
+        action,
+        Some(content_witness_of(captured, from)),
+        overlay,
+        *windows,
+      )])
     }
-    (Held::Symlink { target: before, .. }, Held::Symlink { target, windows }) => {
-      Ok(if before == target {
+    (CapturedState::Symlink { target: before, .. }, Held::Symlink { target, windows }) => {
+      Ok(if before.as_str() == target.as_ref() {
         Vec::new()
       } else {
         vec![entry(
@@ -669,7 +822,7 @@ fn capture_entries(
     }
     _ => {
       let mut out = Vec::new();
-      if let Some((action, witness)) = removal_of(store, base, &was)? {
+      if let Some((action, witness)) = removal_of(&was) {
         out.push(entry(
           action,
           Some(witness),
@@ -687,19 +840,14 @@ fn capture_entries(
 
 /// What removing what the capture held at a path does: a file, symlink or special name deleted while it is still what
 /// the capture held, a directory removed once emptied; nothing for a name the capture did not hold.
-fn removal_of(
-  store: &Store,
-  base: FrozenTree,
-  was: &Held,
-) -> Result<Option<(Action, Witness)>, VfsError> {
-  Ok(match was {
-    Held::Absent => None,
-    Held::Dir { .. } => Some((Action::Rmdir, content_witness([0; 32]))),
-    Held::File { .. } | Held::Symlink { .. } | Held::Special => Some((
-      Action::Delete,
-      content_witness(captured_identity(store, base, was)?),
-    )),
-  })
+fn removal_of(was: &CapturedState) -> Option<(Action, Witness)> {
+  match was {
+    CapturedState::Absent => None,
+    CapturedState::Dir { .. } => Some((Action::Rmdir, content_witness([0; 32]))),
+    CapturedState::File { .. } | CapturedState::Symlink { .. } | CapturedState::Special => {
+      Some((Action::Delete, content_witness(was.identity())))
+    }
+  }
 }
 
 /// What making `held` writes: its action, for a file or directory its identity, and its Windows bits (A-451).
@@ -814,6 +962,9 @@ fn entry_for(
     Divergence::Created | Divergence::Witnessed => {
       let located = source.resolve(vol, store, &d.path)?;
       match located.child {
+        Child::Dir(_) if d.kind == Divergence::Witnessed => {
+          dir_meta_entry(vol, store, source, path, located.inode)
+        }
         Child::Dir(_) => {
           let attrs = source.stat(vol, store, located.inode)?;
           // An opaque directory over a whiteout of a base directory clears the disk's copy.
@@ -857,35 +1008,113 @@ fn entry_for(
         Child::Fifo(_) | Child::Socket(_) | Child::BlockDevice(_) | Child::CharDevice(_) => {
           Err(VfsError::SpecialFileOperation)
         }
-        Child::File(no) => {
-          let attrs = source.stat(vol, store, no)?;
-          let mut bytes =
-            vec![0u8; usize::try_from(attrs.size).map_err(|_| VfsError::FileTooLarge)?];
-          let n = source.read(vol, store, host, no, &mut bytes)?;
-          bytes.truncate(n);
-          let witnessed = source.witness(vol, no);
-          Ok(Some(LandingEntry {
-            path,
-            action: if witnessed.is_some() {
-              Action::Replace
-            } else {
-              Action::Create
-            },
-            witnessed,
-            overlay: Some(OverlayIdentity {
-              hash: *blake3::hash(&bytes).as_bytes(),
-              size: attrs.size,
-              mode: attrs.mode,
-              mtime_ns: attrs.mtime,
-            }),
-            judged: Judged::Witness,
-            windows: source.windows(vol, store, no)?,
-          }))
-        }
+        Child::File(no) => file_entry(vol, store, host, source, path, no).map(Some),
         Child::Whiteout => Ok(None),
       }
     }
   }
+}
+
+/// The manifest entry for a diverged file (§4.15 step 1): a create where it has no witness, else a replacement, or a
+/// metadata entry where its bytes are its witness's and its mode or Windows bits are not (A-458): its bytes are then not
+/// rewritten, and the verdict judges the fields it changed.
+fn file_entry(
+  vol: &mut Volume,
+  store: &mut Store,
+  host: &mut dyn HostFs,
+  source: Source,
+  path: Box<str>,
+  no: InodeNo,
+) -> Result<LandingEntry, VfsError> {
+  let attrs = source.stat(vol, store, no)?;
+  let witnessed = source.witness(vol, no);
+  let hash = file_identity(vol, store, host, source, no, witnessed.as_ref(), attrs.size)?;
+  let windows = source.windows(vol, store, no)?;
+  let to = FileMeta::of_volume(attrs.mode, windows);
+  let action = match witnessed {
+    None => Action::Create,
+    Some(w) => {
+      let from = FileMeta::of_fingerprint(&w.fingerprint);
+      // Its bytes kept, its mode or bits or its modification time changed: a metadata entry (A-458; a `touch`, A-501).
+      let touched = w.fingerprint.mtime_ns != attrs.mtime;
+      if w.identity == hash && (from != to || touched) {
+        Action::Chmod { from, to }
+      } else {
+        Action::Replace
+      }
+    }
+  };
+  Ok(LandingEntry {
+    path,
+    action,
+    witnessed,
+    overlay: Some(OverlayIdentity {
+      hash,
+      size: attrs.size,
+      mode: attrs.mode,
+      mtime_ns: attrs.mtime,
+    }),
+    judged: Judged::Witness,
+    windows,
+  })
+}
+
+/// The manifest entry for a base directory whose metadata alone the volume changed (A-501): its mode and Windows bits as
+/// its witness found them on the disk and as the volume holds them; none where neither changed (an owner's change, which
+/// a landing never carries).
+fn dir_meta_entry(
+  vol: &mut Volume,
+  store: &mut Store,
+  source: Source,
+  path: Box<str>,
+  no: InodeNo,
+) -> Result<Option<LandingEntry>, VfsError> {
+  let Some(witnessed) = source.witness(vol, no) else {
+    return Ok(None);
+  };
+  let attrs = source.stat(vol, store, no)?;
+  let windows = source.windows(vol, store, no)?;
+  let from = FileMeta::of_dir_fingerprint(&witnessed.fingerprint);
+  let to = FileMeta::of_volume_dir(attrs.mode, windows);
+  if from == to {
+    return Ok(None);
+  }
+  Ok(Some(LandingEntry {
+    path,
+    action: Action::ChmodDir { from, to },
+    witnessed: Some(witnessed),
+    overlay: Some(OverlayIdentity {
+      hash: [0; 32],
+      size: 0,
+      mode: attrs.mode,
+      mtime_ns: attrs.mtime,
+    }),
+    judged: Judged::Witness,
+    windows,
+  }))
+}
+
+/// The BLAKE3 of a diverged file's bytes as the source holds them, read whole. A base file the volume copied up for its
+/// metadata alone holds its witness's bytes (A-458): their identity is the witness's, read from no disk, which may have
+/// drifted since without changing what the volume holds (a read would refuse it `BaseDrift` and fail the whole plan).
+fn file_identity(
+  vol: &mut Volume,
+  store: &mut Store,
+  host: &mut dyn HostFs,
+  source: Source,
+  no: InodeNo,
+  witnessed: Option<&Witness>,
+  size: u64,
+) -> Result<[u8; 32], VfsError> {
+  if let Some(w) = witnessed
+    && source.holds_witnessed_bytes(vol, store, no)?
+  {
+    return Ok(w.identity);
+  }
+  let mut bytes = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
+  let n = source.read(vol, store, host, no, &mut bytes)?;
+  bytes.truncate(n);
+  Ok(*blake3::hash(&bytes).as_bytes())
 }
 
 fn split(path: &str) -> (&str, &str) {
@@ -916,7 +1145,51 @@ pub fn kind_of_mode(mode: u32) -> Kind {
 
 #[cfg(test)]
 mod tests {
-  use super::under;
+  use super::{Action, FileMeta, Judged, LandingEntry, Manifest, WindowsAttributes, under};
+
+  /// A-501 (§4.15 step 5's order). Do: build a manifest, its entries in an order of no meaning, of a file made inside
+  /// `/a/b`, a file removed from `/x` and `/x` itself, and base directories' metadata entries for `/a` and `/a/b`.
+  /// Expect the directories' metadata entries last, after every removal, the deeper first: a mode that bars writing
+  /// into a directory or searching it stands only once everything beneath it, every directory beneath it included, has
+  /// landed.
+  #[test]
+  fn a_directorys_metadata_lands_after_everything_beneath_it_deepest_first() {
+    /// Shape: a base directory's permission bits, and the same made private.
+    const OPEN: u32 = 0o755;
+    /// Shape: see `OPEN`.
+    const PRIVATE: u32 = 0o700;
+    let entry = |path: &str, action: Action| LandingEntry {
+      path: path.into(),
+      action,
+      witnessed: None,
+      overlay: None,
+      judged: Judged::Witness,
+      windows: WindowsAttributes::default(),
+    };
+    let private = || Action::ChmodDir {
+      from: FileMeta {
+        permissions: OPEN,
+        windows: 0,
+      },
+      to: FileMeta {
+        permissions: PRIVATE,
+        windows: 0,
+      },
+    };
+    let manifest = Manifest::from_judged(
+      vec![
+        entry("/a", private()),
+        entry("/x", Action::Rmdir),
+        entry("/a/b/new.rs", Action::Create),
+        entry("/a/b", private()),
+        entry("/x/y", Action::Delete),
+      ],
+      0,
+      Judged::Witness,
+    );
+    let order: Vec<&str> = manifest.entries.iter().map(|e| e.path.as_ref()).collect();
+    assert_eq!(order, vec!["/a/b/new.rs", "/x/y", "/x", "/a/b", "/a"]);
+  }
 
   /// CVE-2025-53110 ("EscapeRoute", Anthropic's Filesystem MCP) replicated against the landing filter's prefix
   /// check. There a naive `path.starts_with(root)` let a sibling like `/root-evil` match the boundary `/root`.
