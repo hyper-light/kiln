@@ -219,7 +219,7 @@ impl ImageClass {
         let waits = image.waits()?;
         let books = self.authority()?;
         let slot = match image.runs.settle(run, Some(waits))? {
-            Settled::Started(guest, _) | Settled::Running(guest, _) => {
+            Settled::Started(guest, _) | Settled::Running(guest, _, _) => {
                 let slot = image.stop(guest, None)?;
                 image.runs.stop_asked(run, &slot)?;
                 slot
@@ -283,7 +283,7 @@ impl ImageClass {
     pub fn node_runs(&self, run: NodeRun) -> Result<bool, Refusal> {
         let image = self.image()?;
         let guest = match image.runs.settle(run, image.waits.as_ref().ok())? {
-            Settled::Started(guest, _) | Settled::Running(guest, _) => guest,
+            Settled::Started(guest, _) | Settled::Running(guest, _, _) => guest,
             Settled::Ends(end) => {
                 self.ended_node(self.authority()?.as_ref(), run, &end)?;
                 return Ok(false);
@@ -307,7 +307,7 @@ impl ImageClass {
         let image = self.image()?;
         let waits = image.waits()?;
         let guest = match image.runs.settle(run, Some(waits))? {
-            Settled::Started(guest, _) | Settled::Running(guest, _) => guest,
+            Settled::Started(guest, _) | Settled::Running(guest, _, _) => guest,
             _ => return Err(not_running(&run)),
         };
         let vcpus = self
@@ -365,7 +365,7 @@ impl ImageClass {
     fn node_guest(&self, run: NodeRun) -> Result<Arc<dyn ImageGuest>, Refusal> {
         let image = self.image()?;
         match image.runs.settle(run, Some(image.waits()?))? {
-            Settled::Started(guest, _) | Settled::Running(guest, _) => Ok(guest),
+            Settled::Started(guest, _) | Settled::Running(guest, _, _) => Ok(guest),
             _ => Err(not_running(&run)),
         }
     }

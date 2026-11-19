@@ -299,8 +299,8 @@ sessions, and an agent's to do to the agents it started (and theirs), as `agents
 
 - **Pause.** On its machine's host, its processes stop where they are, held by the machine's pacer
   ("What a person does with an agent's subagents", below). In a microVM, its microVM is paused,
-  through Hex: until Hex pauses a box (kiln plan 01a1dd2e…, P5.5b), kiln refuses it, its timeline says
-  why, and the session goes on as it was. The subagents kiln started under it pause with it. Your
+  through Hex (kiln plan 01a1dd2e…, P5.5b): its guest runs no CPU, and its stdio and connections are
+  kept until it's resumed. The subagents kiln started under it pause with it. Your
   pause is asked of its machine: `agents.get` says it's paused once it is (stand `paused`,
   `state.frozen` since when).
 - **Resume.** What pauses it ends: your pause, and a usage limit's ("Usage limits: pause and resume",
@@ -2475,9 +2475,8 @@ its machine's pacer holds its group at share 0 (cgroup.freeze on Linux, SIGSTOP 
 thread suspended on Windows) under the pacer's guard, which starts them again should the runner
 end (docs/headroom.md, "A person's pause"). `state.frozen` says since when; a runner that can't
 pause says why, and one that restarts holds a paused session again. In a microVM none of its
-processes is its machine's to hold: its microVM is paused instead (`Run::pause`, through Hex), only
-while it runs, and refused, said in its timeline, until Hex pauses a box (kiln plan 01a1dd2e…,
-P5.5b). The server sends the pause,
+processes is its machine's to hold: its microVM is paused instead (`Run::pause`, through Hex's
+P5.5b), only while it runs. The server sends the pause,
 and its end, to every subagent kiln started under it. With `task`, that subagent of its harness's
 own is held at its next tool call: kiln has a hook on every one of Claude Code's tool calls (a
 `PreToolUse` matcher for every tool, its answer awaited up to 7 days), and on each of Codex's local

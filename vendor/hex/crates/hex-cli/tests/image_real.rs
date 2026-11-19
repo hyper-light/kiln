@@ -34,7 +34,11 @@
 //!   cost sizes (`Allocation::vm_size`);
 //! - `HEX_IMAGE_WORK`: a directory of this run's own, made here; `HEX_IMAGE_WAIT_MS`: the run's explicit deadline
 //!   for the whole suite (the node's start waits for the node while it lives, `image_node::Node::start`);
-//!   `HEX_WAITS_CENSUS_MAX`: the census's most lines.
+//!   `HEX_WAITS_CENSUS_MAX`: the census's most lines;
+//! - `HEX_IMAGE_COMPONENT`, `AT@DIGEST`: a component the node's Shards home holds for a member the image runs (Shards'
+//!   D270 slice 4: an OSI artifact of that member's kind for this host's platform, by its manifest digest), at that
+//!   member's path (`/harness/cat` for `image_harness`'s), which HEX-IMG-11 swaps in and out. Unset, HEX-IMG-11 fails
+//!   saying no component is named, as no swap can be held to the contract without one; the other cases run as ever.
 //!
 //! Run on Linux: build it with `cargo test --release --locked -p hex-cli --test image_real --no-run`, which names the
 //! test binary it built (`target/release/deps/image_real-<hash>`), then start that binary alone in the delegated
@@ -83,10 +87,12 @@ enum Source {
 }
 
 /// Shards image VMs of the pinned image, each admitted for the run's workload: running its members alone, or a
-/// command for the act a case asks of its run.
+/// command for the act a case asks of its run; and the component its node holds for one of its members, where the run
+/// names one (`HEX_IMAGE_COMPONENT`).
 struct ImageBoxes {
     image: String,
     allocation: Allocation,
+    component: Option<conformance::Component>,
 }
 
 /// The command a run's act is, in the image's own shell: the image cases ask a run to fail with a code (HEX-IMG-3)
@@ -136,6 +142,10 @@ impl Fixture for ImageBoxes {
         let args = command(act);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         Program::of(&args)
+    }
+
+    fn component(&self) -> Option<conformance::Component> {
+        self.component.clone()
     }
 }
 
@@ -318,6 +328,15 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
     assert!(!wait.is_zero(), "HEX_IMAGE_WAIT_MS is 0");
     let work = PathBuf::from(input("HEX_IMAGE_WORK"));
     assert!(!work.exists(), "a run's own directory: {work:?} exists");
+    let component = std::env::var("HEX_IMAGE_COMPONENT").ok().map(|named| {
+        let (at, digest) = named
+            .split_once('@')
+            .unwrap_or_else(|| panic!("HEX_IMAGE_COMPONENT {named:?} isn't AT@DIGEST"));
+        conformance::Component {
+            at: at.to_owned(),
+            digest: digest.to_owned(),
+        }
+    });
     fs::create_dir_all(work.join("state")).unwrap();
     // A VM's start boots it: a wait past its W* tells its run-out and follows its party (decision 9), and the run's
     // deadline bounds the whole suite.
@@ -354,7 +373,11 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
             "{:?}",
             client.classes()
         );
-        let fixture = ImageBoxes { image, allocation };
+        let fixture = ImageBoxes {
+            image,
+            allocation,
+            component,
+        };
         let begun = Instant::now();
         let failures = conformance::run_image(&client, &fixture);
         let released = release(&client, &fixture, node_pid);

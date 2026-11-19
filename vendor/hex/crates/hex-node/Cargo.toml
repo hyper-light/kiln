@@ -58,8 +58,9 @@ shards-api.workspace = true
 hex-runtime = { workspace = true, features = ["native-gate-test"] }
 
 [target.'cfg(windows)'.dev-dependencies]
-# guest_loop's Firecracker CONNECT fixture; no production stream or handle adapter.
-shards-afunix = { path = "../../../shards/crates/afunix" }
+# guest_loop's Firecracker CONNECT fixture on Shards' D272 pipes (its VsockListener, as a VM process listens); no
+# production stream or handle adapter.
+shards-ipc = { path = "../../../shards/crates/ipc" }
 
 [lints]
 workspace = true

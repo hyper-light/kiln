@@ -189,6 +189,32 @@ mod hosted {
         ) -> Result<(), Refusal> {
             self.0.signal_member(id, member, signal)
         }
+        fn pause(&self, id: &BoxId) -> Result<(), Refusal> {
+            self.0.pause(id)
+        }
+        fn resume(&self, id: &BoxId) -> Result<(), Refusal> {
+            self.0.resume(id)
+        }
+        fn swap(
+            &self,
+            id: &BoxId,
+            at: &str,
+            digest: &str,
+            when: hex_api::SwapWhen,
+        ) -> Result<hex_api::Swapped, Refusal> {
+            self.0.swap(id, at, digest, when)
+        }
+        fn restore(
+            &self,
+            id: &BoxId,
+            at: &str,
+            when: hex_api::SwapWhen,
+        ) -> Result<hex_api::Swapped, Refusal> {
+            self.0.restore(id, at, when)
+        }
+        fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
+            self.0.components(id)
+        }
     }
 
     impl<R: Runtime> Host for Hosted<R> {
@@ -630,6 +656,130 @@ fn w2_a_vms_start_is_followed_through_started_over_quic() {
         vm.client.started(&none),
         Err(hex_api::Refusal::NoSuchBox(none.clone()))
     );
+    vm.client.delete(&vm.id).unwrap();
+}
+
+/// Kiln plan P5.5b (AC-T7.4.1; docs/design/shards-image-class.md §12): the node's wire carries an image box's pause and
+/// resume (`Call::Pause`, `Call::Resume`, appended), so a remote caller pauses a VM as a caller in the node's own process
+/// does, its state, its usage and its refusals coming back typed. Do: through a simulator node served over QUIC in this
+/// process, pause a running VM; inspect it, read its usage, signal its member, and pause it again; resume it, inspect it,
+/// read its usage and resume it again; then pause an id the node holds no box of. Expect: the pause done and the VM
+/// Paused, its usage telling its paused time; the member's signal refused Pause(Paused) naming it, and the second pause
+/// Pause(Paused); the resume done and the VM Running, its usage's paused time no less than it was while paused; the
+/// second resume Pause(Running); and NoSuchBox for the id with no box.
+#[test]
+fn p5_5b_a_vms_pause_and_resume_go_through_quic() {
+    use hex_api::{BoxState, PauseCause, Refusal, Runtime as _, Signal};
+    let vm = member_vm("node.pause.test", "paused-over-quic");
+    let refused = |op, cause| {
+        Err(Refusal::Pause {
+            id: vm.id.clone(),
+            op,
+            cause,
+        })
+    };
+    assert_eq!(vm.client.pause(&vm.id), Ok(()));
+    assert_eq!(vm.client.inspect(&vm.id).unwrap().state, BoxState::Paused);
+    let paused = vm.client.usage(&vm.id).unwrap().paused_ns.unwrap();
+    assert_eq!(
+        vm.client.signal_member(&vm.id, &vm.claude, Signal::TERM),
+        refused("signal a member", PauseCause::Paused)
+    );
+    assert_eq!(
+        vm.client.pause(&vm.id),
+        refused("pause", PauseCause::Paused)
+    );
+    assert_eq!(vm.client.resume(&vm.id), Ok(()));
+    assert_eq!(vm.client.inspect(&vm.id).unwrap().state, BoxState::Running);
+    let resumed = vm.client.usage(&vm.id).unwrap().paused_ns.unwrap();
+    assert!(resumed >= paused, "{resumed} ns paused, then {paused}");
+    assert_eq!(
+        vm.client.resume(&vm.id),
+        refused("resume", PauseCause::Running)
+    );
+    let none = BoxId::new("paused-over-quic-none").unwrap();
+    assert_eq!(
+        vm.client.pause(&none),
+        Err(Refusal::NoSuchBox(none.clone()))
+    );
+    vm.client.delete(&vm.id).unwrap();
+}
+
+/// Shards' D270 slice 4 (AC-T7.4.1; docs/design/shards-image-class.md §13): the node's wire carries an image box's
+/// component swap, restore and components (`Call::Swap`, `Call::Restore`, `Call::Components`, appended), so a remote
+/// caller swaps a member's component as a caller in the node's own process does, its answers and refusals coming back
+/// typed. Do: through a simulator node served over QUIC in this process, swap the image's harness's component in now,
+/// read the components, restore its image's own at its next start, then swap a digest its node holds none of and swap at
+/// a path no member runs at; take the swapped member's next generation's streams. Expect: the swap now answered held,
+/// its member's generation 1 started and nothing let go unread; the components as it answered them; the restore wanted
+/// none and held it, no generation started; Swap(Artifact) and Swap(Unknown), each naming swap with Shards' words; and
+/// the member driven anew, its streams taken.
+#[test]
+fn d270_a_vms_swap_and_restore_go_through_quic() {
+    use hex_api::sim::{SIM_COMPONENT, SIM_HARNESS};
+    use hex_api::{ComponentAt, Refusal, Runtime as _, SwapCause, SwapWhen};
+    let vm = member_vm("node.swap.test", "swapped-over-quic");
+    let at = format!("/harness/{SIM_HARNESS}");
+    let now = vm
+        .client
+        .swap(&vm.id, &at, SIM_COMPONENT, SwapWhen::Now)
+        .unwrap();
+    let held = vec![ComponentAt {
+        at: at.clone(),
+        desired: Some(SIM_COMPONENT.to_owned()),
+        held: Some(SIM_COMPONENT.to_owned()),
+    }];
+    assert_eq!(
+        (&now.components, now.started, now.unread),
+        (&held, Some(1), 0)
+    );
+    assert_eq!(vm.client.components(&vm.id).unwrap(), held);
+    let back = vm.client.restore(&vm.id, &at, SwapWhen::NextStart).unwrap();
+    assert_eq!(
+        (back.components, back.started),
+        (
+            vec![ComponentAt {
+                at: at.clone(),
+                desired: None,
+                held: Some(SIM_COMPONENT.to_owned()),
+            }],
+            None
+        )
+    );
+    let cause = |got: Result<hex_api::Swapped, Refusal>| match got {
+        Err(Refusal::Swap {
+            op: "swap",
+            cause,
+            why: Some(_),
+            ..
+        }) => cause,
+        other => panic!("{other:?}"),
+    };
+    let none = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(
+        cause(vm.client.swap(&vm.id, &at, &none, SwapWhen::Now)),
+        SwapCause::Artifact
+    );
+    assert_eq!(
+        cause(
+            vm.client
+                .swap(&vm.id, "/harness/nobody", SIM_COMPONENT, SwapWhen::Now)
+        ),
+        SwapCause::Unknown
+    );
+    let claude = format!("/harness/{}", vm.claude.name);
+    let started = vm
+        .client
+        .swap(&vm.id, &claude, SIM_COMPONENT, SwapWhen::Now)
+        .unwrap()
+        .started;
+    assert_eq!(
+        started,
+        Some(1),
+        "the driven member's own first start again"
+    );
+    let mut member = vm.client.member(&vm.id, &vm.claude).unwrap();
+    assert!(member.streams().unwrap().stdout.is_some());
     vm.client.delete(&vm.id).unwrap();
 }
 

@@ -195,6 +195,22 @@ impl GuestRuntime {
         })
     }
 
+    /// Image box `id`'s record for `op`, a call on its components (Shards' D270 slice 4): refused as a retired box's are,
+    /// `NoSuchBox` where none is recorded, and for a box of any other class as the trait refuses it, naming its class.
+    pub(super) fn swappable(&self, id: &BoxId, op: &'static str) -> Result<BoxRecord, Refusal> {
+        match self.routed(id)? {
+            Routed::Retired(record) => Err(record.retired_refusal()?),
+            Routed::Image(record) => Ok(record),
+            Routed::Other(None) => Err(Refusal::NoSuchBox(id.try_clone()?)),
+            Routed::Other(Some(record)) => Err(Refusal::Swap {
+                id: id.try_clone()?,
+                op,
+                cause: hex_api::SwapCause::Class(record.spec.class.class()),
+                why: None,
+            }),
+        }
+    }
+
     /// The boxes its node retired with their node VM (A-6; ROOT, 2026-11-13), each as its inspect answers it, from its
     /// record alone, with no guest left to ask; none where it keeps no books.
     pub(super) fn retired_infos(&self) -> Result<Vec<BoxInfo>, Refusal> {

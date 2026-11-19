@@ -47,8 +47,9 @@
 //! - **What it refuses, typed:** egress to whatever its image grants (`Egress::Any`): Hex's grants are default
 //!   deny, so a run names its destinations; limits it doesn't hold ([`HOLDS`]), and credentials where no broker
 //!   leases them ([`NO_BROKER`]); a warm pool kept for its launches, until Hex's image class takes Shards' pools
-//!   ([`NO_POOLS`]; kiln plan 01a1dd2e…, P3.1); a pause or a resume of its run, until Hex pauses a box ([`NO_PAUSE`];
-//!   P5.5b); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`, a run's own failure as `Failed`).
+//!   ([`NO_POOLS`]; kiln plan 01a1dd2e…, P3.1); and what Hex refuses, in Hex's words (`Awaits` as `Unsupported`, a run's
+//!   own failure as `Failed`). Its run pauses and resumes through Hex (P5.5b, over Shards' D267), a box of a class Hex
+//!   pauses none of refused ([`NO_PAUSE`]).
 //! - **Its MCP lane** (Shards D254; #75 step 3): its harness member is asked for its MCP bridge (`/run/shards/mcp`,
 //!   `ImageMember::mcp`), and each connection its harness makes to it is taken through Hex (`Runtime::mcp`, over its
 //!   run's agent-control endpoint) as `super::Lanes`' next, for the runner to serve kiln's MCP over in its own
@@ -75,7 +76,7 @@ use std::time::Duration;
 
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, ImageVolume, Member, MemberKind, Mount, Ports, Proc, Proto, Runtime, RuntimeCost, ServedMount, ShardsImage};
+use hex_api::{Allocation, BoxId, BoxSpec, CapacityResources, ClassSpec, Destination, Grant, HostUse, ImageMember, ImageShare, ImageVolume, Member, MemberKind, Ports, Proc, Proto, Runtime, RuntimeCost, ServedMount, ShardsImage};
 use kiln_ci::place::holder::BoxName;
 use kiln_seams::Records;
 use kiln_seams::records::{Tx, Write};
@@ -365,7 +366,7 @@ impl HexVms {
         let grants = grants_of(&member, &launch.egress)?;
         let credentials = credentials_of(&member, &launch.credentials);
         let sign_ins = sign_ins_of(&member, sign_ins);
-        let mut shares = launch.shares.iter().map(|s| mount_of(s, &member)).collect::<Result<Vec<Mount>, Refusal>>()?;
+        let mut shares = launch.shares.iter().map(|s| share_of(s, &member)).collect::<Result<Vec<ImageShare>, Refusal>>()?;
         // Its folders another server serves (Shards' D286), each asked of the server its runtime was bound as its box boots.
         let served = launch.served.iter().map(|s| served_of(s, &member)).collect::<Result<Vec<ServedMount>, Refusal>>()?;
         // Its harness works in it from its first instruction: given to no member, it would reach its run's root alone,
@@ -375,7 +376,7 @@ impl HexVms {
             && !shares.iter().any(|s| &s.destination == folder)
             && !launch.served.iter().any(|s| within(folder, &s.at))
         {
-            shares.push(Mount { source: PathBuf::from(folder), destination: folder.clone(), read_only: false, members: vec![member.clone()] });
+            shares.push(ImageShare { source: PathBuf::from(folder), destination: folder.clone(), read_only: false, members: vec![member.clone()], exec: true });
         }
         // Its MCP bridge (Shards D254): nothing of it is a grant or an address.
         let driven = ImageMember { member: member.clone(), env: launch.env.clone(), workdir: launch.folder.clone(), args: launch.args.clone(), mcp: true };
@@ -460,10 +461,11 @@ pub const NO_POOLS: &str = "a warm pool kept for its launches: the Hex kiln vend
 
 /// `share` as Hex mounts it into its box (`ShardsImage::shares`): its host folder at its path, read-only where it isn't
 /// writable, and given as they start to the members it names, which see it from their first instruction (Shards'
-/// share member scope, D277; `hex_api::Mount::members`): none, its run's root alone. Hex names a member by its kind
-/// and its name, and a launch types the harness it drives (`driven`) alone, so a share given to any other member is
-/// refused, never mounted where that member doesn't see it.
-fn mount_of(share: &Share, driven: &Member) -> Result<Mount, Refusal> {
+/// share member scope, D277; `hex_api::ImageShare::members`): none, its run's root alone. Hex names a member by its
+/// kind and its name, and a launch types the harness it drives (`driven`) alone, so a share given to any other member is
+/// refused, never mounted where that member doesn't see it. Its files may be run from it (Shards' D279's `exec`, on), as
+/// every share's were before D279: a launch's share names no `noexec` yet (kiln plan 01a1dd2e…, P6b.4).
+fn share_of(share: &Share, driven: &Member) -> Result<ImageShare, Refusal> {
     let members = share
         .members
         .iter()
@@ -475,7 +477,7 @@ fn mount_of(share: &Share, driven: &Member) -> Result<Mount, Refusal> {
             }
         })
         .collect::<Result<Vec<Member>, Refusal>>()?;
-    Ok(Mount { source: PathBuf::from(&share.host), destination: share.at.clone(), read_only: !share.writable, members })
+    Ok(ImageShare { source: PathBuf::from(&share.host), destination: share.at.clone(), read_only: !share.writable, members, exec: true })
 }
 
 /// Why a launch given a folder another server serves is refused where its runtime was bound no server of them.
@@ -483,7 +485,7 @@ pub const NO_SERVER: &str = "a folder another server serves (a Slates volume ser
 
 /// `served` as Hex asks its server for it as its box boots (`ShardsImage::served`, Shards' D286): by its source, at its
 /// place, read-only where it isn't writable, given as they start to the members it names, which Hex names by kind and
-/// name, so one given to a member the launch doesn't drive is refused, as a share's is ([`mount_of`]).
+/// name, so one given to a member the launch doesn't drive is refused, as a share's is ([`share_of`]).
 fn served_of(served: &kiln_seams::sandbox::Served, driven: &Member) -> Result<ServedMount, Refusal> {
     let members = served
         .members
@@ -943,16 +945,32 @@ impl Run for HexRun {
         Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_SWAP.to_owned())) } })
     }
 
-    // None yet: Hex's wire calls that pause and resume a box (kiln plan 01a1dd2e…, P5.5b, over Shards' D267).
+    // Hex pauses and resumes its box (Hex's `Runtime::pause` and `resume`, its P5.5b over Shards' D267): paused, its guest
+    // runs no CPU and its stdio and connections are kept until it's resumed. One Hex says is paused already (or, for a
+    // resume, running already) is as asked, as Hex's contract has a caller that lost its answer take it; one with no run,
+    // or whose run has ended, is `Ended`; a box of a class Hex pauses none of, [`NO_PAUSE`]; the rest in Hex's words.
     fn pause(&self, on: bool) -> BoxFuture<'_, Result<(), Refusal>> {
-        let _ = on;
-        let over = self.over();
-        Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_PAUSE.to_owned())) } })
+        Box::pin(async move {
+            if self.over() {
+                return Err(Refusal::Ended);
+            }
+            let (runtime, id) = (Arc::clone(&self.vm.runtime), self.vm.id.try_clone().map_err(seam)?);
+            let moved = crate::rt::blocking(move || if on { runtime.pause(&id) } else { runtime.resume(&id) })
+                .await
+                .map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?;
+            match moved {
+                Ok(()) => Ok(()),
+                Err(hex_api::Refusal::Pause { cause, .. }) if matches!((on, cause), (true, hex_api::PauseCause::Paused) | (false, hex_api::PauseCause::Running)) => Ok(()),
+                Err(hex_api::Refusal::Pause { cause: hex_api::PauseCause::NotRunning | hex_api::PauseCause::Ended, .. }) => Err(Refusal::Ended),
+                Err(hex_api::Refusal::Pause { cause: hex_api::PauseCause::Class(_), .. }) => Err(Refusal::Unsupported(NO_PAUSE.to_owned())),
+                Err(why) => Err(seam(why)),
+            }
+        })
     }
 }
 
-/// Why a box isn't paused and resumed yet.
-pub const NO_PAUSE: &str = "a running microVM paused where it is and resumed: the Hex kiln vendors has no wire call for either yet (kiln plan 01a1dd2e…, P5.5b, over Shards' D267)";
+/// Why a box isn't paused and resumed: Hex pauses a Shards image VM alone (its P5.5b, over Shards' D267).
+pub const NO_PAUSE: &str = "a running microVM paused where it is and resumed: Hex pauses a Shards image VM alone, and this box is of another class";
 
 /// Why a box's harness isn't swapped for another in place yet.
 pub const NO_SWAP: &str = "a harness swapped for another in its running microVM: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6c.2)";
@@ -977,7 +995,7 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use hex_api::sim::{SIM_IMAGE, SimRuntime};
-    use hex_api::{BoxId, BoxInfo, BoxSpec, Class, ClassSpec, Destination, Grant, HostUse, Member, MemberKind, Ports, Proc, Program, Proto, Refusal as H, Runtime, Stdio, Usage};
+    use hex_api::{BoxId, BoxInfo, BoxSpec, Class, ClassSpec, Destination, Grant, HostUse, ImageShare, Member, MemberKind, Ports, Proc, Program, Proto, Refusal as H, Runtime, Stdio, Usage};
     use kiln_ci::place::holder::BoxName;
     use kiln_seams::Records as _;
     use kiln_seams::records::{Consistency, SimRecords};
@@ -1130,15 +1148,16 @@ pub(crate) mod tests {
         })
     }
 
-    /// Kiln plan 01a1dd2e…, P5.5c: until the Hex kiln vendors has Hex's P5.5b calls, a pause and a resume of a box's run
-    /// are refused typed (`Unsupported`, naming P5.5b), its run going on; once the run has ended, `Ended`.
+    /// Kiln plan 01a1dd2e…, P5.5c over Hex's P5.5b: a box's run pauses and resumes through Hex. Do pause it twice, then
+    /// resume it twice, then kill it and pause it. Expect each as asked (a pause of a paused run and a resume of a running
+    /// one as asked too, Hex's word that it stands so), its run going on until it was killed, then `Ended`.
     #[test]
-    fn p5_5c_hexs_mapping_refuses_a_pause_typed_until_hex_has_the_call() -> anyhow::Result<()> {
+    fn p5_5c_a_runs_pause_and_resume_go_through_hex() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let (_, vms) = vms();
             let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
-            for on in [true, false] {
-                assert_eq!(run.pause(on).await, Err(Refusal::Unsupported(super::NO_PAUSE.to_owned())), "pause {on}");
+            for on in [true, true, false, false] {
+                assert_eq!(run.pause(on).await, Ok(()), "pause {on}");
             }
             run.kill();
             let (_, ends) = drain(run.as_ref()).await;
@@ -1472,12 +1491,12 @@ pub(crate) mod tests {
     /// Read `n` of a VM's use: its CPU time growing as n squared, its window as n, so a read's CPUs are its
     /// growth since the read before, not its whole run's.
     fn use_at(n: u64) -> HostUse {
-        HostUse { cpu_ns: n * n * 1_000_000, footprint_bytes: (64 << 20) + n, resident_bytes: (80 << 20) + n, guest_ns: vec![n * 500_000], window: Duration::from_millis(n * 4), charged: hex_api::Charged::ToThread }
+        HostUse { cpu_ns: n * n * 1_000_000, footprint_bytes: (64 << 20) + n, resident_bytes: (80 << 20) + n, guest_ns: vec![n * 500_000], window: Duration::from_millis(n * 4), charged: hex_api::Charged::ToThread, paused: Duration::ZERO }
     }
 
     /// A VM's final use, as its delete reads it with its end.
     fn final_use() -> HostUse {
-        HostUse { cpu_ns: 90_000_000, footprint_bytes: 96 << 20, resident_bytes: 112 << 20, guest_ns: vec![70_000_000], window: Duration::from_secs(1), charged: hex_api::Charged::ToThread }
+        HostUse { cpu_ns: 90_000_000, footprint_bytes: 96 << 20, resident_bytes: 112 << 20, guest_ns: vec![70_000_000], window: Duration::from_secs(1), charged: hex_api::Charged::ToThread, paused: Duration::ZERO }
     }
 
     /// D265: a VM's host CPU is its process's CPU time where its OS charges its vCPUs' guest time to it, that and its
@@ -1901,7 +1920,7 @@ pub(crate) mod tests {
         })
     }
 
-    /// Kiln plan 01a1cd8e…, P1.4 (Shards' D277, through Hex's member scope on `Mount`): a launch's shares reach Hex given
+    /// Kiln plan 01a1cd8e…, P1.4 (Shards' D277, through Hex's member scope on `ImageShare`): a launch's shares reach Hex given
     /// to the members they name, its harness by its kind, and one given to none to its run's root alone; its folder, which
     /// none of them shares, is given to its harness, which works in it from its first instruction. A share given to a
     /// member it doesn't drive is refused, typed, asking Hex for no box.
@@ -1917,7 +1936,7 @@ pub(crate) mod tests {
             let spec: BoxSpec = serde_json::from_str(specs.first().ok_or_else(|| anyhow::anyhow!("no box was asked for"))?)?;
             let ClassSpec::ShardsImage(image) = spec.class else { anyhow::bail!("its box isn't a Shards image's") };
             let harness = Member { kind: MemberKind::Harness, name: "claude".into() };
-            let mount = |source: &str, destination: &str, read_only: bool, members: Vec<Member>| hex_api::Mount { source: source.into(), destination: destination.into(), read_only, members };
+            let mount = |source: &str, destination: &str, read_only: bool, members: Vec<Member>| ImageShare { source: source.into(), destination: destination.into(), read_only, members, exec: true };
             let given = [
                 mount("/Users/ada/proj", "/work/proj", false, vec![harness.clone()]),
                 mount("/Users/ada/plugins", "/plugins/a", true, vec![harness.clone()]),

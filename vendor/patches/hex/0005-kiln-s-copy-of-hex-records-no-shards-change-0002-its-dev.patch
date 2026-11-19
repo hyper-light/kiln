@@ -1,0 +1,40 @@
+Subject: kiln's copy of Hex records no Shards change 0002 (its dev-dependencies' shards-testwait)
+Why: Hex's 0002 drops shards-testwait from the dev-dependencies of its own vendored Shards, which takes no crates/testwait; kiln's Shards takes it, and Hex in kiln builds on kiln's Shards (0004), so the change isn't kiln's: kiln's changes to Shards must be the product's.
+Kiln-only: Its layout alone: Hex's own copy of Shards keeps 0002.
+
+diff --git a/vendor/patches/shards/0002-hex-s-vendored-shards-names-no-shards-testwait-among-shards.patch b/vendor/patches/shards/0002-hex-s-vendored-shards-names-no-shards-testwait-among-shards.patch
+deleted file mode 100644
+index 3d879db7cbbf1919c919828647b51e84e66dc2c2..0000000000000000000000000000000000000000
+--- a/vendor/patches/shards/0002-hex-s-vendored-shards-names-no-shards-testwait-among-shards.patch
++++ /dev/null
+@@ -1,30 +0,0 @@
+-Subject: Hex's vendored Shards names no shards-testwait among shards-api's and shards-remote's dev-dependencies
+-Why: Hex takes none of Shards' tests, nor crates/testwait, which needs shards-vmm and much more of Shards. A dev-dependency on it left the vendored Shards workspace unloadable, so cargo fmt --all, Hex's first gate, failed at 84c870b0f (Shards v0.8.0, aa819b058).
+-Kiln-only: Its layout alone: Shards' own workspace takes crates/testwait, and its tests use it.
+-
+-diff --git a/crates/api/Cargo.toml b/crates/api/Cargo.toml
+-index 5f77f03c9444b8121be0bb485435b0d8ed72aab6..200b6b9601d968e22ea7bd1282f3b4ef3f305999 100644
+---- a/crates/api/Cargo.toml
+-+++ b/crates/api/Cargo.toml
+-@@ -57,8 +57,6 @@ windows-sys = { workspace = true, features = [
+- 
+- [dev-dependencies]
+- shards-testdir = { path = "../testdir" }
+--# Its tests' waits, judged on their own threads (D215, #36), as shards-remote's are.
+--shards-testwait = { path = "../testwait" }
+- # Test roots, DER and PEM, for a run's upstream roots (D242).
+- rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+- 
+-diff --git a/crates/remote/Cargo.toml b/crates/remote/Cargo.toml
+-index ae984c412ac32c612bb30e63ca5536f499438994..2eb11071734d872dc8909bf03b556565bb63ee2c 100644
+---- a/crates/remote/Cargo.toml
+-+++ b/crates/remote/Cargo.toml
+-@@ -29,8 +29,6 @@ shards-durable = { path = "../durable" }
+- 
+- [dev-dependencies]
+- shards-testdir = { path = "../testdir" }
+--# Its tests' waits, judged on their own threads (D215, #77), as the daemon's are.
+--shards-testwait = { path = "../testwait" }
+- 
+- [target.'cfg(unix)'.dependencies]
+- libc.workspace = true

@@ -1299,7 +1299,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "sessions.pause",
-            summary: "Pause a session where it is (yours, or an agent's you started), and the subagents kiln started under it: on its machine's host its processes stop where they are, held by the machine's pacer; in a microVM its microVM is paused, through Hex. Taken isn't paused: agents.get says it is once its machine holds it (stand `paused`, `frozen` since when), and its timeline says why not where it can't be (a microVM's, until Hex pauses one: kiln plan 01a1dd2e…, P5.5b). One paused already is refused (409). sessions.resume lets it go on.",
+            summary: "Pause a session where it is (yours, or an agent's you started), and the subagents kiln started under it: on its machine's host its processes stop where they are, held by the machine's pacer; in a microVM its microVM is paused, through Hex. Taken isn't paused: agents.get says it is once its machine holds it (stand `paused`, `frozen` since when), and its timeline says why not where it can't be. One paused already is refused (409). sessions.resume lets it go on.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsInterrupt>(),
