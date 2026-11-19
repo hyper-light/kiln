@@ -65,14 +65,14 @@ pub async fn changes(m: &Made, over: &str) -> anyhow::Result<Vec<Change>> {
     read.map_err(|e| anyhow::anyhow!("its review: {e}"))
 }
 
-/// How many of the files a landing of workspace `m` into `over` writes git ignores (none tracked): what a working
-/// tree's `git status` would leave out, for a workspace with no working tree on this machine.
-pub async fn ignored_writes(m: &Made, over: &str) -> anyhow::Result<usize> {
+/// How many of the files a landing of workspace `m` into `over`, leaving out `excludes`, writes git ignores (none
+/// tracked): what a working tree's `git status` would leave out, for a workspace with no working tree on this machine.
+pub async fn ignored_writes(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<usize> {
     let (tracked, mut ignores) = git_rules(Path::new(over)).await?;
     let volume = super::slates::volume_id(&m.volume)?;
-    let over = over.to_owned();
+    let (over, excludes) = (over.to_owned(), excludes.to_vec());
     let counted = super::slates::call("review", move |i| {
-        Ok(match present(i, volume, None, &over) {
+        Ok(match present(i, volume, None, &over, &excludes) {
             Ok(entries) => entries
                 .iter()
                 .try_fold(0usize, |n, entry| Ok::<usize, Fault>(if writes_untracked(entry, &tracked) && ignored(i, volume, &mut ignores, entry)? { n.saturating_add(1) } else { n })),
@@ -81,6 +81,53 @@ pub async fn ignored_writes(m: &Made, over: &str) -> anyhow::Result<usize> {
     })
     .await?;
     counted.map_err(|e| anyhow::anyhow!("what its landing writes: {e}"))
+}
+
+/// What a landing of workspace `m` into `over` writes that git ignores (none tracked), each a prefix of the volume as a
+/// landing's filter leaves it out: the shallowest directory git ignores above it where there is one (`/target`), else
+/// the file itself (`/secret.env`). For a workspace with no working tree on this machine, what `git status --ignored`
+/// would name in one (`super::slates::excludes`).
+pub async fn ignored_paths(m: &Made, over: &str) -> anyhow::Result<Vec<String>> {
+    let (tracked, mut ignores) = git_rules(Path::new(over)).await?;
+    let volume = super::slates::volume_id(&m.volume)?;
+    let over = over.to_owned();
+    let excludes: Vec<String> = super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect();
+    let found = super::slates::call("review", move |i| {
+        Ok(match present(i, volume, None, &over, &excludes) {
+            Ok(entries) => ignored_prefixes(i, volume, &mut ignores, &tracked, &entries),
+            Err(fault) => Err(fault),
+        })
+    })
+    .await?;
+    found.map_err(|e| anyhow::anyhow!("what its landing writes that git ignores: {e}"))
+}
+
+/// The prefixes of `entries` git ignores ([`ignored_paths`]): each untracked write's shallowest ignored ancestor
+/// directory, else itself where git ignores the file; one a prefix found already covers adds none.
+fn ignored_prefixes(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, tracked: &HashSet<String>, entries: &[PlannedEntry]) -> Result<Vec<String>, Fault> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.iter().filter(|e| writes_untracked(e, tracked)) {
+        let path = relative(&entry.path);
+        if out.iter().any(|p| p.strip_prefix('/').is_some_and(|p| path == p || path.starts_with(&format!("{p}/")))) {
+            continue;
+        }
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut found = None;
+        for depth in 1..parts.len() {
+            let dir = parts.get(..depth).unwrap_or_default().join("/");
+            if ignored_at(i, volume, ignores, &dir, true)? {
+                found = Some(dir);
+                break;
+            }
+        }
+        if found.is_none() && ignored_at(i, volume, ignores, &path, false)? {
+            found = Some(path.clone());
+        }
+        if let Some(prefix) = found {
+            out.push(format!("/{prefix}"));
+        }
+    }
+    Ok(out)
 }
 
 /// The paths the repository at `top` tracks (its index), and git's ignore rules beneath a volume's own `.gitignore`
@@ -112,7 +159,7 @@ enum Read {
 
 fn once(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String>, ignores: &mut Ignores) -> Result<Read, Fault> {
     let snapshot = i.snapshot(volume).map_err(Fault::Slates)?;
-    let read = present(i, volume, Some(snapshot), over).and_then(|entries| read_entries(i, volume, entries, tracked, ignores));
+    let read = present(i, volume, Some(snapshot), over, &super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()).and_then(|entries| read_entries(i, volume, entries, tracked, ignores));
     // The snapshot is the review's alone: let go of it whatever came of it.
     let gone = i.destroy_snapshot(volume, snapshot).map_err(Fault::Slates);
     let read = read?;
@@ -120,10 +167,10 @@ fn once(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String
     Ok(read)
 }
 
-/// Every entry a landing of `volume` (at `snapshot`, else its head) into `over` writes, `.git` left out, presented
+/// Every entry a landing of `volume` (at `snapshot`, else its head) into `over` writes, `excludes` left out, presented
 /// never writing whatever the volume's mode: none where nothing changed.
-fn present(i: &mut Instance, volume: VolumeId, snapshot: Option<SnapshotId>, over: &str) -> Result<Vec<PlannedEntry>, Fault> {
-    let request = LandingRequest { volume, snapshot, target: over.to_owned(), filter: Filter { include: Vec::new(), exclude: super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect() } };
+fn present(i: &mut Instance, volume: VolumeId, snapshot: Option<SnapshotId>, over: &str, excludes: &[String]) -> Result<Vec<PlannedEntry>, Fault> {
+    let request = LandingRequest { volume, snapshot, target: over.to_owned(), filter: Filter { include: Vec::new(), exclude: excludes.to_vec() } };
     match i.plan_landing(&request).map_err(Fault::Slates)? {
         LandOutcome::ApprovalRequired(approval) => i.approval_entries(&approval).map_err(Fault::Slates),
         // Nothing to write: nothing changed.
@@ -175,6 +222,12 @@ fn writes_untracked(entry: &PlannedEntry, tracked: &HashSet<String>) -> bool {
 
 /// Whether git ignores what `entry` writes in `volume`, by its `.gitignore` files read at the volume's head.
 fn ignored(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, entry: &PlannedEntry) -> Result<bool, Fault> {
+    ignored_at(i, volume, ignores, &relative(&entry.path), false)
+}
+
+/// Whether git ignores `path` in `volume` (relative to its top; a directory where `is_dir`), by its `.gitignore` files
+/// read at the volume's head.
+fn ignored_at(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, path: &str, is_dir: bool) -> Result<bool, Fault> {
     let mut read = |file: &str| -> anyhow::Result<Option<Vec<u8>>> {
         match i.read(volume, &format!("/{file}"), ReadAt::Head) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -182,5 +235,5 @@ fn ignored(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, entry: &Pl
             Err(e) => Err(anyhow::anyhow!("reading {file}: {e}")),
         }
     };
-    ignores.ignored(&relative(&entry.path), false, &mut read).map_err(|e| Fault::Other(format!("{e:#}")))
+    ignores.ignored(path, is_dir, &mut read).map_err(|e| Fault::Other(format!("{e:#}")))
 }
