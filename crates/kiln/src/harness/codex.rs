@@ -5101,7 +5101,7 @@ mod tests {
         let mut core = super::super::core::Core::new();
         core.state.mode = "auto".into();
         assert_eq!(c.policies(&core).2, serde_json::json!({"type": "workspaceWrite"}), "no folder given: as it was");
-        let held = |path: &str, access| HeldVolume { volume: Volume { path: path.into(), at: path.into(), access, members: vec![Member::Harness("codex".into())] }, harness: Took::Nothing { why: String::new() }, scope: Took::Nothing { why: String::new() }, microvm: None };
+        let held = |path: &str, access| HeldVolume { volume: Volume { path: path.into(), at: path.into(), access, members: vec![Member::Harness("codex".into())], exec: true }, harness: Took::Nothing { why: String::new() }, scope: Took::Nothing { why: String::new() }, microvm: None };
         core.state.overrides.volumes = vec![held("/data", Access::Rw), held("/docs", Access::Ro)];
         let (_, sandbox, turn) = c.policies(&core);
         assert_eq!(sandbox, "workspace-write");

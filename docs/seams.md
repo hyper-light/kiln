@@ -500,7 +500,8 @@ A run's network and folders change while it runs (`change`; kiln plan 01a1dd2eâ€
 wire calls for Shards' P6b.1 and P6b.2): a host port published to a member's port and unpublished,
 egress granted to a member toward a host and port and revoked, a member connected to a named network
 shared with other runs and its grant there taken back, a machine's folder plugged in for members,
-read-only or writable, and unplugged. Every one names who, to whom, which ports and which way
+read-only or writable, its files run from it or not (`exec`; where not, each member's mount of it is
+`noexec`, Shards' D279), and unplugged. Every one names who, to whom, which ports and which way
 (default deny). A connection (Shards' D285) grants nothing but its grant (`NetworkGrant`): the
 member's name on the network (a host's name, one member's there, as its peers name it), its peer (a
 member of another run on it, by its name there, which outlasts that run's restarts as its `id`

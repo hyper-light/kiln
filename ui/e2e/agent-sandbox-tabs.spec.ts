@@ -73,7 +73,7 @@ test("a microVM session's Engine: its line and controls, its bars each with its 
   expect(said, said.join("\n")).toEqual([]);
 });
 
-test("a volume given live: read and execute by default, as every mount is; execute off refused until Shards can hold it, read off always", async ({ page }) => {
+test("a volume given live: read and execute by default, as every mount is; execute off kept from running in its microVM, read off refused always", async ({ page }) => {
   const said = errors(page);
   await page.goto("/agents/fam-orch");
   await expect(page.getByRole("textbox", { name: "Message to the agent", exact: true })).toBeEnabled({ timeout: 30_000 });
@@ -81,32 +81,28 @@ test("a volume given live: read and execute by default, as every mount is; execu
   const body = page.locator(".hx-inspector-body").filter({ visible: true }).first();
   await body.getByRole("button", { name: "Add a volume" }).click();
   const form = body.getByRole("listitem", { name: "Add a volume" });
-  // A checkbox a row each, set as a Shards mount is today: it reads, and runs what's on it.
+  // A checkbox a row each, set as a Shards mount is by default: it reads, and runs what's on it.
   await expect(form.getByRole("checkbox", { name: "Read" })).toBeChecked();
   await expect(form.getByRole("checkbox", { name: "Write" })).not.toBeChecked();
   await expect(form.getByRole("checkbox", { name: "Execute" })).toBeChecked();
   await form.getByRole("textbox", { name: "Folder on its machine" }).fill("/srv/data");
-  // Execute off: refused, saying why (Shards' noexec isn't vendored yet).
-  await form.getByRole("checkbox", { name: "Execute" }).uncheck();
-  await form.getByRole("button", { name: "Add" }).click();
-  await expect(form).toContainText("Turning off execute isn't possible yet");
   // Read off: refused always (a mount can't stop reads).
-  await form.getByRole("checkbox", { name: "Execute" }).check();
   await form.getByRole("checkbox", { name: "Read" }).uncheck();
   await form.getByRole("checkbox", { name: "Write" }).check();
   await form.getByRole("button", { name: "Add" }).click();
   await expect(form).toContainText("A volume always allows reading");
-  // Read, write and execute: given, its row saying so.
+  // Read and write, execute off: given, its microVM's mount of it noexec (Shards' D279), its row saying so.
   await form.getByRole("checkbox", { name: "Read" }).check();
+  await form.getByRole("checkbox", { name: "Execute" }).uncheck();
   await form.getByRole("button", { name: "Add" }).click();
   await expect(form).toHaveCount(0);
   const row = body.locator("li.sb-vol", { hasText: "/srv/data" });
-  await expect(row.locator(".sb-mode")).toHaveText("rwx");
+  await expect(row.locator(".sb-mode")).toHaveText("rw-");
   await row.getByRole("button", { name: "Take /srv/data back" }).click();
   await row.getByRole("button", { name: "Take /srv/data back" }).click();
   await expect(body.locator("li.sb-vol", { hasText: "/srv/data" })).toHaveCount(0);
-  // The two refusals are the browser's own lines about their 400 and 409; nothing else.
-  const others = said.filter((s) => !/Failed to load resource: the server responded with a status of 40[09]/.test(s));
+  // The refusal is the browser's own line about its 400; nothing else.
+  const others = said.filter((s) => !/Failed to load resource: the server responded with a status of 400/.test(s));
   expect(others, others.join("\n")).toEqual([]);
 });
 

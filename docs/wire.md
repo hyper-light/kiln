@@ -725,6 +725,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   volume that arrived with a session before its harness starts; the server moves a volume only between
   two runners that name it, and refuses the move by kind otherwise (an older runner would hand the
   session over without its volume).
+  `sessions.volumes.exec`: the runner holds a volume given to a running microVM session with its
+  files kept from running (`Command::Override`'s volume with `exec` off: each member's mount of it
+  `noexec`, Shards' D279; kiln plan 01a1dd2e…, P6b.4); the server sends one only to a runner that
+  names it, and refuses it otherwise (an older runner would give the volume with its files run).
 
 ## Registry
 

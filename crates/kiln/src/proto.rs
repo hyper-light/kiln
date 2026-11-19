@@ -840,7 +840,12 @@ pub mod feature {
     /// only between two runners that name it, and refuses the move otherwise (an older runner would hand the session
     /// over without its volume).
     pub const SLATES_MOVE: &str = "workspace.slates.move";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE];
+    /// This runner holds a volume given to a running microVM session with its files kept from running
+    /// (`Command::Override`'s volume `exec` off: each member's mount of it `noexec`, Shards' D279; kiln plan 01a1dd2e…,
+    /// P6b.4); the server sends one only to a runner that names it, and refuses it otherwise (an older runner would
+    /// give the volume with its files run).
+    pub const VOLUME_EXEC: &str = "sessions.volumes.exec";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, VOLUME_EXEC];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
