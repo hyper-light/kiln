@@ -25,12 +25,14 @@ use std::time::Duration;
 use anyhow::Context as _;
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use futures::io::{AsyncRead, AsyncWrite};
+use hyper_quic::rustls::client::WebPkiServerVerifier;
+use hyper_quic::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use hyper_quic::rustls::crypto::CryptoProvider;
 use hyper_quic::rustls::pki_types::pem::PemObject as _;
-use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use hyper_quic::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use hyper_quic::rustls::server::{ClientHello, NoServerSessionStorage, ProducesTickets, ResolvesServerCert};
 use hyper_quic::rustls::sign::CertifiedKey;
-use hyper_quic::rustls::{self, ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use hyper_quic::rustls::{self, ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, ServerConfig, ServerConnection, SignatureScheme};
 
 use super::client::{Identity, Roots};
 
@@ -44,12 +46,16 @@ fn provider() -> &'static CryptoProvider {
 /// Trust and identity for a client, from which each connection's configuration is made.
 pub struct ClientTls {
     roots: RootCertStore,
+    /// A kiln server's CA alone ([`Roots::WebPkiPlusDer`]), under which a certificate answers only in the server's role
+    /// ([`KilnServer`]).
+    kiln: Option<RootCertStore>,
     identity: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
 }
 
 impl ClientTls {
     pub fn new(roots: Roots, identity: Option<Identity>) -> anyhow::Result<Self> {
         let mut store = RootCertStore::empty();
+        let mut kiln = None;
         match roots {
             // The public roots, and this machine's own (a TLS-inspecting proxy's root, say).
             Roots::WebPki => {
@@ -64,7 +70,11 @@ impl ClientTls {
             Roots::WebPkiPlusDer(der) => {
                 store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 store.add_parsable_certificates(super::roots::system().iter().cloned());
-                store.add(CertificateDer::from(der)).context("CA certificate")?;
+                let ca = CertificateDer::from(der);
+                let mut alone = RootCertStore::empty();
+                alone.add(ca.clone()).context("CA certificate")?;
+                store.add(ca).context("CA certificate")?;
+                kiln = Some(alone);
             }
         }
         anyhow::ensure!(!store.is_empty(), "no usable root certificates");
@@ -79,7 +89,7 @@ impl ClientTls {
                 Some((chain, key))
             }
         };
-        let tls = Self { roots: store, identity };
+        let tls = Self { roots: store, kiln, identity };
         // Fail now, not at the first request, for a key the provider cannot load.
         tls.config()?;
         Ok(tls)
@@ -94,8 +104,12 @@ impl ClientTls {
     pub fn config_alpn(&self, alpn: &[&[u8]]) -> anyhow::Result<ClientConfig> {
         let builder = ClientConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
-            .context("protocol versions")?
-            .with_root_certificates(self.roots.clone());
+            .context("protocol versions")?;
+        let builder = match &self.kiln {
+            // A kiln server's: a certificate its CA issued answers only in the server's role (docs/agentic.md W10).
+            Some(kiln) => builder.dangerous().with_custom_certificate_verifier(Box::new(KilnServer::new(kiln, &self.roots)?)),
+            None => builder.with_root_certificates(self.roots.clone()),
+        };
         let mut config = match &self.identity {
             Some((chain, key)) => builder
                 .with_client_auth_cert(chain.clone(), key.clone_key())
@@ -106,6 +120,83 @@ impl ClientTls {
         Ok(config)
     }
 }
+
+/// How a client of a kiln server checks its certificate (docs/agentic.md W10). kiln's CA signs certificates of several
+/// roles, and a capacity holder's and a Slates fleet node's serve both sides of their own links for names the server may
+/// be reached at too, so a client that checked only the name it dialled would take either for the server. So a
+/// certificate the server's CA issued for that name answers only in the server's role, the server's own or a front
+/// door's ([`crate::pki::answers_as_server`]), and any other (a public certificate for the server's name, one under
+/// this machine's roots) is checked as any HTTPS server's is. The CA is asked first, so its rule holds where it is among
+/// this machine's roots as well (installed there for a front door's sake).
+#[derive(Debug)]
+struct KilnServer {
+    /// The server's CA alone.
+    kiln: Box<WebPkiServerVerifier>,
+    /// Every root the client trusts: the public ones, this machine's and the server's CA.
+    all: Box<WebPkiServerVerifier>,
+}
+
+impl KilnServer {
+    fn new(kiln: &RootCertStore, all: &RootCertStore) -> anyhow::Result<Self> {
+        let verifier = |roots: &RootCertStore| WebPkiServerVerifier::builder_with_provider(roots.clone(), provider()).build().map_err(|e| anyhow::anyhow!("server verifier: {e}"));
+        Ok(Self { kiln: verifier(kiln)?, all: verifier(all)? })
+    }
+}
+
+impl ServerCertVerifier for KilnServer {
+    fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>], server_name: &ServerName<'_>, ocsp_response: &[u8], now: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+        match self.kiln.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
+            Ok(verified) if crate::pki::answers_as_server(end_entity.as_ref()) => Ok(verified),
+            Ok(_) => Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError::new(AnotherRole::of(end_entity))))),
+            Err(_) => self.all.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now),
+        }
+    }
+
+    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.all.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.all.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.all.supported_verify_schemes()
+    }
+}
+
+/// A certificate a kiln server's CA issued for the name its client dialled, in another role than the server's
+/// ([`KilnServer`]), with the names it carries, which tell whose it is.
+#[derive(Clone)]
+struct AnotherRole {
+    names: Vec<String>,
+}
+
+impl AnotherRole {
+    fn of(end_entity: &CertificateDer<'_>) -> Self {
+        Self { names: crate::pki::cert_info_der(end_entity.as_ref()).map(|i| i.names).unwrap_or_default() }
+    }
+}
+
+impl std::fmt::Display for AnotherRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the server's CA issued this certificate (for {}) in another role than the server's: where a kiln server is expected, only its own certificate (it names {}) and a front door's answer (docs/agentic.md W10)",
+            self.names.join(", "),
+            crate::pki::SERVER_NAME
+        )
+    }
+}
+
+/// As its message: rustls says a certificate's `Other` error by its `Debug`.
+impl std::fmt::Debug for AnotherRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for AnotherRole {}
 
 /// The TLS name for a URL host: a DNS name is sent as SNI; an IP literal is matched against IP SANs
 /// and never sent as SNI. IPv6 brackets are stripped.

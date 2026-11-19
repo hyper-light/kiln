@@ -5,6 +5,14 @@
 //!   host's names.
 //! * Agents generate their key locally and send only a CSR; the server signs it after checking
 //!   the enrollment token. Private keys never cross the network.
+//! * Each certificate's role is told by marks only its own issuer sets (docs/agentic.md W10): the
+//!   server's names [`SERVER_NAME`], which every other issuer refuses ([`reserved`]); a front
+//!   door's only extended key usage is serverAuth and its organization `kiln front door`; a
+//!   machine's only one is clientAuth. A capacity holder's and a Slates fleet node's serve both
+//!   sides of their own links, for names the server may be reached at too. So where kiln's server
+//!   is expected, a certificate this CA issued answers only as the server's own or a front door's
+//!   ([`answers_as_server`]): the QUIC link checks the server under [`SERVER_NAME`], an HTTPS
+//!   client of the server (`crate::http::client::Roots::WebPkiPlusDer`) by that rule.
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +40,10 @@ pub const OUTPOST_DAYS: i64 = 90;
 pub const FRONT_DOOR_DAYS: i64 = 365;
 /// The longest a TLS server certificate may last for browsers and Apple's platforms.
 pub const MAX_TLS_DAYS: i64 = 398;
+/// The organization a front door's certificate names ([`Pki::sign_front_door`]), serverAuth its only extended key
+/// usage: the two marks that tell a front door, the server's entrance on a runner, from every other certificate this CA
+/// issues ([`answers_as_server`]). Both since the first front door (be7bce8e8, 2026-10-17).
+const FRONT_DOOR_ORGANIZATION: &str = "kiln front door";
 
 pub struct Pki {
     dir: PathBuf,
@@ -97,6 +109,29 @@ pub fn leaf_name(leaf: &Leaf) -> Option<String> {
 /// dot aside): no machine's certificate may carry it.
 pub fn reserved(name: &str) -> bool {
     name.trim_end_matches('.').eq_ignore_ascii_case(SERVER_NAME)
+}
+
+/// Whether a certificate this CA issued (DER) may answer where kiln's server is expected (docs/agentic.md W10): the
+/// server's own, the one certificate that names [`SERVER_NAME`] (every other issuer refuses it: [`reserved`]), or a front
+/// door's, the server's entrance on a runner, whose only extended key usage is serverAuth and whose organization is
+/// `kiln front door` ([`Pki::sign_front_door`]). Never a capacity holder's or a Slates fleet node's: each serves both
+/// sides of its own links (serverAuth and clientAuth) for names the server may be reached at too (a runner named as the
+/// server's host, or listed at its address), so it would stand in for the server to a client that checks only the name
+/// it dialled. Nor a machine's (clientAuth alone, which no TLS client takes from a server), nor what doesn't parse.
+pub fn answers_as_server(der: &[u8]) -> bool {
+    use x509_parser::extensions::GeneralName;
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else { return false };
+    let names_the_server = cert
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .is_some_and(|san| san.value.general_names.iter().any(|n| matches!(n, GeneralName::DNSName(d) if reserved(d))));
+    let serves_alone = cert.extended_key_usage().ok().flatten().is_some_and(|eku| {
+        let e = eku.value;
+        e.server_auth && !e.client_auth && !e.any && !e.code_signing && !e.email_protection && !e.time_stamping && !e.ocsp_signing && e.other.is_empty()
+    });
+    let front_door = serves_alone && cert.subject().iter_organization().any(|o| o.as_str().is_ok_and(|o| o == FRONT_DOOR_ORGANIZATION));
+    names_the_server || front_door
 }
 
 /// A machine's certificate (a runner, a runner process beside it, the server's in-process agent):
@@ -536,7 +571,7 @@ impl Pki {
         if let Some(n) = names.iter().find(|n| n.parse::<std::net::IpAddr>().is_err()) {
             p.distinguished_name.push(DnType::CommonName, n.clone());
         }
-        p.distinguished_name.push(DnType::OrganizationName, "kiln front door");
+        p.distinguished_name.push(DnType::OrganizationName, FRONT_DOOR_ORGANIZATION);
         let signed = CertificateSigningRequestParams { params: p, public_key: csr.public_key }.signed_by(&self.issuer).context("sign CSR")?;
         Ok(signed.pem())
     }
@@ -853,6 +888,34 @@ mod tests {
         let (was, now) = (fingerprints(&cert)?, fingerprints(&moved)?);
         assert_eq!(was.key, now.key, "the same key");
         assert_ne!(was.serial, now.serial, "another certificate");
+        Ok(())
+    }
+
+    /// docs/agentic.md W10: of every certificate this CA issues, only the server's own and a front door's answer where
+    /// the server is expected. A capacity holder's and a Slates fleet node's, which serve both sides of their own links,
+    /// never do, even for the server's own host; nor a machine's (enrolled, a second process, moved, the server's own
+    /// in-process one), an identity's, or what isn't a certificate.
+    #[test]
+    fn w10_only_the_servers_own_certificate_and_a_front_doors_answer_as_the_server() -> anyhow::Result<()> {
+        use kiln_ci::identity::chain::{Actor, Identity};
+        let dir = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(dir.path())?;
+        let host = "kiln.home".to_owned();
+        let request = || -> anyhow::Result<Vec<u8>> { Ok(CertificateParams::new(Vec::<String>::new())?.serialize_request(&KeyPair::generate()?)?.der().to_vec()) };
+        assert!(answers_as_server(&pem_to_der(&pki.server_leaf(std::slice::from_ref(&host))?.cert_pem)?), "the server's own");
+        let door = pki.sign_front_door(&front_door_csr(std::slice::from_ref(&host), &new_key_pem()?)?, std::slice::from_ref(&host), FRONT_DOOR_DAYS)?;
+        assert!(answers_as_server(&pem_to_der(&door)?), "a front door's");
+        assert!(!answers_as_server(&pki.sign_slates_node(&request()?, "slates.kiln", 7, Some(host.as_str()))?), "a Slates fleet node's, listed at the server's host");
+        assert!(!answers_as_server(&pki.sign_holder(&request()?, &host)?), "a capacity holder's, named as the server's host");
+        let (csr, key) = make_csr(&host)?;
+        let machine = pki.sign_csr(&csr, &host, 30)?;
+        assert!(!answers_as_server(&pem_to_der(&machine)?), "a machine's");
+        assert!(!answers_as_server(&pem_to_der(&pki.sign_instance(&machine, &make_csr_with_key(&host, &key)?)?.1)?), "a second process's");
+        assert!(!answers_as_server(&pem_to_der(&pki.sign_moved(&machine, &make_csr_with_key(&host, &key)?, "5f2a9c3e0b1d4e6f8a7c9b0d1e2f3a4b")?.1)?), "a moved machine's");
+        assert!(!answers_as_server(&pem_to_der(&pki.issue_local("local")?.cert_pem)?), "the server's in-process agent's");
+        let agent = Identity::new("hyper-light", Actor::Agent { person: "sam".into(), agent: "matrix".into(), epoch: 1, held_by: None });
+        assert!(!answers_as_server(&pem_to_der(&pki.issue_identity(&make_csr("matrix")?.0, &agent, &[], Duration::hours(1))?)?), "an identity's");
+        assert!(!answers_as_server(b"not a certificate"));
         Ok(())
     }
 }
