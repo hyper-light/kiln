@@ -1236,4 +1236,50 @@ mod tests {
         assert_eq!((ck, sk), (Some(rustls::HandshakeKind::Resumed), Some(rustls::HandshakeKind::Resumed)), "the previous key's ticket resumes");
         Ok(())
     }
+
+    /// docs/agentic.md W10, the roles of kiln's certificates: kiln's CA signs the server's certificate and, for names the
+    /// server is reached at too, a Slates fleet node's (a runner listed at the server's own address: W10 names the host
+    /// it's listed at) and a capacity holder's (named as its machine, as a host's own runner often is). Each serves both
+    /// sides of its own links (serverAuth and clientAuth), so it would stand in for the server to a client that checks only
+    /// the name it dialled. A client of kiln's server (`Roots::WebPkiPlusDer`: a runner's calls and its upgrade, a front
+    /// door's upstream, a peer) takes a certificate kiln's CA issued only in the server's role: the server's own, or a
+    /// front door's, the server's entrance on a runner. Both of those pass the same client at the same name, so a refusal
+    /// is the role's, never the trust's.
+    #[test]
+    fn w10_a_node_certificate_presented_where_the_server_is_expected_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(dir.path())?;
+        let client = ClientTls::new(Roots::WebPkiPlusDer(pki.ca_der.clone()), None)?;
+        // A key and a request for it, as a node or a holder makes its own (the server names the certificate whatever it asks).
+        let request = || -> anyhow::Result<(Vec<u8>, String)> {
+            let key = rcgen::KeyPair::generate()?;
+            let csr = rcgen::CertificateParams::new(Vec::<String>::new())?.serialize_request(&key)?;
+            Ok((csr.der().to_vec(), key.serialize_pem()))
+        };
+        // One connection, in memory, to a server presenting `cert` at `host`.
+        let handshake = |host: &str, cert: &str, key: &str| -> anyhow::Result<()> {
+            let server = ServerTls::from_pem(cert, key)?;
+            let mut ccfg = client.config()?;
+            let mut conn = ClientConnection::new(&mut ccfg, server_name(host)?)?;
+            let mut scfg = server.config()?;
+            let mut served = ServerConnection::new(&scfg)?;
+            pump(&mut conn, &mut ccfg, &mut served, &mut scfg).map(|_| ())
+        };
+        for host in ["kiln.home", "10.0.0.1"] {
+            let own = pki.server_leaf(&[host.to_owned()])?;
+            handshake(host, &own.cert_pem, &own.key_pem).with_context(|| format!("the server's own certificate at {host}"))?;
+            let (door, door_key) = kiln_leaf(&pki, &[host])?;
+            handshake(host, &door, &door_key).with_context(|| format!("a front door's at {host}"))?;
+            let (csr, key) = request()?;
+            let node = crate::pki::cert_pem(&pki.sign_slates_node(&csr, "slates.kiln", 7, Some(host))?);
+            let refused = handshake(host, &node, &key).err().map(|e| format!("{e:#}"));
+            assert!(refused.as_deref().is_some_and(|e| e.contains("another role than the server's")), "a Slates fleet node's certificate listed at {host}, presented where the server is expected: {refused:?}");
+        }
+        // A capacity holder's, named as its machine: a runner named for the server's own host.
+        let (csr, key) = request()?;
+        let holder = crate::pki::cert_pem(&pki.sign_holder(&csr, "kiln.home")?);
+        let refused = handshake("kiln.home", &holder, &key).err().map(|e| format!("{e:#}"));
+        assert!(refused.as_deref().is_some_and(|e| e.contains("another role than the server's")), "a capacity holder's certificate for kiln.home, presented where the server is expected: {refused:?}");
+        Ok(())
+    }
 }
