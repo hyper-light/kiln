@@ -250,4 +250,16 @@ mod tests {
         assert!(!writes_untracked(&changed, &tracked), "tracked: git commits it");
         assert!(!writes_untracked(&entry(PlannedAction::Delete, None), &HashSet::new()), "a removal writes nothing");
     }
+
+    /// W8 (git's `ce_permissions`, object.h line 134 at git e1ec09b23: `(((mode) & 0100) ? 0755 : 0644)`, which
+    /// `create_ce_mode` and `canon_mode` apply to every regular file): git judges a file executable by its owner's
+    /// execute bit alone. So a mode change that sets only its group's or others' execute is none to git, one that clears
+    /// the owner's makes it not executable whatever the others' are, and one that sets the owner's makes it executable
+    /// whatever the others' were.
+    #[test]
+    fn w8_git_judges_a_file_executable_by_its_owners_execute_bit_alone() {
+        assert_eq!(executable_change(&entry(chmod(0o644, 0, 0), Some(0o100_655))), None, "the group's and others' execute set, the owner's not");
+        assert_eq!(executable_change(&entry(chmod(0o755, 0, 0), Some(0o100_655))), Some(false), "the owner's execute cleared, the others' kept");
+        assert_eq!(executable_change(&entry(chmod(0o611, 0, 0), Some(0o100_711))), Some(true), "the owner's execute set beside the others' already set");
+    }
 }
