@@ -616,8 +616,10 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    bound, where the engine would bind the bare folder left there). It binds with `--mount` and never `-v`, which makes a missing source on the host (Docker's
    bind-mount documentation), so a mount gone is the engine's refusal (`bind source path does not exist`), never an
    agent writing into the person's disk: Docker's `type=bind,bind-recursive=disabled,bind-propagation=private`, and
-   `readonly` for a read; podman's `bind-nonrecursive` and `ro=true`. Docker's `--mount` has no word for `nosuid` and
-   `nodev` (podman's `-v` takes both, `[no]suid` and `[no]dev`): owed, below.
+   `readonly` for a read; podman's `bind-nonrecursive` and `ro=true`. Neither engine's `--mount` has a word for `nosuid`
+   and `nodev` (podman's `-v` takes both, `[no]suid` and `[no]dev`), so the container's own rules hold them:
+   `--security-opt=no-new-privileges` (no process of the container gains a privilege by executing a setuid or setgid
+   file) and `--cap-drop=MKNOD` (no device node made through it), the host's mount being `nosuid,nodev` already.
 4. **Where the agent works.** The container sees its workspace at the same path the host mounts it, and its harness
    starts at the same place in it as it would on the host (W3's rule), so every path kiln reasons about on the host
    means the same inside (the agent's folder, its environment moved onto the mount (W2), a child started in its folder
@@ -666,14 +668,19 @@ On each platform:
   says the share reaches it (A-520). If it doesn't, the route is the volume's network export (Slates' NFS server runs on
   Windows: its A-184), mounted in the VM by the engine, which is its own measurement.
 
-Owed, in order, each a piece: Slates' library calls are built (A-520: `Instance::bind_into_container`, contract 44; the
-engine's profile and the check before a bind, moved from Slates' command line into its library as the mount was, its
-A-278, contract 47); kiln's re-vendor of Slates at contract 47 or later; a runner's `container` engine beside `host` and `microvm`
-(`harness::engine`: its facts, placement and drain) and its launch through the seam's `Boundary::Container`, an
-implementation over the machine's engine (`sandbox::container`): its image, and its harness's structured session over
-the container's stdio; `nosuid` and `nodev` under Docker, which its `--mount` can't say: measured first (a setuid file
-and a device node made through one container's bind, used through another's) and held by the container's own rules if
-the bind lets them through; the `.nfs.*` names on a Mac; Windows' measurement and its route; and the goal's proof, a
+Built (2026-11-19, A-520's fourth piece): kiln takes Slates at contract 48 (de1031f1d), and the engine's first
+runnable step, `workspace::container::{start, end}`: an agent's container started on its workspace, mounted already
+(W3), by Slates' bind, its source checked just before the engine binds it, and the engine handed Slates' entry word for
+word as its `--mount` says it (`engine_mount`), with the container's own rules for the two words `--mount` can't say
+(`nosuid`: `--security-opt=no-new-privileges`; `nodev`: `--cap-drop=MKNOD`); a start refused after its bind lets the
+bind go; and its end in order, the container, the bind, then W3's mount and volume. Its order and every refusal are
+held by unit tests over a stand-in engine. Owed, in order, each a piece: a runner's `container` engine beside `host`
+and `microvm` (`harness::engine`: its facts, placement and drain) and its launch through the seam's
+`Boundary::Container`, an implementation over the machine's engine (`sandbox::container`) on `workspace::container`:
+its image, and its harness's structured session over the container's stdio; a workspace mounted shared for a rootful
+Linux engine (until then refused, `NeedsSharedMount`); whether a bind keeps the mount's `nosuid` and `nodev` without
+the container's rules (a setuid file and a device node made through one container's bind, used through another's),
+measured; the `.nfs.*` names on a Mac; Windows' measurement and its route; and the goal's proof, a
 test that starts an agent in a container through kiln on Linux, macOS and Windows (a heavy run, main's).
 
 **W10 Kubernetes (kiln goal 28e73c34's part 01a1f1249c5e75b5bbf0c92c84385109, designed 2026-11-19).** An agent on

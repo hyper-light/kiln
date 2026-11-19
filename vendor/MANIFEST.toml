@@ -295,7 +295,7 @@ own = ["UPSTREAM.md"]
 [projects.slates]
 kind = "git"
 repository = "https://github.com/hyper-light/slates"
-commit = "ce9b6905e9f8e8683a775a89ec93b042ce47ad93"
+commit = "de1031f1de2baacee89d32d54084ba2e3ccc7c4c"
 path = "vendor/slates"
 take = [
   "Cargo.toml",

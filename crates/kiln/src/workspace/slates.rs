@@ -129,7 +129,17 @@ pub const INSTANCE: &str = "kiln";
 /// is not told is missing, to its own can't-mount refusal (`missing_of`). It lets none go by force,
 /// so 36's `unmount_busy` is called no more. The revision brings Slates' A-511 too: a mount's
 /// attachment ends at the kernel's own unmount event, never at its `UMNT`.
-pub const CONTRACT: u32 = 42;
+///
+/// 48 since kiln took Slates at de1031f1d (from 42; Slates' A-520, kiln's W9). kiln uses 44, 47 and 48 for agents in
+/// containers (`super::container`): a workspace's mount bound into a container (44, `Instance::bind_into_container`,
+/// whose entry kiln hands its engine word for word), the bind's source checked again just before the engine binds it (47,
+/// `ContainerBind::check_source`) and the engine's profile judged (47, `container_engine::engine_profile`), rootless
+/// podman's among the profiles that hold evidence (48, `IdentityRule::ContainerRootAsMountingUser`). It maps 43's
+/// `MountMissing::PrivateLoopback` (a Mac whose loopback more than root can capture, Slates' A-535) to its own can't-mount
+/// refusal, Slates' words naming the remedy (`missing_of`), and builds 45's `MountFault::Busy`, which carries the holders
+/// the kernel's own tables show (`MountHolders`, Slates' A-537), as it builds every unmount refusal. It needs none of the
+/// rest: an S3 base's names (46, Mantle's).
+pub const CONTRACT: u32 = 48;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -276,7 +286,9 @@ pub async fn facts() -> Facts {
 /// What a machine lacks for workspaces, as Slates' typed answer to whether it can mount names it (`mount::available`).
 /// Every fault is named, so a contract that adds one fails to build here until kiln places it: one that says what the
 /// machine lacks maps to that lack, and every other (a mount or an unmount refused, the mount table unread: 42's
-/// `Busy`, `StillMounted` and `MountTable` among them) to kiln's own can't-mount refusal.
+/// `Busy`, `StillMounted` and `MountTable` among them) to kiln's own can't-mount refusal. 43's `PrivateLoopback` (a Mac
+/// whose loopback a group or another user can capture) goes there too: what it lacks is no program or device kiln names,
+/// and the fault's own words, which the runner's facts carry, say how to give `/dev/bpf*` back to root.
 fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
     use slates_api::MountFault;
     match fault {
@@ -285,7 +297,10 @@ fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
             slates_api::MountMissing::FuseDevice => WorkspaceMissing::FuseDevice,
             slates_api::MountMissing::WinFsp => WorkspaceMissing::WinFsp,
             slates_api::MountMissing::MountNfs => WorkspaceMissing::MountNfs,
-            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared | slates_api::MountMissing::MountManager => WorkspaceMissing::Mount,
+            slates_api::MountMissing::SharedMount
+            | slates_api::MountMissing::WindowsSubtreeOrShared
+            | slates_api::MountMissing::MountManager
+            | slates_api::MountMissing::PrivateLoopback => WorkspaceMissing::Mount,
         },
         MountFault::MountPoint { .. }
         | MountFault::NoNfsListener
@@ -1628,7 +1643,12 @@ mod tests {
         }
         // Linux's `fusermount3 -u` refused: its exit code alone. macOS's `unmount(2)` refused `EBUSY`.
         let failed = || Some(Err(MountFault::Unmount { path: POINT.to_owned(), status: Some(1), errno: None }));
-        let busy = || Some(Err(MountFault::Busy { path: POINT.to_owned() }));
+        // Contract 45 (Slates' A-537): a busy unmount carries the holders the kernel's tables show; on macOS none are read,
+        // since every libproc answer stats the file, which a `hard` NFS mount whose daemon has gone waits on.
+        let busy = || {
+            let unread = slates_api::MountHolders { pids: Vec::new(), unreadable: 0, unread: Some(slates_api::HoldersUnread::NoReader { platform: "macos" }) };
+            Some(Err(MountFault::Busy { path: POINT.to_owned(), holders: unread }))
+        };
         let named = || Ok(vec!["4242 zsh".to_owned(), "4243 vim".to_owned()]);
         let refused = |lsof: &str| Held::Refused { refusal: REFUSAL.to_owned(), lsof: lsof.to_owned() };
         let stuck = [
@@ -1769,7 +1789,11 @@ mod tests {
         assert_eq!(missing_of(&MountFault::NoNfsListener), WorkspaceMissing::Mount, "any other refusal: a mount kiln makes");
         // Contract 42's unmount refusals (Slates' A-507) say nothing the machine lacks: kiln's own can't-mount refusal.
         let path = || "/state/workspaces/kiln-a".to_owned();
-        for fault in [MountFault::Busy { path: path() }, MountFault::StillMounted { path: path() }, MountFault::MountTable { path: path(), errno: None }] {
+        // Contract 43's private loopback (Slates' A-535) names nothing kiln installs: its can't-mount refusal, in Slates' words.
+        assert_eq!(of(MountMissing::PrivateLoopback), WorkspaceMissing::Mount);
+        // Contract 45's busy unmount carries the holders the kernel's tables show (Slates' A-537): a refusal all the same.
+        let busy = MountFault::Busy { path: path(), holders: slates_api::MountHolders { pids: vec![4242], unreadable: 0, unread: None } };
+        for fault in [busy, MountFault::StillMounted { path: path() }, MountFault::MountTable { path: path(), errno: None }] {
             assert_eq!(missing_of(&fault), WorkspaceMissing::Mount, "{fault}");
         }
     }

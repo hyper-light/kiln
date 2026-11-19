@@ -8,6 +8,7 @@
 //! - [`change`]: an agent's change request, from its work to review (C1, C6).
 //! - [`follow`]: what happens to it, back to the agent (C2, C3).
 //! - [`slates`]: a workspace of its own, a Slates volume over its folder (W1–W4).
+//! - [`container`]: an agent's container on its workspace's volume, bound from its mount through Slates' library (W9).
 //! - [`slates_fleet`]: a runner's identity as a node of kiln's Slates fleet, its key and kiln's certificate for it.
 //! - [`slates_move`]: an agent moved to another runner with its workspace volume, by Slates' own move (K4).
 //! - [`place`]: where a workspace's volume is mounted on its machine (a folder, or a drive letter on Windows).
@@ -17,6 +18,7 @@
 //!   (docs/ci.md W20-R11).
 
 pub mod change;
+pub mod container;
 pub mod follow;
 pub mod git;
 pub mod ignored;

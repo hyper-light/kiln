@@ -4522,6 +4522,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "slates-anchor",
+ "slates-base",
  "slates-bridge-nfs",
  "slates-bridge-oci",
  "slates-bridge-winfsp",
