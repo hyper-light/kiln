@@ -362,6 +362,11 @@ pub enum AgentMsg {
     /// [`feature::PREBUILD`]. Appended last, after `HarnessMailTransfer`: postcard encodes variants
     /// by index.
     Prebuilt { json: String },
+    /// This runner took the certificate [`ServerMsg::RunnerRole`] gave it in the runner's role (`serial`, hex): kept where it
+    /// reads its certificate as it starts, and presented on its link's next connections, so the one it connected with is
+    /// superseded (docs/agentic.md W10). Only to a server that named [`feature::RUNNER_ROLE`]. Appended last, after
+    /// `Prebuilt`: postcard encodes variants by index.
+    RunnerRole { serial: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -840,7 +845,12 @@ pub mod feature {
     /// only between two runners that name it, and refuses the move otherwise (an older runner would hand the session
     /// over without its volume).
     pub const SLATES_MOVE: &str = "workspace.slates.move";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE];
+    /// This runner takes the certificate the server reissues it in the runner's role ([`super::ServerMsg::RunnerRole`],
+    /// docs/agentic.md W10): it keeps it where it reads its certificate as it starts, presents it on its link's next
+    /// connections, and says so ([`super::AgentMsg::RunnerRole`]). Only a runner that named it is reissued one; another
+    /// connected with a certificate from before machines' certificates held their role keeps it until it does.
+    pub const RUNNER_ROLE: &str = "runner-role";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, RUNNER_ROLE];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1266,6 +1276,12 @@ pub enum ServerMsg {
     /// [`AgentMsg::Answer`] under `req` (`crate::agentdefs::volumes::Answer`). Only to runners that named
     /// [`feature::VOLUMES`]. Appended last, after `Prebuild`: postcard encodes variants by index.
     Volumes { req: u64, json: String },
+    /// A certificate in the runner's role (clientAuth alone, PEM) for this runner's key and name, reissued over its link in
+    /// place of the one it connected with, which kiln's CA issued before machines' certificates held their role and which
+    /// serves both sides (docs/agentic.md W10). The runner checks it ([`crate::pki::take_runner_role`]), keeps it, presents
+    /// it from its link's next connection on, and says so ([`AgentMsg::RunnerRole`]). Only to runners that named
+    /// [`feature::RUNNER_ROLE`]. Appended last, after `Volumes`: postcard encodes variants by index.
+    RunnerRole { cert_pem: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2329,6 +2345,7 @@ mod tests {
             ("SkillFile", AgentMsg::SkillFile { req: 1, sha256: "00".into(), offset: 0, data: vec![1], done: true }),
             ("HarnessMailTransfer", AgentMsg::HarnessMailTransfer { json: "{}".into() }),
             ("Prebuilt", AgentMsg::Prebuilt { json: "{}".into() }),
+            ("RunnerRole", AgentMsg::RunnerRole { serial: "00".into() }),
         ];
         let mut last = 63u8;
         for (name, m) in agent {
@@ -2354,6 +2371,7 @@ mod tests {
             ("Replay", ServerMsg::Replay { req: 1, json: "{}".into() }),
             ("Prebuild", ServerMsg::Prebuild { json: "{}".into() }),
             ("Volumes", ServerMsg::Volumes { req: 1, json: "{}".into() }),
+            ("RunnerRole", ServerMsg::RunnerRole { cert_pem: String::new() }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

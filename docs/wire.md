@@ -725,6 +725,11 @@ run out, and two lines can't take the same one by accident as they could a bit.
   volume that arrived with a session before its harness starts; the server moves a volume only between
   two runners that name it, and refuses the move by kind otherwise (an older runner would hand the
   session over without its volume).
+  `runner-role`: the runner takes the certificate the server reissues it in the runner's role
+  (`ServerMsg::RunnerRole`, docs/agentic.md W10), keeps it where it reads its certificate as it
+  starts, presents it on its link's next connections, and says so (`AgentMsg::RunnerRole`), after
+  which the server refuses the one it connected with; a runner that didn't name it keeps the
+  dual-usage certificate it was enrolled with until it does.
 
 ## Registry
 
@@ -770,6 +775,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `AgentMsg` | 71 | `SkillFile` | | this line: a piece of a folder's file for skills, to a server that named `skills` |
 | `AgentMsg` | 72 | `HarnessMailTransfer` | | this line: exact journal transfer phase, to a server that named `mail-transfer` |
 | `AgentMsg` | 73 | `Prebuilt` | | main (kiln plan 01a1dd2e…, P4.5): where a build of an Agentfile asked ahead of its sessions is, JSON, to a server that named `agentfiles.prebuild` |
+| `AgentMsg` | 74 | `RunnerRole` | | this line (docs/agentic.md W10): the runner took the certificate reissued in its role (its serial), to a server that named `runner-role` |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
@@ -792,6 +798,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 83 | `Replay` | | main, withdrawn (kiln plan 01a1dd2e…, P7.1b: replays were never part of experiments): its place kept, as `Prebuild` follows it; no server sends it, and a runner refuses it as a kind it doesn't know, its `req` answered why |
 | `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild`; `{"end": <id>}`, a deleted Agentfile's builds to end, to one that named `agentfiles.prebuild.end` |
 | `ServerMsg` | 85 | `Volumes` | | this line (kiln plan 01a1dd2e…, P6.2): agent volumes of a runner's microVMs' store listed by their names, or one cleared, JSON, to a runner that named `agents.volumes` |
+| `ServerMsg` | 86 | `RunnerRole` | | this line (docs/agentic.md W10): a certificate in the runner's role for a runner's key and name, reissued over its link in place of its dual-usage one, PEM, to a runner that named `runner-role` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -964,6 +971,7 @@ Four edges are left, and the lab steers clear of each:
 | `SkillFile` | answer | A piece of a file of a folder the server asked the runner to read for skills, by its SHA-256, at its offset; the last says so. | New: to a server that named `skills`. |
 | `HarnessMailTransfer` | command, refused while away | Offer, readiness, adoption or abort for one exact fenced journal manifest. | Current authenticated custodian and expected destination only; durable phase acknowledges it. |
 | `Prebuilt` | state | Where a build of an Agentfile the server asked ahead of its sessions is (`agentfiles::prebuild::Said`, JSON: `{agentfile, version, harness, how}`, `how` `{state: "building"}`, `{state: "done", image}` with its image pinned by its digest, or `{state: "failed", why}` in Shards' words or kiln's): building as it begins, done or failed as it ends. The server moves the row of the version it names forward only (queued, building, then done or failed). | New: to a server that named `agentfiles.prebuild`, answering its `Prebuild`. |
+| `RunnerRole` | handshake | The runner took the certificate the server reissued it in the runner's role (`serial`, hex): it keeps it where it reads its certificate as it starts and presents it from its link's next connection on, so the server records the one it connected with superseded and refuses it from then on (docs/agentic.md W10). | New: to a server that named `runner-role`, answering its `RunnerRole`. |
 
 ## Server to runner: `ServerMsg`
 
@@ -1055,6 +1063,7 @@ Four edges are left, and the lab steers clear of each:
 | `Replay` | ask | Withdrawn (P7.1b): sent by no server; a runner refuses it as a kind it doesn't know, answering its `req` why. | As its class says. |
 | `Prebuild` | command, parked | Build an Agentfile ahead of its sessions (`agentfiles::prebuild::Ask`, JSON: `{agentfile, version, harness, text, secrets?}`): its text at a version, beside kiln's harness directory for one of kiln's harnesses, given the secrets it names (P4.7), into the store the runner's microVMs boot from, as a session of that harness builds it there, so the session that starts after it builds nothing. Answered by `Prebuilt` as it goes. | New: to the newest process of a runner that named `agentfiles.prebuild`, at each save of the Agentfile (or of an agent definition naming it), and again for those not done or failed each time one of its processes names the feature. |
 | `Volumes` | ask | An agent's volumes on the runner's microVMs (`agentdefs::volumes::Ask`, JSON: `{"list": {stores}}`, the store names asked, or `{"clear": {store}}`): those of the names asked that its store keeps, each with the bytes its files take, its bound, its charge and when it was made, or one cleared once no session holds it. Answered by `Answer` (`agentdefs::volumes::Answer`: `listed`, `cleared`, or `refused` with its cause: `in_use`, `unknown`, `bound`, `clearing`, `unsupported` where the machine keeps none, `failed`). | New: to runners that named `agents.volumes`; a runner that didn't isn't asked. |
+| `RunnerRole` | handshake | A certificate in the runner's role (clientAuth alone, PEM) for the runner's key and name, reissued over its link in place of the dual-usage one it connected with, which kiln issued before machines' certificates held their role (docs/agentic.md W10). The runner checks it is for its key and name, from its CA and in its role, keeps it, and presents it from its link's next connection on. | New: to runners that named `runner-role` and connected with such a certificate; another keeps its certificate until it names it. |
 
 ## Commands to a session: `Command`
 

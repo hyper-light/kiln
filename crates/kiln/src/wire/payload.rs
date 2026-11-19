@@ -1102,7 +1102,9 @@ impl Carries for AgentMsg {
             | AgentMsg::SkillFile { .. }
             | AgentMsg::HarnessMailTransfer { .. }
             // A build's word is read by `crate::agentfiles::prebuild`, which keeps what it can (P4.5).
-            | AgentMsg::Prebuilt { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::Prebuilt { .. }
+            // A certificate taken up in the runner's role says its serial alone (docs/agentic.md W10).
+            | AgentMsg::RunnerRole { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -1289,7 +1291,9 @@ impl Carries for ServerMsg {
             | ServerMsg::Later { .. }
             | ServerMsg::Back { .. }
             // A build asked ahead of its sessions is read by `crate::agentfiles::prebuild` (P4.5).
-            | ServerMsg::Prebuild { .. }) => return Ok(Carried::Nothing(m)),
+            | ServerMsg::Prebuild { .. }
+            // A certificate reissued in the runner's role is a PEM, checked by `crate::pki::take_runner_role` (W10).
+            | ServerMsg::RunnerRole { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }

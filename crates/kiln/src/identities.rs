@@ -1404,6 +1404,157 @@ pub async fn revoked_keys(store: &Store) -> anyhow::Result<Vec<(String, String)>
     Ok(first.into_iter().collect())
 }
 
+/// The kinds of certificate kiln's CA issues for a machine's name that serve both sides of their own links, and so are
+/// never a runner's on kiln's link (docs/agentic.md W10): a capacity holder's, a keeper's and a Slates fleet node's, each
+/// issued since 2026-11-12, so each recorded as it was issued.
+pub const BOTH_SIDES_KINDS: [&str; 3] = ["holder", "keeper", "slates-node"];
+
+/// Why kiln's link refuses the key of a `kind` certificate for `subject` (one of [`BOTH_SIDES_KINDS`]).
+pub fn not_a_runners(kind: &str, subject: &str) -> String {
+    format!("a {kind}'s key ({subject}): it serves both sides of its own links, never a runner's on kiln's link (docs/agentic.md W10)")
+}
+
+/// What kiln's link refuses from its first handshake (docs/agentic.md W10), read from the store as the server starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkRefusals {
+    /// Keys (SPKI SHA-256, hex), each with its refusal: every revoked key ([`revoked_keys`]), and the key of every
+    /// certificate of the [`BOTH_SIDES_KINDS`] kiln issued.
+    pub keys: Vec<(String, String)>,
+    /// Certificates (their serials, hex), each with its refusal: every certificate for a machine's name revoked by its
+    /// serial, among them a runner's from before machines' certificates held their role once the runner took one in its
+    /// role ([`runner_role_taken`]).
+    pub serials: Vec<(String, String)>,
+}
+
+/// [`LinkRefusals`] from the store.
+pub async fn link_refusals(store: &Store) -> anyhow::Result<LinkRefusals> {
+    let mut keys = revoked_keys(store).await?;
+    let (both_sides, serials) = store
+        .call(|c| {
+            let kinds = BOTH_SIDES_KINDS.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let mut q = c.prepare(&format!("SELECT key_sha256, kind, subject FROM identities WHERE kind IN ({kinds}) ORDER BY issued_at"))?;
+            let both_sides = q
+                .query_map(rusqlite::params_from_iter(BOTH_SIDES_KINDS.iter()), |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            // A W27 identity's subject is its kiln:// URI, and it carries no name the link takes: only machines' names.
+            let mut q = c.prepare("SELECT serial, at, reason, by FROM revocations WHERE serial IS NOT NULL AND subject NOT LIKE 'kiln://%' ORDER BY at, id")?;
+            let serials = q
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((both_sides, serials))
+        })
+        .await?;
+    for (key, kind, subject) in both_sides {
+        if !keys.iter().any(|(k, _)| *k == key) {
+            keys.push((key, not_a_runners(&kind, &subject)));
+        }
+    }
+    let mut first: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (serial, at, reason, by) in serials {
+        first.entry(serial).or_insert_with(|| refusal(at, &reason, &by));
+    }
+    Ok(LinkRefusals { keys, serials: first.into_iter().collect() })
+}
+
+/// A runner's certificate reissued in the runner's role over its link ([`reissue_runner_role`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reissued {
+    /// The new certificate (PEM), for the same key and name.
+    pub cert_pem: String,
+    /// The serial (hex) of the one it supersedes.
+    pub superseded: String,
+    /// The machine both name.
+    pub machine: String,
+}
+
+/// The reissue a runner is owed over its link (docs/agentic.md W10) for `dual_usage`, the certificate it connected with,
+/// issued before machines' certificates held their role: one in the runner's role for the same key and name
+/// ([`crate::pki::Pki::sign_runner_role`]), recorded as every certificate kiln issues is (W27-R01). Refused for one
+/// superseded already, so a runner is reissued once; what supersedes it is the runner's word that it took the new one
+/// ([`runner_role_taken`]), never a date.
+pub async fn reissue_runner_role(store: &Store, pki: &crate::pki::Pki, dual_usage: &[u8]) -> anyhow::Result<Reissued> {
+    let superseded = crate::pki::fingerprints_der(dual_usage)?.serial;
+    let serial = superseded.clone();
+    let taken: bool = store.call(move |c| Ok(c.query_row("SELECT EXISTS (SELECT 1 FROM revocations WHERE serial = ?1)", [&serial], |r| r.get(0))?)).await?;
+    anyhow::ensure!(!taken, "that certificate was superseded already: its runner took one in its role");
+    let machine = crate::pki::cert_dns_name(dual_usage).ok_or_else(|| anyhow::anyhow!("that certificate names no machine"))?;
+    let cert_pem = pki.sign_runner_role(dual_usage)?;
+    record(store, "machine", &machine, &cert_pem).await?;
+    Ok(Reissued { cert_pem, superseded, machine })
+}
+
+/// The runner's word that it took `reissued` up, kept for its next connections: the certificate it supersedes is revoked by
+/// its serial (its key goes on, the new one's), recorded as every revocation is (W27-R01), so kiln's link refuses it from
+/// now on and after a restart ([`link_refusals`]). The refusal, for the link to say.
+pub async fn runner_role_taken(store: &Store, reissued: &Reissued) -> anyhow::Result<String> {
+    let at = crate::util::now_unix();
+    let reason = format!("superseded: runner {} took a certificate in its role", reissued.machine);
+    revoke(store, Target::Serial(reissued.superseded.clone()), &reason, "kiln", at).await?;
+    Ok(refusal(at, &reason, "kiln"))
+}
+
+/// A runner's link owed a reissue in the runner's role (docs/agentic.md W10), as the server keeps it while the link lasts:
+/// the dual-usage certificate it connected with, and the reissue once given.
+#[derive(Clone, Debug)]
+pub struct RoleOwed {
+    /// The certificate it connected with (DER).
+    pub dual_usage: Vec<u8>,
+    /// The reissue given it over this link, awaiting its word.
+    pub given: Option<Reissued>,
+}
+
+/// A runner's features said on a link owed a reissue in the runner's role: one that names
+/// [`crate::proto::feature::RUNNER_ROLE`] is reissued its certificate in that role ([`reissue_runner_role`]), once, and sent
+/// it ([`crate::proto::ServerMsg::RunnerRole`]); one that doesn't keeps the one it connected with until it does.
+pub async fn on_features(hub: &Hub, runner: &str, peer: PeerId, names: &[String]) {
+    if !crate::proto::feature::speaks(names, crate::proto::feature::RUNNER_ROLE) {
+        return;
+    }
+    let Some(dual_usage) = hub.role_owed.load().get(&peer).filter(|o| o.given.is_none()).map(|o| o.dual_usage.clone()) else {
+        return;
+    };
+    match reissue_runner_role(&hub.store, &hub.pki, &dual_usage).await {
+        Ok(reissued) => {
+            let cert_pem = reissued.cert_pem.clone();
+            hub.role_owed.update(|m| {
+                if let Some(owed) = m.get_mut(&peer) {
+                    owed.given = Some(reissued.clone());
+                }
+            });
+            hub.send_peer(peer, &ServerMsg::RunnerRole { cert_pem }).await;
+            tracing::info!(runner, "reissued its certificate in the runner's role over its link (docs/agentic.md W10)");
+        }
+        Err(e) => tracing::warn!(runner, error = %format!("{e:#}"), "its certificate wasn't reissued in the runner's role"),
+    }
+}
+
+/// A runner's word that it took the reissue its link was given ([`crate::proto::AgentMsg::RunnerRole`], `serial`): the
+/// certificate it connected with is recorded superseded ([`runner_role_taken`]) and the link refuses it from now on. A word
+/// on a link given none, or naming another certificate, changes nothing.
+pub async fn runner_role_said(hub: &Hub, runner: &str, peer: PeerId, serial: &str) {
+    let given = hub.role_owed.load().get(&peer).and_then(|o| o.given.clone());
+    let Some(given) = given.filter(|g| crate::pki::fingerprints(&g.cert_pem).is_ok_and(|f| f.serial.eq_ignore_ascii_case(serial))) else {
+        tracing::warn!(runner, serial, "a runner said it took a certificate in its role this link wasn't given");
+        return;
+    };
+    match runner_role_taken(&hub.store, &given).await {
+        Ok(why) => {
+            hub.net.command(crate::net::Out::RevokeSerials { serials: vec![given.superseded.clone()], why }).await;
+            hub.role_owed.update(|m| m.remove(&peer));
+            tracing::info!(runner, superseded = %given.superseded, "its certificate from before the runner's role is superseded");
+        }
+        Err(e) => tracing::warn!(runner, error = %format!("{e:#}"), "its taking the runner's role wasn't recorded"),
+    }
+}
+
+/// Tells kiln's link to refuse the key of a certificate of one of the [`BOTH_SIDES_KINDS`] just issued (`der`, its `kind`,
+/// for `subject`), as it refuses those recorded before it started ([`link_refusals`]): never a runner's (docs/agentic.md W10).
+pub async fn refuse_on_link(hub: &Hub, kind: &str, subject: &str, der: &[u8]) {
+    if let Some(key) = crate::pki::key_sha256(der) {
+        hub.net.command(crate::net::Out::RevokeKeys { keys: vec![key], why: not_a_runners(kind, subject) }).await;
+    }
+}
+
 /// `kiln identities`: the certificates kiln's CA issued, their revocations, and revoking one
 /// (W27-R01), over the API.
 #[derive(clap::Args)]

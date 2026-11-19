@@ -67,6 +67,12 @@ impl ClientTls {
                     store.add(cert.context("CA PEM")?).context("CA certificate")?;
                 }
             }
+            Roots::KilnServerPem(pem) => {
+                for cert in CertificateDer::pem_slice_iter(&pem) {
+                    store.add(cert.context("CA PEM")?).context("CA certificate")?;
+                }
+                kiln = Some(store.clone());
+            }
             Roots::WebPkiPlusDer(der) => {
                 store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 store.add_parsable_certificates(super::roots::system().iter().cloned());

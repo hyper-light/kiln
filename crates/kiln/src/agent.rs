@@ -296,6 +296,18 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
     }
 }
 
+/// Where this runner process reads its certificate as it starts ([`credentials`]): the machine's, or its own as a runner
+/// process beside the machine's usual one; none for one given its credentials (a job's pod, a test).
+fn own_cert_path(o: &Opts) -> Option<PathBuf> {
+    if o.credentials.is_some() {
+        return None;
+    }
+    Some(match &o.instance {
+        Some(id) => crate::upgrade::instance_dir(&o.state_dir, id).join("agent.pem"),
+        None => o.state_dir.join("agent.pem"),
+    })
+}
+
 /// A runner process beside the machine's usual one: the machine's key with this instance's own
 /// certificate, fetched (or renewed) from the server with a current certificate as proof — this
 /// instance's own while it is valid, else the machine's. Its own goes once it is for another key
@@ -2081,7 +2093,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // frames to the loop on the shard that owns the session (`loops::session_loop`), the rest to this loop, the runner's
     // order kept across them by the fan's watermark (`crate::wire::fan`, read by the server's heads: `peek_server`).
     let (fan, crate::wire::fan::Loops { queues, marks }) = crate::wire::fan::Fan::with(crate::wire::fan::Server, crate::wire::fan::shards(), net::EVENTS_BYTES);
-    let net = net::start_with(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() }, net::OUT_BYTES, Box::new(fan))?;
+    // The CA its link trusts: what a certificate the server reissues it in the runner's role must be issued by (W10).
+    let link_ca = ca.clone();
+    let net = net::start_with(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new(), revoked_serials: Vec::new() }, net::OUT_BYTES, Box::new(fan))?;
     let mut queues = queues.into_iter();
     let events = queues.next().ok_or_else(|| anyhow::anyhow!("the runner's fan made no control loop"))?;
     let session_queues: Vec<crate::memory::queue::Receiver<crate::wire::fan::Routed>> = queues.collect();
@@ -5173,6 +5187,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // An Agentfile to build ahead of its sessions, in the microVMs' store they boot from (kiln plan 01a1dd2e…
                     // P4.5).
                     ServerMsg::Prebuild { json } => crate::agentfiles::prebuild::told(&json, own.clone(), harness.as_ref().and_then(|h| h.microvm())),
+                    // Its certificate reissued in the runner's role over this link (docs/agentic.md W10): checked against its
+                    // own (its key, its name, its CA), kept where it reads its certificate as it starts, presented from the
+                    // link's next connection on, and said taken; anything short of that leaves it with the one it has.
+                    ServerMsg::RunnerRole { cert_pem } => match crate::pki::take_runner_role(&machine_leaf, &link_ca, &cert_pem) {
+                        Ok(taken) => {
+                            let kept = own_cert_path(&o).map_or(Ok(()), |path| crate::util::write_secret(&path, taken.cert_pem.as_bytes(), 0o644));
+                            match kept.map_err(|e| e.to_string()) {
+                                Ok(()) => match net.renew_leaf(taken.clone()).await {
+                                    Ok(()) => {
+                                        let serial = crate::pki::fingerprints(&taken.cert_pem).map(|f| f.serial).unwrap_or_default();
+                                        own.0.send(Up::Term(AgentMsg::RunnerRole { serial })).await.ok();
+                                        tracing::info!("took the certificate the server reissued in the runner's role");
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "the link didn't take up the certificate reissued in the runner's role"),
+                                },
+                                Err(e) => tracing::warn!(error = %e, "couldn't keep the certificate reissued in the runner's role"),
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %format!("{e:#}"), "refused the certificate the server sent in the runner's role"),
+                    },
                     // Another runner's room, for this runner's owner to choose where to probe by
                     // (docs/needs.md E5, AUDIT O1).
                     ServerMsg::Offers { json } => {

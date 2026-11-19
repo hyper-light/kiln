@@ -4556,6 +4556,8 @@ async fn enroll_capacity(hub: &Hub, req: Request) -> R {
     let leaf = enrolled.chain.first().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "no certificate was issued".to_owned()))?;
     let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(leaf) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::identities::record(&hub.store, "holder", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Never a runner's on kiln's link (docs/agentic.md W10).
+    crate::identities::refuse_on_link(&hub, "holder", &name, &der).await;
     hub.store.audit(name.clone(), "agent.capacity".into(), String::new()).await;
     tracing::info!(agent = %name, "issued a capacity holder's certificate");
     Ok(srv::json(StatusCode::OK, &enrolled))
@@ -4577,6 +4579,8 @@ async fn enroll_slates_node(hub: &Hub, req: Request) -> R {
     // Every certificate kiln issues is recorded first (W27-R01).
     let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(&issued.certificate) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::identities::record(&hub.store, "slates-node", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Never a runner's on kiln's link (docs/agentic.md W10).
+    crate::identities::refuse_on_link(&hub, "slates-node", &name, &der).await;
     hub.store.audit(name.clone(), "agent.slates_fleet".into(), String::new()).await;
     tracing::info!(agent = %name, domain = issued.domain, "issued a Slates fleet node's certificate");
     Ok(srv::json(StatusCode::OK, &issued))
@@ -4631,6 +4635,8 @@ async fn issue_keeper(hub: &Hub, req: Request) -> R {
     let leaf = issued.chain.first().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "no certificate was issued".to_owned()))?;
     let der = ::hex::decode(leaf).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::identities::record(&hub.store, "keeper", &issued.name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Never a runner's on kiln's link (docs/agentic.md W10).
+    crate::identities::refuse_on_link(&hub, "keeper", &issued.name, &der).await;
     hub.store.audit(issued.name.clone(), "capacity.keeper".into(), String::new()).await;
     tracing::info!(keeper = %issued.name, "issued a capacity keeper's certificate");
     Ok(srv::json(StatusCode::OK, &issued))

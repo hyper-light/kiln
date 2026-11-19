@@ -242,6 +242,7 @@ classes! {
         AgentMsg::SkillFile { .. } => Class::Answer,
         AgentMsg::HarnessMailTransfer { .. } => REFUSED,
         AgentMsg::Prebuilt { .. } => Class::State,
+        AgentMsg::RunnerRole { .. } => Class::Handshake,
     }
 }
 
@@ -334,6 +335,7 @@ classes! {
         ServerMsg::Replay { .. } => Class::Ask,
         ServerMsg::Prebuild { .. } => PARKED,
         ServerMsg::Volumes { .. } => Class::Ask,
+        ServerMsg::RunnerRole { .. } => Class::Handshake,
     }
 }
 
