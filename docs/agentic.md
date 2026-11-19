@@ -291,8 +291,9 @@ where `--resume` looks; Gemini CLI's chat to the project it keeps for that folde
 record of it, not two, as a move to another machine keeps it. A branch of one (`--fork-session`) reads a copy there,
 the conversation itself staying where the person may go on with it. Codex goes on by its thread's id, given the
 mount's folder (`thread/resume`), and an ACP agent is given that folder in `session/load`; a record that can't be
-moved refuses the start, saying why. When any agent on a volume ends, its conversation goes back the other way before
-its mount goes (the project its harness kept for the mount's folder goes with the volume): Claude Code's transcript
+moved refuses the start, saying why. When any agent on a volume ends, its conversation goes back the other way once
+its processes have ended (its harness writes the record until it ends: W3) and before its mount goes (the project its
+harness kept for the mount's folder goes with the volume): Claude Code's transcript
 and its session's own files, and Gemini CLI's chat and its subagents' folder, to the project its harness keeps for its
 person's folder, where they resume it from where they work; one already there is written over in neither place, both
 stay, and kiln logs why (`homes::NotMoved`), and a branch's copy of another conversation stays where it is. An agent
@@ -320,12 +321,21 @@ What the agent hasn't touched is read from the folder as it is now; what it chan
 (edits, build output, git's own writes) is held in the volume alone, so the folder and other
 agents never see it. Ended for good, the agent's volume goes with it, once no other agent works in it: the last
 of the agents working in one ends it (on its machine's runner process), and an agent that couldn't start after all
-takes only a volume made for it alone with it. Its mount goes first, asked again while what the agent left behind
-still holds it for as long as the agent's own end took, then let go: detached on Linux, forced off on macOS (Slates'
-`mount::unmount_busy`, contract 36), kiln saying what held it where it stays. Its volume is destroyed only once the
-kernel's mount table no longer holds its point (an unmount that answers done is believed only when the table agrees);
-one whose mount stays is kept, refused typed (`MountStays`, with the unmount's and the let-go's words and what holds
-it), never destroyed beneath a live mount, which would leave the mount with nothing behind it. kiln reads that table
+takes only a volume made for it alone with it. Its mount goes first, once every process kiln started for the agent has
+ended: its harness, which works in the mount, and its group (every process that started, followed as the agent's), each
+end as the OS tells it (a pidfd on Linux, kqueue on macOS, a process handle on Windows), never a clock. Then the mount
+is asked to go once. Its volume is destroyed only once the kernel's mount table no longer holds its point (an unmount
+that answers done is believed only when the table agrees); one whose mount stays is kept, never destroyed beneath a
+live mount, which would leave the mount with nothing behind it, and never let go by force: what holds it once the
+agent's processes have ended is another's (a person's shell or editor there), which a forced unmount would cut off.
+kiln refuses it by kind (`MountStays`), as Slates' contract 42 types the unmount's answer (its A-507): busy, which the
+OS says itself on macOS (`MountFault::Busy`, its `EBUSY`) and Linux's `fusermount3 -u` doesn't (an exit code alone, so
+there a refusal while `lsof` names processes holding the mount), naming each process that holds it as `lsof` does (the
+system's own, `/usr/sbin/lsof`, on macOS); refused for another reason, in the refusal's words and `lsof`'s; or
+answered done while the table still lists it (`MountFault::StillMounted`). Before, kiln asked again on a clock for as
+long as the agent's own end had taken, then let the mount go (detached on Linux, forced off on macOS: Slates'
+`mount::unmount_busy`, contract 36);
+kiln's clippy refuses a clock there (`rt::sleep`), and the let-go cut off whoever still worked in it. kiln reads that table
 with the system's own `mount` (`/sbin/mount`) on macOS, never a program found on `PATH`. kiln names a mount by its real path, as
 the kernel's mount table names it (macOS reaches `/var`, where temporary folders lie, through a link to
 `/private/var`), and judges whether it's still there by that table, never by looking into the mount, which on a hard

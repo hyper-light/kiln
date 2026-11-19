@@ -299,7 +299,7 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
             let (kind, dirs, cwd, branch) = (spec.kind.clone(), crate::harness::homes::Dirs::here(&spec.env), here.to_string_lossy().into_owned(), spec.fork);
             let moved = crate::rt::blocking(move || if branch { crate::harness::homes::rehome_branch(&kind, &dirs, &session, &cwd) } else { crate::harness::homes::rehome(&kind, &dirs, &session, &cwd) }).await?;
             if let Err(why) = moved {
-                if let Err(gone) = slates::remove(&made, std::time::Duration::ZERO).await {
+                if let Err(gone) = slates::remove(&made).await {
                     tracing::warn!(volume = %made.volume, error = %format!("{gone:#}"), "the workspace of a conversation that couldn't be taken up stayed");
                 }
                 anyhow::bail!("its conversation's record couldn't be moved onto its volume: {why}");
@@ -416,12 +416,12 @@ fn record_places(spec: &crate::harness::session::Spec) -> Option<(String, String
 }
 
 /// Ends agent session `spec`'s workspace for good, when it has a volume: the volume and what it held go
-/// with the session. Its caller asks this of the last agent working in it alone ([`same_volume`]), once its processes
-/// are gone, giving how long their end took as how long what they left behind may still hold the mount
+/// with the session. Its caller asks this of the last agent working in it alone ([`same_volume`]), once every process
+/// kiln started for it has ended (`harness::host::processes_ended`), so its mount is asked to go once
 /// (`slates::remove`).
-pub async fn release(spec: &crate::harness::session::Spec, patience: std::time::Duration) {
+pub async fn release(spec: &crate::harness::session::Spec) {
     let Some(m) = spec.workspace.as_ref().and_then(|w| w.made.clone()) else { return };
-    if let Err(e) = slates::remove(&m, patience).await {
+    if let Err(e) = slates::remove(&m).await {
         tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "an ended agent's workspace stayed");
     }
 }

@@ -4222,7 +4222,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                                 // Nothing ran in it, so nothing of it is on its way out: asked to go once.
                                                 if opened.is_err()
                                                     && let Some(m) = made
-                                                    && let Err(gone) = crate::workspace::slates::remove(&m, std::time::Duration::ZERO).await
+                                                    && let Err(gone) = crate::workspace::slates::remove(&m).await
                                                 {
                                                     tracing::warn!(volume = %m.volume, error = %format!("{gone:#}"), "the workspace of an agent that couldn't start stayed");
                                                 }
