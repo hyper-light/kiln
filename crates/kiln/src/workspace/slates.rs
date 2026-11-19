@@ -1164,6 +1164,57 @@ async fn take_down(steps: &impl TakeDown, mount: &str) -> anyhow::Result<()> {
     steps.destroy().await
 }
 
+/// A daemon of the machine's instance, as Slates' own status names it: its process, and how many daemons its anchor
+/// has restarted so far (`DaemonReport::restarts`; a new anchor counts from none).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Daemon {
+    pid: u32,
+    restarts: u64,
+}
+
+/// How following the machine's instance ended ([`let_go_when_gone`]).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Followed {
+    /// Its anchor is gone: each workspace mount the kernel's table listed as its last daemon ended, let go of, and how
+    /// (or Slates' refusal, in its words).
+    LetGo(Vec<(PathBuf, Result<slates_api::LetGo, String>)>),
+    /// A daemon's end the OS can't tell: nothing more is followed, nothing let go.
+    Unwatched(Vec<crate::os::watch::Unwatched>),
+    /// The mount table couldn't be read as a daemon ended, in its words: nothing let go.
+    Unlisted(String),
+    /// Slates' refusal of the look after a daemon's end, in its words, which says neither restarted nor gone: nothing let go.
+    Unknown(String),
+}
+
+/// What [`let_go_when_gone`] asks of this machine, apart so a test injects a daemon's end: that end as the OS tells it,
+/// Slates' answer after it, the workspace mounts the kernel's table lists, and one let go of though processes hold it.
+#[cfg(unix)]
+trait Gone {
+    /// Until daemon `pid` has ended, as the OS tells it (`os::watch::exited`), or why the OS can't tell its end.
+    async fn ended(&self, pid: u32) -> Result<(), Vec<crate::os::watch::Unwatched>>;
+    /// Slates' answer to an attach now: the daemon serving and its anchor's restarts; none where no daemon answers and no
+    /// anchor holds the instance's rendezvous (Slates' `Unavailable`), which a connect waits on while an anchor does; or
+    /// any other refusal, in its words.
+    async fn answered(&self) -> Result<Option<Daemon>, String>;
+    /// The workspace mounts the kernel's table lists now under this machine's place for workspaces.
+    async fn mounts(&self) -> anyhow::Result<Vec<PathBuf>>;
+    /// `mount` let go of though processes hold it (Slates' `mount::unmount_busy`): how, or its refusal in its words.
+    async fn let_go(&self, mount: PathBuf) -> Result<slates_api::LetGo, String>;
+}
+
+/// Follows the machine's instance from its daemon `first`, by `gone`, until it is gone, then lets go of the workspace
+/// mounts it left.
+#[cfg(unix)]
+async fn let_go_when_gone(gone: &impl Gone, first: Daemon) -> Followed {
+    // Main's behaviour, kept for the failing test: a daemon's end lets go of nothing.
+    match gone.ended(first.pid).await {
+        Ok(()) => Followed::LetGo(Vec::new()),
+        Err(unwatched) => Followed::Unwatched(unwatched),
+    }
+}
+
 /// The files of the folder below workspace `m` that changed on disk after the agent changed them
 /// in its workspace, each as kiln shows it (`/README.md (Modified)`, `drift_lines`).
 pub async fn drift(m: &Made) -> anyhow::Result<Vec<String>> {
@@ -1686,6 +1737,77 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(lsof_holders("p4242\nczsh\nf5\np4243\ncvim\n"), ["4242 zsh", "4243 vim"], "lsof's -F pc fields, each process once");
         Ok(())
+    }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2; UI goal 89): the workspace mounts a Slates instance that is gone
+    /// left behind are let go of on its daemon's end alone, as the OS tells it, never on a clock: a hard NFS mount that no
+    /// server will answer again holds whatever touched it until it's forced off (Slates' `mount::unmount_busy`). The
+    /// mounts are those the table listed as the daemon ended, each let go of once Slates says no anchor holds the
+    /// instance (unavailable) or another instance answers (its anchor's restarts not past the ended one's: a new anchor
+    /// counts from none). A daemon its anchor restarted serves the same mounts again (the anchor holds the NFS listener and
+    /// the daemon's descriptors), so then nothing is let go and the next daemon's end is followed. While the daemon lives
+    /// nothing is done; an end the OS can't tell, or an answer that says neither, lets go of nothing. The daemon's end is
+    /// injected: the fake's, at once.
+    #[cfg(unix)]
+    #[test]
+    fn w3_a_gone_instances_mounts_are_let_go_of_on_its_daemons_end_alone() {
+        use crate::os::watch::{Unwatchable, Unwatched};
+        use futures::FutureExt as _;
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        /// A machine whose instance's daemon ends as `end` says (at once; never, `None`; or untold), whose Slates answers
+        /// each look after an end as `answers` say in turn, and whose table lists `mounts`.
+        struct Fake {
+            end: Option<Result<(), Vec<Unwatched>>>,
+            answers: RefCell<VecDeque<Result<Option<Daemon>, String>>>,
+            mounts: Vec<PathBuf>,
+            ended: RefCell<Vec<u32>>,
+            let_go: RefCell<Vec<PathBuf>>,
+        }
+        impl Gone for Fake {
+            async fn ended(&self, pid: u32) -> Result<(), Vec<Unwatched>> {
+                self.ended.borrow_mut().push(pid);
+                match &self.end {
+                    Some(end) => end.clone(),
+                    None => std::future::pending().await,
+                }
+            }
+            async fn answered(&self) -> Result<Option<Daemon>, String> {
+                self.answers.borrow_mut().pop_front().unwrap_or_else(|| Err("asked once too often".to_owned()))
+            }
+            async fn mounts(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(self.mounts.clone())
+            }
+            async fn let_go(&self, mount: PathBuf) -> Result<slates_api::LetGo, String> {
+                self.let_go.borrow_mut().push(mount);
+                Ok(slates_api::LetGo::Forced)
+            }
+        }
+        let (a, b) = (PathBuf::from("/state/workspaces/kiln-a"), PathBuf::from("/state/workspaces/kiln-b"));
+        let fake = |end, answers: Vec<Result<Option<Daemon>, String>>| Fake { end, answers: RefCell::new(answers.into()), mounts: vec![a.clone(), b.clone()], ended: RefCell::new(Vec::new()), let_go: RefCell::new(Vec::new()) };
+        let both = vec![(a.clone(), Ok(slates_api::LetGo::Forced)), (b.clone(), Ok(slates_api::LetGo::Forced))];
+        let first = Daemon { pid: 10, restarts: 0 };
+
+        let gone = fake(Some(Ok(())), vec![Ok(None)]);
+        assert_eq!(let_go_when_gone(&gone, first).now_or_never(), Some(Followed::LetGo(both.clone())), "no anchor holds it: each mount let go of at its daemon's end");
+        assert_eq!(*gone.ended.borrow(), [10]);
+
+        let restarted = fake(Some(Ok(())), vec![Ok(Some(Daemon { pid: 11, restarts: 1 })), Ok(Some(Daemon { pid: 20, restarts: 0 }))]);
+        assert_eq!(let_go_when_gone(&restarted, first).now_or_never(), Some(Followed::LetGo(both)), "a restarted daemon followed, then a new anchor's instance: let go of");
+        assert_eq!(*restarted.ended.borrow(), [10, 11], "the restarted daemon's end followed");
+
+        let lives = fake(None, Vec::new());
+        assert_eq!(let_go_when_gone(&lives, first).now_or_never(), None, "nothing while its daemon lives");
+        assert!(lives.let_go.borrow().is_empty());
+
+        let unsaid = fake(Some(Ok(())), vec![Err("Slates' contract differs".to_owned())]);
+        assert_eq!(let_go_when_gone(&unsaid, first).now_or_never(), Some(Followed::Unknown("Slates' contract differs".to_owned())));
+        assert!(unsaid.let_go.borrow().is_empty(), "an answer that says neither lets go of nothing");
+
+        let untold_end = vec![Unwatched { pid: 10, why: Unwatchable::Unsupported }];
+        let untold = fake(Some(Err(untold_end.clone())), Vec::new());
+        assert_eq!(let_go_when_gone(&untold, first).now_or_never(), Some(Followed::Unwatched(untold_end)));
+        assert!(untold.let_go.borrow().is_empty(), "an end the OS can't tell lets go of nothing");
     }
 
     /// W8 (kiln goal 01a1ec34599974448aed2672bafaf9a2): what git ignores in a workspace with no mount (an isolated agent's,
