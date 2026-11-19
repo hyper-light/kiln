@@ -1,16 +1,10 @@
 /**
- * The Engine tab's Environments (docs/agents.md, "Environments", "In the Engine tab"; decided by the
- * user, 2026-11-18): a person's named sets of variables an agent session runs with, a section that
- * folds as the tab's Sandboxes and Agents do, found by a filter with facets (Base, Uses, Where) and
- * sorted, a card each (engine-tab.tsx, definitions.tsx DefRow): its line (its name, this session's
- * marked, its base and version), then its variables a line each (its name, where it comes from, a
- * value shown or a secret's name, never a secret's value) and the sessions running with it.
- *
- * At the top, a new one, filled in as a card is edited, in place: a `machine` variable picked from
- * what the session's machine says its user has, with where each is set; a `secret`, from the person's
- * own. Then the machine's user's environment, what a session runs with when it has none, and this
- * session's, first and marked. Applied to this session from its card, which says the session starts
- * again on its conversation; deleting one some session runs with is refused, in the server's words.
+ * The Engine tab's Environments (docs/agents.md, "Environments"; decided by the user, 2026-11-18).
+ * At the top, this session's environment: one dropdown, the machine environment its default; a
+ * change restarts the session, so it's confirmed first. Below, the person's environments as the
+ * tab's other sections list theirs (a filter with facets, a sort, a card each): a variable a line,
+ * its name with where it comes from beside it and its value at the right (a secret by name only).
+ * A new one, or a change, is made in place on its card.
  */
 import * as React from "react";
 import { ArrowDown, ArrowUp, Check, KeyRound, Pencil, Plus, X } from "lucide-react";
@@ -22,7 +16,6 @@ import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Loadable } from "@/components/ui/loading";
 import { FilterBar, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
-import { toast } from "@/components/ui/toast";
 import { labelOf, useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { setData } from "@/lib/resource";
@@ -74,6 +67,7 @@ export function Environments({ agentId, target }: { agentId: string; target: str
   const at = { agentId, target, name: me ? agentLabel(me) : "this session" };
   return (
     <Fold id="engine-environments" title="Environments" count={`${shown.length + (mine ? 1 : 0)} of ${envs.length}`}>
+      <Choose at={at} envs={envs} mine={mine} />
       <FilterBar className="at-bar">
         <FacetBox
           label="Filter environments"
@@ -88,7 +82,6 @@ export function Environments({ agentId, target }: { agentId: string; target: str
       </FilterBar>
       <ul className="ms-list" data-list="envs-tab" aria-label="Environments">
         <NewEnv at={at} />
-        <MachineLine at={at} mine={mine} />
         {mine && <EnvCard e={mine} at={at} list={list} here />}
         {shown.map((e) => (
           <EnvCard key={e.id} e={e} at={at} list={list} />
@@ -106,26 +99,16 @@ export function Environments({ agentId, target }: { agentId: string; target: str
 /** Which session the section is of: its id, its machine, its name. */
 type At = { agentId: string; target: string; name: string };
 
-/* ------------------------------------------------ applying one */
+/* ------------------------------------------------ this session's */
 
-/**
- * Session `at` on environment `e` (null: its machine's user's): shown at once (the session moved to
- * its card), its harness started again on its conversation; a refusal puts the list back and says why.
- */
+/** Session `at` on environment `e` (null: the machine's): shown at once, the session restarted; a refusal says why. */
 function apply(at: At, e: Agentenv | null, why: (w: string | null) => void): Promise<unknown> {
   setData<Agentenv[]>(agentenvsRes.key, (l) =>
     l.map((x) => ({ ...x, sessions: x.id === e?.id ? [...x.sessions.filter((s) => s !== at.agentId), at.agentId] : x.sessions.filter((s) => s !== at.agentId) })),
   );
   why(null);
   return agentenvsApi.apply(at.agentId, e?.id ?? null).then(
-    (r) => {
-      relist();
-      toast({
-        title: e ? `${at.name} runs with ${e.name}` : `${at.name} runs with its machine's user's environment`,
-        description: r.restarted ? "It starts again on its conversation." : undefined,
-        tone: "running",
-      });
-    },
+    () => relist(),
     (err: unknown) => {
       relist();
       why(errorMessage(err));
@@ -133,70 +116,51 @@ function apply(at: At, e: Agentenv | null, why: (w: string | null) => void): Pro
   );
 }
 
-/** Apply it to this session, asked again in place: it starts the session again on its conversation. */
-function ApplyAsk({ at, e, onDone, why }: { at: At; e: Agentenv | null; onDone: () => void; why: (w: string | null) => void }) {
+/** This session's environment: the machine's (the default) or one of the person's. A change restarts the session, so it's confirmed first. */
+function Choose({ at, envs, mine }: { at: At; envs: readonly Agentenv[]; mine: Agentenv | undefined }) {
+  const [want, setWant] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
-  const what = e ? `${e.name} v${e.version}` : "its machine's user's environment";
-  return (
-    <li className="ms-node df-ask ev-ask" data-stand="needs" data-depth={2}>
-      <span className="ms-confirm ev-confirm" role="group" aria-label={`Apply ${e ? e.name : "the machine's user's environment"} to this session?`}>
-        <span>
-          {at.name} starts again on its conversation, with {what}.
-        </span>
-        <button
-          type="button"
-          className="ms-go"
-          disabled={busy}
-          aria-busy={busy || undefined}
-          aria-label={`Apply ${e ? e.name : "the machine's user's environment"} to this session`}
-          onClick={() => {
-            setBusy(true);
-            void apply(at, e, why).finally(onDone);
-          }}
-        >
-          <Check size={15} />
-        </button>
-        <button type="button" className="ms-go" aria-label="Keep it as it is" onClick={onDone}>
-          <X size={15} />
-        </button>
-      </span>
-    </li>
-  );
-}
-
-/* ------------------------------------------------ the machine's user's environment */
-
-/** What a session runs with when it has none: this session's, marked, or the way back to it. */
-function MachineLine({ at, mine }: { at: At; mine: Agentenv | undefined }) {
-  const [asking, setAsking] = React.useState(false);
   const [why, setWhy] = React.useState<string | null>(null);
+  const now = mine?.id ?? "";
+  const picked = want === null ? undefined : (envs.find((e) => e.id === want) ?? null);
   return (
-    <>
-      <li className="ms-node df-defrow df-head" data-stand="done" data-depth={0} data-env="machine">
-        <span className="df-head-main">
-          <span className="df-strong df-defname">Machine&apos;s user environment</span>
-          {!mine && <span className="df-head-v df-this">this session</span>}
+    <div className="ev-choose">
+      <SelectField
+        label="This session's environment"
+        value={want ?? now}
+        onChange={(v) => setWant(v === now ? null : v)}
+        options={[{ value: "", label: "Machine environment (default)" }, ...envs.map((e) => ({ value: e.id, label: e.name }))]}
+      />
+      {picked !== undefined && (
+        <span className="ms-confirm ev-confirm" role="group" aria-label="Restart this session?">
+          <span>Restart this session with {picked ? picked.name : "the machine environment"}?</span>
+          <button
+            type="button"
+            className="ms-go"
+            disabled={busy}
+            aria-busy={busy || undefined}
+            aria-label={`Restart with ${picked ? picked.name : "the machine environment"}`}
+            onClick={() => {
+              setBusy(true);
+              void apply(at, picked, setWhy).finally(() => {
+                setBusy(false);
+                setWant(null);
+              });
+            }}
+          >
+            <Check size={15} />
+          </button>
+          <button type="button" className="ms-go" aria-label="Cancel" onClick={() => setWant(null)}>
+            <X size={15} />
+          </button>
         </span>
-        <span className="df-head-end">
-          {mine ? (
-            <Button size="xs" variant="secondary" onClick={() => setAsking(true)}>
-              Go back to it
-            </Button>
-          ) : (
-            <span className="df-head-v">{machineOf(at.target)}</span>
-          )}
+      )}
+      {why && (
+        <span className="sb-why" role="alert">
+          {why}
         </span>
-      </li>
-      <li className="ms-node df-body" data-depth={2}>
-        <span className="df-note">What its user would have in a terminal on {machineOf(at.target)}: a session with no environment of yours runs with it.</span>
-        {why && (
-          <span className="sb-why" role="alert">
-            {why}
-          </span>
-        )}
-      </li>
-      {asking && <ApplyAsk at={at} e={null} why={setWhy} onDone={() => setAsking(false)} />}
-    </>
+      )}
+    </div>
   );
 }
 
@@ -204,7 +168,7 @@ function MachineLine({ at, mine }: { at: At; mine: Agentenv | undefined }) {
 
 function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly AgentInfo[]; here?: boolean }) {
   const [editing, setEditing] = React.useState(false);
-  const [asking, setAsking] = React.useState<"apply" | "delete" | null>(null);
+  const [asking, setAsking] = React.useState(false);
   const [why, setWhy] = React.useState<string | null>(null);
   const sessions = e.sessions.map((id) => list.find((a) => a.id === id) ?? { id, name: id, target: "" });
   return (
@@ -217,7 +181,7 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
         </span>
         <span className="df-head-end">
           <span className="df-head-v">
-            {BASE_WORD[e.base]} · v{e.version}
+            {BASE_WORD[e.base]} base · v{e.version}
           </span>
         </span>
         <span className="df-head-acts">
@@ -239,23 +203,19 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
               )}
               <GroupHead label="Variables" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.vars.length}</span>} />
               <li className="ms-node df-body" data-depth={2}>
-                <span className="df-facts">
-                  <span className="df-fact">
-                    <span className="ms-edit-k">base</span>
-                    <span className="df-fact-v">{e.base === "user" ? "The machine's user's environment" : "Clean: only what its harness needs to run"}</span>
-                  </span>
-                </span>
                 {e.vars.length === 0 ? (
-                  <span className="df-note">No variables: the base as it is.</span>
+                  <span className="df-note">No variables.</span>
                 ) : (
                   <ul className="sb-rows ev-rows" aria-label={`${e.name}'s variables`}>
                     {e.vars.map((v, i) => (
                       <li key={`${i}:${v.name}`} className="sb-row ev-var" data-from={v.from}>
-                        <span className="sb-mono sb-clip ev-name">{v.name}</span>
-                        <span className="sb-tags">
-                          <i>{FROM_WORD[v.from]}</i>
+                        <span className="ev-key">
+                          <span className="sb-mono sb-clip ev-name">{v.name}</span>
+                          <span className="sb-tags">
+                            <i>{FROM_WORD[v.from]}</i>
+                          </span>
                         </span>
-                        <span className="sb-mono sb-clip ev-gives" title={v.from === "secret" ? `Your secret ${v.secret ?? ""}: its value is never shown` : givesOf(v)}>
+                        <span className="sb-mono sb-clip ev-gives" title={v.from === "secret" ? `Secret ${v.secret ?? ""} (value hidden)` : givesOf(v)}>
                           {v.from === "secret" && <KeyRound size={11} aria-hidden="true" />}
                           {givesOf(v)}
                         </span>
@@ -267,7 +227,7 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
               <GroupHead label="Sessions" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.sessions.length}</span>} />
               <li className="ms-node df-body" data-depth={2}>
                 {sessions.length === 0 ? (
-                  <span className="df-note">No session runs with it.</span>
+                  <span className="df-note">No sessions.</span>
                 ) : (
                   <ul className="sb-rows ev-rows" aria-label={`Sessions running with ${e.name}`}>
                     {sessions.map((s) => (
@@ -281,24 +241,17 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
                   </ul>
                 )}
                 <span className="ev-acts">
-                  {!here && (
-                    <Button size="xs" variant="secondary" onClick={() => setAsking("apply")}>
-                      Apply to this session
-                    </Button>
-                  )}
-                  <Button size="xs" variant="ghost-danger" onClick={() => setAsking("delete")}>
+                  <Button size="xs" variant="ghost-danger" onClick={() => setAsking(true)}>
                     Delete
                   </Button>
                 </span>
-                {!here && <span className="df-note">Applying it starts this session again on its conversation.</span>}
                 {why && (
                   <span className="sb-why" role="alert">
                     {why}
                   </span>
                 )}
               </li>
-              {asking === "apply" && <ApplyAsk at={at} e={e} why={setWhy} onDone={() => setAsking(null)} />}
-              {asking === "delete" && <DeleteAsk e={e} why={setWhy} onDone={() => setAsking(null)} />}
+              {asking && <DeleteAsk e={e} why={setWhy} onDone={() => setAsking(false)} />}
             </>
           )}
         </ul>
@@ -329,7 +282,6 @@ function DeleteAsk({ e, onDone, why }: { e: Agentenv; onDone: () => void; why: (
                 () => {
                   setData<Agentenv[]>(agentenvsRes.key, (l) => l.filter((x) => x.id !== e.id));
                   relist();
-                  toast({ title: `Deleted ${e.name}`, tone: "info" });
                 },
                 (err: unknown) => why(errorMessage(err)),
               )
@@ -338,7 +290,7 @@ function DeleteAsk({ e, onDone, why }: { e: Agentenv; onDone: () => void; why: (
         >
           <Check size={15} />
         </button>
-        <button type="button" className="ms-go" aria-label="Keep it" onClick={onDone}>
+        <button type="button" className="ms-go" aria-label="Cancel" onClick={onDone}>
           <X size={15} />
         </button>
       </span>
@@ -399,7 +351,6 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
         (saved) => {
           setData<Agentenv[]>(agentenvsRes.key, (l) => (l.some((x) => x.id === saved.id) ? l.map((x) => (x.id === saved.id ? saved : x)) : [saved, ...l]));
           relist();
-          toast({ title: e ? (saved.version > e.version ? `Saved ${saved.name}, v${saved.version}` : "Nothing changed") : `Made ${saved.name}, v${saved.version}`, tone: "info" });
           onDone();
         },
         (err: unknown) => {
@@ -416,7 +367,7 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
         <input className="sb-in sb-grow" value={d.name} placeholder="name" aria-label="Environment's name" spellCheck={false} onChange={(x) => setD({ ...d, name: x.target.value })} />
       </span>
       <span className="sb-form-row">
-        <input className="sb-in sb-grow" value={d.description} placeholder="what it's for (optional)" aria-label="Description" onChange={(x) => setD({ ...d, description: x.target.value })} />
+        <input className="sb-in sb-grow" value={d.description} placeholder="Description (optional)" aria-label="Description" onChange={(x) => setD({ ...d, description: x.target.value })} />
       </span>
       <span className="sb-form-row">
         <Segmented
@@ -425,11 +376,10 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
           value={d.base}
           onChange={(base) => setD({ ...d, base })}
           options={[
-            { value: "user", label: "User's", title: "The machine's user's environment, its variables over it" },
-            { value: "clean", label: "Clean", title: "Only what its harness needs to run, its variables over that" },
+            { value: "user", label: "Machine", title: "Start from the machine environment" },
+            { value: "clean", label: "Clean", title: "Start empty: only what the harness needs" },
           ]}
         />
-        <span className="sb-dim ev-base">{d.base === "user" ? "over the machine's user's environment" : "over only what its harness needs to run"}</span>
       </span>
       <span className="sb-k ev-k">Variables</span>
       {d.vars.map((v, i) => (
@@ -484,7 +434,7 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
                 <MachinePick target={at.target} v={v} i={i} onPick={(pick) => setVar(i, { pick, name: v.name || pick })} />
               </Loadable>
             )}
-            {v.from === "unset" && <span className="sb-dim">taken away from what the base gives</span>}
+            {v.from === "unset" && <span className="sb-dim">Removed</span>}
           </span>
         </span>
       ))}
@@ -496,7 +446,7 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
       </span>
       {e && d.version !== undefined && e.version !== d.version && (
         <span className="sb-form-row">
-          <span className="sb-dim">Saved as v{e.version} since you opened it.</span>
+          <span className="sb-dim">Changed elsewhere (now v{e.version}).</span>
           <Button size="xs" variant="secondary" onClick={() => setD(draftOf(e))}>
             Start over from v{e.version}
           </Button>
@@ -561,7 +511,7 @@ function MachinePick({ target, v, i, onPick }: { target: string; v: DraftVar; i:
         ))}
       </select>
       {/* Where a picked one is set, its option says; one the machine hasn't, this line. */}
-      {v.pick && !picked && <span className="sb-dim ev-src">{`${machineOf(target)}'s user hasn't it now: it's left unset`}</span>}
+      {v.pick && !picked && <span className="sb-dim ev-src">{`Not set on ${machineOf(target)}`}</span>}
     </>
   );
 }

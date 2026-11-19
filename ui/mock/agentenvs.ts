@@ -34,7 +34,7 @@ function seed(): Map<string, Agentenv> {
       id: "env-release",
       owner: "ada",
       name: "release-tools",
-      description: "What a release needs: the GitHub token, quiet logs, the user's cargo",
+      description: "GitHub token, quiet logs, cargo",
       base: "user",
       vars: [
         { name: "GH_TOKEN", from: "secret", secret: "GH_TOKEN" },
@@ -66,7 +66,7 @@ function seed(): Map<string, Agentenv> {
       id: "env-clean",
       owner: "ada",
       name: "clean-ci",
-      description: "As CI has it: nothing of the user's but the search path",
+      description: "Like CI: only PATH",
       base: "clean",
       vars: [
         { name: "PATH", from: "machine" },

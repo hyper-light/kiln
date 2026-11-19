@@ -65,9 +65,9 @@ test("facets: base, what it uses (unset isn't a use), and where it runs from thi
   assert.deepEqual(
     facets[2]!.options.map((o) => [o.label, o.count]),
     [
-      ["This session's", 1],
-      ["Others'", 1],
-      ["None", 0],
+      ["This session", 1],
+      ["Other sessions", 1],
+      ["Unused", 0],
     ],
   );
   // What's typed finds a variable's name and the machine's variable it takes.

@@ -443,7 +443,7 @@ function AgentenvRow({ c }: { c: Choices }) {
           label="The environment it runs with"
           value={chosen?.id ?? ""}
           onChange={c.setAgentenv}
-          options={[{ value: "", label: "Machine's user environment" }, ...envs.map((e) => ({ value: e.id, label: `${e.name} v${e.version}`, group: "Yours" }))]}
+          options={[{ value: "", label: "Machine environment (default)" }, ...envs.map((e) => ({ value: e.id, label: `${e.name} v${e.version}`, group: "Yours" }))]}
         />
       </div>
     </div>

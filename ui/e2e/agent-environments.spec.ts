@@ -38,6 +38,12 @@ async function engine(page: Page) {
   return { body, list: body.getByRole("list", { name: "Environments", exact: true }) };
 }
 
+/** `b` clicked from the middle of the page: on a phone, the notifications stacked at its foot would take a click there. */
+async function press(b: import("@playwright/test").Locator) {
+  await b.evaluate((el) => el.scrollIntoView({ block: "center" }));
+  await b.click();
+}
+
 /** No page scrolls sideways. */
 const sideways = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
 
@@ -45,20 +51,20 @@ test("a session on bare metal has the Engine tab: Environments and Agents, no Sa
   const said = errors(page);
   const { body, list } = await engine(page);
   await expect(body.locator(".in-sec-toggle")).toHaveText([/^Environments/, /^Agents/]);
-  // The machine's user's, then this session's, marked, then the others.
+  // This session's environment, chosen at the top; its card first, marked.
+  await expect(body.getByLabel("This session's environment").locator("option:checked")).toHaveText("release-tools");
+  await expect(body.getByLabel("This session's environment").locator("option").first()).toHaveText("Machine environment (default)");
   const lines = list.locator(":scope > li.df-defrow");
-  await expect(lines.first()).toContainText("Machine's user environment");
-  await expect(lines.first()).not.toContainText("this session");
-  await expect(lines.nth(1)).toContainText("release-tools");
-  await expect(lines.nth(1)).toContainText("this session");
-  await expect(lines.nth(1)).toContainText("User's · v3");
+  await expect(lines.first()).toContainText("release-tools");
+  await expect(lines.first()).toContainText("this session");
+  await expect(lines.first()).toContainText("Machine base · v3");
   // Its variables a line each: a secret by its name, a value as it is, the machine's variable it takes.
   const vars = list.getByRole("list", { name: "release-tools's variables" }).locator("li");
   await expect(vars).toHaveText([/^GH_TOKEN\s*secret\s*GH_TOKEN$/, /^RUST_LOG\s*value\s*info$/, /^CARGO_HOME\s*machine\s*\$CARGO_HOME$/]);
   await expect(list.getByRole("list", { name: "Sessions running with release-tools" })).toContainText("Update the docs");
   // Sorted and found: most variables first after this session's; Secrets chosen, only those that give one.
   await body.getByRole("combobox", { name: "Sort environments" }).selectOption("vars");
-  await expect(lines.locator(".df-defname")).toHaveText(["Machine's user environment", "release-tools", "aws-agents", "clean-ci"]);
+  await expect(lines.locator(".df-defname")).toHaveText(["release-tools", "aws-agents", "clean-ci"]);
   expect(await sideways(page)).toBe(0);
   expect(said, said.join("\n")).toEqual([]);
 });
@@ -88,7 +94,7 @@ test("one made, changed in place, applied to this session, refused deletion whil
   await form.getByRole("button", { name: "Create the new environment" }).click();
   await expect(form).toHaveCount(0);
   const card = list.locator(":scope > li.df-defrow", { hasText: "e2e-env" });
-  await expect(card).toContainText("Clean · v1");
+  await expect(card).toContainText("Clean base · v1");
   const tree = list.getByRole("list", { name: "e2e-env: variables and sessions" });
   await expect(tree.getByRole("list", { name: "e2e-env's variables" }).locator("li .ev-name")).toHaveText(["RUST_LOG", "GH_TOKEN", "CARGO_HOME"]);
 
@@ -97,31 +103,34 @@ test("one made, changed in place, applied to this session, refused deletion whil
   const edit = list.getByRole("listitem", { name: "Edit e2e-env" });
   await edit.getByRole("button", { name: "Remove variable 1" }).click();
   await edit.getByRole("button", { name: "Save e2e-env" }).click();
-  await expect(card).toContainText("Clean · v2");
+  await expect(card).toContainText("Clean base · v2");
   await expect(tree.getByRole("list", { name: "e2e-env's variables" }).locator("li .ev-name")).toHaveText(["GH_TOKEN", "CARGO_HOME"]);
 
-  // Applied to this session, asked again in place: it starts again on its conversation.
-  await tree.getByRole("button", { name: "Apply to this session" }).click();
-  await expect(tree.getByRole("group", { name: "Apply e2e-env to this session?" })).toContainText("Update the docs starts again on its conversation, with e2e-env v2.");
+  // Chosen for this session from the dropdown, confirmed first: it restarts the session.
+  const body = page.locator(".hx-inspector-body").filter({ visible: true }).first();
+  const choose = body.getByLabel("This session's environment");
+  await choose.selectOption({ label: "e2e-env" });
+  await expect(body.getByRole("group", { name: "Restart this session?" })).toHaveText(/Restart this session with e2e-env\?/);
   const put = page.waitForRequest((r) => r.method() === "PUT" && r.url().endsWith("/api/harness/sessions/fam-docs/agentenv"));
-  await tree.getByRole("button", { name: "Apply e2e-env to this session" }).click();
+  await body.getByRole("button", { name: "Restart with e2e-env" }).click();
   expect((await put).postDataJSON()).toEqual({ agentenv: expectNow.stringMatching(/^env-/) });
   const lines = list.locator(":scope > li.df-defrow");
-  await expect(lines.nth(1)).toContainText("e2e-env");
-  await expect(lines.nth(1)).toContainText("this session");
+  await expect(lines.first()).toContainText("e2e-env");
+  await expect(lines.first()).toContainText("this session");
   await expect(list.locator(":scope > li.df-defrow", { hasText: "release-tools" })).not.toContainText("this session");
 
   // Deleting it while this session runs with it: refused, in the server's words.
-  await tree.getByRole("button", { name: "Delete", exact: true }).click();
-  await tree.getByRole("button", { name: "Delete e2e-env" }).click();
+  await press(tree.getByRole("button", { name: "Delete", exact: true }));
+  await press(tree.getByRole("button", { name: "Delete e2e-env" }));
   await expect(tree.getByRole("alert")).toHaveText("e2e-env can't be deleted: “Update the docs” runs with it. Put it on another environment first.");
 
-  // Back on the machine's user's environment, then deleted.
-  await lines.first().getByRole("button", { name: "Go back to it" }).click();
-  await list.getByRole("button", { name: "Apply the machine's user's environment to this session" }).click();
-  await expect(lines.first()).toContainText("this session");
-  await tree.getByRole("button", { name: "Delete", exact: true }).click();
-  await tree.getByRole("button", { name: "Delete e2e-env" }).click();
+  // Back on the machine environment, then deleted.
+  await choose.selectOption({ label: "Machine environment (default)" });
+  await body.getByRole("button", { name: "Restart with the machine environment" }).click();
+  await expect(choose.locator("option:checked")).toHaveText("Machine environment (default)");
+  await expect(list.locator(":scope > li.df-defrow", { hasText: "e2e-env" })).not.toContainText("this session");
+  await press(tree.getByRole("button", { name: "Delete", exact: true }));
+  await press(tree.getByRole("button", { name: "Delete e2e-env" }));
   await expect(list.locator(":scope > li.df-defrow", { hasText: "e2e-env" })).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
   expect(said, said.join("\n")).toEqual([]);
@@ -134,7 +143,7 @@ test("the composer's Environment row: the machine's user's by default, one of th
   await page.getByRole("button", { name: /^More options/ }).click();
   const pick = page.getByLabel("The environment it runs with");
   await expect(pick).toHaveValue("");
-  await expect(pick.locator("option").first()).toHaveText("Machine's user environment");
+  await expect(pick.locator("option").first()).toHaveText("Machine environment (default)");
   await pick.selectOption({ label: "release-tools v3" });
   // Closed, More options says it.
   await page.getByRole("button", { name: /^More options/ }).click();

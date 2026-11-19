@@ -18,14 +18,23 @@
 .ev-rows {
   justify-self: stretch;
 }
-/* A variable: its name, where it comes from, what it gives (a value, a secret's name, the machine's variable). */
+/* A variable: its name with where it comes from beside it, then what it gives at the row's right edge. */
 .sb-row.ev-var {
-  grid-template-columns: minmax(0, 2fr) 64px minmax(0, 3fr);
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+}
+.ev-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 .ev-gives {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
+  justify-self: end;
   gap: 5px;
+  text-align: right;
   color: #d4d6dc;
 }
 .ev-gives > svg {
@@ -76,7 +85,12 @@
 .ev-vacts {
   margin-left: auto;
 }
-.ev-base,
+/* This session's environment, chosen above the list; a change asks first, as it restarts the session. */
+.ev-choose {
+  display: grid;
+  gap: 8px;
+  padding: 4px 0 12px;
+}
 .ev-src {
   font-size: 12px;
 }

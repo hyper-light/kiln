@@ -21,7 +21,7 @@ export const SOURCE_WORD: Record<AgentenvSource, string> = {
 export const FROM_WORD: Record<AgentenvFrom, string> = { machine: "machine", value: "value", secret: "secret", unset: "unset" };
 
 /** What it goes over, in a card's line and its facet. */
-export const BASE_WORD: Record<AgentenvBase, string> = { user: "User's", clean: "Clean" };
+export const BASE_WORD: Record<AgentenvBase, string> = { user: "Machine", clean: "Clean" };
 
 /** This session's environment: the one that lists it among its sessions, else the one its entry names. */
 export function mineOf(envs: readonly Agentenv[], session: string, said: AgentenvRef | null): Agentenv | undefined {
@@ -63,7 +63,7 @@ export function facetsFor<T>(all: readonly T[], wordsOf: (x: T) => string, q: st
 }
 
 const USES_WORD: Record<string, string> = { machine: "Machine variables", value: "Values", secret: "Secrets" };
-const WHERE_WORD: Record<string, string> = { this: "This session's", others: "Others'", none: "None" };
+const WHERE_WORD: Record<string, string> = { this: "This session", others: "Other sessions", none: "Unused" };
 
 /** Base, what it uses (machine variables, values, secrets) and where it runs (this session, others, none), for session `session`. */
 export function envFacets(session: string): FacetOf<Agentenv>[] {
