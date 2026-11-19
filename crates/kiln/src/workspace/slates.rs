@@ -121,12 +121,14 @@ pub const INSTANCE: &str = "kiln";
 /// 42 since kiln took Slates at ce9b6905e (from 41; Slates' A-507). kiln uses 42: an unmount runs
 /// no program on macOS and the BSDs (`unmount(2)`, where it ran `umount` and `umount -f` found on
 /// `PATH`) and is believed only when the kernel's mount table agrees, so a runner's `PATH` no longer
-/// decides whether a workspace's mount comes down (`unmount`, `let_go`). Its three new refusals,
+/// decides whether a workspace's mount comes down (`unmount`). Its three new refusals,
 /// a mount still busy (`MountFault::Busy`), one the table still lists after an unmount answered done
 /// (`StillMounted`) and a table that could not be read (`MountTable`), kiln shows in Slates' words as
-/// it shows every unmount's, and maps, as every mount fault it is not told is missing, to its own
-/// can't-mount refusal (`missing_of`). The revision brings Slates' A-511 too: a mount's attachment
-/// ends at the kernel's own unmount event, never at its `UMNT`.
+/// it shows every unmount's, tells by the first two the kind of an ended agent's mount that stays
+/// ([`MountStays`]: busy, naming what holds it, or still listed), and maps, as every mount fault it
+/// is not told is missing, to its own can't-mount refusal (`missing_of`). It lets none go by force,
+/// so 36's `unmount_busy` is called no more. The revision brings Slates' A-511 too: a mount's
+/// attachment ends at the kernel's own unmount event, never at its `UMNT`.
 pub const CONTRACT: u32 = 42;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
@@ -1025,13 +1027,14 @@ pub struct MountStays {
 
 /// Why a workspace's mount stays after kiln's one unmount, by what a person does about it: end what holds it
 /// ([`Held::Busy`]), look into the refusal ([`Held::Refused`]), or look at an OS whose unmount and mount table disagree
-/// ([`Held::StillListed`]). Slates' contract 42 answers the first as `MountFault::Busy` on macOS (its A-507); kiln, at
-/// contract 41 ([`CONTRACT`]), tells it by what holds the mount.
+/// ([`Held::StillListed`]). The kind is Slates' typed answer where it gives one (contract 42, its A-507:
+/// `MountFault::Busy`, the OS's `EBUSY` on macOS and the BSDs, and `MountFault::StillMounted`); Linux's `fusermount3
+/// -u` answers a busy mount with its exit code alone, so there kiln tells it by what `lsof` names holding it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Held {
-    /// The unmount was refused while processes hold a file or a working directory on the mount, each as `lsof` names
-    /// it (`<pid> <command>`). Every process kiln started for its agent had ended, so each is another's: a person's
-    /// shell or editor there, or a process that left the agent's group.
+    /// The unmount was refused while processes hold a file or a working directory on the mount: the OS said so
+    /// (`MountFault::Busy`), or `lsof` names them (Linux), each as `<pid> <command>`. Every process kiln started for its
+    /// agent had ended, so each is another's: a person's shell or editor there, or a process that left the agent's group.
     Busy {
         /// What holds it, as `lsof` names it (none where it sees none: another user's process, which it isn't shown);
         /// what kept `lsof` from saying, where it couldn't.
@@ -1063,8 +1066,9 @@ impl std::fmt::Display for MountStays {
 
 impl std::error::Error for MountStays {}
 
-/// The kind of a mount the table still holds after its unmount was refused (`refusal`, in its words), told by what
-/// `lsof` names holding it (`holders`; why `lsof` couldn't say, where it couldn't).
+/// The kind of a mount the table still holds after its unmount was refused (`refusal`, in its words) without the OS
+/// saying it's busy, told by what `lsof` names holding it (`holders`; why `lsof` couldn't say, where it couldn't):
+/// Linux's `fusermount3 -u` answers a busy mount with its exit code alone (Slates' `MountFault::Unmount`).
 fn held_by(refusal: String, holders: Result<Vec<String>, String>) -> Held {
     match holders {
         Ok(holders) if !holders.is_empty() => Held::Busy { holders: Ok(holders) },
@@ -1112,16 +1116,21 @@ impl TakeDown for Live<'_> {
 /// Takes a workspace with mount point `mount` down by `steps`: unmounted, asked once (what held it, the processes kiln
 /// started in it, has ended: [`remove`]), then its volume destroyed, only once the kernel's mount table no longer holds
 /// the point; an unmount that answers done is believed only when the table agrees. A mount that stays keeps its volume,
-/// refused by kind ([`MountStays`], [`Held`]) and logged: a volume destroyed beneath a live mount leaves the mount with
-/// nothing behind it (the macOS bare-metal drive, f3f618f2, kiln 68eda5b1, 2026-11-18). Nothing is let go by force:
-/// what still holds it once kiln's own processes have ended is another's, which a forced unmount would cut off.
+/// refused by kind, as Slates types the unmount's answer ([`MountStays`], [`Held`]), and logged: a volume destroyed
+/// beneath a live mount leaves the mount with nothing behind it (the macOS bare-metal drive, f3f618f2, kiln 68eda5b1,
+/// 2026-11-18). Nothing is let go by force: what still holds it once kiln's own processes have ended is another's,
+/// which a forced unmount would cut off.
 async fn take_down(steps: &impl TakeDown, mount: &str) -> anyhow::Result<()> {
     if !mount.is_empty() {
         if steps.mounted().await {
             let asked = steps.unmount().await;
             if steps.mounted().await {
                 let held = match asked {
-                    Ok(Ok(())) => Held::StillListed,
+                    // Done by Slates' word while kiln's own read of the table still lists it, or Slates' own read
+                    // after an unmount that answered done (contract 42): the OS's unmount and its table disagree.
+                    Ok(Ok(()) | Err(slates_api::Error::Mount(slates_api::MountFault::StillMounted { .. }))) => Held::StillListed,
+                    // Busy by the OS's own word (`EBUSY`, macOS and the BSDs), whatever `lsof` can see holding it.
+                    Ok(Err(slates_api::Error::Mount(slates_api::MountFault::Busy { .. }))) => Held::Busy { holders: steps.holders().await },
                     Ok(Err(refused)) => held_by(format!("Slates' unmount: {refused}"), steps.holders().await),
                     Err(unasked) => held_by(format!("{unasked:#}"), steps.holders().await),
                 };

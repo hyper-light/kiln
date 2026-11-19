@@ -325,11 +325,13 @@ is asked to go once. Its volume is destroyed only once the kernel's mount table 
 that answers done is believed only when the table agrees); one whose mount stays is kept, never destroyed beneath a
 live mount, which would leave the mount with nothing behind it, and never let go by force: what holds it once the
 agent's processes have ended is another's (a person's shell or editor there), which a forced unmount would cut off.
-kiln refuses it by kind (`MountStays`): busy, naming each process that holds it as `lsof` does (the system's own,
-`/usr/sbin/lsof`, on macOS); refused while nothing `lsof` sees holds it, or `lsof` can't say, in the refusal's words;
-or answered done while the table still lists it. Slates' contract 42 types the first as `MountFault::Busy` (its A-507),
-which kiln takes with that revision. Before, kiln asked again on a clock for as long as the agent's own end
-had taken, then let the mount go (detached on Linux, forced off on macOS: Slates' `mount::unmount_busy`, contract 36);
+kiln refuses it by kind (`MountStays`), as Slates' contract 42 types the unmount's answer (its A-507): busy, which the
+OS says itself on macOS (`MountFault::Busy`, its `EBUSY`) and Linux's `fusermount3 -u` doesn't (an exit code alone, so
+there a refusal while `lsof` names processes holding the mount), naming each process that holds it as `lsof` does (the
+system's own, `/usr/sbin/lsof`, on macOS); refused for another reason, in the refusal's words and `lsof`'s; or
+answered done while the table still lists it (`MountFault::StillMounted`). Before, kiln asked again on a clock for as
+long as the agent's own end had taken, then let the mount go (detached on Linux, forced off on macOS: Slates'
+`mount::unmount_busy`, contract 36);
 kiln's clippy refuses a clock there (`rt::sleep`), and the let-go cut off whoever still worked in it. kiln reads that table
 with the system's own `mount` (`/sbin/mount`) on macOS, never a program found on `PATH`. kiln names a mount by its real path, as
 the kernel's mount table names it (macOS reaches `/var`, where temporary folders lie, through a link to
