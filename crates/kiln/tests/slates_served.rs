@@ -96,8 +96,8 @@ fn git_in(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 /// volume as an agent would (a tracked file changed, a new file, a new executable, a `.gitignore` the agent extended,
 /// a file that extension ignores, build output the project's own `.gitignore` ignores). Expect: nothing mounted for it;
 /// its review the commit of exactly the tracked change, the new file, the executable with its bit and the extended
-/// `.gitignore`, on the folder's last commit, the folder's branch, index and files as they were; a landing refused as
-/// writing the two files git ignores; Slates' stream of the volume a socket, and a volume it doesn't serve refused
+/// `.gitignore`, on the folder's last commit, the folder's branch, index and files as they were; a landing that leaves
+/// out the two files git ignores, read from the volume itself; Slates' stream of the volume a socket, and a volume it doesn't serve refused
 /// `Invalid` naming it; and the workspace gone with its volume.
 #[test]
 fn g265_a_volume_with_no_mount_is_served_on_a_stream_and_reviewed_from_its_own_changes() -> anyhow::Result<()> {
@@ -164,18 +164,20 @@ fn g265_a_volume_with_no_mount_is_served_on_a_stream_and_reviewed_from_its_own_c
     assert_eq!(git_in(project.path(), &["status", "--porcelain"])?, "", "the folder's index and files are as they were");
     assert_eq!(std::fs::read(project.path().join("a.txt"))?, b"a\n", "nothing of the volume reached the folder");
 
-    // A landing of it would write the two files git ignores: refused, as a mounted workspace's is.
+    // A landing of it leaves out what git ignores in the volume, as a mounted workspace's leaves out what git ignores in
+    // its working tree: read from the volume's own `.gitignore` files, never from the runner's folder (`git -C ""`).
     let (plan, excludes) = kiln::rt::block_on({
         let (made, over) = (made.clone(), over.clone());
         async move { slates::plan_landing(&made, &over).await }
     })?;
-    // No mount to ask git in: what every landing leaves out, alone (what git ignores is judged from the entries).
-    assert_eq!(excludes, slates::EXCLUDES, "{excludes:?}");
-    let refused = kiln::rt::block_on({
-        let (made, over, plan) = (made.clone(), over.clone(), plan.clone());
-        async move { anyhow::Ok(slates::writable(&made, &over, &plan).await) }
+    let mut left_out = excludes.clone();
+    left_out.sort();
+    assert_eq!(left_out, ["/.git", "/secret.env", "/target"], "the two the volume's git ignores, and .git");
+    let writes = kiln::rt::block_on({
+        let (made, over, plan, excludes) = (made.clone(), over.clone(), plan.clone(), excludes.clone());
+        async move { anyhow::Ok(slates::writable(&made, &over, &plan, &excludes).await) }
     })?;
-    assert!(refused.as_ref().is_err_and(|why| why.contains("2 files git ignores")), "{refused:?}");
+    assert_eq!(writes, Ok(()), "with them left out, nothing it writes is ignored");
 
     // Slates' stream of the volume, as Hex asks it of kiln's server for a box's boot: a socket, its microVM's device's
     // to frame FUSE on; a volume Slates serves none of is refused Invalid, naming it (Hex's HEX-SERVE-3).
