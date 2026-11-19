@@ -1169,8 +1169,12 @@ pub const EXCLUDES: &[&str] = &["/.git"];
 /// What a landing of workspace `m` leaves out, each a prefix of its volume: what git ignores there (its build output
 /// and dependencies, which kiln never writes into a person's folder), then [`EXCLUDES`]. A folder git doesn't know
 /// (or a volume with no mount to ask git in) leaves out [`EXCLUDES`] alone.
-pub async fn excludes(m: &Made) -> Vec<String> {
-    let mut out = match git_ignored(m).await {
+pub async fn excludes(m: &Made, over: &str) -> Vec<String> {
+    let ignored = match ignores_from(m) {
+        IgnoresFrom::Tree(top) => git_ignored(&top).await,
+        IgnoresFrom::Volume => super::review::ignored_paths(m, over).await,
+    };
+    let mut out = match ignored {
         Ok(ignored) => ignored,
         Err(e) => {
             tracing::debug!(error = %format!("{e:#}"), "what git ignores in a workspace couldn't be read: only .git is left out");
@@ -1179,6 +1183,23 @@ pub async fn excludes(m: &Made) -> Vec<String> {
     };
     out.extend(EXCLUDES.iter().map(|p| (*p).to_owned()));
     out
+}
+
+/// Where what git ignores in a workspace is read ([`excludes`]).
+#[derive(Debug, PartialEq, Eq)]
+enum IgnoresFrom {
+    /// The working tree at its mount's top.
+    Tree(PathBuf),
+    /// The volume itself.
+    Volume,
+}
+
+/// Where what git ignores in workspace `m` is read: the working tree at its mount, or, with none (an isolated workspace,
+/// its volume served to its microVM), the volume itself (`super::review::ignored_paths`: its own `.gitignore` files,
+/// the repository's excludes and the user's, over what its landing writes). Never `git -C ""`, which git takes for its
+/// own process's folder, the runner's.
+fn ignores_from(m: &Made) -> IgnoresFrom {
+    if m.mount.is_empty() { IgnoresFrom::Volume } else { IgnoresFrom::Tree(super::place::top(&m.mount)) }
 }
 
 /// The volume whose drift says what changed on disk under workspace `m` (K5): its base overlay for a captured clone, whose
@@ -1194,9 +1215,9 @@ fn landing(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<LandingR
 }
 
 /// What git ignores in workspace `m` ([`ignored_prefixes`]).
-async fn git_ignored(m: &Made) -> anyhow::Result<Vec<String>> {
+async fn git_ignored(top: &Path) -> anyhow::Result<Vec<String>> {
     let mut c = Command::new("git");
-    c.arg("-C").arg(super::place::top(&m.mount)).args(["status", "--porcelain=v1", "-z", "--ignored=traditional", "--untracked-files=normal"]).env("GIT_TERMINAL_PROMPT", "0");
+    c.arg("-C").arg(top).args(["status", "--porcelain=v1", "-z", "--ignored=traditional", "--untracked-files=normal"]).env("GIT_TERMINAL_PROMPT", "0");
     let o = crate::proc::output(c, GIT_TIMEOUT).await?;
     anyhow::ensure!(o.status.success(), "git status: {}", String::from_utf8_lossy(&o.stderr).trim());
     Ok(ignored_prefixes(&String::from_utf8_lossy(&o.stdout)))
@@ -1270,15 +1291,16 @@ fn planned_files(plan: &Value) -> usize {
 /// Whether `plan` writes only what git sees changed in workspace `m`: with what git ignores and `.git` left out
 /// ([`excludes`]), anything more is something git ignores that was made after kiln asked git (a build still running),
 /// which kiln won't write into a person's folder. One with no mount is judged by its landing's entries instead.
-pub async fn writable(m: &Made, over: &str, plan: &Value) -> Result<(), String> {
+pub async fn writable(m: &Made, over: &str, plan: &Value, excludes: &[String]) -> Result<(), String> {
     let planned = planned_files(plan);
-    // One with no mount has no working tree for git to look at: what git ignores among what its landing writes is read
-    // from its entries and its own `.gitignore` files (kiln goal 01a1ec34…, `super::review::ignored_writes`).
+    // One with no mount has no working tree for git to look at: what git ignores among what its landing writes, past the
+    // `excludes` it was planned with (themselves read from its volume, [`excludes`]), is read from its entries and its
+    // own `.gitignore` files (kiln goal 01a1ec34…, `super::review::ignored_writes`).
     if m.mount.is_empty() {
-        let ignored = super::review::ignored_writes(m, over).await.map_err(|e| format!("{e:#}"))?;
+        let ignored = super::review::ignored_writes(m, over, excludes).await.map_err(|e| format!("{e:#}"))?;
         return match ignored {
             0 => Ok(()),
-            n => Err(format!("it would also write {n} file{} git ignores (build output, dependencies) into the folder: kiln leaves out only .git, so put the work up for review instead", if n == 1 { "" } else { "s" })),
+            n => Err(format!("it would also write {n} file{} git ignores (build output, dependencies) into the folder, made since kiln read what git ignores in it: plan it again once the agent's build is done, or put the work up for review instead", if n == 1 { "" } else { "s" })),
         };
     }
     let changed = git_changed(m).await.map_err(|e| format!("{e:#}"))?;
@@ -1382,7 +1404,7 @@ fn plan_json(o: &LandOutcome) -> Value {
 /// volume's mode (its present-only verb): what review shows, and what an approval binds; what git
 /// ignores and git's own directory left out ([`excludes`]).
 pub async fn plan(m: &Made, over: &str) -> anyhow::Result<LandOutcome> {
-    let excludes = excludes(m).await;
+    let excludes = excludes(m, over).await;
     plan_with(m, over, &excludes).await
 }
 
@@ -1396,7 +1418,7 @@ async fn plan_with(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<
 /// `manifest`, `summary`, `conflicts`, `grant_required`), or how it went if nothing needed an
 /// approval; and what it leaves out ([`excludes`]).
 pub async fn plan_landing(m: &Made, over: &str) -> anyhow::Result<(Value, Vec<String>)> {
-    let excludes = excludes(m).await;
+    let excludes = excludes(m, over).await;
     let shown = plan_with(m, over, &excludes).await?;
     Ok((plan_json(&shown), excludes))
 }
@@ -1405,7 +1427,7 @@ pub async fn plan_landing(m: &Made, over: &str) -> anyhow::Result<(Value, Vec<St
 /// (bypass), held as an approval request (ask), conflicted, or refused (forbid), Slates' typed
 /// outcome either way; what git ignores and git's own directory left out ([`excludes`]).
 pub async fn land_by_policy(m: &Made, over: &str) -> anyhow::Result<LandOutcome> {
-    let excludes = excludes(m).await;
+    let excludes = excludes(m, over).await;
     let request = landing(m, over, &excludes)?;
     call("land", move |i| i.land(&request, None)).await
 }
@@ -1421,7 +1443,7 @@ pub async fn approve(m: &Made, over: &str, manifest: &str) -> anyhow::Result<Lan
     let approved = manifest_hash(manifest)?;
     // The plan the person saw left out what git ignored then; asked again, a new ignored path moves the manifest, and
     // nothing is approved.
-    let excludes = excludes(m).await;
+    let excludes = excludes(m, over).await;
     let request = landing(m, over, &excludes)?;
     call("land", move |i| match i.plan_landing(&request)? {
         LandOutcome::ApprovalRequired(approval) if approval.manifest == approved => i.approve_landing(&approval, &authority),
@@ -1494,7 +1516,7 @@ pub async fn land(m: &Made, over: &str, manifest: &str) -> anyhow::Result<Landed
             _ => Landed::Changed(shown, excludes),
         });
     }
-    writable(m, over, &shown).await.map_err(anyhow::Error::msg)?;
+    writable(m, over, &shown, &excludes).await.map_err(anyhow::Error::msg)?;
     Ok(match approve(m, over, manifest).await? {
         LandOutcome::Written(report) => Landed::Written(json!({"grant_required": false, "outcome": report_json(&report)})),
         other => Landed::Changed(plan_json(&other), excludes),
@@ -1583,6 +1605,18 @@ mod tests {
             anyhow::ensure!((none.unmounts.load(Relaxed), none.destroyed.load(Relaxed)) == (0, 1), "nothing mounted: destroyed, nothing asked");
             Ok(())
         })
+    }
+
+    /// W8 (kiln goal 01a1ec34599974448aed2672bafaf9a2): what git ignores in a workspace with no mount (an isolated agent's,
+    /// its volume served to its microVM) is read from its volume, never from the tree at its mount's top: with no mount
+    /// that's `git -C ""`, which git takes for its own process's folder, the runner's, whose ignores are another
+    /// repository's or none (g267, 2026-11-18). A mounted workspace's are read from its working tree.
+    #[test]
+    fn w8_an_unmounted_workspaces_ignores_are_read_from_its_volume_never_the_runners_folder() {
+        let unmounted = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-iso".into(), mount: String::new(), ..Default::default() };
+        assert_eq!(ignores_from(&unmounted), IgnoresFrom::Volume);
+        let mounted = Made { mount: "/state/workspaces/kiln-a".into(), ..unmounted.clone() };
+        assert_eq!(ignores_from(&mounted), IgnoresFrom::Tree(PathBuf::from("/state/workspaces/kiln-a")));
     }
 
     #[test]

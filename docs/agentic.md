@@ -495,7 +495,10 @@ stream kiln asks of its instance and hands Shards through Hex (Shards' D286, Hex
 path in its guest. Its change request is built from the volume's own changes (`workspace::review`: Slates'
 landing entries, each file read from the volume and checked against its BLAKE3, and a file whose executable bit alone
 changed read there and checked against the folder's copy, whose bytes its landing keeps; A-287), and its landing
-is the same Slates landing as a mounted workspace's. Owed: its real-VM run (`tests/slates_e2e.rs`'s
+is the same Slates landing as a mounted workspace's, leaving out what git ignores as a mounted one does: read from
+the volume itself (its own `.gitignore` files, the repository's excludes and the person's, over what the landing
+writes: each ignored file, or the shallowest directory git ignores above it), never from the runner's own folder,
+which a working tree's `git -C` at an empty mount would read. Owed: its real-VM run (`tests/slates_e2e.rs`'s
 `microvm::` drive); Shards' D286 on Shards' main (carried as a recorded change of vendor/shards until then).
 
 ## C: From changes to landed

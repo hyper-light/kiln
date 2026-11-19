@@ -620,7 +620,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
             let (m, over) = own(ws)?;
             let (plan, excludes) = slates::plan_landing(m, over).await?;
             // Why it can't be written from kiln: the landing would write what git ignores.
-            let why_not = slates::writable(m, over, &plan).await.err();
+            let why_not = slates::writable(m, over, &plan, &excludes).await.err();
             Ok(json!({"plan": plan, "excludes": excludes, "can_write": why_not.is_none(), "why_not": why_not}))
         }
         Ask::Land { manifest } => {
@@ -628,7 +628,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
             Ok(match slates::land(m, over, &manifest).await? {
                 slates::Landed::Written(outcome) => json!({"landed": outcome}),
                 slates::Landed::Changed(plan, excludes) => {
-                    let why_not = slates::writable(m, over, &plan).await.err();
+                    let why_not = slates::writable(m, over, &plan, &excludes).await.err();
                     json!({"changed": true, "plan": plan, "excludes": excludes, "can_write": why_not.is_none(), "why_not": why_not})
                 }
             })
