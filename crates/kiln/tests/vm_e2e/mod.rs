@@ -82,21 +82,56 @@ fn bare(line: &str) -> &str {
 /// harness's reply arrives in chunks that kiln joins into one event), and its tools' output (a real
 /// harness asked to print something may print it through its shell).
 pub fn said(events: &[Value]) -> Vec<String> {
+    events.iter().flat_map(said_in).collect()
+}
+
+/// The lines one timeline event says: an assistant's text, a tool's output.
+fn said_in(e: &Value) -> Vec<String> {
+    let text = match e.get("kind").and_then(Value::as_str) {
+        Some("assistant") => e.get("text"),
+        Some("tool") => e.get("output"),
+        _ => None,
+    };
+    text.and_then(Value::as_str).unwrap_or("").lines().map(bare).filter(|b| !b.is_empty()).map(str::to_owned).collect()
+}
+
+/// Whether timeline event `e` is a message kiln delivered (a person's words, or a child's news kiln
+/// queues to its parent, `told.rs`): the start of a turn of its own.
+fn is_delivered(e: &Value) -> bool {
+    e.get("kind").and_then(Value::as_str) == Some("user")
+}
+
+/// What the harness said past the timeline's first `n` lines, in the turn they were said in: up to
+/// the next message kiln delivered after them. A message kiln queued meanwhile (a child's news,
+/// "told, not made to wait", docs/agents.md) starts a turn of its own once the stopped one is over,
+/// and its lines are that turn's, never the stopped turn's (rest on Linux, 2026-11-19: amp's, devin's
+/// and goose's stopped turns taken for going on by their next turn's lines).
+fn said_past(events: &[Value], n: usize) -> Vec<String> {
+    let mut seen = 0usize;
     let mut out = Vec::new();
     for e in events {
-        let text = match e.get("kind").and_then(Value::as_str) {
-            Some("assistant") => e.get("text"),
-            Some("tool") => e.get("output"),
-            _ => None,
-        };
-        for line in text.and_then(Value::as_str).unwrap_or("").lines() {
-            let b = bare(line);
-            if !b.is_empty() {
-                out.push(b.to_owned());
+        if seen >= n && is_delivered(e) {
+            break;
+        }
+        for line in said_in(e) {
+            if seen >= n {
+                out.push(line);
             }
+            seen = seen.saturating_add(1);
         }
     }
     out
+}
+
+/// What the harness said in the turn kiln's message `client` started: its lines after the message's
+/// delivery, up to the next message kiln delivered (a later turn's lines are not this turn's).
+pub fn said_in_turn(events: &[Value], client: &str) -> Vec<String> {
+    let Some(at) = delivered_at(events, client) else {
+        return Vec::new();
+    };
+    let rest = events.get(at + 1..).unwrap_or_default();
+    let end = rest.iter().position(is_delivered).unwrap_or(rest.len());
+    said(rest.get(..end).unwrap_or_default())
 }
 
 /// What follows `key` on the last line that has it.
@@ -1767,7 +1802,8 @@ impl<'a> Watch<'a> {
             return Some(Stuck::Asks(asks));
         }
         if let Asked::Stop { said: Some(n) } = self.asked {
-            return said(events).get(n..).filter(|more| !more.is_empty()).map(|more| Stuck::NotStopped(more.to_vec()));
+            let more = said_past(events, n);
+            return (!more.is_empty()).then_some(Stuck::NotStopped(more));
         }
         let client = self.message(info).and_then(|m| may_have_answered(info, events, &m))?;
         state.is_some_and(|s| answered_in(s, &client)).then_some(Stuck::Answered)
@@ -2263,7 +2299,7 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let held = if ask.stub() { Some(said(&self::events(f, &id)?).len()) } else { None };
     let (_, e) = pace.until(f, &id, Asked::Stop { said: held }, &format!("{kind} stopping its turn"), |i, _| status(i) == "idle")?;
     if ask.stub() {
-        anyhow::ensure!(!said_marker(&said_after(&e, &stop_me), ask.marker), "{kind}: the stopped turn ran to its end");
+        anyhow::ensure!(!said_marker(&said_in_turn(&e, &stop_me), ask.marker), "{kind}: the stopped turn ran to its end");
     }
 
     // Every link's suite, from both ends, while the session runs.
