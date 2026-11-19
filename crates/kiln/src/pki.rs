@@ -456,7 +456,7 @@ impl Pki {
     /// announced failure domain against the second name (its `discovery::scope_name`, region 0). For
     /// both sides of the fleet's sessions (serverAuth and clientAuth), valid as a machine's is, its
     /// serial its own. Parsing checks the CSR's signature (possession of its key). DER.
-    pub fn sign_slates_node(&self, csr_der: &[u8], fleet: &str, domain: u64) -> anyhow::Result<Vec<u8>> {
+    pub fn sign_slates_node(&self, csr_der: &[u8], fleet: &str, domain: u64, _host: Option<&str>) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(sanitize_name(fleet) == fleet && !fleet.is_empty(), "a fleet's name is a DNS name kiln issues as written, and {fleet:?} isn't");
         anyhow::ensure!(!reserved(fleet), "{SERVER_NAME} is the server's own identity; a fleet can't be named so");
         let csr = CertificateSigningRequestParams::from_der(&csr_der.to_vec().into()).context("parse the fleet node's CSR")?;

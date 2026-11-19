@@ -49,7 +49,6 @@ use anyhow::Context as _;
 use base64::Engine as _;
 use rcgen::{CertificateParams, KeyPair, PublicKeyData as _};
 use serde::{Deserialize, Serialize};
-use x509_parser::extensions::GeneralName;
 
 use crate::pki::{Leaf, Pki};
 
@@ -96,6 +95,24 @@ pub fn scope_name(fleet: &str, domain: u64) -> String {
     format!("r0.d{domain}.{fleet}")
 }
 
+/// The names kiln's CA signs a node of failure domain `domain` for, in order: the fleet's TLS name and the node's scope.
+/// `_host` is the host its runner is listed at in `[slates_fleet]`, when it is listed.
+pub fn node_names(fleet: &str, domain: u64, _host: Option<&str>) -> Vec<String> {
+    vec![fleet.to_owned(), scope_name(fleet, domain)]
+}
+
+/// The host of node address `address` (`host:port`, as [`check_address`] takes it).
+pub fn host_of(address: &str) -> Option<&str> {
+    address.rsplit_once(':').map(|(host, _)| host)
+}
+
+/// The host `[slates_fleet]` lists the runner of machine `machine` at: none when it lists it not; refused, naming what's
+/// wrong, when the setting can't make a fleet ([`place_of`]).
+pub fn listed_host(setting: &crate::config::SlatesFleet, machine: &str) -> anyhow::Result<Option<String>> {
+    let place = place_of(setting, machine).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(place.and_then(|place| host_of(&place.address).map(str::to_owned)))
+}
+
 /// What a runner sends `POST /api/agents/slates-fleet`: the proof of its machine (its current certificate, and a CSR
 /// for that certificate's key) and its node's request (PKCS #10, DER, base64), whose key is the node's own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +129,10 @@ pub struct NodeIssued {
     pub machine: String,
     pub fleet: String,
     pub domain: u64,
+    /// The host the node's runner is listed at in `[slates_fleet]`, which the certificate names too; none for a runner
+    /// the setting doesn't list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub certificate: String,
     pub roots: Vec<String>,
 }
@@ -124,12 +145,14 @@ fn unb64(what: &str, text: &str) -> anyhow::Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(text).with_context(|| format!("{what} isn't base64"))
 }
 
-/// The server's side (module docs): the machine `ask` proves, and its node's certificate for the fleet's names alone.
-pub fn issue(pki: &Pki, ask: &EnrollNode) -> anyhow::Result<NodeIssued> {
+/// The server's side (module docs): the machine `ask` proves, and its node's certificate for the fleet's names, with the
+/// host `setting` lists its runner at.
+pub fn issue(pki: &Pki, ask: &EnrollNode, setting: &crate::config::SlatesFleet) -> anyhow::Result<NodeIssued> {
     let machine = pki.prove_machine(&ask.cert_pem, &ask.proof_csr)?;
     let domain = domain_of(&machine);
-    let der = pki.sign_slates_node(&unb64("the node's request", &ask.csr)?, FLEET, domain)?;
-    Ok(NodeIssued { machine, fleet: FLEET.to_owned(), domain, certificate: b64(&der), roots: vec![b64(&pki.ca_der)] })
+    let host = listed_host(setting, &machine)?;
+    let der = pki.sign_slates_node(&unb64("the node's request", &ask.csr)?, FLEET, domain, host.as_deref())?;
+    Ok(NodeIssued { machine, fleet: FLEET.to_owned(), domain, host, certificate: b64(&der), roots: vec![b64(&pki.ca_der)] })
 }
 
 /// A runner's node identity as its files hold it: what a fleet manifest names for this node.
@@ -171,20 +194,9 @@ fn key_in(dir: &Path) -> anyhow::Result<KeyPair> {
     }
 }
 
-/// The DNS names a DER certificate carries, in order.
-fn dns_names(der: &[u8]) -> Option<Vec<String>> {
-    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
-    let san = cert.subject_alternative_name().ok()??;
-    Some(
-        san.value
-            .general_names
-            .iter()
-            .filter_map(|name| match name {
-                GeneralName::DNSName(dns) => Some((*dns).to_owned()),
-                _ => None,
-            })
-            .collect(),
-    )
+/// The names a DER certificate carries (its DNS names and IP addresses), in order.
+fn san_names(der: &[u8]) -> Option<Vec<String>> {
+    crate::pki::cert_info_der(der).ok().map(|info| info.names)
 }
 
 /// Whether DER certificate `der` is for `key`.
@@ -192,23 +204,23 @@ fn for_key(der: &[u8], key: &KeyPair) -> bool {
     x509_parser::parse_x509_certificate(der).is_ok_and(|(_, cert)| key.der_bytes() == cert.public_key().subject_public_key.data.as_ref())
 }
 
-/// Whether DER certificate `der`, issued by `root`, is the node's for `key`, carrying exactly the fleet's names for
-/// `domain`, and not yet due for renewal.
-fn stands(der: &[u8], root: &[u8], key: &KeyPair, fleet: &str, domain: u64) -> bool {
+/// Whether DER certificate `der`, issued by `root`, is the node's for `key`, carrying exactly `names` ([`node_names`]),
+/// and not yet due for renewal.
+fn stands(der: &[u8], root: &[u8], key: &KeyPair, names: &[String]) -> bool {
     crate::pki::verify_issued(root, der)
         && for_key(der, key)
-        && dns_names(der).is_some_and(|names| names == [fleet.to_owned(), scope_name(fleet, domain)])
+        && san_names(der).is_some_and(|carried| carried == names)
         && !crate::pki::needs_renewal(&crate::pki::cert_pem(der))
 }
 
-/// The node's identity in `dir` for the machine named `machine` (module docs): its certificate where it stands, else
-/// its request for kiln's CA, its key made here where there is none.
-pub fn prepared(dir: &Path, machine: &str) -> anyhow::Result<Prepared> {
+/// The node's identity in `dir` for the machine named `machine`, its runner listed at `host` (module docs): its
+/// certificate where it stands, else its request for kiln's CA, its key made here where there is none.
+pub fn prepared(dir: &Path, machine: &str, host: Option<&str>) -> anyhow::Result<Prepared> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let key = key_in(dir)?;
     let domain = domain_of(machine);
     if let (Ok(der), Ok(root)) = (std::fs::read(dir.join(CERTIFICATE)), std::fs::read(dir.join(ROOT)))
-        && stands(&der, &root, &key, FLEET, domain)
+        && stands(&der, &root, &key, &node_names(FLEET, domain, host))
     {
         return Ok(Prepared::Ready(identity_in(dir, FLEET, domain)));
     }
@@ -226,17 +238,18 @@ fn identity_in(dir: &Path, fleet: &str, domain: u64) -> NodeIdentity {
 
 /// The identity kiln's CA's answer makes with the key in `dir`, kept there once it proves to be the node's: issued by
 /// `trusted` (the CA the runner already trusts, which the answer's roots must hold), for the node's key, carrying
-/// exactly the fleet's names for the domain it gives.
-pub fn finished(dir: &Path, trusted: &[u8], issued: &NodeIssued) -> anyhow::Result<NodeIdentity> {
+/// exactly the fleet's names for the domain it gives and `host`, the host this runner is listed at.
+pub fn finished(dir: &Path, trusted: &[u8], issued: &NodeIssued, host: Option<&str>) -> anyhow::Result<NodeIdentity> {
     let der = unb64("the node's certificate", &issued.certificate)?;
     let roots = issued.roots.iter().map(|root| unb64("a root", root)).collect::<anyhow::Result<Vec<_>>>()?;
     anyhow::ensure!(roots.iter().any(|root| root.as_slice() == trusted), "the answer's roots don't hold the CA this runner trusts");
     let key = key_in(dir)?;
     anyhow::ensure!(crate::pki::verify_issued(trusted, &der), "the node's certificate wasn't issued by the CA this runner trusts");
     anyhow::ensure!(for_key(&der, &key), "the node's certificate is for another key than the one kept in {}", dir.display());
+    anyhow::ensure!(issued.host.as_deref() == host, "the server named this node's host {:?}, and this runner is listed at {:?}", issued.host, host);
     anyhow::ensure!(
-        dns_names(&der).is_some_and(|names| names == [issued.fleet.clone(), scope_name(&issued.fleet, issued.domain)]),
-        "the node's certificate doesn't name the fleet {} for domain {}",
+        san_names(&der).is_some_and(|names| names == node_names(&issued.fleet, issued.domain, host)),
+        "the node's certificate doesn't name the fleet {} for domain {} at the host its runner is listed at ({host:?})",
         issued.fleet,
         issued.domain
     );
@@ -245,11 +258,11 @@ pub fn finished(dir: &Path, trusted: &[u8], issued: &NodeIssued) -> anyhow::Resu
     Ok(identity_in(dir, &issued.fleet, issued.domain))
 }
 
-/// The runner's side (module docs): the node's identity in `dir`, enrolled with the server at `server_url` (whose CA
-/// is `ca_pem`) by `machine`'s proof where its certificate is missing or no longer stands.
-pub async fn identity(dir: &Path, server_url: &str, ca_pem: &str, machine_name: &str, machine: &Leaf) -> anyhow::Result<NodeIdentity> {
+/// The runner's side (module docs): the node's identity in `dir`, its runner listed at `host`, enrolled with the server
+/// at `server_url` (whose CA is `ca_pem`) by `machine`'s proof where its certificate is missing or no longer stands.
+pub async fn identity(dir: &Path, server_url: &str, ca_pem: &str, machine_name: &str, machine: &Leaf, host: Option<&str>) -> anyhow::Result<NodeIdentity> {
     use crate::http::client::{Client, Roots};
-    let csr = match prepared(dir, machine_name)? {
+    let csr = match prepared(dir, machine_name, host)? {
         Prepared::Ready(identity) => return Ok(identity),
         Prepared::Ask(csr) => csr,
     };
@@ -264,7 +277,7 @@ pub async fn identity(dir: &Path, server_url: &str, ca_pem: &str, machine_name: 
         anyhow::bail!("the server refused the fleet node's certificate ({status}): {}", String::from_utf8_lossy(&body).trim());
     }
     let issued: NodeIssued = resp.json(ANSWER_BYTES).await.context("the fleet node's certificate")?;
-    finished(dir, &trusted, &issued)
+    finished(dir, &trusted, &issued, host)
 }
 
 // ------------------------------------------------------------------------------------ discovery (K2)
@@ -328,8 +341,8 @@ pub struct Members {
 }
 
 /// The server's side of a runner's word (module docs): the node of the machine `ask` proves, taken only with that
-/// machine's own certificate (issued by this CA, still valid, naming the fleet and the machine's domain) and an
-/// address Slates can dial.
+/// machine's own certificate (issued by this CA, still valid, naming the fleet and the machine's domain at the host of
+/// the address it announces) and an address Slates can dial.
 pub fn admit(pki: &Pki, ask: &Announce) -> anyhow::Result<Member> {
     let machine = pki.prove_machine(&ask.cert_pem, &ask.proof_csr)?;
     check_address(&ask.node.address)?;
@@ -337,9 +350,11 @@ pub fn admit(pki: &Pki, ask: &Announce) -> anyhow::Result<Member> {
     anyhow::ensure!(pki.issued(&der), "the node's certificate wasn't issued by this server's CA");
     anyhow::ensure!(crate::pki::still_valid(&crate::pki::cert_pem(&der)), "the node's certificate has expired");
     let domain = domain_of(&machine);
+    let host = host_of(&ask.node.address);
     anyhow::ensure!(
-        dns_names(&der).is_some_and(|names| names == [FLEET.to_owned(), scope_name(FLEET, domain)]),
-        "that certificate isn't {machine}'s node's: it doesn't name the fleet {FLEET} for {machine}'s domain"
+        san_names(&der).is_some_and(|names| names == node_names(FLEET, domain, host)),
+        "that certificate isn't {machine}'s node's at {}: it doesn't name the fleet {FLEET} for {machine}'s domain at the host it announces",
+        ask.node.address
     );
     Ok(Member { machine, address: ask.node.address.clone(), domain, certificate: ask.node.certificate.clone(), member: ask.node.member })
 }
@@ -538,7 +553,7 @@ pub async fn join(source: &Source) -> anyhow::Result<Option<Joined>> {
     let Some(place) = ask_place(source).await? else {
         return Ok(None);
     };
-    let identity = identity(&source.dir, &source.server_url, &source.ca_pem, &source.machine_name, &source.machine).await?;
+    let identity = identity(&source.dir, &source.server_url, &source.ca_pem, &source.machine_name, &source.machine, host_of(&place.address)).await?;
     let node = announcement(&identity, &place.address)?;
     let members = discover(&source.server_url, &source.ca_pem, &source.machine_name, &source.machine, &node).await?;
     let manifest = write_manifest(&source.dir, &identity, &source.machine_name, &members, place.f)?;
@@ -563,9 +578,10 @@ mod tests {
         pki.issue_local(name)
     }
 
-    /// The request a runner sends for the node in `dir`, proving `leaf`'s machine named `name`.
-    fn ask(dir: &Path, name: &str, leaf: &Leaf) -> anyhow::Result<EnrollNode> {
-        let Prepared::Ask(csr) = prepared(dir, name)? else {
+    /// The request a runner sends for the node in `dir`, its runner listed at `host`, proving `leaf`'s machine named
+    /// `name`.
+    fn ask(dir: &Path, name: &str, leaf: &Leaf, host: Option<&str>) -> anyhow::Result<EnrollNode> {
+        let Prepared::Ask(csr) = prepared(dir, name, host)? else {
             anyhow::bail!("a node with no certificate asked for none");
         };
         Ok(EnrollNode { cert_pem: leaf.cert_pem.clone(), proof_csr: crate::pki::make_csr_with_key(name, &leaf.key_pem)?, csr: b64(&csr) })
@@ -587,24 +603,24 @@ mod tests {
         let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
         let dir = scratch.path().join("fleet");
         let leaf = machine(&pki, "bench-a")?;
-        let request = ask(&dir, "bench-a", &leaf)?;
+        let request = ask(&dir, "bench-a", &leaf, None)?;
         let key = std::fs::read(dir.join(KEY))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(std::fs::metadata(dir.join(KEY))?.permissions().mode() & 0o777, KEY_MODE);
         }
-        let issued = issue(&pki, &request)?;
-        assert_eq!((issued.machine.as_str(), issued.fleet.as_str(), issued.domain), ("bench-a", FLEET, domain_of("bench-a")));
+        let issued = issue(&pki, &request, &crate::config::SlatesFleet::default())?;
+        assert_eq!((issued.machine.as_str(), issued.fleet.as_str(), issued.domain, issued.host.as_deref()), ("bench-a", FLEET, domain_of("bench-a"), None));
         let der = unb64("certificate", &issued.certificate)?;
-        assert_eq!(dns_names(&der), Some(vec![FLEET.to_owned(), scope_name(FLEET, domain_of("bench-a"))]));
+        assert_eq!(san_names(&der), Some(vec![FLEET.to_owned(), scope_name(FLEET, domain_of("bench-a"))]));
         assert_eq!(eku(&der)?, (true, true), "a node is both sides of the fleet's sessions");
         assert!(pki.issued(&der));
         assert!(for_key(&der, &KeyPair::try_from(key.as_slice())?), "signed for the node's own key");
-        let identity = finished(&dir, &pki.ca_der, &issued)?;
+        let identity = finished(&dir, &pki.ca_der, &issued, None)?;
         assert_eq!(identity, identity_in(&dir, FLEET, domain_of("bench-a")));
         assert_eq!(std::fs::read(dir.join(ROOT))?, pki.ca_der);
-        let Prepared::Ready(again) = prepared(&dir, "bench-a")? else {
+        let Prepared::Ready(again) = prepared(&dir, "bench-a", None)? else {
             anyhow::bail!("a node whose certificate stands asked again");
         };
         assert_eq!(again, identity);
@@ -620,21 +636,21 @@ mod tests {
         let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
         let leaf = machine(&pki, "bench-a")?;
         let other = machine(&pki, "bench-b")?;
-        let mut request = ask(&scratch.path().join("a"), "bench-a", &leaf)?;
+        let mut request = ask(&scratch.path().join("a"), "bench-a", &leaf, None)?;
         // A request asking for other names gets the fleet's.
         let key = KeyPair::generate()?;
         let asked = CertificateParams::new(vec!["evil.example".to_owned(), "kiln-server".to_owned()])?.serialize_request(&key)?;
         request.csr = b64(asked.der());
-        let issued = issue(&pki, &request)?;
-        assert_eq!(dns_names(&unb64("certificate", &issued.certificate)?), Some(vec![FLEET.to_owned(), scope_name(FLEET, domain_of("bench-a"))]));
+        let issued = issue(&pki, &request, &crate::config::SlatesFleet::default())?;
+        assert_eq!(san_names(&unb64("certificate", &issued.certificate)?), Some(vec![FLEET.to_owned(), scope_name(FLEET, domain_of("bench-a"))]));
         // The proof's CSR must be for the machine certificate's own key.
         request.proof_csr = crate::pki::make_csr_with_key("bench-a", &other.key_pem)?;
-        assert!(issue(&pki, &request).is_err());
+        assert!(issue(&pki, &request, &crate::config::SlatesFleet::default()).is_err());
         assert_eq!(domain_of("bench-a"), domain_of("bench-a"));
         assert_ne!(domain_of("bench-a"), domain_of("bench-b"));
         assert_eq!(scope_name("slates.kiln", 7), "r0.d7.slates.kiln");
-        assert!(pki.sign_slates_node(asked.der(), "kiln-server", 1).is_err(), "the server's own name names no fleet");
-        assert!(pki.sign_slates_node(asked.der(), "Not A Name", 1).is_err());
+        assert!(pki.sign_slates_node(asked.der(), "kiln-server", 1, None).is_err(), "the server's own name names no fleet");
+        assert!(pki.sign_slates_node(asked.der(), "Not A Name", 1, None).is_err());
         Ok(())
     }
 
@@ -648,32 +664,39 @@ mod tests {
         let stranger = Pki::open_scratch(&scratch.path().join("stranger"))?;
         let dir = scratch.path().join("fleet");
         let leaf = machine(&pki, "bench-a")?;
-        let request = ask(&dir, "bench-a", &leaf)?;
-        let issued = issue(&pki, &request)?;
-        assert!(finished(&dir, &stranger.ca_der, &issued).is_err(), "roots without the trusted CA");
+        let unlisted = crate::config::SlatesFleet::default();
+        let request = ask(&dir, "bench-a", &leaf, None)?;
+        let issued = issue(&pki, &request, &unlisted)?;
+        assert!(finished(&dir, &stranger.ca_der, &issued, None).is_err(), "roots without the trusted CA");
         let mut forged = issued.clone();
         forged.roots.push(b64(&stranger.ca_der));
-        assert!(finished(&dir, &stranger.ca_der, &forged).is_err(), "issued by a CA the runner doesn't trust");
-        let elsewhere = ask(&scratch.path().join("elsewhere"), "bench-a", &leaf)?;
-        assert!(finished(&dir, &pki.ca_der, &issue(&pki, &elsewhere)?).is_err(), "a certificate for another key");
+        assert!(finished(&dir, &stranger.ca_der, &forged, None).is_err(), "issued by a CA the runner doesn't trust");
+        let elsewhere = ask(&scratch.path().join("elsewhere"), "bench-a", &leaf, None)?;
+        assert!(finished(&dir, &pki.ca_der, &issue(&pki, &elsewhere, &unlisted)?, None).is_err(), "a certificate for another key");
         assert!(!dir.join(CERTIFICATE).exists(), "nothing refused was kept");
-        finished(&dir, &pki.ca_der, &issued)?;
+        finished(&dir, &pki.ca_der, &issued, None)?;
         let key = std::fs::read(dir.join(KEY))?;
-        let Prepared::Ask(_) = prepared(&dir, "bench-a-renamed")? else {
+        let Prepared::Ask(_) = prepared(&dir, "bench-a-renamed", None)? else {
             anyhow::bail!("a certificate for the machine's old name still stood");
         };
         assert_eq!(std::fs::read(dir.join(KEY))?, key, "asked again with the key it kept");
         Ok(())
     }
 
-    /// A runner's node in a folder of its own under `root`, its certificate from `pki` (K1's flow): its machine and its
-    /// identity.
-    fn node(pki: &Pki, root: &Path, name: &str) -> anyhow::Result<(Leaf, NodeIdentity)> {
+    /// A runner's node in a folder of its own under `root`, its runner listed at `address`, its certificate from `pki`
+    /// (K1's flow): its machine and its identity.
+    fn node(pki: &Pki, root: &Path, name: &str, address: &str) -> anyhow::Result<(Leaf, NodeIdentity)> {
         let leaf = machine(pki, name)?;
         let dir = root.join(name);
-        let request = ask(&dir, name, &leaf)?;
-        let identity = finished(&dir, &pki.ca_der, &issue(pki, &request)?)?;
+        let host = host_of(address);
+        let request = ask(&dir, name, &leaf, host)?;
+        let identity = finished(&dir, &pki.ca_der, &issue(pki, &request, &alone(name, address))?, host)?;
         Ok((leaf, identity))
+    }
+
+    /// The setting that lists `name`'s runner alone, at `address`: a fleet of one, `f` 0.
+    fn alone(name: &str, address: &str) -> crate::config::SlatesFleet {
+        crate::config::SlatesFleet { f: 0, nodes: [(name.to_owned(), address.to_owned())].into_iter().collect() }
     }
 
     /// The word `name`'s runner sends for its node at `address`.
@@ -689,7 +712,7 @@ mod tests {
         let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
         let directory = Directory::default();
         for (name, address) in [("bench-a", "10.0.0.1:17300"), ("bench-b", "runner-b.lan:17300"), ("bench-c", "10.0.0.3:17300")] {
-            let (leaf, identity) = node(&pki, scratch.path(), name)?;
+            let (leaf, identity) = node(&pki, scratch.path(), name, address)?;
             directory.admit(admit(&pki, &word(name, &leaf, &identity, address)?)?);
         }
         let live = directory.members(|machine| machine != "bench-c");
@@ -698,9 +721,8 @@ mod tests {
         assert_eq!(listed, [("bench-a", "10.0.0.1:17300", domain_of("bench-a")), ("bench-b", "runner-b.lan:17300", domain_of("bench-b"))]);
         let a = scratch.path().join("bench-a");
         assert_eq!(live.members.first().map(|m| unb64("certificate", &m.certificate)).transpose()?, Some(std::fs::read(a.join(CERTIFICATE))?));
-        // A newer word moves the node; it stays one node.
-        let leaf = machine(&pki, "bench-a")?;
-        let identity = identity_in(&a, FLEET, domain_of("bench-a"));
+        // A newer word moves the node, with its certificate for the host it moved to (W10); it stays one node.
+        let (leaf, identity) = node(&pki, &scratch.path().join("moved"), "bench-a", "10.0.0.9:17400")?;
         directory.admit(admit(&pki, &word("bench-a", &leaf, &identity, "10.0.0.9:17400")?)?);
         let all = directory.members(|_| true);
         assert_eq!(all.members.len(), 3);
@@ -715,15 +737,15 @@ mod tests {
     fn k2_a_word_for_another_machines_node_or_an_address_slates_cant_dial_is_refused() -> anyhow::Result<()> {
         let scratch = tempfile::tempdir()?;
         let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
-        let (leaf_a, identity_a) = node(&pki, scratch.path(), "bench-a")?;
-        let (_, identity_b) = node(&pki, scratch.path(), "bench-b")?;
+        let (leaf_a, identity_a) = node(&pki, scratch.path(), "bench-a", "10.0.0.1:17300")?;
+        let (_, identity_b) = node(&pki, scratch.path(), "bench-b", "10.0.0.2:17300")?;
         assert!(admit(&pki, &word("bench-a", &leaf_a, &identity_a, "10.0.0.1:17300")?).is_ok());
         assert!(admit(&pki, &word("bench-a", &leaf_a, &identity_b, "10.0.0.1:17300")?).is_err(), "bench-b's node in bench-a's word");
         let stranger = Pki::open_scratch(&scratch.path().join("stranger"))?;
-        let Prepared::Ask(csr) = prepared(&scratch.path().join("bench-a"), "bench-a-elsewhere")? else {
+        let Prepared::Ask(csr) = prepared(&scratch.path().join("bench-a"), "bench-a-elsewhere", Some("10.0.0.1"))? else {
             anyhow::bail!("a renamed machine's node asked for nothing");
         };
-        let foreign = stranger.sign_slates_node(&csr, FLEET, domain_of("bench-a"))?;
+        let foreign = stranger.sign_slates_node(&csr, FLEET, domain_of("bench-a"), Some("10.0.0.1"))?;
         let mut forged = word("bench-a", &leaf_a, &identity_a, "10.0.0.1:17300")?;
         forged.node.certificate = b64(&foreign);
         assert!(admit(&pki, &forged).is_err(), "a certificate another CA issued");
@@ -748,7 +770,7 @@ mod tests {
         let directory = Directory::default();
         let mut identities = BTreeMap::new();
         for (name, address) in [("bench-a", "10.0.0.1:17300"), ("bench-b", "10.0.0.2:17300"), ("bench-c", "runner-c.lan:17302")] {
-            let (leaf, identity) = node(&pki, scratch.path(), name)?;
+            let (leaf, identity) = node(&pki, scratch.path(), name, address)?;
             directory.admit(admit(&pki, &word(name, &leaf, &identity, address)?)?);
             identities.insert(name, identity);
         }
@@ -829,8 +851,8 @@ mod tests {
     fn k3_only_a_listed_runners_word_is_taken_at_its_listed_address() -> anyhow::Result<()> {
         let scratch = tempfile::tempdir()?;
         let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
-        let (leaf_a, identity_a) = node(&pki, scratch.path(), "bench-a")?;
-        let (leaf_d, identity_d) = node(&pki, scratch.path(), "bench-d")?;
+        let (leaf_a, identity_a) = node(&pki, scratch.path(), "bench-a", "10.0.0.1:17300")?;
+        let (leaf_d, identity_d) = node(&pki, scratch.path(), "bench-d", "10.0.0.4:17300")?;
         assert!(admit_chosen(&pki, &word("bench-a", &leaf_a, &identity_a, "10.0.0.1:17300")?, &chosen(1)).is_ok());
         assert!(admit_chosen(&pki, &word("bench-a", &leaf_a, &identity_a, "10.0.0.9:17300")?, &chosen(1)).is_err(), "another address than its listed one");
         assert!(admit_chosen(&pki, &word("bench-d", &leaf_d, &identity_d, "10.0.0.4:17300")?, &chosen(1)).is_err(), "a runner not listed");
@@ -848,7 +870,7 @@ mod tests {
         let directory = Directory::default();
         let mut identities = BTreeMap::new();
         for (name, address) in [("bench-a", "10.0.0.1:17300"), ("bench-b", "10.0.0.2:17300"), ("bench-c", "runner-c.lan:17302")] {
-            let (leaf, identity) = node(&pki, scratch.path(), name)?;
+            let (leaf, identity) = node(&pki, scratch.path(), name, address)?;
             directory.admit(admit_chosen(&pki, &word(name, &leaf, &identity, address)?, &chosen(1))?);
             identities.insert(name, identity);
         }
@@ -873,7 +895,7 @@ mod tests {
         let scratch = tempfile::tempdir()?;
         let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
         let directory = Directory::default();
-        let (leaf, identity) = node(&pki, scratch.path(), "bench-a")?;
+        let (leaf, identity) = node(&pki, scratch.path(), "bench-a", "10.0.0.1:17300")?;
         let mut said = word("bench-a", &leaf, &identity, "10.0.0.1:17300")?;
         let member_of = |d: &Directory| d.members(|_| true).members.first().and_then(|m| m.member);
         directory.admit(admit(&pki, &said)?);
@@ -884,6 +906,77 @@ mod tests {
         said.node.member = None;
         directory.admit(admit(&pki, &said)?);
         assert_eq!(member_of(&directory), None, "started again: said again once it serves");
+        Ok(())
+    }
+
+    /// Whether a TLS client that reached a server by `name` takes certificate `der` as that server's, by rustls' check of
+    /// a server's name (a DNS name against the certificate's DNS names, an IP address against its IP addresses): the check
+    /// RFC 9289 §5.2.1 asks of an RPC-with-TLS client, which ktls-utils' `tlshd` makes through GnuTLS
+    /// (`gnutls_certificate_verify_peers3` with the name the mount used).
+    fn verifies_as(der: &[u8], name: &str) -> bool {
+        use hyper_quic::rustls::pki_types::{CertificateDer, ServerName};
+        let certificate = CertificateDer::from(der.to_vec());
+        let Ok(parsed) = hyper_quic::rustls::server::ParsedCertificate::try_from(&certificate) else {
+            return false;
+        };
+        ServerName::try_from(name.to_owned()).is_ok_and(|server| hyper_quic::rustls::client::verify_server_name(&parsed, &server).is_ok())
+    }
+
+    /// W10 (docs/agentic.md): a runner `[slates_fleet]` lists is signed for the host it is listed at too, beside the
+    /// fleet's names (an IP address for an IPv4 address, a DNS name for a name), since Slates serves the node's network
+    /// export with this certificate and a kubelet's RPC-with-TLS client checks it against the name its mount used (RFC
+    /// 9289 §5.2.1). Its peers still verify it by the fleet's names. A certificate from before it was listed there, which
+    /// doesn't name the host, no longer stands, so the runner asks again with the key it kept, and the server takes no
+    /// word with it; an answer for another host is refused; and the server's own reserved name is never a node's host.
+    #[test]
+    fn w10_a_listed_runners_node_names_its_host_so_a_client_of_its_export_verifies_it() -> anyhow::Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
+        let listed = crate::config::SlatesFleet {
+            f: 0,
+            nodes: [("bench-a", "10.0.0.1:17300"), ("bench-b", "runner-b.lan:17300")].into_iter().map(|(m, a)| (m.to_owned(), a.to_owned())).collect(),
+        };
+        for (name, address, host) in [("bench-a", "10.0.0.1:17300", "10.0.0.1"), ("bench-b", "runner-b.lan:17300", "runner-b.lan")] {
+            let leaf = machine(&pki, name)?;
+            let dir = scratch.path().join(name);
+            let issued = issue(&pki, &ask(&dir, name, &leaf, Some(host))?, &listed)?;
+            let der = unb64("certificate", &issued.certificate)?;
+            assert!(verifies_as(&der, host), "a client that mounted {name}'s export at {host} can't verify the certificate it serves with, which names {:?}", san_names(&der));
+            assert!(verifies_as(&der, FLEET) && verifies_as(&der, &scope_name(FLEET, domain_of(name))), "its peers verify it by the fleet's names");
+            assert!(!verifies_as(&der, "10.0.0.9") && !verifies_as(&der, "runner-c.lan"), "a host it isn't listed at");
+            assert_eq!(issued.host.as_deref(), Some(host));
+            assert_eq!(san_names(&der), Some(node_names(FLEET, domain_of(name), Some(host))));
+            let identity = finished(&dir, &pki.ca_der, &issued, Some(host))?;
+            let Prepared::Ready(again) = prepared(&dir, name, Some(host))? else {
+                anyhow::bail!("a node whose certificate names the host it's listed at asked again");
+            };
+            assert_eq!(again, identity);
+            assert!(admit_chosen(&pki, &word(name, &leaf, &identity, address)?, &listed).is_ok());
+            // A certificate from before the runner was listed there names the fleet alone: it no longer stands, the node
+            // asks again with the key it kept, and the server takes no word with it.
+            let earlier = scratch.path().join(format!("{name}-earlier"));
+            let before = issue(&pki, &ask(&earlier, name, &leaf, None)?, &crate::config::SlatesFleet::default())?;
+            finished(&earlier, &pki.ca_der, &before, None)?;
+            let key = std::fs::read(earlier.join(KEY))?;
+            let Prepared::Ask(_) = prepared(&earlier, name, Some(host))? else {
+                anyhow::bail!("a certificate that doesn't name {host} still stood once {name} was listed there");
+            };
+            assert_eq!(std::fs::read(earlier.join(KEY))?, key, "asked again with the key it kept");
+            let stale = identity_in(&earlier, FLEET, domain_of(name));
+            assert!(admit_chosen(&pki, &word(name, &leaf, &stale, address)?, &listed).is_err(), "a word whose certificate doesn't name the host it announces");
+        }
+        // An answer naming another host than the runner is listed at is refused, and nothing of it is kept.
+        let leaf = machine(&pki, "bench-a")?;
+        let elsewhere = scratch.path().join("bench-a-elsewhere");
+        let answer = issue(&pki, &ask(&elsewhere, "bench-a", &leaf, Some("10.0.0.1"))?, &listed)?;
+        assert!(finished(&elsewhere, &pki.ca_der, &answer, Some("10.0.0.7")).is_err(), "an answer for another host");
+        assert!(!elsewhere.join(CERTIFICATE).exists(), "nothing refused was kept");
+        // The server's own reserved name is never a node's host, as no certificate kiln issues carries it but the server's.
+        let mut naming_the_server = listed.clone();
+        naming_the_server.nodes.insert("bench-c".to_owned(), format!("{}:17300", crate::pki::SERVER_NAME));
+        let leaf_c = machine(&pki, "bench-c")?;
+        let request = ask(&scratch.path().join("bench-c"), "bench-c", &leaf_c, Some(crate::pki::SERVER_NAME))?;
+        assert!(issue(&pki, &request, &naming_the_server).is_err(), "a node named for the server's own name");
         Ok(())
     }
 }

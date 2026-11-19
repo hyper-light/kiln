@@ -30,7 +30,7 @@ its grant and that person's (W10-R01, W20-R06), and an agent it starts gets no m
 | P | A plan run as one agent per step | O (W for parallel steps' isolation) | built: P1–P4: each met step's work goes up as one diff on the diff of the step met before it, so the run ends as a stack (P-AC1, tested in process against kiln's own git hosting). Since 2026-10-21 a run follows its steps' `needs` (a graph): steps that don't wait for each other run side by side, as many at once as there's room for, sharing one folder unless given folders or machines of their own (their isolation, W5, held with Slates); a step can go on the main agent's own goal stack rather than to an agent of its own; and the agent holding a step splits its goal into its acceptance criteria and tests (`goals_split`) and says each met (`goals_done`). Tested in process: a five-step graph run side by side and blocked by one unmet step until retried, `max_parallel`, and a step given to the main agent. Checked live 2026-10-21 on a throwaway server with real Claude Code agents: a four-step graph (step 1 given to a Sonnet main agent, which split it into its two criteria and its test and said each met with `goals_done`; steps 2 and 3 side by side on Haiku agents of their own, met by Claude Code's `/goal`; step 4 after both) ran to done in 74 s, as four commits in the order met, each by its step's agent with only its own file; and since 2026-10-22 a goal turns into a plan (`goals_plan`): planned first (research inside and outside, each finding graded by kiln from its sources: docs/research.md), its steps then the goal's parts or a run, the goal met once every step is; plan runs and goal stacks draw where each step stands as the conversation draws work |
 | G | Goal stacks as a graph, run side by side on subagents | O, P | in progress (docs/goals.md, "What a goal waits for"). The person's decisions, 2026-10-24: order is inferred as far as it can be, then goals fan out; while subagents are in play the stack's agent coordinates, and otherwise it does the work itself; a plan is a subgraph drawing on the same pool, filled greedily; with no Subagents setting there's no maximum; a goal's subagent ends once its goal is met; every subagent at work draws on the session's pool. G1 (built): what a goal waits for (`needs` on `goals_add` and `goals_update`, `goals_order` for several at once), with loops refused, a goal taken out passing on what it waited for, and the next goal the first one ready (in the stack's order where nothing says otherwise). G2: the ready goals out to subagents, with the agent coordinating, and goals that say nothing ordered by the agent first. Built of G2 (2026-11-05; docs/goals.md, "Goals side by side" and "Several goals under way at once"): several goals of a stack under way at once, each ending alone; the agent sets goals under way itself for its own harness's subagents (`goals_update` `active`), beside its goal under way, which stays the one kiln sends it and holds it to; and on a stack that runs side by side (`side_by_side`), its goals ready together that say what they wait for go each to a subagent of the agent's (P2's subagents, under way there and here), as many as its Subagents setting leaves room for, the rest waiting for room while the agent coordinates; a goal's parts that say what they wait for (a plan inside it) fan out the same way; met there is met here, not met comes back to the agent, and pauses, removals, clears and restarts are followed as P2's are. Not built: kiln asking the agent to order the goals that say nothing (today they go in turn, on the agent). G3: a plan's steps as a subgraph of the same pool (with P2's subagents). G4: one pool per session. G5: docs, metrics and G-AC1, a live check |
 | R | Runners: diagnostics, upgrades and repair, by agents and people | O | built: R1–R5 (docs/releases.md, "Diagnosing and repairing a runner"; docs/agents.md, "Attached agents"): R4 is an agent attached to the runners, woken by a failed upgrade, a failing check or a machine offline (the CI's `runner.offline`), held to `diagnose` and `manage-runners`, its incident on the runner's row in System → Updates. R-AC1 passed 2026-10-19 on a throwaway server and runner (a self-build without npm failed; Claude Code as the runner doctor diagnosed it as a missing dependency, retried by download with a person approving its calls, the runner upgraded, and the doctor resolved its incident once told the upgrade went through: in the lab by hand, the message kiln now sends itself) |
-| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk by the write mode kiln gives its volume, approved with kiln's own launcher secret: everywhere kiln starts Slates itself). Since 2026-11-18 kiln vendors Slates (`vendor/slates`) and drives it through its library alone, never its command line: kiln's own executable is the instance's anchor and daemon, so no machine installs Slates. Since 2026-11-18 (the person's decision, kiln goal 01a1ec34…) a volume is what every agent on a machine's host gets unless a person chooses its folder (W2), an agent started in another agent's folder works in that agent's volume, which goes with the last of them, an agent lands as its granted mode lets it and never raises its own permission (W6), and a Windows machine with WinFsp mounts each workspace at a drive letter of its own (W1; its run on Windows owed). **Held** (2026-10-19: Slates is far from complete): W5 merging between agents. Moving an agent with its volume to another machine is built inside kiln's Slates fleet (W7, kiln goal 95101ef3 K4, 2026-11-18): by Slates' own move, refused by kind where it can't be; a listed runner's workspace is a clone of its folder's captured base, so it moves (K5, 2026-11-18), and one laid over its folder elsewhere is refused `not_plain`. Since 2026-11-18 an agent started in a person's shell whose folder lies in another agent's mount works in that agent's volume, as one started in another agent's folder does: its machine, reading the shell's folder after the server chose a volume of its own for it, takes the volume it is in (`workspace::from_shell`), where it was laid over that mount and Slates refused it (A-227). Owed by Slates: its library's unmount runs `umount` by name (`slates_api::mount::unmount`, `unmount_busy`), so a runner whose `PATH` lacks `/sbin` (the bare-metal drive's did, until 2026-11-18) can't take a workspace's mount down on macOS; kiln keeps such a volume rather than destroy it beneath its mount. W8 built as far as Shards' D286 on its branch allows: an isolated session's volume served to its microVM with no mount, its change request from the volume's own changes (its real-VM run owed) |
+| W | Workspaces: Slates volumes, then Shards microVMs | Slates (merging: its mountable work volumes), Shards (networking, file device) | built: W1–W4, W6 and W7 as far as Slates allows (an overlay volume of its own per agent, its change requests from it, writing it to disk by the write mode kiln gives its volume, approved with kiln's own launcher secret: everywhere kiln starts Slates itself). Since 2026-11-18 kiln vendors Slates (`vendor/slates`) and drives it through its library alone, never its command line: kiln's own executable is the instance's anchor and daemon, so no machine installs Slates. Since 2026-11-18 (the person's decision, kiln goal 01a1ec34…) a volume is what every agent on a machine's host gets unless a person chooses its folder (W2), an agent started in another agent's folder works in that agent's volume, which goes with the last of them, an agent lands as its granted mode lets it and never raises its own permission (W6), and a Windows machine with WinFsp mounts each workspace at a drive letter of its own (W1; its run on Windows owed). **Held** (2026-10-19: Slates is far from complete): W5 merging between agents. Moving an agent with its volume to another machine is built inside kiln's Slates fleet (W7, kiln goal 95101ef3 K4, 2026-11-18): by Slates' own move, refused by kind where it can't be; a listed runner's workspace is a clone of its folder's captured base, so it moves (K5, 2026-11-18), and one laid over its folder elsewhere is refused `not_plain`. Since 2026-11-18 an agent started in a person's shell whose folder lies in another agent's mount works in that agent's volume, as one started in another agent's folder does: its machine, reading the shell's folder after the server chose a volume of its own for it, takes the volume it is in (`workspace::from_shell`), where it was laid over that mount and Slates refused it (A-227). Owed by Slates: its library's unmount runs `umount` by name (`slates_api::mount::unmount`, `unmount_busy`), so a runner whose `PATH` lacks `/sbin` (the bare-metal drive's did, until 2026-11-18) can't take a workspace's mount down on macOS; kiln keeps such a volume rather than destroy it beneath its mount. W8 built as far as Shards' D286 on its branch allows: an isolated session's volume served to its microVM with no mount, its change request from the volume's own changes (its real-VM run owed). W10, the Kubernetes engine, designed 2026-11-19 (kiln goal 28e73c34's part 01a1f124…): an agent's pod works in its home runner's volume through kubelet's mount of that runner's Slates export over RPC-with-TLS (no copy on a node, no CSI driver, no privilege); built of it: a listed runner's node certificate names the host it's listed at, so a node's RPC-with-TLS client can verify the export |
 | C | From an agent's changes to landed: change requests, CI, review | W14 (ci.md), W | built: C1–C6 (docs/agents.md, "Change requests from agents"): `agents.change` and the Changes tab's **Open change request** (kiln's own review with an agent token; a pull request through GitHub, GitLab or Bitbucket when kiln has an integration there, else the branch and a link), comments, requested changes, failing checks and the land queue back to the agent, Mission Control's word on each agent's change, and the review UI; a plan run's steps go up as a stack, one diff per step (P4). A comment's message tells the agent how to answer in its thread once W14's `ci.diffs.reply` is there (the CI work's, on its way to main); until then agents answer with a new version |
 | K | Agentic control of CI/CD, whatever the provider | W20 (ci.md), the provider model | K1: W20-R02's operations, the CI work's (in progress there, `ci.diffs.*` included); K2 built: attachments and incidents (W20-R08 to R10, `crate::ci::attach`; docs/agents.md, "Attached agents"), Agents → Attached, Mission Control grouping an attachment's agents under it; their questions come to Needs you and notifications as any agent's do |
 
@@ -495,6 +495,106 @@ landing entries, each file read from the volume and checked against its BLAKE3, 
 changed read there and checked against the folder's copy, whose bytes its landing keeps; A-287), and its landing
 is the same Slates landing as a mounted workspace's. Owed: its real-VM run (`tests/slates_e2e.rs`'s
 `microvm::` drive); Shards' D286 on Shards' main (carried as a recorded change of vendor/shards until then).
+
+**W10 Kubernetes (kiln goal 28e73c34's part 01a1f1249c5e75b5bbf0c92c84385109, designed 2026-11-19).** An agent on
+kiln's Kubernetes engine runs its harness in a pod of its own and works in the Slates volume the bare-metal engine would
+give it (W2, W3), which kubelet mounts into the pod from the network export of the runner that holds the volume: never a
+copy of the folder on a node. Slates decided the form (its SLATES_DESIGN.md §4.6 "Kubernetes publication without
+privilege", AUD-29-75) and proves it with kubelet's own mount on KIND (`cargo xtask kind export`: a pod writes through
+the mount, a second pod reads the bytes back, a pod's map follows a change made by another path). What follows is kiln's
+part.
+
+- **The volume stays at home.** Its *home* is the runner whose machine holds the agent's folder, which makes the volume
+  there with no mount, as an isolated session's is (W8): an overlay laid over the folder (W3), on a fleet runner too,
+  where W3 makes a captured clone only so that a volume can move with its agent, and a pod's never does (the pod, not a
+  runner, is where its agent runs). The home's instance is a node of kiln's Slates fleet (W7: listed in
+  `[slates_fleet]`, where a fleet of one at `f = 0` is Slates' own solo case, "the same code path"), because Slates
+  serves the network export only on a fleet node whose manifest names an authority to check clients against (its
+  `deploy::plan`: the probe plane's address and port, over TCP, on Unix), and kiln's CA is that authority. A Slates
+  daemon on each node (a DaemonSet) was weighed and rejected: Slates lays an overlay only over a folder on its own
+  machine (its base plane reads its own disk alone, R1), so a node's daemon could hold only a copy of the folder (a
+  captured base moved there, K5), whose landing back onto the person's folder waits on Slates' A-424 stage 2 (W7); and
+  every pod's volume would sit in its node's memory beside the pods, where kubelet's accounting doesn't see it. With the
+  volume at home, review, drift and landing are the bare-metal engine's, unchanged. A daemon per node is worth its cost
+  only once measurement shows NFS round trips across the network dominating an agent's tool time, and a moved clone can
+  land.
+- **kubelet mounts an `nfs` PersistentVolume, over RPC-with-TLS.** For each pod the server makes a PersistentVolume:
+  `nfs.server` the home's host as `[slates_fleet.nodes]` lists it, `nfs.path` the pod's capability path
+  (`/<name>@<attachment>.<token>`, `slates_api::mount::export_path`), and `mountOptions: [nfsvers=4.2, xprtsec=mtls,
+  port=<the home's listed base port>, nosuid, nodev]`; a PersistentVolumeClaim in kiln's jobs namespace bound to it by
+  name (`volumeName`, `storageClassName: ""`), the PersistentVolume reserved for that claim alone ("Specify the relevant
+  PersistentVolumeClaim in the `claimRef` field of the PV so that other PVCs can not bind to it": Kubernetes,
+  "Reserving a PersistentVolume"); and the pod's volume from the claim, mounted at the folder's own path, as an isolated
+  session's guest has it (W8). A pod's own `nfs` volume can't be used: it takes no mount options, so it can't ask for
+  `xprtsec=mtls`. Nor can a CSI driver: its node plugin mounts with `Bidirectional` propagation, which Kubernetes allows
+  only in a privileged container, and Slates holds no privilege (its R10); kubelet, the node's own mount broker, mounts a
+  PersistentVolume instead (both cited in Slates' §4.6).
+- **One capability per pod.** As each pod starts, the home asks its daemon for an export attachment of the volume for
+  that pod alone, bound to one Unix identity (Slates' A-115): that uid's calls are served, and every other caller, root
+  included, is shown attributes and an `ACCESS` that grants nothing. The uid and gid are those that own the folder at
+  home, and the pod's containers run as them (`runAsUser`, `runAsGroup`), so permission bits mean in the pod what they
+  mean in the folder (Slates' §4.6 item 5). The path's token is half the capability, and RPC-with-TLS's mutual
+  authentication the other half: a node that presents no certificate from kiln's CA gets no session (Slates' export
+  takes TLS 1.3 alone, and only a client whose certificate chains to the fleet's root), so the token never crosses the
+  network in the clear. Slates' export takes any client certificate under that root, and kiln's CA also signs its
+  runners' own, so it's the token, never a TLS identity alone, that reaches a volume. A pod's end detaches its
+  attachment, after which its path reaches nothing (Slates' detach rules), whatever kubelet still holds; the next pod
+  gets a new token. The PersistentVolume carries the path, so reading it takes the cluster-wide right to read
+  PersistentVolumes. Owed by Slates (A-521): its library has no export verb (slates-api serves a host mount and a VMM's
+  descriptors; the command line's `slates export` attaches on the raw client), so Slates' first piece here adds one,
+  answering the attachment and its path with typed refusals, and kiln calls that, never the command line or the raw
+  client.
+- **Two certificates, both from kiln's CA.** *The export's:* Slates serves the export with the node's fleet identity
+  (`fleet::serve_export`), and a node's client checks it against the name its mount used: "Server certificate validation
+  MUST include a check on whether the locally configured expected DNS-ID or iPAddress subjectAltName of the server that
+  is contacted matches its presented certificate" (RFC 9289 §5.2.1; ktls-utils' `tlshd` hands the mount's server name to
+  GnuTLS's `gnutls_certificate_verify_peers3`). So kiln's CA signs a listed runner's node certificate for the host its
+  node is listed at too, beside the fleet's two names: an iPAddress for an IPv4 address, a dNSName for a name, as the
+  operator wrote it, which the PersistentVolume names as written. Built 2026-11-19 (`Pki::sign_slates_node`,
+  `workspace::slates_fleet::node_names`): the server takes the host from `[slates_fleet]`, never from the request, and
+  refuses kiln's own reserved name there as it does for every certificate it issues; a node certificate that doesn't
+  name the host its runner is listed at no longer stands, so a runner listed before asks again as its instance next
+  starts, keeping its key; and the server takes a runner's word only with a certificate naming the host of the address
+  it announces. Like a capacity holder's, a node's certificate serves either side of a session, so the host the operator
+  lists for a runner should be that runner's alone. *The node's:* Linux's NFS client hands the handshake to ktls-utils'
+  `tlshd` (kernel `CONFIG_TLS` and `CONFIG_NET_HANDSHAKE`) with one certificate for the node: the pods on a node share
+  its NFS client and its session, so the client is the node, never a pod ("The tuple (serial number of the presented
+  certificate; Issuer) uniquely identifies the RPC client", RFC 9289 §5.2.1). kiln's CA issues it to the cluster's
+  operator for each node's `tlshd` (`x509.truststore` kiln's CA, `x509.certificate` and `x509.private_key` the node's,
+  its key `0600`, as Slates' `deploy/kind/tlshd.conf` has them), installed once per node by the operator, as
+  `user_allow_other` is: never a privilege kiln or Slates holds. Owed: that issue (an operator's call, recorded as every
+  certificate kiln issues is, W27-R01).
+- **Review, drift and landing at home.** The server asks the volume's home, not the pod's runner (a workspace names its
+  home runner where the two differ): its change request is built from the volume's own changes (`workspace::review`, as
+  W8's), its drift is Slates' drift of the overlay there (W3), and its landing is W6's: the agent's granted mode, set by
+  kiln, the launcher, as the volume's write policy, and written by the home's daemon into the person's folder under that
+  grant. The pod never writes the folder, and nothing reaches its disk except through a landing.
+- **In order.** (1) A start asks for the engine (planned: `isolation: {"kind": "pod"}`, beside W8's `microvm`), refused
+  where the server has no `[kubernetes]`, or where the folder's machine isn't in kiln's Slates fleet or is Windows, where
+  Slates serves no export. (2) The home makes the volume with no mount, sets its write policy (W6) and asks its daemon
+  for the pod's export, answering the server with the export's host, port and path and the uid and gid. (3) The server
+  makes the PersistentVolume, the claim and the pod in kiln's jobs namespace (`crate::k8s`, as it makes a job's pod),
+  whose harness kiln's own runner in the pod starts in the claim's mount (`kiln agent --ephemeral`, connecting back over
+  QUIC with mutual TLS, as a `k8s` pool's executor does). (4) At the agent's end, or for a pod that never starts, the
+  server deletes the pod, the claim and the PersistentVolume, and the home detaches the export's attachment and ends the
+  volume by W3's rules. A pod kubelet can't mount (its events' `FailedMount`: a node without `tlshd` or its
+  certificate, or no route to the home) fails its start in kubelet's words, as a job's pod that can't start does
+  (`k8s::reap_loop`).
+- **What the cluster needs.** Each node: a kernel with `CONFIG_TLS` (`modprobe tls`) and `CONFIG_NET_HANDSHAKE`;
+  nfs-utils' `mount.nfs`, which takes `xprtsec` (kind's node image carries nfs-common 2.8.3, as Slates records); ktls-utils'
+  `tlshd`, running with the node's certificate and kiln's CA (wanted by `multi-user.target`, since a kind node never
+  reaches `remote-fs.target`: Slates' `deploy/kind/node-tls.Dockerfile`); and TCP to each home's listed address and base
+  port. kiln's service account: in its jobs namespace, PersistentVolumeClaims to create and delete beside its pods (it
+  may only `get` them now), and PersistentVolumes to create, get and delete, which belong to no namespace (a
+  ClusterRole). Nothing else: no CSI driver, no privileged container, no `hostPath`, no mount propagation, no
+  StorageClass.
+- **Proof, and the order it's built in.** The proof (owed, main's run): KIND on a Linux machine whose kernel has
+  `CONFIG_TLS` (Docker Desktop's has none, as Slates measured on 2026-10-01), through kiln: an agent on the Kubernetes
+  engine edits in its pod; its change request shows the edit; a file a person changed in the folder meanwhile shows as
+  drift; its landing writes the folder only under its grant; and a pod deleted mid-session leaves no attachment, claim
+  or PersistentVolume behind. Built in this order: the certificate naming the host (built); Slates' export verb (A-521)
+  and kiln's call of it; the PersistentVolume, claim and pod as pure builders, unit-tested as a job's pod is, with the
+  chart's RBAC; the engine and the workspace's home; the end and its reaper; the node certificate's issue; the proof.
 
 ## C: From changes to landed
 
