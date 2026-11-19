@@ -196,8 +196,41 @@ pub(crate) async fn settle(w: &Watched, quiet: std::time::Duration, until: std::
 /// Until one of `pids` exits (goal 9: a process's end as the OS tells it, a pidfd on Linux,
 /// kqueue's `EVFILT_PROC` on macOS, a wait on its handle on Windows); at once when one is gone
 /// already; never with none to watch, or where the OS can't say.
-pub async fn exited(pids: &[u32]) {
+pub async fn exited(pids: &[u32]) -> Result<(), Vec<Unwatched>> {
     backend::exited(pids).await;
+    Ok(())
+}
+
+/// Why the OS can't tell kiln a process's end ([`exited`]'s refusal, by kind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unwatchable {
+    /// No process has that id: 0 (on Unix the caller's own process group, on Windows the System Idle Process, which
+    /// never ends), or one past a Unix `pid_t`.
+    NotAPid,
+    /// The OS keeps no way to be told a process's end that kiln uses: a Linux before 5.3 has no pidfd (`ENOSYS`), and
+    /// an OS kiln watches nothing on has none.
+    Unsupported,
+    /// The OS refused to watch it, its error number: descriptors exhausted (`EMFILE`), memory (`ENOMEM`), a Windows wait
+    /// it wouldn't register.
+    Refused(i32),
+}
+
+/// A process whose end the OS can't tell kiln, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unwatched {
+    pub pid: u32,
+    pub why: Unwatchable,
+}
+
+impl std::fmt::Display for Unwatched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pid = self.pid;
+        match self.why {
+            Unwatchable::NotAPid => write!(f, "{pid} names no process"),
+            Unwatchable::Unsupported => write!(f, "process {pid}: this OS can't tell kiln a process's end (a Linux before 5.3 has no pidfd)"),
+            Unwatchable::Refused(code) => write!(f, "process {pid}: the OS refused to watch it ({})", std::io::Error::from_raw_os_error(code)),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -317,10 +350,24 @@ mod tests {
             let pids = [pid];
             let waiting = exited(&pids);
             child.kill()?;
-            anyhow::ensure!(crate::rt::timeout(Duration::from_secs(20), waiting).await.is_ok(), "its end didn't end the wait");
+            let heard = crate::rt::timeout(Duration::from_secs(20), waiting).await;
+            anyhow::ensure!(matches!(heard, Ok(Ok(()))), "its end didn't end the wait: {heard:?}");
             child.wait()?;
-            anyhow::ensure!(crate::rt::timeout(Duration::from_secs(5), exited(&[pid])).await.is_ok(), "a wait on a process gone didn't end at once");
+            let gone = crate::rt::timeout(Duration::from_secs(5), exited(&[pid])).await;
+            anyhow::ensure!(matches!(gone, Ok(Ok(()))), "a wait on a process gone didn't end at once: {gone:?}");
             Ok(())
         })
+    }
+
+    /// UI goal 88 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a wait on what names no process is refused at once, by
+    /// kind, on every OS, never left pending for ever: 0 is the caller's own process group on Unix, and on Windows the
+    /// System Idle Process, which never ends (macOS would watch its kernel's `kernel_task`, which never does either).
+    #[test]
+    fn g9_a_wait_on_what_names_no_process_is_refused_at_once_by_kind() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        // Asked once, on the runtime a backend's wait registers with: an answer now, or none.
+        let answered = crate::rt::block_on(async { Ok(exited(&[0]).now_or_never()) })?;
+        anyhow::ensure!(answered == Some(Err(vec![Unwatched { pid: 0, why: Unwatchable::NotAPid }])), "not refused at once by kind: {answered:?}");
+        Ok(())
     }
 }
