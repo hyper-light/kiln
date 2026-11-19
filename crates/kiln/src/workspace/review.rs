@@ -157,6 +157,16 @@ fn read_entries(i: &mut Instance, volume: VolumeId, entries: Vec<PlannedEntry>, 
             PlannedAction::Rmdir | PlannedAction::Clear => Change::GoneUnder { path },
             PlannedAction::Rename { from } => Change::Moved { from: relative(&from), to: path },
             PlannedAction::Mkdir => continue,
+            // A mode or Windows bits alone (Slates' A-458, A-501): git keeps a file's executable bit and nothing else of a
+            // mode, so only a flip of it is a change git commits, the file's bytes as the volume's head holds them.
+            PlannedAction::Chmod { permissions_was, .. } => {
+                let executable = entry.mode.is_some_and(|m| m & 0o111 != 0);
+                if (permissions_was & 0o111 != 0) == executable {
+                    continue;
+                }
+                let bytes = i.read(volume, &entry.path, ReadAt::Head).map_err(Fault::Slates)?;
+                Change::File { path, bytes, executable }
+            }
         };
         changes.push(change);
     }
@@ -170,7 +180,7 @@ fn relative(path: &str) -> String {
 
 /// Whether `entry` writes a file or a link git doesn't track, which git's ignore rules apply to.
 fn writes_untracked(entry: &PlannedEntry, tracked: &HashSet<String>) -> bool {
-    matches!(entry.action, PlannedAction::Create | PlannedAction::Replace | PlannedAction::Symlink { .. }) && !tracked.contains(&relative(&entry.path))
+    matches!(entry.action, PlannedAction::Create | PlannedAction::Replace | PlannedAction::Symlink { .. } | PlannedAction::Chmod { .. }) && !tracked.contains(&relative(&entry.path))
 }
 
 /// Whether git ignores what `entry` writes in `volume`, by its `.gitignore` files read at the volume's head.

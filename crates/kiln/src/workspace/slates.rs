@@ -108,7 +108,13 @@ pub const INSTANCE: &str = "kiln";
 /// own until this revision). It maps 37's `MountMissing::MountManager` (Windows) to its own
 /// can't-mount refusal, and needs none of the rest: a snapshot's archive exported (38) and a volume
 /// imported from one (40).
-pub const CONTRACT: u32 = 40;
+///
+/// 41 since kiln took Slates at e2d1bc42b (Slates' A-503: a captured clone that moved lands against
+/// its capture, so kiln lands a workspace that moved here as any). 41 adds a landing entry for a file
+/// or directory whose mode or Windows bits alone changed (`PlannedAction::Chmod`, A-458 and A-501):
+/// kiln's summary counts them, and a review commits a file whose executable bit flipped, the one bit
+/// of a mode git keeps ([`super::review`]).
+pub const CONTRACT: u32 = 41;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -475,12 +481,6 @@ pub struct Made {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(skip))]
     pub base: Option<Base>,
-    /// It moved here with its agent from another runner (K4, [`arrived`]): Slates judges a landing of a moved clone
-    /// against its capture only once the move carries the capture (its stage 2), so kiln lands none until then
-    /// ([`landing`]).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[cfg_attr(test, ts(skip))]
-    pub moved: bool,
 }
 
 /// What a workspace's volume is a clone of (K5): its folder's captured base, an overlay of the folder whose whole tree
@@ -530,7 +530,7 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     let volume = slates_api::volume_id_text(id);
     let mut failed = anyhow::anyhow!(super::place::NO_POINT);
     for point in super::place::points(&here()?.root, name) {
-        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone(), moved: false };
+        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone() };
         // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
         // volume, not this one, and Slates refuses a second mount at it.
         match mount_typed(&m).await {
@@ -569,7 +569,7 @@ pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
     let spec = VolumeSpec::overlay(name, over, volume_max());
     let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
-    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None, moved: false })
+    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None })
 }
 
 /// A workspace's volume `name` over folder `over`, unmounted (K5): with `captured`, a clone of the folder's captured base
@@ -759,16 +759,11 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     mount_at(m).await
 }
 
-/// Workspace `m` as it arrived here with its agent: placed as this machine places it ([`placed_under`]), and marked moved
-/// where it came from another machine (`from_elsewhere`, K4), whose clone Slates lands against its capture only from its
-/// stage 2 ([`landing`]).
-pub fn arrived(m: &Made, from_elsewhere: bool) -> anyhow::Result<Made> {
-    arrived_under(m, &here()?.root, from_elsewhere)
-}
-
-/// [`arrived`] with this machine's place for workspaces `root`.
-fn arrived_under(m: &Made, root: &Path, from_elsewhere: bool) -> anyhow::Result<Made> {
-    Ok(Made { moved: m.moved || from_elsewhere, ..placed_under(m, root)? })
+/// Workspace `m` as this machine places it ([`placed_under`] its place for workspaces): a workspace that arrived here
+/// with its agent (K4). A captured clone that moved lands here against its capture as on the runner it came from: its
+/// move carried what Slates judges by (Slates' A-503).
+pub fn placed_here(m: &Made) -> anyhow::Result<Made> {
+    placed_under(m, &here()?.root)
 }
 
 /// Workspace `m` as this machine places it, its place for workspaces `root`: where its mount names another machine's
@@ -1191,11 +1186,9 @@ fn drift_volume(m: &Made) -> &str {
     m.base.as_ref().map_or(&m.volume, |b| &b.volume)
 }
 
-/// The landing of workspace `m`'s head into `over`, each of `excludes` left out. None for a workspace that moved here
-/// from another runner (K4): Slates lands a moved clone as a volume with no capture (every file a creation, no removal
-/// carried) until its move carries the capture (Slates' A-424 stage 2), so kiln refuses it rather than write that.
+/// The landing of workspace `m`'s head into `over`, each of `excludes` left out: one that moved here from another runner
+/// is landed as any (Slates judges a moved captured clone against its capture, its A-503).
 fn landing(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<LandingRequest> {
-    anyhow::ensure!(!m.moved, "its workspace moved here from another runner, and Slates writes a moved workspace back against the folder it was captured from only from its next step (its A-424 stage 2): put the work up for review instead");
     Ok(LandingRequest { volume: volume_id(&m.volume)?, snapshot: None, target: over.to_owned(), filter: Filter { include: Vec::new(), exclude: excludes.to_vec() } })
 }
 
@@ -1264,7 +1257,7 @@ fn planned_files(plan: &Value) -> usize {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|a| !matches!(a.get("action").and_then(Value::as_str), Some("mkdir" | "rmdir")))
+        .filter(|a| !matches!(a.get("action").and_then(Value::as_str), Some("mkdir" | "rmdir" | "chmod")))
         .filter_map(|a| a.get("count").and_then(Value::as_u64))
         .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
         .fold(0usize, usize::saturating_add)
@@ -1299,7 +1292,7 @@ pub async fn writable(m: &Made, over: &str, plan: &Value) -> Result<(), String> 
 /// action, bytes to write, entries the filter left out.
 fn summary_json(s: &Summary) -> Value {
     let a = &s.actions;
-    let by_action: Vec<Value> = [("create", a.create), ("replace", a.replace), ("delete", a.delete), ("rename", a.rename), ("mkdir", a.mkdir), ("rmdir", a.rmdir), ("symlink", a.symlink), ("clear", a.clear)]
+    let by_action: Vec<Value> = [("create", a.create), ("replace", a.replace), ("delete", a.delete), ("rename", a.rename), ("mkdir", a.mkdir), ("rmdir", a.rmdir), ("symlink", a.symlink), ("clear", a.clear), ("chmod", a.chmod)]
         .into_iter()
         .filter(|(_, count)| *count > 0)
         .map(|(action, count)| json!({"action": action, "count": count}))
@@ -1922,39 +1915,23 @@ mod tests {
     /// A captured clone's record, as a fleet runner makes one (K5).
     fn captured() -> Made {
         let base = Some(Base { volume: "00017f80ff10abcdef1234567890ffff".into(), snapshot: 7 });
-        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base, moved: false }
+        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base }
     }
 
-    /// K5 (kiln goal 95101ef32ffb8b099942fe076619c310): a workspace that arrives from another machine is placed as K4
-    /// places it and marked moved; one an older runner process of this machine hands over is placed and not marked; one
-    /// marked once stays marked.
+    /// A-503 (kiln goal 95101ef32ffb8b099942fe076619c310): a captured clone that moved here with its agent is placed under
+    /// this machine's own place and written back as any workspace is, into its folder with what git ignores left out:
+    /// Slates judges it against its capture, which its move carried. Until A-503 kiln refused it.
     #[cfg(unix)]
     #[test]
-    fn k5_a_workspace_from_another_machine_is_marked_moved_and_a_local_hand_over_is_not() -> anyhow::Result<()> {
+    fn a503_a_workspace_that_moved_here_is_written_back_as_any_workspace_is() -> anyhow::Result<()> {
         let scratch = tempfile::tempdir()?;
         let root = scratch.path().join("workspaces");
         let came = captured();
-        let moved = arrived_under(&came, &root, true)?;
-        assert_eq!(moved, Made { moved: true, ..placed_under(&came, &root)? });
         let here = placed_under(&came, &root)?;
-        assert_eq!(arrived_under(&here, &root, false)?, here, "a hand-over between two runner processes of this machine moves nothing");
-        assert!(arrived_under(&moved, &root, false)?.moved, "a workspace that moved stays moved");
-        Ok(())
-    }
-
-    /// K5: a workspace that moved here is written back to no folder (Slates lands a moved clone against its capture only
-    /// from its A-424 stage 2: before, as a volume with no capture, every file a creation and no removal carried); one
-    /// that stayed lands into its folder as before.
-    #[test]
-    fn k5_a_moved_workspace_is_written_back_nowhere_until_slates_carries_its_capture() -> anyhow::Result<()> {
-        let stayed = captured();
-        let request = landing(&stayed, "/src/kiln", &["/.git".to_owned()])?;
+        assert_eq!(here, Made { mount: super::super::place::real(&root).join("kiln-a").to_string_lossy().into_owned(), ..came });
+        let request = landing(&here, "/src/kiln", &["/.git".to_owned()])?;
         assert_eq!((request.target.as_str(), request.filter.exclude.as_slice()), ("/src/kiln", ["/.git".to_owned()].as_slice()));
-        let refused = match landing(&Made { moved: true, ..stayed }, "/src/kiln", &[]) {
-            Ok(request) => anyhow::bail!("a moved workspace's landing was asked: {request:?}"),
-            Err(e) => format!("{e:#}"),
-        };
-        assert!(refused.contains("moved here from another runner"), "{refused}");
+        assert_eq!(request.volume, volume_id(&here.volume)?);
         Ok(())
     }
 
@@ -1984,18 +1961,23 @@ mod tests {
         }
     }
 
-    /// K5: a workspace's record from before (an overlay's: no base, never moved) reads as it did and is written as it was,
-    /// so a runner or server of either age reads the other's; a captured clone's carries its base, and a moved one says so.
+    /// K5: a workspace's record from before (an overlay's: no base) reads as it did and is written as it was, so a runner
+    /// or server of either age reads the other's; a captured clone's carries its base. A record K5's runners wrote with
+    /// `moved` (A-503 made the field go) reads as the same workspace.
     #[test]
     fn k5_a_workspace_record_from_before_reads_and_writes_as_it_did() -> anyhow::Result<()> {
         let before = json!({"volume": "00017f80ff10abcdef123456789abcde", "name": "kiln-a", "mount": "/w/kiln-a"});
         let read: Made = serde_json::from_value(before.clone())?;
-        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None, moved: false });
+        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None });
         assert_eq!(serde_json::to_value(&read)?, before);
-        let moved = Made { moved: true, ..captured() };
-        let written = serde_json::to_value(&moved)?;
-        assert_eq!((written.pointer("/base/snapshot"), written.get("moved")), (Some(&json!(7)), Some(&json!(true))));
-        assert_eq!(serde_json::from_value::<Made>(written)?, moved);
+        let clone = captured();
+        let mut written = serde_json::to_value(&clone)?;
+        assert_eq!(written.pointer("/base/snapshot"), Some(&json!(7)));
+        assert_eq!(serde_json::from_value::<Made>(written.clone())?, clone);
+        if let Some(fields) = written.as_object_mut() {
+            fields.insert("moved".to_owned(), json!(true));
+        }
+        assert_eq!(serde_json::from_value::<Made>(written)?, clone, "a K5 runner's moved record");
         Ok(())
     }
 

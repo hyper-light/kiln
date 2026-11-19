@@ -358,7 +358,7 @@ memory, where an overlay reads only what the agent uses: so only a fleet runner,
 move, pays for one, and a folder larger than a workspace's share of memory is refused there in
 Slates' words. Owed: a capture of what git tracks alone; a second landing judged against what the
 first landed (Slates' A-424 advance: an outsider's later edit of a file the agent landed is a
-conflict until then); and a moved workspace's landing (below). An agent whose volume moves with it works at the
+conflict until then). An agent whose volume moves with it works at the
 mount its volume is placed at on the runner it goes to, its folder and its environment with it: every path of its
 environment on the mount it left (moved there as it started, W2: an activated virtual environment, a
 `CARGO_TARGET_DIR`) names its place on the new one. Only a runner in kiln's Slates fleet captures: a workspace
@@ -476,11 +476,13 @@ again and the agent going on where it was. Then the session is handed over; the 
 places the volume's mount under its own place for workspaces and mounts it before the harness starts.
 A workspace laid over its machine's folder is refused `not_plain`: its base stays on its machine.
 A listed runner's workspaces are clones of a captured base (W3, K5), so they move. A workspace that
-moved here from another runner (the server's package, never a hand-over between two runner processes
-of one machine) is written back to no folder: Slates lands a moved clone against its capture only
-from its A-424 stage 2 (until then as a volume with no capture, every file a creation and no removal
-carried), so kiln refuses its landing, saying so, and its work goes up as a change request (W4)
-as any workspace's does.
+moved here from another runner lands as it would have there: its move carried what Slates judges it
+by (Slates' A-503: the captured state of every path the agent changed, in the volume's catalog, and
+the moved head, which the new owner keeps), so its plan holds the agent's changes since the capture
+alone, before the move and after it, and an outsider's later edit of a file the agent didn't touch is
+passed. Its landing waits on its grant (W6) as any's does, into the folder it was laid over, as
+this runner's disk names it. Owed: a workspace taken over after its runner's loss (no move carried
+its capture), which Slates still lands as a volume with no capture.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.

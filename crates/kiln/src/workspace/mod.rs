@@ -285,13 +285,12 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
 
 /// A session that arrived with a workspace volume (it moved here with its agent, K4, `harness::host`'s take-over): its
 /// mount re-placed under this machine's own place for workspaces where it named another machine's, and its folder and
-/// environment there ([`follow_to`]: the mount's top, with the agent's place beneath it); marked moved where it came from another machine
-/// (`from_elsewhere`: the server's package, never a hand-over between two runner processes of this one), which kiln
-/// writes back to no folder until Slates' move carries its capture (`slates::arrived`, K5). Whether it has a workspace
-/// volume to mount here as it starts ([`mounted_for`]), so its folder is never taken for one this machine lacks.
-pub fn arrived_here(spec: &mut crate::harness::session::Spec, from_elsewhere: bool) -> bool {
+/// environment there ([`follow_to`]: the mount's top, with the agent's place beneath it). Its work is written back here as
+/// on the runner it came from (Slates judges a moved captured clone against its capture, its A-503). Whether it has a
+/// workspace volume to mount here as it starts ([`mounted_for`]), so its folder is never taken for one this machine lacks.
+pub fn arrived_here(spec: &mut crate::harness::session::Spec) -> bool {
     let Some(m) = spec.workspace.as_ref().filter(|w| w.kind == "volume").and_then(|w| w.made.clone()).filter(|m| !m.mount.is_empty()) else { return false };
-    match slates::arrived(&m, from_elsewhere) {
+    match slates::placed_here(&m) {
         Ok(arrived) => follow_to(spec, arrived),
         Err(e) => {
             tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "a workspace that arrived couldn't be placed here");

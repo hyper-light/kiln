@@ -114,6 +114,30 @@ pub fn crash_loop_backoff(life_ns: u64, last_backoff_ns: Option<u64>, cap_ns: u6
     .max(1)
 }
 
+/// The bounds a graceful stop holds its daemon to ([`Supervisor::stop_step`], A-461), each derived by the owner from what
+/// it waits for; none is a fixed second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopBounds {
+  /// The age past which the daemon's beat has lapsed and it is killed: the owner's lapse bound for a running daemon
+  /// (the `slates anchor` loop's: its liveness window plus its own measured lateness, A-228).
+  pub lapse_ns: u64,
+  /// How much of its own beating the daemon is given to acknowledge the request, and to exit once past the deadline it
+  /// declared ([`stop_overdue`]): the owner's liveness window.
+  pub window_ns: u64,
+}
+
+/// Whether a stopping daemon is overdue (A-461), judged by its own beating, not by the owner's clock: it has beaten a
+/// window (`window_ns`) past the request (`requested_ns`) without acknowledging it, or a window past the deadline it
+/// declared (`stop_by`); `beat_ns` is its last beat. A daemon's control loop reads the request at each of its turns, and
+/// the turns are what its beats show, so one that has beaten a window since the request has had a window of turns to
+/// see it and is deaf; one held off its CPUs beats late and is waited for, and one that stops beating is the lapse's to
+/// end ([`StopBounds::lapse_ns`]), so every stop ends. Before, both were counted on the owner's clock from the request
+/// (or the deadline) by the bare liveness budget, and a daemon held off its CPUs past it was killed mid-drain, a planned
+/// handoff of its leadership cut short. Pure, so every case tests on any host.
+pub fn stop_overdue(requested_ns: u64, stop_by: Option<u64>, beat_ns: u64, window_ns: u64) -> bool {
+  beat_ns > stop_by.unwrap_or(requested_ns).saturating_add(window_ns)
+}
+
 /// What one supervision step found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
@@ -147,15 +171,15 @@ pub enum Step {
 /// What one step of a graceful stop found ([`Supervisor::stop_step`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Stopping {
-  /// The daemon is still stopping: it acknowledged the request and is inside its declared deadline, or the
-  /// liveness budget has not yet passed without an acknowledgement.
+  /// The daemon is still stopping: it beats, and it is neither deaf to the request nor past its declared deadline by a
+  /// window of its own beating ([`stop_overdue`]).
   Draining,
   /// The daemon has exited and the stop is recorded (nothing restarts it).
   Exited {
     /// The exit code, when the OS reports one (a signal death has none).
     exit_code: Option<i32>,
-    /// Whether the anchor had to kill it: no acknowledgement within the liveness budget, a heartbeat that
-    /// lapsed, or a declared deadline overrun by the budget.
+    /// Whether the anchor had to kill it: a heartbeat that lapsed, or a window of its own beating with no
+    /// acknowledgement or past its declared deadline ([`StopBounds`]).
     killed: bool,
   },
 }
@@ -233,6 +257,18 @@ struct DeviceHold {
   refused: u64,
   /// Which refusals the log has said, so that the log stays bounded while the count goes on (A-213).
   logged: crate::handles::RefusalLog<crate::held::HoldRefusal>,
+}
+
+/// What a spawn is handed of the anchor's holdings (A-462): the environment naming the handoff table, and the table's
+/// sealed object, which the caller keeps until the spawn holds its own copy of its descriptor. Nothing of either where
+/// the anchor holds no device channel.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct HeldHandoff {
+  /// The variables to set: the table's pointer.
+  env: Vec<(String, String)>,
+  /// The table's object.
+  table: Option<crate::held::TableObject>,
 }
 
 /// The most messages one drain applies per device the bound allows: a hold, its session and its release are
@@ -502,14 +538,18 @@ impl Supervisor {
     self.devices.as_ref().map_or(0, |hold| hold.refused)
   }
 
-  /// The environment handing the device channel and every held device to a daemon about to be spawned, each
-  /// descriptor made inheritable. A descriptor that cannot be made inheritable is left out (and counted): handing
-  /// a number the daemon does not inherit would have it adopt whatever that number names in its own table.
+  /// The handoff to a daemon about to be spawned (A-462): the device channel and every held device, connection and copy,
+  /// each descriptor made inheritable, in one table written into a sealed, read-only object whose descriptor the spawn
+  /// inherits too ([`crate::held::TableObject`]), and the environment naming it ([`crate::held::ENV_HELD`]). The caller
+  /// keeps the object until the spawn holds its own copy. A descriptor that cannot be made inheritable is left out (and
+  /// counted): handing a number the daemon does not inherit would have it adopt whatever that number names in its own
+  /// table. A table that cannot be made refuses the spawn ([`AnchorError::Handoff`]): a daemon started without it would
+  /// take every held entry for none.
   #[cfg(unix)]
-  fn device_env(&mut self) -> Vec<(String, String)> {
+  fn device_env(&mut self) -> Result<HeldHandoff, AnchorError> {
     self.drain_devices();
     let Some(hold) = self.devices.as_mut() else {
-      return Vec::new();
+      return Ok(HeldHandoff::default());
     };
     let inheritable = |fd: &OwnedFd| rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty());
     if let Err(e) = inheritable(&hold.daemon_end) {
@@ -517,7 +557,7 @@ impl Supervisor {
         call: "fcntl(F_SETFD) on the channel",
         code: e.raw_os_error(),
       });
-      return Vec::new();
+      return Ok(HeldHandoff::default());
     }
     let mut lost = Vec::new();
     for (attachment, held) in hold.held.iter() {
@@ -557,20 +597,24 @@ impl Supervisor {
         reason: "a held copy could not be made inheritable",
       });
     }
-    let value = hold
-      .held
-      .env_value(std::os::fd::AsFd::as_fd(&hold.daemon_end));
-    vec![
-      (crate::held::ENV_DEVICES.to_owned(), value),
-      (
-        crate::held::ENV_CONNECTIONS.to_owned(),
-        hold.held.connections_env_value(),
-      ),
-      (
-        crate::held::ENV_COPIES.to_owned(),
-        hold.held.copies_env_value(),
-      ),
-    ]
+    let table = crate::held::Table {
+      devices: hold
+        .held
+        .devices_part(std::os::fd::AsFd::as_fd(&hold.daemon_end)),
+      connections: hold.held.connections_part(),
+      copies: hold.held.copies_part(),
+    };
+    let object = crate::held::TableObject::new(&table).map_err(AnchorError::Handoff)?;
+    rustix::io::fcntl_setfd(object.descriptor(), rustix::io::FdFlags::empty()).map_err(|e| {
+      AnchorError::Handoff(crate::held::HoldRefusal::Os {
+        call: "fcntl(F_SETFD) on the handoff table",
+        code: e.raw_os_error(),
+      })
+    })?;
+    Ok(HeldHandoff {
+      env: vec![(crate::held::ENV_HELD.to_owned(), object.pointer())],
+      table: Some(object),
+    })
   }
 
   /// Hands `name=value` to every daemon this supervisor spawns: the handoff of an endpoint the owner holds across
@@ -632,10 +676,16 @@ impl Supervisor {
       }
       env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
-    // And the hold channel with every FUSE device (A-61) and NFS connection (A-113) held: the daemon takes back the
-    // mounts it recovers and answers the connections the dead daemon left.
+    // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
+    // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the
+    // dead daemon left. The table's object is kept until the spawn holds its own copy.
     #[cfg(unix)]
-    env.extend(self.device_env());
+    let HeldHandoff {
+      env: held_env,
+      table: _table,
+    } = self.device_env()?;
+    #[cfg(unix)]
+    env.extend(held_env);
     env.extend(self.environment.iter().cloned());
     // The daemon before this one may have died inside its republication of the profile; the anchor's is whole again
     // before the next reads it. No daemon runs now, so nothing else writes it.
@@ -838,16 +888,11 @@ impl Supervisor {
   }
 
   /// One step of a graceful stop, never blocking. `Exited` once the daemon has exited — the stop is recorded,
-  /// so no later step restarts it. Otherwise the anchor **kills** the daemon, and reports it killed, when it
-  /// has not acknowledged the request within `liveness_budget_ns`, when its heartbeat is older than that
-  /// budget (a wedged daemon), or when it has run past its own declared deadline by that budget; while none
-  /// of these holds it is `Draining`. Every bound is one the daemon declared or the liveness budget the
-  /// anchor already holds it to — none is new.
-  pub fn stop_step(
-    &mut self,
-    now_ns: u64,
-    liveness_budget_ns: u64,
-  ) -> Result<Stopping, AnchorError> {
+  /// so no later step restarts it. Otherwise the anchor **kills** the daemon, and reports it killed, when its
+  /// heartbeat is older than `bounds.lapse_ns` (a wedged daemon), or when it has beaten `bounds.window_ns` past the
+  /// request without acknowledging it or past its own declared deadline ([`stop_overdue`]); while none of these holds
+  /// it is `Draining`. Every bound is one the daemon declared or one the owner derives (A-461) — none is new.
+  pub fn stop_step(&mut self, now_ns: u64, bounds: StopBounds) -> Result<Stopping, AnchorError> {
     // A stop ends a crash loop's backoff too: nothing restarts the daemon after it.
     self.retry_at_ns = None;
     let Some(child) = self.child.as_mut() else {
@@ -876,12 +921,14 @@ impl Supervisor {
     let give_up = {
       let supervision = self.segment.supervision()?;
       let requested = supervision.stop_requested_at().unwrap_or(now_ns);
-      let (alive, _) = supervision.alive(now_ns, liveness_budget_ns);
-      let overdue = match supervision.stop_by() {
-        None => now_ns.saturating_sub(requested) > liveness_budget_ns,
-        Some(deadline) => now_ns > deadline.saturating_add(liveness_budget_ns),
-      };
-      !alive || overdue
+      let (alive, _) = supervision.alive(now_ns, bounds.lapse_ns);
+      !alive
+        || stop_overdue(
+          requested,
+          supervision.stop_by(),
+          supervision.heartbeat_ns(),
+          bounds.window_ns,
+        )
     };
     if !give_up {
       return Ok(Stopping::Draining);
@@ -1149,6 +1196,55 @@ mod backoff_tests {
       RestartPolicy::derive(0).get().backoff_cap_ns,
       1,
       "no SLO still caps at a nanosecond, never at zero"
+    );
+  }
+}
+
+#[cfg(test)]
+mod stop_tests {
+  use super::*;
+
+  /// Shape: the window the stop is judged by in these cases: a second, the liveness window on a quiet anchor.
+  const WINDOW_NS: u64 = 1_000_000_000;
+  /// Shape: the request's time on the host's clock.
+  const ASKED_NS: u64 = 50 * WINDOW_NS;
+  /// Shape: the deadline a daemon declares, a few windows past the request.
+  const DEADLINE_NS: u64 = ASKED_NS + 3 * WINDOW_NS;
+
+  /// A-461, §2.5 "supervises and restarts the daemon". Do: judge a stopping daemon by its last beat: one that has not
+  /// acknowledged and was held off its CPUs, so its last beat came just after the request while the owner's clock ran
+  /// two windows on; one that beat a window past the request and is deaf; one that acknowledged and beats inside its
+  /// deadline and its window after it; and one beating past both. Expect: the held daemon waited for (the owner's clock
+  /// alone, as before, killed it mid-drain), the deaf one overdue, the draining one waited for, the overrunning one
+  /// overdue.
+  #[test]
+  fn a_stopping_daemon_is_overdue_by_its_own_beating_not_by_the_owners_clock() {
+    let held_beat = ASKED_NS + WINDOW_NS / 10;
+    assert!(
+      !stop_overdue(ASKED_NS, None, held_beat, WINDOW_NS),
+      "a daemon held off its CPUs since the request has beaten no window of it"
+    );
+    assert!(
+      stop_overdue(ASKED_NS, None, ASKED_NS + WINDOW_NS + 1, WINDOW_NS),
+      "a window of its own beating with no acknowledgement is deaf"
+    );
+    assert!(
+      !stop_overdue(
+        ASKED_NS,
+        Some(DEADLINE_NS),
+        DEADLINE_NS + WINDOW_NS,
+        WINDOW_NS
+      ),
+      "inside its deadline and a window past it, it drains"
+    );
+    assert!(
+      stop_overdue(
+        ASKED_NS,
+        Some(DEADLINE_NS),
+        DEADLINE_NS + WINDOW_NS + 1,
+        WINDOW_NS
+      ),
+      "a window of its own beating past the deadline it declared is overdue"
     );
   }
 }

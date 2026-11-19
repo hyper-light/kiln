@@ -1,8 +1,8 @@
 //! A Shards stream whose guest maps a file with DAX outlives its daemon's death (§4.6, the Shards form; A-365), with this
 //! test as the anchor and as the device. The test makes the anchor's hold channel and hands it to each daemon as the
-//! anchor does, the held resync ends and the held DAX object to the second (`SLATES_ANCHOR_DEVICES`,
-//! `SLATES_ANCHOR_COPIES`), which a daemon adopts once per process into a process-wide cell: hence a binary of its own
-//! with one test. A daemon's death is a fenced stop, which ends no record and releases no hold, as a killed process
+//! anchor does, the held resync ends and the held DAX object to the second (the handoff table `SLATES_ANCHOR_HELD`
+//! names, A-462), which a daemon adopts once per process into a process-wide cell: hence a binary of its own with one
+//! test. A daemon's death is a fenced stop, which ends no record and releases no hold, as a killed process
 //! does.
 
 #![cfg(unix)]
@@ -353,8 +353,8 @@ fn hex(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Hands the next daemon what the anchor holds, as the anchor does: `SLATES_ANCHOR_DEVICES` (its channel end, then each
-/// held resync end with its session) and `SLATES_ANCHOR_COPIES` (each held object with its record).
+/// Hands the next daemon what the anchor holds, as the anchor does (A-462): a table whose devices part is its channel
+/// end, then each held resync end with its session, and whose copies part is each held object with its record.
 fn hand_to_next_daemon(channel: &OwnedFd, holds: &[&Hold], objects: &[&HeldObject]) {
   let mut devices = copy(channel).to_string();
   for hold in holds {
@@ -379,8 +379,15 @@ fn hand_to_next_daemon(channel: &OwnedFd, holds: &[&Hold], objects: &[&HeldObjec
   // SAFETY: this binary holds this one test; it sets the variables only between daemons, each of which reads them once
   // at its start, and no other thread of this process reads the environment meanwhile.
   unsafe {
-    std::env::set_var(held::ENV_DEVICES, devices);
-    std::env::set_var(held::ENV_COPIES, copies.join(";"));
+    std::env::set_var(
+      held::ENV_HELD,
+      held::hand_in_process(&held::Table {
+        devices,
+        connections: String::new(),
+        copies: copies.join(";"),
+      })
+      .unwrap(),
+    );
   }
 }
 
@@ -448,23 +455,15 @@ fn map_and_store(
   (node, window, held)
 }
 
-/// After the resync: `other` reads the file through its own stream, where the dead daemon's guest's unsynced store must
-/// be (the successor ingested it before serving); `mapping` asks for the file's descriptor again and is given the very
-/// object it maps (a store through the old window reads back through a map of the new descriptor); and `other`'s write
-/// reaches the old window (the adopted backing takes every change again).
-fn kept_and_coherent(
-  daemon: &Daemon,
-  mapping: &mut Guest,
-  other: &mut Guest,
-  (node, window): (u64, &Window),
-) {
+/// The successor took the mapped object back (`shards.dax_adopted`) and ingested the guest's stores into it
+/// (`shards.dax_ingested`). The resynced stream's ingest runs before that stream serves anything; another stream's turns
+/// may come between its slices, so the count is waited for.
+fn assert_taken_back_and_ingested(daemon: &Daemon) {
   assert_eq!(
     counted(daemon, "shards.dax_adopted", 1),
     1,
     "the object is taken back"
   );
-  // The resynced stream's ingest of the guest's stores runs before that stream serves anything; another stream's turns
-  // may come between its slices, so the read waits for the ingest to have written.
   let ingested = counted(daemon, "shards.dax_ingested", 1);
   let ledger: Vec<(&str, u64)> = daemon
     .refusals_on_every_shard()
@@ -476,6 +475,19 @@ fn kept_and_coherent(
     ingested >= 1,
     "the adopted object's stores were ingested; the successor's ledger: {ledger:?}"
   );
+}
+
+/// After the resync: `other` reads the file through its own stream, where the dead daemon's guest's unsynced store must
+/// be (the successor ingested it before serving); `mapping` asks for the file's descriptor again and is given the very
+/// object it maps (a store through the old window reads back through a map of the new descriptor); and `other`'s write
+/// reaches the old window (the adopted backing takes every change again).
+fn kept_and_coherent(
+  daemon: &Daemon,
+  mapping: &mut Guest,
+  other: &mut Guest,
+  (node, window): (u64, &Window),
+) {
+  assert_taken_back_and_ingested(daemon);
   let (errno, body) = other.ask(LOOKUP, 1, b"mapped\0");
   assert_eq!(errno, 0);
   assert_eq!(u64::from_le_bytes(body[0..8].try_into().unwrap()), node);
@@ -525,13 +537,17 @@ fn a_streams_dax_map_outlives_its_daemon_with_its_unsynced_stores() {
   // SAFETY: this binary holds this one test; the variable is set before any daemon starts.
   unsafe {
     std::env::set_var(
-      held::ENV_DEVICES,
-      daemon_end
-        .as_fd()
-        .try_clone_to_owned()
-        .unwrap()
-        .into_raw_fd()
-        .to_string(),
+      held::ENV_HELD,
+      held::hand_in_process(&held::Table {
+        devices: daemon_end
+          .as_fd()
+          .try_clone_to_owned()
+          .unwrap()
+          .into_raw_fd()
+          .to_string(),
+        ..held::Table::default()
+      })
+      .unwrap(),
     );
   }
   let profile = common::machine_profile();

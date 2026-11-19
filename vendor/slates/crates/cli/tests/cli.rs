@@ -546,8 +546,8 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// restarted. Do: start an anchor, freeze its daemon (`SIGSTOP`: alive and silent), and wait for another daemon to
 /// answer. Expect the frozen one gone, killed once, and the anchor's kill line to be its process judgment, never a
 /// withheld beat's: the line names a beat at least a window old and a process that made no progress for at least the
-/// window and at most one more, the window being the liveness budget; and the new daemon answering within the suite's
-/// start wait.
+/// window and at most one more, the window being the anchor's (the liveness budget, raised to how late the anchor's own
+/// waits ran where that is longer, A-461); and the new daemon answering within the suite's start wait.
 ///
 /// A frozen process stops its watchdog with every other thread, so the watchdog's silence cannot say whether the daemon
 /// is stuck or only starved; since A-232 the anchor then judges the process by the start's rule, sparing a starved one
@@ -610,10 +610,9 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
-  assert_eq!(
-    window,
-    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
-    "the anchor's window is the liveness budget"
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the anchor's window is the liveness budget, or longer where its own waits ran later (A-461): {window:?} ({line})"
   );
   assert!(
     age >= window && still >= window,
@@ -634,7 +633,7 @@ const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
 
 /// Format: the words of the anchor's kill line for a daemon whose watchdog has gone silent and whose process the start's
 /// rule finds stuck (`on_lapse`, A-232): "the daemon's watchdog has not looked for L ms, its heartbeat A ms old; its
-/// process made no progress for F ms (the W ms liveness window); killing it".
+/// process made no progress for F ms (its W ms window); killing it" (A-461: the window the anchor judged it by).
 const PROCESS_KILL_LINE: &str = "; its process made no progress for ";
 
 /// The beat's age, how long the process made no progress, and the window the anchor's process kill line names: its
@@ -769,12 +768,30 @@ fn a_stuck_start_is_killed_and_restarted() {
   drop(anchor);
   assert_ne!(answered, stuck);
   assert!(!stuck_alive, "the stuck start was killed");
-  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-  let still_for = kill_line
+  // The stillness and the window the line names (A-461: the anchor's window, the liveness budget or, where its own waits
+  // ran later, longer): "made no progress for F ms (its W ms window)".
+  let named: Vec<u64> = kill_line
     .split_once(STUCK_WORDS)
-    .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-    .and_then(|ms| ms.parse().ok())
-    .map(Duration::from_millis);
+    .map(|(_, rest)| {
+      rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .take(2)
+        .filter_map(|word| word.parse().ok())
+        .collect()
+    })
+    .unwrap_or_default();
+  let (still_for, window) = match named[..] {
+    [still, window] => (
+      Some(Duration::from_millis(still)),
+      Duration::from_millis(window),
+    ),
+    _ => (None, Duration::ZERO),
+  };
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the start was judged by the anchor's window, never under the liveness budget: {kill_line:?}"
+  );
   assert!(
     still_for.is_some_and(|still| still >= window && still < window * 2),
     "killed as a start within a window of its last progress: {kill_line:?}"
@@ -1514,9 +1531,9 @@ fn the_macos_mount_is_nosuid_and_nodev(path: &str) {
   }
 }
 
-/// Shape: how long a forged `UMNT` is watched for effect: three times the daemon's one-liveness-budget
-/// confirmation deadline (`crates/server/src/nfs.rs`, `UNMOUNT_CONFIRM_NS`), so a loaded box's delay
-/// cannot hide an ended attachment.
+/// Shape: how long a forged `UMNT` is watched for effect: three times the bound a fresh daemon's first confirmation
+/// waits (the liveness window before any unmount was measured; `crates/server/src/nfs.rs`, `unmount_bound_ns`, A-493),
+/// so a loaded box's delay cannot hide an ended attachment.
 #[cfg(target_os = "macos")]
 const FORGED_UNMOUNT_WATCH: Duration = Duration::from_secs(3);
 
@@ -7662,45 +7679,8 @@ fn judge_apparmor_launches(
 ) {
   let executable = report["executable"].as_str().unwrap_or_default();
   match readiness {
-    "profile-loaded" => {
-      assert_eq!(
-        on.code, 0,
-        "the profile's launcher runs the command: {}",
-        on.err
-      );
-      assert_eq!(
-        on.out.lines().collect::<Vec<_>>(),
-        ["through-the-bind", "unconfined", "grant-withheld"],
-        "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
-      );
-      assert_eq!(
-        off.code, 4,
-        "without the option the launcher leaves the profile: {}",
-        off.err
-      );
-      assert!(
-        off.err.contains("--apparmor-profile") && off.err.contains(executable),
-        "the refusal names the option and the loaded profile: {}",
-        off.err
-      );
-    }
-    "profile-missing" => {
-      assert_eq!(off.code, 4, "{}", off.err);
-      assert_eq!(
-        off.err.trim(),
-        format!("slates: {CONFINED_REFUSAL}"),
-        "without the option, the refusal as it read before A-370"
-      );
-      assert_eq!(on.code, 4, "{}", on.err);
-      let file = report["profile_file"].as_str().unwrap_or_default();
-      assert!(
-        !file.is_empty()
-          && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
-          && on.err.contains(executable),
-        "with the option, the refusal names this binary's profile and how to load it: {}",
-        on.err
-      );
-    }
+    "profile-loaded" => judge_launches_under_a_loaded_profile(off, on, executable),
+    "profile-missing" => judge_launches_with_the_profile_missing(off, on, report, executable),
     _ if off.err.contains("cannot create a user+mount namespace") => {
       eprintln!(
         "SKIP: this host refuses unprivileged user namespaces outright: {}",
@@ -7714,6 +7694,58 @@ fn judge_apparmor_launches(
       }
     }
   }
+}
+
+/// Under a loaded profile only the option's launch runs, outside the profile and holding no user-namespace grant; the
+/// launch without the option is refused, naming the option and the loaded profile's `executable`.
+#[cfg(target_os = "linux")]
+fn judge_launches_under_a_loaded_profile(off: &Launched, on: &Launched, executable: &str) {
+  assert_eq!(
+    on.code, 0,
+    "the profile's launcher runs the command: {}",
+    on.err
+  );
+  assert_eq!(
+    on.out.lines().collect::<Vec<_>>(),
+    ["through-the-bind", "unconfined", "grant-withheld"],
+    "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
+  );
+  assert_eq!(
+    off.code, 4,
+    "without the option the launcher leaves the profile: {}",
+    off.err
+  );
+  assert!(
+    off.err.contains("--apparmor-profile") && off.err.contains(executable),
+    "the refusal names the option and the loaded profile: {}",
+    off.err
+  );
+}
+
+/// With the profile missing both launches are refused: the one without the option as it read before A-370, the option's
+/// naming this binary's profile file from `report` and how to load it.
+#[cfg(target_os = "linux")]
+fn judge_launches_with_the_profile_missing(
+  off: &Launched,
+  on: &Launched,
+  report: &serde_json::Value,
+  executable: &str,
+) {
+  assert_eq!(off.code, 4, "{}", off.err);
+  assert_eq!(
+    off.err.trim(),
+    format!("slates: {CONFINED_REFUSAL}"),
+    "without the option, the refusal as it read before A-370"
+  );
+  assert_eq!(on.code, 4, "{}", on.err);
+  let file = report["profile_file"].as_str().unwrap_or_default();
+  assert!(
+    !file.is_empty()
+      && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
+      && on.err.contains(executable),
+    "with the option, the refusal names this binary's profile and how to load it: {}",
+    on.err
+  );
 }
 
 /// A-370. Do: print slates' AppArmor profile for an installed path, and for a path it cannot name. Expect: the profile
@@ -12322,6 +12354,9 @@ const GARBLED_HOLD_MESSAGES: usize = 20;
 const UNKNOWN_HOLD_KIND: u8 = 0xff;
 /// Format: the daemon status line carrying the anchor's hold refusals (A-213).
 const HOLD_REFUSALS_LINE: &str = "anchor_hold_refusals: ";
+/// Shape: the bounds the garbling daemon reads its handoff table against, each: past what the anchor holds for this test's
+/// one instance, which holds nothing at the garbler's start, so only the table's frame is read.
+const HANDED_BOUND: usize = 1 << 16;
 /// Shape: the quick profile's probe budget (milliseconds), as `slates anchor --quick` measures it
 /// (`crates/api/src/role/daemon.rs`, `QUICK_PROBE_MS`).
 const QUICK_PROBE_MS: u64 = 5;
@@ -12338,11 +12373,23 @@ fn garbling_daemon() {
   let Ok(instance) = std::env::var(GARBLING_DAEMON_INSTANCE) else {
     return;
   };
-  let handed =
-    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
-  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
-  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment. It is
-  // borrowed, never owned, so it stays open across the exec below for the real daemon to adopt.
+  let pointer =
+    std::env::var(slates_anchor::held::ENV_HELD).expect("the anchor handed its table over");
+  let bounds = slates_anchor::held::TableBounds {
+    devices: HANDED_BOUND,
+    connections: HANDED_BOUND,
+    copies: HANDED_BOUND,
+  };
+  let (table, len) = slates_anchor::held::parse_pointer(&pointer, bounds).unwrap();
+  // SAFETY: the anchor made the table's object inheritable and named its number in the environment (A-462). It is
+  // borrowed, never owned: a copy is read here, and the object stays open across the exec below for the real daemon.
+  let object = unsafe { BorrowedFd::borrow_raw(table) };
+  let text = slates_anchor::held::read_table(object.try_clone_to_owned().unwrap(), len).unwrap();
+  let inherited =
+    slates_anchor::held::parse_devices(&slates_anchor::held::decode_table(&text).unwrap().devices)
+      .unwrap();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in its table. It is borrowed,
+  // never owned, so it stays open across the exec below for the real daemon to adopt.
   let channel = unsafe { BorrowedFd::borrow_raw(inherited.channel) };
   let short = vec![0u8; slates_anchor::held::MESSAGE_BYTES / 2];
   let mut unknown = vec![0u8; slates_anchor::held::MESSAGE_BYTES];
