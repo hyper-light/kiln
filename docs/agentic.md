@@ -494,7 +494,8 @@ stream kiln asks of its instance and hands Shards through Hex (Shards' D286, Hex
 `sandbox::served`), so nothing of it is mounted on the machine and the harness works at its project's own
 path in its guest. Its change request is built from the volume's own changes (`workspace::review`: Slates'
 landing entries, each file read from the volume and checked against its BLAKE3, and a file whose owner's execute bit
-alone changed (all git keeps of a mode: git's `ce_permissions`) read there and checked against the folder's copy, whose
+alone changed (all git keeps of a mode: git's `ce_permissions`; where the repository's `core.fileMode` is false,
+git keeps none, and each file has the mode its index holds) read there and checked against the folder's copy, whose
 bytes its landing keeps; A-287), and its landing
 is the same Slates landing as a mounted workspace's, leaving out what git ignores as a mounted one does: read from
 the volume itself (its own `.gitignore` files, the repository's excludes and the person's, over what the landing

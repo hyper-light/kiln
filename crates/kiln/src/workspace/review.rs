@@ -140,7 +140,10 @@ fn ignored_prefixes(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, t
 async fn git_rules(top: &Path) -> anyhow::Result<(HashSet<String>, Ignores, Modes)> {
     let tracked = super::git::tracked(top).await?;
     let (info, user, case_insensitive) = super::git::excludes(top).await?;
-    let modes = Modes { trusted: true, executable_in_index: HashSet::new() };
+    let trusted = super::git::trusts_executable_bit(top).await?;
+    // The index's modes are what git records where it trusts no execute bit; where it trusts them, none is read.
+    let executable_in_index = if trusted { HashSet::new() } else { super::git::executable_in_index(top).await? };
+    let modes = Modes { trusted, executable_in_index };
     Ok((tracked, Ignores::new(info.as_deref(), user.as_deref(), case_insensitive)?, modes))
 }
 
@@ -252,9 +255,14 @@ fn git_executable(mode: u32) -> bool {
 /// What git commits for an entry whose mode or Windows attribute bits alone change (Slates' contract 41,
 /// `PlannedAction::Chmod`): the file executable or not as it lands ([`git_executable`]), where that changed, the one part
 /// of a mode git keeps (its two file modes); none where only another permission bit or a Windows attribute changed, of
-/// which a commit of the volume's working tree holds nothing, and none for any other entry.
-fn executable_change(entry: &PlannedEntry, _modes: &Modes) -> Option<bool> {
+/// which a commit of the volume's working tree holds nothing, none where the repository's git trusts no execute bit
+/// (`core.fileMode` false: [`Modes`]), and none for any other entry.
+fn executable_change(entry: &PlannedEntry, modes: &Modes) -> Option<bool> {
     let PlannedAction::Chmod { permissions_was, .. } = entry.action else { return None };
+    // Where git trusts no execute bit (`core.fileMode` false) it records none, so no mode change is one it sees.
+    if !modes.trusted {
+        return None;
+    }
     let executable = entry.mode.is_some_and(git_executable);
     (executable != git_executable(permissions_was)).then_some(executable)
 }
@@ -267,9 +275,12 @@ fn unseen_mode_change(entry: &PlannedEntry, tracked: &HashSet<String>, modes: &M
     matches!(entry.action, PlannedAction::Chmod { .. }) && tracked.contains(&relative(&entry.path)) && executable_change(entry, modes).is_none()
 }
 
-/// Whether git records a file of `mode` written at `path` as executable (red step: its owner's execute bit alone).
-fn recorded_executable(mode: Option<u32>, _path: &str, _modes: &Modes) -> bool {
-    mode.is_some_and(git_executable)
+/// Whether git records a file of `mode` written at `path` (as git names it within the repository) as executable: by its
+/// owner's execute bit ([`git_executable`]) where git trusts execute bits; else as its index holds the path, and not
+/// executable where it holds none (`ce_mode_from_stat`, read-cache.h lines 23-27 at git e1ec09b23: the index's mode,
+/// else `create_ce_mode(0666)`).
+fn recorded_executable(mode: Option<u32>, path: &str, modes: &Modes) -> bool {
+    if modes.trusted { mode.is_some_and(git_executable) } else { modes.executable_in_index.contains(path) }
 }
 
 /// A path from the target's root (`/src/a.rs`) as git names it within the repository (`src/a.rs`).

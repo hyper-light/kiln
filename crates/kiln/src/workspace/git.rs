@@ -370,6 +370,37 @@ pub async fn tracked(top: &Path) -> anyhow::Result<std::collections::HashSet<Str
     Ok(run(c, GIT_TIMEOUT).await?.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect())
 }
 
+/// Whether repository `top`'s git records files' execute bits (`core.fileMode`), read as git reads it: `git config` over
+/// the system, global, repository and worktree files in git's order (git-config(1), "FILES"), true where none sets it
+/// false. Git's own: `git_default_core_config` sets `trust_executable_bit` from `core.filemode` (environment.c lines
+/// 327-329 at git e1ec09b23), 1 by default (line 788); where it is 0, `ce_mode_from_stat` (read-cache.h lines 23-27)
+/// keeps the mode the index holds for a regular file and records one it doesn't hold as `100644`.
+pub async fn trusts_executable_bit(top: &Path) -> anyhow::Result<bool> {
+    let mut c = git(top);
+    c.args(["config", "--bool", "--get", "core.fileMode"]);
+    Ok(ask(c).await.as_deref() != Some("false"))
+}
+
+/// The paths repository `top`'s index holds as executable files (`100755`), each as git names it within the repository:
+/// the mode git records for each where it trusts no execute bit ([`trusts_executable_bit`]), whatever the working tree's.
+pub async fn executable_in_index(top: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut c = git(top);
+    c.args(["ls-files", "-s", "-z"]);
+    Ok(executable_paths(&run(c, GIT_TIMEOUT).await?))
+}
+
+/// The paths `git ls-files -s -z` lists as executable files (`<mode> <object> <stage>\t<path>`, each ended by a NUL, the
+/// mode `100755`).
+fn executable_paths(listed: &str) -> std::collections::HashSet<String> {
+    listed
+        .split('\0')
+        .filter_map(|record| {
+            let (meta, path) = record.split_once('\t')?;
+            meta.split(' ').next().filter(|mode| *mode == "100755").map(|_| path.to_owned())
+        })
+        .collect()
+}
+
 /// What repository `top`'s ignore rules beneath its folders' own `.gitignore` files are (gitignore(5)): its
 /// `info/exclude`, the user's excludes file (`core.excludesFile`, else git's own default,
 /// `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`), each one's bytes where it has one, and whether names match
@@ -1260,6 +1291,38 @@ mod tests {
             "git init -q -b main && git config user.name Ada && git config user.email ada@example.com && git config commit.gpgsign false && git config tag.gpgsign false && echo a > a && echo b > b && mkdir -p src && echo s > src/s.rs && printf 'target/\\n*.log\\n' > .gitignore && git add . && git commit -qm init && git remote add origin git@github.com:acme/app.git",
         )?;
         Ok(d)
+    }
+
+    /// W8 (git's `core.fileMode`, environment.c lines 327-329 at git e1ec09b23, 1 by default at line 788): kiln reads
+    /// whether a repository records execute bits as git does, true where nothing sets it false (git init sets it true where
+    /// the file system keeps execute bits) and false where the repository's config sets it so; and the paths the index
+    /// holds executable, which git records for each where it trusts none.
+    #[cfg(unix)]
+    #[test]
+    fn w8_kiln_reads_core_filemode_and_the_index_modes_as_git_does() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "printf '#!/bin/sh\\n' > run.sh && chmod 755 run.sh && git add run.sh && git commit -qm run")?;
+        let here = top.clone();
+        crate::rt::block_on(async move {
+            let top = here;
+            anyhow::ensure!(trusts_executable_bit(&top).await?, "a repository git init made here records execute bits");
+            sh(&top, "git config core.fileMode false")?;
+            anyhow::ensure!(!trusts_executable_bit(&top).await?, "its config sets core.fileMode false");
+            let executable = executable_in_index(&top).await?;
+            anyhow::ensure!(executable == ["run.sh".to_owned()].into_iter().collect(), "the index's executable paths: {executable:?}");
+            anyhow::Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// W8: the paths `git ls-files -s -z` lists as executable files, a path with a tab or a space in it whole, and none of
+    /// another mode.
+    #[test]
+    fn w8_the_index_listing_names_its_executable_paths() {
+        let listed = "100644 aaaa 0\ta.rs\0100755 bbbb 0\tbin/run.sh\0100755 cccc 0\tbin/two words\ttab.sh\0120000 dddd 0\tlink\0";
+        let executable = executable_paths(listed);
+        assert_eq!(executable, ["bin/run.sh".to_owned(), "bin/two words\ttab.sh".to_owned()].into_iter().collect());
     }
 
     #[test]
