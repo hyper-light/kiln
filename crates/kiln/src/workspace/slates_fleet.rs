@@ -11,19 +11,24 @@
 //!
 //! - **The server's side** ([`issue`], `POST /api/agents/slates-fleet`): a runner proves its machine as a second
 //!   runner process does (its current certificate and a CSR for that certificate's key), and its node's request is
-//!   signed for the fleet's names alone, whatever it asked (`Pki::sign_slates_node`), as `crate::capacity`'s holders
-//!   are signed for their machine's name.
+//!   signed for the fleet's names and, for a runner `[slates_fleet]` lists, the host it's listed at ([`node_names`]),
+//!   whatever it asked (`Pki::sign_slates_node`), as `crate::capacity`'s holders are signed for their machine's name.
+//!   Slates serves the node's network export with this certificate, and a kubelet's RPC-with-TLS client checks it
+//!   against the name its mount used (RFC 9289 §5.2.1; docs/agentic.md W10): an IP address for an IPv4 address, a DNS
+//!   name for a name, as the operator wrote it, taken from the setting, never from the request.
 //! - **The runner's side** ([`prepared`], [`finished`], [`identity`]): its node's files in a folder of its own, DER as
 //!   slates' manifest reads them: the key ([`KEY`], `0600`, made where there is none and kept across renewals), the
 //!   certificate ([`CERTIFICATE`]) and kiln's CA ([`ROOT`]). The server is asked where the certificate is missing, is
-//!   for another key, names another fleet or domain (the machine since renamed), or is due for renewal; an answer is
-//!   kept only once it proves to be for the node's key, under the CA the runner already trusts.
+//!   for another key, names another fleet or domain (the machine since renamed) or another host than the one its runner
+//!   is listed at (W10), or is due for renewal; an answer is kept only once it proves to be for the node's key, under the
+//!   CA the runner already trusts, naming the host its runner is listed at.
 //!
 //! - **Discovery** (K2; [`admit`], [`Directory`], [`discover`], `POST /api/agents/slates-fleet/members`): a runner
 //!   that joins says where its node is reached and which certificate it holds, with its machine's proof; the server
-//!   takes the word only for that machine's own node (a certificate kiln's CA issued naming the fleet and that
-//!   machine's domain, at an address Slates can dial: an IPv4 literal or a DNS name, and a base port whose block of
-//!   two fits the port range), keeps it in memory by machine, and answers with every node whose runner is connected.
+//!   takes the word only for that machine's own node (a certificate kiln's CA issued naming the fleet, that machine's
+//!   domain and the host of the address it announces, at an address Slates can dial: an IPv4 literal or a DNS name, and
+//!   a base port whose block of two fits the port range), keeps it in memory by machine, and answers with every node
+//!   whose runner is connected.
 //!   A server that restarts hears each again at its runner's next word; a node that joins later is also admitted by
 //!   Slates' own enrollment through any listed node, under the fleet's root.
 //! - **The manifest** ([`write_manifest`]): Slates' fleet manifest in the node's folder ([`MANIFEST`]), naming every
@@ -95,10 +100,11 @@ pub fn scope_name(fleet: &str, domain: u64) -> String {
     format!("r0.d{domain}.{fleet}")
 }
 
-/// The names kiln's CA signs a node of failure domain `domain` for, in order: the fleet's TLS name and the node's scope.
-/// `_host` is the host its runner is listed at in `[slates_fleet]`, when it is listed.
-pub fn node_names(fleet: &str, domain: u64, _host: Option<&str>) -> Vec<String> {
-    vec![fleet.to_owned(), scope_name(fleet, domain)]
+/// The names kiln's CA signs a node of failure domain `domain` for, in order (docs/agentic.md W10): the fleet's TLS
+/// name, the node's scope, and, for a runner `[slates_fleet]` lists, `host`, the host it's listed at, which a client of
+/// the node's network export checks the certificate against, the name its mount used (RFC 9289 §5.2.1).
+pub fn node_names(fleet: &str, domain: u64, host: Option<&str>) -> Vec<String> {
+    [fleet.to_owned(), scope_name(fleet, domain)].into_iter().chain(host.map(str::to_owned)).collect()
 }
 
 /// The host of node address `address` (`host:port`, as [`check_address`] takes it).
@@ -594,9 +600,9 @@ mod tests {
     }
 
     /// K1: a runner's node key is made on the runner and kept (`0600`); its request, sent with its machine's proof, is
-    /// signed by kiln's CA for the fleet's two names alone (the fleet's TLS name and `r0.d<domain>.<fleet>`, its domain
-    /// its machine's), for both sides of a session; the answer is kept, and the node then stands without asking again,
-    /// on the same key.
+    /// signed by kiln's CA for the fleet's two names (the fleet's TLS name and `r0.d<domain>.<fleet>`, its domain its
+    /// machine's), and nothing else for a runner `[slates_fleet]` doesn't list (W10 adds a listed runner's host), for
+    /// both sides of a session; the answer is kept, and the node then stands without asking again, on the same key.
     #[test]
     fn k1_a_runners_node_is_signed_for_the_fleets_names_and_kept_on_its_own_key() -> anyhow::Result<()> {
         let scratch = tempfile::tempdir()?;
