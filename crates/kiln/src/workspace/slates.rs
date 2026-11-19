@@ -1040,8 +1040,11 @@ impl std::error::Error for MountStays {}
 /// The kind of a mount the table still holds after its unmount was refused (`refusal`, in its words), told by what
 /// `lsof` names holding it (`holders`; why `lsof` couldn't say, where it couldn't).
 fn held_by(refusal: String, holders: Result<Vec<String>, String>) -> Held {
-    // The failing test's first run: main told no kind apart, its refusal and what lsof said.
-    Held::Refused { refusal, lsof: format!("{holders:?}") }
+    match holders {
+        Ok(holders) if !holders.is_empty() => Held::Busy { holders },
+        Ok(_) => Held::Refused { refusal, lsof: "nothing lsof can see holds it".to_owned() },
+        Err(lsof) => Held::Refused { refusal, lsof },
+    }
 }
 
 /// The steps of taking a workspace down ([`take_down`]), each this machine's word: whether its own mount is in the
@@ -1539,7 +1542,7 @@ mod tests {
     /// holds it as `lsof` does; refused with nothing `lsof` sees holding it, or `lsof` unable to say, in the refusal's
     /// words; or answered done while the table still lists it. One that goes, or none there, takes its volume with it.
     /// The macOS bare-metal drive met a volume destroyed under its mount (f3f618f2, kiln 68eda5b1, 2026-11-18), and
-    /// kiln's clippy the clock its retries waited on (2026-11-19).
+    /// kiln's clippy the clock its retries waited on (2026-11-18).
     #[test]
     fn w3_a_volume_is_never_destroyed_while_its_mount_is_in_the_table() -> anyhow::Result<()> {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};

@@ -3885,8 +3885,24 @@ fn remap_handed(map: &mut HashMap<String, Box<session::Handed>>, carried: &[i64]
 /// with them. What holds a workspace's mount busy is a process with a file or its working directory there, and an
 /// agent's are these: its mount is asked to go after this, once (`workspace::release`).
 pub(crate) async fn processes_ended(id: &str, harness: Option<u32>) {
-    // The failing test's first run: main awaited no process's end.
-    let _ = (id, harness);
+    let mut ended: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut next: Vec<u32> = harness.into_iter().collect();
+    loop {
+        let session = id.to_owned();
+        let members = crate::rt::blocking(move || crate::os::contain::Group::existing(&session).map(|g| g.pids()).unwrap_or_default()).await.unwrap_or_default();
+        next.extend(members);
+        next.retain(|pid| !ended.contains(pid));
+        next.sort_unstable();
+        next.dedup();
+        if next.is_empty() {
+            return;
+        }
+        tracing::info!(session = %id, pids = ?next, "an ended agent's processes are awaited before its workspace's mount comes down");
+        for pid in next.drain(..) {
+            crate::os::watch::exited(&[pid]).await;
+            ended.insert(pid);
+        }
+    }
 }
 
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.
@@ -4074,7 +4090,7 @@ mod tests {
     /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2): an ended agent's mount comes down once every process kiln started
     /// for it has ended, each end as the OS tells it (`os::watch::exited`), never on a clock: the wait goes on while its
     /// harness runs and is over once it has ended; with nothing of it running here it's over at once. kiln's clippy
-    /// found the clock its unmount's retries waited on instead (2026-11-19).
+    /// found the clock its unmount's retries waited on instead (2026-11-18).
     #[test]
     fn w3_an_ended_agents_processes_are_awaited_by_their_ends() -> anyhow::Result<()> {
         crate::rt::block_on(async {
