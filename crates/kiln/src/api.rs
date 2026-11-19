@@ -4573,7 +4573,7 @@ async fn enroll_slates_node(hub: &Hub, req: Request) -> R {
     if !known {
         return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
     }
-    let issued = crate::workspace::slates_fleet::issue(&hub.pki, &ask).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let issued = crate::workspace::slates_fleet::issue(&hub.pki, &ask, &hub.cfg.slates_fleet).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
     // Every certificate kiln issues is recorded first (W27-R01).
     let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(&issued.certificate) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::identities::record(&hub.store, "slates-node", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;

@@ -451,16 +451,22 @@ impl Pki {
 
     /// Sign a runner's Slates fleet node CSR (DER; `crate::workspace::slates_fleet`, kiln goal
     /// 95101ef32ffb8b099942fe076619c310, K1): a certificate for its key carrying exactly the fleet's
-    /// TLS name `fleet` and the node's placement name `r0.d<domain>.<fleet>`, whatever it asked.
-    /// Slates checks both: every peer verifies its sessions against `fleet`, and an enrolling node's
-    /// announced failure domain against the second name (its `discovery::scope_name`, region 0). For
+    /// TLS name `fleet`, the node's placement name `r0.d<domain>.<fleet>` and, for a runner the
+    /// server's `[slates_fleet]` lists, `host`, the host it's listed at, whatever it asked.
+    /// Slates checks the first two: every peer verifies its sessions against `fleet`, and an enrolling
+    /// node's announced failure domain against the second name (its `discovery::scope_name`, region 0).
+    /// The third is the name a client of the node's network export checks its certificate against,
+    /// the one its mount used (RFC 9289 §5.2.1; docs/agentic.md W10): an IP address for an IPv4
+    /// address, a DNS name for a name, as the operator wrote it, and never the server's own name. For
     /// both sides of the fleet's sessions (serverAuth and clientAuth), valid as a machine's is, its
     /// serial its own. Parsing checks the CSR's signature (possession of its key). DER.
-    pub fn sign_slates_node(&self, csr_der: &[u8], fleet: &str, domain: u64) -> anyhow::Result<Vec<u8>> {
+    pub fn sign_slates_node(&self, csr_der: &[u8], fleet: &str, domain: u64, host: Option<&str>) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(sanitize_name(fleet) == fleet && !fleet.is_empty(), "a fleet's name is a DNS name kiln issues as written, and {fleet:?} isn't");
         anyhow::ensure!(!reserved(fleet), "{SERVER_NAME} is the server's own identity; a fleet can't be named so");
+        anyhow::ensure!(!host.is_some_and(reserved), "{SERVER_NAME} is the server's own identity; a fleet node can't be named so");
         let csr = CertificateSigningRequestParams::from_der(&csr_der.to_vec().into()).context("parse the fleet node's CSR")?;
-        let mut params = leaf_params(vec![fleet.to_owned(), format!("r0.d{domain}.{fleet}")], LEAF_DAYS)?;
+        let names = [fleet.to_owned(), format!("r0.d{domain}.{fleet}")].into_iter().chain(host.map(str::to_owned)).collect();
+        let mut params = leaf_params(names, LEAF_DAYS)?;
         params.serial_number = Some(random_serial());
         let signed = CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&self.issuer).context("sign the fleet node's CSR")?;
         Ok(signed.der().to_vec())

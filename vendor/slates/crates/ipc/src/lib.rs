@@ -44,6 +44,7 @@ pub mod error;
 pub mod exit_watch;
 #[cfg(windows)]
 pub mod handle_route;
+pub mod looks;
 /// The owner's token on macOS (A-176, A-178): a Mach bootstrap name that ends with its holder, so one live process
 /// owns an instance's rendezvous, as Windows's named Event token and Linux's abstract address make it there. A
 /// registration made once per owner's life; no message crosses it, so D-10's refusal of Mach messages as the request
@@ -94,7 +95,7 @@ pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};
 pub use rendezvous::{
   Accepted, Adoption, CLAIM_WAIT_NS, Claim, Connected, Doorbell, HeldRendezvous, Listener,
-  Liveness, Prepared, begin_connect_as, connect, connect_as, instance_from_env,
+  Liveness, Prepared, begin_connect_as, connect, connect_as, holder_lives, instance_from_env,
 };
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};
 

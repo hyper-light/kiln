@@ -10,7 +10,7 @@
 //! once, and the count starts again. The first failed start is restarted at once. A second in a
 //! row is a crash loop: recorded as `CrashLoop` in the segment, and restarted after a backoff of at
 //! least the failed daemon's own life, doubling with each further failure up to the policy's cap
-//! ([`RestartPolicy`], the operator's failover SLO), and never shorter than the failed start took.
+//! ([`RestartPolicy`], the NFSv4 lease its daemon grants, A-525), and never shorter than the failed start took.
 //! So a loop spends at most half its time starting, however long each start takes and whether or
 //! not each daemon served a moment first, and supervision never gives up: every hard mount waits
 //! on the daemon.
@@ -79,19 +79,22 @@ pub struct RestartPolicy {
 }
 
 impl RestartPolicy {
-  /// Derived: the cap is the operator's failover SLO (`slates_server::config::FAILOVER_SLO_NS` until the operator gives
-  /// one): the outage an operator accepts for a failed owner, and the lease the daemon grants every NFSv4 client
-  /// (`crates/server/src/delegation.rs`). Capped there, a crash-looping daemon is started again within one SLO of its
-  /// last failure, so once the cause clears it serves within the bound the operator set, and its NFSv4 clients' leases
-  /// have not all expired meanwhile. Until 2026-11-17 the cap was 60 s, a hard Linux NFS mount's major timeout
-  /// (`nfs(5)`, `timeo` 600), which no mount slates makes sets.
-  pub fn derive(failover_slo_ns: u64) -> Derived<RestartPolicy> {
+  /// Derived: the cap is the NFSv4 lease the daemon grants every client (`lease_ns`: the server's
+  /// `config::NfsV4Caps::lease_ns`, A-425, an idle Linux client's renewal floor and a liveness window, in whole seconds).
+  /// Capped there, a crash-looping daemon is started again within one lease of its last failure (and never sooner than
+  /// the failed start took), so once the cause clears it serves again before a client that renews at its floor has seen
+  /// its lease run out, and the client keeps its opens, locks and delegations instead of losing them to the outage. The
+  /// lease is the term the daemon's own clients hold it to; nothing about the cap is a setting. Until A-525 the cap was
+  /// the operator's ten-second failover placeholder, past the lease, and until 2026-11-17 60 s, a hard Linux NFS
+  /// mount's major timeout (`nfs(5)`, `timeo` 600), which no mount slates makes sets.
+  pub fn derive(lease_ns: u64) -> Derived<RestartPolicy> {
     derived!(
       RestartPolicy {
-        backoff_cap_ns: failover_slo_ns.max(1),
+        backoff_cap_ns: lease_ns.max(1),
       },
-      "backoff_cap_ns = failover_slo_ns: a crash loop's doubling stops at the operator's failover SLO, the NFSv4 lease",
-      ["failover_slo_ns"]
+      "backoff_cap_ns = nfs_v4_lease_ns: a crash loop's doubling stops at the NFSv4 lease the daemon grants, so a \
+       client renewing at its floor finds the daemon back before its lease runs out",
+      ["nfs_v4_lease_ns"]
     )
   }
 }
@@ -257,6 +260,18 @@ struct DeviceHold {
   refused: u64,
   /// Which refusals the log has said, so that the log stays bounded while the count goes on (A-213).
   logged: crate::handles::RefusalLog<crate::held::HoldRefusal>,
+}
+
+/// What a spawn is handed of the anchor's holdings (A-462): the environment naming the handoff table, and the table's
+/// sealed object, which the caller keeps until the spawn holds its own copy of its descriptor. Nothing of either where
+/// the anchor holds no device channel.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct HeldHandoff {
+  /// The variables to set: the table's pointer.
+  env: Vec<(String, String)>,
+  /// The table's object.
+  table: Option<crate::held::TableObject>,
 }
 
 /// The most messages one drain applies per device the bound allows: a hold, its session and its release are
@@ -526,14 +541,18 @@ impl Supervisor {
     self.devices.as_ref().map_or(0, |hold| hold.refused)
   }
 
-  /// The environment handing the device channel and every held device to a daemon about to be spawned, each
-  /// descriptor made inheritable. A descriptor that cannot be made inheritable is left out (and counted): handing
-  /// a number the daemon does not inherit would have it adopt whatever that number names in its own table.
+  /// The handoff to a daemon about to be spawned (A-462): the device channel and every held device, connection and copy,
+  /// each descriptor made inheritable, in one table written into a sealed, read-only object whose descriptor the spawn
+  /// inherits too ([`crate::held::TableObject`]), and the environment naming it ([`crate::held::ENV_HELD`]). The caller
+  /// keeps the object until the spawn holds its own copy. A descriptor that cannot be made inheritable is left out (and
+  /// counted): handing a number the daemon does not inherit would have it adopt whatever that number names in its own
+  /// table. A table that cannot be made refuses the spawn ([`AnchorError::Handoff`]): a daemon started without it would
+  /// take every held entry for none.
   #[cfg(unix)]
-  fn device_env(&mut self) -> Vec<(String, String)> {
+  fn device_env(&mut self) -> Result<HeldHandoff, AnchorError> {
     self.drain_devices();
     let Some(hold) = self.devices.as_mut() else {
-      return Vec::new();
+      return Ok(HeldHandoff::default());
     };
     let inheritable = |fd: &OwnedFd| rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty());
     if let Err(e) = inheritable(&hold.daemon_end) {
@@ -541,7 +560,7 @@ impl Supervisor {
         call: "fcntl(F_SETFD) on the channel",
         code: e.raw_os_error(),
       });
-      return Vec::new();
+      return Ok(HeldHandoff::default());
     }
     let mut lost = Vec::new();
     for (attachment, held) in hold.held.iter() {
@@ -581,20 +600,24 @@ impl Supervisor {
         reason: "a held copy could not be made inheritable",
       });
     }
-    let value = hold
-      .held
-      .env_value(std::os::fd::AsFd::as_fd(&hold.daemon_end));
-    vec![
-      (crate::held::ENV_DEVICES.to_owned(), value),
-      (
-        crate::held::ENV_CONNECTIONS.to_owned(),
-        hold.held.connections_env_value(),
-      ),
-      (
-        crate::held::ENV_COPIES.to_owned(),
-        hold.held.copies_env_value(),
-      ),
-    ]
+    let table = crate::held::Table {
+      devices: hold
+        .held
+        .devices_part(std::os::fd::AsFd::as_fd(&hold.daemon_end)),
+      connections: hold.held.connections_part(),
+      copies: hold.held.copies_part(),
+    };
+    let object = crate::held::TableObject::new(&table).map_err(AnchorError::Handoff)?;
+    rustix::io::fcntl_setfd(object.descriptor(), rustix::io::FdFlags::empty()).map_err(|e| {
+      AnchorError::Handoff(crate::held::HoldRefusal::Os {
+        call: "fcntl(F_SETFD) on the handoff table",
+        code: e.raw_os_error(),
+      })
+    })?;
+    Ok(HeldHandoff {
+      env: vec![(crate::held::ENV_HELD.to_owned(), object.pointer())],
+      table: Some(object),
+    })
   }
 
   /// Hands `name=value` to every daemon this supervisor spawns: the handoff of an endpoint the owner holds across
@@ -656,10 +679,16 @@ impl Supervisor {
       }
       env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
-    // And the hold channel with every FUSE device (A-61) and NFS connection (A-113) held: the daemon takes back the
-    // mounts it recovers and answers the connections the dead daemon left.
+    // And the hold channel with every FUSE device (A-61), NFS connection (A-113) and copy (A-197, A-365) held, in one
+    // table the spawn inherits (A-462): the daemon takes back the mounts it recovers and answers the connections the
+    // dead daemon left. The table's object is kept until the spawn holds its own copy.
     #[cfg(unix)]
-    env.extend(self.device_env());
+    let HeldHandoff {
+      env: held_env,
+      table: _table,
+    } = self.device_env()?;
+    #[cfg(unix)]
+    env.extend(held_env);
     env.extend(self.environment.iter().cloned());
     // The daemon before this one may have died inside its republication of the profile; the anchor's is whole again
     // before the next reads it. No daemon runs now, so nothing else writes it.
@@ -1110,17 +1139,17 @@ impl DeviceHold {
 mod backoff_tests {
   use super::*;
 
-  /// Shape: the failover SLO the tests derive their cap from: ten seconds, the default's.
-  const SLO_NS: u64 = 10_000_000_000;
-  /// Shape: a failed start's life, many times under the SLO: 300 ms.
+  /// Shape: the lease the tests derive their cap from: ten seconds, many lives long.
+  const LEASE_NS: u64 = 10_000_000_000;
+  /// Shape: a failed start's life, many times under the lease: 300 ms.
   const LIFE_NS: u64 = 300_000_000;
 
   /// A-311, §2.6 step 1. Do: follow a crash loop's backoffs over failed starts of one life, under the cap the anchor
-  /// derives from a failover SLO many lives long. Expect the first backoff the failed start's own life, each next twice
+  /// derives from a lease many lives long. Expect the first backoff the failed start's own life, each next twice
   /// the last, and the cap once the doubling passes it, held there.
   #[test]
   fn a_crash_loops_backoff_starts_at_the_failed_starts_life_and_doubles_to_the_cap() {
-    let cap = RestartPolicy::derive(SLO_NS).get().backoff_cap_ns;
+    let cap = RestartPolicy::derive(LEASE_NS).get().backoff_cap_ns;
     let mut last = None;
     let mut backoffs = Vec::new();
     for _ in 0..8 {
@@ -1137,8 +1166,8 @@ mod backoff_tests {
         8 * LIFE_NS,
         16 * LIFE_NS,
         32 * LIFE_NS,
-        SLO_NS,
-        SLO_NS
+        LEASE_NS,
+        LEASE_NS
       ]
     );
   }
@@ -1150,9 +1179,12 @@ mod backoff_tests {
   #[test]
   fn a_daemon_has_recovered_once_it_has_served_as_long_as_its_start_took() {
     assert_eq!(recovered_at(0, LIFE_NS), 2 * LIFE_NS);
-    assert_eq!(recovered_at(SLO_NS, SLO_NS + LIFE_NS), SLO_NS + 2 * LIFE_NS);
-    assert_eq!(recovered_at(SLO_NS, SLO_NS), SLO_NS);
-    assert_eq!(recovered_at(SLO_NS, LIFE_NS), LIFE_NS);
+    assert_eq!(
+      recovered_at(LEASE_NS, LEASE_NS + LIFE_NS),
+      LEASE_NS + 2 * LIFE_NS
+    );
+    assert_eq!(recovered_at(LEASE_NS, LEASE_NS), LEASE_NS);
+    assert_eq!(recovered_at(LEASE_NS, LIFE_NS), LIFE_NS);
   }
 
   /// A-311. Do: back off failed starts longer than the cap, and a loop whose starts grow longer mid-way. Expect every
@@ -1160,8 +1192,8 @@ mod backoff_tests {
   /// the cap; and a start that takes no measurable time still waits a nanosecond, never none.
   #[test]
   fn a_backoff_is_never_shorter_than_the_failed_starts_own_life() {
-    let cap = RestartPolicy::derive(SLO_NS).get().backoff_cap_ns;
-    let long = 3 * SLO_NS;
+    let cap = RestartPolicy::derive(LEASE_NS).get().backoff_cap_ns;
+    let long = 3 * LEASE_NS;
     assert_eq!(crash_loop_backoff(long, None, cap), long);
     assert_eq!(crash_loop_backoff(long, Some(long), cap), long);
     assert_eq!(crash_loop_backoff(long, Some(LIFE_NS), cap), long);
@@ -1169,7 +1201,7 @@ mod backoff_tests {
     assert_eq!(
       RestartPolicy::derive(0).get().backoff_cap_ns,
       1,
-      "no SLO still caps at a nanosecond, never at zero"
+      "no lease still caps at a nanosecond, never at zero"
     );
   }
 }

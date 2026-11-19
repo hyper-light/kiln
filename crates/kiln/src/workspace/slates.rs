@@ -114,9 +114,20 @@ pub const INSTANCE: &str = "kiln";
 /// 41 since kiln took Slates at 1f332da55 (from 40; Slates' A-496). kiln uses 41: a file whose
 /// mode or Windows attribute bits alone changed lands as a `chmod` entry (Slates' A-458), which a
 /// plan shows (`summary_json`) and counts among the files it lands (`planned_files`), and which a
-/// review commits where git keeps the change, its executable bit (`super::review`). 41 changes
-/// nothing else.
-pub const CONTRACT: u32 = 41;
+/// review commits where git keeps the change, its owner's execute bit (`super::review`). 41 changes
+/// nothing else. Kiln takes Slates at e2d1bc42b since, the same contract: Slates' A-503 lands a
+/// captured clone that moved against its capture, so kiln lands a workspace that moved here as any.
+///
+/// 42 since kiln took Slates at ce9b6905e (from 41; Slates' A-507). kiln uses 42: an unmount runs
+/// no program on macOS and the BSDs (`unmount(2)`, where it ran `umount` and `umount -f` found on
+/// `PATH`) and is believed only when the kernel's mount table agrees, so a runner's `PATH` no longer
+/// decides whether a workspace's mount comes down (`unmount`, `let_go`). Its three new refusals,
+/// a mount still busy (`MountFault::Busy`), one the table still lists after an unmount answered done
+/// (`StillMounted`) and a table that could not be read (`MountTable`), kiln shows in Slates' words as
+/// it shows every unmount's, and maps, as every mount fault it is not told is missing, to its own
+/// can't-mount refusal (`missing_of`). The revision brings Slates' A-511 too: a mount's attachment
+/// ends at the kernel's own unmount event, never at its `UMNT`.
+pub const CONTRACT: u32 = 42;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -258,16 +269,30 @@ pub async fn facts() -> Facts {
 }
 
 /// What a machine lacks for workspaces, as Slates' typed answer to whether it can mount names it (`mount::available`).
+/// Every fault is named, so a contract that adds one fails to build here until kiln places it: one that says what the
+/// machine lacks maps to that lack, and every other (a mount or an unmount refused, the mount table unread: 42's
+/// `Busy`, `StillMounted` and `MountTable` among them) to kiln's own can't-mount refusal.
 fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
+    use slates_api::MountFault;
     match fault {
-        slates_api::MountFault::Unsupported { missing } => match missing {
+        MountFault::Unsupported { missing } => match missing {
             slates_api::MountMissing::Fusermount3 => WorkspaceMissing::Fusermount3,
             slates_api::MountMissing::FuseDevice => WorkspaceMissing::FuseDevice,
             slates_api::MountMissing::WinFsp => WorkspaceMissing::WinFsp,
             slates_api::MountMissing::MountNfs => WorkspaceMissing::MountNfs,
             slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared | slates_api::MountMissing::MountManager => WorkspaceMissing::Mount,
         },
-        _ => WorkspaceMissing::Mount,
+        MountFault::MountPoint { .. }
+        | MountFault::NoNfsListener
+        | MountFault::NoCapability
+        | MountFault::RootHandle { .. }
+        | MountFault::Refused { .. }
+        | MountFault::Unbound { .. }
+        | MountFault::Unmount { .. }
+        | MountFault::Busy { .. }
+        | MountFault::StillMounted { .. }
+        | MountFault::MountTable { .. }
+        | MountFault::NotMounted { .. } => WorkspaceMissing::Mount,
     }
 }
 
@@ -483,12 +508,6 @@ pub struct Made {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(skip))]
     pub base: Option<Base>,
-    /// It moved here with its agent from another runner (K4, [`arrived`]): Slates judges a landing of a moved clone
-    /// against its capture only once the move carries the capture (its stage 2), so kiln lands none until then
-    /// ([`landing`]).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[cfg_attr(test, ts(skip))]
-    pub moved: bool,
 }
 
 /// What a workspace's volume is a clone of (K5): its folder's captured base, an overlay of the folder whose whole tree
@@ -538,7 +557,7 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     let volume = slates_api::volume_id_text(id);
     let mut failed = anyhow::anyhow!(super::place::NO_POINT);
     for point in super::place::points(&here()?.root, name) {
-        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone(), moved: false };
+        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone() };
         // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
         // volume, not this one, and Slates refuses a second mount at it.
         match mount_typed(&m).await {
@@ -577,7 +596,7 @@ pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
     let spec = VolumeSpec::overlay(name, over, volume_max());
     let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
-    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None, moved: false })
+    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None })
 }
 
 /// A workspace's volume `name` over folder `over`, unmounted (K5): with `captured`, a clone of the folder's captured base
@@ -767,16 +786,11 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     mount_at(m).await
 }
 
-/// Workspace `m` as it arrived here with its agent: placed as this machine places it ([`placed_under`]), and marked moved
-/// where it came from another machine (`from_elsewhere`, K4), whose clone Slates lands against its capture only from its
-/// stage 2 ([`landing`]).
-pub fn arrived(m: &Made, from_elsewhere: bool) -> anyhow::Result<Made> {
-    arrived_under(m, &here()?.root, from_elsewhere)
-}
-
-/// [`arrived`] with this machine's place for workspaces `root`.
-fn arrived_under(m: &Made, root: &Path, from_elsewhere: bool) -> anyhow::Result<Made> {
-    Ok(Made { moved: m.moved || from_elsewhere, ..placed_under(m, root)? })
+/// Workspace `m` as this machine places it ([`placed_under`] its place for workspaces): a workspace that arrived here
+/// with its agent (K4). A captured clone that moved lands here against its capture as on the runner it came from: its
+/// move carried what Slates judges by (Slates' A-503).
+pub fn placed_here(m: &Made) -> anyhow::Result<Made> {
+    placed_under(m, &here()?.root)
 }
 
 /// Workspace `m` as this machine places it, its place for workspaces `root`: where its mount names another machine's
@@ -1194,11 +1208,9 @@ fn drift_volume(m: &Made) -> &str {
     m.base.as_ref().map_or(&m.volume, |b| &b.volume)
 }
 
-/// The landing of workspace `m`'s head into `over`, each of `excludes` left out. None for a workspace that moved here
-/// from another runner (K4): Slates lands a moved clone as a volume with no capture (every file a creation, no removal
-/// carried) until its move carries the capture (Slates' A-424 stage 2), so kiln refuses it rather than write that.
+/// The landing of workspace `m`'s head into `over`, each of `excludes` left out: one that moved here from another runner
+/// is landed as any (Slates judges a moved captured clone against its capture, its A-503).
 fn landing(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<LandingRequest> {
-    anyhow::ensure!(!m.moved, "its workspace moved here from another runner, and Slates writes a moved workspace back against the folder it was captured from only from its next step (its A-424 stage 2): put the work up for review instead");
     Ok(LandingRequest { volume: volume_id(&m.volume)?, snapshot: None, target: over.to_owned(), filter: Filter { include: Vec::new(), exclude: excludes.to_vec() } })
 }
 
@@ -1262,7 +1274,7 @@ fn count_changed(text: &str) -> usize {
 }
 
 /// The files a landing's plan would write, create, delete or set the mode of (not counting directories). A mode git keeps
-/// no part of (any permission bit but the executable one, a Windows attribute) is counted all the same, where git's
+/// no part of (any permission bit but its owner's execute, a Windows attribute) is counted all the same, where git's
 /// count of what changed has no record of it: such a landing is held back for review rather than judged by a count that
 /// can't tell it from build output git ignores (Slates' contract 41, `chmod`).
 fn planned_files(plan: &Value) -> usize {
@@ -1281,14 +1293,15 @@ fn planned_files(plan: &Value) -> usize {
 /// which kiln won't write into a person's folder. One with no mount is judged by its landing's entries instead.
 pub async fn writable(m: &Made, over: &str, plan: &Value, excludes: &[String]) -> Result<(), String> {
     let planned = planned_files(plan);
-    // One with no mount has no working tree for git to look at: what git ignores among what its landing writes, past the
-    // `excludes` it was planned with (themselves read from its volume, [`excludes`]), is read from its entries and its
-    // own `.gitignore` files (kiln goal 01a1ec34…, `super::review::ignored_writes`).
+    // One with no mount has no working tree for git to look at: what git doesn't see among what its landing writes, past
+    // the `excludes` it was planned with (themselves read from its volume, [`excludes`]): what git ignores, read from its
+    // entries and its own `.gitignore` files, and a mode git keeps no part of on a file it tracks (kiln goal 01a1ec34…,
+    // `super::review::unseen_writes`).
     if m.mount.is_empty() {
-        let ignored = super::review::ignored_writes(m, over, excludes).await.map_err(|e| format!("{e:#}"))?;
-        return match ignored {
+        let unseen = super::review::unseen_writes(m, over, excludes).await.map_err(|e| format!("{e:#}"))?;
+        return match unseen {
             0 => Ok(()),
-            n => Err(format!("it would also write {n} file{} git ignores (build output, dependencies) into the folder, made since kiln read what git ignores in it: plan it again once the agent's build is done, or put the work up for review instead", if n == 1 { "" } else { "s" })),
+            n => Err(format!("it would also write {n} file{} git doesn't see changed into the folder: what git ignores (build output, dependencies) made since kiln read what git ignores in it, or a mode git keeps no part of: plan it again once the agent's build is done, or put the work up for review instead", if n == 1 { "" } else { "s" })),
         };
     }
     let changed = git_changed(m).await.map_err(|e| format!("{e:#}"))?;
@@ -1712,6 +1725,11 @@ mod tests {
         assert_eq!(of(MountMissing::WinFsp), WorkspaceMissing::WinFsp);
         assert_eq!(of(MountMissing::MountNfs), WorkspaceMissing::MountNfs);
         assert_eq!(missing_of(&MountFault::NoNfsListener), WorkspaceMissing::Mount, "any other refusal: a mount kiln makes");
+        // Contract 42's unmount refusals (Slates' A-507) say nothing the machine lacks: kiln's own can't-mount refusal.
+        let path = || "/state/workspaces/kiln-a".to_owned();
+        for fault in [MountFault::Busy { path: path() }, MountFault::StillMounted { path: path() }, MountFault::MountTable { path: path(), errno: None }] {
+            assert_eq!(missing_of(&fault), WorkspaceMissing::Mount, "{fault}");
+        }
     }
 
     /// W1: kiln speaks the contract it was written against; a re-vendor that moves it fails here, beside the matches
@@ -1938,39 +1956,23 @@ mod tests {
     /// A captured clone's record, as a fleet runner makes one (K5).
     fn captured() -> Made {
         let base = Some(Base { volume: "00017f80ff10abcdef1234567890ffff".into(), snapshot: 7 });
-        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base, moved: false }
+        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base }
     }
 
-    /// K5 (kiln goal 95101ef32ffb8b099942fe076619c310): a workspace that arrives from another machine is placed as K4
-    /// places it and marked moved; one an older runner process of this machine hands over is placed and not marked; one
-    /// marked once stays marked.
+    /// A-503 (kiln goal 95101ef32ffb8b099942fe076619c310): a captured clone that moved here with its agent is placed under
+    /// this machine's own place and written back as any workspace is, into its folder with what git ignores left out:
+    /// Slates judges it against its capture, which its move carried. Until A-503 kiln refused it.
     #[cfg(unix)]
     #[test]
-    fn k5_a_workspace_from_another_machine_is_marked_moved_and_a_local_hand_over_is_not() -> anyhow::Result<()> {
+    fn a503_a_workspace_that_moved_here_is_written_back_as_any_workspace_is() -> anyhow::Result<()> {
         let scratch = tempfile::tempdir()?;
         let root = scratch.path().join("workspaces");
         let came = captured();
-        let moved = arrived_under(&came, &root, true)?;
-        assert_eq!(moved, Made { moved: true, ..placed_under(&came, &root)? });
         let here = placed_under(&came, &root)?;
-        assert_eq!(arrived_under(&here, &root, false)?, here, "a hand-over between two runner processes of this machine moves nothing");
-        assert!(arrived_under(&moved, &root, false)?.moved, "a workspace that moved stays moved");
-        Ok(())
-    }
-
-    /// K5: a workspace that moved here is written back to no folder (Slates lands a moved clone against its capture only
-    /// from its A-424 stage 2: before, as a volume with no capture, every file a creation and no removal carried); one
-    /// that stayed lands into its folder as before.
-    #[test]
-    fn k5_a_moved_workspace_is_written_back_nowhere_until_slates_carries_its_capture() -> anyhow::Result<()> {
-        let stayed = captured();
-        let request = landing(&stayed, "/src/kiln", &["/.git".to_owned()])?;
+        assert_eq!(here, Made { mount: super::super::place::real(&root).join("kiln-a").to_string_lossy().into_owned(), ..came });
+        let request = landing(&here, "/src/kiln", &["/.git".to_owned()])?;
         assert_eq!((request.target.as_str(), request.filter.exclude.as_slice()), ("/src/kiln", ["/.git".to_owned()].as_slice()));
-        let refused = match landing(&Made { moved: true, ..stayed }, "/src/kiln", &[]) {
-            Ok(request) => anyhow::bail!("a moved workspace's landing was asked: {request:?}"),
-            Err(e) => format!("{e:#}"),
-        };
-        assert!(refused.contains("moved here from another runner"), "{refused}");
+        assert_eq!(request.volume, volume_id(&here.volume)?);
         Ok(())
     }
 
@@ -2000,18 +2002,23 @@ mod tests {
         }
     }
 
-    /// K5: a workspace's record from before (an overlay's: no base, never moved) reads as it did and is written as it was,
-    /// so a runner or server of either age reads the other's; a captured clone's carries its base, and a moved one says so.
+    /// K5: a workspace's record from before (an overlay's: no base) reads as it did and is written as it was, so a runner
+    /// or server of either age reads the other's; a captured clone's carries its base. A record K5's runners wrote with
+    /// `moved` (A-503 made the field go) reads as the same workspace.
     #[test]
     fn k5_a_workspace_record_from_before_reads_and_writes_as_it_did() -> anyhow::Result<()> {
         let before = json!({"volume": "00017f80ff10abcdef123456789abcde", "name": "kiln-a", "mount": "/w/kiln-a"});
         let read: Made = serde_json::from_value(before.clone())?;
-        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None, moved: false });
+        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None });
         assert_eq!(serde_json::to_value(&read)?, before);
-        let moved = Made { moved: true, ..captured() };
-        let written = serde_json::to_value(&moved)?;
-        assert_eq!((written.pointer("/base/snapshot"), written.get("moved")), (Some(&json!(7)), Some(&json!(true))));
-        assert_eq!(serde_json::from_value::<Made>(written)?, moved);
+        let clone = captured();
+        let mut written = serde_json::to_value(&clone)?;
+        assert_eq!(written.pointer("/base/snapshot"), Some(&json!(7)));
+        assert_eq!(serde_json::from_value::<Made>(written.clone())?, clone);
+        if let Some(fields) = written.as_object_mut() {
+            fields.insert("moved".to_owned(), json!(true));
+        }
+        assert_eq!(serde_json::from_value::<Made>(written)?, clone, "a K5 runner's moved record");
         Ok(())
     }
 

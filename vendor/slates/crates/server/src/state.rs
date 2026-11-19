@@ -30,13 +30,13 @@ pub struct ClientSlot {
   pub principal: Principal,
   /// The client id.
   pub client_id: u32,
-  /// The client's process id (the liveness probe's input where no socket closes).
+  /// The client's process id (the hang-up watch's input where no control socket closes: macOS, Windows; A-475).
   pub pid: u32,
-  /// When the client last wrote a slot (any kind); a client silent past the liveness budget
-  /// is asked about.
-  pub last_seen_ns: u64,
   /// Dead ring admission is closed while its attachments are retired on all owner shards (§4.7).
   pub(crate) retiring: bool,
+  /// The watch awaiting this client's hang-up (A-475, `crate::reap::watch`): set at admission, cleared at its report,
+  /// and cancelled by a seat that ends first (`crate::reap::end_unproven`).
+  pub(crate) watch: Option<slates_rt::TaskId>,
   /// Set once the client has proven its id with its session key (`crate::session_key`), checked before its first
   /// request is served. A slot never proven is ended without retiring its id's attachments (`reap::end_unproven`):
   /// they belong to the id's owner, whom a stranger naming the id is not.
@@ -67,6 +67,12 @@ pub struct ClientSlot {
   /// The volumes of other hosts this client asked for an attachment of in the record form (A-222), so its reap ends
   /// them at their owners (`crate::remote_attach::reap_at_owners`). Bounded by `crate::remote_attach::bound`.
   pub(crate) remote_volumes: Vec<slates_ipc::protocol::VolumeId>,
+  /// The direct maps this shard sent the client over its control socket whose replies have not reached it yet (Linux,
+  /// A-188, A-505; `crate::direct_map`). A copy's shard that lost the answer to its send asks again, and that ask is
+  /// answered from here, so a copy is never sent twice. Each leaves when its reply is delivered here, after every ask
+  /// about it has run, since one channel carries the asks and the reply in order. So it holds at most the client's maps
+  /// in flight, each within the client's share of its copy's shard, and it is released with this client.
+  pub(crate) maps_sent: std::collections::BTreeSet<u64>,
 }
 
 impl std::fmt::Debug for ClientSlot {
@@ -103,6 +109,13 @@ pub struct VolumeSlot {
   /// A strict (`--locked`) volume's entitlement, held against the daemon's lock capacity (§4.2 D-12,
   /// `lock_ledger`); returned when the slot drops.
   pub lock_credit: Option<crate::lock_ledger::LockCredit>,
+  /// The seal this volume's owner shard took once it served the volume a planned move handed it (A-291,
+  /// `verbs::seal_adopted_head`): the adopted head snapshot the seal superseded and the seal's head epoch. The control
+  /// shard learns the seal only from this shard's answer, and an answer lost to a shard that stopped for a window (the
+  /// caller forgot the call, and the shard ran it once it resumed) left the control shard asking again, which took a
+  /// second seal and left the adopted snapshot behind for good (A-488). A second ask answers this record. It lives and
+  /// ends with the slot, so a volume released and made again never carries one adoption's seal into another.
+  pub adopted_seal: Option<(slates_db::catalog::SnapshotId, u64)>,
 }
 
 impl std::fmt::Debug for VolumeSlot {
@@ -298,10 +311,10 @@ pub struct ShardState {
   /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
   /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
   pub(crate) refill_settled: Option<u64>,
-  /// The bytes one idle give-back step walks (A-226), the recovery memory's and the write log's alike: what the OS gave
-  /// back in one step quantum the last time, measured by each step for the next (`daemon::learn_give_back_rate`); zero
-  /// until the first, which takes a page.
-  pub(crate) give_back_slice_bytes: usize,
+  /// What one idle give-back step walks (A-226), the recovery memory's and the write log's alike: the bytes the shard
+  /// gave back in one step quantum of its own thread's CPU, measured by the steps for the next (A-491,
+  /// `daemon::GiveBackRate`); a page until the first rate is learned.
+  pub(crate) give_back_rate: crate::daemon::GiveBackRate,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
@@ -536,6 +549,10 @@ pub struct ShardState {
   /// the partition's attachment cap.
   #[cfg(target_os = "macos")]
   pub(crate) own_nfs_mounts: BTreeMap<u64, crate::own_nfs::OwnNfsMount>,
+  /// Whether this shard's watch of the kernel's unmounts runs (A-511, `crate::own_nfs::watch`): started once the shard
+  /// holds an own NFS mount, ended by the watch itself once it holds none.
+  #[cfg(target_os = "macos")]
+  pub(crate) unmount_watch: bool,
   /// The Windows WinFsp mounts this shard serves, by attachment (§4.6 "Windows"; `crate::winfsp`). Bounded by the
   /// partition's attachment cap: one entry per live WinFsp attachment at most.
   #[cfg(windows)]
@@ -667,6 +684,18 @@ pub struct ShardState {
   pub deferred: Vec<Deferred>,
   /// The shard's server task, woken when a client is added while it idles.
   pub server_task: Option<slates_rt::TaskId>,
+  /// The clients whose watches reported them gone and whose retirement is owed, each with its id (A-475): a seat joins
+  /// once, at its report, so the queue is bounded by the shard's seats (`clients_per_shard`). The reaper takes them a
+  /// batch at a time (`crate::reap::reaper`).
+  pub(crate) dead_clients: std::collections::VecDeque<(slates_mem::Handle<ClientSlot>, u32)>,
+  /// The shard's reaper task, woken when a client's watch reports it gone while the reaper idles (A-475).
+  pub(crate) reaper_task: Option<slates_rt::TaskId>,
+  /// The seats whose status capture has a deadline, by it (A-522, `crate::deadlines`): a seat once at most.
+  pub(crate) capture_deadlines: crate::deadlines::CaptureDeadlines,
+  /// The shard's deadline keeper, woken when a deadline is set earlier than the one it sleeps for (A-522).
+  pub(crate) deadline_task: Option<slates_rt::TaskId>,
+  /// The deadline the keeper sleeps until, `None` while none is set (`crate::deadlines::noted` reads it).
+  pub(crate) deadline_armed: Option<u64>,
   /// Listing pages in flight: by request word, the client slot, the shards still to answer, and
   /// their parts so far, each at most a page (a scatter-gather over owners, §4.8 "Lookup"; §4.4 `list`).
   pub(crate) scatters: BTreeMap<u64, (u32, usize, crate::verbs::ListParts)>,
@@ -722,9 +751,6 @@ pub struct ShardState {
   /// work retirement moves this to exactly what the engine holds. Balanced by construction; bounded
   /// by the greens.
   pub green_retention: BTreeMap<VolumeId, u64>,
-  /// The replicas of greens this shard owns or holds (A-457, A-273 step 5a; `crate::green_replicas`): as an owner, the
-  /// shards it fed and the engines it is retiring; as a replica's shard, the replicas it holds and what they charged.
-  pub(crate) green_replicas: crate::green_replicas::GreenReplicas,
   /// The read-ahead windows this shard's clients hold or are fetching (`crate::verbs::ReadAhead`): the bytes charged,
   /// never past `DaemonConfig::read_ahead_bytes`. Charged before a batch is fetched, credited as each window is
   /// replaced, dropped or its client goes.
@@ -925,6 +951,9 @@ pub struct ShardState {
   /// target and the head its move waits to see placed. Bounded by the shard's volumes; an entry leaves when its volume
   /// is released to the target, or thaws.
   pub(crate) moves_out: crate::moves::MovesOut,
+  /// Where each of those moves stands in carrying its captured clone's capture (A-503, `crate::moves::begin_carry`).
+  /// Bounded by the moves; an entry leaves once its carry is recorded, or with its move.
+  pub(crate) move_carries: crate::moves::MoveCarries,
   /// The adoptions of volumes the configuration moved to this node (A-291), driven on the control shard only: per
   /// volume, its round's epoch, the records its cohort reported and its seal. Bounded by the moved-object exceptions
   /// naming this node; an entry leaves once its move is adopted.
@@ -957,6 +986,11 @@ pub struct ShardState {
   pub(crate) learner_fetch: crate::fleet::LearnerFetchLog,
   /// When an uninitialized root learner fetches next, and the wait after it.
   pub(crate) root_learner_pace: crate::fleet::LearnerPace,
+  /// On the control shard: the newest root configuration version a peer showed this node it holds, past the one this
+  /// node holds, and that peer (§4.8 Lookup, D-14 learners, A-489): a location query is bound to its asker's root view,
+  /// so one bound to a newer view than this node's says this node is behind and who is not. The root learner's next
+  /// period fetches from that peer and takes it (`fleet::root_learner_fetch`). One entry, the newest version seen.
+  pub(crate) root_newer_seen: Option<(u64, slates_db::register::HostId)>,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
   /// per-peer link task (`crate::fleet::establish_record_link`) brings its session up on one socket and
   /// installs it here as `Some`; the record-plane coordinator borrows a session for each dispatch — leaving
