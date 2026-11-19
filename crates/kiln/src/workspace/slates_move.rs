@@ -68,6 +68,26 @@ pub enum MoveRefused {
     Slates { said: String },
 }
 
+/// Every kind a move is refused by ([`MoveRefused::kind`]), as a refusal names it (`[kind: x]`): what a mover, or a test of
+/// kiln's Slates fleet under faults (`super::slates_faults`), may take a refusal for.
+pub const KINDS: [&str; 15] = [
+    "not_in_fleet",
+    "setting",
+    "target_not_serving",
+    "older_runner",
+    "shared",
+    "source_away",
+    "attached",
+    "already_moving",
+    "not_plain",
+    "lineage",
+    "snapshots",
+    "not_a_member",
+    "outside_neighbourhood",
+    "unplaced",
+    "slates",
+];
+
 impl MoveRefused {
     /// Slates' typed answer to a move, by kind.
     pub fn of(e: &slates_api::Error) -> MoveRefused {
@@ -214,6 +234,35 @@ pub async fn move_out(m: &Made, to: &VolumeMove) -> Result<(), MoveRefused> {
 
 #[cfg(test)]
 mod tests {
+    /// A-580. Do: take every refusal a move can end in, one of each, and their kinds. Expect each kind in [`KINDS`], and
+    /// [`KINDS`] to hold those kinds alone, each once: the list a test judges a refusal by never drifts from the kinds a
+    /// refusal names.
+    #[test]
+    fn every_refusals_kind_is_listed_and_the_list_holds_no_other() {
+        let machine = || "m".to_owned();
+        let every = [
+            MoveRefused::NotInFleet { machine: machine() },
+            MoveRefused::Setting { said: String::new() },
+            MoveRefused::TargetNotServing { machine: machine() },
+            MoveRefused::OlderRunner { machine: machine() },
+            MoveRefused::Shared { with: Vec::new() },
+            MoveRefused::SourceAway { machine: machine() },
+            MoveRefused::Attached,
+            MoveRefused::AlreadyMoving,
+            MoveRefused::NotPlain,
+            MoveRefused::Lineage,
+            MoveRefused::Snapshots,
+            MoveRefused::NotAMember,
+            MoveRefused::OutsideNeighbourhood,
+            MoveRefused::Unplaced,
+            MoveRefused::Slates { said: String::new() },
+        ];
+        let named: std::collections::BTreeSet<&str> = every.iter().map(MoveRefused::kind).collect();
+        let listed: std::collections::BTreeSet<&str> = KINDS.iter().copied().collect();
+        assert_eq!(listed.len(), KINDS.len(), "each kind listed once");
+        assert_eq!(named, listed, "the kinds refusals name are the kinds listed");
+    }
+
     use super::*;
     use crate::workspace::slates_fleet::Member;
 
