@@ -58,10 +58,10 @@ impl std::error::Error for Fault {}
 /// removals, directories moved whole or cleared; none git ignores among what it doesn't track. Empty where nothing
 /// changed.
 pub async fn changes(m: &Made, over: &str) -> anyhow::Result<Vec<Change>> {
-    let (tracked, ignores) = git_rules(Path::new(over)).await?;
+    let (tracked, ignores, modes) = git_rules(Path::new(over)).await?;
     let volume = super::slates::volume_id(&m.volume)?;
     let over = over.to_owned();
-    let read = super::slates::call("review", move |i| Ok(changes_of(i, volume, &over, &tracked, ignores))).await?;
+    let read = super::slates::call("review", move |i| Ok(changes_of(i, volume, &over, &tracked, ignores, &modes))).await?;
     read.map_err(|e| anyhow::anyhow!("its review: {e}"))
 }
 
@@ -69,7 +69,7 @@ pub async fn changes(m: &Made, over: &str) -> anyhow::Result<Vec<Change>> {
 /// a write git ignores (none tracked), or a mode git keeps no part of set on a file it tracks ([`unseen_mode_change`]):
 /// what a working tree's `git status` would leave out, for a workspace with no working tree on this machine.
 pub async fn unseen_writes(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<usize> {
-    let (tracked, mut ignores) = git_rules(Path::new(over)).await?;
+    let (tracked, mut ignores, modes) = git_rules(Path::new(over)).await?;
     let volume = super::slates::volume_id(&m.volume)?;
     let (over, excludes) = (over.to_owned(), excludes.to_vec());
     let counted = super::slates::call("review", move |i| {
@@ -77,7 +77,7 @@ pub async fn unseen_writes(m: &Made, over: &str, excludes: &[String]) -> anyhow:
             Ok(entries) => entries
                 .iter()
                 .try_fold(0usize, |n, entry| {
-                    let unseen = unseen_mode_change(entry, &tracked) || (writes_untracked(entry, &tracked) && ignored(i, volume, &mut ignores, entry)?);
+                    let unseen = unseen_mode_change(entry, &tracked, &modes) || (writes_untracked(entry, &tracked) && ignored(i, volume, &mut ignores, entry)?);
                     Ok::<usize, Fault>(if unseen { n.saturating_add(1) } else { n })
                 }),
             Err(fault) => Err(fault),
@@ -134,20 +134,31 @@ fn ignored_prefixes(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, t
     Ok(out)
 }
 
-/// The paths the repository at `top` tracks (its index), and git's ignore rules beneath a volume's own `.gitignore`
-/// files there: its `info/exclude`, the user's excludes file (`core.excludesFile`, else git's own default) and whether
-/// names match whatever their case (`core.ignoreCase`).
-async fn git_rules(top: &Path) -> anyhow::Result<(HashSet<String>, Ignores)> {
+/// The paths the repository at `top` tracks (its index), git's ignore rules beneath a volume's own `.gitignore` files
+/// there (its `info/exclude`, the user's excludes file, `core.excludesFile` else git's own default, and whether names
+/// match whatever their case, `core.ignoreCase`), and how it records files' modes ([`Modes`]).
+async fn git_rules(top: &Path) -> anyhow::Result<(HashSet<String>, Ignores, Modes)> {
     let tracked = super::git::tracked(top).await?;
     let (info, user, case_insensitive) = super::git::excludes(top).await?;
-    Ok((tracked, Ignores::new(info.as_deref(), user.as_deref(), case_insensitive)?))
+    let modes = Modes { trusted: true, executable_in_index: HashSet::new() };
+    Ok((tracked, Ignores::new(info.as_deref(), user.as_deref(), case_insensitive)?, modes))
+}
+
+/// How a repository's git records a file's mode: whether it trusts files' execute bits (`core.fileMode`), and, where it
+/// trusts none, the paths its index holds executable, the mode it keeps for each (git's `ce_mode_from_stat`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Modes {
+    /// Whether git records files' execute bits (`core.fileMode`, true unless set false).
+    trusted: bool,
+    /// The paths the index holds as executable files (`100755`), read where git trusts no execute bit.
+    executable_in_index: HashSet<String>,
 }
 
 /// [`changes`] on one client, its review made again from a new snapshot where a file moved since the last one.
-fn changes_of(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String>, mut ignores: Ignores) -> Result<Vec<Change>, Fault> {
+fn changes_of(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String>, mut ignores: Ignores, modes: &Modes) -> Result<Vec<Change>, Fault> {
     let mut moving = String::new();
     for _ in 0..TRIES {
-        match once(i, volume, over, tracked, &mut ignores)? {
+        match once(i, volume, over, tracked, &mut ignores, modes)? {
             Read::Changes(changes) => return Ok(changes),
             Read::Moved(path) => moving = path,
         }
@@ -161,9 +172,9 @@ enum Read {
     Moved(String),
 }
 
-fn once(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String>, ignores: &mut Ignores) -> Result<Read, Fault> {
+fn once(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String>, ignores: &mut Ignores, modes: &Modes) -> Result<Read, Fault> {
     let snapshot = i.snapshot(volume).map_err(Fault::Slates)?;
-    let read = present(i, volume, Some(snapshot), over, &super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()).and_then(|entries| read_entries(i, volume, over, entries, tracked, ignores));
+    let read = present(i, volume, Some(snapshot), over, &super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()).and_then(|entries| read_entries(i, volume, over, entries, tracked, ignores, modes));
     // The snapshot is the review's alone: let go of it whatever came of it.
     let gone = i.destroy_snapshot(volume, snapshot).map_err(Fault::Slates);
     let read = read?;
@@ -188,14 +199,14 @@ fn present(i: &mut Instance, volume: VolumeId, snapshot: Option<SnapshotId>, ove
 /// file whose executable bit alone changed read there and checked against the folder's copy at `over`, whose bytes its
 /// landing keeps; what git ignores among what it doesn't track left out; the path whose bytes moved since the entries
 /// were presented, where one did.
-fn read_entries(i: &mut Instance, volume: VolumeId, over: &str, entries: Vec<PlannedEntry>, tracked: &HashSet<String>, ignores: &mut Ignores) -> Result<Read, Fault> {
+fn read_entries(i: &mut Instance, volume: VolumeId, over: &str, entries: Vec<PlannedEntry>, tracked: &HashSet<String>, ignores: &mut Ignores, modes: &Modes) -> Result<Read, Fault> {
     let mut changes = Vec::with_capacity(entries.len());
     for entry in entries {
         if writes_untracked(&entry, tracked) && ignored(i, volume, ignores, &entry)? {
             continue;
         }
         let path = relative(&entry.path);
-        let executable_now = executable_change(&entry);
+        let executable_now = executable_change(&entry, modes);
         let change = match entry.action {
             PlannedAction::Create | PlannedAction::Replace => {
                 let content = entry.content.ok_or_else(|| Fault::Other(format!("{path}: Slates writes it with no bytes named")))?;
@@ -203,7 +214,8 @@ fn read_entries(i: &mut Instance, volume: VolumeId, over: &str, entries: Vec<Pla
                 if blake3::hash(&bytes).as_bytes() != &content.hash {
                     return Ok(Read::Moved(path));
                 }
-                Change::File { path, bytes, executable: entry.mode.is_some_and(git_executable) }
+                let executable = recorded_executable(entry.mode, &path, modes);
+                Change::File { path, bytes, executable }
             }
             PlannedAction::Symlink { target } => Change::Link { path, target },
             PlannedAction::Delete => Change::Gone { path },
@@ -241,7 +253,7 @@ fn git_executable(mode: u32) -> bool {
 /// `PlannedAction::Chmod`): the file executable or not as it lands ([`git_executable`]), where that changed, the one part
 /// of a mode git keeps (its two file modes); none where only another permission bit or a Windows attribute changed, of
 /// which a commit of the volume's working tree holds nothing, and none for any other entry.
-fn executable_change(entry: &PlannedEntry) -> Option<bool> {
+fn executable_change(entry: &PlannedEntry, _modes: &Modes) -> Option<bool> {
     let PlannedAction::Chmod { permissions_was, .. } = entry.action else { return None };
     let executable = entry.mode.is_some_and(git_executable);
     (executable != git_executable(permissions_was)).then_some(executable)
@@ -251,8 +263,13 @@ fn executable_change(entry: &PlannedEntry) -> Option<bool> {
 /// Windows attribute): a change git doesn't see, which holds a landing back for review as a mounted workspace's is held
 /// by git's own count (A-496's rule, `super::slates::writable`). A file git doesn't track is listed by git whatever its
 /// mode, and its ignore rules judge it ([`writes_untracked`]).
-fn unseen_mode_change(entry: &PlannedEntry, tracked: &HashSet<String>) -> bool {
-    matches!(entry.action, PlannedAction::Chmod { .. }) && tracked.contains(&relative(&entry.path)) && executable_change(entry).is_none()
+fn unseen_mode_change(entry: &PlannedEntry, tracked: &HashSet<String>, modes: &Modes) -> bool {
+    matches!(entry.action, PlannedAction::Chmod { .. }) && tracked.contains(&relative(&entry.path)) && executable_change(entry, modes).is_none()
+}
+
+/// Whether git records a file of `mode` written at `path` as executable (red step: its owner's execute bit alone).
+fn recorded_executable(mode: Option<u32>, _path: &str, _modes: &Modes) -> bool {
+    mode.is_some_and(git_executable)
 }
 
 /// A path from the target's root (`/src/a.rs`) as git names it within the repository (`src/a.rs`).
@@ -293,6 +310,16 @@ mod tests {
         PlannedEntry { path: "/bin/run.sh".to_owned(), action, content: None, mode, witnessed: true, conflict: None }
     }
 
+    /// A repository whose git records files' execute bits (`core.fileMode` true, git's default).
+    fn trusted() -> Modes {
+        Modes { trusted: true, executable_in_index: HashSet::new() }
+    }
+
+    /// [`executable_change`] where git records files' execute bits.
+    fn executable_change_trusted(entry: &PlannedEntry) -> Option<bool> {
+        executable_change(entry, &trusted())
+    }
+
     /// A file's mode or Windows attribute bits alone set: the permission bits it had, the attribute bits it had and
     /// those it lands with.
     fn chmod(permissions_was: u32, windows_was: u16, windows: u16) -> PlannedAction {
@@ -304,12 +331,12 @@ mod tests {
     /// since git keeps a file's executable bit alone of its mode; and no other entry is judged a mode change.
     #[test]
     fn w8_a_files_mode_alone_changed_is_committed_where_git_keeps_it() {
-        assert_eq!(executable_change(&entry(chmod(0o644, 0, 0), Some(0o100_755))), Some(true), "made executable");
-        assert_eq!(executable_change(&entry(chmod(0o755, 0, 0), Some(0o100_644))), Some(false), "made not executable");
-        assert_eq!(executable_change(&entry(chmod(0o750, 0, 0), Some(0o100_700))), None, "its group's bits alone: git keeps none of them");
-        assert_eq!(executable_change(&entry(chmod(0o644, 0x20, 0x01), Some(0o100_644))), None, "a Windows attribute alone");
-        assert_eq!(executable_change(&entry(chmod(0o644, 0, 0), None)), None, "no mode named lands as it was: not executable");
-        assert_eq!(executable_change(&entry(PlannedAction::Replace, Some(0o100_755))), None, "a written file is no mode change");
+        assert_eq!(executable_change_trusted(&entry(chmod(0o644, 0, 0), Some(0o100_755))), Some(true), "made executable");
+        assert_eq!(executable_change_trusted(&entry(chmod(0o755, 0, 0), Some(0o100_644))), Some(false), "made not executable");
+        assert_eq!(executable_change_trusted(&entry(chmod(0o750, 0, 0), Some(0o100_700))), None, "its group's bits alone: git keeps none of them");
+        assert_eq!(executable_change_trusted(&entry(chmod(0o644, 0x20, 0x01), Some(0o100_644))), None, "a Windows attribute alone");
+        assert_eq!(executable_change_trusted(&entry(chmod(0o644, 0, 0), None)), None, "no mode named lands as it was: not executable");
+        assert_eq!(executable_change_trusted(&entry(PlannedAction::Replace, Some(0o100_755))), None, "a written file is no mode change");
     }
 
     /// W8 (Slates' contract 41): git's ignore rules judge an untracked file whose mode alone changes as they judge one
@@ -331,9 +358,9 @@ mod tests {
     /// whatever the others' were.
     #[test]
     fn w8_git_judges_a_file_executable_by_its_owners_execute_bit_alone() {
-        assert_eq!(executable_change(&entry(chmod(0o644, 0, 0), Some(0o100_655))), None, "the group's and others' execute set, the owner's not");
-        assert_eq!(executable_change(&entry(chmod(0o755, 0, 0), Some(0o100_655))), Some(false), "the owner's execute cleared, the others' kept");
-        assert_eq!(executable_change(&entry(chmod(0o611, 0, 0), Some(0o100_711))), Some(true), "the owner's execute set beside the others' already set");
+        assert_eq!(executable_change_trusted(&entry(chmod(0o644, 0, 0), Some(0o100_655))), None, "the group's and others' execute set, the owner's not");
+        assert_eq!(executable_change_trusted(&entry(chmod(0o755, 0, 0), Some(0o100_655))), Some(false), "the owner's execute cleared, the others' kept");
+        assert_eq!(executable_change_trusted(&entry(chmod(0o611, 0, 0), Some(0o100_711))), Some(true), "the owner's execute set beside the others' already set");
         assert!(!git_executable(0o100_655) && !git_executable(0o100_011), "the group's or others' execute alone: 100644 to git");
         assert!(git_executable(0o100_744) && git_executable(0o100_700), "the owner's execute: 100755 to git");
     }
@@ -345,10 +372,26 @@ mod tests {
     #[test]
     fn w6_a_mode_change_git_cant_see_on_a_tracked_file_holds_its_landing_back() {
         let tracked: HashSet<String> = ["bin/run.sh".to_owned()].into_iter().collect();
-        assert!(unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_654)), &tracked), "the group's execute alone");
-        assert!(unseen_mode_change(&entry(chmod(0o644, 0x20, 0x01), Some(0o100_644)), &tracked), "a Windows attribute alone");
-        assert!(!unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_744)), &tracked), "the owner's execute: git sees it");
-        assert!(!unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_654)), &HashSet::new()), "untracked: git lists the file itself");
-        assert!(!unseen_mode_change(&entry(PlannedAction::Replace, Some(0o100_644)), &tracked), "a write is no mode change");
+        assert!(unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_654)), &tracked, &trusted()), "the group's execute alone");
+        assert!(unseen_mode_change(&entry(chmod(0o644, 0x20, 0x01), Some(0o100_644)), &tracked, &trusted()), "a Windows attribute alone");
+        assert!(!unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_744)), &tracked, &trusted()), "the owner's execute: git sees it");
+        assert!(!unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_654)), &HashSet::new(), &trusted()), "untracked: git lists the file itself");
+        assert!(!unseen_mode_change(&entry(PlannedAction::Replace, Some(0o100_644)), &tracked, &trusted()), "a write is no mode change");
+    }
+
+    /// W8 (git's `core.fileMode`: environment.c lines 327-329 at git e1ec09b23 set `trust_executable_bit` from it, 1 by
+    /// default at line 788; where false, `ce_mode_from_stat`, read-cache.h lines 23-27, keeps the mode the index holds for
+    /// a regular file and gives one it doesn't hold `create_ce_mode(0666)`): where a repository trusts no execute bit, a
+    /// review records a written file as its index does, not executable where it holds none, and a mode-only change is none
+    /// to git, held back as one git doesn't see (A-496's rule).
+    #[test]
+    fn w8_where_git_trusts_no_execute_bit_a_review_records_none() {
+        let untrusted = Modes { trusted: false, executable_in_index: ["bin/run.sh".to_owned()].into_iter().collect() };
+        assert!(!recorded_executable(Some(0o100_755), "bin/new.sh", &untrusted), "a path the index doesn't hold: 100644, whatever its mode");
+        assert!(recorded_executable(Some(0o100_644), "bin/run.sh", &untrusted), "a path the index holds executable stays so, whatever its mode");
+        assert_eq!(executable_change(&entry(chmod(0o644, 0, 0), Some(0o100_755)), &untrusted), None, "a mode-only change is none to git");
+        let tracked: HashSet<String> = ["bin/run.sh".to_owned()].into_iter().collect();
+        assert!(unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_755)), &tracked, &untrusted), "and holds its landing back");
+        assert!(recorded_executable(Some(0o100_755), "bin/new.sh", &trusted()), "where git trusts it: the owner's execute bit");
     }
 }
