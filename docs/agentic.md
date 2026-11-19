@@ -548,7 +548,8 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    means the same inside (the agent's folder, its environment moved onto the mount (W2), a child started in its folder
    working in its volume): nothing is translated. Where the profile forwards a container's ids as the host's own (a
    rootful Linux engine), the container runs as the person's uid and gid, so what the agent makes is theirs and the
-   permission bits hold.
+   permission bits hold; under rootless podman (`ContainerRootAsMountingUser`) it runs as the container's root, which
+   the engine maps to the person, the one id an unshared mount admits.
 5. **Its end.** The container goes first (its engine lets go of the files it held open), then the binding is detached,
    then the mount comes down as W3's does.
 
@@ -558,8 +559,10 @@ On each platform:
   rootful Docker Engine over a shared mount (its T-4.13 Linux leg, its linux-oci CI lane) and with rootless podman (a
   program in the container mapping a Slates file through the bound mount: its G-mount step 3, 2026-10-25). Slates' judge
   holds the rootful Docker Engine's profile (`ContainerIdsAsHostIds`; every name of a hard-linked file served at once)
-  and still refuses a rootless engine (`UserNamespaceUntested`) and podman's command line (`RuntimeUnsupported`), which
-  Slates has run since: their profiles are Slates' to add (A-520).
+  and, since its A-520 third piece (contract 48), rootless podman's on its own Linux host (`engine_profile("podman")`:
+  `ContainerRootAsMountingUser` over an unshared mount, which needs no `user_allow_other`), the case that needs no
+  privilege anywhere; it still refuses a rootless Docker engine, podman run as root and a remote podman, each typed.
+  Rootless podman's live check (the container's other ids refused, its hard links) is Slates' run, filed.
 - **macOS.** Docker Desktop runs its engine in a Linux VM, and a bind's source resolves there, through Desktop's file
   sharing, which carries the Mac's folders into the VM over the Virtualization framework's virtio-fs device (Slates
   measured `virtiofs0 /run/host_virtiofs/Users` on 2026-10-27; `/private` is shared as `/run/host_mark/private`,
