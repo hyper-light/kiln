@@ -2136,8 +2136,9 @@ mod tests {
         // asked for a person, HarnessHistoryFor (80); kiln plan 01a1dd2e… P2.3 a runner's engine, RunnerEngine (81);
         // CP-T3.2 the room a hand-over's spool leaves, AdoptPolicy (82); kiln plan 01a1dd2e… P7.1b a replay, Replay (83);
         // kiln plan 01a1dd2e… P4.5 an Agentfile's build ahead of its sessions, Prebuild (84), and where it is, Prebuilt (73);
-        // kiln plan 01a1dd2e… P6.2 an agent's volumes on a runner, Volumes (85).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (74, 86), "each table has every variant once");
+        // kiln plan 01a1dd2e… P6.2 an agent's volumes on a runner, Volumes (85); docs/agentic.md W10 a runner's
+        // certificate reissued in its role and its word it took it, RunnerRole (86 and 74).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (75, 87), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
