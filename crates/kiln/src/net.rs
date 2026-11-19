@@ -1860,6 +1860,123 @@ mod tests {
         })
     }
 
+    /// The server's next `Connected` with the dual-usage certificate it was made with (one owed a reissue in the runner's
+    /// role), skipping other events; `None` once `within` passes.
+    async fn connected_owing_within(rx: &crate::memory::queue::Receiver<crate::wire::fan::Routed>, within: Duration) -> Option<(PeerId, Option<Vec<u8>>)> {
+        let deadline = Instant::now() + within;
+        loop {
+            match next_event(rx, deadline).await {
+                Ok(NetEvent::Connected { peer, dual_usage, .. }) => return Some((peer, dual_usage)),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// What kiln's CA issues for the runner `name` that may be presented on the link: the runner's own certificate, a Slates
+    /// fleet node's listed at its name (`Pki::sign_slates_node`) and a capacity holder's named as it (`Pki::sign_holder`),
+    /// each with its own key.
+    fn issued_for(pki: &crate::pki::Pki, name: &str) -> anyhow::Result<(Leaf, Leaf, Leaf)> {
+        let request = || -> anyhow::Result<(Vec<u8>, String)> {
+            let key = rcgen::KeyPair::generate()?;
+            let csr = rcgen::CertificateParams::new(Vec::<String>::new())?.serialize_request(&key)?;
+            Ok((csr.der().to_vec(), key.serialize_pem()))
+        };
+        let (csr, key_pem) = request()?;
+        let node = Leaf { cert_pem: crate::pki::cert_pem(&pki.sign_slates_node(&csr, "slates.kiln", 7, Some(name))?), key_pem };
+        let (csr, key_pem) = request()?;
+        let holder = Leaf { cert_pem: crate::pki::cert_pem(&pki.sign_holder(&csr, name)?), key_pem };
+        Ok((pki.issue_local(name)?, node, holder))
+    }
+
+    /// A net thread's spec, the server's when `server`, refusing what `refused` says.
+    fn link_spec(pki: &crate::pki::Pki, bind: SocketAddr, leaf: Leaf, server: bool, refused: crate::identities::LinkRefusals) -> Spec {
+        Spec { bind, ca_der: pki.ca_der.clone(), leaf, server, dial_deadline: if server { DIAL_DEADLINE } else { Duration::from_secs(2) }, revoked_keys: refused.keys, revoked_serials: refused.serials }
+    }
+
+    /// docs/agentic.md W10, the runner's role on the link: kiln's CA signs a Slates fleet node's and a capacity holder's
+    /// certificates for a runner's own name, and each serves both sides of its own links (serverAuth and clientAuth), so a
+    /// link that took any certificate under the CA would take either as that runner. Do: record each as the server does
+    /// when it issues it, start the server with what its store refuses on the link (`identities::link_refusals`), and
+    /// connect with the node's, the holder's, then the runner's own. Expect the node's and the holder's refused, by the kind
+    /// recorded, and the runner's taken.
+    #[test]
+    fn w10_a_node_or_holder_certificate_presented_as_a_runner_is_refused() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(dir.path())?;
+            let store = crate::store::Store::in_memory()?;
+            let (runner, node, holder) = issued_for(&pki, "bench-a")?;
+            crate::identities::record(&store, "slates-node", "bench-a", &node.cert_pem).await?;
+            crate::identities::record(&store, "holder", "bench-a", &holder.cert_pem).await?;
+            let at = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
+            let (_srv, srv_ev) = in_order(link_spec(&pki, at, pki.server_leaf(&[])?, true, crate::identities::link_refusals(&store).await?))?;
+            let mut agents = Vec::new();
+            for (kind, leaf) in [("node", node), ("holder", holder)] {
+                let (agent, agent_ev) = in_order(link_spec(&pki, "127.0.0.1:0".parse()?, leaf, false, crate::identities::LinkRefusals::default()))?;
+                agent.command(Out::Connect { addr: at }).await;
+                assert_eq!(connected_within(&srv_ev, Duration::from_secs(3)).await, None, "a {kind}'s certificate presented as the runner: refused");
+                agents.push((agent, agent_ev));
+            }
+            let (agent, _agent_ev) = in_order(link_spec(&pki, "127.0.0.1:0".parse()?, runner, false, crate::identities::LinkRefusals::default()))?;
+            agent.command(Out::Connect { addr: at }).await;
+            assert!(connected_within(&srv_ev, Duration::from_secs(10)).await.is_some(), "the runner's own certificate connects");
+            Ok(())
+        })
+    }
+
+    /// docs/agentic.md W10: a runner enrolled before machines' certificates held their role (ba0ecd654, 2026-10-17) holds
+    /// one serving both sides, which no record holds (kiln records what it issues since 2026-10-26). Do: connect with it;
+    /// reissue it in the runner's role for its key, as the server does over that link (`identities::reissue_runner_role`);
+    /// have the runner take it up on its link (`Out::Leaf`, which its next connection presents) and its word recorded
+    /// (`identities::runner_role_taken`, the link told); connect again with the old one, and again from the runner that took
+    /// the new one; start a server from the store and connect with the old one; reissue the old one again. Expect the old
+    /// one taken until then, its connection owed a reissue; the new one for the same key and name, in the runner's role, and
+    /// owed nothing; the old one refused once the record exists, and after a restart; and no second reissue.
+    #[test]
+    fn w10_a_dual_usage_runner_is_reissued_once_then_refused_on_its_old_certificate() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(dir.path())?;
+            let store = crate::store::Store::in_memory()?;
+            let old = pki.issue_dual_usage_runner("bench-a")?;
+            let at = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
+            let (srv, srv_ev) = in_order(link_spec(&pki, at, pki.server_leaf(&[])?, true, crate::identities::link_refusals(&store).await?))?;
+            let (agent, _agent_ev) = in_order(link_spec(&pki, "127.0.0.1:0".parse()?, old.clone(), false, crate::identities::LinkRefusals::default()))?;
+            agent.command(Out::Connect { addr: at }).await;
+            let (_, owed) = connected_owing_within(&srv_ev, Duration::from_secs(10)).await.ok_or_else(|| anyhow::anyhow!("the old certificate is taken until it's superseded"))?;
+            let owed = owed.ok_or_else(|| anyhow::anyhow!("a connection with the old certificate is owed a reissue"))?;
+            assert_eq!(owed, crate::pki::der_of(&old.cert_pem)?);
+            let reissued = crate::identities::reissue_runner_role(&store, &pki, &owed).await?;
+            let (was, now) = (crate::pki::fingerprints(&old.cert_pem)?, crate::pki::fingerprints(&reissued.cert_pem)?);
+            assert_eq!(now.key, was.key, "for the runner's own key");
+            assert_eq!(crate::pki::link_role(&crate::pki::der_of(&reissued.cert_pem)?), crate::pki::LinkRole::Runner);
+            let new = Leaf { cert_pem: reissued.cert_pem.clone(), key_pem: old.key_pem.clone() };
+            assert_eq!(crate::pki::leaf_name(&new).as_deref(), Some("bench-a"));
+            agent.renew_leaf(new.clone()).await.map_err(|e| anyhow::anyhow!("the runner takes up its new certificate: {e}"))?;
+            let why = crate::identities::runner_role_taken(&store, &reissued).await?;
+            srv.command(Out::RevokeSerials { serials: vec![reissued.superseded.clone()], why }).await;
+            let (old_again, _old_ev) = in_order(link_spec(&pki, "127.0.0.1:0".parse()?, old.clone(), false, crate::identities::LinkRefusals::default()))?;
+            old_again.command(Out::Connect { addr: at }).await;
+            assert_eq!(connected_within(&srv_ev, Duration::from_secs(3)).await, None, "the old certificate, superseded: refused");
+            agent.command(Out::Disconnect { peer: SERVER_PEER }).await;
+            agent.command(Out::Connect { addr: at }).await;
+            let (_, owed) = connected_owing_within(&srv_ev, Duration::from_secs(10)).await.ok_or_else(|| anyhow::anyhow!("the runner connects with its new certificate"))?;
+            assert_eq!(owed, None, "in the runner's role: nothing owed");
+            let restarted = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
+            let (_srv2, srv2_ev) = in_order(link_spec(&pki, restarted, pki.server_leaf(&[])?, true, crate::identities::link_refusals(&store).await?))?;
+            old_again.command(Out::Connect { addr: restarted }).await;
+            assert_eq!(connected_within(&srv2_ev, Duration::from_secs(3)).await, None, "refused from a restarted server's first handshake");
+            assert!(crate::identities::reissue_runner_role(&store, &pki, &owed_der(&old)?).await.is_err(), "superseded: never reissued again");
+            Ok(())
+        })
+    }
+
+    /// The DER of `leaf`'s certificate.
+    fn owed_der(leaf: &Leaf) -> anyhow::Result<Vec<u8>> {
+        crate::pki::der_of(&leaf.cert_pem)
+    }
+
     /// A test build's fault sends the frames it picks twice, or late: after the next frame on its
     /// lane, or once `LATE_FOR` passes with none.
     #[test]

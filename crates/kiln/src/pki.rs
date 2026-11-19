@@ -622,6 +622,16 @@ impl Pki {
         verify_issued(&self.ca_der, der)
     }
 
+    /// A runner's certificate as kiln issued one before machines' certificates held their role (ba0ecd654,
+    /// 2026-10-17: `machine_params`): serverAuth and clientAuth, its name alone, its serial left to rcgen; a test's
+    /// stand-in for a runner enrolled then, its key made here.
+    #[cfg(test)]
+    pub fn issue_dual_usage_runner(&self, name: &str) -> anyhow::Result<Leaf> {
+        let key = KeyPair::generate()?;
+        let cert = leaf_params(vec![sanitize_name(name)], LEAF_DAYS)?.signed_by(&key, &self.issuer)?;
+        Ok(Leaf { cert_pem: cert.pem(), key_pem: key.serialize_pem() })
+    }
+
     /// Issue a full leaf (key generated here). Used for the server's own in-process local agent.
     pub fn issue_local(&self, name: &str) -> anyhow::Result<Leaf> {
         let key = KeyPair::generate()?;
