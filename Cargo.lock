@@ -4554,8 +4554,11 @@ dependencies = [
  "aws-lc-rs",
  "libc",
  "rustix",
+ "rustls",
  "slates-bridge-oci",
  "slates-machine",
+ "slates-rt",
+ "slates-transport",
  "slates-vfs",
  "windows-sys 0.60.2",
 ]

@@ -65,22 +65,73 @@ pub async fn changes(m: &Made, over: &str) -> anyhow::Result<Vec<Change>> {
     read.map_err(|e| anyhow::anyhow!("its review: {e}"))
 }
 
-/// How many of the files a landing of workspace `m` into `over` writes git ignores (none tracked): what a working
-/// tree's `git status` would leave out, for a workspace with no working tree on this machine.
-pub async fn ignored_writes(m: &Made, over: &str) -> anyhow::Result<usize> {
+/// How many of the files a landing of workspace `m` into `over`, leaving out `excludes`, writes git doesn't see changed:
+/// a write git ignores (none tracked), or a mode git keeps no part of set on a file it tracks ([`unseen_mode_change`]):
+/// what a working tree's `git status` would leave out, for a workspace with no working tree on this machine.
+pub async fn unseen_writes(m: &Made, over: &str, excludes: &[String]) -> anyhow::Result<usize> {
     let (tracked, mut ignores) = git_rules(Path::new(over)).await?;
     let volume = super::slates::volume_id(&m.volume)?;
-    let over = over.to_owned();
+    let (over, excludes) = (over.to_owned(), excludes.to_vec());
     let counted = super::slates::call("review", move |i| {
-        Ok(match present(i, volume, None, &over) {
+        Ok(match present(i, volume, None, &over, &excludes) {
             Ok(entries) => entries
                 .iter()
-                .try_fold(0usize, |n, entry| Ok::<usize, Fault>(if writes_untracked(entry, &tracked) && ignored(i, volume, &mut ignores, entry)? { n.saturating_add(1) } else { n })),
+                .try_fold(0usize, |n, entry| {
+                    let unseen = unseen_mode_change(entry, &tracked) || (writes_untracked(entry, &tracked) && ignored(i, volume, &mut ignores, entry)?);
+                    Ok::<usize, Fault>(if unseen { n.saturating_add(1) } else { n })
+                }),
             Err(fault) => Err(fault),
         })
     })
     .await?;
     counted.map_err(|e| anyhow::anyhow!("what its landing writes: {e}"))
+}
+
+/// What a landing of workspace `m` into `over` writes that git ignores (none tracked), each a prefix of the volume as a
+/// landing's filter leaves it out: the shallowest directory git ignores above it where there is one (`/target`), else
+/// the file itself (`/secret.env`). For a workspace with no working tree on this machine, what `git status --ignored`
+/// would name in one (`super::slates::excludes`).
+pub async fn ignored_paths(m: &Made, over: &str) -> anyhow::Result<Vec<String>> {
+    let (tracked, mut ignores) = git_rules(Path::new(over)).await?;
+    let volume = super::slates::volume_id(&m.volume)?;
+    let over = over.to_owned();
+    let excludes: Vec<String> = super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect();
+    let found = super::slates::call("review", move |i| {
+        Ok(match present(i, volume, None, &over, &excludes) {
+            Ok(entries) => ignored_prefixes(i, volume, &mut ignores, &tracked, &entries),
+            Err(fault) => Err(fault),
+        })
+    })
+    .await?;
+    found.map_err(|e| anyhow::anyhow!("what its landing writes that git ignores: {e}"))
+}
+
+/// The prefixes of `entries` git ignores ([`ignored_paths`]): each untracked write's shallowest ignored ancestor
+/// directory, else itself where git ignores the file; one a prefix found already covers adds none.
+fn ignored_prefixes(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, tracked: &HashSet<String>, entries: &[PlannedEntry]) -> Result<Vec<String>, Fault> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries.iter().filter(|e| writes_untracked(e, tracked)) {
+        let path = relative(&entry.path);
+        if out.iter().any(|p| p.strip_prefix('/').is_some_and(|p| path == p || path.starts_with(&format!("{p}/")))) {
+            continue;
+        }
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut found = None;
+        for depth in 1..parts.len() {
+            let dir = parts.get(..depth).unwrap_or_default().join("/");
+            if ignored_at(i, volume, ignores, &dir, true)? {
+                found = Some(dir);
+                break;
+            }
+        }
+        if found.is_none() && ignored_at(i, volume, ignores, &path, false)? {
+            found = Some(path.clone());
+        }
+        if let Some(prefix) = found {
+            out.push(format!("/{prefix}"));
+        }
+    }
+    Ok(out)
 }
 
 /// The paths the repository at `top` tracks (its index), and git's ignore rules beneath a volume's own `.gitignore`
@@ -112,7 +163,7 @@ enum Read {
 
 fn once(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String>, ignores: &mut Ignores) -> Result<Read, Fault> {
     let snapshot = i.snapshot(volume).map_err(Fault::Slates)?;
-    let read = present(i, volume, Some(snapshot), over).and_then(|entries| read_entries(i, volume, over, entries, tracked, ignores));
+    let read = present(i, volume, Some(snapshot), over, &super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()).and_then(|entries| read_entries(i, volume, over, entries, tracked, ignores));
     // The snapshot is the review's alone: let go of it whatever came of it.
     let gone = i.destroy_snapshot(volume, snapshot).map_err(Fault::Slates);
     let read = read?;
@@ -120,10 +171,10 @@ fn once(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String
     Ok(read)
 }
 
-/// Every entry a landing of `volume` (at `snapshot`, else its head) into `over` writes, `.git` left out, presented
+/// Every entry a landing of `volume` (at `snapshot`, else its head) into `over` writes, `excludes` left out, presented
 /// never writing whatever the volume's mode: none where nothing changed.
-fn present(i: &mut Instance, volume: VolumeId, snapshot: Option<SnapshotId>, over: &str) -> Result<Vec<PlannedEntry>, Fault> {
-    let request = LandingRequest { volume, snapshot, target: over.to_owned(), filter: Filter { include: Vec::new(), exclude: super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect() } };
+fn present(i: &mut Instance, volume: VolumeId, snapshot: Option<SnapshotId>, over: &str, excludes: &[String]) -> Result<Vec<PlannedEntry>, Fault> {
+    let request = LandingRequest { volume, snapshot, target: over.to_owned(), filter: Filter { include: Vec::new(), exclude: excludes.to_vec() } };
     match i.plan_landing(&request).map_err(Fault::Slates)? {
         LandOutcome::ApprovalRequired(approval) => i.approval_entries(&approval).map_err(Fault::Slates),
         // Nothing to write: nothing changed.
@@ -152,7 +203,7 @@ fn read_entries(i: &mut Instance, volume: VolumeId, over: &str, entries: Vec<Pla
                 if blake3::hash(&bytes).as_bytes() != &content.hash {
                     return Ok(Read::Moved(path));
                 }
-                Change::File { path, bytes, executable: entry.mode.is_some_and(|m| m & 0o111 != 0) }
+                Change::File { path, bytes, executable: entry.mode.is_some_and(git_executable) }
             }
             PlannedAction::Symlink { target } => Change::Link { path, target },
             PlannedAction::Delete => Change::Gone { path },
@@ -160,7 +211,7 @@ fn read_entries(i: &mut Instance, volume: VolumeId, over: &str, entries: Vec<Pla
             PlannedAction::Rename { from } => Change::Moved { from: relative(&from), to: path },
             PlannedAction::Mkdir => continue,
             // Its mode or Windows attribute bits alone (Slates' contract 41): a commit holds it only where git keeps
-            // the change, its executable bit. Its bytes are the folder's, which its landing keeps, so the volume's are
+            // the change, its owner's execute bit ([`git_executable`]). Its bytes are the folder's, which its landing keeps, so the volume's are
             // held to the folder's copy as a written file's are held to its entry: an agent's write since the
             // snapshot moves them, and the review is made again.
             PlannedAction::Chmod { .. } => {
@@ -178,14 +229,30 @@ fn read_entries(i: &mut Instance, volume: VolumeId, over: &str, entries: Vec<Pla
     Ok(Read::Changes(changes))
 }
 
+/// Whether git records a file of `mode` as executable: its owner's execute bit alone, all git keeps of a regular file's
+/// mode. Git's `ce_permissions` (object.h line 134 at git e1ec09b23, `(((mode) & 0100) ? 0755 : 0644)`), which
+/// `create_ce_mode` and `canon_mode` apply to every regular file, so a file only its group or others may execute is
+/// `100644` to git, and its commit holds it so.
+fn git_executable(mode: u32) -> bool {
+    mode & 0o100 != 0
+}
+
 /// What git commits for an entry whose mode or Windows attribute bits alone change (Slates' contract 41,
-/// `PlannedAction::Chmod`): the file executable or not as it lands, where that changed, the one part of a mode git keeps
-/// (its two file modes); none where only another permission bit or a Windows attribute changed, of which a commit of
-/// the volume's working tree holds nothing, and none for any other entry.
+/// `PlannedAction::Chmod`): the file executable or not as it lands ([`git_executable`]), where that changed, the one part
+/// of a mode git keeps (its two file modes); none where only another permission bit or a Windows attribute changed, of
+/// which a commit of the volume's working tree holds nothing, and none for any other entry.
 fn executable_change(entry: &PlannedEntry) -> Option<bool> {
     let PlannedAction::Chmod { permissions_was, .. } = entry.action else { return None };
-    let executable = entry.mode.is_some_and(|mode| mode & 0o111 != 0);
-    (executable != (permissions_was & 0o111 != 0)).then_some(executable)
+    let executable = entry.mode.is_some_and(git_executable);
+    (executable != git_executable(permissions_was)).then_some(executable)
+}
+
+/// Whether `entry` sets a mode git keeps no part of on a file git tracks (any permission bit but its owner's execute, a
+/// Windows attribute): a change git doesn't see, which holds a landing back for review as a mounted workspace's is held
+/// by git's own count (A-496's rule, `super::slates::writable`). A file git doesn't track is listed by git whatever its
+/// mode, and its ignore rules judge it ([`writes_untracked`]).
+fn unseen_mode_change(entry: &PlannedEntry, tracked: &HashSet<String>) -> bool {
+    matches!(entry.action, PlannedAction::Chmod { .. }) && tracked.contains(&relative(&entry.path)) && executable_change(entry).is_none()
 }
 
 /// A path from the target's root (`/src/a.rs`) as git names it within the repository (`src/a.rs`).
@@ -201,6 +268,12 @@ fn writes_untracked(entry: &PlannedEntry, tracked: &HashSet<String>) -> bool {
 
 /// Whether git ignores what `entry` writes in `volume`, by its `.gitignore` files read at the volume's head.
 fn ignored(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, entry: &PlannedEntry) -> Result<bool, Fault> {
+    ignored_at(i, volume, ignores, &relative(&entry.path), false)
+}
+
+/// Whether git ignores `path` in `volume` (relative to its top; a directory where `is_dir`), by its `.gitignore` files
+/// read at the volume's head.
+fn ignored_at(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, path: &str, is_dir: bool) -> Result<bool, Fault> {
     let mut read = |file: &str| -> anyhow::Result<Option<Vec<u8>>> {
         match i.read(volume, &format!("/{file}"), ReadAt::Head) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -208,7 +281,7 @@ fn ignored(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, entry: &Pl
             Err(e) => Err(anyhow::anyhow!("reading {file}: {e}")),
         }
     };
-    ignores.ignored(&relative(&entry.path), false, &mut read).map_err(|e| Fault::Other(format!("{e:#}")))
+    ignores.ignored(path, is_dir, &mut read).map_err(|e| Fault::Other(format!("{e:#}")))
 }
 
 #[cfg(test)]
@@ -249,5 +322,33 @@ mod tests {
         assert!(writes_untracked(&changed, &HashSet::new()), "untracked: git's ignore rules apply");
         assert!(!writes_untracked(&changed, &tracked), "tracked: git commits it");
         assert!(!writes_untracked(&entry(PlannedAction::Delete, None), &HashSet::new()), "a removal writes nothing");
+    }
+
+    /// W8 (git's `ce_permissions`, object.h line 134 at git e1ec09b23: `(((mode) & 0100) ? 0755 : 0644)`, which
+    /// `create_ce_mode` and `canon_mode` apply to every regular file): git judges a file executable by its owner's
+    /// execute bit alone. So a mode change that sets only its group's or others' execute is none to git, one that clears
+    /// the owner's makes it not executable whatever the others' are, and one that sets the owner's makes it executable
+    /// whatever the others' were.
+    #[test]
+    fn w8_git_judges_a_file_executable_by_its_owners_execute_bit_alone() {
+        assert_eq!(executable_change(&entry(chmod(0o644, 0, 0), Some(0o100_655))), None, "the group's and others' execute set, the owner's not");
+        assert_eq!(executable_change(&entry(chmod(0o755, 0, 0), Some(0o100_655))), Some(false), "the owner's execute cleared, the others' kept");
+        assert_eq!(executable_change(&entry(chmod(0o611, 0, 0), Some(0o100_711))), Some(true), "the owner's execute set beside the others' already set");
+        assert!(!git_executable(0o100_655) && !git_executable(0o100_011), "the group's or others' execute alone: 100644 to git");
+        assert!(git_executable(0o100_744) && git_executable(0o100_700), "the owner's execute: 100755 to git");
+    }
+
+    /// W6 on a workspace with no mount (A-496's rule): a mode change git keeps no part of, on a file git tracks, counts as
+    /// one git doesn't see, so its landing is held back for review as a mounted workspace's is by git's own count; one git
+    /// sees (the owner's execute bit) doesn't, nor one on a file git doesn't track (git lists that file whatever its mode,
+    /// and its ignore rules judge it), nor a write.
+    #[test]
+    fn w6_a_mode_change_git_cant_see_on_a_tracked_file_holds_its_landing_back() {
+        let tracked: HashSet<String> = ["bin/run.sh".to_owned()].into_iter().collect();
+        assert!(unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_654)), &tracked), "the group's execute alone");
+        assert!(unseen_mode_change(&entry(chmod(0o644, 0x20, 0x01), Some(0o100_644)), &tracked), "a Windows attribute alone");
+        assert!(!unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_744)), &tracked), "the owner's execute: git sees it");
+        assert!(!unseen_mode_change(&entry(chmod(0o644, 0, 0), Some(0o100_654)), &HashSet::new()), "untracked: git lists the file itself");
+        assert!(!unseen_mode_change(&entry(PlannedAction::Replace, Some(0o100_644)), &tracked), "a write is no mode change");
     }
 }
