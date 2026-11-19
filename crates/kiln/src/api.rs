@@ -6264,8 +6264,10 @@ async fn harness_workspaces(hub: &Hub) -> Response {
     let mut out = serde_json::Map::new();
     let mut targets = vec!["local".to_owned()];
     targets.extend(hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
+    // Mounted on each machine's host, as an agent there works in one (W2); a volume served to a microVM, which needs no
+    // host mount, is judged as its isolated start is made (`lineage::WorkspaceUse::Served`, W8).
     for t in targets {
-        let v = match crate::harness::lineage::workspaces_on(hub, &t).await {
+        let v = match crate::harness::lineage::workspaces_on(hub, &t, crate::harness::lineage::WorkspaceUse::Mounted).await {
             Ok(()) => json!({"available": true}),
             Err(no) => json!({"available": false, "why_not": no.said, "missing": no.missing}),
         };
@@ -6931,12 +6933,14 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     as_asked(&mut body.spec, caller.as_ref());
     // A workspace is asked for by its kind alone (its machine makes a volume), a volume only of a machine that can make
     // one: one that can't would let it work in the folder itself, unasked. Asked nothing, it gets a volume where its
-    // machine can make one (`Registry::open_as`); the folder itself is a choice kept as made.
+    // machine can make one (`Registry::open_as`); the folder itself is a choice kept as made. One that will run isolated,
+    // as the registry decides its boundary, has its volume served to its microVM, which needs no host mount (W8).
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
         None => {}
         Some("folder") => body.spec.workspace = Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }),
         Some("volume") => {
-            crate::harness::lineage::workspaces_on(hub, &body.target).await.map_err(|no| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
+            let used = crate::harness::lineage::WorkspaceUse::of(hub.harness.isolation_for(hub, &body.target, &body.spec).is_some());
+            crate::harness::lineage::workspaces_on(hub, &body.target, used).await.map_err(|no| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
             body.spec.workspace = Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });
         }
         Some(other) => return Err(err(StatusCode::BAD_REQUEST, format!("a workspace is \"folder\" or \"volume\", not {other:?}"))),
