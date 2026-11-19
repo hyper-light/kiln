@@ -159,7 +159,7 @@ enum Read {
 
 fn once(i: &mut Instance, volume: VolumeId, over: &str, tracked: &HashSet<String>, ignores: &mut Ignores) -> Result<Read, Fault> {
     let snapshot = i.snapshot(volume).map_err(Fault::Slates)?;
-    let read = present(i, volume, Some(snapshot), over, &super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()).and_then(|entries| read_entries(i, volume, entries, tracked, ignores));
+    let read = present(i, volume, Some(snapshot), over, &super::slates::EXCLUDES.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()).and_then(|entries| read_entries(i, volume, over, entries, tracked, ignores));
     // The snapshot is the review's alone: let go of it whatever came of it.
     let gone = i.destroy_snapshot(volume, snapshot).map_err(Fault::Slates);
     let read = read?;
@@ -180,16 +180,18 @@ fn present(i: &mut Instance, volume: VolumeId, snapshot: Option<SnapshotId>, ove
     }
 }
 
-/// `entries` as git commits them, each written file read at the volume's head and checked against its entry; what git
-/// ignores among what it doesn't track left out; the path whose bytes moved since the entries were presented, where one
-/// did.
-fn read_entries(i: &mut Instance, volume: VolumeId, entries: Vec<PlannedEntry>, tracked: &HashSet<String>, ignores: &mut Ignores) -> Result<Read, Fault> {
+/// `entries` as git commits them, each written file read at the volume's head and checked against its entry, and each
+/// file whose executable bit alone changed read there and checked against the folder's copy at `over`, whose bytes its
+/// landing keeps; what git ignores among what it doesn't track left out; the path whose bytes moved since the entries
+/// were presented, where one did.
+fn read_entries(i: &mut Instance, volume: VolumeId, over: &str, entries: Vec<PlannedEntry>, tracked: &HashSet<String>, ignores: &mut Ignores) -> Result<Read, Fault> {
     let mut changes = Vec::with_capacity(entries.len());
     for entry in entries {
         if writes_untracked(&entry, tracked) && ignored(i, volume, ignores, &entry)? {
             continue;
         }
         let path = relative(&entry.path);
+        let executable_now = executable_change(&entry);
         let change = match entry.action {
             PlannedAction::Create | PlannedAction::Replace => {
                 let content = entry.content.ok_or_else(|| Fault::Other(format!("{path}: Slates writes it with no bytes named")))?;
@@ -204,10 +206,33 @@ fn read_entries(i: &mut Instance, volume: VolumeId, entries: Vec<PlannedEntry>, 
             PlannedAction::Rmdir | PlannedAction::Clear => Change::GoneUnder { path },
             PlannedAction::Rename { from } => Change::Moved { from: relative(&from), to: path },
             PlannedAction::Mkdir => continue,
+            // Its mode or Windows attribute bits alone (Slates' contract 41): a commit holds it only where git keeps
+            // the change, its executable bit. Its bytes are the folder's, which its landing keeps, so the volume's are
+            // held to the folder's copy as a written file's are held to its entry: an agent's write since the
+            // snapshot moves them, and the review is made again.
+            PlannedAction::Chmod { .. } => {
+                let Some(executable) = executable_now else { continue };
+                let bytes = i.read(volume, &entry.path, ReadAt::Head).map_err(Fault::Slates)?;
+                let kept = std::fs::read(Path::new(over).join(&path)).map_err(|e| Fault::Other(format!("{path}: reading the folder's copy, whose bytes its landing keeps: {e}")))?;
+                if bytes != kept {
+                    return Ok(Read::Moved(path));
+                }
+                Change::File { path, bytes, executable }
+            }
         };
         changes.push(change);
     }
     Ok(Read::Changes(changes))
+}
+
+/// What git commits for an entry whose mode or Windows attribute bits alone change (Slates' contract 41,
+/// `PlannedAction::Chmod`): the file executable or not as it lands, where that changed, the one part of a mode git keeps
+/// (its two file modes); none where only another permission bit or a Windows attribute changed, of which a commit of
+/// the volume's working tree holds nothing, and none for any other entry.
+fn executable_change(entry: &PlannedEntry) -> Option<bool> {
+    let PlannedAction::Chmod { permissions_was, .. } = entry.action else { return None };
+    let executable = entry.mode.is_some_and(|mode| mode & 0o111 != 0);
+    (executable != (permissions_was & 0o111 != 0)).then_some(executable)
 }
 
 /// A path from the target's root (`/src/a.rs`) as git names it within the repository (`src/a.rs`).
@@ -215,9 +240,10 @@ fn relative(path: &str) -> String {
     path.trim_start_matches('/').to_owned()
 }
 
-/// Whether `entry` writes a file or a link git doesn't track, which git's ignore rules apply to.
+/// Whether `entry` writes a file or a link git doesn't track, or sets such a file's mode, which git's ignore rules apply
+/// to.
 fn writes_untracked(entry: &PlannedEntry, tracked: &HashSet<String>) -> bool {
-    matches!(entry.action, PlannedAction::Create | PlannedAction::Replace | PlannedAction::Symlink { .. }) && !tracked.contains(&relative(&entry.path))
+    matches!(entry.action, PlannedAction::Create | PlannedAction::Replace | PlannedAction::Symlink { .. } | PlannedAction::Chmod { .. }) && !tracked.contains(&relative(&entry.path))
 }
 
 /// Whether git ignores what `entry` writes in `volume`, by its `.gitignore` files read at the volume's head.
@@ -236,4 +262,45 @@ fn ignored_at(i: &mut Instance, volume: VolumeId, ignores: &mut Ignores, path: &
         }
     };
     ignores.ignored(path, is_dir, &mut read).map_err(|e| Fault::Other(format!("{e:#}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An entry of `action` at `/bin/run.sh`, landing with `mode`.
+    fn entry(action: PlannedAction, mode: Option<u32>) -> PlannedEntry {
+        PlannedEntry { path: "/bin/run.sh".to_owned(), action, content: None, mode, witnessed: true, conflict: None }
+    }
+
+    /// A file's mode or Windows attribute bits alone set: the permission bits it had, the attribute bits it had and
+    /// those it lands with.
+    fn chmod(permissions_was: u32, windows_was: u16, windows: u16) -> PlannedAction {
+        PlannedAction::Chmod { permissions_was, windows_was, windows }
+    }
+
+    /// W8 (Slates' contract 41, A-458): a file whose executable bit alone changes is a change its review commits,
+    /// executable or not as it lands; one whose other permission bits or Windows attribute bits alone change is none,
+    /// since git keeps a file's executable bit alone of its mode; and no other entry is judged a mode change.
+    #[test]
+    fn w8_a_files_mode_alone_changed_is_committed_where_git_keeps_it() {
+        assert_eq!(executable_change(&entry(chmod(0o644, 0, 0), Some(0o100_755))), Some(true), "made executable");
+        assert_eq!(executable_change(&entry(chmod(0o755, 0, 0), Some(0o100_644))), Some(false), "made not executable");
+        assert_eq!(executable_change(&entry(chmod(0o750, 0, 0), Some(0o100_700))), None, "its group's bits alone: git keeps none of them");
+        assert_eq!(executable_change(&entry(chmod(0o644, 0x20, 0x01), Some(0o100_644))), None, "a Windows attribute alone");
+        assert_eq!(executable_change(&entry(chmod(0o644, 0, 0), None)), None, "no mode named lands as it was: not executable");
+        assert_eq!(executable_change(&entry(PlannedAction::Replace, Some(0o100_755))), None, "a written file is no mode change");
+    }
+
+    /// W8 (Slates' contract 41): git's ignore rules judge an untracked file whose mode alone changes as they judge one
+    /// written, so a mode set on what git ignores is left out of a review and counted as a write git ignores; a tracked
+    /// file's mode change is git's to commit whatever its ignore rules say.
+    #[test]
+    fn w8_an_untracked_files_mode_change_is_judged_by_gits_ignore_rules() {
+        let changed = entry(chmod(0o644, 0, 0), Some(0o100_755));
+        let tracked: HashSet<String> = ["bin/run.sh".to_owned()].into_iter().collect();
+        assert!(writes_untracked(&changed, &HashSet::new()), "untracked: git's ignore rules apply");
+        assert!(!writes_untracked(&changed, &tracked), "tracked: git commits it");
+        assert!(!writes_untracked(&entry(PlannedAction::Delete, None), &HashSet::new()), "a removal writes nothing");
+    }
 }

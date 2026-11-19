@@ -2878,6 +2878,12 @@ impl Registry {
         v
     }
 
+    /// The workspaces the agents of the machine at `target` work in now (`workspace::live`): what a start there whose
+    /// folder lies in one of them shares (W2).
+    fn live_at(&self, target: &str) -> Vec<(String, crate::workspace::Workspace)> {
+        crate::workspace::live(self.list().into_iter().filter(|i| Location::of_target(&i.target).target() == target).collect())
+    }
+
     /// [`Registry::list`], each info as its owner shares it with its view, none copied (goal 9, plan 01a1a87b2cec
     /// step 5: `agents.list` copied every session's whole info to read a few fields of each).
     pub fn list_shared(&self) -> Vec<Arc<Info>> {
@@ -4422,8 +4428,7 @@ impl Registry {
         // a conversation taken up (`resume`), its harness's record of it moved to where the harness looks from the
         // mount's folder (`harness::homes::rehome`, I12).
         if spec.isolation.is_none() && spec.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
-            let here = loc.target();
-            let live: Vec<(String, crate::workspace::Workspace)> = self.list().into_iter().filter(|i| Location::of_target(&i.target).target() == here).filter_map(|i| i.workspace.filter(|w| w.made.is_some()).map(|w| (i.id, w))).collect();
+            let live = self.live_at(&loc.target());
             if let Some(shared) = spec.cwd.as_deref().and_then(|cwd| crate::workspace::sharing(cwd, &live)) {
                 spec.workspace = Some(shared);
             } else if spec.workspace.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
@@ -4466,15 +4471,11 @@ impl Registry {
             }
             match loc {
                 Location::Local => {
-                    // Started on one of the server's own shells: in that shell's directory.
+                    // Started on one of the server's own shells: in that shell's directory, and in the volume of an
+                    // agent here whose mount that directory lies in (`workspace::from_shell`, W2).
                     if let Some(pid) = spec.shell.as_ref().and_then(|t| self.local_shells.load().get(t).copied()) {
-                        let (cwd, env) = crate::rt::blocking(move || super::host::shell_context(pid)).await.unwrap_or((None, Vec::new()));
-                        if spec.cwd.is_none() {
-                            spec.cwd = cwd;
-                        }
-                        if spec.env.is_empty() {
-                            spec.env = env;
-                        }
+                        let shell = crate::rt::blocking(move || super::host::shell_context(pid)).await.unwrap_or((None, Vec::new()));
+                        crate::workspace::from_shell(&mut spec, shell, &self.live_at(&loc.target()));
                     }
                     // A workspace of its own first: a volume over its folder, mounted, its folder in it.
                     let id = ids.get(i).cloned().unwrap_or_else(crate::util::new_id);
