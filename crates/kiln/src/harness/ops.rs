@@ -2403,7 +2403,9 @@ for line in sys.stdin:
         /// The source's own: while it owes kiln an answer, a still source is asked whether its CPU time
         /// moved ([`source_until`]).
         Source,
-        /// Kiln's own: its mail pump's, its goal driver's ([`kiln_until`]).
+        /// Kiln's own: its mail pump's, its goal driver's ([`kiln_until`]). Unix's alone, as its one
+        /// waiter's test is.
+        #[cfg(unix)]
         Kiln,
     }
 
@@ -2434,7 +2436,9 @@ for line in sys.stdin:
     /// waits at the gate) says nothing of the wait, which follows its liveness alone, as it does for
     /// kiln's next move after a turn. Kiln runs r700 and r712 refused "one real refill goal" by its
     /// source's CPU time, at windows of 670 ms and 10 ms, its source held at the test's result gate and
-    /// kiln's pump yet to deliver the goal.
+    /// kiln's pump yet to deliver the goal. Unix's alone, as the one test that waits so is: on Windows
+    /// it and its party were never used, which clippy's dead-code lint refused.
+    #[cfg(unix)]
     pub(crate) async fn kiln_until<F, Fut>(hub: &Hub, id: &str, what: &str, check: F) -> anyhow::Result<()>
     where F: FnMut() -> Fut, Fut: std::future::Future<Output = anyhow::Result<bool>> {
         until(hub, id, what, Party::Kiln, check).await
