@@ -112,7 +112,7 @@ pub const INSTANCE: &str = "kiln";
 /// 41 since kiln took Slates at 1f332da55 (from 40; Slates' A-496). kiln uses 41: a file whose
 /// mode or Windows attribute bits alone changed lands as a `chmod` entry (Slates' A-458), which a
 /// plan shows (`summary_json`) and counts among the files it lands (`planned_files`), and which a
-/// review commits where git keeps the change, its executable bit (`super::review`). 41 changes
+/// review commits where git keeps the change, its owner's execute bit (`super::review`). 41 changes
 /// nothing else.
 pub const CONTRACT: u32 = 41;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
@@ -1265,7 +1265,7 @@ fn count_changed(text: &str) -> usize {
 }
 
 /// The files a landing's plan would write, create, delete or set the mode of (not counting directories). A mode git keeps
-/// no part of (any permission bit but the executable one, a Windows attribute) is counted all the same, where git's
+/// no part of (any permission bit but its owner's execute, a Windows attribute) is counted all the same, where git's
 /// count of what changed has no record of it: such a landing is held back for review rather than judged by a count that
 /// can't tell it from build output git ignores (Slates' contract 41, `chmod`).
 fn planned_files(plan: &Value) -> usize {
@@ -1284,13 +1284,14 @@ fn planned_files(plan: &Value) -> usize {
 /// which kiln won't write into a person's folder. One with no mount is judged by its landing's entries instead.
 pub async fn writable(m: &Made, over: &str, plan: &Value) -> Result<(), String> {
     let planned = planned_files(plan);
-    // One with no mount has no working tree for git to look at: what git ignores among what its landing writes is read
-    // from its entries and its own `.gitignore` files (kiln goal 01a1ec34…, `super::review::ignored_writes`).
+    // One with no mount has no working tree for git to look at: what git doesn't see among what its landing writes (what
+    // git ignores, a mode git keeps no part of) is read from its entries and its own `.gitignore` files (kiln goal
+    // 01a1ec34…, `super::review::unseen_writes`).
     if m.mount.is_empty() {
-        let ignored = super::review::ignored_writes(m, over).await.map_err(|e| format!("{e:#}"))?;
-        return match ignored {
+        let unseen = super::review::unseen_writes(m, over).await.map_err(|e| format!("{e:#}"))?;
+        return match unseen {
             0 => Ok(()),
-            n => Err(format!("it would also write {n} file{} git ignores (build output, dependencies) into the folder: kiln leaves out only .git, so put the work up for review instead", if n == 1 { "" } else { "s" })),
+            n => Err(format!("it would also write {n} file{} git doesn't see changed into the folder: what git ignores (build output, dependencies), or a mode git keeps no part of: kiln leaves out only .git, so put the work up for review instead", if n == 1 { "" } else { "s" })),
         };
     }
     let changed = git_changed(m).await.map_err(|e| format!("{e:#}"))?;
