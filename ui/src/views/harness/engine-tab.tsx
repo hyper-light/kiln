@@ -15,7 +15,7 @@
  *     its line, then its settings and experiments. This session's agent is always first, marked, with
  *     what this session started on.
  *
- * Only the sections fold: inside them nothing does (no collapsible nested in another).
+ * The sections fold, and so does each environment in its own (asked by the user, 2026-11-19).
  */
 import * as React from "react";
 import { agentdefsRes, enginesOf, type AgentDef } from "@/api/agentdefs";

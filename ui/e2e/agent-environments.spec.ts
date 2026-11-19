@@ -173,6 +173,28 @@ test("a card's head is edited in place: renamed, tagged and untagged, described;
   expect(said, said.join("\n")).toEqual([]);
 });
 
+test("each environment folds to its head and is kept folded; its pencil opens it", async ({ page }) => {
+  const said = errors(page);
+  const { list } = await engine(page);
+  const toggle = list.getByRole("button", { name: "Collapse clean-ci" });
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toBeVisible();
+  await toggle.click();
+  await expect(list.getByRole("button", { name: "Expand clean-ci" })).toHaveAttribute("aria-expanded", "false");
+  await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toHaveCount(0);
+  await expect(list.locator(":scope > li.df-defrow", { hasText: "clean-ci" })).toContainText("Clean base · v1");
+  // Kept as it was left.
+  await page.reload();
+  await tab(page, "Engine");
+  await expect(list.getByRole("button", { name: "Expand clean-ci" })).toBeVisible();
+  await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toHaveCount(0);
+  // The pencil opens it, to its form.
+  await list.getByRole("button", { name: "Edit clean-ci" }).click();
+  await expect(list.getByRole("button", { name: "Collapse clean-ci" })).toBeVisible();
+  await expect(list.getByRole("listitem", { name: "Edit clean-ci" })).toBeVisible();
+  expect(said, said.join("\n")).toEqual([]);
+});
+
 test("the composer's Environment row: the machine's user's by default, one of the person's carried into the start as `agentenv`, and kept", async ({ page }) => {
   const said = errors(page);
   await page.request.post("/api/mock/agentenvs");

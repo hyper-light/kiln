@@ -7,7 +7,7 @@
  * A new one, or a change, is made in place on its card.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, Check, KeyRound, Pencil, Plus, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, ChevronRight, KeyRound, Pencil, Plus, X } from "lucide-react";
 import { agentenvOf, agentenvsApi, agentenvsRes, machineVarsRes, relist, type Agentenv, type AgentenvFrom, type MachineVar } from "@/api/agentenvs";
 import type { AgentInfo } from "@/api/harness";
 import { mySecretsRes } from "@/api/secrets";
@@ -44,7 +44,7 @@ import {
 } from "./agentenv-logic";
 import { GroupHead } from "./definitions";
 import { agentLabel } from "./derive";
-import { Fold } from "./fold";
+import { Fold, useFold } from "./fold";
 import { useAgentList } from "./use-agents";
 import "./definition.css";
 import "./sandbox.css";
@@ -167,6 +167,8 @@ function Choose({ at, envs, mine }: { at: At; envs: readonly Agentenv[]; mine: A
 /* ------------------------------------------------ a card */
 
 function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly AgentInfo[]; here?: boolean }) {
+  // Each folds to its head, open as it starts and as the person last left it.
+  const [open, setOpen] = useFold(`engine-env.${e.id}`, true);
   const [editing, setEditing] = React.useState(false);
   const [asking, setAsking] = React.useState(false);
   const [why, setWhy] = React.useState<string | null>(null);
@@ -176,6 +178,9 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
       {/* Its line: its name (this session's marked), its base and version, its pencil. */}
       <li className="ms-node df-defrow df-head" data-stand={e.sessions.length > 0 ? "working" : "done"} data-depth={0} data-env={e.id}>
         <span className="df-head-main">
+          <button type="button" className="ev-chev" aria-expanded={open} aria-label={`${open ? "Collapse" : "Expand"} ${e.name}`} onClick={() => setOpen(!open)}>
+            <ChevronRight size={12} className={open ? "hx-chev rotate-90" : "hx-chev"} aria-hidden="true" />
+          </button>
           <Inline value={e.name} action={`Rename ${e.name}`} label={`${e.name}'s name`} className="df-strong df-defname" onSave={(name) => change(e, { name }, setWhy)} />
           {here && <span className="df-head-v df-this">this session</span>}
         </span>
@@ -185,95 +190,107 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
           </span>
         </span>
         <span className="df-head-acts">
-          <button type="button" className="hx-icon" aria-label={`Edit ${e.name}`} aria-pressed={editing} title="Edit" onClick={() => setEditing(!editing)}>
+          <button
+            type="button"
+            className="hx-icon"
+            aria-label={`Edit ${e.name}`}
+            aria-pressed={editing}
+            title="Edit"
+            onClick={() => {
+              setOpen(true);
+              setEditing(!editing);
+            }}
+          >
             <Pencil size={14} />
           </button>
         </span>
       </li>
-      <li className="ms-tree df-groups">
-        <ul className="ms-tree-rows" aria-label={`${e.name}: variables and sessions`}>
-          {editing ? (
-            <EnvForm e={e} at={at} onDone={() => setEditing(false)} />
-          ) : (
-            <>
-              <li className="ms-node df-body ev-tagrow" data-depth={2}>
-                <span className="ev-tags" role="list" aria-label={`${e.name}'s tags`}>
-                  {e.tags.map((t) => (
-                    <span role="listitem" key={t} className="ev-tag">
-                      {t}
-                      <button type="button" className="ev-tag-x" aria-label={`Remove tag ${t}`} onClick={() => change(e, { tags: e.tags.filter((x) => x !== t) }, setWhy)}>
-                        <X size={10} />
-                      </button>
-                    </span>
-                  ))}
-                  <AddTag name={e.name} onAdd={(t) => change(e, { tags: [...e.tags, t] }, setWhy)} />
-                </span>
-              </li>
-              <li className="ms-node df-body ev-desc" data-depth={2}>
-                <Inline
-                  value={e.description ?? ""}
-                  action={`Describe ${e.name}`}
-                  label={`${e.name}'s description`}
-                  placeholder="Add a description"
-                  className="df-note"
-                  onSave={(d) => change(e, { description: d || null }, setWhy)}
-                />
-              </li>
-              <GroupHead label="Variables" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.vars.length}</span>} />
-              <li className="ms-node df-body" data-depth={2}>
-                {e.vars.length === 0 ? (
-                  <span className="df-note">No variables.</span>
-                ) : (
-                  <ul className="sb-rows ev-rows" aria-label={`${e.name}'s variables`}>
-                    {e.vars.map((v, i) => (
-                      <li key={`${i}:${v.name}`} className="sb-row ev-var" data-from={v.from}>
-                        <span className="ev-key">
-                          <span className="sb-mono sb-clip ev-name">{v.name}</span>
-                          <span className="sb-tags">
-                            <i>{FROM_WORD[v.from]}</i>
-                          </span>
-                        </span>
-                        <span className="sb-mono sb-clip ev-gives" title={v.from === "secret" ? `Secret ${v.secret ?? ""} (value hidden)` : givesOf(v)}>
-                          {v.from === "secret" && <KeyRound size={11} aria-hidden="true" />}
-                          {givesOf(v)}
-                        </span>
-                      </li>
+      {open && (
+        <li className="ms-tree df-groups">
+          <ul className="ms-tree-rows" aria-label={`${e.name}: variables and sessions`}>
+            {editing ? (
+              <EnvForm e={e} at={at} onDone={() => setEditing(false)} />
+            ) : (
+              <>
+                <li className="ms-node df-body ev-tagrow" data-depth={2}>
+                  <span className="ev-tags" role="list" aria-label={`${e.name}'s tags`}>
+                    {e.tags.map((t) => (
+                      <span role="listitem" key={t} className="ev-tag">
+                        {t}
+                        <button type="button" className="ev-tag-x" aria-label={`Remove tag ${t}`} onClick={() => change(e, { tags: e.tags.filter((x) => x !== t) }, setWhy)}>
+                          <X size={10} />
+                        </button>
+                      </span>
                     ))}
-                  </ul>
-                )}
-              </li>
-              <GroupHead label="Sessions" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.sessions.length}</span>} />
-              <li className="ms-node df-body" data-depth={2}>
-                {sessions.length === 0 ? (
-                  <span className="df-note">No sessions.</span>
-                ) : (
-                  <ul className="sb-rows ev-rows" aria-label={`Sessions running with ${e.name}`}>
-                    {sessions.map((s) => (
-                      <li key={s.id} className="sb-row ev-session">
-                        <Link to={`/agents/${s.id}`} className="ms-link sb-clip">
-                          {"kind" in s ? agentLabel(s) : s.name}
-                        </Link>
-                        <span className="sb-dim sb-clip">{s.id === at.agentId ? "this session" : s.target ? machineOf(s.target) : ""}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                <span className="ev-acts">
-                  <Button size="xs" variant="ghost-danger" onClick={() => setAsking(true)}>
-                    Delete
-                  </Button>
-                </span>
-                {why && (
-                  <span className="sb-why" role="alert">
-                    {why}
+                    <AddTag name={e.name} onAdd={(t) => change(e, { tags: [...e.tags, t] }, setWhy)} />
                   </span>
-                )}
-              </li>
-              {asking && <DeleteAsk e={e} why={setWhy} onDone={() => setAsking(false)} />}
-            </>
-          )}
-        </ul>
-      </li>
+                </li>
+                <li className="ms-node df-body ev-desc" data-depth={2}>
+                  <Inline
+                    value={e.description ?? ""}
+                    action={`Describe ${e.name}`}
+                    label={`${e.name}'s description`}
+                    placeholder="Add a description"
+                    className="df-note"
+                    onSave={(d) => change(e, { description: d || null }, setWhy)}
+                  />
+                </li>
+                <GroupHead label="Variables" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.vars.length}</span>} />
+                <li className="ms-node df-body" data-depth={2}>
+                  {e.vars.length === 0 ? (
+                    <span className="df-note">No variables.</span>
+                  ) : (
+                    <ul className="sb-rows ev-rows" aria-label={`${e.name}'s variables`}>
+                      {e.vars.map((v, i) => (
+                        <li key={`${i}:${v.name}`} className="sb-row ev-var" data-from={v.from}>
+                          <span className="ev-key">
+                            <span className="sb-mono sb-clip ev-name">{v.name}</span>
+                            <span className="sb-tags">
+                              <i>{FROM_WORD[v.from]}</i>
+                            </span>
+                          </span>
+                          <span className="sb-mono sb-clip ev-gives" title={v.from === "secret" ? `Secret ${v.secret ?? ""} (value hidden)` : givesOf(v)}>
+                            {v.from === "secret" && <KeyRound size={11} aria-hidden="true" />}
+                            {givesOf(v)}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+                <GroupHead label="Sessions" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.sessions.length}</span>} />
+                <li className="ms-node df-body" data-depth={2}>
+                  {sessions.length === 0 ? (
+                    <span className="df-note">No sessions.</span>
+                  ) : (
+                    <ul className="sb-rows ev-rows" aria-label={`Sessions running with ${e.name}`}>
+                      {sessions.map((s) => (
+                        <li key={s.id} className="sb-row ev-session">
+                          <Link to={`/agents/${s.id}`} className="ms-link sb-clip">
+                            {"kind" in s ? agentLabel(s) : s.name}
+                          </Link>
+                          <span className="sb-dim sb-clip">{s.id === at.agentId ? "this session" : s.target ? machineOf(s.target) : ""}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <span className="ev-acts">
+                    <Button size="xs" variant="ghost-danger" onClick={() => setAsking(true)}>
+                      Delete
+                    </Button>
+                  </span>
+                  {why && (
+                    <span className="sb-why" role="alert">
+                      {why}
+                    </span>
+                  )}
+                </li>
+                {asking && <DeleteAsk e={e} why={setWhy} onDone={() => setAsking(false)} />}
+              </>
+            )}
+          </ul>
+        </li>
+      )}
     </>
   );
 }

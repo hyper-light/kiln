@@ -203,3 +203,24 @@ input.ev-inline-in {
   min-width: 12ch;
   height: 26px;
 }
+
+/* Its fold: the chevron before its name, as the sections' (fold.tsx). */
+.ev-chev {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-right: -2px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  color: #7b7e88;
+  cursor: pointer;
+}
+.ev-chev:hover {
+  color: #d4d6dc;
+}
+.ev-chev:focus-visible {
+  outline: 1px solid #6b6e78;
+}
