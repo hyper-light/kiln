@@ -3882,7 +3882,9 @@ fn remap_handed(map: &mut HashMap<String, Box<session::Handed>>, carried: &[i64]
 /// forked while it ended among them, its group asked again after each round of ends until it holds none not seen to
 /// end. Its close stops them all, and its group's end kills whatever is left in it (`session::end_group`), so this ends
 /// with them. What holds a workspace's mount busy is a process with a file or its working directory there, and an
-/// agent's are these: its mount is asked to go after this, once (`workspace::release`).
+/// agent's are these: its mount is asked to go after this, once (`workspace::release`). A process whose end the OS can't
+/// tell (refused by kind: no pidfd before Linux 5.3, descriptors exhausted) isn't waited on, which held the release until
+/// the runner restarted: it is said, and the mount's one unmount says whether it still holds it.
 pub(crate) async fn processes_ended(id: &str, harness: Option<u32>) {
     let unwatched = processes_ended_by(&OsEnds, id, harness).await;
     if !unwatched.is_empty() {
@@ -3912,10 +3914,12 @@ impl Ends for OsEnds {
     }
 }
 
-/// [`processes_ended`] by `ends`: what it couldn't wait on, each process the OS can't watch to its end, by kind.
+/// [`processes_ended`] by `ends`: what it couldn't wait on, each process the OS can't watch to its end, by kind. Such a
+/// process isn't waited on, since its end would never be told, and is counted with those ended, so the group's next
+/// reading doesn't ask after it again: the mount's one unmount then says, by kind, whether it still holds the mount.
 async fn processes_ended_by(ends: &impl Ends, id: &str, harness: Option<u32>) -> Vec<crate::os::watch::Unwatched> {
     let mut ended: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let unwatched = Vec::new();
+    let mut unwatched = Vec::new();
     let mut next: Vec<u32> = harness.into_iter().collect();
     loop {
         next.extend(ends.members(id).await);
@@ -3927,9 +3931,8 @@ async fn processes_ended_by(ends: &impl Ends, id: &str, harness: Option<u32>) ->
         }
         tracing::info!(session = %id, pids = ?next, "an ended agent's processes are awaited before its workspace's mount comes down");
         for pid in next.drain(..) {
-            // Main's behaviour, kept for the failing test: a process the OS can't watch is waited on for ever.
-            if ends.exited(pid).await.is_err() {
-                std::future::pending::<()>().await;
+            if let Err(refused) = ends.exited(pid).await {
+                unwatched.extend(refused);
             }
             ended.insert(pid);
         }

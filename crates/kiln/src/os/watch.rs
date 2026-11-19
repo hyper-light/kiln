@@ -194,11 +194,25 @@ pub(crate) async fn settle(w: &Watched, quiet: std::time::Duration, until: std::
 }
 
 /// Until one of `pids` exits (goal 9: a process's end as the OS tells it, a pidfd on Linux,
-/// kqueue's `EVFILT_PROC` on macOS, a wait on its handle on Windows); at once when one is gone
-/// already; never with none to watch, or where the OS can't say.
+/// kqueue's `EVFILT_PROC` on macOS, a wait on its handle on Windows): `Ok` once one has, at once
+/// when one is gone already; never with none to watch. Refused, each by kind ([`Unwatched`]), where
+/// the OS can watch none of them: a pid that names no process, an OS with no way to say (a Linux
+/// before 5.3 has no pidfd), or the OS's refusal (descriptors exhausted), so no caller waits for
+/// ever on an end it will never be told. Where it can watch some of them, it waits on those.
 pub async fn exited(pids: &[u32]) -> Result<(), Vec<Unwatched>> {
-    backend::exited(pids).await;
-    Ok(())
+    let (named, unnamed): (Vec<u32>, Vec<u32>) = pids.iter().copied().partition(|pid| names_a_process(*pid));
+    let unnamed = unnamed.into_iter().map(|pid| Unwatched { pid, why: Unwatchable::NotAPid });
+    if named.is_empty() {
+        let refused: Vec<Unwatched> = unnamed.collect();
+        return if refused.is_empty() { std::future::pending().await } else { Err(refused) };
+    }
+    backend::exited(&named).await.map_err(|refused| refused.into_iter().chain(unnamed).collect())
+}
+
+/// Whether `pid` can name a process the OS is asked of: never 0 (on Unix the caller's own process group, on Windows
+/// the System Idle Process), nor on Unix one past `pid_t`'s range.
+fn names_a_process(pid: u32) -> bool {
+    pid != 0 && (cfg!(windows) || i32::try_from(pid).is_ok())
 }
 
 /// Why the OS can't tell kiln a process's end ([`exited`]'s refusal, by kind).
@@ -247,8 +261,12 @@ mod backend {
     //! No folder events here: nothing is told but what [`super::Watched::tell`] is called for.
     pub(super) fn start(_w: &std::sync::Arc<super::Watched>) {}
     pub(super) fn forget(_id: u64) {}
-    pub(super) async fn exited(_pids: &[u32]) {
-        std::future::pending::<()>().await;
+    /// No process's end is told here: refused, each `Unsupported`; with none to watch, never.
+    pub(super) async fn exited(pids: &[u32]) -> Result<(), Vec<super::Unwatched>> {
+        if pids.is_empty() {
+            return std::future::pending().await;
+        }
+        Err(pids.iter().map(|pid| super::Unwatched { pid: *pid, why: super::Unwatchable::Unsupported }).collect())
     }
 }
 

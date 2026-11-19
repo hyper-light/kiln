@@ -320,8 +320,9 @@ agents never see it. Ended for good, the agent's volume goes with it, once no ot
 of the agents working in one ends it (on its machine's runner process), and an agent that couldn't start after all
 takes only a volume made for it alone with it. Its mount goes first, once every process kiln started for the agent has
 ended: its harness, which works in the mount, and its group (every process that started, followed as the agent's), each
-end as the OS tells it (a pidfd on Linux, kqueue on macOS, a process handle on Windows), never a clock. Then the mount
-is asked to go once. Its volume is destroyed only once the kernel's mount table no longer holds its point (an unmount
+end as the OS tells it (a pidfd on Linux, kqueue on macOS, a process handle on Windows), never a clock. A process whose
+end the OS can't tell (no pidfd before Linux 5.3, descriptors exhausted) is refused by kind and not waited on, where it
+held the release until the runner restarted (2026-11-19). Then the mount is asked to go once. Its volume is destroyed only once the kernel's mount table no longer holds its point (an unmount
 that answers done is believed only when the table agrees); one whose mount stays is kept, never destroyed beneath a
 live mount, which would leave the mount with nothing behind it, and never let go by force: what holds it once the
 agent's processes have ended is another's (a person's shell or editor there), which a forced unmount would cut off.
