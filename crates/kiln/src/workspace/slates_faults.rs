@@ -47,29 +47,46 @@ pub enum Unjudged {
     NeitherMovedNorRefused { runs_on: Option<String> },
 }
 
-/// The kind a refusal names (`... [kind: x]`), if it names one.
-pub fn refusal_kind(_said: &str) -> Option<&str> {
-    None
+/// The kind a refusal names (`... [kind: x]`, `slates_move::MoveRefused::reported`'s form), if it names one: the last
+/// `[kind: ` in its words, up to its closing bracket.
+pub fn refusal_kind(said: &str) -> Option<&str> {
+    let from = said.rfind("[kind: ")?;
+    let rest = said.get(from..)?.strip_prefix("[kind: ")?;
+    let (kind, _) = rest.split_once(']')?;
+    let kind = kind.trim();
+    (!kind.is_empty()).then_some(kind)
 }
 
 /// A move's end, judged ([`MoveSaid`]): moved, or refused by a kind a move is refused by with the agent where it was,
 /// or why it's neither.
 pub fn judge_move(said: &MoveSaid<'_>) -> Result<MoveOutcome, Unjudged> {
-    Ok(MoveOutcome::Moved {
-        to: said.to.to_owned(),
-    })
+    let runs_on = || said.runs_on.map(str::to_owned);
+    match said.refused {
+        Some(words) => {
+            let kind = refusal_kind(words).ok_or_else(|| Unjudged::NoKind { said: words.to_owned() })?;
+            if !super::slates_move::KINDS.contains(&kind) {
+                return Err(Unjudged::UnknownKind { kind: kind.to_owned() });
+            }
+            if said.runs_on != Some(said.from) {
+                return Err(Unjudged::RefusedElsewhere { runs_on: runs_on() });
+            }
+            Ok(MoveOutcome::Refused { kind: kind.to_owned() })
+        }
+        None if said.runs_on == Some(said.to) => Ok(MoveOutcome::Moved { to: said.to.to_owned() }),
+        None => Err(Unjudged::NeitherMovedNorRefused { runs_on: runs_on() }),
+    }
 }
 
 /// The paths of `acknowledged` (each file's bytes as its turn wrote them and Slates acknowledged them) that `served`
 /// doesn't hold byte for byte: an acknowledged change lost. A file served besides them is no loss.
-pub fn lost(_acknowledged: &BTreeMap<String, Vec<u8>>, _served: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
-    Vec::new()
+pub fn lost(acknowledged: &BTreeMap<String, Vec<u8>>, served: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    acknowledged.iter().filter(|(path, bytes)| served.get(*path) != Some(*bytes)).map(|(path, _)| path.clone()).collect()
 }
 
 /// The runners of `listed` (by machine) that `members` doesn't hold as serving members (a member id said): the fleet
 /// hasn't re-formed while any is left.
-pub fn not_reformed<'a>(_listed: &[&'a str], _members: &[Member]) -> Vec<&'a str> {
-    Vec::new()
+pub fn not_reformed<'a>(listed: &[&'a str], members: &[Member]) -> Vec<&'a str> {
+    listed.iter().copied().filter(|machine| !members.iter().any(|m| m.machine == *machine && m.member.is_some())).collect()
 }
 
 #[cfg(test)]
