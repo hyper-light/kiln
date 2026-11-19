@@ -109,11 +109,12 @@ pub const INSTANCE: &str = "kiln";
 /// can't-mount refusal, and needs none of the rest: a snapshot's archive exported (38) and a volume
 /// imported from one (40).
 ///
-/// 41 since kiln took Slates at e2d1bc42b (Slates' A-503: a captured clone that moved lands against
-/// its capture, so kiln lands a workspace that moved here as any). 41 adds a landing entry for a file
-/// or directory whose mode or Windows bits alone changed (`PlannedAction::Chmod`, A-458 and A-501):
-/// kiln's summary counts them, and a review commits a file whose executable bit flipped, the one bit
-/// of a mode git keeps ([`super::review`]).
+/// 41 since kiln took Slates at 1f332da55 (from 40; Slates' A-496). kiln uses 41: a file whose
+/// mode or Windows attribute bits alone changed lands as a `chmod` entry (Slates' A-458), which a
+/// plan shows (`summary_json`) and counts among the files it lands (`planned_files`), and which a
+/// review commits where git keeps the change, its executable bit (`super::review`). 41 changes
+/// nothing else. Kiln takes Slates at e2d1bc42b since, the same contract: Slates' A-503 lands a
+/// captured clone that moved against its capture, so kiln lands a workspace that moved here as any.
 pub const CONTRACT: u32 = 41;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
@@ -1251,13 +1252,16 @@ fn count_changed(text: &str) -> usize {
     n
 }
 
-/// The files a landing's plan would write, create or delete (not counting directories).
+/// The files a landing's plan would write, create, delete or set the mode of (not counting directories). A mode git keeps
+/// no part of (any permission bit but the executable one, a Windows attribute) is counted all the same, where git's
+/// count of what changed has no record of it: such a landing is held back for review rather than judged by a count that
+/// can't tell it from build output git ignores (Slates' contract 41, `chmod`).
 fn planned_files(plan: &Value) -> usize {
     plan.pointer("/summary/by_action")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|a| !matches!(a.get("action").and_then(Value::as_str), Some("mkdir" | "rmdir" | "chmod")))
+        .filter(|a| !matches!(a.get("action").and_then(Value::as_str), Some("mkdir" | "rmdir")))
         .filter_map(|a| a.get("count").and_then(Value::as_u64))
         .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
         .fold(0usize, usize::saturating_add)
@@ -1282,14 +1286,15 @@ pub async fn writable(m: &Made, over: &str, plan: &Value) -> Result<(), String> 
         return Ok(());
     }
     Err(format!(
-        "it would also write {} file{} git ignores (build output, dependencies) into the folder, made since kiln asked git what it ignores: plan it again once the agent's build is done, or put the work up for review instead",
+        "it would also write {} file{} git doesn't see changed into the folder: what git ignores (build output, dependencies) made since kiln asked git, or a mode git keeps no part of: plan it again once the agent's build is done, or put the work up for review instead",
         planned.saturating_sub(changed),
         if planned.saturating_sub(changed) == 1 { "" } else { "s" }
     ))
 }
 
 /// What a landing would write, as kiln shows it (the shape Slates' own JSON had): entries per
-/// action, bytes to write, entries the filter left out.
+/// action, a file whose mode alone it sets as `chmod` (Slates' contract 41), bytes to write, entries
+/// the filter left out.
 fn summary_json(s: &Summary) -> Value {
     let a = &s.actions;
     let by_action: Vec<Value> = [("create", a.create), ("replace", a.replace), ("delete", a.delete), ("rename", a.rename), ("mkdir", a.mkdir), ("rmdir", a.rmdir), ("symlink", a.symlink), ("clear", a.clear), ("chmod", a.chmod)]
@@ -1756,6 +1761,19 @@ mod tests {
         let held = plan_json(&LandOutcome::Conflicted(vec![conflict]));
         assert_eq!(held.get("conflicts"), Some(&json!(["/README.md"])));
         assert!(held.get("manifest").is_none(), "nothing to approve while it conflicts: {held}");
+        Ok(())
+    }
+
+    /// W6 (Slates' contract 41, A-458): a file whose mode alone changes shows in a plan as `chmod`, after the actions
+    /// kiln always showed, and counts among the files the plan lands, so a person sees every entry they approve, and a
+    /// mode git keeps no part of holds the landing back for review rather than passing as no change.
+    #[test]
+    fn w6_a_plan_shows_a_file_whose_mode_alone_changes_and_counts_it() -> anyhow::Result<()> {
+        let mut shown = approval([0x3c; 32])?;
+        shown.summary.actions.chmod = 2;
+        let plan = plan_json(&LandOutcome::ApprovalRequired(shown));
+        assert_eq!(plan.pointer("/summary/by_action"), Some(&json!([{"action": "create", "count": 2}, {"action": "mkdir", "count": 1}, {"action": "chmod", "count": 2}])));
+        assert_eq!(planned_files(&plan), 4, "two files written and two whose mode alone it sets; the directory not counted");
         Ok(())
     }
 
