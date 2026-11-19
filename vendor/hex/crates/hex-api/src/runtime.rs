@@ -409,6 +409,25 @@ pub trait Runtime: Send + Sync {
             why: None,
         })
     }
+
+    /// Changes running Shards image box `id`'s network or folders in place, as its run goes (kiln plan P6b.3; Shards'
+    /// D269, D271, D278, D285; docs/design/shards-image-class.md §14): a grant added or taken back, a member connected to
+    /// a network shared with other runs or taken off it, a host directory plugged in or unplugged ([`crate::Live`]), its
+    /// VM neither restarted nor rebooted. Its form is held to [`crate::check_live`] first, refused `Invalid`; one it holds
+    /// already is done already. Taken, it is the box's from then on, which inspect says ([`BoxInfo::live`]). It waits on
+    /// its VM's answer or its run's end alone, never a timer. Refused, typed ([`Refusal::Live`]): Shards' own causes
+    /// ([`crate::LiveCause::Net`], [`crate::LiveCause::Plug`]), in its words; `NotRunning` before its start and once its
+    /// stop has begun; `Ended` once its run has ended; and `Class` for a box of any other class or form, which is this
+    /// default's answer, its class as inspect says it. A change its guest must answer ([`crate::Live::needs_guest`]) is
+    /// refused [`Refusal::Pause`] `Paused` while it is paused; while it boots, `Lifecycle { Pending }`.
+    fn change(&self, id: &BoxId, change: crate::Live) -> Result<(), Refusal> {
+        Err(Refusal::Live {
+            cause: crate::LiveCause::Class(self.inspect(id)?.class),
+            id: id.try_clone()?,
+            op: change.op(),
+            why: None,
+        })
+    }
 }
 
 /// When a component's swap or restore takes its member (Shards' D270 slice 4; [`Runtime::swap`]). The node's wire tags
@@ -2944,6 +2963,12 @@ pub struct BoxInfo {
     /// (append-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_wake: Option<ControlWake>,
+    /// What its run took as it runs, beside its spec (kiln plan P6b.3; docs/design/shards-image-class.md §14): the
+    /// grants, connections and plugs it holds now, a Shards image VM's while it runs; none for any other class, none
+    /// once its run has ended, and none in its record, which its spec alone makes. After `control_wake`, so absent
+    /// means none (append-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<crate::LiveHeld>,
 }
 
 /// The waker and the wake of a run's agent-control endpoint ([`BoxInfo::control_wake`]; Shards' `ControlAt::waker` and
@@ -3171,6 +3196,17 @@ pub enum Refusal {
         id: BoxId,
         op: &'static str,
         cause: SwapCause,
+        why: Option<String>,
+    },
+    /// Box `id`'s change `op` refused as it runs (kiln plan P6b.3; docs/design/shards-image-class.md §14): a grant, a
+    /// revoke, a connection, a disconnection, a plug or an unplug ([`Runtime::change`]). Typed by [`crate::LiveCause`],
+    /// so a caller tells where the box stands and each of Shards' causes apart without reading words; `why` in Shards'
+    /// words where it gave them. After `Swap` (append-only).
+    #[error("box {id}: {op}: {cause}{}", Said(.why))]
+    Live {
+        id: BoxId,
+        op: &'static str,
+        cause: crate::LiveCause,
         why: Option<String>,
     },
 }

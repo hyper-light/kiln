@@ -662,6 +662,7 @@ fn info() -> BoxInfo {
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     }
 }
@@ -1373,6 +1374,7 @@ fn answers() -> Vec<(u64, Answer)> {
                         ended: None,
                         control: None,
                         control_wake: None,
+                        live: None,
                         credentials: Vec::new(),
                     },
                 ],
@@ -2123,6 +2125,7 @@ fn the_wire_identity_is_its_definitions_digest_line_endings_aside() {
         "../../hex-api/src/grants.rs",
         "../../hex-api/src/credentials.rs",
         "../../hex-api/src/lease.rs",
+        "../../hex-api/src/live.rs",
     ];
     let mut sources: Vec<Vec<u8>> = paths
         .iter()
@@ -2367,8 +2370,8 @@ fn a_run_is_a_create_and_an_exec_in_one_request() {
 #[test]
 fn unknown_kinds_are_refused() {
     let hello = request(5, &Request::Hello { build: build() }, MAX_MESSAGE).unwrap();
-    // 0x0027: the first request kind past every one defined, a box's components' (Shards' D270 slice 4) the last.
-    for kind in [0u16, 0x0027, 0x7fff, 0x8001, 0x8009, 0xffff] {
+    // 0x0028: the first request kind past every one defined, a running box's change (kiln plan P6b.3) the last.
+    for kind in [0u16, 0x0028, 0x7fff, 0x8001, 0x8009, 0xffff] {
         let mut bytes = hello.clone();
         bytes[12..14].copy_from_slice(&kind.to_le_bytes());
         let got = read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap_err();
@@ -2505,6 +2508,7 @@ fn hostile_values_are_refused_by_name() {
         - NO_CREDENTIALS
         - NO_CONTROL
         - NO_WAKE
+        - NO_LIVE
         - 2
         - 8
         - 6
@@ -2729,6 +2733,7 @@ fn any_info() -> impl Strategy<Value = BoxInfo> {
                 ended: None,
                 control: None,
                 control_wake: None,
+                live: None,
                 credentials: Vec::new(),
             },
         )
@@ -3973,6 +3978,7 @@ fn route_wire_spec_and_info_inconsistent_route_receipts_refuse() {
         - NO_CREDENTIALS
         - NO_CONTROL
         - NO_WAKE
+        - NO_LIVE
         - route_bytes;
     assert_eq!(bad[route_at], 1);
     assert_eq!(bad[route_at + 1], class_tag(Class::Oci));
@@ -5634,6 +5640,8 @@ const NO_CONTROL: usize = 1;
 /// What ends an info whose run told no agent-control endpoint's waker and wake (Shards' D252 amended, image channel
 /// v30): its none tag, after the endpoint's.
 const NO_WAKE: usize = 1;
+/// What ends an info whose run took nothing as it runs (kiln plan P6b.3): its none tag, after its waker's and wake's.
+const NO_LIVE: usize = 1;
 
 /// Joint plan step 14 (AC-T7.4.1, C5): why a node's last resort ended a VM crosses the wire after its info's grants. Do:
 /// encode an info with an end and one with none, cut the second before its end's none tag, and read and write both as
@@ -5653,11 +5661,11 @@ fn w14_an_infos_last_resort_crosses_the_wire_after_its_grants() {
     let plain = info();
     let mut cut = answer(3, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
     assert_eq!(
-        cut[cut.len() - NO_WAKE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END],
+        cut[cut.len() - NO_WAKE - NO_LIVE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END],
         0,
         "no end's tag"
     );
-    cut.truncate(cut.len() - NO_WAKE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END);
+    cut.truncate(cut.len() - NO_WAKE - NO_LIVE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -5689,10 +5697,11 @@ fn w12_an_infos_run_words_cross_the_wire_last() {
         Answer::Info(failed.clone())
     );
     assert!(
-        bytes[..bytes.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE].ends_with(words.as_bytes())
+        bytes[..bytes.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_LIVE]
+            .ends_with(words.as_bytes())
     );
     let mut garbled = bytes.clone();
-    let last = garbled.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - 1;
+    let last = garbled.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_LIVE - 1;
     garbled[last] = 0xff;
     assert!(matches!(
         read_answer(&received(&garbled, 0), MAX_MESSAGE),
@@ -5701,11 +5710,11 @@ fn w12_an_infos_run_words_cross_the_wire_last() {
     let plain = info();
     let mut cut = answer(5, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
     assert_eq!(
-        cut[cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - 1],
+        cut[cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_LIVE - 1],
         0,
         "no words' tag ends it, but for its credentials and its agent-control endpoint"
     );
-    cut.truncate(cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_WORDS);
+    cut.truncate(cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_LIVE - NO_WORDS);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -6388,7 +6397,7 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
     tail.extend(49152u16.to_le_bytes());
     tail.push(1);
     tail.extend(1455u16.to_le_bytes());
-    tail.extend([0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE]);
+    tail.extend([0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE + NO_LIVE]);
     assert!(bytes.ends_with(&tail));
     let declared = Answer::Info(BoxInfo {
         class: Class::Shards,
@@ -6408,7 +6417,7 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
         older.ends_with(
             &[
                 &[0][..],
-                &[0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE][..]
+                &[0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE + NO_LIVE][..]
             ]
             .concat()
         )
@@ -6437,7 +6446,8 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
         - NO_WORDS
         - NO_CREDENTIALS
         - NO_CONTROL
-        - NO_WAKE;
+        - NO_WAKE
+        - NO_LIVE;
     hostile[receiver] = 2;
     assert!(matches!(
         read_answer(&received(&hostile, 0), MAX_MESSAGE),
@@ -6642,7 +6652,9 @@ fn w33_an_inspect_carries_its_credential_grants_last() {
     );
     let mut listed = Writer::new(MAX_MESSAGE);
     put_credentials(&mut listed, &credentials, &each_way()).unwrap();
-    assert!(bytes[..bytes.len() - NO_CONTROL - NO_WAKE].ends_with(&listed.done().unwrap()));
+    assert!(
+        bytes[..bytes.len() - NO_CONTROL - NO_WAKE - NO_LIVE].ends_with(&listed.done().unwrap())
+    );
     let unreached = Answer::Info(BoxInfo {
         class: Class::Shards,
         grants: Vec::new(),
@@ -6677,6 +6689,7 @@ fn an_inspect_carries_its_runs_agent_control_endpoint_last() {
             class: Class::Shards,
             control: Some(at.parse().unwrap()),
             control_wake: None,
+            live: None,
             ..info()
         };
         let bytes = answer(99, &Answer::Info(shown.clone()), MAX_MESSAGE).unwrap();
@@ -6685,7 +6698,14 @@ fn an_inspect_carries_its_runs_agent_control_endpoint_last() {
             Answer::Info(shown.clone()),
             "{at}"
         );
-        let tail = [&[1u8][..], &address, &43471u16.to_le_bytes(), &[0u8]].concat();
+        let tail = [
+            &[1u8][..],
+            &address,
+            &43471u16.to_le_bytes(),
+            &[0u8],
+            &[0u8],
+        ]
+        .concat();
         assert!(bytes.ends_with(&tail), "{at}");
         let json = serde_json::to_value(&shown).unwrap();
         assert_eq!(serde_json::from_value::<BoxInfo>(json).unwrap(), shown);
@@ -6704,8 +6724,12 @@ fn an_inspect_carries_its_runs_agent_control_endpoint_last() {
     }
     let plain = info();
     let mut cut = answer(99, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
-    assert_eq!(cut.last(), Some(&0), "no waker's and wake's tag ends it");
-    cut.truncate(cut.len() - NO_WAKE);
+    assert_eq!(
+        cut.last(),
+        Some(&0),
+        "no live changes' tag ends it, after no waker's and wake's"
+    );
+    cut.truncate(cut.len() - NO_WAKE - NO_LIVE);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -6732,6 +6756,7 @@ fn v30_an_inspect_carries_its_endpoints_waker_and_wake_after_it() {
             class: Class::Shards,
             control: Some(control),
             control_wake: Some(ControlWake { waker, wake }),
+            live: None,
             ..info()
         };
         assert_eq!(shown.control_sockets(), Some([control, waker, wake]));
@@ -6751,6 +6776,7 @@ fn v30_an_inspect_carries_its_endpoints_waker_and_wake_after_it() {
             &waker.port().to_le_bytes(),
             &address(wake),
             &wake.port().to_le_bytes(),
+            &[0u8][..],
         ]
         .concat();
         assert!(bytes.ends_with(&tail), "{control}");
@@ -6764,6 +6790,7 @@ fn v30_an_inspect_carries_its_endpoints_waker_and_wake_after_it() {
             waker: v4(50001),
             wake: v4(50002),
         }),
+        live: None,
         ..info()
     };
     assert_eq!(unbound.control_sockets(), None);
@@ -7549,6 +7576,177 @@ fn d270_a_swap_its_answer_and_its_refusal_cross_the_wire() {
             ..
         })
     ));
+}
+
+/// Kiln plan P6b.3 (AC-T7.4.1; docs/design/shards-image-class.md §14): a running box's change crosses the wire as an
+/// appended call, its box then its change (a tag by its place in `Live`, then its parts); its refusal as tag 20, where the
+/// box stands or Shards' cause by its place, then Shards' words as an option; an inspect's record of what its run took
+/// after every older field; and an image spec's plug roots and ceiling after its served shares. Do write each change and
+/// read it back, then an unplug with its tag 6; write a refusal of each kind of cause and read each back, then one with
+/// its cause byte 6; write an info holding a grant, its port as bound, a connection and a plug, and a spec with roots and
+/// a ceiling, and read each back. Expect each read back as written; tag 6 refused as "change", cause 6 as "change cause".
+#[test]
+fn p6b3_a_change_its_refusal_and_what_a_run_took_cross_the_wire() {
+    let harness = Member {
+        kind: MemberKind::Harness,
+        name: "claude".to_owned(),
+    };
+    let egress = Grant::Egress {
+        member: harness.clone(),
+        to: Destination::Name("api.example.com".to_owned()),
+        ports: Ports {
+            proto: Proto::Tcp,
+            first: 443,
+            last: 443,
+        },
+    };
+    let publish = Grant::Publish {
+        member: harness.clone(),
+        proto: Proto::Tcp,
+        port: 3000,
+        host: "127.0.0.1".parse().unwrap(),
+        host_port: Some(8080),
+    };
+    let grant = NetworkGrant {
+        name: "alice".to_owned(),
+        peer: "bob.team".to_owned(),
+        proto: Proto::Udp,
+        first: 8080,
+        last: 8081,
+        way: Way::In,
+    };
+    let plug = ImagePlug {
+        source: PathBuf::from("/srv/data"),
+        members: vec![harness.clone()],
+        at: "/volumes/data".to_owned(),
+        read_only: true,
+        exec: false,
+    };
+    for change in [
+        Live::Grant(egress.clone()),
+        Live::Revoke(publish.clone()),
+        Live::Connect {
+            member: harness.clone(),
+            network: "team".to_owned(),
+            grant: grant.clone(),
+        },
+        Live::Disconnect {
+            member: harness.clone(),
+            network: "team".to_owned(),
+            grant: grant.clone(),
+        },
+        Live::Plug(plug.clone()),
+        Live::Unplug {
+            at: "/volumes/data".to_owned(),
+        },
+    ] {
+        let call = Request::Call(Call::Change {
+            id: id("image"),
+            change,
+        });
+        let bytes = request(7, &call, MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            call
+        );
+    }
+    // An unplug: its box, then its tag (5, by its place) and its place, last.
+    let unplug = Request::Call(Call::Change {
+        id: id("image"),
+        change: Live::Unplug {
+            at: "/v/d".to_owned(),
+        },
+    });
+    let bytes = request(7, &unplug, MAX_MESSAGE).unwrap();
+    let tag = bytes.len() - "/v/d".len() - size_of::<u32>() - 1;
+    assert_eq!(bytes[tag], 5, "Unplug, by its place");
+    let mut hostile = bytes.clone();
+    hostile[tag] = 6;
+    assert!(matches!(
+        read_request(&received(&hostile, 0), MAX_MESSAGE).map_err(|bad| bad.fault),
+        Err(Fault::Value { what: "change", .. })
+    ));
+    for cause in [
+        LiveCause::NotRunning,
+        LiveCause::Ended,
+        LiveCause::Class(Class::Process),
+        LiveCause::Unsupported,
+        LiveCause::Net(NetCause::Overlaps),
+        LiveCause::Plug(PlugCause::Clearing),
+    ] {
+        let refused = Answer::Refused(Refusal::Live {
+            id: id("image"),
+            op: "grant",
+            cause,
+            why: Some("past its ceiling".to_owned()),
+        });
+        let bytes = answer(7, &refused, MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            refused
+        );
+    }
+    // Its cause's tag (1, Ended), then its words' none tag, last.
+    let refused = Answer::Refused(Refusal::Live {
+        id: id("image"),
+        op: "plug",
+        cause: LiveCause::Ended,
+        why: None,
+    });
+    let bytes = answer(7, &refused, MAX_MESSAGE).unwrap();
+    let tag = bytes.len() - 2;
+    assert_eq!(bytes[tag], 1, "Ended, by its place");
+    let mut hostile = bytes.clone();
+    hostile[tag] = 6;
+    assert!(matches!(
+        read_answer(&received(&hostile, 0), MAX_MESSAGE),
+        Err(Fault::Value {
+            what: "change cause",
+            ..
+        })
+    ));
+    let shown = BoxInfo {
+        class: Class::ShardsImage,
+        live: Some(LiveHeld {
+            grants: vec![publish, egress.clone()],
+            published: vec![Published {
+                grant: 0,
+                at: "127.0.0.1:8080".parse().unwrap(),
+                receiver: Receiver::Named { port: 3000 },
+            }],
+            networks: vec![Connection {
+                member: harness,
+                network: "team".to_owned(),
+                grant,
+            }],
+            plugs: vec![plug],
+        }),
+        ..info()
+    };
+    let bytes = answer(7, &Answer::Info(shown.clone()), MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        Answer::Info(shown)
+    );
+    let create = Request::Call(Call::Create(Box::new(BoxSpec {
+        id: id("image-live"),
+        bounds: Bounds::default(),
+        class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+            plug_roots: vec!["/volumes".to_owned()],
+            ceiling: vec![egress],
+            ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
+        })),
+        owner: None,
+        devices: Vec::new(),
+        allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+        route: None,
+        band: 0,
+    })));
+    let bytes = request(9, &create, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        create
+    );
 }
 
 /// Shards' D279 (AC-T7.4.1): whether a share's files may be run from it crosses the wire after its member scope (Shards'

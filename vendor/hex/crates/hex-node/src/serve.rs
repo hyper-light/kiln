@@ -2527,6 +2527,8 @@ impl<O: Os> Shared<O> {
             } => host.swap(&id, &at, &digest, when).map(Answer::Swapped),
             Call::Restore { id, at, when } => host.restore(&id, &at, when).map(Answer::Swapped),
             Call::Components(id) => host.components(&id).map(Answer::Components),
+            // Kiln plan P6b.3: a running box's network or folders changed in place, answered once its run holds it.
+            Call::Change { id, change } => host.change(&id, change).map(|()| Answer::Done),
             // The machine's capacity view's word, kept for the node's charge learner (the review's A-10).
             Call::Reserved(word) => host.reserved(word).map(|()| Answer::Done),
             Call::Usage(id) => host.usage(&id).map(Answer::Usage),

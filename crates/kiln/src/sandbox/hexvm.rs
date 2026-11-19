@@ -90,7 +90,7 @@ use kiln_seams::sandbox::{Boundary, Egress, Exit, Holds, KeptVolume, Launch, Lin
 /// guest: its `usage_of`), or weights. Credentials it holds where its runtime leases them ([`HexVms::leasing`], its
 /// [`Sandbox::holds`]); these say none. Volumes of its node's Shards home given to a launch, listed and cleared (kiln
 /// plan 01a1dd2e…, P6.2: module docs).
-pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: false, swaps: false, components: false, pools: false, volumes: true, served: false };
+pub const HOLDS: Holds = Holds { memory: false, processes: false, weights: false, no_egress: true, egress_by_host: true, shares: true, signals: true, credentials: false, live: true, swaps: false, components: false, pools: false, volumes: true, served: false };
 
 /// Why a launch granting a credential is refused where no broker leases this machine's credentials (module docs).
 pub const NO_BROKER: &str = "credentials filled in at its egress: no run-lease broker leases this machine's microVMs' credentials (its server's broker didn't open, or this runner has no link to its server to ask it over), and a run granted one is never run without it (Shards' D242)";
@@ -383,7 +383,11 @@ impl HexVms {
         // Its volumes (P6.2), plugged by Hex as its run starts, each bound drawn from the disk its box is admitted with.
         let disk = disk_of(&launch.volumes)?;
         let volumes = volumes_of(&member, &launch.volumes)?;
-        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, volumes, served, ..ShardsImage::new(image) };
+        // Where its run takes a folder of the machine's live (Shards' D271 plug roots), and the most its harness may be
+        // granted past its microVM as it runs (Shards' D278 ceiling), as its launch declared them (kiln plan 01a1dd2e…,
+        // P6b.4, through Hex's P6b.3).
+        let ceiling = grants_of(&member, &Egress::Only(launch.egress_ceiling.clone()))?;
+        let class = ShardsImage { grants, members: vec![driven], shares, credentials, sign_ins, volumes, served, plug_roots: launch.plug_roots.clone(), ceiling, ..ShardsImage::new(image) };
         let id = name.id().map_err(seam)?;
         let spec = BoxSpec { id: id.try_clone().map_err(seam)?, bounds: hex_api::Bounds::default(), class: ClassSpec::ShardsImage(Box::new(class)), owner: None, devices: Vec::new(), allocation: Some(allocation(size, disk)?), route: None, band: 0 };
         let name = id.to_string();
@@ -930,12 +934,25 @@ impl Run for HexRun {
         })
     }
 
-    // None live yet (`HOLDS.live`): Hex's wire calls for a running box's network and folders (kiln plan 01a1dd2e…,
-    // P6b.3, over Shards' P6b.1 and P6b.2) haven't landed in the Hex kiln vendors.
+    // Hex changes its box's network and folders in place (Hex's `Runtime::change`, its P6b.3 over Shards' D269, D271,
+    // D278 and D285), each change as Hex's one call takes it ([`HexRun::live_of`]); a component's swap or restore is none
+    // of them ([`NO_SWAP`]). One after its run's end is `Ended`; the rest in Hex's words.
     fn change(&self, change: kiln_seams::sandbox::Change) -> BoxFuture<'_, Result<(), Refusal>> {
-        drop(change);
-        let over = self.over();
-        Box::pin(async move { if over { Err(Refusal::Ended) } else { Err(Refusal::Unsupported(NO_LIVE.to_owned())) } })
+        Box::pin(async move {
+            if self.over() {
+                return Err(Refusal::Ended);
+            }
+            let live = self.live_of(change).await?;
+            let (runtime, id) = (Arc::clone(&self.vm.runtime), self.vm.id.try_clone().map_err(seam)?);
+            let made = crate::rt::blocking(move || runtime.change(&id, live))
+                .await
+                .map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?;
+            match made {
+                Ok(()) => Ok(()),
+                Err(hex_api::Refusal::Live { cause: hex_api::LiveCause::NotRunning | hex_api::LiveCause::Ended, .. }) => Err(Refusal::Ended),
+                Err(why) => Err(seam(why)),
+            }
+        })
     }
 
     // None yet (`HOLDS.swaps`): Hex's wire calls for a component swapped into a running box (P6c.2, over Shards' P6c.1).
@@ -969,6 +986,87 @@ impl Run for HexRun {
     }
 }
 
+impl HexRun {
+    /// `change` as Hex's one call takes it (Hex's `Live`; kiln plan 01a1dd2e…, P6b.3): a port published as its harness
+    /// member's, which Hex holds it to (the seam's publish names none: Shards' D269 takes a guest port alone); a port let
+    /// go by the publish its box holds at that socket, as Hex says it (`BoxInfo::live`); egress a member's by TCP, as its
+    /// launch's is ([`grants_of`]); a network's grant whole; a folder of the machine's plugged in, read-only and runnable
+    /// as it says (Shards' D279). A member is its harness, the one member Hex drives; another is refused, as a share given
+    /// one is ([`share_of`]); a store's volume plugged in live and a component's swap or restore are refused
+    /// `Unsupported`, saying why.
+    async fn live_of(&self, change: kiln_seams::sandbox::Change) -> Result<hex_api::Live, Refusal> {
+        use hex_api::{ImagePlug, Live, NetworkGrant as Granted, Way as HexWay};
+        use kiln_seams::sandbox::{Change, PlugFor, PlugSource, Way as SeamWay};
+        let driven = &self.vm.member;
+        let member = |named: &kiln_seams::sandbox::Member| -> Result<Member, Refusal> {
+            if named.0 == driven.name {
+                Ok(driven.clone())
+            } else {
+                Err(Refusal::Unsupported(format!("a change for {:?}, a member of its image it doesn't drive: Hex names each member by its kind, and drives its harness alone", named.0)))
+            }
+        };
+        let proto = |udp: bool| if udp { Proto::Udp } else { Proto::Tcp };
+        let egress = |who: &kiln_seams::sandbox::Member, host: &str, port: u16| -> Result<Grant, Refusal> {
+            let mut granted = grants_of(&member(who)?, &Egress::Only(vec![format!("{host}:{port}")]))?;
+            granted.pop().ok_or_else(|| Refusal::Invalid { what: "its egress", why: format!("{host}:{port} names no grant") })
+        };
+        let network = |grant: kiln_seams::sandbox::NetworkGrant| Granted {
+            name: grant.name,
+            peer: grant.peer,
+            proto: proto(grant.ports.udp),
+            first: grant.ports.first,
+            last: grant.ports.last,
+            way: match grant.way {
+                SeamWay::In => HexWay::In,
+                SeamWay::Out => HexWay::Out,
+            },
+        };
+        Ok(match change {
+            Change::Publish { guest_port, udp, host, host_port } => {
+                let host = host
+                    .as_deref()
+                    .ok_or_else(|| Refusal::Invalid { what: "a published port", why: "names no host address it's bound at: Hex publishes each at an address of the host's".into() })?;
+                let host = host.parse::<std::net::IpAddr>().map_err(|_| Refusal::Invalid { what: "a published port", why: format!("{host:?} is no address of the host's") })?;
+                Live::Grant(Grant::Publish { member: driven.clone(), proto: proto(udp), port: guest_port, host, host_port: if host_port == 0 { None } else { Some(host_port) } })
+            }
+            Change::Unpublish { udp, host } => {
+                let at: std::net::SocketAddr = host.parse().map_err(|_| Refusal::Invalid { what: "a published port", why: format!("{host:?} is no address and port") })?;
+                let (runtime, id) = (Arc::clone(&self.vm.runtime), self.vm.id.try_clone().map_err(seam)?);
+                let shown = crate::rt::blocking(move || runtime.inspect(&id))
+                    .await
+                    .map_err(|e| Refusal::Invalid { what: "its microVM", why: format!("{e:#}") })?
+                    .map_err(seam)?;
+                let held = shown.live.unwrap_or_default();
+                let grant = held
+                    .published
+                    .iter()
+                    .filter(|bound| bound.at == at)
+                    .filter_map(|bound| usize::try_from(bound.grant).ok().and_then(|i| held.grants.get(i)))
+                    .find(|grant| matches!(grant, Grant::Publish { proto: p, .. } if *p == proto(udp)))
+                    .cloned()
+                    .ok_or_else(|| Refusal::Invalid { what: "a published port", why: format!("its microVM publishes nothing it took live at {at}") })?;
+                Live::Revoke(grant)
+            }
+            Change::Grant { member: who, host, port } => Live::Grant(egress(&who, &host, port)?),
+            Change::Revoke { member: who, host, port } => Live::Revoke(egress(&who, &host, port)?),
+            Change::Connect { member: who, network: name, grant } => Live::Connect { member: member(&who)?, network: name, grant: network(grant) },
+            Change::Disconnect { member: who, network: name, grant } => Live::Disconnect { member: member(&who)?, network: name, grant: network(grant) },
+            Change::Plug { source, to, at, read_only, exec } => {
+                let PlugSource::Host(folder) = source else {
+                    return Err(Refusal::Unsupported("a volume of its store plugged in as it runs: Hex plugs a folder of the machine's alone, and gives a launch its volumes as it starts".into()));
+                };
+                let members = match to {
+                    PlugFor::Every => Vec::new(),
+                    PlugFor::Members(named) => named.iter().map(&member).collect::<Result<Vec<Member>, Refusal>>()?,
+                };
+                Live::Plug(ImagePlug { source: PathBuf::from(folder), members, at, read_only, exec })
+            }
+            Change::Unplug { at } => Live::Unplug { at },
+            Change::Swap { .. } | Change::Restore { .. } => return Err(Refusal::Unsupported(NO_SWAP.to_owned())),
+        })
+    }
+}
+
 /// Why a box isn't paused and resumed: Hex pauses a Shards image VM alone (its P5.5b, over Shards' D267).
 pub const NO_PAUSE: &str = "a running microVM paused where it is and resumed: Hex pauses a Shards image VM alone, and this box is of another class";
 
@@ -978,9 +1076,6 @@ pub const NO_SWAP: &str = "a harness swapped for another in its running microVM:
 /// Why a harness swapped into a running box isn't granted its sign-in there yet (plan step 33): Hex grants one only as a
 /// box is made (its C8), and has no call that swaps a member in place, nor one that grants a running box a sign-in.
 pub const NO_SWAP_SIGN_IN: &str = "a sign-in granted to a harness swapped into its running microVM: Hex grants one only as a box is made (its C8), and the Hex kiln vendors has no wire call that swaps a member in place with one yet (kiln plan 01a1dd2e…, P6c.2)";
-
-/// Why a box's network and folders don't change while it runs yet.
-pub const NO_LIVE: &str = "a change to a running microVM's network or folders: the Hex kiln vendors has no wire call for one yet (kiln plan 01a1dd2e…, P6b.3)";
 
 impl Drop for HexRun {
     fn drop(&mut self) {
@@ -1128,22 +1223,47 @@ pub(crate) mod tests {
         })
     }
 
-    /// Kiln plan 01a1dd2e…, P6b.3, for Shards' D285: until the Hex kiln vendors has a wire call for it, Hex's mapping
-    /// refuses a member connected to a network shared with other runs, its grant whole, typed (`Unsupported`, saying
-    /// why), its run going on; once the run has ended, `Ended`.
+    /// Kiln plan 01a1dd2e…, P6b.4 through Hex's P6b.3 (Shards' D269, D271, D278, D285): a run's network and folders change
+    /// in place through Hex, its launch's plug roots and egress ceiling its box's. Do launch one declaring a root and a
+    /// ceiling, then grant its harness egress within the ceiling and past it, publish a port and let it go, connect it to
+    /// a network and disconnect it, plug a folder in (read-only, its files kept from running) and unplug it, ask a swap, and
+    /// after its kill, a connection. Expect each taken, Hex's record of the box saying each while held; past the ceiling,
+    /// a refusal in Hex's words; the swap `Unsupported`; after its end, `Ended`.
     #[test]
-    fn p6b_3_hexs_mapping_refuses_a_connection_typed_until_hex_has_the_call() -> anyhow::Result<()> {
-        use kiln_seams::sandbox::{Change, Member as Who, NetworkGrant, Ports as SeamPorts, Way};
+    fn p6b_4_a_runs_network_and_folders_change_in_place_through_hex() -> anyhow::Result<()> {
+        use kiln_seams::sandbox::{Change, Member as Who, NetworkGrant, PlugFor, PlugSource, Ports as SeamPorts, Way};
         crate::rt::block_on(async {
-            let (_, vms) = vms();
-            assert!(!vms.holds().live, "it says it takes changes live");
-            let run = vms.launch(launch(Egress::Only(Vec::new()))).await?;
-            let connect = || Change::Connect { member: Who("claude".into()), network: "team".into(), grant: NetworkGrant { name: "alice".into(), peer: "bob".into(), ports: SeamPorts { udp: false, first: 8080, last: 8080 }, way: Way::Out } };
-            assert_eq!(run.change(connect()).await, Err(Refusal::Unsupported(super::NO_LIVE.to_owned())));
+            let (sim, vms) = vms();
+            assert!(vms.holds().live, "it takes changes live");
+            let declared = Launch { plug_roots: vec!["/volumes".into()], egress_ceiling: vec!["api.example.com:443".into()], ..launch(Egress::Only(Vec::new())) };
+            let run = vms.launch(declared).await?;
+            let id = BoxId::new(&run.id().unwrap_or_default())?;
+            let held = || sim.inspect(&id).map(|info| info.live.unwrap_or_default());
+            let claude = || Who("claude".into());
+            run.change(Change::Grant { member: claude(), host: "API.example.com".into(), port: 443 }).await?;
+            anyhow::ensure!(held()?.grants.len() == 1, "{:?}", held()?);
+            let past = run.change(Change::Grant { member: claude(), host: "elsewhere.example.com".into(), port: 443 }).await;
+            anyhow::ensure!(matches!(&past, Err(Refusal::Invalid { why, .. }) if why.contains("past its image's grants and its ceiling")), "{past:?}");
+            run.change(Change::Publish { guest_port: 3000, udp: false, host: Some("127.0.0.1".into()), host_port: 8080 }).await?;
+            anyhow::ensure!(held()?.published.iter().any(|p| p.at.to_string() == "127.0.0.1:8080"), "{:?}", held()?);
+            run.change(Change::Unpublish { udp: false, host: "127.0.0.1:8080".into() }).await?;
+            anyhow::ensure!(held()?.published.is_empty(), "{:?}", held()?);
+            let grant = || NetworkGrant { name: "alice".into(), peer: "bob".into(), ports: SeamPorts { udp: false, first: 8080, last: 8081 }, way: Way::Out };
+            run.change(Change::Connect { member: claude(), network: "team".into(), grant: grant() }).await?;
+            anyhow::ensure!(held()?.networks.len() == 1, "{:?}", held()?);
+            run.change(Change::Disconnect { member: claude(), network: "team".into(), grant: grant() }).await?;
+            let plug = Change::Plug { source: PlugSource::Host("/srv/data".into()), to: PlugFor::Members(vec![claude()]), at: "/volumes/data".into(), read_only: true, exec: false };
+            run.change(plug).await?;
+            anyhow::ensure!(held()?.plugs.first().is_some_and(|p| p.read_only && !p.exec && p.at == "/volumes/data"), "{:?}", held()?);
+            run.change(Change::Unplug { at: "/volumes/data".into() }).await?;
+            anyhow::ensure!(held()?.grants.len() == 1 && held()?.networks.is_empty() && held()?.plugs.is_empty(), "{:?}", held()?);
+            let swap = run.change(Change::Restore { at: "/harness/claude".into() }).await;
+            anyhow::ensure!(swap == Err(Refusal::Unsupported(super::NO_SWAP.to_owned())), "{swap:?}");
             run.kill();
             let (_, ends) = drain(run.as_ref()).await;
-            assert_eq!(ends, [Exit::Killed], "its run went on until it was killed");
-            assert_eq!(run.change(connect()).await, Err(Refusal::Ended));
+            anyhow::ensure!(ends == [Exit::Killed], "its run went on until it was killed: {ends:?}");
+            let late = run.change(Change::Connect { member: claude(), network: "team".into(), grant: grant() }).await;
+            anyhow::ensure!(late == Err(Refusal::Ended), "{late:?}");
             anyhow::Ok(())
         })
     }

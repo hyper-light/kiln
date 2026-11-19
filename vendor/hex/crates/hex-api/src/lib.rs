@@ -31,6 +31,7 @@ pub mod event;
 mod grants;
 mod id;
 pub mod lease;
+mod live;
 pub mod patience;
 mod runtime;
 pub mod serve;
@@ -51,6 +52,10 @@ pub use grants::{
     check_published, unheld,
 };
 pub use id::BoxId;
+pub use live::{
+    Connection, ImagePlug, Live, LiveCause, LiveHeld, NetCause, NetworkGrant, PlugCause, Way,
+    check_live, check_plug_root,
+};
 pub use runtime::{
     Allocation, Asked, BackingGrant, BackingKey, BackingOffer, BackingPhase, BoxInfo, BoxState,
     Capacity, CapacityResources, Charged, ComponentAt, ConnectFailure, ConnectPhase, ConnectReply,

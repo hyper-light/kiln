@@ -1675,6 +1675,13 @@ impl Runtime for GuestRuntime {
         self.images.components_image(record)
     }
 
+    /// Kiln plan P6b.3: an image VM's network or folders changed as it runs, its class's ([`image::ImageClass`]); any
+    /// other box's refused as the trait refuses it, naming its class.
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        let record = self.changeable(id, change.op())?;
+        self.images.change_image(record, change)
+    }
+
     fn signal(&self, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
         match self.routed(id)? {
             books::Routed::Retired(record) => Err(record.retired_refusal()?),
@@ -2472,6 +2479,12 @@ impl<P: Runtime> Runtime for WithGuest<P> {
 
     fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
         self.holder(id)?.components(id)
+    }
+
+    /// The runtime holding the box changes its network or folders as it runs (kiln plan P6b.3), as it swaps its
+    /// components: an image VM's its guest runtime's class, a process box's its host's, which takes none.
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        self.holder(id)?.change(id, change)
     }
 
     fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {

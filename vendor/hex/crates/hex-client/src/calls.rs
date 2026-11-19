@@ -103,10 +103,13 @@ pub enum BoxKind {
     Restore,
     /// An image box's components (`Call::Components`): answered from what its node holds.
     Components,
+    /// A running image box's network or folders changed in place (`Call::Change`; kiln plan P6b.3): answered once its
+    /// run holds it, a member's reach, a connection and a plug once its guest does too.
+    Change,
 }
 
 /// The box kinds' waits for one class ([`BoxKind`]).
-pub const BOX_KINDS: usize = BoxKind::Components as usize + 1;
+pub const BOX_KINDS: usize = BoxKind::Change as usize + 1;
 
 /// The classes a box is of ([`Class`]), a table of box kinds' waits for each, in [`by_class`]'s order.
 pub const CLASSES: usize = 5;
@@ -133,8 +136,9 @@ macro_rules! class_wait {
 
 /// One class's box-kind waits, in [`BoxKind`]'s order, each named `<prefix>.<kind>.<class>` (AC-T7.4.1: one census
 /// name per (kind, class)); `measuring` makes every one of them so. A member's take (joint plan step 17), a start
-/// followed to its end, a member's MCP connection, an image box's pause and resume (kiln plan P5.5b) and its components'
-/// swap, restore and read (Shards' D270 slice 4) have no census row for any class, so they measure in every table.
+/// followed to its end, a member's MCP connection, an image box's pause and resume (kiln plan P5.5b), its components'
+/// swap, restore and read (Shards' D270 slice 4) and its change as it runs (kiln plan P6b.3) have no census row for any
+/// class, so they measure in every table.
 macro_rules! class_waits {
     ($prefix:literal, $class:literal, measuring) => {
         $crate::calls::class_waits!(
@@ -172,6 +176,7 @@ macro_rules! class_waits {
             $crate::calls::class_wait!(concat!($prefix, ".swap.", $class), measuring),
             $crate::calls::class_wait!(concat!($prefix, ".restore.", $class), measuring),
             $crate::calls::class_wait!(concat!($prefix, ".components.", $class), measuring),
+            $crate::calls::class_wait!(concat!($prefix, ".change.", $class), measuring),
         ]
     };
 }
@@ -228,7 +233,8 @@ pub(crate) fn kind_of<'a>(waits: &'a [Patience; KINDS], request: &Request) -> Op
             | Call::Resume(_)
             | Call::Swap { .. }
             | Call::Restore { .. }
-            | Call::Components(_) => return None,
+            | Call::Components(_)
+            | Call::Change { .. } => return None,
         },
         Request::Release
         | Request::Taken
@@ -275,6 +281,7 @@ fn box_kind_of(request: &Request) -> Option<(BoxKind, Timed<'_>)> {
         Call::Swap { id, .. } => (BoxKind::Swap, Timed::Box(id)),
         Call::Restore { id, .. } => (BoxKind::Restore, Timed::Box(id)),
         Call::Components(id) => (BoxKind::Components, Timed::Box(id)),
+        Call::Change { id, .. } => (BoxKind::Change, Timed::Box(id)),
         Call::List
         | Call::Netns
         | Call::Schedule(_)
@@ -3455,6 +3462,18 @@ impl<T: Transport> Runtime for Core<T> {
             Answer::Components(components) => Ok(components),
             Answer::Refused(why) => Err(why),
             other => Err(unexpected("components", &other)),
+        }
+    }
+
+    /// Kiln plan P6b.3: a running image box's network or folders changed in place (`Call::Change`).
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        match self.plain(Call::Change {
+            id: id.clone(),
+            change,
+        })? {
+            Answer::Done => Ok(()),
+            Answer::Refused(why) => Err(why),
+            other => Err(unexpected("change", &other)),
         }
     }
 

@@ -215,6 +215,9 @@ mod hosted {
         fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
             self.0.components(id)
         }
+        fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+            self.0.change(id, change)
+        }
     }
 
     impl<R: Runtime> Host for Hosted<R> {

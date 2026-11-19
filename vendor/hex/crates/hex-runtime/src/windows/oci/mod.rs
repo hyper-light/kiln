@@ -1253,6 +1253,7 @@ pub fn info(b: &OciBox) -> Result<hex_api::BoxInfo, Refusal> {
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     })
 }

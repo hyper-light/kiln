@@ -1302,6 +1302,7 @@ fn a_vm_create_slower_than_the_oci_creates_is_answered() {
                 ended: None,
                 control: None,
                 control_wake: None,
+                live: None,
                 credentials: Vec::new(),
             };
             let bytes = wire::answer(h.id, &Answer::Info(info), wire::MAX_MESSAGE).unwrap();

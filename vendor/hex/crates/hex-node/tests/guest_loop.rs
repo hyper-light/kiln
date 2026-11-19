@@ -261,6 +261,7 @@ fn guest_box(id: &BoxId) -> hex_api::BoxInfo {
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     }
 }

@@ -1960,6 +1960,7 @@ mod projection_tests {
             ended: None,
             control: None,
             control_wake: None,
+            live: None,
             credentials: Vec::new(),
         }
     }
@@ -3195,6 +3196,12 @@ impl<R: Recover> Runtime for Recorded<R> {
 
     fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
         self.runtime_at(id)?.components(id)
+    }
+
+    /// Kiln plan P6b.3: the box's runtime changes its network or folders as it runs, an image VM's its class's; its
+    /// record is unchanged, as a change is its run's alone (docs/design/shards-image-class.md §14).
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        self.runtime_at(id)?.change(id, change)
     }
 
     fn list(&self) -> Result<Vec<BoxInfo>, Refusal> {

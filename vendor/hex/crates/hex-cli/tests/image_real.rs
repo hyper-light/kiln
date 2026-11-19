@@ -39,6 +39,8 @@
 //!   D270 slice 4: an OSI artifact of that member's kind for this host's platform, by its manifest digest), at that
 //!   member's path (`/harness/cat` for `image_harness`'s), which HEX-IMG-11 swaps in and out. Unset, HEX-IMG-11 fails
 //!   saying no component is named, as no swap can be held to the contract without one; the other cases run as ever.
+//! - `HEX_IMAGE_NETWORK`: a network shared by runs, made beforehand in the node's Shards home (`shards network create`),
+//!   which HEX-IMG-13 connects the image's harness to (kiln plan P6b.3; Shards' D285); none, and HEX-IMG-13 fails.
 //!
 //! Run on Linux: build it with `cargo test --release --locked -p hex-cli --test image_real --no-run`, which names the
 //! test binary it built (`target/release/deps/image_real-<hash>`), then start that binary alone in the delegated
@@ -93,6 +95,11 @@ struct ImageBoxes {
     image: String,
     allocation: Allocation,
     component: Option<conformance::Component>,
+    /// A host directory of the run's own, which HEX-IMG-12 plugs in (kiln plan P6b.3).
+    plugged: PathBuf,
+    /// A network shared by runs, made beforehand in the node's Shards home (`HEX_IMAGE_NETWORK`), which HEX-IMG-13
+    /// connects to (Shards' D285); none, and HEX-IMG-13 fails.
+    network: Option<String>,
 }
 
 /// The command a run's act is, in the image's own shell: the image cases ask a run to fail with a code (HEX-IMG-3)
@@ -146,6 +153,14 @@ impl Fixture for ImageBoxes {
 
     fn component(&self) -> Option<conformance::Component> {
         self.component.clone()
+    }
+
+    fn plug_source(&self) -> Option<PathBuf> {
+        Some(self.plugged.clone())
+    }
+
+    fn network(&self) -> Option<String> {
+        self.network.clone()
     }
 }
 
@@ -338,6 +353,9 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
         }
     });
     fs::create_dir_all(work.join("state")).unwrap();
+    let plugged = work.join("plugged");
+    fs::create_dir_all(&plugged).unwrap();
+    let network = std::env::var("HEX_IMAGE_NETWORK").ok();
     // A VM's start boots it: a wait past its W* tells its run-out and follows its party (decision 9), and the run's
     // deadline bounds the whole suite.
     assert!(
@@ -377,6 +395,8 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
             image,
             allocation,
             component,
+            plugged,
+            network,
         };
         let begun = Instant::now();
         let failures = conformance::run_image(&client, &fixture);

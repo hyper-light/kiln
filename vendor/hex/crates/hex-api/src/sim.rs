@@ -152,6 +152,8 @@ struct SimVm {
     components: BTreeMap<String, (Option<String>, Option<String>)>,
     /// Each member's current generation by its path, where a swap or restore now started it again: 0, its first, else.
     generations: BTreeMap<String, u32>,
+    /// What its run took as it runs (kiln plan P6b.3): its grants, publishes, connections and plugs, in order.
+    live: crate::LiveHeld,
 }
 
 /// Whether a simulated VM's vCPUs run its guest, as its owner last moved them ([`Runtime::pause`], [`Runtime::resume`]):
@@ -329,6 +331,15 @@ impl SimRuntime {
             ended: None,
             control: None,
             control_wake: None,
+            // What its run took as it runs (P6b.3), while its run goes: none once it has ended.
+            live: match (&b.vm, &b.init) {
+                (Some(vm), Some(init))
+                    if b.started && init.exit()?.is_none() && !vm.live.is_empty() =>
+                {
+                    Some(vm.live.clone())
+                }
+                _ => None,
+            },
             credentials: match &b.spec.class {
                 ClassSpec::ShardsImage(image) => image.credentials.clone(),
                 _ => Vec::new(),
@@ -530,12 +541,43 @@ impl SimRuntime {
         Ok(vm)
     }
 
+    /// Box `b`'s VM and its image, its run going, for change `op` (kiln plan P6b.3); or why not, as the image class refuses
+    /// it: a box of any other class as one that takes no change, its run ended, or none started yet.
+    fn changeable<'b>(
+        b: &'b mut SimBox,
+        id: &BoxId,
+        op: &'static str,
+    ) -> Result<(&'b ShardsImage, &'b mut SimVm), Refusal> {
+        let refused = |cause| Refusal::Live {
+            id: id.clone(),
+            op,
+            cause,
+            why: None,
+        };
+        let class = b.spec.class.class();
+        let ended = match &b.init {
+            Some(init) => init.exit()?.is_some(),
+            None => false,
+        };
+        let started = b.started;
+        let (ClassSpec::ShardsImage(image), Some(vm)) = (&b.spec.class, b.vm.as_mut()) else {
+            return Err(refused(crate::LiveCause::Class(class)));
+        };
+        if ended {
+            return Err(refused(crate::LiveCause::Ended));
+        }
+        if !started {
+            return Err(refused(crate::LiveCause::NotRunning));
+        }
+        Ok((image, vm))
+    }
+
     /// Box `id`'s member at path `at` given component `digest`, or its image's own back where none (`op`, a swap or a
     /// restore), at its next start or now, as Shards' run host makes it (D270 slice 4) and the image class refuses it:
     /// typed where it can't be made, `Pause(Paused)` while its VM is paused; now, its current generation ends as TERM
     /// ends a program with no handler, its streams no caller's any longer, and its next is current, its streams taken
     /// anew. The simulator's members say nothing no caller reads, so none is let go unread.
-    fn change(
+    fn swap_change(
         &self,
         id: &BoxId,
         at: &str,
@@ -840,6 +882,7 @@ impl Runtime for SimRuntime {
                 pauses: Duration::ZERO,
                 components: BTreeMap::new(),
                 generations: BTreeMap::new(),
+                live: crate::LiveHeld::default(),
             }),
             _ => None,
         };
@@ -1338,14 +1381,14 @@ impl Runtime for SimRuntime {
         }
     }
 
-    /// A running image VM's member given the one component its node's store holds, at once ([`SimRuntime::change`]).
+    /// A running image VM's member given the one component its node's store holds, at once ([`SimRuntime::swap_change`]).
     fn swap(&self, id: &BoxId, at: &str, digest: &str, when: SwapWhen) -> Result<Swapped, Refusal> {
-        self.change(id, at, Some(digest), when, "swap")
+        self.swap_change(id, at, Some(digest), when, "swap")
     }
 
-    /// A running image VM's member given its image's own component back, at once ([`SimRuntime::change`]).
+    /// A running image VM's member given its image's own component back, at once ([`SimRuntime::swap_change`]).
     fn restore(&self, id: &BoxId, at: &str, when: SwapWhen) -> Result<Swapped, Refusal> {
-        self.change(id, at, None, when, "restore")
+        self.swap_change(id, at, None, when, "restore")
     }
 
     /// A running image VM's members' components, paused or not; refused as a swap is.
@@ -1356,6 +1399,205 @@ impl Runtime for SimRuntime {
             .ok_or_else(|| Refusal::NoSuchBox(id.clone()))?;
         let vm = Self::swappable(b, id, "components")?;
         Ok(listed(&vm.components))
+    }
+
+    /// A running image VM's network or folders changed in place (kiln plan P6b.3), at once, as its run takes each and the
+    /// image class refuses it: its form held to [`crate::check_live`] first; a grant or a connection it holds already
+    /// done already; a grant for a member its image runs not refused `Unknown`, and an egress or host grant past its
+    /// spec's grants and its ceiling `Widening`; a publish bound where it names, or on a port of the dynamic range (RFC
+    /// 6335 §6) where it names none; a name another member holds on a network `NameTaken`; a plug for a member its image
+    /// declares not refused `Ask`, at a place beneath none of its roots (its plug roots and its shares' top-level
+    /// directories) `Root`, at a place plugged already `Taken`; what it takes back that it doesn't hold `Unknown`, or
+    /// `Unplugged`; one its guest must answer `Pause(Paused)` while its VM is paused; `NotRunning`, `Ended` and `Class` as
+    /// a swap is.
+    fn change(&self, id: &BoxId, change: crate::Live) -> Result<(), Refusal> {
+        use crate::{Grant, Live, LiveCause, NetCause, PlugCause, Published, Receiver};
+        let op = change.op();
+        let refused = |cause, why: String| Refusal::Live {
+            id: id.clone(),
+            op,
+            cause,
+            why: Some(why),
+        };
+        let mut boxes = self.boxes()?;
+        let b = boxes
+            .get_mut(id)
+            .ok_or_else(|| Refusal::NoSuchBox(id.clone()))?;
+        let (image, vm) = Self::changeable(b, id, op)?;
+        crate::check_live(&change, &image.grants, &vm.live)?;
+        if change.needs_guest() && matches!(vm.hold, SimHold::Paused(_)) {
+            return Err(Refusal::Pause {
+                id: id.clone(),
+                op,
+                cause: PauseCause::Paused,
+            });
+        }
+        let runs = |member: &Member| {
+            (member.kind == MemberKind::Harness && member.name == SIM_HARNESS)
+                || image.members.iter().any(|m| &m.member == member)
+        };
+        match change {
+            Live::Grant(grant) => {
+                if image.grants.contains(&grant) || vm.live.grants.contains(&grant) {
+                    return Ok(());
+                }
+                if !runs(grant.member()) {
+                    return Err(refused(
+                        LiveCause::Net(NetCause::Unknown),
+                        format!("no member {} runs", grant.member()),
+                    ));
+                }
+                let at = vm.live.grants.len();
+                if let Grant::Publish {
+                    port,
+                    host,
+                    host_port,
+                    ..
+                } = &grant
+                {
+                    let picked = match host_port {
+                        Some(port) => *port,
+                        None => u16::try_from(vm.live.published.len())
+                            .ok()
+                            .and_then(|n| SIM_DYNAMIC_PORTS.checked_add(n))
+                            .ok_or_else(|| {
+                                refused(
+                                    LiveCause::Net(NetCause::Bind),
+                                    "no port of the dynamic range is left".to_owned(),
+                                )
+                            })?,
+                    };
+                    let grant = u32::try_from(at).map_err(|_| {
+                        Refusal::Broken("a simulated VM's live grants pass a u32".to_owned())
+                    })?;
+                    vm.live.published.push(Published {
+                        grant,
+                        at: std::net::SocketAddr::new(*host, picked),
+                        receiver: Receiver::Named { port: *port },
+                    });
+                } else if !within(&grant, &image.grants) && !within(&grant, &image.ceiling) {
+                    return Err(refused(
+                        LiveCause::Net(NetCause::Widening),
+                        format!(
+                            "{} is past its image's grants and its ceiling",
+                            grant.member()
+                        ),
+                    ));
+                }
+                vm.live.grants.push(grant);
+            }
+            Live::Revoke(grant) => {
+                let Some(at) = vm.live.grants.iter().position(|held| held == &grant) else {
+                    return Err(refused(
+                        LiveCause::Net(NetCause::Unknown),
+                        "it holds no such grant as it runs".to_owned(),
+                    ));
+                };
+                vm.live.grants.remove(at);
+                // Its publish let go, and each later one's place in its grants one less.
+                let at = u32::try_from(at).map_err(|_| {
+                    Refusal::Broken("a simulated VM's live grants pass a u32".to_owned())
+                })?;
+                vm.live.published.retain(|bound| bound.grant != at);
+                for bound in &mut vm.live.published {
+                    if bound.grant > at
+                        && let Some(less) = bound.grant.checked_sub(1)
+                    {
+                        bound.grant = less;
+                    }
+                }
+            }
+            Live::Connect {
+                member,
+                network,
+                grant,
+            } => {
+                let connection = crate::Connection {
+                    member,
+                    network,
+                    grant,
+                };
+                if vm.live.networks.contains(&connection) {
+                    return Ok(());
+                }
+                if !runs(&connection.member) {
+                    return Err(refused(
+                        LiveCause::Net(NetCause::Unknown),
+                        format!("no member {} runs", connection.member),
+                    ));
+                }
+                let taken = vm.live.networks.iter().any(|held| {
+                    held.network == connection.network
+                        && held.member != connection.member
+                        && held.grant.name.eq_ignore_ascii_case(&connection.grant.name)
+                });
+                if taken {
+                    return Err(refused(
+                        LiveCause::Net(NetCause::NameTaken),
+                        format!(
+                            "{} is another member's name on {}",
+                            connection.grant.name, connection.network
+                        ),
+                    ));
+                }
+                vm.live.networks.push(connection);
+            }
+            Live::Disconnect {
+                member,
+                network,
+                grant,
+            } => {
+                let connection = crate::Connection {
+                    member,
+                    network,
+                    grant,
+                };
+                let Some(at) = vm.live.networks.iter().position(|held| held == &connection) else {
+                    return Err(refused(
+                        LiveCause::Net(NetCause::Unknown),
+                        "it holds no such grant on that network".to_owned(),
+                    ));
+                };
+                vm.live.networks.remove(at);
+            }
+            Live::Plug(plug) => {
+                if let Some(member) = plug.members.iter().find(|member| !runs(member)) {
+                    return Err(refused(
+                        LiveCause::Plug(PlugCause::Ask),
+                        format!("its image declares no member {member}"),
+                    ));
+                }
+                let top = top_level(&plug.at);
+                let rooted = image.plug_roots.iter().any(|root| top_level(root) == top)
+                    || image
+                        .shares
+                        .iter()
+                        .any(|share| top_level(&share.destination) == top);
+                if !rooted {
+                    return Err(refused(
+                        LiveCause::Plug(PlugCause::Root),
+                        format!("{} is beneath none of its plug roots", plug.at),
+                    ));
+                }
+                if vm.live.plugs.iter().any(|held| held.at == plug.at) {
+                    return Err(refused(
+                        LiveCause::Plug(PlugCause::Taken),
+                        format!("something is plugged in at {} already", plug.at),
+                    ));
+                }
+                vm.live.plugs.push(plug);
+            }
+            Live::Unplug { at } => {
+                let Some(held) = vm.live.plugs.iter().position(|plug| plug.at == at) else {
+                    return Err(refused(
+                        LiveCause::Plug(PlugCause::Unplugged),
+                        format!("nothing is plugged in at {at}"),
+                    ));
+                };
+                vm.live.plugs.remove(held);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1441,6 +1683,44 @@ pub enum SimFixture {
 /// digits, the fixture's own.
 pub const SIM_IMAGE: &str =
     "hex-sim/harness@sha256:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
+
+/// The first port of the dynamic range (RFC 6335 §6), where a simulated VM binds a live publish that names no host port.
+const SIM_DYNAMIC_PORTS: u16 = 49152;
+
+/// Whether `grant`, an egress or host grant, lies within one of `of`: the same member, way and destination, and its
+/// ports within that grant's (kiln plan P6b.3: Shards' D278 holds a live grant to the image's grants and the ceiling).
+fn within(grant: &crate::Grant, of: &[crate::Grant]) -> bool {
+    use crate::Grant;
+    let inside = |ports: &crate::Ports, wider: &crate::Ports| {
+        ports.proto == wider.proto && wider.first <= ports.first && ports.last <= wider.last
+    };
+    of.iter().any(|wider| match (grant, wider) {
+        (
+            Grant::Egress { member, to, ports },
+            Grant::Egress {
+                member: m,
+                to: t,
+                ports: p,
+            },
+        ) => member == m && to == t && inside(ports, p),
+        (
+            Grant::Host { member, ports },
+            Grant::Host {
+                member: m,
+                ports: p,
+            },
+        ) => member == m && inside(ports, p),
+        _ => false,
+    })
+}
+
+/// The top-level directory of absolute path `path` (`/volumes` of `/volumes/data`), as Shards names a plug root by its
+/// first component.
+fn top_level(path: &str) -> Option<&str> {
+    path.strip_prefix('/')
+        .and_then(|rest| rest.split('/').next())
+        .filter(|name| !name.is_empty())
+}
 
 /// The harness the simulator's image runs of its own, at `/harness/hex-sim` (Shards' D270 slice 4's paths), beside the
 /// members a box's spec says its caller drives, each of which the simulator takes as its image's too.
@@ -1598,6 +1878,21 @@ impl Fixture for SimFixture {
                 at: format!("/harness/{SIM_HARNESS}"),
                 digest: SIM_COMPONENT.to_owned(),
             }),
+            Self::Process | Self::Bundle | Self::Spec | Self::Firecracker | Self::Shards => None,
+        }
+    }
+    /// A host directory the simulated node plugs in (kiln plan P6b.3): the simulator opens none, so any absolute path is
+    /// one.
+    fn plug_source(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::ShardsImage => Some(std::path::PathBuf::from("/sim/plugged")),
+            Self::Process | Self::Bundle | Self::Spec | Self::Firecracker | Self::Shards => None,
+        }
+    }
+    /// A network shared by runs (kiln plan P6b.3; Shards' D285): the simulator holds every one it's asked of as made.
+    fn network(&self) -> Option<String> {
+        match self {
+            Self::ShardsImage => Some("hex-sim-net".to_owned()),
             Self::Process | Self::Bundle | Self::Spec | Self::Firecracker | Self::Shards => None,
         }
     }

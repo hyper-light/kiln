@@ -520,6 +520,17 @@ struct Runs(Mutex<Maps>);
 struct Maps {
     boxes: BTreeMap<BoxId, Run>,
     nodes: BTreeMap<NodeRun, Run>,
+    /// What each box's run took as it runs (kiln plan P6b.3), at most one for each box's run: let go with its run.
+    changes: BTreeMap<BoxId, Changes>,
+}
+
+/// What a box's run took as it runs (kiln plan P6b.3; docs/design/shards-image-class.md §14): the run it was taken on,
+/// so another run of the box starts from none; what that run holds; and whether a change of it is under way, one at a
+/// time as its run host makes them, so no member's reach, given whole, is made from a record another change is moving.
+struct Changes {
+    guest: Arc<dyn ImageGuest>,
+    held: hex_api::LiveHeld,
+    busy: bool,
 }
 
 /// Whose run: a box's, or a node VM's the node runs for itself.
@@ -558,7 +569,10 @@ impl Maps {
 
     fn remove(&mut self, key: Key<'_>) {
         match key {
-            Key::Box(id) => drop(self.boxes.remove(id)),
+            Key::Box(id) => {
+                drop(self.boxes.remove(id));
+                drop(self.changes.remove(id));
+            }
             Key::Node(run) => drop(self.nodes.remove(&run)),
         }
     }
@@ -1313,6 +1327,329 @@ pub(super) fn preflight(record: &BoxRecord) -> Result<(), Refusal> {
 }
 
 /// Why Shards refused a component's swap (D270 slice 4), in Hex's words: Shards' ten, one for one.
+/// Image box `id`'s `change`, made on its run `guest`, whose spec `image` is and which holds `held` as it runs (kiln plan
+/// P6b.3, §14): what it holds once made, or why not, nothing of `held` moved then. Its form held to
+/// [`hex_api::check_live`] first, refused `Invalid`; a grant or a connection it holds already done already.
+/// - **A publish** bound on the host (Shards' D269) and held to its grant as a boot's is (N6, [`crate::grants::bound`]):
+///   reaching another than the grant's member, it is let go at once and the change refused, in that check's words.
+/// - **An egress or host grant** given to its member's reach, whole (D278): its box's grants and every one it holds live,
+///   programmed as its boot's are ([`crate::grants::member_reach`]); taken back, the same reach without it.
+/// - **A connection** to a network shared by runs (D285), and its taking back; **a plug** and **an unplug** (D271).
+fn make_change(
+    id: &BoxId,
+    image: &ShardsImage,
+    guest: &Arc<dyn ImageGuest>,
+    held: &hex_api::LiveHeld,
+    change: &hex_api::Live,
+) -> Result<hex_api::LiveHeld, Refusal> {
+    use hex_api::{Grant, Live, LiveCause, NetCause, PlugCause};
+    hex_api::check_live(change, &image.grants, held)?;
+    let op = change.op();
+    let not_held = |cause, why: &str| -> Result<Refusal, Refusal> {
+        Ok(Refusal::Live {
+            id: id.try_clone()?,
+            op,
+            cause,
+            why: Some(why.to_owned()),
+        })
+    };
+    let mut next = held.clone();
+    match change {
+        Live::Grant(grant) => {
+            if image.grants.contains(grant) || held.grants.contains(grant) {
+                return Ok(next);
+            }
+            let at = next.grants.len();
+            next.grants.push(grant.clone());
+            match grant {
+                Grant::Publish {
+                    proto,
+                    port,
+                    host,
+                    host_port,
+                    ..
+                } => {
+                    let asked = shards_api::image::Publish {
+                        guest_port: *port,
+                        proto: crate::grants::shards_proto(*proto),
+                        host: Some(*host),
+                        host_port: host_port.unwrap_or(0),
+                    };
+                    let bound = guest
+                        .publish(asked, Duration::MAX)
+                        .map_err(|why| live_refused(id, op, why))?;
+                    match crate::grants::bound(std::slice::from_ref(grant), guest.members(), &bound)
+                    {
+                        Ok(published) => {
+                            let place = u32::try_from(at).map_err(|_| {
+                                Refusal::Broken("a run's live grants pass a u32".to_owned())
+                            })?;
+                            next.published.extend(published.into_iter().map(|mut p| {
+                                p.grant = place;
+                                p
+                            }));
+                        }
+                        Err(why) => {
+                            // Reaching another than its member: let go at once, whatever its letting go answers, so no
+                            // port stays published for anyone its grant doesn't name (N6).
+                            for socket in &bound {
+                                let _ = guest.unpublish(socket.proto, socket.host, Duration::MAX);
+                            }
+                            return Err(why);
+                        }
+                    }
+                }
+                Grant::Egress { member, .. } | Grant::Host { member, .. } => {
+                    give_reach(id, op, image, guest, &next.grants, member)?;
+                }
+            }
+        }
+        Live::Revoke(grant) => {
+            let Some(at) = next.grants.iter().position(|held| held == grant) else {
+                return Err(not_held(
+                    LiveCause::Net(NetCause::Unknown),
+                    "it holds no such grant as it runs",
+                )?);
+            };
+            let place = u32::try_from(at)
+                .map_err(|_| Refusal::Broken("a run's live grants pass a u32".to_owned()))?;
+            next.grants.remove(at);
+            match grant {
+                Grant::Publish { proto, .. } => {
+                    for socket in held.published.iter().filter(|p| p.grant == place) {
+                        guest
+                            .unpublish(
+                                crate::grants::shards_proto(*proto),
+                                socket.at,
+                                Duration::MAX,
+                            )
+                            .map_err(|why| live_refused(id, op, why))?;
+                    }
+                }
+                Grant::Egress { member, .. } | Grant::Host { member, .. } => {
+                    give_reach(id, op, image, guest, &next.grants, member)?;
+                }
+            }
+            // Its publish gone, and each later grant's place one less.
+            next.published.retain(|p| p.grant != place);
+            for p in &mut next.published {
+                if p.grant > place
+                    && let Some(less) = p.grant.checked_sub(1)
+                {
+                    p.grant = less;
+                }
+            }
+        }
+        Live::Connect {
+            member,
+            network,
+            grant,
+        } => {
+            let connection = hex_api::Connection {
+                member: member.clone(),
+                network: network.clone(),
+                grant: grant.clone(),
+            };
+            if held.networks.contains(&connection) {
+                return Ok(next);
+            }
+            guest
+                .connect(
+                    &member_name(member),
+                    network,
+                    &shards_network_grant(grant),
+                    Duration::MAX,
+                )
+                .map_err(|why| live_refused(id, op, why))?;
+            next.networks.push(connection);
+        }
+        Live::Disconnect {
+            member,
+            network,
+            grant,
+        } => {
+            let Some(at) = next
+                .networks
+                .iter()
+                .position(|c| &c.member == member && &c.network == network && &c.grant == grant)
+            else {
+                return Err(not_held(
+                    LiveCause::Net(NetCause::Unknown),
+                    "it holds no such grant on that network",
+                )?);
+            };
+            guest
+                .disconnect(
+                    &member_name(member),
+                    network,
+                    &shards_network_grant(grant),
+                    Duration::MAX,
+                )
+                .map_err(|why| live_refused(id, op, why))?;
+            next.networks.remove(at);
+        }
+        Live::Plug(plug) => {
+            let asked = Plug {
+                source: PlugSource::Host(plug.source.clone()),
+                to: if plug.members.is_empty() {
+                    PlugFor::Every
+                } else {
+                    PlugFor::Members(plug.members.iter().map(member_name).collect())
+                },
+                at: plug.at.clone(),
+                read_only: plug.read_only,
+                exec: plug.exec,
+            };
+            guest
+                .plug(&asked, Duration::MAX)
+                .map_err(|why| live_refused(id, op, why))?;
+            next.plugs.push(plug.clone());
+        }
+        Live::Unplug { at } => {
+            let Some(place) = next.plugs.iter().position(|plug| &plug.at == at) else {
+                return Err(not_held(
+                    LiveCause::Plug(PlugCause::Unplugged),
+                    "nothing it plugged in as it runs is there",
+                )?);
+            };
+            guest
+                .unplug(at, Duration::MAX)
+                .map_err(|why| live_refused(id, op, why))?;
+            next.plugs.remove(place);
+        }
+    }
+    Ok(next)
+}
+
+/// Member `member`'s reach given its run whole (Shards' D278 `member_egress`): its box's grants and `live`, programmed as
+/// its boot's are.
+fn give_reach(
+    id: &BoxId,
+    op: &'static str,
+    image: &ShardsImage,
+    guest: &Arc<dyn ImageGuest>,
+    live: &[hex_api::Grant],
+    member: &Member,
+) -> Result<(), Refusal> {
+    let mut all: Vec<hex_api::Grant> = Vec::new();
+    let count = image.grants.len().saturating_add(live.len());
+    all.try_reserve_exact(count)
+        .map_err(|_| Refusal::Exhausted {
+            what: "grants",
+            bound: count,
+        })?;
+    all.extend(image.grants.iter().cloned());
+    all.extend(live.iter().cloned());
+    let reach = crate::grants::member_reach(&all, member)?;
+    guest
+        .member_egress(&member_name(member), Some(&reach), Duration::MAX)
+        .map(|_| ())
+        .map_err(|why| live_refused(id, op, why))
+}
+
+/// A run's publishes, as it reports them, held to its box's grants and those it took live (N6; kiln plan P6b.3), and
+/// told apart: its spec's, by their places in its spec's grants, and its live ones, by their places in `live`.
+fn published_apart(
+    image: &ShardsImage,
+    live: &[hex_api::Grant],
+    members: &[MemberInfo],
+    reported: &[shards_api::image::Bound],
+) -> Result<(Vec<hex_api::Published>, Vec<hex_api::Published>), Refusal> {
+    let spec = image.grants.len();
+    let mut all: Vec<hex_api::Grant> = Vec::new();
+    let count = spec.saturating_add(live.len());
+    all.try_reserve_exact(count)
+        .map_err(|_| Refusal::Exhausted {
+            what: "grants",
+            bound: count,
+        })?;
+    all.extend(image.grants.iter().cloned());
+    all.extend(live.iter().cloned());
+    let spec =
+        u32::try_from(spec).map_err(|_| Refusal::Broken("a box's grants pass a u32".to_owned()))?;
+    let (mut own, mut taken) = (Vec::new(), Vec::new());
+    for mut published in crate::grants::bound(&all, members, reported)? {
+        match published.grant.checked_sub(spec) {
+            Some(place) => {
+                published.grant = place;
+                taken.push(published);
+            }
+            None => own.push(published),
+        }
+    }
+    Ok((own, taken))
+}
+
+/// Shards' D285 grant of `grant`.
+fn shards_network_grant(grant: &hex_api::NetworkGrant) -> shards_api::image::NetworkGrant {
+    shards_api::image::NetworkGrant {
+        name: grant.name.clone(),
+        peer: grant.peer.clone(),
+        proto: crate::grants::shards_proto(grant.proto),
+        first: grant.first,
+        last: grant.last,
+        way: match grant.way {
+            hex_api::Way::In => shards_api::image::Way::In,
+            hex_api::Way::Out => shards_api::image::Way::Out,
+        },
+    }
+}
+
+/// Image box `id`'s change `op` refused by its run (kiln plan P6b.3): a network change's and a plug's by Shards' own causes
+/// one for one, in its words; its run's end `Ended`; a guest that takes none `Unsupported`; the rest as every call's are.
+fn live_refused(id: &BoxId, op: &'static str, why: ImageRefusal) -> Refusal {
+    use hex_api::{LiveCause, NetCause, PlugCause};
+    let cause = match &why {
+        ImageRefusal::Net(net, _) => Some(LiveCause::Net(match net {
+            NetRefusal::NoNetwork => NetCause::NoNetwork,
+            NetRefusal::Widening => NetCause::Widening,
+            NetRefusal::Bind => NetCause::Bind,
+            NetRefusal::Unknown => NetCause::Unknown,
+            NetRefusal::Network => NetCause::Network,
+            NetRefusal::Image => NetCause::Image,
+            NetRefusal::Unheld => NetCause::Unheld,
+            NetRefusal::NoSuchNetwork => NetCause::NoSuchNetwork,
+            NetRefusal::NameTaken => NetCause::NameTaken,
+            NetRefusal::Exhausted => NetCause::Exhausted,
+            NetRefusal::PairedElsewhere => NetCause::PairedElsewhere,
+            NetRefusal::Ipv6 => NetCause::Ipv6,
+            NetRefusal::Grant => NetCause::Grant,
+            NetRefusal::Overlaps => NetCause::Overlaps,
+        })),
+        ImageRefusal::Plug(plug, _) => Some(LiveCause::Plug(match plug {
+            PlugRefusal::Request => PlugCause::Ask,
+            PlugRefusal::Member => PlugCause::Member,
+            PlugRefusal::Outside => PlugCause::Root,
+            PlugRefusal::Taken => PlugCause::Taken,
+            PlugRefusal::Host => PlugCause::Source,
+            PlugRefusal::Device => PlugCause::Device,
+            PlugRefusal::Unknown => PlugCause::Unplugged,
+            PlugRefusal::Busy => PlugCause::InUse,
+            PlugRefusal::Volume => PlugCause::Volume,
+            PlugRefusal::Bound => PlugCause::Bound,
+            PlugRefusal::Clearing => PlugCause::Clearing,
+        })),
+        ImageRefusal::Ended(_) => Some(LiveCause::Ended),
+        ImageRefusal::Unsupported { .. } => Some(LiveCause::Unsupported),
+        _ => None,
+    };
+    let words = match &why {
+        ImageRefusal::Net(_, words) | ImageRefusal::Plug(_, words) => Some(words.clone()),
+        ImageRefusal::Unsupported { what, why } => Some(format!("{what}: {why}")),
+        _ => None,
+    };
+    match (cause, id.try_clone()) {
+        (Some(cause), Ok(id)) => Refusal::Live {
+            id,
+            op,
+            cause,
+            why: words,
+        },
+        (Some(_), Err(e)) => e,
+        (None, _) => refused(id, op, why),
+    }
+}
+
 fn swap_cause(cause: SwapRefusal) -> SwapCause {
     match cause {
         SwapRefusal::Unknown => SwapCause::Unknown,
@@ -1409,6 +1746,13 @@ fn plug_roots(image: &ShardsImage) -> Result<Vec<String>, Refusal> {
         }
         if !roots.contains(&root) {
             roots.push(root);
+        }
+    }
+    // The roots its spec names (kiln plan P6b.3), each checked as its spec's check checks it, each once.
+    for (i, root) in image.plug_roots.iter().enumerate() {
+        hex_api::check_plug_root(root, &format!("plug_roots[{i}]"))?;
+        if !roots.contains(root) {
+            roots.push(root.clone());
         }
     }
     Ok(roots)
@@ -1723,6 +2067,7 @@ fn unread_info(id: BoxId) -> BoxInfo {
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     }
 }
@@ -1749,6 +2094,7 @@ fn info(spec: &BoxSpec, state: BoxState, exit: Option<Exit>) -> Result<BoxInfo, 
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         // Every credential grant as the record holds it (joint plan step 33, docs/design/credential-grants.md C4).
         credentials: match &spec.class {
             ClassSpec::ShardsImage(image) => image.credentials.clone(),
@@ -2575,6 +2921,69 @@ impl Runs {
         self.0.lock().map_err(poisoned)
     }
 
+    /// Box `id`'s change begun on its run `guest` (kiln plan P6b.3): what that run holds as it runs, none where it took
+    /// nothing or another run of the box did. Refused `Busy` while another change of it is under way: one at a time, as
+    /// its run host makes them.
+    fn begin_change(
+        &self,
+        id: &BoxId,
+        guest: &Arc<dyn ImageGuest>,
+    ) -> Result<hex_api::LiveHeld, Refusal> {
+        let mut runs = self.lock()?;
+        if let Some(changes) = runs.changes.get_mut(id)
+            && Arc::ptr_eq(&changes.guest, guest)
+        {
+            if changes.busy {
+                return Err(Refusal::Lifecycle {
+                    id: id.try_clone()?,
+                    cause: LifecycleCause::Busy,
+                    why: Some("another change of it is under way: one at a time".to_owned()),
+                });
+            }
+            changes.busy = true;
+            return Ok(changes.held.clone());
+        }
+        runs.changes.insert(
+            id.try_clone()?,
+            Changes {
+                guest: Arc::clone(guest),
+                held: hex_api::LiveHeld::default(),
+                busy: true,
+            },
+        );
+        Ok(hex_api::LiveHeld::default())
+    }
+
+    /// Box `id`'s change on its run `guest` ended ([`Runs::begin_change`]): what that run holds now where it was made,
+    /// else as it held. Another run of the box since is left as it is.
+    fn end_change(
+        &self,
+        id: &BoxId,
+        guest: &Arc<dyn ImageGuest>,
+        now: Option<hex_api::LiveHeld>,
+    ) -> Result<(), Refusal> {
+        if let Some(changes) = self.lock()?.changes.get_mut(id)
+            && Arc::ptr_eq(&changes.guest, guest)
+        {
+            if let Some(now) = now {
+                changes.held = now;
+            }
+            changes.busy = false;
+        }
+        Ok(())
+    }
+
+    /// What box `id`'s run `guest` took as it runs: none where it took nothing, or another run of the box did.
+    fn live(&self, id: &BoxId, guest: &Arc<dyn ImageGuest>) -> Result<hex_api::LiveHeld, Refusal> {
+        Ok(self
+            .lock()?
+            .changes
+            .get(id)
+            .filter(|changes| Arc::ptr_eq(&changes.guest, guest))
+            .map(|changes| changes.held.clone())
+            .unwrap_or_default())
+    }
+
     /// When `key`'s run started, as its boot answered, where it runs in this process, paused or not.
     fn started<'k>(&self, key: impl Into<Key<'k>>) -> Result<Option<Instant>, Refusal> {
         Ok(match self.lock()?.get(key.into()) {
@@ -3322,11 +3731,12 @@ impl ImageClass {
             // No GPU report (Shards' D233, image channel v29): it renders on no GPU.
             gpu_report: None,
             // The top-level directory of each of its volumes' places (Shards' D271; kiln plan 01a1dd2e…, P6.2), beneath
-            // which they are plugged as its run starts ([`plug_volumes`]): no other root, and nothing else plugged.
+            // which they are plugged as its run starts ([`plug_volumes`]), and the roots its spec names (kiln plan
+            // P6b.3), beneath which a host directory is plugged as it runs: no other root.
             plug_roots: plug_roots(image)?,
-            // No member's reach past its image's grants (Shards' D278, image channel v39): its grants are the start's,
-            // and this class changes no member's reach as it runs.
-            egress_ceiling: Vec::new(),
+            // The most each member may be given past its grants as its run goes (Shards' D278, image channel v39; kiln
+            // plan P6b.3): its spec's ceiling, programmed as its grants are; none, nothing live past them.
+            egress_ceiling: crate::grants::ceiling(&image.ceiling)?,
             // Its shares another server serves (Shards' D286, image channel v52), each one's stream asked of the node's
             // server as its start boots it ([`ImageClass::served`]), never kept in a record.
             served: Vec::new(),
@@ -3950,10 +4360,15 @@ impl ImageClass {
             State::Held => return Err(held()),
         };
         let mut shown = info(&record.spec, state, None)?;
-        // Its publishes as bound (joint plan step 15, N6).
+        // Its publishes as bound (joint plan step 15, N6), its spec's and those its run took live (kiln plan P6b.3), each
+        // held to its grant, and what its run holds as it runs.
         if let ClassSpec::ShardsImage(shards) = &record.spec.class {
-            shown.published =
-                crate::grants::bound(&shards.grants, guest.members(), &guest.published())?;
+            let mut live = self.image()?.runs.live(&record.spec.id, &guest)?;
+            let (spec, taken) =
+                published_apart(shards, &live.grants, guest.members(), &guest.published())?;
+            shown.published = spec;
+            live.published = taken;
+            shown.live = if live.is_empty() { None } else { Some(live) };
         }
         // Its run's agent-control endpoint, as its run host told it (N6), and that endpoint's waker and wake (Shards'
         // D252 amended, image channel v30), so a reading of the host tells each from a socket no grant made.
@@ -4207,6 +4622,56 @@ impl ImageClass {
     ) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
         let (guest, _) = self.components_of(&record, "components")?;
         Ok(guest.components().into_iter().map(component_at).collect())
+    }
+
+    /// Image box `record`'s network or folders changed as its run goes (`Runtime::change`; kiln plan P6b.3,
+    /// docs/design/shards-image-class.md §14; Shards' D269, D271, D278, D285): its run settled first and refused as it
+    /// stands (`Pending` while it boots, held as every call is, `NotRunning` before its start and once its owner's stop
+    /// has begun, `Ended` once its run has ended); a change its guest must answer refused `Pause(Paused)` while it is
+    /// paused; one change of it at a time ([`Runs::begin_change`]). Then made ([`ImageClass::make_change`]), each ask of
+    /// Shards waiting on its run host's answer or its run's end alone (`Duration::MAX`), never a timer, as a pause's and a
+    /// swap's do; and what its run holds kept where it was made, else left as it held.
+    pub(super) fn change_image(
+        &self,
+        record: BoxRecord,
+        change: hex_api::Live,
+    ) -> Result<(), Refusal> {
+        let id = record.spec.id.try_clone()?;
+        let op = change.op();
+        let ClassSpec::ShardsImage(image) = &record.spec.class else {
+            return Err(Refusal::Live {
+                id,
+                op,
+                cause: hex_api::LiveCause::Class(record.spec.class.class()),
+                why: None,
+            });
+        };
+        let stands = |cause| -> Result<Refusal, Refusal> {
+            Ok(Refusal::Live {
+                id: id.try_clone()?,
+                op,
+                cause,
+                why: None,
+            })
+        };
+        let guest = match self.settle(&record)? {
+            State::Running(guest) => guest,
+            State::Paused(guest) if !change.needs_guest() => guest,
+            State::Paused(_) => return Err(paused(&id, op)?),
+            State::Booting => return Err(pending(&id)?),
+            State::Held => return Err(held()),
+            State::Created | State::Stopping(_, Stop::Asked | Stop::Grants(_)) => {
+                return Err(stands(hex_api::LiveCause::NotRunning)?);
+            }
+            State::Stopping(_, Stop::Ended(_)) | State::Ended(_) => {
+                return Err(stands(hex_api::LiveCause::Ended)?);
+            }
+        };
+        let runs = &self.image()?.runs;
+        let held = runs.begin_change(&id, &guest)?;
+        let made = make_change(&id, image, &guest, &held, &change);
+        runs.end_change(&id, &guest, made.as_ref().ok().cloned())?;
+        made.map(|_| ())
     }
 
     /// What running image box `record`'s VM costs its host (`Runtime::host_use`): its run's microVM part (D241).
@@ -4883,6 +5348,10 @@ impl hex_api::Runtime for ImageClass {
 
     fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
         self.components_image(self.called(id)?)
+    }
+
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        self.change_image(self.called(id)?, change)
     }
 
     fn delete_with_host_use(&self, id: &BoxId) -> Result<Option<HostUse>, Refusal> {

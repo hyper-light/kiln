@@ -1166,6 +1166,7 @@ impl Node {
             ended: None,
             control: None,
             control_wake: None,
+            live: None,
             credentials: Vec::new(),
         })
     }
@@ -1691,6 +1692,7 @@ impl Node {
             ended: None,
             control: None,
             control_wake: None,
+            live: None,
             credentials: Vec::new(),
         })
     }
@@ -2435,6 +2437,20 @@ impl Runtime for Node {
         Err(self.no_components(id, "components")?)
     }
 
+    /// Kiln plan P6b.3: a VM box's backend changes its network or folders as it runs, an image VM's its class's; any
+    /// other box of the node takes none, refused naming its class as inspect says it, as the trait refuses it.
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.change(id, change);
+        }
+        Err(Refusal::Live {
+            cause: hex_api::LiveCause::Class(self.inspect(id)?.class),
+            id: id.clone(),
+            op: change.op(),
+            why: None,
+        })
+    }
+
     fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
         if let Some(backend) = self.backend_record(id)? {
             return backend.usage(id);
@@ -2481,6 +2497,7 @@ impl Runtime for Node {
                         ended: None,
                         control: None,
                         control_wake: None,
+                        live: None,
                         credentials: Vec::new(),
                     }),
                     Err(why) => return Err(why),
@@ -2505,6 +2522,7 @@ impl Runtime for Node {
                     ended: None,
                     control: None,
                     control_wake: None,
+                    live: None,
                     credentials: Vec::new(),
                 });
             }

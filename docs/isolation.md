@@ -250,9 +250,13 @@ it at its start (`Spec::egress_ceiling`). A folder is plugged as Shards' `ImageG
 folder or a volume of its store, for every member or those named, strictly beneath a root, read-only or not), and
 unplugged by where it is; one outside every root is refused until a member restarted can take it (D270); egress past
 the ceiling is refused. Ports go as Shards' `ImageGuest::publish` and `unpublish` take them (D269): a guest port at a
-host address and port, let go of by the address it's bound at. A microVM that takes no change live refuses it
-in its own words, kept on the override (`took: refused`): Hex's microVMs do until its wire calls land (P6b.3,
-`sandbox::hexvm::NO_LIVE`). A session on its machine's host refuses ports, egress and networks, naming its engine.
+host address and port, let go of by the address it's bound at. Hex's microVMs take each through Hex's one call
+for a running box's changes (its P6b.3, `Runtime::change`): a port published as its harness member's, which Hex holds
+it to; egress its harness member's by TCP within the ceiling; a network's grant whole; a folder of the machine's
+plugged in, its files run from it or not (`exec`, Shards' D279). A member other than its harness, a volume of its store
+plugged in live and a component's swap are refused, saying why. A microVM that takes no change live refuses it in its
+own words, kept on the override (`took: refused`). A session on its machine's host refuses ports, egress and networks,
+naming its engine.
 
 ## An agent's volumes
 

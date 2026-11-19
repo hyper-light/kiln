@@ -9,7 +9,9 @@ use hex_api::{
     Destination, Grant, MemberKind, Proto, Published, Receiver, Refusal, ShardsImage, check_grants,
     unheld,
 };
-use shards_api::image::{Bound, Keep, MemberInfo, MemberReach, Narrowing, Publish, Receiving};
+use shards_api::image::{
+    Bound, Keep, MemberCeiling, MemberInfo, MemberReach, Narrowing, Publish, Reach, Receiving,
+};
 
 /// What an image boot is told of a box's grants: the ports it publishes, and how the image's own grants past the
 /// microVM are narrowed.
@@ -86,6 +88,59 @@ pub fn program(image: &ShardsImage) -> Result<ImageNetwork, Refusal> {
             dns: false,
             members: Some(members),
         },
+    })
+}
+
+/// The most each member of a box may be given past its grants as its run goes (kiln plan P6b.3,
+/// docs/design/shards-image-class.md §14; Shards' D278 `ImageSpec::egress_ceiling`): `ceiling`'s egress and host
+/// grants, each member's destinations as its boot's reach writes them ([`reach`]), and nothing else (no port egress, no
+/// remote MCP server, no name past its VM but its destinations', as its boot's narrowing keeps none). Held to N5's one
+/// check and to the bytes the boot's one request carries, as [`program`] holds its grants (N7).
+pub fn ceiling(ceiling: &[Grant]) -> Result<Vec<MemberCeiling>, Refusal> {
+    check_grants(ceiling)?;
+    let bytes = request_bytes(ceiling)?;
+    let most = u64::from(shards_abi::run::MAX_PAYLOAD);
+    if bytes > most {
+        return Err(Refusal::Invalid {
+            what: "ceiling",
+            why: format!(
+                "it names destinations taking {bytes} bytes of an image boot's request, past the {most} its channel \
+                 carries (Shards' run::MAX_PAYLOAD): name fewer ports or hosts"
+            ),
+        });
+    }
+    let (_, members) = reach(ceiling)?;
+    Ok(members
+        .into_iter()
+        .map(|member| MemberCeiling {
+            kind: member.kind,
+            name: member.name,
+            reach: Reach {
+                ports: Vec::new(),
+                mcp: Vec::new(),
+                destinations: member.destinations,
+                dns: false,
+            },
+        })
+        .collect())
+}
+
+/// Member `member`'s reach past its VM, whole, as its run goes (kiln plan P6b.3; Shards' D278 `member_egress`): its
+/// destinations from `grants` (its box's and every one given it live), as its boot's reach writes them ([`reach`]), and
+/// nothing else, as its boot's narrowing keeps nothing else.
+pub fn member_reach(grants: &[Grant], member: &hex_api::Member) -> Result<Reach, Refusal> {
+    let (_, members) = reach(grants)?;
+    let kind = shards_kind(member.kind);
+    let destinations = members
+        .into_iter()
+        .find(|reached| reached.kind == kind && reached.name == member.name)
+        .map(|reached| reached.destinations)
+        .unwrap_or_default();
+    Ok(Reach {
+        ports: Vec::new(),
+        mcp: Vec::new(),
+        destinations,
+        dns: false,
     })
 }
 
@@ -393,7 +448,7 @@ fn shards_kind(kind: MemberKind) -> shards_api::image::MemberKind {
     }
 }
 
-fn shards_proto(proto: Proto) -> shards_api::image::Proto {
+pub(crate) fn shards_proto(proto: Proto) -> shards_api::image::Proto {
     match proto {
         Proto::Tcp => shards_api::image::Proto::Tcp,
         Proto::Udp => shards_api::image::Proto::Udp,

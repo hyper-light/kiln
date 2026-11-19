@@ -3,7 +3,7 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `cfe430167d4adc23777004d86d0de4173052e6a4`
+- **Upstream:** https://github.com/hyper-light/hex, commit `3af377b93b1296d286317361aa7b41371093dbdf`
   (2026-11-18), MIT (`LICENSE`): its branch `p/v080-vendor`, with Shards' v0.8.0 tag vendored. Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
   Shards deleted the 16550 at `35e2de91e`; Hex's D261, D262), its Shards image class in a process that links Hex
   (`hex_node::images::ImageRuntime::new`, and `ImageRuntime::leasing`, made with its orchestrator's lessors), a member's

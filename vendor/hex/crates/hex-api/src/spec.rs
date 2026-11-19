@@ -377,6 +377,19 @@ pub struct ShardsImage {
     /// guest and that server. None by default. After the volumes (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub served: Vec<ServedMount>,
+    /// Where its members may be given a host directory as its run goes (kiln plan P6b.3, docs/design/shards-image-class.md
+    /// §14; Shards' D271 `ImageSpec::plug_roots`): each a top-level directory of its members' view, beside its shares'
+    /// own, beneath which a plug ([`crate::Live::Plug`]) goes, given its members' domains as its run starts and never
+    /// widened after. None by default: a plug goes beneath its shares' own directories alone. After `served`
+    /// (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plug_roots: Vec<String>,
+    /// The most each member may be given past its grants as its run goes (kiln plan P6b.3, §14; Shards' D278
+    /// `ImageSpec::egress_ceiling`): `Egress` and `Host` grants, the person's own policy, never a grant itself; a live
+    /// grant past them and its image's grants is refused (`Widening`). None by default: nothing live past its grants.
+    /// After `plug_roots` (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ceiling: Vec<crate::Grant>,
 }
 
 /// A share another server serves a Shards image's guest ([`ShardsImage::served`]; Shards' D286, `shards_api::image::
@@ -611,6 +624,8 @@ impl ShardsImage {
             sign_ins: Vec::new(),
             volumes: Vec::new(),
             served: Vec::new(),
+            plug_roots: Vec::new(),
+            ceiling: Vec::new(),
         }
     }
 
@@ -739,6 +754,30 @@ impl ShardsImage {
                 )));
             }
         }
+        // Its plug roots (kiln plan P6b.3; Shards' D271), each a root Shards takes and each named once.
+        for (at, root) in self.plug_roots.iter().enumerate() {
+            crate::check_plug_root(root, &format!("plug_roots[{at}]"))?;
+            if self.plug_roots.get(..at).unwrap_or_default().contains(root) {
+                return Err(invalid_image(format!(
+                    "plug_roots[{at}] names {root:?} again"
+                )));
+            }
+        }
+        // Its ceiling (kiln plan P6b.3; Shards' D278): egress and host grants alone, each as N5's one check takes a grant,
+        // none named twice; a publish is no reach.
+        if let Some(at) = self
+            .ceiling
+            .iter()
+            .position(|grant| matches!(grant, crate::Grant::Publish { .. }))
+        {
+            return Err(invalid_image(format!(
+                "ceiling[{at}] is a publish: a ceiling holds egress and host grants, the most a member may reach"
+            )));
+        }
+        crate::check_grants(&self.ceiling).map_err(|e| match e {
+            Refusal::Invalid { why, .. } => invalid_image(format!("ceiling: {why}")),
+            other => other,
+        })?;
         // Its credentials, each one that could be filled in exactly as it says over the grants just taken (joint plan
         // step 33, docs/design/credential-grants.md C2).
         crate::check_credentials(&self.credentials, &self.grants)?;

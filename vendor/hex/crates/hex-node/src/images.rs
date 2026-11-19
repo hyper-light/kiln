@@ -421,6 +421,9 @@ impl Runtime for ImageRuntime {
     fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
         self.class.components(id)
     }
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        self.class.change(id, change)
+    }
 }
 
 #[cfg(test)]
