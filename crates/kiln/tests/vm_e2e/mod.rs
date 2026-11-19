@@ -1511,7 +1511,7 @@ fn t_within(t: f64, nu: u32) -> f64 {
     let theta = (t / f64::from(nu).sqrt()).atan();
     let (sin, cos) = theta.sin_cos();
     let cos2 = cos * cos;
-    if nu % 2 == 0 {
+    if nu.is_multiple_of(2) {
         let (mut term, mut sum) = (1.0, 1.0);
         for j in 1..=(nu - 2) / 2 {
             term *= f64::from(2 * j - 1) / f64::from(2 * j) * cos2;
