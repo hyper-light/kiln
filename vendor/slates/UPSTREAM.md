@@ -6,11 +6,11 @@ Slates' A-278), linked from here, never through its command line (the person, 20
 `crates/kiln/src/workspace/slates.rs` calls it, and kiln's own executable runs the instance's anchor and daemon
 (`kiln slates-role`, served by `slates_api::role::main`), so kiln carries no Slates binary and the daemon is the same
 code as the client kiln links. kiln speaks the library's typed consumer contract (A-299) and pins the version it was
-written against (`workspace::slates::CONTRACT`, 40 at this revision): a re-vendor that moves it fails kiln's unit test
+written against (`workspace::slates::CONTRACT`, 41 at this revision): a re-vendor that moves it fails kiln's unit test
 `w1_kiln_speaks_the_contract_it_was_written_against`.
 
 - **Upstream:** https://github.com/hyper-light/slates, branch `main`, commit
-  `b2909fcf515f35d69753877dc86e69939bc867a9` (2026-11-18), MIT (`LICENSE`).
+  `1f332da55c8199a04758edf977d3a53df2c9d7f5` (2026-11-18), MIT (`LICENSE`).
 - **What is here:** upstream's tree, at upstream's paths: its crates (`crates/*`), its root manifest, its toolchain,
   lint and format settings with the budgets its own checks read (`clippy.toml`, `rustfmt.toml`,
   `rust-toolchain.toml`, `unsafe-budget.toml`, `ratchets.toml`), its `xtask`, its agents' skills (`skills/`, which its
