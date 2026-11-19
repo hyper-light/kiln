@@ -115,7 +115,17 @@ pub const INSTANCE: &str = "kiln";
 /// review commits where git keeps the change, its executable bit (`super::review`). 41 changes
 /// nothing else. Kiln takes Slates at e2d1bc42b since, the same contract: Slates' A-503 lands a
 /// captured clone that moved against its capture, so kiln lands a workspace that moved here as any.
-pub const CONTRACT: u32 = 41;
+///
+/// 42 since kiln took Slates at ce9b6905e (from 41; Slates' A-507). kiln uses 42: an unmount runs
+/// no program on macOS and the BSDs (`unmount(2)`, where it ran `umount` and `umount -f` found on
+/// `PATH`) and is believed only when the kernel's mount table agrees, so a runner's `PATH` no longer
+/// decides whether a workspace's mount comes down (`unmount`, `let_go`). Its three new refusals,
+/// a mount still busy (`MountFault::Busy`), one the table still lists after an unmount answered done
+/// (`StillMounted`) and a table that could not be read (`MountTable`), kiln shows in Slates' words as
+/// it shows every unmount's, and maps, as every mount fault it is not told is missing, to its own
+/// can't-mount refusal (`missing_of`). The revision brings Slates' A-511 too: a mount's attachment
+/// ends at the kernel's own unmount event, never at its `UMNT`.
+pub const CONTRACT: u32 = 42;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -257,16 +267,30 @@ pub async fn facts() -> Facts {
 }
 
 /// What a machine lacks for workspaces, as Slates' typed answer to whether it can mount names it (`mount::available`).
+/// Every fault is named, so a contract that adds one fails to build here until kiln places it: one that says what the
+/// machine lacks maps to that lack, and every other (a mount or an unmount refused, the mount table unread: 42's
+/// `Busy`, `StillMounted` and `MountTable` among them) to kiln's own can't-mount refusal.
 fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
+    use slates_api::MountFault;
     match fault {
-        slates_api::MountFault::Unsupported { missing } => match missing {
+        MountFault::Unsupported { missing } => match missing {
             slates_api::MountMissing::Fusermount3 => WorkspaceMissing::Fusermount3,
             slates_api::MountMissing::FuseDevice => WorkspaceMissing::FuseDevice,
             slates_api::MountMissing::WinFsp => WorkspaceMissing::WinFsp,
             slates_api::MountMissing::MountNfs => WorkspaceMissing::MountNfs,
             slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared | slates_api::MountMissing::MountManager => WorkspaceMissing::Mount,
         },
-        _ => WorkspaceMissing::Mount,
+        MountFault::MountPoint { .. }
+        | MountFault::NoNfsListener
+        | MountFault::NoCapability
+        | MountFault::RootHandle { .. }
+        | MountFault::Refused { .. }
+        | MountFault::Unbound { .. }
+        | MountFault::Unmount { .. }
+        | MountFault::Busy { .. }
+        | MountFault::StillMounted { .. }
+        | MountFault::MountTable { .. }
+        | MountFault::NotMounted { .. } => WorkspaceMissing::Mount,
     }
 }
 
@@ -1741,6 +1765,11 @@ mod tests {
         assert_eq!(of(MountMissing::WinFsp), WorkspaceMissing::WinFsp);
         assert_eq!(of(MountMissing::MountNfs), WorkspaceMissing::MountNfs);
         assert_eq!(missing_of(&MountFault::NoNfsListener), WorkspaceMissing::Mount, "any other refusal: a mount kiln makes");
+        // Contract 42's unmount refusals (Slates' A-507) say nothing the machine lacks: kiln's own can't-mount refusal.
+        let path = || "/state/workspaces/kiln-a".to_owned();
+        for fault in [MountFault::Busy { path: path() }, MountFault::StillMounted { path: path() }, MountFault::MountTable { path: path(), errno: None }] {
+            assert_eq!(missing_of(&fault), WorkspaceMissing::Mount, "{fault}");
+        }
     }
 
     /// W1: kiln speaks the contract it was written against; a re-vendor that moves it fails here, beside the matches

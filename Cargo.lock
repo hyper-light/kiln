@@ -4523,6 +4523,7 @@ dependencies = [
  "serde_json",
  "slates-anchor",
  "slates-bridge-nfs",
+ "slates-bridge-oci",
  "slates-bridge-winfsp",
  "slates-client",
  "slates-db",
@@ -4744,7 +4745,6 @@ name = "slates-merge"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "slates-mem",
 ]
 
 [[package]]
