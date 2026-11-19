@@ -207,11 +207,11 @@ async fn scenario() -> anyhow::Result<()> {
 
     // A base goes with the last workspace that's a clone of it.
     let (first, newer) = (a.base.clone().map(|b| b.volume).unwrap_or_default(), c.base.clone().map(|b| b.volume).unwrap_or_default());
-    super::slates::remove(&a, Duration::ZERO).await?;
+    super::slates::remove(&a).await?;
     anyhow::ensure!(!gone(&first).await?, "a base went while another workspace is a clone of it");
-    super::slates::remove(&b, Duration::ZERO).await?;
+    super::slates::remove(&b).await?;
     anyhow::ensure!(gone(&first).await?, "a base stayed after its last clone went");
-    super::slates::remove(&c, Duration::ZERO).await?;
+    super::slates::remove(&c).await?;
     anyhow::ensure!(gone(&newer).await?, "the folder's newest base stayed after its last clone went");
     Ok(())
 }
