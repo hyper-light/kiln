@@ -902,16 +902,24 @@ fn another_letter_may_serve(refused: &slates_api::Error, taken_now: bool) -> boo
     taken_now || matches!(refused, slates_api::Error::Host(slates_api::HostFault::Target(slates_api::TargetRefusal::DriveLetterTaken)))
 }
 
+/// Takes workspace `m`'s mount away ([`unmount_typed`]), its refusal in Slates' words.
+async fn unmount(m: &Made) -> anyhow::Result<()> {
+    unmount_typed(m).await?.map_err(|refused| anyhow::anyhow!("Slates' unmount: {refused}"))
+}
+
 /// Takes workspace `m`'s mount away: with the OS's own unmount, which needs no daemon (Unix); or by
 /// ending its own volume's attachment at its drive (Windows, where the drive is the daemon's own:
 /// [`attachment_at`]). Never Slates' `Instance::unmount` by the letter there, which detaches
 /// whichever volume reports the letter first: another workspace's, where this one's drive went and
-/// another's took the letter since.
-async fn unmount(m: &Made) -> anyhow::Result<()> {
+/// another's took the letter since. Slates' refusal is kept typed (`Ok(Err(refused))`: on a Unix host its `MountFault`,
+/// which contract 42 types `Busy` and `StillMounted` among others), apart from a failure to ask at all, so [`take_down`]
+/// tells a mount that stays by kind; a drive's detach is refused in Slates' words, as what holds a drive isn't asked on
+/// Windows ([`holders`]).
+async fn unmount_typed(m: &Made) -> anyhow::Result<Result<(), slates_api::Error>> {
     #[cfg(unix)]
     {
         let path = m.mount.clone();
-        crate::rt::blocking(move || slates_api::mount::unmount(&path)).await?.map_err(|e| anyhow::anyhow!("Slates' unmount: {e}"))
+        Ok(crate::rt::blocking(move || slates_api::mount::unmount(&path)).await?.map_err(slates_api::Error::Mount))
     }
     #[cfg(not(unix))]
     {
@@ -922,6 +930,7 @@ async fn unmount(m: &Made) -> anyhow::Result<()> {
             None => Ok(()),
         })
         .await
+        .map(Ok)
     }
 }
 
@@ -1024,8 +1033,9 @@ pub enum Held {
     /// it (`<pid> <command>`). Every process kiln started for its agent had ended, so each is another's: a person's
     /// shell or editor there, or a process that left the agent's group.
     Busy {
-        /// What holds it.
-        holders: Vec<String>,
+        /// What holds it, as `lsof` names it (none where it sees none: another user's process, which it isn't shown);
+        /// what kept `lsof` from saying, where it couldn't.
+        holders: Result<Vec<String>, String>,
     },
     /// The unmount was refused, and nothing `lsof` sees holds the mount, or `lsof` couldn't say.
     Refused {
@@ -1042,7 +1052,9 @@ impl std::fmt::Display for MountStays {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mount = &self.mount;
         match &self.held {
-            Held::Busy { holders } => write!(f, "{mount} stays mounted, so its volume is kept: it's busy, held by {}", holders.join(", ")),
+            Held::Busy { holders: Ok(holders) } if !holders.is_empty() => write!(f, "{mount} stays mounted, so its volume is kept: it's busy, held by {}", holders.join(", ")),
+            Held::Busy { holders: Ok(_) } => write!(f, "{mount} stays mounted, so its volume is kept: it's busy, held by nothing lsof can see"),
+            Held::Busy { holders: Err(lsof) } => write!(f, "{mount} stays mounted, so its volume is kept: it's busy, and lsof couldn't name what holds it ({lsof})"),
             Held::Refused { refusal, lsof } => write!(f, "{mount} stays mounted, so its volume is kept: its unmount was refused ({refusal}), and {lsof}"),
             Held::StillListed => write!(f, "{mount} stays mounted, so its volume is kept: its unmount answered done, but the kernel's mount table still lists it"),
         }
@@ -1055,7 +1067,7 @@ impl std::error::Error for MountStays {}
 /// `lsof` names holding it (`holders`; why `lsof` couldn't say, where it couldn't).
 fn held_by(refusal: String, holders: Result<Vec<String>, String>) -> Held {
     match holders {
-        Ok(holders) if !holders.is_empty() => Held::Busy { holders },
+        Ok(holders) if !holders.is_empty() => Held::Busy { holders: Ok(holders) },
         Ok(_) => Held::Refused { refusal, lsof: "nothing lsof can see holds it".to_owned() },
         Err(lsof) => Held::Refused { refusal, lsof },
     }
@@ -1066,7 +1078,8 @@ fn held_by(refusal: String, holders: Result<Vec<String>, String>) -> Held {
 /// from [`remove`] so a test holds their order.
 trait TakeDown {
     async fn mounted(&self) -> bool;
-    async fn unmount(&self) -> anyhow::Result<()>;
+    /// Slates' answer, its refusal kept typed (`Ok(Err(refused))`), apart from a failure to ask it at all.
+    async fn unmount(&self) -> anyhow::Result<Result<(), slates_api::Error>>;
     async fn holders(&self) -> Result<Vec<String>, String>;
     async fn destroy(&self) -> anyhow::Result<()>;
 }
@@ -1082,8 +1095,8 @@ impl TakeDown for Live<'_> {
         mounted_as_made(self.made).await.unwrap_or(true)
     }
 
-    async fn unmount(&self) -> anyhow::Result<()> {
-        unmount(self.made).await
+    async fn unmount(&self) -> anyhow::Result<Result<(), slates_api::Error>> {
+        unmount_typed(self.made).await
     }
 
     async fn holders(&self) -> Result<Vec<String>, String> {
@@ -1108,8 +1121,9 @@ async fn take_down(steps: &impl TakeDown, mount: &str) -> anyhow::Result<()> {
             let asked = steps.unmount().await;
             if steps.mounted().await {
                 let held = match asked {
-                    Ok(()) => Held::StillListed,
-                    Err(refused) => held_by(format!("{refused:#}"), steps.holders().await),
+                    Ok(Ok(())) => Held::StillListed,
+                    Ok(Err(refused)) => held_by(format!("Slates' unmount: {refused}"), steps.holders().await),
+                    Err(unasked) => held_by(format!("{unasked:#}"), steps.holders().await),
                 };
                 let stays = MountStays { mount: mount.to_owned(), held };
                 tracing::warn!(%stays, "an ended agent's workspace stays mounted once its processes have ended: its volume is kept");
@@ -1551,40 +1565,44 @@ mod tests {
     /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2): a workspace's volume is never destroyed while the kernel's mount
     /// table still holds its point, and its mount is asked to go once, never again on a clock: its caller asks once
     /// every process kiln started in it has ended (`harness::host::processes_ended`), so what holds it then is another's
-    /// and isn't cut off by force. One that stays keeps its volume, refused by kind (`MountStays`): busy, naming what
+    /// and isn't cut off by force. One that stays keeps its volume, refused by kind (`MountStays`): busy, as Slates'
+    /// contract 42 types it (`MountFault::Busy`, the OS's `EBUSY` on macOS) whatever `lsof` sees, or as `lsof` names
+    /// processes holding it where the unmount said no more than that it failed (Linux's `fusermount3 -u`), naming what
     /// holds it as `lsof` does; refused with nothing `lsof` sees holding it, or `lsof` unable to say, in the refusal's
-    /// words; or answered done while the table still lists it. One that goes, or none there, takes its volume with it.
-    /// The macOS bare-metal drive met a volume destroyed under its mount (f3f618f2, kiln 68eda5b1, 2026-11-18), and
-    /// kiln's clippy the clock its retries waited on (2026-11-18).
+    /// words; or answered done, or refused `MountFault::StillMounted`, while the table still lists it. One that goes, or
+    /// none there, takes its volume with it. The macOS bare-metal drive met a volume destroyed under its mount
+    /// (f3f618f2, kiln 68eda5b1, 2026-11-18), and kiln's clippy the clock its retries waited on (2026-11-18).
     #[test]
     fn w3_a_volume_is_never_destroyed_while_its_mount_is_in_the_table() -> anyhow::Result<()> {
+        use slates_api::MountFault;
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+        const POINT: &str = "/state/workspaces/kiln-a";
         const REFUSAL: &str = "Slates' unmount: unmounting /state/workspaces/kiln-a failed (exit 1); is the path still in use?";
+        const NO_LSOF: &str = "lsof couldn't run: No such file or directory (os error 2)";
         struct Fake {
             mounted: AtomicBool,
-            refuses: bool,
-            lies: bool,
+            /// What its unmount answers while the mount stays (done, or Slates' typed refusal); with none it goes.
+            stays: Option<Result<(), MountFault>>,
             holders: Result<Vec<String>, String>,
             unmounts: AtomicU32,
             destroyed: AtomicU32,
         }
         impl Fake {
-            fn new(mounted: bool, refuses: bool, lies: bool, holders: Result<Vec<String>, String>) -> Self {
-                Fake { mounted: AtomicBool::new(mounted), refuses, lies, holders, unmounts: AtomicU32::new(0), destroyed: AtomicU32::new(0) }
+            fn new(mounted: bool, stays: Option<Result<(), MountFault>>, holders: Result<Vec<String>, String>) -> Self {
+                Fake { mounted: AtomicBool::new(mounted), stays, holders, unmounts: AtomicU32::new(0), destroyed: AtomicU32::new(0) }
             }
         }
         impl TakeDown for Fake {
             async fn mounted(&self) -> bool {
                 self.mounted.load(Relaxed)
             }
-            async fn unmount(&self) -> anyhow::Result<()> {
+            async fn unmount(&self) -> anyhow::Result<Result<(), slates_api::Error>> {
                 self.unmounts.fetch_add(1, Relaxed);
-                match (self.refuses, self.lies) {
-                    (true, _) => anyhow::bail!(REFUSAL),
-                    (false, true) => Ok(()),
-                    (false, false) => {
+                match &self.stays {
+                    Some(answer) => Ok(answer.clone().map_err(slates_api::Error::Mount)),
+                    None => {
                         self.mounted.store(false, Relaxed);
-                        Ok(())
+                        Ok(Ok(()))
                     }
                 }
             }
@@ -1596,31 +1614,43 @@ mod tests {
                 Ok(())
             }
         }
-        let busy = Held::Busy { holders: vec!["4242 zsh".to_owned(), "4243 vim".to_owned()] };
-        let unseen = Held::Refused { refusal: REFUSAL.to_owned(), lsof: "nothing lsof can see holds it".to_owned() };
-        let unsaid = Held::Refused { refusal: REFUSAL.to_owned(), lsof: "lsof couldn't run: No such file or directory (os error 2)".to_owned() };
+        // Linux's `fusermount3 -u` refused: its exit code alone. macOS's `unmount(2)` refused `EBUSY`.
+        let failed = || Some(Err(MountFault::Unmount { path: POINT.to_owned(), status: Some(1), errno: None }));
+        let busy = || Some(Err(MountFault::Busy { path: POINT.to_owned() }));
+        let named = || Ok(vec!["4242 zsh".to_owned(), "4243 vim".to_owned()]);
+        let refused = |lsof: &str| Held::Refused { refusal: REFUSAL.to_owned(), lsof: lsof.to_owned() };
         let stuck = [
-            (Fake::new(true, true, false, Ok(vec!["4242 zsh".to_owned(), "4243 vim".to_owned()])), busy),
-            (Fake::new(true, true, false, Ok(Vec::new())), unseen),
-            (Fake::new(true, true, false, Err("lsof couldn't run: No such file or directory (os error 2)".to_owned())), unsaid),
-            (Fake::new(true, false, true, Ok(vec!["4242 zsh".to_owned()])), Held::StillListed),
+            (Fake::new(true, failed(), named()), Held::Busy { holders: named() }),
+            (Fake::new(true, failed(), Ok(Vec::new())), refused("nothing lsof can see holds it")),
+            (Fake::new(true, failed(), Err(NO_LSOF.to_owned())), refused(NO_LSOF)),
+            (Fake::new(true, busy(), named()), Held::Busy { holders: named() }),
+            (Fake::new(true, busy(), Ok(Vec::new())), Held::Busy { holders: Ok(Vec::new()) }),
+            (Fake::new(true, busy(), Err(NO_LSOF.to_owned())), Held::Busy { holders: Err(NO_LSOF.to_owned()) }),
+            (Fake::new(true, Some(Ok(())), named()), Held::StillListed),
+            (Fake::new(true, Some(Err(MountFault::StillMounted { path: POINT.to_owned() })), named()), Held::StillListed),
         ];
         crate::rt::block_on(async {
+            let mut wrong = Vec::new();
             for (fake, kind) in stuck {
-                let kept = take_down(&fake, "/state/workspaces/kiln-a").await;
+                let kept = take_down(&fake, POINT).await;
                 let stays = kept.as_ref().err().and_then(|e| e.downcast_ref::<MountStays>()).cloned();
-                anyhow::ensure!(stays == Some(MountStays { mount: "/state/workspaces/kiln-a".into(), held: kind.clone() }), "{kind:?}: {kept:?}");
+                if stays != Some(MountStays { mount: POINT.into(), held: kind.clone() }) {
+                    wrong.push(format!("{kind:?}: {kept:?}"));
+                }
                 anyhow::ensure!(fake.destroyed.load(Relaxed) == 0, "{kind:?}: destroyed under a mount the table holds");
                 anyhow::ensure!(fake.unmounts.load(Relaxed) == 1, "{kind:?}: asked {} times, not once", fake.unmounts.load(Relaxed));
             }
-            let goes = Fake::new(true, false, false, Ok(Vec::new()));
+            anyhow::ensure!(wrong.is_empty(), "kept, but told by the wrong kind:\n{}", wrong.join("\n"));
+            let goes = Fake::new(true, None, Ok(Vec::new()));
             take_down(&goes, "/state/workspaces/kiln-b").await?;
             anyhow::ensure!((goes.unmounts.load(Relaxed), goes.destroyed.load(Relaxed)) == (1, 1), "unmounted once, then destroyed");
-            let none = Fake::new(false, false, false, Ok(Vec::new()));
+            let none = Fake::new(false, None, Ok(Vec::new()));
             take_down(&none, "/state/workspaces/kiln-c").await?;
             anyhow::ensure!((none.unmounts.load(Relaxed), none.destroyed.load(Relaxed)) == (0, 1), "nothing mounted: destroyed, nothing asked");
             Ok(())
         })?;
+        let said = MountStays { mount: POINT.into(), held: Held::Busy { holders: named() } }.to_string();
+        anyhow::ensure!(said.ends_with("it's busy, held by 4242 zsh, 4243 vim"), "a busy mount's refusal names what holds it: {said}");
         #[cfg(unix)]
         assert_eq!(lsof_holders("p4242\nczsh\nf5\np4243\ncvim\n"), ["4242 zsh", "4243 vim"], "lsof's -F pc fields, each process once");
         Ok(())
