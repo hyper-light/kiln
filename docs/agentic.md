@@ -531,8 +531,9 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    bind's source resolves on the engine's host; the engine's kind, version and security options; judged by Slates'
    `slates_bridge_oci::runtime::judge`): a profile a container workload has run through, with how a container's ids
    reach the volume and how hard links behave through it, or a typed refusal (a remote engine, a profile no workload has
-   run through), which refuses the start in Slates' words before anything is made. The handshake is Slates' command
-   line's today (`slates oci-runtime`) and becomes a library call (A-520's next piece).
+   run through), which refuses the start in Slates' words before anything is made. The handshake is Slates' library
+   call `container_engine::engine_profile(runtime)` (A-520, contract 47; its command line's `slates oci-runtime` makes
+   the same call), whose `EngineFault::Untested` names the engine and profile it refused.
 2. **The mount, on the host.** `Instance::mount` at the workspace's place (W3: `workspaces/kiln-<id>` under the
    runner's state, by the real path the kernel's mount table names), shared with other users only where the profile
    needs it. A rootful Linux engine reaches the mount as users other than the person (the engine itself, as root, and
@@ -545,9 +546,9 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    exactly this volume's mount (on Linux its own mount, by its record: A-227), records the binding, which lasts until
    it's detached or its mount goes, and answers the runtime's `mounts` entry: a non-recursive `bind`, `ro` or `rw` by the
    intent, `private`, `nosuid` and `nodev`. kiln never makes a bind of its own: it hands the engine that entry word for
-   word, just after Slates' check that the source is still the mount it verified (`slates oci-check`, a library call
-   to come with the handshake: a mount gone or replaced in between is never bound, where the engine would bind the
-   bare folder left there). It binds with `--mount` and never `-v`, which makes a missing source on the host (Docker's
+   word, just after Slates' check that the source is still the mount it verified (`ContainerBind::check_source`, by
+   the kernel's table and the mount id it never reuses, contract 47: a mount gone or replaced in between is never
+   bound, where the engine would bind the bare folder left there). It binds with `--mount` and never `-v`, which makes a missing source on the host (Docker's
    bind-mount documentation), so a mount gone is the engine's refusal (`bind source path does not exist`), never an
    agent writing into the person's disk: Docker's `type=bind,bind-recursive=disabled,bind-propagation=private`, and
    `readonly` for a read; podman's `bind-nonrecursive` and `ro=true`. Docker's `--mount` has no word for `nosuid` and
@@ -557,7 +558,8 @@ which a bundle Hex runs takes as it is, so a Linux runner can take that class la
    means the same inside (the agent's folder, its environment moved onto the mount (W2), a child started in its folder
    working in its volume): nothing is translated. Where the profile forwards a container's ids as the host's own (a
    rootful Linux engine), the container runs as the person's uid and gid, so what the agent makes is theirs and the
-   permission bits hold.
+   permission bits hold; under rootless podman (`ContainerRootAsMountingUser`) it runs as the container's root, which
+   the engine maps to the person, the one id an unshared mount admits.
 5. **Its end.** The container goes first (its engine lets go of the files it held open), then the binding is detached,
    then the mount comes down as W3's does.
 
@@ -567,8 +569,10 @@ On each platform:
   rootful Docker Engine over a shared mount (its T-4.13 Linux leg, its linux-oci CI lane) and with rootless podman (a
   program in the container mapping a Slates file through the bound mount: its G-mount step 3, 2026-10-25). Slates' judge
   holds the rootful Docker Engine's profile (`ContainerIdsAsHostIds`; every name of a hard-linked file served at once)
-  and still refuses a rootless engine (`UserNamespaceUntested`) and podman's command line (`RuntimeUnsupported`), which
-  Slates has run since: their profiles are Slates' to add (A-520).
+  and, since its A-520 third piece (contract 48), rootless podman's on its own Linux host (`engine_profile("podman")`:
+  `ContainerRootAsMountingUser` over an unshared mount, which needs no `user_allow_other`), the case that needs no
+  privilege anywhere; it still refuses a rootless Docker engine, podman run as root and a remote podman, each typed.
+  Rootless podman's live check (the container's other ids refused, its hard links) is Slates' run, filed.
 - **macOS.** Docker Desktop runs its engine in a Linux VM, and a bind's source resolves there, through Desktop's file
   sharing, which carries the Mac's folders into the VM over the Virtualization framework's virtio-fs device (Slates
   measured `virtiofs0 /run/host_virtiofs/Users` on 2026-10-27; `/private` is shared as `/run/host_mark/private`,
@@ -597,9 +601,9 @@ On each platform:
   says the share reaches it (A-520). If it doesn't, the route is the volume's network export (Slates' NFS server runs on
   Windows: its A-184), mounted in the VM by the engine, which is its own measurement.
 
-Owed, in order, each a piece: Slates' library calls (the bind is built, A-520: `Instance::bind_into_container`; the
+Owed, in order, each a piece: Slates' library calls are built (A-520: `Instance::bind_into_container`, contract 44; the
 engine's profile and the check before a bind, moved from Slates' command line into its library as the mount was, its
-A-278); kiln's re-vendor of Slates at contract 44 or later; a runner's `container` engine beside `host` and `microvm`
+A-278, contract 47); kiln's re-vendor of Slates at contract 47 or later; a runner's `container` engine beside `host` and `microvm`
 (`harness::engine`: its facts, placement and drain) and its launch through the seam's `Boundary::Container`, an
 implementation over the machine's engine (`sandbox::container`): its image, and its harness's structured session over
 the container's stdio; `nosuid` and `nodev` under Docker, which its `--mount` can't say: measured first (a setuid file
