@@ -5,7 +5,7 @@
 //! daemon, and the daemon's back to the client, without descriptors, each side's end the
 //! other's.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
@@ -158,15 +158,16 @@ impl<D: Disk> Daemon<D> {
     /// client opened holds it. Once it has closed, each its client opened holds it until
     /// its serving ends, its answer's last word is its client's, or its client has taken
     /// nothing of its answer for longer than the slowest take seen (`Seen::answer_wait`),
-    /// its answer's writer waiting on it that long; before any take, until it ends. A client
-    /// reading its answer makes room as it reads, however slowly; one stopped, or held by a
-    /// pager that waits, takes nothing, and keeps no daemon from exiting nor the next from
-    /// starting past that wait. One whose request went on, with nothing of its answer to
-    /// take yet, takes nothing it could: it holds the daemon while the daemon has yet to
-    /// answer, as an attached run its stop ends after its timeout says nothing meanwhile (PM
-    /// M331). One whose request has not gone on holds it until its serving ends: its
-    /// request's wait is its own (`serve_slot`: the requests' record, and none once the
-    /// daemon has closed), never the answers'. A slot no client opened has no client.
+    /// its answer's writer waiting on it that long; before any take, until it ends, as the
+    /// daemon says ([`say_held_slots`](Self::say_held_slots)). A client reading its answer
+    /// makes room as it reads, however slowly; one stopped, or held by a pager that waits,
+    /// takes nothing, and keeps no daemon from exiting nor the next from starting past that
+    /// wait. One whose request went on, with nothing of its answer to take yet, takes nothing
+    /// it could: it holds the daemon while the daemon has yet to answer, as an attached run
+    /// its stop ends after its timeout says nothing meanwhile (PM M331). One whose request
+    /// has not gone on holds it until its serving ends: its request's wait is its own
+    /// (`serve_slot`: the requests' record, and none once the daemon has closed), never the
+    /// answers'. A slot no client opened has no client.
     pub(super) fn slots_hold(&self) -> (bool, Option<Instant>) {
         let closed = self.closed.load(Ordering::SeqCst);
         let wait = lock(&self.seen).answer_wait();
@@ -221,6 +222,23 @@ impl<D: Disk> Daemon<D> {
         }
     }
 
+    /// Says, once each (`said`), which slots hold the closed daemon until their clients read
+    /// or end: those its answer's writer waits on before any take has been seen, which no
+    /// time lets go of ([`slots_hold`](Self::slots_hold)'s cold start). A stop held by a
+    /// client stopped, or by a pager that waits, names what holds it.
+    pub(super) fn say_held_slots(&self, said: &mut HashSet<u64>) {
+        if !self.closed.load(Ordering::SeqCst) || lock(&self.seen).answer_wait().is_some() {
+            return;
+        }
+        for (n, live) in lock(&self.live).iter() {
+            if live.waiting.is_some() && said.insert(*n) {
+                log(format!(
+                    "request slot {n}: its answer waits on its client, with no take seen yet: held until that client reads or ends"
+                ));
+            }
+        }
+    }
+
     /// The slots' maker: keeps [`slots::OFFERED`] slots of each kind offered, without streams
     /// and with: one for the next client, and one for a client that comes as the first's
     /// replacement is made (making and removing a slot of five FIFOs is 317 µs of the
@@ -254,8 +272,8 @@ impl<D: Disk> Daemon<D> {
         // more lost past its end than it had lasted), as nothing else may wake it while every
         // client waits on a list it left short.
         let mut failing: Option<(Instant, Instant)> = None;
-        // What was heard while the lists were looked over ([`reclaim`]), heard before the
-        // next.
+        // Every event a reclaim drained ([`reclaim`]), heard before the next wait: a look
+        // follows each event, wherever it was heard.
         let mut pending: VecDeque<Event> = VecDeque::new();
         // Whether to look at the lists: at first, and as the listener asks ([`Event::Look`]).
         let mut look = true;
@@ -334,9 +352,12 @@ impl<D: Disk> Daemon<D> {
                 },
             };
             match heard {
+                // Its names go as it leaves `offered`, once: a reclaim gives back the events
+                // whose slots it let go of.
                 Ok(Event::Asked(n) | Event::Ended(n)) => {
-                    offered.remove(&n);
-                    requests.remove(n);
+                    if offered.remove(&n).is_some() {
+                        requests.remove(n);
+                    }
                 }
                 Ok(Event::Named(n)) => {
                     if let Some(o) = offered.get_mut(&n) {
@@ -753,11 +774,19 @@ impl<'a, D: Disk> Living<'a, D> {
 
     /// Writes `kind` and `payload` to its client as its FIFO takes them, waiting on that
     /// client only where the FIFO takes none of what is left: until it makes room, a take
-    /// (`Seen`), each wait's start and end a step on.
+    /// (`Seen`), each wait's start and end a step on. A wait that begins once the daemon has
+    /// closed wakes its listener, which sleeps until the first slot holding it lets go
+    /// ([`Daemon::slots_hold`]): this one's time is set as it begins, and the listener's last
+    /// look may have found its slot with its answer still to come, held with no time at all.
     pub(super) fn answer(&self, to: &slots::Line, kind: u8, payload: &[u8]) -> io::Result<()> {
         let message = slots::frame(kind, payload)?;
         let written = slots::write_all_waiting(to, &message, |wait| match wait {
-            slots::Wait::Began(began) => self.step(|live| live.waiting = Some(began)),
+            slots::Wait::Began(began) => {
+                self.step(|live| live.waiting = Some(began));
+                if self.daemon.closed.load(Ordering::SeqCst) {
+                    self.daemon.listener_wake.wake();
+                }
+            }
             slots::Wait::Ended(took) => {
                 lock(&self.daemon.seen).taken(took);
                 self.step(|live| live.waiting = None);
@@ -872,9 +901,12 @@ fn unnamed_taken(requests: &Requests, offered: &HashMap<u64, Offered>) -> bool {
 /// taken has a taker named in it, its name there to read ([`Probe`]) or read by its wait,
 /// which said so first ([`Event::Named`], drained here), unless its taker ended between
 /// its record's read and its name's write. Each such slot's names go and its wait ends
-/// through its own pipe; its maker offers another in its place. What else was heard meanwhile
-/// is given back, for the maker to hear next. Where a client is taking one, nothing is done:
-/// its name, or its slot's request, is an event that brings the maker back.
+/// through its own pipe; its maker offers another in its place. Every event drained is given
+/// back, what it says of a slot applied here first, for the maker to hear before it waits:
+/// one may leave a list short, which only the maker's look after it fills again. Kept here,
+/// a slot's `Asked` left the maker asleep with its list empty, each client after waiting on
+/// it until some other event came (#36). Where a client is taking one, nothing is done: its
+/// name, or its slot's request, is an event that brings the maker back.
 fn reclaim(
     requests: &Requests,
     offered: &mut HashMap<u64, Offered>,
@@ -900,11 +932,13 @@ fn reclaim(
                 }
             }
             Event::Asked(n) | Event::Ended(n) => {
-                offered.remove(&n);
-                requests.remove(n);
+                if offered.remove(&n).is_some() {
+                    requests.remove(n);
+                }
             }
-            other => later.push(other),
+            Event::Room | Event::Look | Event::Close => {}
         }
+        later.push(event);
     }
     for streams in [false, true] {
         // Read back, and offered again: no client reads a record while the lock is held.
@@ -1050,6 +1084,51 @@ mod tests {
         assert!(
             matches!(dead.wait(|| {}), Ok(Waited::Stopped)),
             "its wait not ended"
+        );
+    }
+
+    /// What a reclaim drains, the maker hears before it waits again: here a slot's `Asked`,
+    /// told by its thread as its client began its request, before the reclaim drained the
+    /// maker's events (slot 11's in kiln r72's run 257; 12's and 13's came as it ran). The
+    /// reclaim lets the slot go, its list one short, and gives the `Asked` back, so that the
+    /// maker looks, offering another, before it waits. Before, it kept what it applied, and
+    /// the maker slept with its list empty until some other event came: 1.10 s and 724 ms in
+    /// runs 257 and 290, its next client's wait refused, "no slot was offered" (#36; CI
+    /// 44245219858 darwin).
+    #[test]
+    fn what_a_reclaim_drains_the_maker_hears_before_it_waits() {
+        let home = shards_testdir::TempDir::new("slots-drained").unwrap();
+        let mut requests = Requests::open(&home).unwrap();
+        let mut offered = HashMap::new();
+        let mut made = Vec::new();
+        for _ in 0..slots::OFFERED {
+            let slot = requests.make(false).unwrap();
+            let n = slot.number();
+            requests.offer(n, false).unwrap();
+            let o = Offered {
+                streams: false,
+                stopper: slot.stopper().unwrap(),
+                probe: slot.probe().unwrap(),
+                named: false,
+            };
+            offered.insert(n, o);
+            made.push(slot);
+        }
+        // A client takes the first offered (a list is a FIFO), naming itself in it.
+        let taken = slots::take(&home, 0).unwrap();
+        assert!(matches!(taken, slots::Taken::Slot(_)), "no slot was taken");
+        let asked = made[0].number();
+        let (tell, heard) = mpsc::channel();
+        tell.send(Event::Asked(asked)).unwrap();
+        let later = reclaim(&requests, &mut offered, &heard);
+        assert!(!offered.contains_key(&asked), "the slot asked still offered");
+        assert!(
+            untaken(&requests, &offered, false) < slots::OFFERED,
+            "its list not short of the slot taken"
+        );
+        assert!(
+            matches!(later.as_slice(), [Event::Asked(n)] if *n == asked),
+            "the Asked the reclaim drained was not given back: the maker would wait with its list short ({later:?})"
         );
     }
 }

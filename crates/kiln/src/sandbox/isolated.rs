@@ -14,7 +14,7 @@
 //! - **Its folder** is the session's own, at its own path, so what the harness says of its files
 //!   names them as the machine does.
 //! - **What it sees of the machine** ([`Launch::shares`]): its project at its own path (a Windows
-//!   folder, which no Linux path names, under `/work` by its name: [`guest_path`]), and its
+//!   folder at its path as WSL names it, `C:\src\app` at `/mnt/c/src/app`: [`guest_path`]), and its
 //!   harness's home, its person's volumes kept on the machine (`harness::isolated::home::Layout`), each
 //!   at its path in the microVM, as kiln's Agentfile for its harness declares them, or a person's own
 //!   ([`kept_volumes`], its run's environment read from its image: [`harness_env`]); and the plugin
@@ -238,7 +238,7 @@ pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, hom
     }
     launch.plug_roots = roots;
     for dir in plugin_folders(kind, session) {
-        let at = guest_path(&dir, PLUGINS).map_err(anyhow::Error::msg)?;
+        let at = guest_path(&dir).map_err(anyhow::Error::msg)?;
         launch.args.extend(["--plugin-dir".to_owned(), at.clone()]);
         launch.shares.push(Share { host: dir, at, writable: false, members: Vec::new() });
     }
@@ -331,7 +331,7 @@ fn again(r: &Refusal) -> &'static str {
     match r {
         Refusal::Volume { cause: VolumeCause::Clearing, .. } => " (start it again once that volume's clearing has answered)",
         Refusal::Volume { cause: VolumeCause::Bound, .. } => " (its volume's bound changed: start it again once no other session of this agent on this machine holds that volume)",
-        Refusal::Volume { cause: VolumeCause::InUse | VolumeCause::Unknown, .. } | Refusal::NoSuchProgram(_) | Refusal::Invalid { .. } | Refusal::Unsupported(_) | Refusal::Full { .. } | Refusal::Ended => "",
+        Refusal::Volume { cause: VolumeCause::InUse | VolumeCause::Unknown, .. } | Refusal::NoSuchProgram(_) | Refusal::Invalid { .. } | Refusal::Unsupported(_) | Refusal::Full { .. } | Refusal::Ended | Refusal::Failed(_) => "",
     }
 }
 
@@ -370,11 +370,10 @@ pub fn bridge(lanes: std::sync::Arc<dyn super::Lanes>, vm: String, here: Option<
     })
 }
 
-/// Where a microVM sees a Windows machine's project folder: beneath this, by its own name ([`guest_path`]).
-pub const PROJECTS: &str = "/work";
-
-/// Where a microVM sees a Windows machine's plugin folders: beneath this, each by its own name.
-pub const PLUGINS: &str = "/plugins";
+/// Where a microVM sees a Windows machine's drives, each beneath it by its letter, drive C: at `/mnt/c`
+/// ([`guest_path`]): WSL's root of them (DrvFs's `automount.root`), which Shards takes as a Windows
+/// host's plug root (D235, its `setup.rs` `STANDARD_ROOTS`).
+pub const DRIVES: &str = "/mnt";
 
 /// Where a microVM sees the folders a person gives its running session (`harness::overrides`), by default: beneath
 /// this, each by its own name, one of the plug roots its launch declares ([`launch`]), so each is taken live.
@@ -398,31 +397,45 @@ pub fn volume_at(host: &str) -> Result<String, String> {
     Ok(format!("{VOLUMES}/{name}"))
 }
 
-/// Where a microVM sees folder `host` of the machine, as Shards plugs one in (D235): a Unix path at its
-/// own path, so what the harness says of its files names them as the machine does; a Windows one
-/// (`C:\…`, `\\?\C:\…`, `\\server\share\…`), which no Linux path names, beneath `under` by its own
-/// name, its last part. Hex takes a Windows folder as a share's source, but a share's destination and a
-/// member's working folder are the guest's Linux paths, absolute and plain, and Hex maps none for kiln
-/// (Hex's lead, through ROOT, 2026-11-13). Why not, for a path of neither kind, or a Windows one with
-/// no name to go by (a drive's root).
-pub fn guest_path(host: &str, under: &str) -> Result<String, String> {
+/// Where a microVM sees folder `host` of the machine: at its host path, as Shards plugs one in (D235)
+/// and kiln shares a project (Shards' D277), one rule for every machine and every folder. A Unix path
+/// is its own, so what the harness says of its files names them as the machine does; a Windows one on
+/// a drive (`C:\…`, `\\?\C:\…`, `D:/…`) is its path as WSL names it, its drive at
+/// [`DRIVES`]`/<its letter>` and `/` between its parts (`C:\src\app` at `/mnt/c/src/app`), where Shards
+/// roots a Windows host's paths (D235's plug roots). Hex takes a Windows folder as a share's source,
+/// but a share's destination and a member's working folder are the guest's Linux paths, absolute and
+/// plain, and Hex maps none for kiln (Hex's lead, through ROOT, 2026-11-13). Why not, for a folder on
+/// no drive (a share's, `\\server\share\…`), which WSL names at no path either, and one of neither
+/// kind.
+pub fn guest_path(host: &str) -> Result<String, String> {
     if host.starts_with('/') {
         return Ok(host.to_owned());
     }
-    let windows = host.starts_with(r"\\") || host.get(1..3).is_some_and(|s| s == ":\\" || s == ":/");
-    if !windows {
-        return Err(format!("{host:?} is neither a Unix path nor a Windows one"));
+    let path = host.strip_prefix(r"\\?\").unwrap_or(host);
+    let mut head = path.chars();
+    match (head.next(), head.next(), head.next()) {
+        (Some(drive), Some(':'), Some('\\' | '/')) if drive.is_ascii_alphabetic() => {
+            let mut at = format!("{DRIVES}/{}", drive.to_ascii_lowercase());
+            // A doubled or trailing separator names no step.
+            for step in path.get(3..).unwrap_or_default().split(['\\', '/']).filter(|s| !s.is_empty()) {
+                at.push('/');
+                at.push_str(step);
+            }
+            Ok(at)
+        }
+        _ => Err(format!(r"{host:?} is neither a Unix path nor one on a Windows drive (`C:\…`), which its microVM sees beneath {DRIVES} as WSL does; a share's (`\\server\share\…`) is on none until a drive is mapped to it")),
     }
-    let name = host.rsplit(['\\', '/']).find(|c| !c.is_empty()).filter(|c| *c != "." && *c != ".." && !c.ends_with(':') && *c != "?");
-    let name = name.ok_or_else(|| format!("{host:?} has no folder's name to plug it in by"))?;
-    Ok(format!("{}/{name}", under.trim_end_matches('/')))
 }
 
 /// Where an isolated session's harness sees the project kiln holds for it on this machine, where the two
-/// differ: a Windows machine's folder, which its microVM sees at [`guest_path`]'s `/work/<name>` (a Unix
-/// one it sees at its own path). The harness knows only its microVM's paths, so what tells it of a
+/// differ: a Windows machine's folder, which its microVM sees at [`guest_path`]'s `/mnt/<drive>/…` (a
+/// Unix one it sees at its own path). The harness knows only its microVM's paths, so what tells it of a
 /// folder (Codex's and ACP's requests) or names something after one for it (Claude Code's folder of a
-/// project's conversations) says the folder as [`Seen::said`] has it.
+/// project's conversations) says the folder as [`Seen::said`] has it; and what it says of the folder it
+/// works in (Claude Code's `init` and worktrees, Codex's thread) is the machine's folder again
+/// ([`Seen::host_of`]), the session's own, where kiln reads its files on the machine. A file it names that
+/// kiln reads (a change's baseline and its file now, an approval's preview) is the machine's too
+/// ([`host_file`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Seen {
     host: String,
@@ -437,7 +450,7 @@ impl Seen {
         spec.isolation.as_ref()?;
         // A project Slates serves is seen where the folder its volume lies over is ([`served_project`]).
         let host = served_over(spec).map_or_else(|| crate::harness::session::resolve_cwd(spec.cwd.as_deref()), |(_, over)| over.to_owned());
-        let at = guest_path(&host, PROJECTS).ok()?;
+        let at = guest_path(&host).ok()?;
         (at != host).then(|| Self { host: host.trim_end_matches(['\\', '/']).to_owned(), at })
     }
 
@@ -452,6 +465,23 @@ impl Seen {
                 at
             }),
             None => path.to_owned(),
+        }
+    }
+
+    /// `path`, a folder or file as the harness says it, as this machine names it: its project and what's
+    /// beneath it at the machine's own place, its parts joined as its folder is written (Windows' `\`, or
+    /// `/` for a folder written with it alone) ([`Seen::said`] the other way); anything else as it is. A
+    /// drive's root keeps its separator: `C:` alone names the drive's current folder (Microsoft's "Naming
+    /// Files, Paths, and Namespaces").
+    pub fn host_of(&self, path: &str) -> String {
+        match path.strip_prefix(self.at.as_str()) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                let sep = if self.host.contains('/') && !self.host.contains('\\') { "/" } else { "\\" };
+                let rest = rest.trim_end_matches('/').replace('/', sep);
+                let root = if rest.is_empty() && self.host.ends_with(':') { sep } else { "" };
+                format!("{}{root}{rest}", self.host)
+            }
+            _ => path.to_owned(),
         }
     }
 }
@@ -481,6 +511,21 @@ pub fn said(seen: Option<&Seen>, path: &str) -> String {
     seen.map_or_else(|| path.to_owned(), |s| s.said(path))
 }
 
+/// `path`, as the harness `seen` says it, as this machine names it ([`Seen::host_of`]); as it is for a
+/// harness that sees the machine's own paths.
+pub fn host_of(seen: Option<&Seen>, path: &str) -> String {
+    seen.map_or_else(|| path.to_owned(), |s| s.host_of(path))
+}
+
+/// The machine's file a harness names, `path`, where kiln reads it (a change's baseline and its file now,
+/// an approval's preview): rooted in its view as it is (`Path::has_root`: a microVM's `/…` on every
+/// machine, where Windows' `Path::is_absolute` wants a drive and would put `/mnt/c/x` beneath `cwd`), else
+/// beneath `cwd`, its folder as it sees it ([`said`]); then as this machine names it ([`host_of`]).
+pub fn host_file(seen: Option<&Seen>, cwd: &str, path: &str) -> String {
+    let path = if std::path::Path::new(path).has_root() || cwd.is_empty() { path.to_owned() } else { format!("{}/{path}", cwd.trim_end_matches('/')) };
+    host_of(seen, &path)
+}
+
 /// The folder `spec`'s harness is told it works in: its project as its microVM sees it, isolated
 /// ([`Seen`]); the machine's own, on its machine.
 pub fn harness_cwd(spec: &Spec) -> String {
@@ -490,7 +535,7 @@ pub fn harness_cwd(spec: &Spec) -> String {
 /// The project folder `cwd` as a launch shares it: writable, where [`guest_path`] puts it in the
 /// microVM, which is its member's working folder too.
 pub fn project_share(cwd: &str) -> Result<Share, String> {
-    Ok(Share { host: cwd.to_owned(), at: guest_path(cwd, PROJECTS)?, writable: true, members: Vec::new() })
+    Ok(Share { host: cwd.to_owned(), at: guest_path(cwd)?, writable: true, members: Vec::new() })
 }
 
 /// `spec`'s workspace of its own where it is a Slates volume made with no mount, which Slates serves its microVM
@@ -510,7 +555,7 @@ fn served_over(spec: &Spec) -> Option<(&crate::workspace::slates::Made, &str)> {
 /// the volume lies over.
 pub fn served_project(spec: &Spec, cwd: &str, harness: &kiln_seams::sandbox::Member) -> Result<Option<(kiln_seams::sandbox::Served, String)>, String> {
     let Some((made, over)) = served_over(spec) else { return Ok(None) };
-    let at = guest_path(over, PROJECTS)?;
+    let at = guest_path(over)?;
     let names = beneath(cwd, over).ok_or_else(|| format!("{cwd} lies outside {over}, the folder its workspace's volume lies over"))?;
     let folder = names.iter().fold(at.clone(), |mut folder, name| {
         folder.push('/');
@@ -1169,24 +1214,51 @@ mod tests {
     }
 
     /// Step 17 part 7: an isolated harness on a Windows machine is told its project, and what's beneath it,
-    /// at its place in its microVM, and anything else as it is; one on a Unix machine, and one on its
-    /// machine, the machine's own paths.
+    /// at its place in its microVM (its path as WSL names it, Shards' D235), and anything else as it is; what
+    /// it says of where it works is the machine's folder again; one on a Unix machine, and one on its
+    /// machine, the machine's own paths both ways.
     #[test]
     fn s17_an_isolated_harness_is_told_its_folder_as_its_microvm_sees_it() {
         let spec = |cwd: &str, isolated: bool| Spec { kind: "codex".into(), cwd: Some(cwd.into()), isolation: isolated.then(|| microvm(None)), ..Spec::default() };
         let seen = Seen::of(&spec(r"C:\src\app\", true));
-        for (path, told) in [(r"C:\src\app", "/work/app"), (r"C:\src\app\", "/work/app"), (r"C:\src\app\crates\kiln", "/work/app/crates/kiln"), ("C:\\src\\app/docs", "/work/app/docs"), (r"C:\src\application", r"C:\src\application"), ("/work/app/sub", "/work/app/sub")] {
+        for (path, told) in [(r"C:\src\app", "/mnt/c/src/app"), (r"C:\src\app\", "/mnt/c/src/app"), (r"C:\src\app\crates\kiln", "/mnt/c/src/app/crates/kiln"), ("C:\\src\\app/docs", "/mnt/c/src/app/docs"), (r"C:\src\application", r"C:\src\application"), ("/mnt/c/src/app/sub", "/mnt/c/src/app/sub")] {
             assert_eq!(said(seen.as_ref(), path), told, "{path}");
         }
-        assert_eq!(harness_cwd(&spec(r"\\?\D:\repos\kiln", true)), "/work/kiln");
-        for (cwd, isolated) in [("/Users/ada/src/app", true), (r"C:\src\app", false), (r"C:\", true)] {
+        for (path, host) in [("/mnt/c/src/app", r"C:\src\app"), ("/mnt/c/src/app/", r"C:\src\app"), ("/mnt/c/src/app/.claude/worktrees/x", r"C:\src\app\.claude\worktrees\x"), ("/mnt/c/src/application", "/mnt/c/src/application"), ("/home/codex", "/home/codex")] {
+            assert_eq!(host_of(seen.as_ref(), path), host, "{path}");
+        }
+        assert_eq!(harness_cwd(&spec(r"\\?\D:\repos\kiln", true)), "/mnt/d/repos/kiln");
+        // A drive's root keeps its `\`, `D:` alone naming the drive's current folder.
+        assert_eq!(host_of(Seen::of(&spec(r"D:\", true)).as_ref(), "/mnt/d"), r"D:\");
+        for (cwd, isolated) in [("/Users/ada/src/app", true), (r"C:\src\app", false), (r"\\server\share\app", true)] {
             assert_eq!(Seen::of(&spec(cwd, isolated)), None, "{cwd}");
             assert_eq!(harness_cwd(&spec(cwd, isolated)), cwd);
+            assert_eq!(host_of(Seen::of(&spec(cwd, isolated)).as_ref(), "/mnt/c/x"), "/mnt/c/x", "{cwd}");
         }
     }
 
+    /// Step 17 part 7: a file an isolated harness names is read where the machine has it (`host_file`): a
+    /// microVM's rooted `/mnt/c/…` as it is (rooted on every machine, though Windows' `Path::is_absolute`
+    /// wants a drive), a relative one beneath its folder as it sees it, each then the machine's; a harness
+    /// on its machine, its own paths; a folder written with `/` keeps it.
+    #[test]
+    fn s17_a_file_an_isolated_harness_names_is_read_where_the_machine_has_it() {
+        let spec = |cwd: &str| Spec { kind: "claude".into(), cwd: Some(cwd.into()), isolation: Some(microvm(None)), ..Spec::default() };
+        let windows = spec(r"C:\src\app");
+        let (seen, cwd) = (Seen::of(&windows), harness_cwd(&windows));
+        assert_eq!(cwd, "/mnt/c/src/app");
+        for (named, file) in [("/mnt/c/src/app/notes.txt", r"C:\src\app\notes.txt"), ("notes.txt", r"C:\src\app\notes.txt"), ("crates/kiln/a.rs", r"C:\src\app\crates\kiln\a.rs"), ("/mnt/c/src/app/.claude/worktrees/x/b.rs", r"C:\src\app\.claude\worktrees\x\b.rs"), ("/home/claude/.claude/settings.json", "/home/claude/.claude/settings.json")] {
+            assert_eq!(host_file(seen.as_ref(), &cwd, named), file, "{named}");
+        }
+        for (named, file) in [("/Users/ada/app/a.rs", "/Users/ada/app/a.rs"), ("src/a.rs", "/Users/ada/app/src/a.rs")] {
+            assert_eq!(host_file(None, "/Users/ada/app", named), file, "{named}");
+        }
+        let slashed = Seen::of(&spec("D:/src/kiln"));
+        assert_eq!(host_file(slashed.as_ref(), "/mnt/d/src/kiln", "a/b.rs"), "D:/src/kiln/a/b.rs");
+    }
+
     /// Step 17: an isolated launch is its image's harness member, in the session's folder as its microVM
-    /// sees it (a Unix folder at its own path, a Windows one at `/work/<its name>`), given only what its image's command doesn't: Codex none, Claude Code its session's
+    /// sees it (a Unix folder at its own path, a Windows one at its path as WSL names it), given only what its image's command doesn't: Codex none, Claude Code its session's
     /// flags; of the session's environment only its locale and time zone, and no kiln variable.
     #[test]
     fn s17_an_isolated_launch_is_the_members_with_what_the_session_adds() -> anyhow::Result<()> {
@@ -1198,22 +1270,22 @@ mod tests {
         assert_eq!((codex.program.as_str(), codex.args.as_slice()), ("codex", &[][..]), "its image's command runs it as kiln's adapter drives it");
         assert_eq!(codex.boundary, Boundary::MicroVm { image: "harness-codex@sha256:00".into() });
         // Its project, shared from this machine's folder to where its microVM sees it, which is its member's
-        // working folder too: a Unix folder at its own path, a Windows one at `/work/<its name>` (`guest_path`;
-        // jupiter, 2026-11-13: `/work/.tmpAoo893` for `C:\Users\…\Temp\.tmpAoo893`). Its home comes with its
-        // person's volume.
-        let name = dir.path().file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("{cwd} has no name"))?;
-        let at = if cfg!(windows) { format!("{PROJECTS}/{name}") } else { cwd.clone() };
+        // working folder too: a Unix folder at its own path, a Windows one at its path as WSL names it
+        // (`guest_path`, Shards' D235: `C:\Users\…\Temp\.tmpAoo893` at `/mnt/c/Users/…/Temp/.tmpAoo893`). Its
+        // home comes with its person's volume.
+        let at = if cfg!(windows) { guest_path(&cwd).map_err(anyhow::Error::msg)? } else { cwd.clone() };
         assert_eq!(codex.shares, [Share { host: cwd.clone(), at: at.clone(), writable: true, members: Vec::new() }], "its project, where its microVM sees it");
         assert_eq!(codex.folder.as_deref(), Some(at.as_str()), "its working folder, its project's place in its microVM");
-        // A Windows machine's project: shared from where it is, at a Linux path of its own name, which is
-        // its working folder too; Unix's at its own path.
+        // A Windows machine's project: shared from where it is, at its path as WSL names it (its drive at
+        // `/mnt/<its letter>`, `/` between its parts), which is its working folder too; Unix's at its own
+        // path; one on no drive, a share's, refused.
         let windows = project_share(r"C:\Users\ada\proj").map_err(anyhow::Error::msg)?;
-        assert_eq!(windows, Share { host: r"C:\Users\ada\proj".into(), at: "/work/proj".into(), writable: true, members: Vec::new() });
-        for (host, at) in [(r"\\?\C:\Users\ada\proj\", "/work/proj"), ("D:/src/kiln", "/work/kiln"), (r"\\server\share\repo", "/work/repo"), ("/Users/ada/proj", "/Users/ada/proj")] {
-            assert_eq!(guest_path(host, PROJECTS), Ok(at.to_owned()), "{host}");
+        assert_eq!(windows, Share { host: r"C:\Users\ada\proj".into(), at: "/mnt/c/Users/ada/proj".into(), writable: true, members: Vec::new() });
+        for (host, at) in [(r"\\?\C:\Users\ada\proj\", "/mnt/c/Users/ada/proj"), ("D:/src/kiln", "/mnt/d/src/kiln"), (r"e:\a\\b\", "/mnt/e/a/b"), (r"C:\", "/mnt/c"), ("/Users/ada/proj", "/Users/ada/proj")] {
+            assert_eq!(guest_path(host), Ok(at.to_owned()), "{host}");
         }
-        for nameless in [r"C:\", "C:/", r"\\?\C:\", "relative\\proj"] {
-            assert!(guest_path(nameless, PROJECTS).is_err(), "{nameless}");
+        for nowhere in [r"\\server\share\repo", r"\\?\UNC\server\share\repo", "relative\\proj", "C:relative", ""] {
+            assert!(guest_path(nowhere).is_err(), "{nowhere}");
         }
         assert_eq!(codex.env, vec![("LANG".to_owned(), "fr_FR.UTF-8".to_owned()), ("TZ".to_owned(), "Europe/Paris".to_owned())]);
         let resumed = Spec { resume: Some("conversation-1".into()), model: Some("claude-opus-5-5".into()), allow_bypass: false, ..spec("claude") };
@@ -1325,7 +1397,7 @@ mod tests {
         };
         let spec = Spec { kind: "codex".into(), cwd: Some(sub_s.clone()), isolation: Some(microvm(None)), workspace: Some(workspace("")), ..Spec::default() };
         let launched = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into(), &[])?;
-        let at = guest_path(&top_s, PROJECTS).map_err(anyhow::Error::msg)?;
+        let at = guest_path(&top_s).map_err(anyhow::Error::msg)?;
         let folder = format!("{at}/crates/kiln");
         assert!(launched.shares.is_empty(), "no folder of the machine's: {:?}", launched.shares);
         assert_eq!(

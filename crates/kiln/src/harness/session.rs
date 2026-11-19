@@ -5395,7 +5395,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         let tx = pv_tx.clone();
                         crate::rt::spawn(async move {
                             let id = job.approval.clone();
-                            let diffs = crate::rt::blocking(move || super::claude::preview(&job.tool, &job.input, &job.cwd)).await.unwrap_or_default();
+                            let diffs = crate::rt::blocking(move || super::claude::preview(&job.tool, &job.input, &job.cwd, job.seen.as_ref())).await.unwrap_or_default();
                             let _ = tx.send((id, diffs)).await;
                         });
                     }

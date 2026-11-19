@@ -110,12 +110,18 @@ pub fn vsock_instance(name: &str, first: bool) -> io::Result<OwnedHandle> {
     )
 }
 
-/// An instance of each of `names`: the way down's, then the way up's.
+/// An instance of each of `names`, the way down's and the way up's, the way up's made first:
+/// a new instance wakes the clients waiting on its name (ReactOS npfs create.c
+/// `NpCreateExistingNamedPipe`, `NpCancelWaiter`), and a client let in by the way down opens
+/// the way up next, which is there. Made second, it was not yet for a client woken by the
+/// way down, and where no connection held one its name had none, which refused the client
+/// (ERROR_FILE_NOT_FOUND) as its listener replaced a broken pair: the muxer's
+/// `a_client_waiting_as_a_broken_pair_is_replaced_is_let_in` on a loaded runner (CI
+/// 44189693085, x86_64 Windows; arm64 Windows before it).
 pub fn vsock_pair(names: &VsockNames, first: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
-    Ok((
-        vsock_instance(&names.down, first)?,
-        vsock_instance(&names.up, first)?,
-    ))
+    let up = vsock_instance(&names.up, first)?;
+    let down = vsock_instance(&names.down, first)?;
+    Ok((down, up))
 }
 
 /// A listener's first pair at `path`, under fresh names its file there says, written whole
@@ -188,6 +194,30 @@ pub fn vsock_open(path: &Path, deadline: Option<Instant>) -> io::Result<(OwnedHa
     let down = open_waiting(&names.down, deadline)?;
     let up = open_waiting(&names.up, deadline)?;
     Ok((down, up))
+}
+
+/// A connection whose two sides this process makes (D272, amended 2026-11-17): a pair under
+/// fresh names, their first instances, its client ends opened as [`vsock_open`] opens them,
+/// its way down first, and its server ends connected to them, the [`VsockConn`] a
+/// [`VsockListener`] would hand its host program. For a host port no listener of pipes
+/// holds: its spawner carries the connection between the server ends and that host side.
+pub fn vsock_carried() -> io::Result<(VsockConn, (OwnedHandle, OwnedHandle))> {
+    let names = VsockNames::fresh()?;
+    let (down, up) = vsock_pair(&names, true)?;
+    // Free instances just made, which nothing else knows the names of: open at once.
+    let now = Some(Instant::now());
+    let theirs = (open_waiting(&names.down, now)?, open_waiting(&names.up, now)?);
+    for end in [&down, &up] {
+        // Its client already there: ConnectNamedPipe says ERROR_PIPE_CONNECTED at once.
+        if !super::connected(end.as_raw_handle(), &[])? {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+    }
+    let ours = VsockConn {
+        down: super::Pipe::from_handle(down),
+        up: super::Pipe::from_handle(up),
+    };
+    Ok((ours, theirs))
 }
 
 /// The client end of the pipe `name`, waited for while busy until `deadline`.

@@ -767,7 +767,9 @@ mod tests {
     /// the pair written and loaded as a node loads it, its envelope the configured guest's, its window the governor's
     /// period, two guests in its evidence, and no guest
     /// leaving anything on disk: its native owner releases the AppContainer profiles and records its VM process made
-    /// as it ends its scope (Shards' D141, shards_api::release_app_containers), which the census would refuse. Needs
+    /// as it ends its scope (Shards' D141, shards_api::release_app_containers), which the census would refuse; Shards
+    /// keeps those records per user, beside the profiles (shards_api::app_container_records), so those there before
+    /// this run are another's, and none other may start a Shards VM meanwhile. Needs
     /// SHARDS_BIN, HEX_GUEST_KERNEL, HEX_GUEST_INITRD, HEX_GUEST_CPUS, HEX_GUEST_MEMORY_MIB and GUEST_COST_SMOKE_OUT (a
     /// folder of the run's own under the user's profile).
     #[test]
@@ -775,6 +777,10 @@ mod tests {
     fn two_managed_guests_make_a_pair_the_node_loads() {
         let out =
             PathBuf::from(std::env::var_os("GUEST_COST_SMOKE_OUT").expect("GUEST_COST_SMOKE_OUT"));
+        let records = shards_api::app_container_records().unwrap();
+        let before: Vec<std::ffi::OsString> = std::fs::read_dir(&records)
+            .map(|dir| dir.flatten().map(|entry| entry.file_name()).collect())
+            .unwrap_or_default();
         let mut driver = Managed::from_env(&out).unwrap();
         let envelope = driver.envelope().unwrap().resources;
         let made = produce(
@@ -801,10 +807,14 @@ mod tests {
         );
         assert_eq!(text.lines().filter(|l| l.starts_with("guest ")).count(), 2);
         // Its native owner released each guest's AppContainer profiles with its scope, the window's guest's too: no
-        // record of one is left in its cache.
-        let records = out.join("runtime").join("cache").join("containers");
+        // record this run made is left.
         let left: Vec<_> = std::fs::read_dir(&records)
-            .map(|dir| dir.flatten().map(|entry| entry.file_name()).collect())
+            .map(|dir| {
+                dir.flatten()
+                    .map(|entry| entry.file_name())
+                    .filter(|name| !before.contains(name))
+                    .collect()
+            })
             .unwrap_or_default();
         assert!(left.is_empty(), "{left:?} left in {records:?}");
         println!("{}\n{text}", made.summary);

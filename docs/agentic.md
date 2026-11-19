@@ -507,6 +507,42 @@ passed. Its landing waits on its grant (W6) as any's does, into the folder it wa
 this runner's disk names it. Owed: a workspace taken over after its runner's loss (no move carried
 its capture), which Slates still lands as a volume with no capture.
 
+**The multi-runner test with injected faults (kiln goal 95101ef3, its part 60178ceb; Slates' A-580).** What the fleet
+promises, proved by faults rather than said (`tests/slates_fleet_faults.rs`): three runners of a test's own server,
+each its own machine (`KILN_MACHINE_ID`) with its own Slates instance (`KILN_SLATES_INSTANCE`), listed in the server's
+`[slates_fleet]` with `f = 1` and nodes on loopback, form kiln's Slates fleet the way W7's runners do (each node's key
+and certificate from kiln's CA, discovery, the manifest Slates' own reader takes, the instance started as the fleet's
+node). An agent of the stand-in harness (no model) works in a captured clone on the first runner (W3, K5), and files are
+written into its volume before each fault, each one Slates acknowledged. Each flow injects one fault, with no privilege
+(as Slates' own `live_chaos.rs`: a stopped process is the unprivileged partition):
+- **a runner killed**: the instance holding the agent's volume loses its anchor and daemon at once (SIGKILL, the
+  machine's loss), and the fleet takes the volume over;
+- **a runner partitioned**: its anchor and daemon stopped (SIGSTOP) past the fleet's failover delay, then let go on;
+- **a runner restarted**: its runner and its instance stopped and started again, rejoining as the same machine;
+- **a link lost mid-move**: an agent's move (`agents.move`) to the second runner, whose node is stopped once the move
+  has begun and let go on after the failover delay.
+
+Every flow ends with the same three verdicts, each from what an agent or a person can see, judged by pure code that
+runs on every host (`workspace::slates_faults`): **no acknowledged change lost** (every file Slates acknowledged before
+the fault is served after it byte for byte, by whichever node serves the volume then); **the move completes or refuses
+by kind** (kiln's word on it, once it settles, is the agent working on its target with its workspace, or a refusal
+naming a kind W7 lists, `workspace::slates_move::KINDS`, with the agent working where it was: never neither); and **the
+fleet re-forms** (once the fault ends, every listed runner's node is a member again, serving). It is a test of what
+holds, not of how fast: no latency is judged, and every wait is the fleet's own failover delay as its nodes report it.
+Linux alone, where a workspace is a FUSE mount: on macOS it's a kernel NFS mount over loopback, and a daemon killed or
+stopped under a live NFS mount has panicked the Mac (Slates' record of 2026-10-06), so the macOS flows wait until a
+runner lets its workspace mounts go before a fault. Gated by `SLATES_FLEET_FAULTS=1` and skipped, saying so, without it,
+since it starts three instances and their anchors:
+
+```sh
+SLATES_FLEET_FAULTS=1 cargo test -p kiln --test slates_fleet_faults -- --nocapture --test-threads 1
+```
+
+Not in it: a captured clone landed after its runner's loss and a moved live clone landed against its capture, which are
+Slates' own fleet tests (its A-583); one link cut while every node runs, which needs a relay between the nodes that
+kiln's manifest can't name yet (Slates' `bind`, its A-277); and runners on separate machines, the same flows driven
+through `kiln run --on` once this one holds.
+
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.
 Its workspace of its own is a Slates volume made with no mount (kiln goal 01a1ec34599974448f6b7663ddb07001):

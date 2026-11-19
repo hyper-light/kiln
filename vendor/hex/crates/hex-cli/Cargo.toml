@@ -84,6 +84,9 @@ hex-testkit.workspace = true
 # hex-wait rests between them to each one's deadline, on macOS too.
 hex-sim.workspace = true
 hex-wait.workspace = true
+# The image grants probe's closed target, a port held by a socket bound and connected, never listening
+# (tests/image_grants_real.rs `closed_port`), on every OS: std binds a stream socket only to listen or connect from.
+socket2.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 hex-node = { workspace = true, features = ["test-controls"] }

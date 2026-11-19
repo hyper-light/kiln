@@ -570,6 +570,9 @@ pub struct PreviewJob {
     pub cwd: String,
     pub tool: String,
     pub input: serde_json::Value,
+    /// Where its harness sees its project, isolated (`sandbox::isolated::Seen`): the file it names is
+    /// read where the machine has it.
+    pub seen: Option<crate::sandbox::isolated::Seen>,
 }
 
 /// A tag of one run of a harness's adapter: the ids of the events it makes carry it, so a harness

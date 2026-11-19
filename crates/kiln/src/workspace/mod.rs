@@ -26,6 +26,7 @@ pub mod measure;
 pub mod place;
 pub mod review;
 pub mod slates;
+pub mod slates_faults;
 pub mod slates_fleet;
 pub mod slates_move;
 

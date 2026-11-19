@@ -355,7 +355,7 @@ index 44102a4b671a7c7cdbe8fcf59a0254d8b294e3be..daad732531ba66212d500d474df62d9a
      /// it on this host, so its spec pools with the one that names that size, its warm host's
      /// exemplar and its claim that size; and a run of it takes the other's warm host.
 diff --git a/crates/api/src/image/session.rs b/crates/api/src/image/session.rs
-index 69f3badc528ba3754710b5e875cb67e7c4a95a93..fd6c5a8cfb7d8d1b82336a4a0f1d56fe5f0ed3cb 100644
+index 80fdbc4c3fcc1a2576e429860fd9a3d165b65e5a..8f316580109560eb0617e7746aa4975bf9e20c46 100644
 --- a/crates/api/src/image/session.rs
 +++ b/crates/api/src/image/session.rs
 @@ -1031,6 +1031,18 @@ pub(crate) struct Host {
@@ -490,7 +490,7 @@ index 69f3badc528ba3754710b5e875cb67e7c4a95a93..fd6c5a8cfb7d8d1b82336a4a0f1d56fe
              .map_err(|(refused, _)| refused)
      }
  
-@@ -5783,6 +5853,7 @@ mod tests {
+@@ -5792,6 +5862,7 @@ mod tests {
              upstream_roots: Vec::new(),
              plug_roots: Vec::new(),
              egress_ceiling: Vec::new(),
@@ -498,7 +498,7 @@ index 69f3badc528ba3754710b5e875cb67e7c4a95a93..fd6c5a8cfb7d8d1b82336a4a0f1d56fe
              gpu_report: None,
              shares: Vec::new(),
              nesting: false,
-@@ -6193,6 +6264,52 @@ mod tests {
+@@ -6202,6 +6273,52 @@ mod tests {
          assert_eq!(layer_files(&home), [others], "its run host's layer outlived it");
      }
  
@@ -1192,7 +1192,7 @@ index 92b5d66781f5c828636cc4e56039b963ae5baaaa..6672b7a05fcbd97016ec8b6009749d5c
          cli[at] = 9;
          assert!(matches!(Request::decode(&cli), Err(WireError::Tag { .. })));
 diff --git a/crates/ipc/src/lib.rs b/crates/ipc/src/lib.rs
-index 4f9d1f8244c107da5118c545cb3fa5aff3c40cbf..290743a7fee91a2bf7b8a1991905068faa56298c 100644
+index 7fc5cf4d6c17de77895f1a4096183da0cebca92c..b14a8271f8be6bc3ac4b499fdf58fd2061e41126 100644
 --- a/crates/ipc/src/lib.rs
 +++ b/crates/ipc/src/lib.rs
 @@ -527,6 +527,12 @@ pub mod kind {

@@ -109,6 +109,17 @@ pub fn said_marker(lines: &[String], marker: &str) -> bool {
     lines.iter().any(|l| l.contains(marker))
 }
 
+/// What the harness said in its first turn: `lines` up to and including the first that has `marker`. The look that
+/// finds that turn ended can come after a later one, and kiln's word that an agent the harness started ended its
+/// turn starts one that quotes the agent's own `CWD` and `WHERE` (`harness::told`), which r41 read as devin's and
+/// cursor's.
+pub fn first_turn(mut lines: Vec<String>, marker: &str) -> Vec<String> {
+    if let Some(end) = lines.iter().position(|l| l.contains(marker)) {
+        lines.truncate(end + 1);
+    }
+    lines
+}
+
 // ------------------------------------------------------------------------------------------------
 // Check 1: the negotiated suite, from both ends of every link
 // ------------------------------------------------------------------------------------------------
@@ -242,20 +253,21 @@ pub fn check_all_links(links: &[LinkSuites]) -> Result<(), String> {
     links.iter().try_for_each(check_link)
 }
 
-/// Why a drive's links can't pass the checks above where kiln's own word on its session says why: a gap of the built
-/// system's, named, so a run's red reads as that gap rather than as a check's words (gaps.json's `link_report`).
+/// Why a drive's links can't pass the checks above where kiln's own word on its session says why, named, so a run's
+/// red reads as that cause rather than as a check's words. kiln reports a microVM's link (gaps.json's `link_report`,
+/// which holds for every harness): this names a run it reported none of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkGap {
-    /// kiln says the session runs in a microVM and reports no agent-control link of it (`/runs/control` absent).
-    /// kiln's runner holds its microVMs through Hex's image runtime (`sandbox::held_in`), whose `Runtime` signals the
-    /// member and takes kiln's MCP lane over that link but has no call that reports it, so `HexRun::link` answers none.
+    /// kiln says the session runs in a microVM and has no `/runs/control` for it. `HexRun::link` asks Hex's
+    /// `Runtime::link`, which waits for its run's agent-control endpoint to report (`sandbox::hexvm`), and answers none
+    /// only where that run ended before its endpoint reported, or where Hex refused the call.
     HexReportsNoLink,
 }
 
 impl std::fmt::Display for LinkGap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HexReportsNoLink => f.write_str("Hex reports no agent-control link: Hex has no Runtime call for it yet"),
+            Self::HexReportsNoLink => f.write_str("kiln has no /runs/control for this microVM's run: Hex reported no agent-control link of it"),
         }
     }
 }
@@ -278,7 +290,7 @@ pub struct LinksFailed {
 impl std::fmt::Display for LinksFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.gap {
-            Some(gap) => write!(f, "{gap} (kiln says the session runs in a microVM and reports no /runs/control: gaps.json's link_report gap); its links' checks said: {}", self.said),
+            Some(gap) => write!(f, "{gap}; its links' checks said: {}", self.said),
             None => f.write_str(&self.said),
         }
     }
@@ -945,49 +957,25 @@ impl Wake {
     }
 
     /// Waits for kiln's next change: until a frame comes down the socket, or `within` passes (none: no
-    /// bound). Frames that follow it within `settle` (how long a look takes) are read with it, so looks
-    /// never outrun kiln's answers. The socket is opened as it's first waited on, and again after it
-    /// ended; that wait returns at once, so a change made while it opened is looked at. An opening
-    /// that fails pauses as long as it took. What it read, each frame's JSON, is its answer (a session's
-    /// admission's word on a message among them: [`Watch::heard`]).
+    /// bound). Frames that follow it within `settle` of it (how long a look takes) are read with it
+    /// ([`frames`]), so looks never outrun kiln's answers. The socket is opened as it's first waited on, and
+    /// again after it ended; that wait returns at once, so a change made while it opened is looked at. An
+    /// opening that fails pauses as long as it took. What it read, each frame's JSON, is its answer (a
+    /// session's admission's word on a message among them: [`Watch::heard`]).
     pub fn next(&mut self, within: Option<Duration>, settle: Duration) -> Vec<Value> {
-        let mut said = Vec::new();
         if self.sock.is_none() {
             let began = Instant::now();
             match self.open() {
                 Ok(s) => self.sock = Some(s),
                 Err(_) => std::thread::sleep(began.elapsed()),
             }
-            return said;
+            return Vec::new();
         }
         if within.is_some_and(|w| w.is_zero()) {
-            return said;
+            return Vec::new();
         }
-        let Some(s) = self.sock.as_mut() else { return said };
-        // A frame within `t` (none: no bound), each read with its own bound: a frame that began is
-        // read whole, with none.
-        let mut read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
-            s.set_read_timeout(t)?;
-            let Some(payload) = frame_or_quiet(s)? else { return Ok(false) };
-            if let Ok(v) = serde_json::from_slice::<Value>(&payload) {
-                said.push(v);
-            }
-            Ok(true)
-        };
-        let ended = match read(s, within) {
-            Ok(true) => {
-                !settle.is_zero()
-                    && loop {
-                        match read(s, Some(settle)) {
-                            Ok(true) => {}
-                            Ok(false) => break false,
-                            Err(_) => break true,
-                        }
-                    }
-            }
-            Ok(false) => false,
-            Err(_) => true,
-        };
+        let Some(s) = self.sock.as_mut() else { return Vec::new() };
+        let (said, ended) = frames(s, within, settle);
         if ended {
             self.sock = None;
         }
@@ -1001,6 +989,45 @@ impl Wake {
         }
         Ok(s)
     }
+}
+
+/// What kiln's socket `s` says to a wait ([`Wake::next`]): its next frame, waited for up to `within` (none: no
+/// bound), and the frames that follow it within `settle` of it, each frame's JSON; and whether `s` ended or broke.
+/// Those that come later are the next look's: kiln's events socket is never quiet for long (its server samples
+/// itself every `[telemetry] sample_seconds`), so a wait that read on while each frame followed the last within
+/// `settle` never looked again. pre2's start, asked twice under strain and each POST unanswered for its 75 s, was
+/// never asked a third time, the strain's end and five clear hours after it included (adacachy, 2026-11-18).
+pub fn frames(s: &mut std::net::TcpStream, within: Option<Duration>, settle: Duration) -> (Vec<Value>, bool) {
+    let mut said = Vec::new();
+    // A frame within `t` (none: no bound), each read with its own bound: a frame that began is
+    // read whole, with none.
+    let mut read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
+        s.set_read_timeout(t)?;
+        let Some(payload) = frame_or_quiet(s)? else { return Ok(false) };
+        if let Ok(v) = serde_json::from_slice::<Value>(&payload) {
+            said.push(v);
+        }
+        Ok(true)
+    };
+    let ended = match read(s, within) {
+        Ok(true) => {
+            let until = Instant::now().checked_add(settle);
+            loop {
+                let left = until.map_or(Duration::ZERO, |u| u.saturating_duration_since(Instant::now()));
+                if left.is_zero() {
+                    break false;
+                }
+                match read(s, Some(left)) {
+                    Ok(true) => {}
+                    Ok(false) => break false,
+                    Err(_) => break true,
+                }
+            }
+        }
+        Ok(false) => false,
+        Err(_) => true,
+    };
+    (said, ended)
 }
 
 /// One WebSocket frame off `s`, the server's (unmasked): its payload where one came; none where none
@@ -1235,6 +1262,22 @@ pub fn open(f: &Fixture, spec: &Value) -> anyhow::Result<String> {
         let (code, text) = common::http_within(f.port, "POST", "/api/harness/sessions", &f.admin, Some(&body), Duration::from_secs(75))?;
         let throughout = code != 200 && before && up()?;
         Ok(opened(code, &text, throughout))
+    })
+}
+
+/// Session `id`, whose start kiln queued for room on the fixture's runner (`agents.start` answered
+/// `queued`, its words `queued`: "it starts there as soon as there's room"), once kiln opened it
+/// under `id` as it said it would; until then kiln has no such session (404). Followed as a setup
+/// wait is ([`setup`]): no window, its parties' liveness and kiln's word alone.
+pub fn queued_start(f: &Fixture, id: &str, what: &str, queued: &str) -> anyhow::Result<()> {
+    let path = format!("/api/harness/sessions/{id}");
+    setup_on(f, &format!("{what}: its start, queued: {queued}"), || {
+        let (code, body) = common::http(f.port, "GET", &path, &f.admin, None)?;
+        Ok(match code {
+            200 => Setup::Ready(()),
+            404 => Setup::Wait,
+            _ => server_said(code, &body),
+        })
     })
 }
 
@@ -2196,7 +2239,7 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     ends.started(&id);
     let (first_info, events) = pace.until(f, &id, Asked::Opening, &format!("{kind}'s first turn"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
-    let first = said(&events);
+    let first = first_turn(said(&events), ask.marker);
 
     // Steer: a message into a turn under way (where the harness takes none mid-turn, kiln sends it
     // next), answered.
@@ -2610,9 +2653,11 @@ pub fn stub_host_env(dir: &Path) -> anyhow::Result<Vec<(&'static str, String)>> 
     let bin = dir.join("bin");
     if !bin.exists() {
         std::fs::create_dir_all(&bin)?;
-        let python = stub_python()?;
+        // cmd.exe expands `%` in a batch file's lines, quoted or not: each of a path's doubled. No path holds a `"`.
+        let in_batch = |p: &Path| p.display().to_string().replace('%', "%%");
+        let (python, stub) = (in_batch(stub_python()?.as_path()), in_batch(stub_path().as_path()));
         for k in kiln::harness::kinds::Kind::all() {
-            let shim = format!("@set \"VM_STUB_PROTOCOL={}\"\r\n@\"{}\" \"{}\" %*\r\n", k.program, python.display(), stub_path().display());
+            let shim = format!("@set \"VM_STUB_PROTOCOL={}\"\r\n@\"{python}\" \"{stub}\" %*\r\n", k.program);
             std::fs::write(bin.join(format!("{}.cmd", k.program)), shim)?;
         }
     }

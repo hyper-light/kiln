@@ -4584,12 +4584,12 @@ mod tests {
 
     /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: kiln's copy of an isolated Claude
     /// Code's conversation is kept where Claude Code in its microVM looks for it, under its project's
-    /// name there (`sandbox::isolated::guest_path`): a Windows machine's folder's `/work/<name>`, a Unix
-    /// one's own path; Claude Code on its machine, the machine's.
+    /// name there (`sandbox::isolated::guest_path`): a Windows machine's folder's path as WSL names it
+    /// (`/mnt/c/…`, Shards' D235), a Unix one's own path; Claude Code on its machine, the machine's.
     #[test]
     fn s17_an_isolated_claudes_copy_is_kept_under_its_guest_folders_name() -> anyhow::Result<()> {
         crate::rt::block_on(async {
-            for (host_cwd, told, isolated) in [(r"C:\src\app", "/work/app", true), ("/Users/ada/src/app", "/Users/ada/src/app", true), (r"C:\src\app", r"C:\src\app", false)] {
+            for (host_cwd, told, isolated) in [(r"C:\src\app", "/mnt/c/src/app", true), ("/Users/ada/src/app", "/Users/ada/src/app", true), (r"C:\src\app", r"C:\src\app", false)] {
                 let dir = tempfile::tempdir()?;
                 let (tx, _rx) = async_channel::unbounded();
                 let host = sim(tx, Some(dir.path().join("harness.json")), Limits::default());

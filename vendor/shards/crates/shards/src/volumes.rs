@@ -1219,6 +1219,13 @@ impl Holds {
     pub fn holds(&self, name: &str) -> bool {
         self.0.contains_key(name)
     }
+
+    /// Whether it holds no volume: a run's end on Windows waits for its VM's where it holds
+    /// some (D281, `Daemon::park_end`).
+    #[cfg(windows)]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 fn dir_size(dir: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> std::io::Result<u64> {
@@ -1283,7 +1290,7 @@ fn durably(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let aside = dir.join(format!("{name}.new"));
     let mut f = std::fs::File::create(&aside)?;
     f.write_all(bytes)?;
-    f.sync_all()?;
+    shards_durable::all(&f)?;
     std::fs::rename(&aside, dir.join(name))?;
     shards_vmm::platform::sync_dir(dir)
 }
