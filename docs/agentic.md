@@ -329,6 +329,13 @@ held the release until the runner restarted (2026-11-19). Then the mount is aske
 that answers done is believed only when the table agrees); one whose mount stays is kept, never destroyed beneath a
 live mount, which would leave the mount with nothing behind it, and never let go by force: what holds it once the
 agent's processes have ended is another's (a person's shell or editor there), which a forced unmount would cut off.
+The one mount kiln lets go of by force is one a gone Slates instance left (2026-11-19): kiln follows the machine's
+instance from its daemon, as Slates' own status names it, and at that daemon's end, as the OS tells it, reads the
+table's workspace mounts and asks Slates. A daemon its anchor restarted serves the same mounts again (the anchor holds
+the NFS listener and the daemon's descriptors), so its end is followed next; no anchor holding the instance, or another
+instance, means nothing will serve them again, and a process stuck on a hard NFS mount ends only once it's forced off,
+so each is let go of (Slates' `mount::unmount_busy`: forced on macOS, detached on Linux; a WinFsp drive goes with its
+daemon). Never on a clock: no end told, nothing let go.
 kiln refuses it by kind (`MountStays`), as Slates' contract 42 types the unmount's answer (its A-507): busy, which the
 OS says itself on macOS (`MountFault::Busy`, its `EBUSY`) and Linux's `fusermount3 -u` doesn't (an exit code alone, so
 there a refusal while `lsof` names processes holding the mount), naming each process that holds it as `lsof` does (the
