@@ -758,17 +758,17 @@ mod tests {
         let path = write_manifest(&dir, &a, "bench-a", &members, 1)?;
         assert_eq!(path, dir.join(MANIFEST));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        assert_eq!(manifest["name"], FLEET);
-        assert_eq!(manifest["f"], 1);
-        assert_eq!(manifest["enrollment_roots"], serde_json::json!([ROOT]));
-        let nodes = manifest["nodes"].as_array().ok_or_else(|| anyhow::anyhow!("no nodes"))?;
-        let names: Vec<&str> = nodes.iter().filter_map(|n| n["node"].as_str()).collect();
+        assert_eq!(manifest.get("name"), Some(&serde_json::json!(FLEET)), "the manifest names its fleet: {manifest}");
+        assert_eq!(manifest.get("f"), Some(&serde_json::json!(1)), "the manifest names its fault tolerance: {manifest}");
+        assert_eq!(manifest.get("enrollment_roots"), Some(&serde_json::json!([ROOT])), "the manifest names kiln's CA as its root: {manifest}");
+        let nodes = manifest.get("nodes").and_then(serde_json::Value::as_array).ok_or_else(|| anyhow::anyhow!("the manifest names no list of nodes: {manifest}"))?;
+        let names: Vec<&str> = nodes.iter().filter_map(|n| n.get("node").and_then(serde_json::Value::as_str)).collect();
         assert_eq!(names, ["bench-a", "bench-b", "bench-c"]);
         assert_eq!(nodes.first(), Some(&serde_json::json!({ "node": "bench-a", "address": "10.0.0.1:17300", "certificate": CERTIFICATE, "key": KEY, "domain": domain_of("bench-a") })));
         assert_eq!(nodes.get(2), Some(&serde_json::json!({ "node": "bench-c", "address": "runner-c.lan:17302", "certificate": "peers/bench-c.crt.der", "key": "", "domain": domain_of("bench-c") })));
         for node in nodes {
-            let certificate = node["certificate"].as_str().ok_or_else(|| anyhow::anyhow!("no certificate"))?;
-            let name = node["node"].as_str().ok_or_else(|| anyhow::anyhow!("no name"))?;
+            let certificate = node.get("certificate").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("a node names no certificate: {node}"))?;
+            let name = node.get("node").and_then(serde_json::Value::as_str).ok_or_else(|| anyhow::anyhow!("a node names no machine: {node}"))?;
             let theirs = identities.get(name).ok_or_else(|| anyhow::anyhow!("{name}"))?;
             assert_eq!(std::fs::read(dir.join(certificate))?, std::fs::read(&theirs.certificate)?, "{name}'s certificate as Slates reads it");
         }
