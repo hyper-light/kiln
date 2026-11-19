@@ -509,7 +509,8 @@ stream kiln asks of its instance and hands Shards through Hex (Shards' D286, Hex
 path in its guest. Its change request is built from the volume's own changes (`workspace::review`: Slates'
 landing entries, each file read from the volume and checked against its BLAKE3, and a file whose owner's execute bit
 alone changed (all git keeps of a mode: git's `ce_permissions`) read there and checked against the folder's copy, whose
-bytes its landing keeps; A-287), and its landing
+bytes its landing keeps; A-287; in a repository whose `core.fileMode` is false no execute bit is taken from the volume,
+as git takes none: a tracked file keeps its index's mode and a new one is not executable), and its landing
 is the same Slates landing as a mounted workspace's, leaving out what git ignores as a mounted one does: read from
 the volume itself (its own `.gitignore` files, the repository's excludes and the person's, over what the landing
 writes: each ignored file, or the shallowest directory git ignores above it), never from the runner's own folder,

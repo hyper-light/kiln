@@ -370,6 +370,24 @@ pub async fn tracked(top: &Path) -> anyhow::Result<std::collections::HashSet<Str
     Ok(run(c, GIT_TIMEOUT).await?.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect())
 }
 
+/// Whether repository `top` takes a file's execute bit from its working tree (`core.fileMode`: git-config(1), "Tells Git
+/// if the executable bit of files in the working tree is to be honored", true unless set false, as `git init` sets it on
+/// a filesystem that keeps no execute bit), and, where it doesn't, the tracked files its index records executable
+/// (`100755`): such a repository keeps a tracked file's mode as its index holds it and records a new file as not
+/// executable, whatever the working tree's bits (`ce_mode_from_stat`, read-cache.h at git e1ec09b23). For a review made
+/// with no working tree (`super::review`).
+pub async fn file_modes(top: &Path) -> anyhow::Result<(bool, std::collections::HashSet<String>)> {
+    let mut c = git(top);
+    c.args(["config", "--bool", "--get", "core.fileMode"]);
+    if ask(c).await.is_none_or(|v| v != "false") {
+        return Ok((true, std::collections::HashSet::new()));
+    }
+    let mut c = git(top);
+    c.args(["ls-files", "-s", "-z"]);
+    let listed = run(c, GIT_TIMEOUT).await?;
+    Ok((false, listed.split('\0').filter_map(|record| record.split_once('\t')).filter(|(meta, _)| meta.starts_with("100755 ")).map(|(_, path)| path.to_owned()).collect()))
+}
+
 /// What repository `top`'s ignore rules beneath its folders' own `.gitignore` files are (gitignore(5)): its
 /// `info/exclude`, the user's excludes file (`core.excludesFile`, else git's own default,
 /// `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`), each one's bytes where it has one, and whether names match
