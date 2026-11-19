@@ -800,38 +800,6 @@ pub unsafe fn map_file_shared_at(file: &File, len: usize, at: NonNull<u8>) -> io
     Ok(())
 }
 
-/// Makes what was written to `file` durable, through write(2) or through `ptr..ptr+len`,
-/// a shared mapping of it ([`map_file_shared`]). Linux's fdatasync(2) writes back the pages a
-/// mapping dirtied, as it does any (Btrfs: 2.5 to 3.6 ms for 16 pages of a 10 GiB file).
-/// macOS's F_FULLFSYNC writes them back too, and flushes the drive's cache (3 to 6 ms at
-/// any size), where a plain fsync leaves them dirty (mincore(2)'s MINCORE_MODIFIED) and an
-/// msync(2) of a 10 GiB mapping took 12 to 32 ms (PM M286); a file system without
-/// F_FULLFSYNC gets msync, then fsync.
-///
-/// # Safety
-/// `ptr..ptr+len` is the mapping [`map_file_shared`] made of `file`, still mapped.
-pub unsafe fn sync_mapped(file: &File, ptr: NonNull<u8>, len: usize) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: fcntl(2) on an owned, open descriptor.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
-            return Ok(());
-        }
-        // SAFETY: forwarded caller contract.
-        unsafe { flush_shared(ptr, len) }?;
-        // SAFETY: fsync(2) on the same descriptor.
-        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-            return Ok(());
-        }
-        Err(io::Error::last_os_error())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (ptr, len);
-        file.sync_data()
-    }
-}
-
 /// Which host pages of `ptr..ptr+len`, a mapping of a file, the host's page cache holds,
 /// one for each page in order: mincore(2), whose byte for a page has its low bit set where
 /// the page is in core (Linux mm/mincore.c, a file mapping's pages as the page cache holds
@@ -862,21 +830,6 @@ pub unsafe fn in_core(ptr: *const u8, len: usize) -> io::Result<Vec<bool>> {
 /// pages written through a mapping and not yet written back counted as data (Linux
 /// 6.19).
 pub const MAPPED_HIDES_HOLES: bool = cfg!(target_os = "macos");
-
-/// Writes what was written through `ptr..ptr + len`, a mapping [`map_file_shared`] made,
-/// to its file, and waits until it has (msync(2) MS_SYNC): the file's blocks then hold it,
-/// which [`data_ranges`] says.
-///
-/// # Safety
-/// `ptr` and `len` are a mapping's from [`map_file_shared`], still mapped.
-pub unsafe fn flush_shared(ptr: NonNull<u8>, len: usize) -> io::Result<()> {
-    // SAFETY: forwarded caller contract.
-    if unsafe { libc::msync(ptr.as_ptr().cast(), len, libc::MS_SYNC) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
 
 /// The ranges of `file`'s first `len` bytes that hold data, `(offset, length)` in order:
 /// what lseek(2)'s SEEK_DATA and SEEK_HOLE say of it. A file system that keeps no holes
@@ -1021,6 +974,43 @@ impl FaultAroundOff {
         }
     }
 
+    /// Over this process's own program as it runs: each of its loadable segments that is
+    /// never written, its read-only data and its code ([`program_read_only`]), what its
+    /// start mapped of them let go of (madvise(2) MADV_DONTNEED, after which a private file
+    /// mapping refaults from its file). From here a fault maps the page it touches alone:
+    /// `should_fault_around` maps none around it, and `finish_fault`, which elsewhere maps a
+    /// page cache's large folio whole, maps one page of a range a userfaultfd holds
+    /// (mm/memory.c). So the program keeps resident the pages it runs, where a VM process's
+    /// boot kept whole 64 KiB blocks of its code, all but two of them (D36). None where the
+    /// host cannot hold it off, as [`over`](Self::over).
+    ///
+    /// # Safety
+    ///
+    /// No segment of the program without PF_W may have been written: a program linked
+    /// without text relocations, which LLD refuses unless told `-z notext`. The private
+    /// copy of a written page would be let go of with the rest.
+    pub unsafe fn over_this_program() -> Option<FaultAroundOff> {
+        let ranges = match program_read_only() {
+            Ok(ranges) => ranges,
+            Err(e) => {
+                crate::debug!("the host's fault-around stays on over this program: {e}");
+                return None;
+            }
+        };
+        let off = Self::over(&ranges)?;
+        for &(start, len) in &ranges {
+            // SAFETY: madvise(2) over this program's own segments, which nothing wrote (the
+            // caller's word): their pages refault from its file as they are touched.
+            if unsafe { libc::madvise(start.cast(), len, libc::MADV_DONTNEED) } != 0 {
+                crate::debug!(
+                    "what this program's start mapped stays mapped: madvise(2): {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        Some(off)
+    }
+
     fn try_over(ranges: &[(*mut u8, usize)]) -> io::Result<FaultAroundOff> {
         use std::os::fd::FromRawFd as _;
         // SAFETY: userfaultfd(2) takes its flags alone.
@@ -1056,6 +1046,54 @@ impl FaultAroundOff {
         }
         Ok(FaultAroundOff { _fd: fd })
     }
+}
+
+/// This process's program's loadable segments that are never written (PT_LOAD without
+/// PF_W), each page-aligned where it is loaded: the program's headers as the dynamic linker
+/// lists them (dl_iterate_phdr(3), whose first object is the program, a static one's from
+/// its auxiliary vector).
+#[cfg(target_os = "linux")]
+fn program_read_only() -> io::Result<Vec<(*mut u8, usize)>> {
+    unsafe extern "C" fn program(
+        info: *mut libc::dl_phdr_info,
+        _: libc::size_t,
+        data: *mut libc::c_void,
+    ) -> libc::c_int {
+        // SAFETY: the vector given below, alive through the walk; the linker's own entry.
+        let (spans, info) = unsafe { (&mut *data.cast::<Vec<(u64, u64)>>(), &*info) };
+        if !info.dlpi_phdr.is_null() {
+            // SAFETY: the program's headers, as many as the linker says.
+            let headers = unsafe { std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)) };
+            for header in headers
+                .iter()
+                .filter(|h| h.p_type == libc::PT_LOAD && (h.p_flags & libc::PF_W) == 0)
+            {
+                let start = info.dlpi_addr.wrapping_add(header.p_vaddr);
+                spans.push((start, start.wrapping_add(header.p_memsz)));
+            }
+        }
+        // The program alone, the walk's first object.
+        1
+    }
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    // SAFETY: the callback above, given the vector it fills.
+    unsafe { libc::dl_iterate_phdr(Some(program), std::ptr::from_mut(&mut spans).cast()) };
+    let page = u64::try_from(page_size()?).map_err(|_| io::Error::other("a page past u64"))?;
+    spans
+        .into_iter()
+        .map(|(start, end)| {
+            let first = start - start % page;
+            let past = end
+                .checked_next_multiple_of(page)
+                .ok_or_else(|| io::Error::other("a segment past the address space"))?;
+            let len = past
+                .checked_sub(first)
+                .and_then(|len| usize::try_from(len).ok())
+                .ok_or_else(|| io::Error::other("a segment past the address space"))?;
+            let at = usize::try_from(first).map_err(|_| io::Error::other("a segment past usize"))?;
+            Ok((std::ptr::with_exposed_provenance_mut::<u8>(at), len))
+        })
+        .collect()
 }
 
 /// userfaultfd(2)'s interface as include/uapi/linux/userfaultfd.h has it, for
@@ -1492,7 +1530,7 @@ pub fn write_in(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
     let mut file = unsafe { File::from_raw_fd(fd) };
     let written = file
         .write_all(bytes)
-        .and_then(|()| sync_durable(&file))
+        .and_then(|()| shards_durable::data(&file))
         .and_then(|()| {
             // SAFETY: renameat(2) with NUL-terminated names, relative to a directory we hold
             // open.
@@ -1513,15 +1551,11 @@ pub fn write_in(dir: &File, name: &str, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Makes the entries of the directory `dir` holds open durable: the renames into it
-/// survive a crash once this returns (review 1.13). Linux takes an fsync of the directory
-/// itself (fsync(2)); macOS takes [`sync_durable`]'s flush, whose `F_FULLFSYNC`
-/// directories accept (PM M46), and whose fsync a filesystem without it gets instead,
-/// where std's `sync_all` would fail.
+/// survive a crash once this returns (review 1.13), as `shards_durable::entries` does with
+/// the descriptor itself, which may write a directory's names here (windows_files.rs opens
+/// one that may write).
 pub fn sync_entries(dir: &File) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    return sync_durable(dir);
-    #[cfg(not(target_os = "macos"))]
-    return dir.sync_all();
+    shards_durable::entries(dir)
 }
 
 /// Makes `file` keep what is never written to it as holes: nothing to do, as ext4, btrfs,
@@ -1541,27 +1575,6 @@ pub struct Cached;
 /// file's (windows.rs must map it).
 pub fn keep_cached(_file: &File) -> io::Result<Cached> {
     Ok(Cached)
-}
-
-/// Makes completed writes durable on stable storage. On macOS `fsync` does not flush the
-/// drive's write cache; `F_FULLFSYNC` does (fsync(2), fcntl(2)). A filesystem without
-/// `F_FULLFSYNC` gets `fsync` instead, as SQLite falls back (`full_fsync`, os_unix.c):
-/// std's `sync_data` would ask for `F_FULLFSYNC` again.
-pub fn sync_durable(file: &File) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: fcntl(2) on an owned, open descriptor.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
-            return Ok(());
-        }
-        // SAFETY: fsync(2) on the same descriptor.
-        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-            return Ok(());
-        }
-        Err(io::Error::last_os_error())
-    }
-    #[cfg(not(target_os = "macos"))]
-    file.sync_data()
 }
 
 /// Makes `file` sparse, so that what it holds past what is written takes none of its disk:
@@ -3599,7 +3612,7 @@ mod holes_tests {
             .unwrap();
         file.set_len(len as u64).unwrap();
         crate::platform::write_all_at(&file, &[1; 16 << 10], 32 << 20).unwrap();
-        file.sync_all().unwrap();
+        shards_durable::all(&file).unwrap();
         let alone = data_ranges(&file, len as u64).unwrap();
         assert_eq!(alone, [(32 << 20, 16 << 10)]);
         let mapped = map_file_shared(&file, len).unwrap();
@@ -3630,11 +3643,11 @@ mod deallocate_tests {
             .write(true)
             .open(&path)
             .unwrap();
-        file.sync_all().unwrap();
+        shards_durable::all(&file).unwrap();
         let before = file.metadata().unwrap().blocks() * 512;
         deallocate(&file, 2 * mib, 4 * mib).unwrap();
         deallocate(&file, 0, 0).unwrap();
-        file.sync_all().unwrap();
+        shards_durable::all(&file).unwrap();
         let meta = file.metadata().unwrap();
         assert_eq!(meta.len(), 8 * mib);
         let after = meta.blocks() * 512;

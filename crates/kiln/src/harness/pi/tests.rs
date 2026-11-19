@@ -405,3 +405,23 @@ fn it_is_written_out_and_read_back_whole() -> anyhow::Result<()> {
     assert_eq!(back.retained_input_ids().iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["m1"]);
     Ok(())
 }
+
+/// Step 17 part 7: an isolated Pi on a Windows machine names its files at its microVM's `/mnt/c/…`: its
+/// calls show them by their place in its project.
+#[test]
+fn s17_an_isolated_pis_calls_show_its_files_in_its_folder() {
+    let spec = Spec { kind: "pi".into(), cwd: Some(r"C:\src\app".into()), isolation: Some(crate::harness::session::Isolation::microvm()), ..Spec::default() };
+    let mut core = Core::new();
+    core.state.cwd = r"C:\src\app".into();
+    let mut a = Pi::new(&spec);
+    a.start(&mut core);
+    feed(&mut a, &mut core, &[json!({"type": "tool_execution_start", "toolCallId": "c1", "toolName": "read", "args": {"path": "/mnt/c/src/app/src/a.rs"}})]);
+    let titles: Vec<String> = core
+        .events()
+        .filter_map(|e| match &e.body {
+            Body::Tool(t) if t.tool == ToolKind::Read => Some(t.title.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(titles, ["src/a.rs"]);
+}

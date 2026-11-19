@@ -36,7 +36,6 @@ pub mod control;
 pub mod demand;
 pub mod host;
 pub mod image;
-mod judge;
 mod native;
 pub mod networks;
 pub mod physical;
@@ -63,12 +62,16 @@ pub use client::{
     prepare_boot, prepare_native_boot, recorded_console_bytes, recorded_console_bytes_at, vm_process_file,
 };
 pub use host::{CheckRefusal, HostCheck, Unusable, host_check};
-pub use judge::{Found, Judge, Rate, Rated, Record, Seen, Span, Stall};
+#[cfg(windows)]
+pub use native::app_container_records;
 pub use native::{
     ImageIdentity, NativeBoot, NativeImages, NativeStartup, release_app_containers, verify_native_image,
 };
 pub use physical::{GpuName, GpuProbe, GpuProbeError, PhysicalGpu, PhysicalGpuError, ResolvedGpu};
-pub use progress::{Awaited, Bound, Follow, Followed, Unfollowed, Watch, runnable_threads};
+pub use progress::{Awaited, Bound, Follow, Followed, Listing, Threads, Unfollowed, Watch, starved};
+pub use shards_judge::{Found, Judge, LOOKS_TO_REFUSE, Rate, Rated, Record, SPREAD, Seen, Span, Stall, Work};
+#[cfg(windows)]
+pub use shards_judge::{ThreadsHeld, threads_held};
 
 /// A guest to boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +412,9 @@ pub enum ProcessOperation {
     /// macOS: sysctl(3) of `kern.clockrate`, the clock tick in whose steps a VM process's
     /// CPU times show.
     ClockRate,
+    /// macOS: proc_pidinfo(3) `PROC_PIDT_SHORTBSDINFO` of a process whose exit has begun,
+    /// which tells an exit its kernel still does from one done, a zombie.
+    ProcBsdInfo,
     /// Windows: CreateToolhelp32Snapshot, a snapshot of the system's processes.
     Snapshot,
     /// Windows: Process32FirstW or Process32NextW, a snapshot's processes.
@@ -735,17 +741,18 @@ impl std::fmt::Display for Refusal {
             Refusal::Stalled(stall) if let (Some(rate), Some(least)) = (stall.rate(), stall.least()) => {
                 write!(
                     f,
-                    "the guest's VM process ran too slowly to be answering: {:?} into the wait, {:?} \
-                 of CPU in the {:?} it was seen to run, below the least a VM process ran here and \
-                 still answered ({:?} in {:?}) and more than any answer took ({:?}), past the \
-                 slowest answer seen ({:?})",
+                    "the guest's VM process ran too slowly to be answering: {:?} into the wait, {} \
+                 in the {:?} it was seen to run, below the least a VM process ran here and still \
+                 answered ({} in {:?}) and more than any answer took ({}), past the slowest answer \
+                 seen ({:?}){}",
                     stall.waited(),
-                    rate.cpu,
+                    rate.work,
                     rate.over,
-                    least.cpu,
+                    least.work,
                     least.over,
                     stall.most().unwrap_or_default(),
-                    stall.slowest()
+                    stall.slowest(),
+                    stall.account()
                 )
             }
             Refusal::Stalled(stall) => write!(
@@ -758,11 +765,12 @@ impl std::fmt::Display for Refusal {
                 stall.least().map_or_else(
                     || "no answer of its kind had its CPU read".to_string(),
                     |least| format!(
-                        "the least a VM process ran here and still answered was {:?} in {:?}",
-                        least.cpu, least.over
+                        "the least a VM process ran here and still answered was {} in {:?}",
+                        least.work, least.over
                     )
                 )
-            ),
+            )
+            .and_then(|()| f.write_str(&stall.account())),
             Refusal::Rate(why) => write!(f, "the guest's rate: {why}"),
             Refusal::HostUse(broken) => write!(f, "the guest's use: its VM process answered {broken}"),
             Refusal::Release(why) => write!(f, "the VM's AppContainers: {why}"),
@@ -1017,11 +1025,9 @@ pub fn backend() -> Result<Backend, Refusal> {
     backend_of(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// The least memory a guest of `arch` boots in, in MiB: shards-vmm's `MIN_MEMORY_MIB`
-/// (`crates/vmm/src/vm/aarch64.rs:28`, `crates/vmm/src/vm/x86_64.rs:28`).
-pub fn min_memory_mib(arch: &str) -> u64 {
-    if arch == "x86_64" { 128 } else { 64 }
-}
+/// The least memory a guest of `arch` boots in, in MiB: shards-abi's, which shards-vmm
+/// refuses less than; one source, which this crate takes without linking the VMM (D30).
+pub use shards_abi::bounds::min_memory_mib;
 
 /// Guest memory's unit, in MiB: shards-vmm boots an even number of MiB alone (`ram_bytes`
 /// in `vm/aarch64.rs`, `ram_ranges` in `vm/x86_64.rs`). On arm64 that keeps the DTB at

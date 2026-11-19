@@ -397,7 +397,9 @@ pub fn send_judged(
 /// in poll(2) until the time `judge` names, where it is asked again. `None` for the peer's
 /// end between messages.
 pub fn recv_judged(sock: &UnixStream, judge: &mut Judge<'_>) -> io::Result<Option<Message>> {
-    let mut due = judge()?;
+    // Its judge asked only once a look finds the message not whole: a due already past, so
+    // that a read first, then a poll with no wait, looks before it asks ([`Judge`]).
+    let mut due = Some(Instant::now());
     let mut incoming = Incoming::default();
     loop {
         match incoming.take(sock)? {
@@ -564,10 +566,9 @@ fn send_with(
         }
     }
     let total = HEADER + payload.len();
-    let mut due = match judge.as_deref_mut() {
-        Some(judge) => judge()?,
-        None => None,
-    };
+    // A judged send's judge asked only once a look finds no room: a due already past, so that
+    // its write first, or (macOS) a poll with no wait, looks before it asks ([`Judge`]).
+    let mut due = judge.is_some().then(Instant::now);
     let flags = if judge.is_some() { libc::MSG_DONTWAIT } else { 0 };
     #[cfg(target_os = "macos")]
     if let Some(judge) = judge.as_deref_mut() {
@@ -1359,22 +1360,43 @@ pub(crate) fn alive(pid: u32) -> bool {
     exists && !exited(pid)
 }
 
-/// Whether process `pid` has exited, unreaped: on Linux its `/proc/<pid>/stat` state, field
-/// 3, after the last ')', `Z` (zombie) or `X` (dead, proc(5)). One whose state cannot be read
-/// (gone meanwhile, or hidden) is not known to have.
+/// Whether process `pid` has exited, unreaped: on Linux once its whole thread group has
+/// ([`ended_in`] of its `/proc/<pid>/stat`). One whose state cannot be read (gone meanwhile,
+/// or hidden) is not known to have.
 #[cfg(target_os = "linux")]
 fn exited(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        stat.rfind(')')
-            .and_then(|i| stat.get(i.saturating_add(1)..))
-            .and_then(|fields| fields.split_ascii_whitespace().next())
-            .is_some_and(|state| matches!(state, "Z" | "X"))
-    })
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| ended_in(&stat))
+}
+
+/// Whether a `/proc/<pid>/stat` line says its process has exited: its state, field 3, after
+/// the last ')', `Z` (zombie) or `X` (dead), and no thread of it left but that one, its thread
+/// count, field 20, at most 1 (proc(5); fs/proc/array.c `do_task_stat`). A thread-group leader
+/// that exits before its other threads stays a zombie while they run, hold its files and do
+/// its work, until the last of them has gone (kernel/exit.c: "we don't reap group leaders
+/// with subthreads"; fs/file.c `put_files_struct`), and the count holds it until then
+/// (kernel/exit.c `__exit_signal`): it has not exited (ROOT's ruling of 2026-11-17, D185).
+/// A line whose count cannot be read says no exit.
+#[cfg(target_os = "linux")]
+fn ended_in(stat: &str) -> bool {
+    let mut fields = stat
+        .rfind(')')
+        .and_then(|i| stat.get(i.saturating_add(1)..))
+        .unwrap_or_default()
+        .split_ascii_whitespace();
+    let ended = fields.next().is_some_and(|state| matches!(state, "Z" | "X"));
+    // Field 20, the 17th after the state.
+    ended
+        && fields
+            .nth(16)
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| n <= 1)
 }
 
 /// Whether process `pid` has exited, unreaped: on macOS `proc_pid_rusage`'s
-/// `ri_proc_exit_abstime`, set as it exits (XNU's `proc_exit`), as crates/api's judge reads
-/// a process ending. One whose rusage cannot be read (another user's) is not known to have.
+/// `ri_proc_exit_abstime`, set as its exit begins (XNU's `proc_prepareexit`, which a thread
+/// that ends alone never calls: a process whose main thread has ended lives while its other
+/// threads run), as crates/api's judge reads a process ending. One whose rusage cannot be
+/// read (another user's) is not known to have.
 #[cfg(not(target_os = "linux"))]
 fn exited(pid: u32) -> bool {
     let Ok(pid) = libc::c_int::try_from(pid) else {
@@ -2253,27 +2275,6 @@ pub(crate) fn spawn_here(
     }
 }
 
-/// Makes completed writes to `file` durable on stable storage, as the VMM's
-/// `platform::sync_durable` does for the processes that link it (review 1.13): on macOS
-/// `F_FULLFSYNC`, which flushes the drive's cache where `fsync` does not (fsync(2)), and
-/// `fsync` where the filesystem has no `F_FULLFSYNC`, as SQLite falls back and as Go's
-/// `File.Sync` does on an SMB mount (go.dev/issue/64215), where std's `sync_all` fails.
-pub fn sync_durable(file: &std::fs::File) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: fcntl(2) on a descriptor the caller holds open.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
-            return Ok(());
-        }
-        // SAFETY: fsync(2) on the same descriptor.
-        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-            return Ok(());
-        }
-        Err(io::Error::last_os_error())
-    }
-    #[cfg(not(target_os = "macos"))]
-    file.sync_all()
-}
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 pub(crate) mod tests {
@@ -2297,6 +2298,34 @@ pub(crate) mod tests {
                 ));
             }
             Ok(std::time::Instant::now().checked_add(every))
+        }
+    }
+
+    /// A `/proc/<pid>/stat` line says its process has exited once its state is a zombie's or a
+    /// dead process's and no thread of it is left but that one (ROOT's ruling of 2026-11-17,
+    /// D185): a zombie leader with threads still running, as a SIGKILLed daemon's may be, has
+    /// not. Red before, where its state alone said it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_leader_with_threads_left_has_not_exited() {
+        // `PID (COMM) STATE`, fields 4 to 19 each 0, its thread count (field 20), then fields
+        // 21 and 22; its command holds a ')' of its own.
+        let line =
+            |state: &str, threads: &str| format!("42 (own ) x) {state}{} {threads} 0 7\n", " 0".repeat(16));
+        for (state, threads, exited) in [
+            ("Z", "3", false),
+            ("Z", "2", false),
+            ("Z", "1", true),
+            ("X", "0", true),
+            ("S", "1", false),
+            ("R", "5", false),
+            ("Z", "x", false),
+        ] {
+            assert_eq!(
+                super::ended_in(&line(state, threads)),
+                exited,
+                "{state} with {threads} threads"
+            );
         }
     }
 
@@ -2334,9 +2363,10 @@ pub(crate) mod tests {
     /// Do send, judged, to a socket with room, and receive, judged, from one with a message
     /// waiting, each with a judge whose first due has passed as it answers (its first reading
     /// of its party outlasting W*) and that refuses at its next ask. Expect: both go, the judge
-    /// asked once. Red before: a wait whose due had passed asked its judge without looking at
-    /// the socket, and the judge refused a party that had nothing to do (batch 26, a daemon's
-    /// stop SIGTERM refused `Stalled` with its VM's socket empty).
+    /// never asked, as each wait looks before it asks and finds its socket ready (D215, amended
+    /// 2026-11-17; asked once before that). Red before the batch-26 cure: a wait whose due had
+    /// passed asked its judge without looking at the socket, and the judge refused a party that
+    /// had nothing to do (a daemon's stop SIGTERM refused `Stalled` with its VM's socket empty).
     #[test]
     fn a_judged_wait_looks_before_its_judge_is_asked_again() {
         let past = || {
@@ -2384,20 +2414,6 @@ pub(crate) mod tests {
         drop(theirs);
         let mut judge = judge_every(std::time::Duration::from_millis(10), &asked, None);
         assert!(super::recv_judged(&ours, &mut judge).unwrap().is_none());
-    }
-
-    /// What a filesystem without F_FULLFSYNC holds is made durable with fsync instead:
-    /// /dev/null refuses F_FULLFSYNC and takes fsync, as an SMB share does, where std's
-    /// sync_all fails (review 1.13).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_file_without_full_fsync_is_synced_still() {
-        let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
-        assert!(null.sync_all().is_err(), "std's sync_all took F_FULLFSYNC here");
-        sync_durable(&null).unwrap();
-        let held = shards_testdir::TempDir::new("sync").unwrap();
-        let dir = std::fs::File::open(&held).unwrap();
-        sync_durable(&dir).unwrap();
     }
 
     use super::*;

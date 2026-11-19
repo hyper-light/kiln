@@ -2283,25 +2283,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if !o.ephemeral && !o.outpost {
         crate::sense::run::install(uplink.clone());
     }
-    // Its facts, probed on each connection, when the server asks, and again as what they're found
-    // from changes (docs/ci.md W13-R01; goal 9: they were probed again every 10 minutes): a folder
-    // they find tools in, a container engine starting or stopping, a run failing for a tool not
-    // found (`crate::runner::probe::Asks`). What comes while a probe runs gives one after it.
-    let probing = Arc::new(crate::runner::probe::Probing::default());
-    if !o.ephemeral && !o.outpost {
-        let (up, dir, declared, busy, stop) = (uplink.clone(), o.work_dir.clone(), o.declared.clone(), Arc::clone(&probing), shutdown.clone());
-        crate::rt::spawn(async move {
-            use futures::FutureExt as _;
-            let asks = crate::runner::probe::Asks::new();
-            loop {
-                futures::select_biased! {
-                    () = stop.cancelled().fuse() => return,
-                    looked = asks.next().fuse() => probe_facts_as(&up, &dir, &declared, &busy, looked),
-                    () = crate::runner::probe::gpu_change().fuse() => start_facts_probe(&up, &dir, &declared, &busy, false, true),
-                }
-            }
-        });
-    }
     let (done_tx, done_rx) = crate::memory::queue::unbounded::<JobResult>(&crate::memory::owners::CHANNELS);
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
     let mut buffered = 0usize;
@@ -2569,6 +2550,31 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's microVMs couldn't be held: it holds no isolated agent"),
         }
+    }
+    // Its facts, probed on each connection, when the server asks, and again as what they're found
+    // from changes (docs/ci.md W13-R01; goal 9: they were probed again every 10 minutes): a folder
+    // they find tools in, a container engine starting or stopping, a run failing for a tool not
+    // found (`crate::runner::probe::Asks`). What comes while a probe runs gives one after it.
+    // Asked from here on, once its microVMs are held or it's known it holds none (kiln plan
+    // 01a1cd8e862e7169a074db3d5fa33f3d step 17; kiln goal 3cd82843): a probe while they're being held
+    // would say this kiln carries no microVM runtime, and the hold makes one, its check of the host
+    // (Shards' `api-check`) opening `/dev/kvm` to write, which these asks hear; those facts, sent
+    // before the connection, reached the server ahead of every later probe's (ROOT's pre-runs of
+    // round K on adacachy, 2026-11-18: rest, mcp, narrowed and engine runners said none).
+    let probing = Arc::new(crate::runner::probe::Probing::default());
+    if !o.ephemeral && !o.outpost {
+        let (up, dir, declared, busy, stop) = (uplink.clone(), o.work_dir.clone(), o.declared.clone(), Arc::clone(&probing), shutdown.clone());
+        crate::rt::spawn(async move {
+            use futures::FutureExt as _;
+            let asks = crate::runner::probe::Asks::new();
+            loop {
+                futures::select_biased! {
+                    () = stop.cancelled().fuse() => return,
+                    looked = asks.next().fuse() => probe_facts_as(&up, &dir, &declared, &busy, looked),
+                    () = crate::runner::probe::gpu_change().fuse() => start_facts_probe(&up, &dir, &declared, &busy, false, true),
+                }
+            }
+        });
     }
     // Bind the local Reach endpoint to the actual Host before restoring adapters that
     // can immediately ask it to run work (attention plan 01a199e1b177752e84dad5dc990e6a15).

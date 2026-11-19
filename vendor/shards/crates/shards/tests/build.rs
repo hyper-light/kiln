@@ -413,8 +413,9 @@ fn a_builders_steps_see_the_memory_it_may_have() {
         (built, shown)
     };
     let stat = r#"["/bin/testguest", "stat", "/proc/sys/vm/pluggable_kbytes", "/proc/meminfo"]"#;
-    // The home's first builder boots cold, with all it may have, and teaches the home what
-    // its guest needs to boot.
+    // The home's first builder boots cold, with all it may have (on Windows with its
+    // architecture's least, plugged as it needs: D133), and teaches the home what its guest
+    // needs to boot.
     let (cold, shown) = build("build-report-cold-ctx", stat);
     if cold.stderr.contains("/proc/sys/vm/pluggable_kbytes missing") {
         println!("SKIP: this guest kernel reports none of the memory it may plug (D149)");
@@ -612,7 +613,9 @@ fn a_builders_ceiling_comes_from_its_host_and_its_homes_builds() {
 /// least a guest's booted with all of it, and within a tenth of them; and a step that takes
 /// more than all of it fails, as one past the memory of a builder booted with all of it
 /// does. A home's first builder boots with all it may have and plugs nothing
-/// (`a_builders_memory_in_a_new_home_is_all_it_may_have`).
+/// (`a_builders_memory_in_a_new_home_is_all_it_may_have`), except on Windows, where it boots
+/// with its architecture's least and plugs the rest (D133, build_windows.rs
+/// `a_builder_in_a_new_home_commits_what_it_boots_with_and_is_plugged`).
 #[test]
 fn a_builders_memory_is_plugged_as_its_build_needs_it() {
     if cannot_run_vms() {
@@ -748,7 +751,7 @@ fn a_builders_memory_is_plugged_as_its_build_needs_it() {
 /// vCPUs over its 1 GiB of packages did, and its grower never plugged more (PM M392). In a
 /// home whose first build has ended, whose builder boots with what its guest was learned
 /// to need, less than the build's 4 GiB (memory-15): a home's first builder boots with all
-/// it may have, and plugs nothing.
+/// it may have, and plugs nothing, except on Windows (D133).
 #[test]
 fn a_builders_memory_is_plugged_as_fast_as_its_jobs_take_it() {
     if cannot_run_vms() {
@@ -805,7 +808,9 @@ fn a_builders_memory_is_plugged_as_fast_as_its_jobs_take_it() {
 /// first, whose builder booted cold and taught the home its guest's boot (memory-15), into
 /// its builder's page cache, then waits; the build is told once that its host is short of
 /// memory (SHARDS_BUILD_PRESSURE's FIFO, as no unprivileged process may raise macOS's
-/// system pressure), and its builder gives back most of the file, its VM process then
+/// system pressure), and its builder gives back most of what its step held of the file as
+/// it read it (`common::held_as_read`: under its hold a builder's kernel reclaims a read's own
+/// pages as the read outruns its grower), its VM process then
 /// holding that much less on its host, the step going on to its end; and the build's
 /// layers are the same as the same build's not told, byte for byte. Each build runs its
 /// step again for a build argument of its own, its cache kept, as `--no-cache` would start
@@ -906,9 +911,11 @@ fn a_builder_gives_back_what_it_holds_cold_at_its_builds_word() {
     let shown = lines.join("\n");
     assert!(status.success(), "{shown}");
     let gave = gave.unwrap_or_else(|| panic!("nothing given back said:\n{shown}"));
+    // Most of what its step held of the file as it read it (`common::held_as_read`).
+    let held = common::held_as_read(&shown);
     assert!(
-        gave >= MIB / 2,
-        "gave back {gave} MiB of the {MIB} MiB file:\n{shown}"
+        gave >= held / 2,
+        "gave back {gave} MiB of the {held} MiB its step held of the {MIB} MiB file:\n{shown}"
     );
     assert!(
         shown.contains("dropped "),
@@ -942,7 +949,11 @@ fn a_builder_gives_back_what_it_holds_cold_at_its_builds_word() {
 /// pages (D188), its VM process then holding that much less, as
 /// `a_builder_gives_back_what_it_holds_cold_at_its_builds_word`'s warm builder does; and as
 /// it ends its home learns what its guest needs to boot, less than its ceiling, which the
-/// home's next builder boots with, having the rest to plug.
+/// home's next builder boots with, having the rest to plug. Unix's cold start: Windows
+/// charges guest RAM as it is reserved, all of it committed as a VM boots, so there a new
+/// home's builder boots with its architecture's least and plugs the rest (D133, CI
+/// 44245219858; build_windows.rs
+/// `a_builder_in_a_new_home_commits_what_it_boots_with_and_is_plugged`).
 #[cfg(unix)]
 #[test]
 fn a_builders_memory_in_a_new_home_is_all_it_may_have() {
@@ -1097,11 +1108,12 @@ fn a_builders_memory_in_a_new_home_is_all_it_may_have() {
 }
 
 /// A home's first build that runs out of memory is recorded short (D133, D148, memory-15):
-/// its builder, booted cold with all it may have and nothing to plug, counts what its build
-/// held in the build's cgroup as a warm one does, and the processes its kernel ended; the
-/// home records the build's need and that it ended short, and its next builder may have all
-/// its host's memory, as a run with no limit may: `MemTotal` of the host's less no more than
-/// what the home learned its guest needs to boot, and a block.
+/// its builder, booted cold with all it may have and nothing to plug (on Windows with its
+/// architecture's least, plugged to all of it), counts what its build held in the build's
+/// cgroup as a warm one does, and the processes its kernel ended; the home records the
+/// build's need and that it ended short, and its next builder may have all its host's
+/// memory, as a run with no limit may: `MemTotal` of the host's less no more than what the
+/// home learned its guest needs to boot, and a block.
 #[test]
 fn a_new_homes_build_that_runs_out_is_recorded_short() {
     if cannot_run_vms() {
@@ -2939,17 +2951,8 @@ fn an_images_healthcheck_probes_its_microvm() {
         "slow",
         "--interval=200ms --timeout=100ms --retries=1 CMD [\"/bin/testguest\", \"sleep\"]",
     );
-    for (name, image, options) in [
-        ("good", "good:1", &[][..]),
-        ("bad", "bad:1", &[][..]),
-        ("slow", "slow:1", &[][..]),
-        // The run's retries over the image's: unhealthy only after 50 failures.
-        ("patient", "bad:1", &["--health-retries", "50"][..]),
-    ] {
-        let mut args = vec!["-d", "--name", name];
-        args.extend_from_slice(options);
-        args.push(image);
-        let ran = run_shards_env(&["run"], &args, &env);
+    for (name, image) in [("good", "good:1"), ("bad", "bad:1"), ("slow", "slow:1")] {
+        let ran = run_shards_env(&["run"], &["-d", "--name", name, image], &env);
         assert_eq!(ran.status, Some(0), "{}", ran.stderr);
     }
     let status = |name: &str| {
@@ -2968,7 +2971,6 @@ fn an_images_healthcheck_probes_its_microvm() {
         ("good", "(healthy)"),
         ("bad", "(unhealthy)"),
         ("slow", "(unhealthy)"),
-        ("patient", "(health: starting)"),
     ];
     loop {
         let now: Vec<(String, String)> = wanted.iter().map(|(n, _)| (n.to_string(), status(n))).collect();
@@ -2983,9 +2985,6 @@ fn an_images_healthcheck_probes_its_microvm() {
         std::thread::sleep(patience.next_look());
     }
     patience.done();
-    // The run's retries over the image's: `patient` is still starting once its failing
-    // streak is past five (below), where the image's two would have made it unhealthy. An
-    // order, its probes counted, where a second's sleep claimed nothing came within it.
     // `inspect` shows each record as dockerd keeps it (moby daemon/health.go): its status,
     // its failing streak, and its last five probes, each with its times, exit code and
     // output, a probe past its timeout -1 and dockerd's words (D26).
@@ -2994,34 +2993,8 @@ fn an_images_healthcheck_probes_its_microvm() {
         assert_eq!(shown.status, Some(0), "{}", shown.stderr);
         serde_json::from_str(&shown.stdout).unwrap()
     };
-    // The good one last: once each failing one has failed six times, it has been probed
-    // more than five times too.
-    for (name, status, code, output) in [
-        ("bad", "unhealthy", 1, ""),
-        // What the probe said before its timeout follows dockerd's words (D26).
-        (
-            "slow",
-            "unhealthy",
-            -1,
-            "Health check exceeded timeout (100ms): ready\n",
-        ),
-        ("patient", "starting", 1, ""),
-        ("good", "healthy", 0, ""),
-    ] {
-        // More than five probes run (a failing streak counts them); five are kept.
-        let mut patience = Patience::of(&home);
-        let h = loop {
-            let h = health(name);
-            let probed = h["Log"].as_array().is_some_and(|l| l.len() >= 5)
-                && (code == 0 || h["FailingStreak"].as_u64().is_some_and(|n| n > 5));
-            if probed {
-                patience.done();
-                break h;
-            }
-            assert!(patience.holds(), "{name}: {h}");
-            std::thread::sleep(patience.next_look());
-        };
-        assert_eq!(h["Status"], status, "{name}: {h}");
+    // Five probes kept, each as its microVM's probe ended: its exit code, its output, its times.
+    let kept = |name: &str, h: &serde_json::Value, code: i64, output: &str| {
         let log = h["Log"].as_array().unwrap();
         assert_eq!(log.len(), 5, "{name}: {h}");
         // A probe past its timeout says what it printed by then: one the host started late,
@@ -3043,10 +3016,79 @@ fn an_images_healthcheck_probes_its_microvm() {
                 assert!(t.len() >= 20 && t.as_bytes()[10] == b'T', "{name}: {h}");
             }
         }
+    };
+    // The good one last: once each failing one has failed six times, it has been probed
+    // more than five times too.
+    for (name, status, code, output) in [
+        ("bad", "unhealthy", 1, ""),
+        // What the probe said before its timeout follows dockerd's words (D26).
+        (
+            "slow",
+            "unhealthy",
+            -1,
+            "Health check exceeded timeout (100ms): ready\n",
+        ),
+        ("good", "healthy", 0, ""),
+    ] {
+        // More than five probes run (a failing streak counts them); five are kept.
+        let mut patience = Patience::of(&home);
+        let h = loop {
+            let h = health(name);
+            let probed = h["Log"].as_array().is_some_and(|l| l.len() >= 5)
+                && (code == 0 || h["FailingStreak"].as_u64().is_some_and(|n| n > 5));
+            if probed {
+                patience.done();
+                break h;
+            }
+            assert!(patience.holds(), "{name}: {h}");
+            std::thread::sleep(patience.next_look());
+        };
+        assert_eq!(h["Status"], status, "{name}: {h}");
+        kept(name, &h, code, output);
         if code == 0 {
             assert_eq!(h["FailingStreak"], 0, "{name}: {h}");
         }
     }
+    // The run's retries over the image's: `patient`, of `bad`'s image (2 retries) run with 50,
+    // is still starting at any failing streak from 2 to 49 (moby daemon/health.go
+    // `handleProbeResult`: unhealthy once the streak reaches the retries), where the image's 2
+    // would have made it unhealthy. Run last and watched at once: its 50 failures at its 200 ms
+    // interval take about ten seconds, which the checks above once spent before a look at it,
+    // so that it was looked at first at a streak of 61, unhealthy as dockerd's rule says
+    // (jupiter, after its party followed its microVM's work, 2026-11-18).
+    const RETRIES: u64 = 50;
+    let retries = RETRIES.to_string();
+    let ran = run_shards_env(
+        &["run"],
+        &["-d", "--name", "patient", "--health-retries", &retries, "bad:1"],
+        &env,
+    );
+    assert_eq!(ran.status, Some(0), "{}", ran.stderr);
+    let mut patience = Patience::of(&home);
+    let mut starting_at = None;
+    let h = loop {
+        let h = health("patient");
+        let streak = h["FailingStreak"].as_u64().unwrap_or(0);
+        if (2..RETRIES).contains(&streak) {
+            assert_eq!(h["Status"], "starting", "patient at a streak of {streak}: {h}");
+            starting_at = Some(streak);
+        }
+        let probed = h["Log"].as_array().is_some_and(|l| l.len() >= 5) && streak > 5;
+        if probed || streak >= RETRIES {
+            patience.done();
+            break h;
+        }
+        assert!(patience.holds(), "patient: {h}");
+        std::thread::sleep(patience.next_look());
+    };
+    assert!(
+        starting_at.is_some(),
+        "patient: its host ran {} probes, its run's {RETRIES} retries reached, before a look of \
+         the test's found its streak past its image's 2: its run's retries over its image's are \
+         unproven: {h}",
+        h["FailingStreak"]
+    );
+    kept("patient", &h, 1, "");
     for name in ["good", "bad", "slow", "patient"] {
         let _ = run_shards_env(&["rm"], &["-f", name], &env);
     }
@@ -6412,6 +6454,66 @@ fn steps_are_kept_by_what_they_read() {
     }
 }
 
+/// A builder never boots under the least memory a guest of its architecture boots in, whatever
+/// its home learned its guest needs (D133, memory-15): a home whose record says its builder's
+/// guest needs less boots its next builder with that least, and its step runs. On x86_64 a
+/// small build's guest was learned to need less than the 128 MiB its VM process refuses less
+/// than, so that the builder ended as it started (CI 44227612442, x86_64-pc-windows-msvc,
+/// `steps_are_kept_by_what_they_read`). On every architecture whose host has a hypervisor:
+/// the least is the guest's own, one kernel and init each architecture, so that a builder
+/// booted at arm64's 64 MiB and running its step is the evidence that a cold builder may
+/// boot with the least there too, as one does where guest RAM is charged as it is reserved
+/// (D133, #36).
+#[test]
+fn a_builder_learned_to_need_less_than_its_floor_boots_with_the_floor() {
+    if cannot_run_vms() {
+        return;
+    }
+    let (image, _) = served();
+    let home = TempDir::new("floor-home");
+    let env = [
+        ("SHARDS_HOME", home.as_os_str()),
+        ("SHARDS_KERNEL", kernel().as_os_str()),
+        ("SHARDS_INIT", guest_init().as_os_str()),
+        ("SHARDS_BUILD_MEMORY", "1024".as_ref()),
+    ];
+    let ctx = context(
+        "floor-ctx",
+        &format!("FROM {image}\nUSER root\nRUN [\"/bin/testguest\", \"fs\", \"write:/one=1\"]\n"),
+    );
+    let build = || {
+        run_shards_env(
+            &["build"],
+            &["--progress=plain", "--no-cache", ctx.to_str().unwrap()],
+            &env,
+        )
+    };
+    let first = build();
+    assert_eq!(first.status, Some(0), "{}", first.stderr);
+    // What the first builder's guest said it needs to boot, its record's line rewritten to
+    // two MiB under this architecture's least, as a home that learned it so would hold it.
+    let record = home.join("builder-memory");
+    let text = std::fs::read_to_string(&record).unwrap_or_else(|e| panic!("{e}: {}", first.stderr));
+    let under = (shards_abi::bounds::min_memory_mib(std::env::consts::ARCH) - 2) << 20;
+    let mut seeded = 0;
+    let rewritten: String = text
+        .lines()
+        .map(
+            |line| match line.strip_prefix("boot ").and_then(|rest| rest.rsplit_once(' ')) {
+                Some((identity, _)) => {
+                    seeded += 1;
+                    format!("boot {identity} {under}\n")
+                }
+                None => format!("{line}\n"),
+            },
+        )
+        .collect();
+    assert_eq!(seeded, 1, "its guest's need recorded once:\n{text}");
+    std::fs::write(&record, rewritten).unwrap();
+    let next = build();
+    assert_eq!(next.status, Some(0), "{}", next.stderr);
+}
+
 /// `RUN --mount=type=cache` kept across builds (D114), as BuildKit keeps cache mounts:
 /// what a step writes is there for the next build's, a failing step's writes too; one id
 /// is one cache wherever it is mounted, twice in one step too; its root keeps the owner
@@ -6901,28 +7003,57 @@ fn run_caches_are_shared_among_concurrent_builds() {
         );
         assert_eq!(seeded.status, Some(0), "{}", seeded.stderr);
         // A holds the record for half a minute; B builds once it does.
-        let (a, b) = std::thread::scope(|s| {
-            let a = s.spawn(|| {
-                build(
-                    "a",
-                    &format!("\"fs\", \"write:/c/a-{sharing}=written-by-a\", \"sleep:30000\""),
-                )
-            });
-            let mut patience = Patience::of(&home);
-            while records() != [true] {
-                assert!(patience.holds(), "no build took the {sharing} cache");
-                std::thread::sleep(patience.next_look());
+        let a_ctx = context(
+            &format!("cache-sharing-{sharing}-a"),
+            &format!(
+                "FROM {image}\nUSER root\nRUN --mount=type=cache,target=/c,id=s-{sharing},sharing={sharing} [\"/bin/testguest\", \"fs\", \"write:/c/a-{sharing}=written-by-a\", \"sleep:30000\"]\n"
+            ),
+        );
+        let a_said = home.join(format!("a-{sharing}.stderr"));
+        let mut a = common::command()
+            .args(["build", "--progress=plain", a_ctx.to_str().unwrap()])
+            .envs(env.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&a_said).unwrap())
+            .spawn()
+            .unwrap();
+        // Waited for while A's client goes on, as well as its daemon and their microVMs (D215:
+        // a wait whose answer is another process's run follows that process). Its client reads
+        // its context and asks its daemon before any of them holds the cache, and a wait on the
+        // daemon alone took that time for its party's stillness (CI 44245219858, windows-2025:
+        // "no build took the shared cache", as case 4's `build_cache_usage_lists_every_record`
+        // was refused on x86_64 gnu).
+        let mut patience = Patience::client(a.id(), &home);
+        while records() != [true] {
+            assert!(patience.holds(), "no build took the {sharing} cache");
+            std::thread::sleep(patience.next_look());
+        }
+        patience.done();
+        let b = build(
+            "b",
+            &format!(
+                "\"fs\", \"write:/c/b-{sharing}=written-by-b\", \"print:/c/zero-{sharing}\", \"print:/c/a-{sharing}\""
+            ),
+        );
+        // A's end, waited for while its client goes on.
+        let mut ending = Patience::client(a.id(), &home);
+        let a_ended = loop {
+            if let Some(status) = a.try_wait().unwrap() {
+                ending.done();
+                break status;
             }
-            patience.done();
-            let b = build(
-                "b",
-                &format!(
-                    "\"fs\", \"write:/c/b-{sharing}=written-by-b\", \"print:/c/zero-{sharing}\", \"print:/c/a-{sharing}\""
-                ),
+            assert!(
+                ending.holds(),
+                "the build holding the {sharing} cache never ended"
             );
-            (a.join().unwrap(), b)
-        });
-        assert_eq!(a.status, Some(0), "{}", a.stderr);
+            std::thread::sleep(ending.next_look());
+        };
+        assert!(
+            a_ended.success(),
+            "{a_ended:?}\n{}",
+            std::fs::read_to_string(&a_said).unwrap_or_default()
+        );
         // The files B found, by what it printed of them: B's own step names neither.
         let found = |text: &str| b.stderr.contains(text);
         match sharing {
@@ -7059,25 +7190,55 @@ fn build_cache_usage_lists_every_record() {
         "ERROR: --format and --verbose cannot be used together\n"
     );
     // A cache a running step holds: in use, its size 0B.
-    std::thread::scope(|s| {
-        let held = s.spawn(|| build("hold", "\"write:/c/g=2\", \"sleep:20000\""));
-        let mut patience = Patience::of(&home);
-        let in_use = loop {
-            if let Some(r) = records(&["--filter", "type=exec.cachemount"])
-                .into_iter()
-                .find(|r| r["Reclaimable"] == false)
-            {
-                patience.done();
-                break r;
-            }
-            assert!(patience.holds(), "no step held the cache");
-            std::thread::sleep(patience.next_look());
-        };
-        assert_eq!(in_use["Size"], "0B", "{in_use}");
-        assert_eq!(in_use["ID"], mounts[0]["ID"]);
-        let held = held.join().unwrap();
-        assert_eq!(held.status, Some(0), "{}", held.stderr);
-    });
+    let hold = context(
+        "du-hold",
+        &format!(
+            "FROM {image}\nUSER root\nRUN --mount=type=cache,target=/c,id=du [\"/bin/testguest\", \"fs\", \"write:/c/g=2\", \"sleep:20000\"]\n"
+        ),
+    );
+    let said = home.join("hold.stderr");
+    let mut held = common::command()
+        .args(["build", "--progress=plain", hold.to_str().unwrap()])
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&said).unwrap())
+        .spawn()
+        .unwrap();
+    // Waited for while that build's client goes on, as well as its daemon and their microVMs
+    // (D215: a wait whose answer is another process's run follows that process). Its client
+    // reads its context and asks its daemon before any of them holds the cache, and a wait on
+    // the daemon alone took that time for its party's stillness (CI 44245219858, x86_64 gnu:
+    // refused 610 ms in, its daemon asleep and no microVM yet, past a W* of 557.78 ms).
+    let mut patience = Patience::client(held.id(), &home);
+    let in_use = loop {
+        if let Some(r) = records(&["--filter", "type=exec.cachemount"])
+            .into_iter()
+            .find(|r| r["Reclaimable"] == false)
+        {
+            patience.done();
+            break r;
+        }
+        assert!(patience.holds(), "no step held the cache");
+        std::thread::sleep(patience.next_look());
+    };
+    assert_eq!(in_use["Size"], "0B", "{in_use}");
+    assert_eq!(in_use["ID"], mounts[0]["ID"]);
+    // Its end, waited for while its client goes on.
+    let mut ending = Patience::client(held.id(), &home);
+    let ended = loop {
+        if let Some(status) = held.try_wait().unwrap() {
+            ending.done();
+            break status;
+        }
+        assert!(ending.holds(), "the build holding the cache never ended");
+        std::thread::sleep(ending.next_look());
+    };
+    assert!(
+        ended.success(),
+        "{ended:?}\n{}",
+        std::fs::read_to_string(&said).unwrap_or_default()
+    );
     // Pruned: none left, and totals of nothing.
     ok(&["builder", "prune", "-af"]);
     assert_eq!(

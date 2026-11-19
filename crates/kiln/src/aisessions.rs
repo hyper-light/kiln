@@ -365,6 +365,15 @@ impl Reporter {
     /// process that has written nothing yet (Gemini CLI before its first prompt, any tool before
     /// its first file) is seen at the next scan one of these brings, not before.
     fn watch(&self, up: crate::memory::queue::Sender<crate::exec::Up>) {
+        /// Until one of `pids` exits, as the OS tells it (`os::watch::exited`); never where it can tell none of their
+        /// ends (each refused by kind, said): those ends are seen at the next scan another event brings.
+        async fn one_exited(pids: &[u32]) {
+            if let Err(unwatched) = crate::os::watch::exited(pids).await {
+                let said: Vec<String> = unwatched.iter().map(ToString::to_string).collect();
+                tracing::debug!(unwatched = %said.join("; "), "an AI session's process can't be watched to its end: its end is seen at the next scan");
+                std::future::pending::<()>().await;
+            }
+        }
         if self.watching.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -379,7 +388,7 @@ impl Reporter {
                 futures::select_biased! {
                     () = me.asked.notified().fuse() => {}
                     () = files.changed().fuse() => {}
-                    () = crate::os::watch::exited(&pids).fuse() => {}
+                    () = one_exited(&pids).fuse() => {}
                 }
             }
         }));

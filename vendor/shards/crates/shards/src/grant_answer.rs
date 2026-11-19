@@ -492,10 +492,14 @@ fn handed(access: Access, path: &Path) -> Result<Handed, String> {
 }
 
 /// A connection to vsock host port `port` beside `listening`, the vsock path the VM was
-/// granted, the only ports it may have dialled for it: the client ends of the pair the host
-/// port's file at `<path>_<port>` names, its way down opened first (D272). Waited for not at
-/// all: a host port whose pair another client holds refuses at once, as one whose backlog is
-/// full, so that the VM's device, which waits for this answer, waits on no host program.
+/// granted, the only ports it may have dialled for it: the client ends of a pair of pipes,
+/// its way down first (D272). What listens at `<path>_<port>` is read once, by its entry's
+/// handle, and decides (D272, amended 2026-11-17): a pair's file (a regular file) is opened
+/// as its host program's listener named it; an AF_UNIX listener's socket (a builder's, on
+/// every OS) is connected here and the connection carried ([`carried`]); anything else is
+/// refused, its path named. Waited for not at all: a host port whose pair another client
+/// holds refuses at once, as one whose backlog is full, so that the VM's device, which
+/// waits for this answer, waits on no host program.
 #[cfg(windows)]
 fn dial_for(
     listening: Option<&Path>,
@@ -507,12 +511,126 @@ fn dial_for(
     ),
     String,
 > {
+    use shards_vmm::platform::EntryKind;
     let path = listening.ok_or("a dial from a VM granted no vsock path")?;
     let mut target = path.as_os_str().to_owned();
     target.push(format!("_{port}"));
     let target = Path::new(&target);
-    shards_ipc::vsock_open(target, Some(std::time::Instant::now()))
-        .map_err(|e| format!("{}: {e}", target.display()))
+    let at = |e: std::io::Error| format!("{}: {e}", target.display());
+    match shards_vmm::platform::entry_kind(target).map_err(at)? {
+        EntryKind::File => shards_ipc::vsock_open(target, Some(std::time::Instant::now())).map_err(at),
+        EntryKind::UnixSocket => carried(target).map_err(at),
+        EntryKind::Directory => Err(format!(
+            "{}: a directory, neither a vsock pair's file nor an AF_UNIX socket",
+            target.display()
+        )),
+        EntryKind::Reparse(tag) => Err(format!(
+            "{}: a reparse point tagged {tag:#010x}, neither a vsock pair's file nor an AF_UNIX \
+             socket",
+            target.display()
+        )),
+    }
+}
+
+/// A connection to the AF_UNIX listener at `target` (D272, amended 2026-11-17): connected
+/// here, before the VM is answered, so that a host takes its guest's connections in the
+/// order the guest dials them, as Unix's spawner connects them (a builder's init dials its
+/// give-back port before its build's, and its builder takes them in that order); carried
+/// both ways between that socket and a pair of pipes made whole here
+/// ([`shards_ipc::vsock_carried`]), whose client ends are the VM's, by a thread for each
+/// way ([`carry_up`], [`carry_down`]), each ending with its peers.
+#[cfg(windows)]
+fn carried(
+    target: &Path,
+) -> std::io::Result<(
+    std::os::windows::io::OwnedHandle,
+    std::os::windows::io::OwnedHandle,
+)> {
+    let unix = shards_vmm::platform::UnixStream::connect(target)?;
+    let to_host = unix.try_clone()?;
+    let (ours, theirs) = shards_ipc::vsock_carried()?;
+    let shards_ipc::VsockConn { down, up } = ours;
+    // A chunk of a way's quota: one read takes what its pipe holds, one write fills it.
+    let chunk = usize::try_from(shards_ipc::VSOCK_QUOTA).map_err(std::io::Error::other)?;
+    std::thread::Builder::new()
+        .name("carried up".into())
+        .spawn(move || carry_up(&up, &to_host, chunk))?;
+    std::thread::Builder::new()
+        .name("carried down".into())
+        .spawn(move || carry_down(&unix, down, chunk))?;
+    Ok(theirs)
+}
+
+/// `chunk` bytes to carry through, none where they cannot be had.
+#[cfg(windows)]
+fn chunk_of(chunk: usize) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(chunk).ok()?;
+    buf.resize(chunk, 0);
+    Some(buf)
+}
+
+/// The guest's way: what it writes up its pipe, written to its host's socket, to its end,
+/// which the socket is told by a shutdown of its writes alone, so that its host reads every
+/// byte, then that end (D251's first invariant). Where the host's socket refuses them (its
+/// host gone), it ends at once, its pipe let go with it, so that the guest's next write
+/// fails, as a pipe's does whose host has closed.
+#[cfg(windows)]
+fn carry_up(up: &shards_ipc::Pipe, to_host: &shards_vmm::platform::UnixStream, chunk: usize) {
+    use std::io::{Read as _, Write as _};
+    let Some(mut buf) = chunk_of(chunk) else {
+        let _ = to_host.shutdown(std::net::Shutdown::Write);
+        return;
+    };
+    let mut from_guest = up;
+    loop {
+        let n = match from_guest.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => 0,
+        };
+        let Some(bytes) = buf.get(..n).filter(|b| !b.is_empty()) else {
+            let _ = to_host.shutdown(std::net::Shutdown::Write);
+            return;
+        };
+        let mut to = to_host;
+        if to.write_all(bytes).is_err() {
+            return;
+        }
+    }
+}
+
+/// The host's way: what it writes on its socket, written down the guest's pipe, to its end,
+/// then the pipe let go, so that the guest reads every byte, then that end. The socket is
+/// read to its end all the same once the guest's pipe refuses its bytes (the guest gone),
+/// those bytes dropped: a Windows AF_UNIX socket closed while it holds its peer's bytes
+/// unread resets and loses the peer what it had not read (PM M358), here the guest's bytes
+/// its host had still to read. So a host's write after its guest's end is taken, not
+/// refused; its host finds that end by its read.
+#[cfg(windows)]
+fn carry_down(from_host: &shards_vmm::platform::UnixStream, down: shards_ipc::Pipe, chunk: usize) {
+    use std::io::{Read as _, Write as _};
+    let Some(mut buf) = chunk_of(chunk) else {
+        return;
+    };
+    let mut down = Some(down);
+    let mut from = from_host;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => 0,
+        };
+        let Some(bytes) = buf.get(..n).filter(|b| !b.is_empty()) else {
+            return;
+        };
+        if let Some(pipe) = down.as_ref() {
+            let mut to = pipe;
+            if to.write_all(bytes).is_err() {
+                down = None;
+            }
+        }
+    }
 }
 
 /// `down` and `up`, a pair of pipes' ends, put in `to`: the answer that hands them over, each
@@ -541,11 +659,23 @@ fn give_pair(
 /// which this process keeps no copy, so that the VM's close is their end; a directory to
 /// write in made, in which this process stages each snapshot generation the VM asks for,
 /// hands it the generation's memory and state files, and commits the generation on its word
-/// (`STAGE`, `COMMIT`, D196). A path that cannot be granted ends the answers with why. As on
-/// macOS, a VM that has its vsock path, the last it asks for, has started, and asks for
-/// nothing more but its dials, its pairs and its snapshots.
+/// (`STAGE`, `COMMIT`, D196), apart from its answers ([`commit_apart`]). A path that cannot
+/// be granted ends the answers with why. As on macOS, a VM that has its vsock path, the last
+/// it asks for, has started, and asks for nothing more but its dials, its pairs and its
+/// snapshots. It returns once every commit it began has ended, as the VM and the generation
+/// it committed are its caller's to report only then.
 #[cfg(windows)]
 pub fn serve(link: &crate::grant::Link, to: &dyn Recipient) -> Result<(), String> {
+    serve_committing(link, to, &shards_vmm::snapshot::Staged::commit)
+}
+
+/// [`serve`], each generation the VM commits made durable and put in use by `commit`.
+#[cfg(windows)]
+fn serve_committing(
+    link: &crate::grant::Link,
+    to: &dyn Recipient,
+    commit: &(dyn Fn(shards_vmm::snapshot::Staged) -> Result<(), String> + Sync),
+) -> Result<(), String> {
     use shards_ipc::kind;
     use std::os::windows::io::AsHandle as _;
     // Its vsock path and its listener's pipes' names, under which its next pairs are made.
@@ -555,135 +685,175 @@ pub fn serve(link: &crate::grant::Link, to: &dyn Recipient) -> Result<(), String
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut staged: Vec<shards_vmm::snapshot::Staged> = Vec::new();
     let mut started = false;
+    // Each commit's directory as it ends, and whether its generation is in place.
+    let (ended, commits) = std::sync::mpsc::channel::<(PathBuf, bool)>();
     let refuse = |e: String| {
         let _ = shards_ipc::write_message(&link.to, kind::ERR, e.as_bytes());
         Err(e)
     };
-    loop {
-        let asked =
-            shards_ipc::read_message(&link.from).map_err(|e| format!("a VM's request for access: {e}"))?;
-        let Some(asked) = asked else {
-            return Ok(());
-        };
-        if asked.kind == kind::TAKEN {
-            continue;
-        }
-        // Nothing more granted it, as after a vsock path's listen: what it asks after is
-        // its files' ranges and its snapshots alone.
-        if asked.kind == kind::SEALED {
-            started = true;
-            continue;
-        }
-        if asked.kind == kind::DIAL {
-            let port = <[u8; 4]>::try_from(asked.payload.as_slice())
-                .map(u32::from_be_bytes)
-                .map_err(|_| "a VM sent a malformed dial".to_string())?;
-            let answer = dial_for(listening.as_ref().map(|(path, _)| path.as_path()), port)
-                .and_then(|(down, up)| give_pair(to, &down, &up));
-            reply(link, answer, "a VM's dial")?;
-            continue;
-        }
-        // Its listener's next pair, under its first's names, as a client has opened both
-        // ways of the last (D272): the VM may make none its user can open.
-        if asked.kind == kind::VSOCK_PAIR {
-            let answer = match &listening {
-                Some((_, names)) => shards_ipc::vsock_pair(names, false)
-                    .map_err(|e| format!("a VM's next pair: {e}"))
-                    .and_then(|(down, up)| give_pair(to, &down, &up)),
-                None => Err("a VM granted no vsock path asked for a pair".into()),
+    std::thread::scope(|scope| {
+        loop {
+            let asked = shards_ipc::read_message(&link.from)
+                .map_err(|e| format!("a VM's request for access: {e}"))?;
+            let Some(asked) = asked else {
+                return Ok(());
             };
-            reply(link, answer, "a VM's pair")?;
-            continue;
-        }
-        // A file of the VM's, its ranges read for it (D196): taken out of the VM by its
-        // handle there, which names no file of this process's.
-        if asked.kind == kind::RANGES {
-            let answer = ranges(&asked.payload, to);
-            reply(link, answer, "a VM's ranges")?;
-            continue;
-        }
-        if asked.kind == kind::STAGE {
-            let answer = stage(&asked.payload, &dirs, to).map(|(generation, payload)| {
-                // One generation at a time a directory: one staged and never committed goes.
-                staged.retain(|s| s.dir() != generation.dir());
-                staged.push(generation);
-                payload
-            });
-            reply(link, answer, "a VM's stage")?;
-            continue;
-        }
-        if asked.kind == kind::COMMIT {
-            let answer = match staged
-                .iter()
-                .position(|s| s.name().as_bytes() == asked.payload.as_slice())
-            {
-                // Its directory given up once its snapshot is in place, as a Unix VM's is
-                // (vm_run.rs `seal`): a guest that took the VM's process over later could
-                // otherwise have every later restore of it restore what it wrote.
-                Some(at) => {
-                    let generation = staged.swap_remove(at);
-                    let dir = generation.dir().to_path_buf();
-                    generation.commit().map(|()| {
-                        dirs.retain(|d| *d != dir);
+            // A directory whose snapshot is in place is given up, as a Unix VM's is (vm_run.rs
+            // `seal`): a guest that took the VM's process over later could otherwise have every
+            // later restore of it restore what it wrote. Before any ask after the commit's end,
+            // which the VM hears of only once this has heard of it ([`commit_apart`]).
+            for (dir, in_place) in commits.try_iter() {
+                if in_place {
+                    dirs.retain(|d| *d != dir);
+                }
+            }
+            if asked.kind == kind::TAKEN {
+                continue;
+            }
+            // Nothing more granted it, as after a vsock path's listen: what it asks after is
+            // its files' ranges and its snapshots alone.
+            if asked.kind == kind::SEALED {
+                started = true;
+                continue;
+            }
+            if asked.kind == kind::DIAL {
+                let port = <[u8; 4]>::try_from(asked.payload.as_slice())
+                    .map(u32::from_be_bytes)
+                    .map_err(|_| "a VM sent a malformed dial".to_string())?;
+                let answer = dial_for(listening.as_ref().map(|(path, _)| path.as_path()), port)
+                    .and_then(|(down, up)| give_pair(to, &down, &up));
+                reply(link, answer, "a VM's dial")?;
+                continue;
+            }
+            // Its listener's next pair, under its first's names, as a client has opened both
+            // ways of the last (D272): the VM may make none its user can open.
+            if asked.kind == kind::VSOCK_PAIR {
+                let answer = match &listening {
+                    Some((_, names)) => shards_ipc::vsock_pair(names, false)
+                        .map_err(|e| format!("a VM's next pair: {e}"))
+                        .and_then(|(down, up)| give_pair(to, &down, &up)),
+                    None => Err("a VM granted no vsock path asked for a pair".into()),
+                };
+                reply(link, answer, "a VM's pair")?;
+                continue;
+            }
+            // A file of the VM's, its ranges read for it (D196): taken out of the VM by its
+            // handle there, which names no file of this process's.
+            if asked.kind == kind::RANGES {
+                let answer = ranges(&asked.payload, to);
+                reply(link, answer, "a VM's ranges")?;
+                continue;
+            }
+            if asked.kind == kind::STAGE {
+                let answer = stage(&asked.payload, &dirs, to).map(|(generation, payload)| {
+                    // One generation at a time a directory: one staged and never committed goes.
+                    staged.retain(|s| s.dir() != generation.dir());
+                    staged.push(generation);
+                    payload
+                });
+                reply(link, answer, "a VM's stage")?;
+                continue;
+            }
+            if asked.kind == kind::COMMIT {
+                let answer = match staged
+                    .iter()
+                    .position(|s| s.name().as_bytes() == asked.payload.as_slice())
+                {
+                    Some(at) => commit_apart(scope, staged.swap_remove(at), commit, ended.clone(), to),
+                    None => Err(format!(
+                        "{}: no generation of that name is staged",
+                        String::from_utf8_lossy(&asked.payload)
+                    )),
+                };
+                reply(link, answer, "a VM's commit")?;
+                continue;
+            }
+            let wanted = match (asked.kind, decode(&asked.payload)) {
+                (kind::GRANT, Some(wanted)) => wanted,
+                _ => return Err("a VM sent a malformed request for access".into()),
+            };
+            if started {
+                return refuse("a VM asked for access after it started".into());
+            }
+            started = wanted.iter().any(|(access, _)| *access == Access::Listen);
+            for (access, path) in wanted {
+                let payload = match handed(access, &path) {
+                    Ok(Handed::File(file)) => {
+                        let real = shards_vmm::platform::final_path(&file)
+                            .map_err(|e| format!("{}: {e}", path.display()));
+                        let value = to
+                            .give(file.as_handle())
+                            .map_err(|e| format!("giving a VM {}: {e}", path.display()));
+                        match real.and_then(|real| value.map(|v| (v, real))) {
+                            Ok((value, real)) => {
+                                let mut payload = (value as u64).to_le_bytes().to_vec();
+                                payload.extend(crate::grant::path_bytes(&real));
+                                payload
+                            }
+                            Err(e) => return refuse(e),
+                        }
+                    }
+                    Ok(Handed::Absent) => Vec::new(),
+                    Ok(Handed::Dir) => {
+                        dirs.push(path.clone());
                         Vec::new()
-                    })
-                }
-                None => Err(format!(
-                    "{}: no generation of that name is staged",
-                    String::from_utf8_lossy(&asked.payload)
-                )),
-            };
-            reply(link, answer, "a VM's commit")?;
-            continue;
+                    }
+                    Ok(Handed::Pair(names, down, up)) => {
+                        if listening.is_some() {
+                            return refuse("a VM asked for a second vsock path".into());
+                        }
+                        match give_pair(to, &down, &up) {
+                            Ok(payload) => {
+                                listening = Some((path.clone(), names));
+                                payload
+                            }
+                            Err(e) => return refuse(format!("{}: {e}", path.display())),
+                        }
+                    }
+                    Err(e) => return refuse(e),
+                };
+                shards_ipc::write_message(&link.to, kind::GRANTED, &payload)
+                    .map_err(|e| format!("granting a VM {}: {e}", path.display()))?;
+            }
         }
-        let wanted = match (asked.kind, decode(&asked.payload)) {
-            (kind::GRANT, Some(wanted)) => wanted,
-            _ => return Err("a VM sent a malformed request for access".into()),
+    })
+}
+
+/// Makes `generation` durable and puts it in use with `commit` on a thread of `scope`'s, apart
+/// from the link, whose answers go on meanwhile (D30, D272, amended 2026-11-18): done in the
+/// link's loop, it held every grant the VM asked as it ran, its vsock listener's next pair
+/// among them, and so the VM's whole vsock device, as long as its fsyncs took. Its answer,
+/// `GRANTED` as it begins, hands the VM the read end of a pipe of its own (`to`'s handle
+/// there), on which the thread says its end once `ended` has heard of it: `GRANTED` once the
+/// generation is in place, or `ERR` and why not (`grant_ask::durable`).
+#[cfg(windows)]
+fn commit_apart<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    generation: shards_vmm::snapshot::Staged,
+    commit: &'env (dyn Fn(shards_vmm::snapshot::Staged) -> Result<(), String> + Sync),
+    ended: std::sync::mpsc::Sender<(PathBuf, bool)>,
+    to: &dyn Recipient,
+) -> Result<Vec<u8>, String> {
+    use shards_ipc::kind;
+    use std::os::windows::io::AsHandle as _;
+    let (heard, word) = std::io::pipe().map_err(|e| format!("a VM's commit's word: {e}"))?;
+    let dir = generation.dir().to_path_buf();
+    let durable = move || {
+        let made = commit(generation);
+        let _ = ended.send((dir, made.is_ok()));
+        let _ = match made {
+            Ok(()) => shards_ipc::write_message(&word, kind::GRANTED, &[]),
+            Err(e) => shards_ipc::write_message(&word, kind::ERR, e.as_bytes()),
         };
-        if started {
-            return refuse("a VM asked for access after it started".into());
-        }
-        started = wanted.iter().any(|(access, _)| *access == Access::Listen);
-        for (access, path) in wanted {
-            let payload = match handed(access, &path) {
-                Ok(Handed::File(file)) => {
-                    let real = shards_vmm::platform::final_path(&file)
-                        .map_err(|e| format!("{}: {e}", path.display()));
-                    let value = to
-                        .give(file.as_handle())
-                        .map_err(|e| format!("giving a VM {}: {e}", path.display()));
-                    match real.and_then(|real| value.map(|v| (v, real))) {
-                        Ok((value, real)) => {
-                            let mut payload = (value as u64).to_le_bytes().to_vec();
-                            payload.extend(crate::grant::path_bytes(&real));
-                            payload
-                        }
-                        Err(e) => return refuse(e),
-                    }
-                }
-                Ok(Handed::Absent) => Vec::new(),
-                Ok(Handed::Dir) => {
-                    dirs.push(path.clone());
-                    Vec::new()
-                }
-                Ok(Handed::Pair(names, down, up)) => {
-                    if listening.is_some() {
-                        return refuse("a VM asked for a second vsock path".into());
-                    }
-                    match give_pair(to, &down, &up) {
-                        Ok(payload) => {
-                            listening = Some((path.clone(), names));
-                            payload
-                        }
-                        Err(e) => return refuse(format!("{}: {e}", path.display())),
-                    }
-                }
-                Err(e) => return refuse(e),
-            };
-            shards_ipc::write_message(&link.to, kind::GRANTED, &payload)
-                .map_err(|e| format!("granting a VM {}: {e}", path.display()))?;
-        }
-    }
+    };
+    std::thread::Builder::new()
+        .name("commit".into())
+        .spawn_scoped(scope, durable)
+        .map_err(|e| format!("committing a VM's snapshot: {e}"))?;
+    let value = to
+        .give(heard.as_handle())
+        .map_err(|e| format!("giving a VM its commit's word: {e}"))?;
+    Ok((value as u64).to_le_bytes().to_vec())
 }
 
 /// A generation staged for the VM in the directory a `STAGE`'s payload names, after what it
@@ -764,7 +934,10 @@ fn reply(link: &crate::grant::Link, answer: Result<Vec<u8>, String>, what: &str)
     .map_err(|e| format!("answering {what}: {e}"))
 }
 
-#[cfg(all(test, windows))]
+// `cfg(test)` alone, as clippy reads a test module (clippy_utils `is_cfg_test`), so that
+// clippy.toml's in-tests allowances cover its helpers; `all(test, windows)` is not read so.
+#[cfg(test)]
+#[cfg(windows)]
 #[allow(clippy::unwrap_used)]
 mod windows_tests {
     use std::io::{Read as _, Write as _};
@@ -911,7 +1084,7 @@ mod windows_tests {
     /// and never committed goes with the VM.
     #[test]
     fn a_spawner_stages_and_commits_a_vms_snapshots() {
-        use crate::grant_ask::{commit, stage};
+        use crate::grant_ask::{commit, durable, stage};
         use shards_vmm::platform::Kept;
         let dir = shards_testdir::TempDir::new("stage").unwrap();
         let snapshot = dir.join("snapshot");
@@ -945,7 +1118,7 @@ mod windows_tests {
             // The pointer as its readers take it, its newest version (platform `write_in`).
             let pointer = || shards_vmm::platform::read_newest_beneath(&snapshot, &["current"], 64).unwrap();
             assert_eq!(pointer(), None, "none in use until its commit");
-            commit(&vm, &name).unwrap();
+            durable(&commit(&vm, &name).unwrap()).unwrap();
             assert_eq!(pointer(), Some(format!("{name}\n").into_bytes()));
             for file in names {
                 assert_eq!(
@@ -975,6 +1148,57 @@ mod windows_tests {
             .filter(|n| n != ".lock")
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A VM's ask is answered while its snapshot is committed (D30, D272, amended 2026-11-18):
+    /// the generation is made durable apart from the link, whose answers go on, and the
+    /// commit's end is said once it has ended. Committed in the link's loop, it held every
+    /// grant asked meanwhile, a resumed VM's vsock listener's next pair among them, and so its
+    /// whole vsock device, as long as the fsyncs took (CI 44189693085, windows-2025: a round
+    /// across its snapshot with no byte for 900 ms; jupiter at a5369bd051: "snapshot made
+    /// durable in 52013 us"). Its commit, a stand-in, is held open until the ask is answered;
+    /// past 10 s it goes on, so that one held in the loop fails this test rather than hangs
+    /// it. Red with the commit made in the loop.
+    #[test]
+    fn a_grant_asked_while_a_snapshot_commits_is_answered_before_the_commit_ends() {
+        use crate::grant_ask::{commit, durable, ranges, stage};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = shards_testdir::TempDir::new("commit-apart").unwrap();
+        let snapshot = dir.join("snapshot");
+        std::fs::write(dir.join("ranged"), b"data").unwrap();
+        let ranged = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("ranged"))
+            .unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let ended = AtomicBool::new(false);
+        let stand_in = |generation: shards_vmm::snapshot::Staged| {
+            let _ = held
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+            let made = generation.commit();
+            ended.store(true, Ordering::SeqCst);
+            made
+        };
+        let (spawner, vm) = link();
+        std::thread::scope(|scope| {
+            let serving = scope.spawn(|| serve_committing(&spawner, &Here, &stand_in));
+            obtain(&vm, &[(Access::MakeDir, snapshot.clone())]).unwrap();
+            let (name, files) = stage(&vm, &snapshot, shards_vmm::platform::Kept::default()).unwrap();
+            drop(files);
+            let word = commit(&vm, &name).unwrap();
+            let answered = ranges(&vm, &ranged, 4);
+            let before = !ended.load(Ordering::SeqCst);
+            release.send(()).unwrap();
+            durable(&word).unwrap();
+            assert!(answered.is_ok(), "{answered:?}");
+            assert!(before, "the VM's ask was answered only once its commit had ended");
+            drop(vm);
+            assert!(serving.join().unwrap().is_ok());
+        });
     }
 
     /// The ranges of a VM's file that hold data are read for it by its spawner, which takes
@@ -1060,7 +1284,7 @@ mod windows_tests {
     /// still staged and committed for it.
     #[test]
     fn a_vm_that_stages_its_snapshots_is_granted_nothing_more_once_it_starts() {
-        use crate::grant_ask::{commit, obtain_sealed, stage};
+        use crate::grant_ask::{commit, durable, obtain_sealed, stage};
         let dir = shards_testdir::TempDir::new("staged").unwrap();
         let (kernel, snapshot, sentinel) = (dir.join("kernel"), dir.join("snapshot"), dir.join("sentinel"));
         std::fs::write(&kernel, b"k").unwrap();
@@ -1078,7 +1302,7 @@ mod windows_tests {
             .unwrap();
             let (name, files) = stage(&vm, &snapshot, shards_vmm::platform::Kept::default()).unwrap();
             drop(files);
-            commit(&vm, &name).unwrap();
+            durable(&commit(&vm, &name).unwrap()).unwrap();
             let late = obtain(&vm, &[(Access::Write, sentinel.clone())]);
             if late.is_ok() {
                 let _ = shards_vmm::platform::open_input(&sentinel, true)
@@ -1182,6 +1406,130 @@ mod windows_tests {
             drop(vm);
             let _ = serving.join();
         });
+    }
+
+    /// What a dialled connection reads to its end, as its VM's device reads it: a look, and a
+    /// read once one would not wait.
+    fn read_to_end(p: &mut shards_vmm::platform::Pipes) -> Vec<u8> {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            p.look();
+            if p.readable() {
+                match std::io::Read::read(p, &mut buf) {
+                    Ok(0) => return got,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("reading the carried connection: {e}"),
+                }
+            } else {
+                assert!(
+                    Instant::now() < deadline,
+                    "not at its end after 30 s, {} bytes read",
+                    got.len()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Three ways' quotas of bytes, none of their places alike.
+    fn three_quotas() -> Vec<u8> {
+        let quota = usize::try_from(shards_ipc::VSOCK_QUOTA).unwrap();
+        (0..3 * quota).map(|i| u8::try_from(i % 251).unwrap()).collect()
+    }
+
+    /// A dial to a host port an AF_UNIX listener holds, as a builder's are on every OS (D272,
+    /// amended 2026-11-17), is connected there and carried over pipes its VM is handed: three
+    /// quotas of bytes cross whole each way; the guest's end of its writes reaches its host
+    /// after the last of them, and its host's answer, written after, still reaches the guest,
+    /// then the host's end.
+    #[test]
+    fn a_dial_to_an_af_unix_listener_is_carried_whole_both_ways() {
+        let sent = three_quotas();
+        let dir = shards_testdir::TempDir::new("carry").unwrap();
+        let vsock = dir.join("v");
+        let host = shards_vmm::platform::UnixListener::bind(dir.join("v_6000")).unwrap();
+        let (spawner, vm) = link();
+        std::thread::scope(|scope| {
+            let serving = scope.spawn(|| serve(&spawner, &Here));
+            obtain(&vm, &[(Access::Listen, vsock.clone())]).unwrap();
+            // The host reads to its guest's end, then answers with every byte and ends.
+            let answering = scope.spawn(|| {
+                let (conn, ()) = host.accept().unwrap();
+                let mut got = Vec::new();
+                (&conn).read_to_end(&mut got).unwrap();
+                (&conn).write_all(&got).unwrap();
+                conn.shutdown(std::net::Shutdown::Write).unwrap();
+                got
+            });
+            let mut dialled = dial(&vm, 6000).unwrap();
+            dialled.write_all_waiting(&sent).unwrap();
+            // The guest's way ended, its host's still read.
+            dialled.shut_down();
+            let back = read_to_end(&mut dialled);
+            assert!(
+                answering.join().unwrap() == sent,
+                "the host read every byte, then the guest's end"
+            );
+            assert!(back == sent, "the guest read every byte, then the host's end");
+            drop((dialled, vm));
+            let _ = serving.join();
+        });
+    }
+
+    /// A carried connection's host may end its way first: its guest reads every byte, then
+    /// that end, and its own way goes on, its bytes read whole by the host after it ended
+    /// its writes.
+    #[test]
+    fn a_carried_dials_host_ends_first_and_its_guest_answers_after() {
+        let sent = three_quotas();
+        let dir = shards_testdir::TempDir::new("carry-host").unwrap();
+        let vsock = dir.join("v");
+        let host = shards_vmm::platform::UnixListener::bind(dir.join("v_6001")).unwrap();
+        let (spawner, vm) = link();
+        std::thread::scope(|scope| {
+            let serving = scope.spawn(|| serve(&spawner, &Here));
+            obtain(&vm, &[(Access::Listen, vsock.clone())]).unwrap();
+            let sending = scope.spawn(|| {
+                let (conn, ()) = host.accept().unwrap();
+                (&conn).write_all(&sent).unwrap();
+                conn.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut got = Vec::new();
+                (&conn).read_to_end(&mut got).unwrap();
+                got
+            });
+            let mut dialled = dial(&vm, 6001).unwrap();
+            let back = read_to_end(&mut dialled);
+            assert!(back == sent, "the guest read every byte, then the host's end");
+            dialled.write_all_waiting(&back).unwrap();
+            dialled.shut_down();
+            assert!(
+                sending.join().unwrap() == sent,
+                "the host read every byte after its own end"
+            );
+            drop((dialled, vm));
+            let _ = serving.join();
+        });
+    }
+
+    /// A host port is a vsock pair's file or an AF_UNIX socket, read once by its entry's
+    /// handle: a directory there is neither, and is refused with its path named, as a port
+    /// nothing listens on is.
+    #[test]
+    fn a_dial_to_neither_a_pairs_file_nor_a_socket_is_refused_naming_it() {
+        let dir = shards_testdir::TempDir::new("carry-none").unwrap();
+        let vsock = dir.join("v");
+        std::fs::create_dir(dir.join("v_7000")).unwrap();
+        let refused = dial_for(Some(vsock.as_path()), 7000).unwrap_err();
+        assert!(
+            refused.contains("v_7000") && refused.contains("a directory"),
+            "{refused}"
+        );
+        let absent = dial_for(Some(vsock.as_path()), 7001).unwrap_err();
+        assert!(absent.contains("v_7001"), "{absent}");
     }
 }
 

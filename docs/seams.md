@@ -433,6 +433,9 @@ the boundary killed it for going over (`memory.events` counts an `oom_kill`); pr
 refused one past its limit (`pids.max` fails the fork, the run isn't stopped) and then failed. A run
 refused a process that copes and ends well ends with its code.
 
+A launch whose run fails as it starts, its command never starting or its boundary failing it, is
+refused `Failed`, in its boundary's words: the launch was valid, and the run is what failed.
+
 A sandbox that holds them keeps warm pools for a microVM's launches as kiln names them (`keep`; kiln
 plan 01a1dd2e…, P3.2, through Hex's P3.1 for Shards' D253 pools): a pool is an image pinned by its
 digest and a size (vCPUs and MiB, or none for the least its boundary boots), and how many hosts it

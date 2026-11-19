@@ -18,6 +18,7 @@ pub fn main() {
             "blk_stress" => blk_stress(),
             "snapshot" => snapshot(),
             "storm" => storm(),
+            "vcpus" => vcpus(),
             "resume" => resume(),
             "idle" => idle(),
             "walk" => memory_walk(),
@@ -90,11 +91,12 @@ pub fn main() {
     }
 }
 
-/// A protocol line the host reads. A storm's kernel diagnostics can interrupt a tty
-/// write even inside a word. Give printk the whole record so it serializes it with
-/// those diagnostics; LOG_USER/ERR keeps it visible with the test kernel's `quiet`.
+/// A protocol line the host reads. The kernel diagnostics of a storm, or of a machine of more
+/// vCPUs than its host has CPUs ([`vcpus`]), can interrupt a tty write even inside a word.
+/// Give printk the whole record so it serializes it with those diagnostics; LOG_USER/ERR
+/// keeps it visible with the test kernel's `quiet`.
 fn report(line: std::fmt::Arguments<'_>) -> Result<(), String> {
-    if std::env::var("shards_test").is_ok_and(|test| test == "storm") {
+    if std::env::var("shards_test").is_ok_and(|test| test == "storm" || test == "vcpus") {
         std::fs::write("/dev/kmsg", format!("<11>{line}\n"))
             .map_err(|e| format!("writing the test record to /dev/kmsg: {e}"))
     } else {
@@ -155,8 +157,7 @@ fn slates_fs() -> Result<(), String> {
             std::fs::File::create("/mnt/from-guest").map_err(|e| format!("create /mnt/from-guest: {e}"))?;
         file.write_all(wrote.as_bytes())
             .map_err(|e| format!("write /mnt/from-guest: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("fsync /mnt/from-guest: {e}"))?;
+        shards_durable::all(&file).map_err(|e| format!("fsync /mnt/from-guest: {e}"))?;
     }
     let back =
         std::fs::read_to_string("/mnt/from-guest").map_err(|e| format!("read /mnt/from-guest: {e}"))?;
@@ -186,8 +187,7 @@ fn share() -> Result<(), String> {
             std::fs::File::create("/mnt0/from-guest").map_err(|e| format!("create /mnt0/from-guest: {e}"))?;
         file.write_all(wrote.as_bytes())
             .map_err(|e| format!("write /mnt0/from-guest: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("fsync /mnt0/from-guest: {e}"))?;
+        shards_durable::all(&file).map_err(|e| format!("fsync /mnt0/from-guest: {e}"))?;
     }
     // Each way to change the read-only share is refused EROFS, as its server answers a
     // change (fs/server.rs `writable`): a file made, one written, removed, renamed and cut.
@@ -324,7 +324,7 @@ fn slates_fs_dax() -> Result<(), String> {
         // SAFETY: inside the mapping (GUEST_AT + GUEST.len() < RANGE).
         unsafe { map.add(GUEST_AT + i).write_volatile(*byte) };
     }
-    file.sync_all().map_err(|e| format!("fsync {BIG}: {e}"))?;
+    shards_durable::all(&file).map_err(|e| format!("fsync {BIG}: {e}"))?;
     let _ = writeln!(io::stdout(), "SLATES-DAX STORED");
     waiting("the host's change in the map", || {
         let (host, own) = (read(HOST_AT, HOST.len()), read(GUEST_AT, GUEST.len()));
@@ -547,10 +547,10 @@ fn blk() -> Result<(), String> {
         pwrite_exact(fd, b, off)?;
         off += len as u64;
     }
-    // SAFETY: fsync on our descriptor; issues VIRTIO_BLK_T_FLUSH.
-    if unsafe { libc::fsync(fd) } != 0 {
-        return Err(format!("fsync: {}", io::Error::last_os_error()));
-    }
+    // SAFETY: our descriptor, open until it is closed below. Its fsync issues
+    // VIRTIO_BLK_T_FLUSH.
+    let held = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    shards_durable::all(held).map_err(|e| format!("fsync: {e}"))?;
     let mut off = 0;
     while off < rw_bytes {
         let len = (1 << 20).min(rw_bytes - off) as usize;
@@ -933,6 +933,24 @@ fn clock_in_step(cpus: usize, when: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A machine of the most vCPUs it may have, each read back by a restore (D13, D14;
+/// tests/snapshot.rs `a_restore_reads_back_every_vcpu_a_machine_may_have`): what a snapshot
+/// keeps of each vCPU crosses its bounds only at the most. Every CPU is online (`setup`), and
+/// each runs a thread of its own, its clock read in turn with every other's
+/// ([`clock_in_step`]), before the snapshot and again in a restore. None carries a storm's
+/// work ([`storm`]): a restored storm of 255 vCPUs took 1,782 s on a 4-CPU host (D14).
+fn vcpus() -> Result<(), String> {
+    // SAFETY: sysconf(3) takes no pointers.
+    let cpus = usize::try_from(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }).unwrap_or(1);
+    clock_in_step(cpus, "before the snapshot")?;
+    let control = ControlPage::map()?;
+    control.write(shards_abi::control::SNAPSHOT, shards_abi::control::SNAPSHOT_NOW);
+    // A restored copy continues here.
+    let generation = control.read(shards_abi::control::GENERATION);
+    report(format_args!("SHARDS-TEST INFO generation={generation}"))?;
+    clock_in_step(cpus, "after the snapshot")
+}
+
 /// A machine busy in every way at once when it asks for a snapshot (audit A02): pairs of
 /// threads on neighbouring CPUs wake each other in turn (interrupts between CPUs), one
 /// thread sleeps in short timer ticks, one reads the read-only disk and checks it, one
@@ -950,8 +968,8 @@ fn clock_in_step(cpus: usize, when: &str) -> Result<(), String> {
 /// record is written exactly once.
 ///
 /// Its checks done, it says `storm checked`, and gives its verdict once the host has
-/// connected to port 1235 and sent a byte: the host stops streaming first, so every round
-/// ends with the guest alive.
+/// connected to port 1235 and sent its word ([`host_word`]): the host stops streaming first,
+/// so every round ends with the guest alive. Any other stream to 1235 fails it, naming itself.
 fn storm() -> Result<(), String> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1111,6 +1129,18 @@ fn storm() -> Result<(), String> {
     let listener = vsock_listen(ECHO_PORT)?;
     thread::spawn(move || serve_echo(&listener));
     let done = vsock_listen(DONE_PORT)?;
+    // Each stream that comes to port 1235 is taken as it comes ([`host_word`]): the host's
+    // word lets the storm give its verdict, and any other stream fails it at once, naming
+    // itself (ROOT, 2026-11-18: on jupiter a stream the host never opened as its word let the
+    // verdict come while the host still streamed through the echo).
+    let (word, heard) = std::sync::mpsc::channel::<Result<(), String>>();
+    thread::spawn(move || {
+        let said = host_word(&done);
+        if let Err(e) = &said {
+            let _ = report(format_args!("SHARDS-TEST FAIL {e}"));
+        }
+        let _ = word.send(said);
+    });
     let _ = writeln!(io::stdout(), "SHARDS-TEST READY");
 
     // The snapshot lands in the thick of it: after the storm is up and the host's stream is.
@@ -1271,14 +1301,69 @@ fn storm() -> Result<(), String> {
     // host streamed ended with the guest alive: its main thread watched no more.
     beats.store(u64::MAX, Ordering::Relaxed);
     report(format_args!("SHARDS-TEST INFO storm checked"))?;
-    // The host's side of the connection is up only once it has read its OK, after this
-    // side's accept: its byte, or its close, says so. The host connects once the round it
-    // streams ends, and gives up on its connection at its own quiet.
-    let mut host = vsock_accept(&done)?;
-    let mut byte = [0u8; 1];
-    std::io::Read::read(&mut host, &mut byte)
-        .map(drop)
-        .map_err(|e| format!("waiting for the host's word: {e}"))
+    // The host's word ([`host_word`]): it connects once the round it streams ends.
+    heard
+        .recv()
+        .map_err(|_| "waiting for the host's word: its taker ended".to_string())?
+}
+
+/// What the host writes to port 1235 once it has stopped streaming through the storm's echo
+/// (snapshot.rs `DONE_WORD`, the same bytes).
+const DONE_WORD: &[u8] = b"SHARDS-DONE\n";
+
+/// The first stream that comes to `done`, the storm's port 1235: the host's word
+/// ([`DONE_WORD`]), or a failure naming the stream that came instead, by the host port it came
+/// from, its first bytes and when it came on this guest's clock (CLOCK_MONOTONIC). A stream
+/// of the host's echo rounds, or any the host did not open as its word, is a failure of the
+/// path that brought it here, never the host's word.
+fn host_word(done: &std::fs::File) -> Result<(), String> {
+    let (mut stream, from) = vsock_accept_from(done)?;
+    let came = monotonic_ns();
+    let mut first = Vec::new();
+    let mut buf = [0u8; 64];
+    while first.len() < DONE_WORD.len() {
+        match std::io::Read::read(&mut stream, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => first.extend_from_slice(buf.get(..n).unwrap_or_default()),
+            Err(e) => {
+                return Err(format!(
+                    "waiting for the host's word on port {DONE_PORT}, from host port {from}: {e}"
+                ));
+            }
+        }
+    }
+    if first.starts_with(DONE_WORD) {
+        return Ok(());
+    }
+    Err(format!(
+        "port {DONE_PORT} took a stream that is not the host's word: from host port {from}, its first bytes {:?}, at {came} ns of this guest's CLOCK_MONOTONIC",
+        String::from_utf8_lossy(&first)
+    ))
+}
+
+/// [`vsock_accept`], with the port of the peer whose stream it is (accept(2)'s address, a
+/// sockaddr_vm: the host's port for a stream the host opened).
+fn vsock_accept_from(listener: &std::fs::File) -> Result<(std::fs::File, u32), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: plain data, for accept4 to fill.
+    let mut peer: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_vm>())
+        .map_err(|e| format!("a sockaddr_vm's length: {e}"))?;
+    // SAFETY: accept(2) on our listening socket, its peer's address into a sockaddr_vm of
+    // `len` bytes.
+    let fd = unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            (&raw mut peer).cast(),
+            &raw mut len,
+            libc::SOCK_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!("vsock accept: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: a fresh descriptor nothing else owns.
+    Ok((unsafe { std::fs::File::from_raw_fd(fd) }, peer.svm_port))
 }
 
 /// Watches the storm's main thread from its snapshot on, by the count it adds to at each
@@ -1661,7 +1746,7 @@ fn pci_plug() -> Result<(), String> {
                 disk.seek(io::SeekFrom::Start(MIB as u64))
                     .map_err(|e| e.to_string())?;
                 disk.write_all(&buf).map_err(|e| format!("writing {name}: {e}"))?;
-                disk.sync_all().map_err(|e| format!("syncing {name}: {e}"))?;
+                shards_durable::all(&disk).map_err(|e| format!("syncing {name}: {e}"))?;
                 let _ = writeln!(io::stdout(), "SHARDS-PLUG DISK {name} {rescanned} {ready}");
             }
             ["grow", name, sectors] => {
@@ -1710,7 +1795,7 @@ fn pci_plug() -> Result<(), String> {
                 let mut file =
                     std::fs::File::create("/mnt/from-guest").map_err(|e| format!("/mnt/from-guest: {e}"))?;
                 file.write_all(b"written through a plugged share\n")
-                    .and_then(|()| file.sync_all())
+                    .and_then(|()| shards_durable::all(&file))
                     .map_err(|e| format!("/mnt/from-guest: {e}"))?;
                 drop(file);
                 let target = cstr("/mnt")?;
@@ -4101,7 +4186,7 @@ fn layer() -> Result<(), String> {
     for _ in 0..64 {
         big.write_all(&chunk).map_err(|e| e.to_string())?;
     }
-    big.sync_all().map_err(|e| e.to_string())?;
+    shards_durable::all(&big).map_err(|e| e.to_string())?;
     let wrote = now() - t;
     drop(big);
     let t = now();
@@ -4139,11 +4224,12 @@ fn layer() -> Result<(), String> {
             // SAFETY: within the mapping.
             unsafe { *p.cast::<u8>().add(page) = 1 };
         }
-        // SAFETY: the mapping made above.
-        unsafe {
-            libc::msync(p, len, libc::MS_SYNC);
-            libc::munmap(p, len);
+        if let Some(at) = std::ptr::NonNull::new(p.cast::<u8>()) {
+            // SAFETY: the mapping of `f` made above, unmapped after.
+            let _ = unsafe { shards_durable::view(&f, at, len) };
         }
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(p, len) };
     }
     let mapped = now() - t;
     let _ = writeln!(
@@ -4753,7 +4839,7 @@ fn bpf_costs() -> Result<(), String> {
         .map_err(|e| format!("/dev/vda: {e}"))?;
     disk.write_all(rec.as_bytes())
         .map_err(|e| format!("writing /dev/vda: {e}"))?;
-    disk.sync_all().map_err(|e| format!("syncing /dev/vda: {e}"))
+    shards_durable::all(&disk).map_err(|e| format!("syncing /dev/vda: {e}"))
 }
 
 /// What a build step's devices cost its start (D44, PM M498): init's step_cgroup as it
@@ -4883,7 +4969,7 @@ fn step_cgroup_costs() -> Result<(), String> {
         .map_err(|e| format!("/dev/vda: {e}"))?;
     disk.write_all(rec.as_bytes())
         .map_err(|e| format!("writing /dev/vda: {e}"))?;
-    disk.sync_all().map_err(|e| format!("syncing /dev/vda: {e}"))
+    shards_durable::all(&disk).map_err(|e| format!("syncing /dev/vda: {e}"))
 }
 
 /// CLOCK_MONOTONIC, in nanoseconds.

@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use common::{
-    Patience, Run, TempDir, cannot_run_vms, guest_init, kernel, run_shards_env, served, served_counting, tar,
+    Patience, Run, TempDir, cannot_run_vms, guest_init, kernel, left_of, run_shards_env, served,
+    served_counting, tar,
 };
 use serde_json::{Value, json};
 #[cfg(windows)]
@@ -3797,7 +3798,13 @@ fn a_microvms_own_engine_makes_volumes_of_its_own() {
         assert!(status.starts_with("api HTTP/1.1 204"), "{name}: {status} {said}");
     }
     let (status, said) = api("p2", "DELETE", "/volumes/data", &Value::Null);
-    assert!(status.starts_with("api HTTP/1.1 204"), "{status} {said}");
+    // Said with what uses the volume's files, where its removal fails (jupiter r11 at
+    // 7254ebaeb8: windows-x86_64, "remove prov.data: Access is denied" every time).
+    assert!(
+        status.starts_with("api HTTP/1.1 204"),
+        "{status} {said}\n{}",
+        left_of(&home.join("volumes").join("prov.data"))
+    );
     // The rest go with their microVM, its joiners that mount them with it; the other
     // microVM's stay its own, and the host's its own.
     let removed = shards(&["rm", "-f", "p2"]);
@@ -3807,6 +3814,119 @@ fn a_microvms_own_engine_makes_volumes_of_its_own() {
     on_host.sort_unstable();
     assert_eq!(on_host, ["other.data", "prov.secret"], "{host}");
     let removed = shards(&["rm", "-f", "other"]);
+    assert_eq!(removed.status, Some(0), "{removed}");
+}
+
+/// A joiner's volume goes while another joiner keeps its provider's join share mounted
+/// (D197): the share's session up, no FUSE_DESTROY lets go of its DAX window whole, as one
+/// does where joiners run one after another (`a_microvms_own_engine_makes_volumes_of_its_own`).
+/// Judged by what holds the volume's files as the writer's end is told: nothing of its
+/// provider's VM process (shards-vm.exe), whose open file there NTFS refuses the volume's
+/// renaming aside for (MS-FSA 2.1.5.15.11, 2.1.4.2; volumes.rs `Store::set_aside`). A drop of
+/// the guest's caches at each joiner's end, tried for this case, found nothing held there to
+/// let go of (jupiter r52, r54) and went; a hold found here brings a release back, with a test
+/// red without it. Meaningful on Windows: Linux and macOS rename and remove what is open.
+#[test]
+fn a_joiners_volume_goes_while_another_keeps_the_share() {
+    let Some((home, image)) = home("eng-ovl") else {
+        return;
+    };
+    let shards = |args: &[&str]| shards_in(&home, args);
+    let ran = shards(&["run", "-d", "--name", "prov", "--use-api-socket", &image, "sleep"]);
+    assert_eq!(ran.status, Some(0), "{ran}");
+    let exec_in = |args: &[&str]| {
+        let mut all = vec!["exec", "prov", "/bin/testguest"];
+        all.extend_from_slice(args);
+        shards(&all)
+    };
+    let mut patience = Patience::of(&home);
+    while exec_in(&["api", "GET", "/_ping", ""]).stdout != "api HTTP/1.1 200 OK\nOK" {
+        assert!(patience.holds(), "its engine never answered");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    patience.done();
+    let api = |method: &str, path: &str, body: &Value| -> (String, Value) {
+        let body = if body.is_null() {
+            String::new()
+        } else {
+            body.to_string()
+        };
+        let out = exec_in(&["api", method, path, &body]);
+        let (status, rest) = out.stdout.split_once('\n').unwrap_or((&out.stdout, ""));
+        (
+            status.to_string(),
+            serde_json::from_str(rest).unwrap_or(Value::Null),
+        )
+    };
+    let started = |name: &str, body: Value| {
+        let (status, said) = api("POST", &format!("/containers/create?name={name}"), &body);
+        assert!(status.starts_with("api HTTP/1.1 201"), "{name}: {status} {said}");
+        let (status, said) = api("POST", &format!("/containers/{name}/start"), &Value::Null);
+        assert!(status.starts_with("api HTTP/1.1 204"), "{name}: {status} {said}");
+    };
+    // The keeper first: its volume's bind is a mount of the join share for as long as it runs.
+    started(
+        "keeper",
+        json!({ "Image": image, "Cmd": ["sleep"], "HostConfig": { "Binds": ["kept:/work"] } }),
+    );
+    let running = || {
+        let (_, keeper) = api("GET", "/containers/keeper/json", &Value::Null);
+        assert_eq!(keeper["State"]["Running"].as_bool(), Some(true), "{keeper}");
+    };
+    running();
+    // Then a joiner that writes a file of its own volume and reads it back through the
+    // share, and ends.
+    started(
+        "writer",
+        json!({ "Image": image, "Cmd": ["fs", "write:/work/hello=hi", "print:/work/hello"],
+                "HostConfig": { "Binds": ["data:/work"] } }),
+    );
+    let (_, waited) = api("POST", "/containers/writer/wait", &Value::Null);
+    // What holds the volume's files as the writer's end is told: on Windows each file with
+    // the processes that use it ([`left_of`]); nothing elsewhere.
+    let volume = home.join("volumes").join("prov.data");
+    let held = left_of(&volume);
+    let logs = exec_in(&["api", "GET", "/containers/writer/logs?stdout=1&stderr=1", ""]).stdout;
+    assert_eq!(waited["StatusCode"].as_i64(), Some(0), "{logs}");
+    assert!(logs.contains("hi"), "{logs}");
+    // Its volume goes while the keeper still runs, the share's session up; each step timed, for
+    // what a failure says.
+    let timed = |method: &str, path: &str| {
+        let began = std::time::Instant::now();
+        let (status, said) = api(method, path, &Value::Null);
+        (status, said, began.elapsed())
+    };
+    let (gone, gone_said, gone_took) = timed("DELETE", "/containers/writer");
+    let (status, said, took) = timed("DELETE", "/volumes/data");
+    let daemon_said = || {
+        std::fs::read_to_string(home.join("daemon.log")).map_or_else(
+            |e| format!("daemon.log: {e}"),
+            |log| {
+                log.lines()
+                    .filter(|l| l.contains("short of memory") || l.contains("giving back"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+        )
+    };
+    assert!(
+        !held.contains("shards-vm"),
+        "the writer's end was told while its provider's VM still held its volume's files, the \
+         share's session kept up by the keeper (D197):\n{held}\n--- the writer's log\n{}\n--- then: \
+         DELETE /containers/writer {gone} {gone_said} in {gone_took:?}; DELETE /volumes/data \
+         {status} {said} in {took:?}\n--- the daemon's give-backs\n{}",
+        logs.escape_debug(),
+        daemon_said()
+    );
+    assert!(gone.starts_with("api HTTP/1.1 204"), "{gone} {gone_said}");
+    assert!(
+        status.starts_with("api HTTP/1.1 204"),
+        "{status} {said}\n{}\n--- the writer's log\n{}",
+        left_of(&volume),
+        logs.escape_debug()
+    );
+    running();
+    let removed = shards(&["rm", "-f", "prov"]);
     assert_eq!(removed.status, Some(0), "{removed}");
 }
 

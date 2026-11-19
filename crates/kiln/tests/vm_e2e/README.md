@@ -38,7 +38,7 @@ Then where it ran:
 
 | Acceptance | Check | Read from |
 |---|---|---|
-| the negotiated suite is `TLS13_AES_256_GCM_SHA384` on every link, both ends | `check_all_links`: every link of `REQUIRED_LINKS` (`server-runner`, `agent-control`, `mcp`) read, and every link read at both ends; checked after every other check, and failed by a gap's name where kiln's word on the session names one (`check_links`, `LinkGap`: "Hex reports no agent-control link") | `VM_E2E_LINKS` (below); a required link not read is a failure |
+| the negotiated suite is `TLS13_AES_256_GCM_SHA384` on every link, both ends | `check_all_links`: every link of `REQUIRED_LINKS` (`server-runner`, `agent-control`, `mcp`) read, and every link read at both ends; checked after every other check, and failed by a gap's name where kiln's word on the session names one (`check_links`, `LinkGap`: "kiln has no /runs/control for this microVM's run") | `VM_E2E_LINKS` (below); a required link not read is a failure |
 | nothing ran outside the microVMs | `harnesses_on_host`: no harness process in the session's process trees on the host (the runner's, and `VM_E2E_HOST_ROOTS`') at any of the drive's looks; `check_in_guest`: the kernel the harness's own shell said is Linux, and on a Linux host a boot other than the host's (a container shares the host's); `check_no_host_pid` and `check_starts`: kiln says the session runs in a microVM holding no process of the host, and every start of its harness was in one, so a harness that ran on the host and ended between two looks is found | `ps` (Linux, macOS) or CIM's `Win32_Process` (Windows); the harness's `WHERE <uname -s> <boot id>` line; the session's `/runs` and `/starts` (kiln plan step 17), read just before it is stopped and after its resumed turn |
 | the project at its host path | `check_project_path`: kiln's `cwd` is the host path, and the harness's own `CWD <path>` is that path as its guest sees it (the same path on Linux and macOS; Shards D235's WSL form on Windows, `C:\X` at `/mnt/c/X`); `check_written`: the file the harness wrote in its project (`{file}`, its name its words) is at the host path | `GET /api/harness/sessions/<id>`, the timeline, the host's file |
 | the harness reaches its provider | a real task's turns end with ROOT's marker, which only the model's answer says | the timeline |
@@ -201,7 +201,8 @@ it, the surface step 34's check reads, and the evidence, at kiln main 562268830 
    of it (`Runtime::link`, on Shards' `Linked::report`, 8c9c03cc4; in the Hex kiln vendors since
    992c5a33a), which `HexRun::link` maps; that link carries none of its stdio, which Hex takes from the
    image channel. `in_microvm` checks the links after every other check and fails missing ones by that
-   name (`vm_e2e::LinkGap`); gaps.json lists no `link_report` gap since `HexRun::link` maps Hex's report.
+   name (`vm_e2e::LinkGap`); gaps.json lists no `link_report` gap since `HexRun::link` maps Hex's report,
+   seen live on WHP (r41) and not yet on HVF or KVM.
    Evidence before it: the session's info (`harness/session.rs`, `Info`) says its
    `isolation` (kind and image) and no links, microVM identity or host pid; step 17's branch
    (`p/s17-launch-seam-v1`, 64dfab21f) reads its process's `host_pid()` inside (`session.rs` 4328 and
