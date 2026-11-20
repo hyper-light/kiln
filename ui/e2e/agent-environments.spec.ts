@@ -298,7 +298,10 @@ test("a card's scope: chips in their own section, added by key and value, taken 
   await expect(scope.getByRole("listitem")).toHaveText(["harness: claude"]);
   // Added: its key from the menu, its value typed (suggested), Enter.
   await scope.getByRole("button", { name: "Add to aws-agents's scope" }).click();
-  await scope.getByRole("combobox", { name: "aws-agents's scope: key" }).selectOption("os");
+  const key = scope.getByRole("combobox", { name: "aws-agents's scope: key" });
+  await key.selectOption("os");
+  // As wide as its key and its arrow, in every engine (not its longest option's width).
+  expect((await key.boundingBox())!.width).toBeLessThan(50);
   let sent = patched();
   await scope.getByRole("combobox", { name: "aws-agents's scope: os" }).fill("linux");
   await scope.getByRole("combobox", { name: "aws-agents's scope: os" }).press("Enter");

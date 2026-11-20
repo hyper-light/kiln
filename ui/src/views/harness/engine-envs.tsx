@@ -391,6 +391,7 @@ function AddChip({ label, facts, onAdd }: { label: string; facts: AgentenvFacts;
       <select
         ref={opened}
         className="ev-tag ev-chipkey"
+        style={{ "--n": chip.key.length } as React.CSSProperties}
         value={chip.key}
         aria-label={`${label}: key`}
         onChange={(x) => {
