@@ -21,11 +21,11 @@
 //!
 //! It judges what holds, not how fast: no latency is judged. Each flow waits on the fleet's own failover delay as its
 //! nodes report it (`daemon_status`), never a number of its own. Gated by `SLATES_FLEET_FAULTS=1`, since each flow starts
-//! three Slates instances and their anchors; without it each skips, saying so. The flows that signal a daemon under its live
-//! mounts (partitioned, restarted, a move's target cut) run on Linux alone, where a workspace is a FUSE mount: on macOS it's a
+//! three Slates instances and their anchors; without it each skips, saying so. The flow that signals a daemon under its live
+//! mounts (a move's target cut) runs on Linux alone, where a workspace is a FUSE mount: on macOS it's a
 //! kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has panicked the Mac (Slates'
-//! record of 2026-10-06). The link faults (A-708) signal no daemon, and the killed runner's flow lets every mount under the owner's
-//! runner go before its kill (A-750), so they run on macOS too ([`Fault`]); there, as
+//! record of 2026-10-06). The link faults (A-708) signal no daemon, and the killed, partitioned and restarted runners' flows let every
+//! mount under the runner go before its signal (A-750), so they run on macOS too ([`Fault`]); there, as
 //! everywhere, the lab's end stops its runners and unmounts every Slates mount under its folder before it ends an
 //! instance, and leaves the instances running, saying so, where a mount won't go (as `slates_e2e`'s drives do).
 //!
@@ -247,6 +247,17 @@ impl Lab {
         Ok(())
     }
 
+    /// Runner `i` stopped and every Slates mount under its folder let go (A-750): no NFS mount stands over its instance's
+    /// daemon, so a signal to it panics no Mac. Fails, signalling nothing, when a mount won't go.
+    fn let_runner_and_mounts_go(&mut self, i: usize) -> anyhow::Result<()> {
+        let name = self.node(i)?.name;
+        self.fleet.stop_runner(name);
+        let root = std::fs::canonicalize(self.fleet.root.path().join(name)).unwrap_or_else(|_| self.fleet.root.path().join(name));
+        let left = unmount_under(&root);
+        anyhow::ensure!(left.is_empty(), "{name}'s mounts wouldn't go, so its daemon isn't signalled beneath them: {left:?}");
+        Ok(())
+    }
+
     /// Waits until every node's daemon counts every node of the lab among its fleet's members: one fleet of three, where
     /// each node serving as a member of its own (`until_reformed`) was also three fleets of one (A-734).
     fn until_one_fleet(&self) -> anyhow::Result<()> {
@@ -404,11 +415,13 @@ impl Lab {
             std::thread::sleep(LOOK);
         };
         // `agents.start` answers `{"agents": [brief], "parent"}` (harness/ops.rs `start_ask`).
-        let id = ["/agents/0/id"]
-            .iter()
-            .find_map(|p| started.pointer(p).and_then(Value::as_str))
-            .ok_or_else(|| anyhow::anyhow!("kiln named no session for the agent it started: {started}"))?
-            .to_owned();
+        let id = match started.pointer("/agents/0/id").and_then(Value::as_str) {
+            Some(id) => id.to_owned(),
+            // Queued for room on its runner ("it starts there as soon as there's room, and agents_list shows it then"):
+            // the agent `agents.list` shows on that runner in the lab's project, once it does.
+            None if started.get("queued").is_some() => self.queued_agent(&on)?,
+            None => anyhow::bail!("kiln named no session for the agent it started: {started}"),
+        };
         let began = Instant::now();
         loop {
             let info = self.agent(&id)?;
@@ -435,6 +448,27 @@ impl Lab {
         let mut out = None;
         said(&events, &mut out);
         Ok(out)
+    }
+
+    /// The agent a queued `agents.start` started on machine `on` in the lab's project, once `agents.list` shows it.
+    fn queued_agent(&self, on: &str) -> anyhow::Result<String> {
+        let project = self.project.to_string_lossy().into_owned();
+        let began = Instant::now();
+        loop {
+            let listed = self.fleet.call("POST", "/api/ops/agents.list", Some(&json!({})))?;
+            let found = listed.get("agents").and_then(Value::as_array).and_then(|agents| {
+                agents.iter().find_map(|a| {
+                    let here = a.get("machine").and_then(Value::as_str) == Some(on) && a.get("cwd").and_then(Value::as_str) == Some(project.as_str());
+                    here.then(|| a.get("id").and_then(Value::as_str).map(str::to_owned)).flatten()
+                })
+            });
+            if let Some(id) = found {
+                eprintln!("PROVEN: the queued start began: agent {id} ({:?})", began.elapsed());
+                return Ok(id);
+            }
+            anyhow::ensure!(began.elapsed() < WITHIN, "the queued start on {on} never began: {listed}");
+            std::thread::sleep(LOOK);
+        }
     }
 
     /// kiln's word on agent `id` (`agents.get`).
@@ -652,50 +686,51 @@ fn w7_a_killed_runner_loses_no_acknowledged_change_and_the_fleet_reforms() -> an
     let (_agent, volume) = lab.start_agent(0)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "killed")?;
     no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "read through the other runners before the kill")?;
-    let name = lab.node(0)?.name;
-    lab.fleet.stop_runner(name);
-    let root = std::fs::canonicalize(lab.fleet.root.path().join(name)).unwrap_or_else(|_| lab.fleet.root.path().join(name));
-    let left = unmount_under(&root);
-    anyhow::ensure!(left.is_empty(), "{name}'s mounts wouldn't go, so its daemon isn't killed beneath them: {left:?}");
+    lab.let_runner_and_mounts_go(0)?;
     lab.signal(0, "KILL")?;
     no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "the owner's runner killed")?;
     lab.start_runner(0)?;
     lab.until_reformed("after the owner's runner killed")
 }
 
-/// W7, A-580: a runner partitioned. Do: write acknowledged files on the first runner; stop its instance's anchor and
-/// daemon past the fleet's failover delay as its nodes report it; let them go on. Expect every acknowledged file served
-/// byte for byte throughout what follows, and the fleet re-formed.
+/// W7, A-580, A-750: a runner partitioned. Do: write acknowledged files on the first runner; stop its runner and let
+/// every mount under it go; stop its instance's anchor and daemon past the fleet's failover delay as its nodes report
+/// it, reading the files through the other two meanwhile; let them go on; start its runner again. Expect every
+/// acknowledged file served byte for byte by the survivors while it is stopped and by any node after, and the fleet
+/// re-formed. With its mounts gone first it runs on macOS too.
 #[test]
 fn w7_a_partitioned_runner_loses_no_acknowledged_change_and_the_fleet_reforms() -> anyhow::Result<()> {
-    if !enabled(Fault::Signal) {
+    if !enabled(Fault::Unmounted) {
         return Ok(());
     }
-    let lab = Lab::start()?;
+    let mut lab = Lab::start()?;
     let (_agent, volume) = lab.start_agent(0)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "partitioned")?;
+    no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "read through the other runners before the partition")?;
     let held = lab.failover(1)?;
+    lab.let_runner_and_mounts_go(0)?;
     lab.signal(0, "STOP")?;
     std::thread::sleep(held.saturating_add(held));
-    no_acknowledged_change_lost(&lab, volume, &acknowledged, "a runner partitioned")?;
+    no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "a runner partitioned")?;
     lab.signal(0, "CONT")?;
+    lab.start_runner(0)?;
     no_acknowledged_change_lost(&lab, volume, &acknowledged, "a partitioned runner back")?;
     lab.until_reformed("after a runner partitioned")
 }
 
-/// W7, A-580: a runner restarted. Do: write acknowledged files on the first runner; stop its runner, end its daemon so
-/// its anchor starts another (the volume in the anchor's memory), start its runner again. Expect every acknowledged file
-/// served byte for byte, and the fleet re-formed with the runner back as the same machine.
+/// W7, A-580, A-750: a runner restarted. Do: write acknowledged files on the first runner; stop its runner and let
+/// every mount under it go, end its daemon so its anchor starts another (the volume in the anchor's memory), start its
+/// runner again. Expect every acknowledged file served byte for byte, and the fleet re-formed with the runner back as
+/// the same machine. With its mounts gone first it runs on macOS too.
 #[test]
 fn w7_a_restarted_runner_rejoins_and_loses_no_acknowledged_change() -> anyhow::Result<()> {
-    if !enabled(Fault::Signal) {
+    if !enabled(Fault::Unmounted) {
         return Ok(());
     }
     let mut lab = Lab::start()?;
     let (_agent, volume) = lab.start_agent(0)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "restarted")?;
-    let name = lab.node(0)?.name;
-    lab.fleet.stop_runner(name);
+    lab.let_runner_and_mounts_go(0)?;
     let daemon = slates_api::Instance::attach(&lab.node(0)?.instance).and_then(|mut i| i.daemon_status()).map_err(|e| anyhow::anyhow!("{e}"))?.pid;
     let status = Command::new("kill").args(["-KILL", &daemon.to_string()]).status()?;
     anyhow::ensure!(status.success(), "kill -KILL {daemon}: {status}");

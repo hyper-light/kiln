@@ -1,7 +1,7 @@
 //! A Windows folder's place, judged from its text as Windows judges it, on any host (docs/agentic.md, "W8 on Linux KVM
 //! and Windows WHP", piece 2; UI goal 88, kiln goal part 01a1f1249c5e75b5bc82c9eb011550f4). An isolated session on a
-//! Windows runner sees its project at its path as WSL names it (`/mnt/c/…`, Shards' D235) in its microVM
-//! (`super::isolated::guest_path`), and its
+//! Windows runner sees its project where WSL names it in its microVM (`C:\Users\ada\proj` at `/mnt/c/Users/ada/proj`,
+//! `super::isolated::guest_path`, Shards' D235 and D277), and its
 //! harness is told each folder of the machine's beneath that project as the microVM sees it (`super::isolated::Seen`),
 //! its working folder first (`super::isolated::served_project`). Where its workspace is a volume laid over a
 //! repository, the project's top is git's (`git rev-parse --show-toplevel`), which Git for Windows resolves on its disk
@@ -236,10 +236,11 @@ mod tests {
     /// a repository whose top Git for Windows writes `C:/Users/ada/proj`, works in `C:\Users\ada\proj\crates\kiln`; its
     /// harness is told that folder, and each place beneath its project however Windows spells it, as its microVM sees
     /// it. Do take its served project and its working folder, the folder its harness is told, and what it's told of
-    /// paths spelled each way; and a session working on a share. Expect its volume served where WSL names the folder it
-    /// lies over (`/mnt/c/Users/ada/proj`, `guest_path`, Shards' D235) and its working folder
+    /// paths spelled each way; and the same of a session working on a share. Expect its volume served at
+    /// `/mnt/c/Users/ada/proj`, where WSL names the folder it lies over (`guest_path`), and its working folder
     /// `/mnt/c/Users/ada/proj/crates/kiln`, which its harness is told; each spelling of a place beneath the project said
-    /// at that place; each path elsewhere said as it is; and a share, on no drive, seen nowhere in a microVM.
+    /// at that place; each path elsewhere said as it is; and a share's paths, which its microVM sees nowhere (a share is
+    /// on no drive until one is mapped to it), said as they are.
     #[test]
     fn w8_p2_a_windows_projects_folders_are_told_as_its_microvm_sees_them_however_windows_spells_them() -> anyhow::Result<()> {
         let cwd = r"C:\Users\ada\proj\crates\kiln";
@@ -256,7 +257,7 @@ mod tests {
             (r"C:\Users\ada\proj\crates\..\docs", "/mnt/c/Users/ada/proj/docs"),
             (r"C:\Users\ada\project\x", r"C:\Users\ada\project\x"),
             (r"D:\Users\ada\proj\x", r"D:\Users\ada\proj\x"),
-            ("/mnt/c/Users/ada/proj/src", "/mnt/c/Users/ada/proj/src"),
+            ("/work/proj/src", "/work/proj/src"),
         ] {
             assert_eq!(said(seen.as_ref(), path), told, "{path}");
         }
@@ -264,10 +265,12 @@ mod tests {
         let (served, folder) = served_project(&spec, cwd, &harness).map_err(anyhow::Error::msg)?.ok_or_else(|| anyhow::anyhow!("its workspace's volume isn't served"))?;
         assert_eq!(served.at, "/mnt/c/Users/ada/proj", "its volume, where its microVM sees the folder it lies over");
         assert_eq!(folder, "/mnt/c/Users/ada/proj/crates/kiln", "its working folder, at the same place in it");
-        // A session working on a share, which is on no drive until one is mapped to it: its microVM sees it nowhere
-        // (`guest_path` refuses it, and its launch with it), so its harness is told nothing of it.
+        // A session working on a share, which its microVM sees nowhere: each of its paths said as it is.
         let on_share = Spec { kind: "codex".into(), cwd: Some(r"\\server\share\repo".into()), isolation: Some(Isolation::microvm()), ..Spec::default() };
-        assert_eq!(Seen::of(&on_share), None, "a share is on no drive its microVM sees");
+        let seen = Seen::of(&on_share);
+        for (path, told) in [(r"\\?\UNC\SERVER\Share\repo\x", r"\\?\UNC\SERVER\Share\repo\x"), ("//server/share/repo", "//server/share/repo"), (r"\\server\other\repo", r"\\server\other\repo")] {
+            assert_eq!(said(seen.as_ref(), path), told, "{path}");
+        }
         Ok(())
     }
 }

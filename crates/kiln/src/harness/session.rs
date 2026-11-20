@@ -3272,6 +3272,10 @@ fn again(ran: Ran, slowest: Option<Duration>) -> Again {
     }
 }
 
+/// The words that say kiln stopped starting a harness again after its end ([`halt_words`]): its end is final until a
+/// person restarts it or sends it a message, so a waiter reading kiln's word on it waits no longer.
+pub const STOPPED_STARTING: &str = "so kiln stopped starting it again";
+
 /// Why kiln stopped starting a harness again, in words, `how` how its process ended and
 /// `slowest` the slowest start of its kind that got ready here.
 fn halt_words(halt: Halt, how: &str, slowest: Option<Duration>) -> Option<String> {
@@ -3281,8 +3285,8 @@ fn halt_words(halt: Halt, how: &str, slowest: Option<Duration>) -> Option<String
     };
     match halt {
         Halt::NeverLaunched => None,
-        Halt::NeverReady => Some(format!("Its process ended before it was ready ({how}) after kiln started it again, so kiln stopped starting it again: a start that never gets ready makes no progress ({record}). Send a message or restart it.")),
-        Halt::CutAgain => Some(format!("Its process ended ({how}) part-way through the turn kiln started it again to pick up, no turn ending in between, so kiln stopped starting it again: that turn makes no progress. Send a message or restart it.")),
+        Halt::NeverReady => Some(format!("Its process ended before it was ready ({how}) after kiln started it again, {STOPPED_STARTING}: a start that never gets ready makes no progress ({record}). Send a message or restart it.")),
+        Halt::CutAgain => Some(format!("Its process ended ({how}) part-way through the turn kiln started it again to pick up, no turn ending in between, {STOPPED_STARTING}: that turn makes no progress. Send a message or restart it.")),
     }
 }
 /// What an agent is told when its process ended part-way through a turn and started again.

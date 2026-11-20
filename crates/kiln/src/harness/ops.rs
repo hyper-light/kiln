@@ -643,6 +643,12 @@ fn workspace_shown(w: &crate::workspace::Workspace) -> Value {
 
 async fn workspace(cx: Cx, v: Value) -> Out {
     let info = seen(&cx, &agent_of(&v)?).await?;
+    // A session in an agent's pod: its workspace is held at its home by its id, which answers its drift (docs/agentic.md W10).
+    if crate::k8s::agent::held_at_home(&cx.hub, &info) {
+        let look = crate::workspace::change::ask_machine(&cx.hub, &info, &crate::workspace::Ask::Look).await?;
+        let home = crate::k8s::agent::home_of(&cx.hub, crate::harness::wait::machine(&info.target)).map(|h| cx.hub.shown(&h));
+        return Ok(json!({"workspace": {"kind": "volume", "over": info.cwd, "held_by": home}, "drift": look.get("drift").cloned().unwrap_or(json!([]))}));
+    }
     let Some(w) = info.workspace.clone() else {
         return Ok(json!({"workspace": Value::Null, "drift": []}));
     };
@@ -701,7 +707,8 @@ async fn commits(cx: Cx, v: Value) -> Out {
 async fn land(cx: Cx, v: Value) -> Out {
     let info = known(&cx, &agent_of(&v)?)?;
     may_steer(&cx, &info.id).await?;
-    if info.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
+    // A session in an agent's pod works in a workspace its home holds by its id (docs/agentic.md W10), named on none of its own.
+    if info.workspace.as_ref().is_none_or(|w| w.made.is_none()) && !crate::k8s::agent::held_at_home(&cx.hub, &info) {
         return Err((StatusCode::CONFLICT, format!("{} works in its folder itself: what it changed is there already", info.name)));
     }
     // A volume lands whole, so an agent working in another's lands nothing of its own while that one works: its work

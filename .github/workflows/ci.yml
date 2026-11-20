@@ -111,8 +111,12 @@ jobs:
         run: cargo test -p kiln --locked
 
   build:
-    name: ${{ matrix.os }} (clippy, build, Slates tests)
+    name: ${{ matrix.os }} (clippy, build)
     needs: ui
+    # Bounded: macos-latest's Clippy ran past two hours in run 44784299374 (a 7 GB runner; kiln's crate takes 7 GiB
+    # and more), and while a leg runs, every newer push's run waits in the one pending place and is cancelled by
+    # the next (44790740630 to 44802263763 all were): GitHub's own limit is six hours.
+    timeout-minutes: 90
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
@@ -156,31 +160,19 @@ jobs:
         name: Clippy
         shell: bash
         run: cargo clippy -p kiln --all-targets --locked -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
-      # The build and the Slates tests run whatever clippy said: a lint is no reason not to know whether kiln
-      # builds and drives the Slates it vendors on this platform (kiln goal 90, part 01a1ec34).
+      # The build runs whatever clippy said: a lint is no reason not to know whether kiln builds here.
       - id: build
         name: Build
         if: ${{ !cancelled() }}
         shell: bash
         run: cargo build -p kiln --locked 2>&1 | tee "$RUNNER_TEMP/build.txt"
-      # kiln's use of vendor/slates on this platform, natively: workspace::slates* (kiln's side of Slates' consumer
-      # contract, its fleet, moves and faults), `vendored` (one revision of each vendored crate in Cargo.lock) and
-      # `slates_roles` (kiln's own executable runs the instance's anchor and daemon, driven through the library; no
-      # Slates binary runs). windows-latest runs them in the windows-slates job, with WinFsp.
-      - id: slates
-        name: Slates tests
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.os != 'windows-latest' }}
-        shell: bash
-        run: |
-          set -o pipefail
-          { cargo test -p kiln --locked --lib -- workspace::slates && cargo test -p kiln --locked --test vendored --test slates_roles; } 2>&1 | tee "$RUNNER_TEMP/slates.txt"
       # A run's logs take a GitHub sign-in to read; its annotations don't. A failed step's first
       # errors, without cargo's progress, as one annotation (the priority checks' Report, below).
       - name: Report
         if: ${{ failure() }}
         shell: bash
         env:
-          OUTCOMES: clippy=${{ steps.clippy.outcome }} build=${{ steps.build.outcome }} slates=${{ steps.slates.outcome }}
+          OUTCOMES: clippy=${{ steps.clippy.outcome }} build=${{ steps.build.outcome }}
         run: |
           set +e +o pipefail
           for said in $OUTCOMES; do
@@ -190,6 +182,72 @@ jobs:
             text=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Checking|Blocking|Downloaded|Downloading|Updating|Locking) ' | awk '/^(error|warning)/ { f = 1 } f' | head -n 200)
             echo "::error title=${{ matrix.os }} $step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
           done
+
+  # kiln goal 90, part 01a1ec34: kiln builds the Slates it vendors (vendor/slates at vendor/MANIFEST.toml's commit) and
+  # tests its use of it natively on every platform it ships, each on GitHub's own runner of that platform, apart from
+  # clippy (the `build` job's), so a lint elsewhere never hides whether it builds and drives Slates here. The tests:
+  # workspace::slates* (kiln's side of Slates' consumer contract, its fleet, moves and faults), `vendored` (one
+  # revision of each vendored crate in Cargo.lock) and `slates_roles` (kiln's own executable runs the instance's anchor
+  # and daemon, driven through the library; no Slates binary runs). Windows on x86-64 is the windows-slates job's,
+  # with WinFsp.
+  slates:
+    name: ${{ matrix.os }} (Slates build and tests)
+    needs: ui
+    # Bounded, at what the lanes take: in run 44807509237 (a82ce7ede) windows-11-arm built kiln in 62 min and ran
+    # the library's Slates tests green in 52, then was stopped 5 min into the integration tests at 120; macos-latest
+    # built in 98 min and was stopped in the library's tests.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # As the `build` job: aws-lc-sys builds with clang-cl on arm64 Windows, never MSVC's cl.exe.
+      - name: clang-cl for the C kiln links (arm64 Windows)
+        if: ${{ matrix.os == 'windows-11-arm' }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # GitHub's Linux images leave ~14 GB free on /, less than kiln's target takes: in run 44807509237 both Linux
+      # lanes lost their runner ~23 min into the build (exit 143). The image's unused SDKs make room; the VM is
+      # GitHub's and thrown away after the job.
+      - name: Room on disk (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # One at a time: kiln's crate compiled twice at once (the library, and the library as its tests) ran a 16 GB
+      # runner out (the linux job).
+      - name: Build kiln with vendor/slates
+        run: cargo build -p kiln --locked
+      - name: kiln's Slates tests (library)
+        run: cargo test -p kiln --locked --lib -- workspace::slates
+      - name: kiln's Slates tests (vendored, slates_roles)
+        run: cargo test -p kiln --locked --test vendored --test slates_roles
 
   # Goal 3 step 1 and goal 8 step 4, on Windows itself (the `build` job only builds there, and the
   # release's Windows binary is cross-built with zig): the compute pool's threads run below normal,

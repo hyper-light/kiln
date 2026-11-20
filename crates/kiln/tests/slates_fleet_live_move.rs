@@ -23,6 +23,8 @@
 //!   each started there through `kiln run --on <runner> --no-sync` (this build's `kiln` and the stand-in fetched from a
 //!   file server of the test's own; nodes at LAN addresses; `SLATES_FLEET_LIVE_MOVE_HOST` is this machine's address the
 //!   others reach). The agent moves from this machine to runner B; runner C is the fleet's third node.
+//! - `<runner B>`: the same with the third runner on this machine beside the first, where only one other Mac reaches this
+//!   one: the move still crosses machines, from this one to runner B.
 //!
 //! Unset, the test skips, saying so. Teardown: the agent is stopped first, and no Slates process is signalled on a
 //! machine while its host's mount table lists a mount under the test's folder there (a daemon killed under a live macOS
@@ -58,7 +60,9 @@ const NAMES: [&str; 3] = ["live-a", "live-b", "live-c"];
 const WITHIN: Duration = Duration::from_secs(600);
 const LOOK: Duration = Duration::from_millis(500);
 /// The first turn's words and the second's (the stand-in's, `tests/fixtures/vm-stub/harness/stub`).
-const FIRST: &str = "WRITE=made.txt APPEND=README.md REMOVE=gone.txt";
+/// Each word once across both, and none of the second's in the first: the stand-in acts on the first of each word it
+/// hears, and the second runner's turn hears kiln's hand-off, which quotes the first turn's words, before its own.
+const FIRST: &str = "WRITE=made.txt REMOVE=gone.txt";
 /// The harness the stand-in plays: an ACP one, whose conversation kiln carries in words from its own timeline when the
 /// agent moves (`harness::moving::record`). Claude Code's moves carry its own transcript file, which the stand-in (no
 /// model) never writes, so a stand-in `claude` can't move ("Claude Code's record of session ... is not on this machine").
@@ -69,7 +73,7 @@ const PREPARE_S: u32 = 1800;
 const MOVES: usize = 10;
 /// How long the test waits on one ask to move before asking again.
 const ASK_AGAIN: Duration = Duration::from_secs(30);
-const SECOND: &str = "WRITE=on-b.txt APPEND=made.txt";
+const SECOND: &str = "APPEND=made.txt";
 
 /// The pure checks: what the switch says, what a remote preparation printed, and the files the moved volume holds.
 mod checks {
@@ -77,7 +81,8 @@ mod checks {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Mode {
         Local,
-        Remote { b: String, c: String },
+        /// The second runner on production runner `b`; the third on `c`, or on this machine beside the first.
+        Remote { b: String, c: Option<String> },
     }
 
     /// The switch's word: `local`, or two runner names comma-separated; none, or anything else, says why.
@@ -87,8 +92,9 @@ mod checks {
             return Ok(Mode::Local);
         }
         match said.split(',').map(str::trim).collect::<Vec<_>>().as_slice() {
-            [b, c] if !b.is_empty() && !c.is_empty() && b != c => Ok(Mode::Remote { b: (*b).to_owned(), c: (*c).to_owned() }),
-            _ => Err(format!("{said:?} is neither `local` nor two runner names, comma-separated")),
+            [b] if !b.is_empty() => Ok(Mode::Remote { b: (*b).to_owned(), c: None }),
+            [b, c] if !b.is_empty() && !c.is_empty() && b != c => Ok(Mode::Remote { b: (*b).to_owned(), c: Some((*c).to_owned()) }),
+            _ => Err(format!("{said:?} is neither `local` nor one or two runner names, comma-separated")),
         }
     }
 
@@ -132,14 +138,13 @@ mod checks {
         files
     }
 
-    /// What the moved volume holds: the project as it was, its first turn's three edits and its second's two.
+    /// What the moved volume holds: the project as it was with its first turn's two edits and its second's append to the
+    /// file the first wrote. A hand-off the second turn hears replays the first turn's write and removal before it (the
+    /// stand-in acts on the first of each word), which leaves the same files: `made.txt` written again, then appended to.
     pub fn expected() -> std::collections::BTreeMap<String, Option<String>> {
         [
-            // Appended on the first runner, and again by the hand-off turn on the second, which hears the first turn's words
-            // (kiln carries an ACP agent's conversation in words): two lines prove the first append moved.
-            ("README.md", Some("the project\nAPPENDED README.md\nAPPENDED README.md\n")),
+            ("README.md", Some("the project\n")),
             ("made.txt", Some("made.txt\nAPPENDED made.txt\n")),
-            ("on-b.txt", Some("on-b.txt\n")),
             ("src/lib.rs", Some("pub fn f() {}\n")),
             ("gone.txt", None),
         ]
@@ -237,9 +242,9 @@ mod checks {
         #[test]
         fn k4_live_move_the_switch_says_where_the_runners_run() {
             assert_eq!(mode(Some("local")), Ok(Mode::Local));
-            assert_eq!(mode(Some(" b.local , c.local ")), Ok(Mode::Remote { b: "b.local".into(), c: "c.local".into() }));
+            assert_eq!(mode(Some(" b.local , c.local ")), Ok(Mode::Remote { b: "b.local".into(), c: Some("c.local".into()) }));
+            assert_eq!(mode(Some("b.local")), Ok(Mode::Remote { b: "b.local".into(), c: None }), "the third runner beside the first");
             assert!(mode(None).is_err());
-            assert!(mode(Some("b.local")).is_err());
             assert!(mode(Some("b.local,b.local")).is_err());
             assert!(mode(Some("a,b,c")).is_err());
         }
@@ -256,10 +261,12 @@ mod checks {
 
         #[test]
         fn k4_live_move_a_listing_reads_back_each_file_or_its_absence() {
-            let out = "== README.md\nthe project\nAPPENDED README.md\nAPPENDED README.md\n== made.txt\nmade.txt\nAPPENDED made.txt\n== on-b.txt\non-b.txt\n== src/lib.rs\npub fn f() {}\n-- absent gone.txt\n";
+            let out = "== README.md\nthe project\n== made.txt\nmade.txt\nAPPENDED made.txt\n== src/lib.rs\npub fn f() {}\n-- absent gone.txt\n";
             assert_eq!(listing(out), expected());
             let short = "== README.md\nthe project\n-- absent gone.txt\n";
             assert_ne!(listing(short), expected());
+            let not_moved = "== README.md\nthe project\n== made.txt\nAPPENDED made.txt\n== src/lib.rs\npub fn f() {}\n-- absent gone.txt\n";
+            assert_ne!(listing(not_moved), expected(), "an append to a made.txt that didn't move");
         }
 
         #[test]
@@ -358,9 +365,17 @@ impl Files {
                 };
                 let _ = s.set_nonblocking(false);
                 let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-                let mut head = [0_u8; 1024];
-                let n = s.read(&mut head).unwrap_or(0);
-                let line = String::from_utf8_lossy(head.get(..n).unwrap_or_default()).lines().next().unwrap_or_default().to_owned();
+                // The request read until its headers end (a request line can arrive split across segments on a LAN,
+                // seen 2026-11-20 as a 404 for the binary), at most 8 KiB.
+                let mut head: Vec<u8> = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while head.len() < 8192 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                    }
+                }
+                let line = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_owned();
                 let path = line.split_whitespace().nth(1).unwrap_or_default().to_owned();
                 let body = match path.as_str() {
                     "/kiln.gz" => Some(gz.clone()),
@@ -410,7 +425,8 @@ fn on(runner: &str, script: &str, timeout_s: u32) -> anyhow::Result<String> {
             return Ok(text);
         }
         let said = String::from_utf8_lossy(&out.stderr).into_owned();
-        if tries < 5 && checks::kiln_unreached(&said) {
+        // kiln says it on either stream (`kiln run` writes its own errors to its standard output too).
+        if tries < 5 && (checks::kiln_unreached(&said) || checks::kiln_unreached(&text)) {
             eprintln!("WAITED: kiln didn't reach {runner} (try {tries}): {}", said.trim().chars().take(200).collect::<String>());
             std::thread::sleep(Duration::from_secs(20));
             continue;
@@ -509,7 +525,7 @@ impl Lab {
         lab.nodes.push(Node { name: a, machine: common::machine(a), instance: instance(a), address: format!("{host}:{}", two_ports(&host)?), at: At::Here, otlp: common::free_port()? });
         let remotes: Vec<(&'static str, Option<String>)> = match mode {
             Mode::Local => vec![(name_b, None), (name_c, None)],
-            Mode::Remote { b, c } => vec![(name_b, Some(b.clone())), (name_c, Some(c.clone()))],
+            Mode::Remote { b, c } => vec![(name_b, Some(b.clone())), (name_c, c.clone())],
         };
         // The server first (its join token is what the remote machines fetch), its fleet listing filled in below.
         let mut prepared: Vec<(&'static str, Option<(String, String, Prepared)>)> = Vec::new();
@@ -531,7 +547,11 @@ impl Lab {
             let url = format!("http://{host}:{}", files.port);
             lab.files = Some(files);
             for (name, runner) in &remotes {
-                let runner = runner.clone().ok_or_else(|| anyhow::anyhow!("no runner for {name}"))?;
+                // The third runner beside the first, on this machine, where no production runner is named for it.
+                let Some(runner) = runner.clone() else {
+                    prepared.push((name, None));
+                    continue;
+                };
                 let dir = format!("$HOME/.cache/kiln-live-move/{run}-{name}");
                 let out = match on(&runner, &format!("{}; echo \"LIVE_MOVE_DIR $d\"", preparation(&dir, &url, &host)), PREPARE_S) {
                     Ok(out) => out,
@@ -562,11 +582,13 @@ impl Lab {
         write_config(&lab, &listed)?;
         lab.fleet.start_server()?;
         lab.fleet.admin = std::fs::read_to_string(data.join("admin.token"))?.trim().to_owned();
-        // One at a time, each once the ones before it are connected and joined: the server answers a joining node with
-        // the nodes of connected runners only, so runners started together each hear only themselves and form fleets
-        // of one that never merge (seen 2026-11-19: `nodes=1` in each one's manifest, members 1 for ten minutes).
+        // All at once: a listed runner joins once the server's directory lists every node the fleet takes (A-734, which
+        // ended the fleets of one that runners started together each formed), so each is waited for, connected and joined
+        // having heard all of them.
         for i in 0..lab.nodes.len() {
             lab.start_runner(i)?;
+        }
+        for i in 0..lab.nodes.len() {
             let n = lab.node(i)?;
             let log = lab.fleet.root.path().join(format!("{}.log", n.name));
             common::agents::connected(lab.fleet.http, &lab.fleet.admin, n.name, &log, WITHIN).map_err(|e| anyhow::anyhow!("{e:#}\n{}", lab.remote_logs()))?;
@@ -664,7 +686,7 @@ impl Lab {
         }
     }
 
-    /// Waits until runner `i`'s Slates joined kiln's Slates fleet having heard every runner started before it.
+    /// Waits until runner `i`'s Slates joined kiln's Slates fleet having heard every listed runner.
     fn until_joined(&self, i: usize) -> anyhow::Result<()> {
         let n = self.node(i)?;
         let began = Instant::now();
@@ -672,7 +694,7 @@ impl Lab {
             let log = self.log(n);
             let joined = log.lines().filter(|l| l.contains("joins kiln's Slates fleet")).filter_map(|l| checks::nodes_heard(l)).last();
             if let Some(heard) = joined {
-                anyhow::ensure!(heard > i, "{} joined having heard {heard} node(s), not the {} started before it and its own", n.name, i);
+                anyhow::ensure!(heard >= self.nodes.len(), "{} joined having heard {heard} node(s) of {}", n.name, self.nodes.len());
                 eprintln!("PROVEN: {} joined kiln's Slates fleet hearing {heard} node(s) ({:?})", n.name, began.elapsed());
                 return Ok(());
             }
@@ -716,12 +738,22 @@ impl Lab {
         }
     }
 
+    /// Each remote runner's log's end, and every runner's Slates anchor log's end (its daemon's own words, what a stall in
+    /// Slates is read from; the forward lane's repeated floor warning left out): a failure's report.
     fn remote_logs(&self) -> String {
+        const SLATES: &str = "grep -v 'forward lane to' \"$d/state/slates-anchor.log\" | tail -60";
         let mut out = String::new();
         for n in &self.nodes {
-            if let At::There { runner, dir, .. } = &n.at {
-                let tail = on(runner, &format!("tail -40 \"{dir}/runner.log\""), 60).unwrap_or_else(|e| format!("{e:#}"));
-                out.push_str(&format!("--- {} on {runner}\n{tail}\n", n.name));
+            match &n.at {
+                At::There { runner, dir, .. } => {
+                    let tail = on(runner, &format!("d=\"{dir}\"; tail -40 \"$d/runner.log\"; echo '--- its Slates'; {SLATES}"), 60).unwrap_or_else(|e| format!("{e:#}"));
+                    out.push_str(&format!("--- {} on {runner}\n{tail}\n", n.name));
+                }
+                At::Here => {
+                    let d = self.fleet.root.path().join(n.name);
+                    let tail = Command::new("/bin/sh").arg("-c").arg(SLATES).env("d", &d).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+                    out.push_str(&format!("--- {}'s Slates\n{tail}\n", n.name));
+                }
             }
         }
         out
@@ -766,6 +798,23 @@ impl Lab {
     }
 
     /// Waits until the stand-in said [`vm_e2e::STUB_DONE`] `turns` times: every line it said.
+    /// Waits until the stand-in said a line holding `marker` and ended that turn ([`vm_e2e::STUB_DONE`] after it): every
+    /// line it said.
+    fn until_said(&self, id: &str, marker: &str, what: &str) -> anyhow::Result<Vec<String>> {
+        let began = Instant::now();
+        loop {
+            let lines = self.lines(id)?;
+            if lines.iter().skip_while(|l| !l.contains(marker)).any(|l| l.contains(vm_e2e::STUB_DONE)) {
+                return Ok(lines);
+            }
+            let session = self.session(id).unwrap_or(Value::Null);
+            let status = session.get("status").and_then(Value::as_str).unwrap_or_default();
+            anyhow::ensure!(!matches!(status, "exited" | "ended" | "failed"), "{what}: the session {status} first: {session}\n{lines:?}\n{}\n{}", self.fleet.logs(), self.remote_logs());
+            anyhow::ensure!(began.elapsed() < WITHIN, "{what}: never said {marker}: {lines:?}\nkiln's word on the session: {session}\n{}\n{}", self.fleet.logs(), self.remote_logs());
+            std::thread::sleep(LOOK);
+        }
+    }
+
     fn until_turns(&self, id: &str, turns: usize, what: &str) -> anyhow::Result<Vec<String>> {
         let began = Instant::now();
         loop {
@@ -776,7 +825,7 @@ impl Lab {
             let session = self.session(id).unwrap_or(Value::Null);
             let status = session.get("status").and_then(Value::as_str).unwrap_or_default();
             anyhow::ensure!(!matches!(status, "exited" | "ended" | "failed"), "{what}: the session {status} first: {session}\n{lines:?}\n{}\n{}", self.fleet.logs(), self.remote_logs());
-            anyhow::ensure!(began.elapsed() < WITHIN, "{what}: never ended: {lines:?}\n{}\n{}", self.fleet.logs(), self.remote_logs());
+            anyhow::ensure!(began.elapsed() < WITHIN, "{what}: never ended: {lines:?}\nkiln's word on the session: {session}\n{}\n{}", self.fleet.logs(), self.remote_logs());
             std::thread::sleep(LOOK);
         }
     }
@@ -869,7 +918,7 @@ fn make_project(dir: &Path) -> anyhow::Result<()> {
 
 /// The listing of the moved volume's files under `mount` (`checks::listing`'s shape).
 fn listing_script(mount: &str) -> String {
-    format!(r#"cd "{mount}" && for f in README.md made.txt on-b.txt src/lib.rs gone.txt; do if [ -e "$f" ]; then echo "== $f"; cat "$f"; else echo "-- absent $f"; fi; done"#)
+    format!(r#"cd "{mount}" && for f in README.md made.txt src/lib.rs gone.txt; do if [ -e "$f" ]; then echo "== $f"; cat "$f"; else echo "-- absent $f"; fi; done"#)
 }
 
 /// K4, K5: an agent with a live Slates volume, moved by kiln from one runner to another, carries on there with its
@@ -912,7 +961,7 @@ fn k4_k5_an_agent_moved_with_its_live_volume_carries_on_and_the_old_runner_lets_
         }
     };
     eprintln!("PROVEN: the agent started on {} at start {starts} ({:?} after the fleet formed)", name_a, began.elapsed());
-    for want in ["WROTE made.txt", "APPENDED README.md", "REMOVED gone.txt"] {
+    for want in ["WROTE made.txt", "REMOVED gone.txt"] {
         anyhow::ensure!(lines.iter().any(|l| l.contains(want)), "its first turn didn't say {want}: {lines:?}");
     }
     let info = lab.session(&id)?;
@@ -954,20 +1003,17 @@ fn k4_k5_an_agent_moved_with_its_live_volume_carries_on_and_the_old_runner_lets_
     }
     eprintln!("PROVEN: moved: kiln says the agent works on {} at move {asked} ({:?})", name_b, began.elapsed());
 
-    // 4. Carried on. kiln goes on with the moved agent on the second runner with a hand-off turn that carries its
-    // conversation in words, which the stand-in hears and acts on again: its removal finds gone.txt gone (the first
-    // runner's removal moved with the volume) and its append adds a second line. Then a turn of its own, asked there.
-    let lines = lab.until_turns(&id, 2, "its hand-off turn after the move")?;
-    let handoff = checks::turn(&lines, 1);
-    for want in ["kiln_handoff", "REMOVE_FAIL", "APPENDED README.md"] {
-        anyhow::ensure!(handoff.iter().any(|l| l.contains(want)), "its hand-off turn didn't say {want}: {handoff:?}");
-    }
+    // 4. Carried on. The moved agent waits on the second runner for its next message, its conversation carried (an ACP
+    // harness's in words: kiln hands it on with that message, or in a turn of its own before it). Its turn there appends
+    // to the file its first turn wrote; a hand-off it hears replays the first turn's words, whose removal then finds
+    // gone.txt gone (the first runner's removal moved with the volume) and whose append adds a second README line.
     let (code, said) = lab.op("agents.send", &json!({"agent": id, "text": SECOND}))?;
     anyhow::ensure!((200..300).contains(&code), "kiln refused the second turn's message: {code} {said}");
-    let lines = lab.until_turns(&id, 3, "its own turn on the second runner")?;
-    let second = checks::turn(&lines, 2);
-    for want in ["WROTE on-b.txt", "APPENDED made.txt"] {
-        anyhow::ensure!(second.iter().any(|l| l.contains(want)), "its turn on the second runner didn't say {want}: {second:?}");
+    let lines = lab.until_said(&id, "APPENDED made.txt", "its turn on the second runner")?;
+    let second: Vec<String> = lines.iter().skip_while(|l| !l.contains(vm_e2e::STUB_DONE)).skip(1).cloned().collect();
+    anyhow::ensure!(!second.iter().any(|l| l.contains("APPEND_FAIL")), "its turn on the second runner found no made.txt to append to: {second:?}");
+    if second.iter().any(|l| l.contains("kiln_handoff")) {
+        anyhow::ensure!(second.iter().any(|l| l.contains("REMOVE_FAIL")), "the hand-off's replay found gone.txt on the second runner: {second:?}");
     }
     let info = lab.session(&id)?;
     let mount_b = info.pointer("/workspace/made/mount").and_then(Value::as_str).unwrap_or_default().to_owned();

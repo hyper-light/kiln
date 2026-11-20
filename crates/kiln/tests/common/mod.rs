@@ -265,11 +265,16 @@ pub struct Tables<'a> {
     /// How often the server looks at its host and scrapes its own registry (`[observe]
     /// host_seconds`): hourly, unless the test reads what the registry says as it changes.
     pub host_seconds: u32,
+    /// The address the server listens at (`http_addr`, `quic_addr`): loopback, unless something off this machine reaches
+    /// it (a Kubernetes cluster's pods, `k8s_agent_live`). Its public URL stays loopback's.
+    pub listen: &'a str,
+    /// `[kubernetes]`'s keys: off, unless the test runs pods. `{http}` and `{quic}` in them are the server's ports.
+    pub kubernetes: &'a str,
 }
 
 impl Default for Tables<'_> {
     fn default() -> Self {
-        Self { cd: "enabled = false", host_seconds: 3600 }
+        Self { cd: "enabled = false", host_seconds: 3600, listen: "127.0.0.1", kubernetes: "enabled = false" }
     }
 }
 
@@ -297,8 +302,8 @@ impl Fleet {
         let cfg = format!(
             r#"
 [server]
-http_addr = "127.0.0.1:{http}"
-quic_addr = "127.0.0.1:{quic}"
+http_addr = "{listen}:{http}"
+quic_addr = "{listen}:{quic}"
 public_url = "http://127.0.0.1:{http}"
 quic_advertise = "127.0.0.1:{quic}"
 data_dir = {data}
@@ -313,7 +318,7 @@ enabled = false
 enabled = false
 
 [kubernetes]
-enabled = false
+{kubernetes}
 
 [cd]
 {cd}
@@ -333,6 +338,8 @@ host_seconds = {host_seconds}
 "#,
             data = toml_path(&data),
             cd = tables.cd,
+            listen = tables.listen,
+            kubernetes = tables.kubernetes.replace("{http}", &http.to_string()).replace("{quic}", &quic.to_string()),
             host_seconds = tables.host_seconds,
             extra = agents_in_folders(&extra(root.path()))
         );
