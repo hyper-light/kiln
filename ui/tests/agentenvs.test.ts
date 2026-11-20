@@ -1,15 +1,52 @@
-// The Engine tab's Environments, decided (views/harness/agentenv-logic.ts; docs/agents.md, "Environments"):
-// this session's, the facets and sorts, a card's draft to what agentenvs.create and .update take; and the
-// composer's choice carried into the start (`agentenv`).
+// The Engine tab's Environments, decided (views/harness/agentenv-logic.ts, agentenv-scope.ts; docs/agents.md,
+// "Environments", "Scopes, stacks, and applied on its own"): scopes matched as the server matches them (the
+// shared testdata/scope-cases.json), the filter by chips, the facets and sorts, a stack reordered, a card's
+// draft to what agentenvs.create and .update take; and the composer's stack carried into the start (`agentenvs`).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Agentenv } from "../src/api/agentenvs.ts";
+import { readFileSync } from "node:fs";
+import type { Agentenv, AgentenvChip, AgentenvFacts } from "../src/api/agentenvs.ts";
 import { agentenvOf } from "../src/api/agentenvs.ts";
 import { startAsk } from "../src/api/harness.ts";
-import { askOf, changeOf, draftOf, ENV_ORDER, envFacets, envWords, facetsFor, givesOf, mineOf, moved, problemOf, shows, varOf, blankVar } from "../src/views/harness/agentenv-logic.ts";
+import {
+  askOf,
+  AUTO_ORDER,
+  blankVar,
+  changeOf,
+  chipsOf,
+  draftOf,
+  ENV_ORDER,
+  envFacets,
+  envWords,
+  facetsFor,
+  filterShows,
+  givesOf,
+  moved,
+  movedTo,
+  problemOf,
+  shows,
+  suggestionsFor,
+  varOf,
+  withChip,
+} from "../src/views/harness/agentenv-logic.ts";
+import { factsOf, scopeMatches } from "../src/views/harness/agentenv-scope.ts";
 import { specOf } from "../src/views/harness/spawn-setup.ts";
 
-const env = (id: string, over: Partial<Agentenv> = {}): Agentenv => ({ id, owner: "ada", name: id, base: "user", vars: [], tags: [], version: 1, created_at: 0, updated_at: 0, sessions: [], ...over });
+const env = (id: string, over: Partial<Agentenv> = {}): Agentenv => ({
+  id,
+  owner: "ada",
+  name: id,
+  base: "user",
+  vars: [],
+  tags: [],
+  scope: [],
+  auto: false,
+  version: 1,
+  created_at: 0,
+  updated_at: 0,
+  sessions: [],
+  ...over,
+});
 
 const release = env("release", {
   created_at: 30,
@@ -25,12 +62,95 @@ const aws = env("aws", { created_at: 10, vars: [{ name: "AWS_PROFILE", from: "ma
 const clean = env("clean", { created_at: 20, base: "clean", vars: [{ name: "NODE_OPTIONS", from: "unset" }] });
 const all = [release, aws, clean];
 
-test("this session's: the one listing it, else the one its entry names", () => {
-  assert.equal(mineOf(all, "s1", null)?.id, "release");
-  assert.equal(mineOf(all, "s9", { id: "clean", name: "clean", version: 1 })?.id, "clean");
-  assert.equal(mineOf(all, "s9", null), undefined);
-  // The list wins: it's what an apply changes first.
-  assert.equal(mineOf(all, "s1", { id: "clean", name: "clean", version: 1 })?.id, "release");
+const CASES = JSON.parse(readFileSync(new URL("../../crates/kiln/src/agentenvs/testdata/scope-cases.json", import.meta.url), "utf8")) as {
+  name: string;
+  scope: AgentenvChip[];
+  facts: AgentenvFacts;
+  matches: boolean;
+}[];
+
+test("a scope matches a session as the server's does: each of the shared cases", () => {
+  assert.ok(CASES.length > 0);
+  for (const c of CASES) assert.equal(scopeMatches(c.scope, c.facts), c.matches, c.name);
+});
+
+const mac: AgentenvFacts = { machine: "m-mac", os: "macos", arch: "arm64", harness: "claude", agent: "kiln:reviewer", model: "claude-opus-5-5", permission: "claude:plan", effort: "claude:high" };
+const chip = (key: AgentenvChip["key"], value: string): AgentenvChip => ({ key, value });
+
+test("the filter by chips: started from a session's facts it shows what matches it; a key it has no chip of is any; none, every one", () => {
+  const own = chipsOf(mac);
+  assert.deepEqual(
+    own.map((c) => c.key),
+    ["machine", "os", "arch", "harness", "agent", "model", "permission", "effort"],
+  );
+  // From the session's own facts, the filter agrees with the matcher on every shared case of that session.
+  for (const c of CASES) assert.equal(filterShows(c.scope, chipsOf(c.facts)), c.matches || [...new Set(c.scope.map((x) => x.key))].some((k) => !c.facts[k]), c.name);
+  // A key taken out of the filter: any value of it.
+  const noOs = own.filter((c) => c.key !== "os");
+  assert.equal(filterShows([chip("os", "linux")], own), false);
+  assert.equal(filterShows([chip("os", "linux")], noOs), true);
+  // Two of a key: either.
+  assert.equal(filterShows([chip("os", "linux")], [chip("os", "macos"), chip("os", "linux")]), true);
+  // A permission of a harness the filter's harnesses leave out never shows, whatever its own key says.
+  assert.equal(filterShows([chip("permission", "codex:plan")], [chip("harness", "claude")]), false);
+  assert.equal(filterShows([chip("permission", "codex:plan")], [chip("harness", "codex")]), true);
+  // No chips: every one; everywhere: always.
+  assert.equal(filterShows([chip("machine", "m-lin")], []), true);
+  assert.equal(filterShows([], own), true);
+});
+
+test("a chip added at its key's place, once", () => {
+  const chips = [chip("os", "linux"), chip("model", "gpt-6")];
+  assert.deepEqual(withChip(chips, chip("harness", "codex")), [chip("os", "linux"), chip("harness", "codex"), chip("model", "gpt-6")]);
+  assert.deepEqual(withChip(chips, chip("os", "macos")), [chip("os", "linux"), chip("os", "macos"), chip("model", "gpt-6")]);
+  assert.deepEqual(withChip(chips, chip("os", "linux")), chips);
+  assert.deepEqual(withChip(chips, chip("effort", "codex:high")).at(-1), chip("effort", "codex:high"));
+});
+
+test("a session to be, as scopes see it: its machine with its system and OCI architecture, its permissions and effort named by their harness", () => {
+  const machines = [{ name: "box", os: "linux", arch: "x86_64" }];
+  assert.deepEqual(factsOf({ target: "agent:box", machines, harness: "codex", model: "gpt-6", mode: "on-request", effort: "high" }), {
+    machine: "box",
+    os: "linux",
+    arch: "amd64",
+    harness: "codex",
+    model: "gpt-6",
+    permission: "codex:on-request",
+    effort: "codex:high",
+  });
+  const local = factsOf({ target: "local", machines, harness: "claude", model: "m", mode: "plan", effort: "" });
+  assert.equal(local.machine, "local");
+  assert.equal("effort" in local, false);
+});
+
+test("a chip's suggestions: machines, harnesses, agents, models; permissions and efforts named by their harness", () => {
+  const known = {
+    machines: [{ name: "box" }],
+    harnesses: [
+      { id: "claude", models: [{ id: "opus" }], modes: [{ id: "plan" }], efforts: [{ id: "high" }] },
+      { id: "codex", modes: [{ id: "plan" }] },
+    ],
+    agents: [{ id: "kiln:reviewer" }],
+  };
+  assert.deepEqual(suggestionsFor("machine", known), ["box", "local"]);
+  assert.deepEqual(suggestionsFor("harness", known), ["claude", "codex"]);
+  assert.deepEqual(suggestionsFor("permission", known), ["claude:plan", "codex:plan"]);
+  assert.deepEqual(suggestionsFor("effort", known), ["claude:high"]);
+  assert.deepEqual(suggestionsFor("model", known), ["opus"]);
+  assert.deepEqual(suggestionsFor("agent", known), ["kiln:reviewer"]);
+  assert.deepEqual(suggestionsFor("arch", known), ["amd64", "arm64"]);
+});
+
+test("a stack: a row dragged to its place, the others in order; those applied on their own join more specific first, then by name", () => {
+  assert.deepEqual(movedTo(["a", "b", "c"], 0, 2), ["b", "c", "a"]);
+  assert.deepEqual(movedTo(["a", "b", "c"], 2, 0), ["c", "a", "b"]);
+  assert.deepEqual(movedTo(["a", "b", "c"], 1, 1), ["a", "b", "c"]);
+  assert.deepEqual(movedTo(["a", "b", "c"], 5, 0), ["a", "b", "c"]);
+  const autos = [env("b", { scope: [chip("os", "linux")] }), env("a", { scope: [chip("os", "linux")] }), env("z", { scope: [chip("os", "linux"), chip("harness", "claude")] })];
+  assert.deepEqual(
+    autos.sort(AUTO_ORDER).map((e) => e.id),
+    ["z", "a", "b"],
+  );
 });
 
 test("a session's entry read defensively: none from a server before environments", () => {
@@ -139,10 +259,11 @@ test("moving a variable past either end changes nothing", () => {
   assert.deepEqual(moved([1, 2, 3], 1, 1), [1, 3, 2]);
 });
 
-test("the composer's environment goes into the start as `agentenv`; none, nothing", () => {
+test("the composer's stack goes into the start as `agentenvs`, top first; none, nothing", () => {
   const base = { kind: "claude", cwd: "~/src", shell: "", mode: "", model: "", effort: "", speed: "", name: "", prompt: "hi", reach: "", volume: false };
-  const spec = specOf({ ...base, agentenv: "env-release" });
-  assert.equal(spec.agentenv, "env-release");
-  assert.equal(startAsk("agent:m", spec, 1).agentenv, "env-release");
-  assert.equal("agentenv" in startAsk("agent:m", specOf(base), 1), false);
+  const spec = specOf({ ...base, agentenvs: ["env-release", "env-aws"] });
+  assert.deepEqual(spec.agentenvs, ["env-release", "env-aws"]);
+  assert.deepEqual(startAsk("agent:m", spec, 1).agentenvs, ["env-release", "env-aws"]);
+  assert.equal("agentenvs" in startAsk("agent:m", specOf(base), 1), false);
+  assert.equal("agentenvs" in startAsk("agent:m", specOf({ ...base, agentenvs: [] }), 1), false);
 });
