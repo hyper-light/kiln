@@ -400,7 +400,7 @@ impl Steps for Machine {
     }
 
     async fn take_down(&self, made: &Made) -> anyhow::Result<()> {
-        super::slates::remove(made).await
+        super::slates::remove_after_container(made).await
     }
 }
 
