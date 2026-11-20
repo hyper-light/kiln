@@ -1942,9 +1942,10 @@ mod container {
         std::fs::write(&config, format!("[agent]\ncontainer_image = {}\n", toml::Value::String(image.to_owned())))?;
         env.push(("KILN_CONFIG", config.to_string_lossy().into_owned()));
         let f = vm_e2e::up_own(dir, "slatesct", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
-        // Its facts come once probed, its engine's profile asked of Slates among them: waited for, never judged unsaid.
+        // Its facts come once probed, its engine's profile asked of Slates among them: waited for until they say its agents
+        // can run in containers, within a bound (an engine slow to answer under load is asked again as facts are).
         let until = Instant::now() + FACTS_WITHIN;
-        while containers_of(&f.get("/api/agents")?, &f.machine).is_null() && Instant::now() < until {
+        while containers_of(&f.get("/api/agents")?, &f.machine).get("available") != Some(&Value::Bool(true)) && Instant::now() < until {
             std::thread::sleep(LOOK_EVERY);
         }
         if !workspaces_ready(&f, Engine::BareMetal)? {
@@ -2015,7 +2016,10 @@ mod container {
         eprintln!("DRIVE: Container, an agent in mode {}, on {}, instance {}", mode.claude(), f.machine, instance.name);
         let id = vm_e2e::open(f, &spec)?;
         let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?.reporting(landing_reports(&instance.name));
-        let (info, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+        // A turn that fails says what the runner and Slates said, the container's launch among it.
+        let (info, events) = pace
+            .until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))
+            .map_err(|e| anyhow::anyhow!("{e:#}\n--- the runner ---\n{}\n{}", f.runner_log(), slates_log(dir)))?;
         let lines = vm_e2e::said(&events);
         let what = format!("Container session {id} ({mode:?})");
         let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}", f.runner_log(), slates_log(dir));
@@ -2118,7 +2122,9 @@ mod container {
             let spec = json!({"kind": "claude", "mode": mode.claude(), "cwd": project.dir, "prompt": format!("APPEND={} do the task", APPENDED.0), "workspace": {"kind": "volume"}});
             let id = vm_e2e::open(&f, &spec)?;
             let mut pace = vm_e2e::Pace::default().reporting(landing_reports(&instance.name));
-            let (_, events) = pace.until(&f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+            let (_, events) = pace
+                .until(&f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))
+                .map_err(|e| anyhow::anyhow!("{mode:?}: {e:#}\n--- the runner ---\n{}\n{}", f.runner_log(), slates_log(&dir)))?;
             let lines = vm_e2e::said(&events);
             anyhow::ensure!(lines.iter().any(|l| *l == format!("APPENDED {}", APPENDED.0)), "{mode:?}: {lines:?}");
             anyhow::ensure!(vm_e2e::where_said(&lines).is_some_and(|w| !cfg!(target_os = "macos") || w.kernel == "Linux"), "{mode:?}: not in a container: {lines:?}");
