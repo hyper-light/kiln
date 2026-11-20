@@ -1651,12 +1651,16 @@ mod bare_metal {
 mod microvm {
     use super::*;
 
+    // Each drive's folder is under the build's own scratch (`CARGO_TARGET_TMPDIR`), never `/tmp`: a project's folder is
+    // its guest's path too, and Shards' guest refuses a volume at or under `/tmp`, its own scratch (adacachy's KVM,
+    // 2026-11-20: "its command never started (status 128)"); a Mac's temporary folder is `/var/folders`, which passed.
+
     /// The module's 1 to 5 in microVMs: the stand-in's Agentfile booted for two agents, each one's volume reaching its
     /// guest with no host mount at any look; the one whose mode asks nothing writes its work to its folder at once, the
     /// one whose mode asks goes up for review and writes only once a person approves it.
     #[test]
     fn g266_in_its_microvm_a_bypass_agents_landing_writes_at_once_and_an_ask_agents_only_once_a_person_approves() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
         let instance = Instance::new(dir.path());
         let env = runner_env(dir.path(), &instance)?;
         let f = vm_e2e::up_own(dir.path(), "slatesvm", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
@@ -1677,7 +1681,7 @@ mod microvm {
     #[cfg(unix)]
     #[test]
     fn g90_an_agents_share_outlives_its_slates_daemon() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
         let instance = Instance::new(dir.path());
         let env = runner_env(dir.path(), &instance)?;
         let f = vm_e2e::up_own(dir.path(), "slatesrs", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;

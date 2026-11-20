@@ -761,6 +761,11 @@ mod waits {
         assert_eq!(w.look(&gone, &[], None, false, s(1)), Verdict::Wait);
         let gone = with(&with(&gone, "exit", json!({"code": 1, "at": 6})), "last_activity", json!(12));
         assert_eq!(w.look(&gone, &[], None, false, s(2)), Verdict::Wait);
+        // kiln's word that it stopped starting it again, said before the wait's first look at its end
+        // (adacachy's KVM drive, 2026-11-20: 35 min waiting on a word already said): gone at once.
+        let halted = format!("Its process ended before it was ready (exit -1) after kiln started it again, {}: a start that never gets ready makes no progress.", kiln::harness::session::STOPPED_STARTING);
+        let gone = with(&ended, "exit", json!({"code": -1, "at": 5, "error": halted}));
+        assert_eq!(Watch::new(Asked::Opening, None).look(&gone, &[], None, false, s(1)), Verdict::Refuse(Stall::Stuck(Stuck::Ended { code: Some(-1), error: Some(halted) })));
         // It waits for a person's answer, which a drive never gives.
         let asks = with(&word("waiting"), "approvals", json!([{"id": "a1", "title": "Run sleep 600"}]));
         assert_eq!(look(&asks), Verdict::Refuse(Stall::Stuck(Stuck::Asks(vec!["Run sleep 600".into()]))));
