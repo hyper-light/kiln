@@ -1,9 +1,9 @@
 //! An agent's container started on its workspace's Slates volume, live (docs/agentic.md W9): a Slates instance of the
 //! test's own run by a kiln executable in Slates' roles (`KILN_TEST_KILN`), a volume made and mounted over a scratch
 //! repository (W3), the machine's own container engine found and judged by Slates, and a harness's stand-in run in a
-//! container of `KILN_TEST_CONTAINER_IMAGE` through `sandbox::container`: it reads a file of the folder through the bind,
-//! writes one, and that file is on the volume's mount on the host as it ends; the container and its bind go, the volume
-//! after them. Skipped, saying why, on a machine that can't mount a volume, has no engine Slates holds evidence for, or
+//! container of `KILN_TEST_CONTAINER_IMAGE` through `sandbox::container`: it reads a file of the folder through the engine's
+//! own NFS volume of Slates' export of the workspace, writes one, and that file is on the volume's mount on the host as it ends; the container, its engine volume and the
+//! export go, the volume after them. Skipped, saying why, on a machine that can't mount a volume, has no engine Slates holds evidence for, or
 //! wasn't given an executable and an image.
 //!
 //! The test owns the instance it starts and stops its anchor once its volume's mount is gone, as the bare-metal test
@@ -28,7 +28,7 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
 /// `seed.txt` says `seeded`, which prints it and writes `from-container.txt`, then let the run end. Expect its output to
 /// carry `seeded`, its end code 0, `from-container.txt` on the mount on the host, and the container gone after.
 #[test]
-fn w9_live_an_agents_container_works_on_its_workspace_volume_through_the_bind() -> anyhow::Result<()> {
+fn w9_live_an_agents_container_works_on_its_workspace_volume_through_its_export() -> anyhow::Result<()> {
     let (Some(program), Some(image)) = (std::env::var_os("KILN_TEST_KILN"), std::env::var("KILN_TEST_CONTAINER_IMAGE").ok()) else {
         eprintln!("skipped: KILN_TEST_KILN names no kiln executable, or KILN_TEST_CONTAINER_IMAGE no image");
         return Ok(());
@@ -48,10 +48,9 @@ fn w9_live_an_agents_container_works_on_its_workspace_volume_through_the_bind() 
             return Ok(());
         }
     };
-    // A rootful Linux engine's containers reach the volume as their own ids, which needs the workspace mounted shared with
-    // other users: kiln refuses it until it mounts one so (`Refusal::NeedsSharedMount`).
-    if judged.tested.identity == slates_api::container_engine::IdentityRule::ContainerIdsAsHostIds {
-        eprintln!("skipped: {engine}'s profile ({:?}, {}) needs the workspace mounted shared with other users, which kiln refuses: {}", judged.profile.engine, judged.profile.server_version, super::container::Refusal::NeedsSharedMount);
+    // A rootless engine can't mount the workspace's export itself (`container::facts`).
+    if judged.profile.rootless {
+        eprintln!("skipped: {engine} runs rootless ({:?}, {}), and a rootless engine can't mount the workspace's export itself", judged.profile.engine, judged.profile.server_version);
         return Ok(());
     }
     let instance = format!("kilntestc{}", std::process::id());
@@ -115,12 +114,12 @@ async fn drive(engine: &str, judged: slates_api::container_engine::EngineProfile
     }
     let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
     anyhow::ensure!(end == Some(Exit::Code(0)), "its run ended {end:?}: {out} {err}");
-    anyhow::ensure!(out.contains("seeded"), "the folder's file wasn't read through the bind: {out:?} {err:?}");
+    anyhow::ensure!(out.contains("seeded"), "the folder's file wasn't read through the export: {out:?} {err:?}");
     let written = std::fs::read_to_string(Path::new(&made.mount).join("from-container.txt"))?;
     anyhow::ensure!(written.trim() == "made-here", "what the container wrote isn't on the mount: {written:?}");
     // Its end released the container: the engine has no container by its id.
     let left = Command::new(engine).args(["container", "inspect", &id]).output()?;
     anyhow::ensure!(!left.status.success(), "container {id} is still there after its run ended");
-    eprintln!("live: {engine} ran {image} on {} through Slates' bind; the container wrote to the volume, then went", made.mount);
+    eprintln!("live: {engine} ran {image} on {} on the engine's NFS volume of Slates' export; the container wrote to the volume, then went", made.mount);
     Ok(())
 }
