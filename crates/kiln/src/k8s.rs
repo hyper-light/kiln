@@ -20,6 +20,8 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use crate::kubeapi::KubeApi;
 
+pub mod volume;
+
 use crate::config::Kubernetes as KCfg;
 use crate::hub::Hub;
 use crate::store::{Job, Run, Status};
