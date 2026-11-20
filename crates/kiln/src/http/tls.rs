@@ -67,6 +67,12 @@ impl ClientTls {
                     store.add(cert.context("CA PEM")?).context("CA certificate")?;
                 }
             }
+            Roots::KilnServerPem(pem) => {
+                for cert in CertificateDer::pem_slice_iter(&pem) {
+                    store.add(cert.context("CA PEM")?).context("CA certificate")?;
+                }
+                kiln = Some(store.clone());
+            }
             Roots::WebPkiPlusDer(der) => {
                 store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 store.add_parsable_certificates(super::roots::system().iter().cloned());
@@ -1371,6 +1377,37 @@ mod tests {
         let holder = crate::pki::cert_pem(&pki.sign_holder(&csr, "kiln.home")?);
         let refused = handshake("kiln.home", &holder, &key).err().map(|e| format!("{e:#}"));
         assert!(refused.as_deref().is_some_and(|e| e.contains("another role than the server's")), "a capacity holder's certificate for kiln.home, presented where the server is expected: {refused:?}");
+        Ok(())
+    }
+
+    /// docs/agentic.md W10, a linked server (`crate::deploy::link`): its integration names the linked kiln's URL and the CA
+    /// it trusts it under, the operator's, which signs that kiln's server certificate and its runners' fleet nodes' and
+    /// holders' too. Do: build the link's trust from that CA (`deploy::link::roots`) and connect it, at the linked server's
+    /// name, to its own certificate, a front door's, and a Slates fleet node's listed at that name. Expect the server's and
+    /// the front door's taken, and the node's refused for its role, never for its trust.
+    #[test]
+    fn w10_a_linked_server_without_the_server_role_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = crate::pki::Pki::open_scratch(dir.path())?;
+        let client = ClientTls::new(crate::deploy::link::roots(Some(pki.ca_pem.clone())), None)?;
+        let handshake = |host: &str, cert: &str, key: &str| -> anyhow::Result<()> {
+            let server = ServerTls::from_pem(cert, key)?;
+            let mut ccfg = client.config()?;
+            let mut conn = ClientConnection::new(&mut ccfg, server_name(host)?)?;
+            let mut scfg = server.config()?;
+            let mut served = ServerConnection::new(&scfg)?;
+            pump(&mut conn, &mut ccfg, &mut served, &mut scfg).map(|_| ())
+        };
+        let host = "kiln.work";
+        let own = pki.server_leaf(&[host.to_owned()])?;
+        handshake(host, &own.cert_pem, &own.key_pem).context("the linked server's own certificate")?;
+        let (door, door_key) = kiln_leaf(&pki, &[host])?;
+        handshake(host, &door, &door_key).context("its front door's")?;
+        let key = rcgen::KeyPair::generate()?;
+        let csr = rcgen::CertificateParams::new(Vec::<String>::new())?.serialize_request(&key)?;
+        let node = crate::pki::cert_pem(&pki.sign_slates_node(csr.der(), "slates.kiln", 7, Some(host))?);
+        let refused = handshake(host, &node, &key.serialize_pem()).err().map(|e| format!("{e:#}"));
+        assert!(refused.as_deref().is_some_and(|e| e.contains("another role than the server's")), "a Slates fleet node's certificate at the linked server's name: {refused:?}");
         Ok(())
     }
 }

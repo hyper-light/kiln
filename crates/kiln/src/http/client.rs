@@ -48,6 +48,10 @@ pub enum Roots {
     /// which a certificate answers only in the server's role, the server's own or a front door's, never a capacity
     /// holder's or a Slates fleet node's for the same name (`crate::pki::answers_as_server`, docs/agentic.md W10).
     WebPkiPlusDer(Vec<u8>),
+    /// A kiln server's under the CA PEM given alone (a linked server's, the operator's CA: `crate::deploy::link`): a
+    /// certificate it issued answers only in the server's role, as under [`Roots::WebPkiPlusDer`], and no public root is
+    /// trusted beside it (docs/agentic.md W10).
+    KilnServerPem(Vec<u8>),
 }
 
 /// A client certificate (PEM chain + PEM private key).

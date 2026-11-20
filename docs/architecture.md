@@ -117,7 +117,10 @@ offering no AES-256-GCM refused at its handshake: `net::LINK_PROVIDER`, kiln pla
 01a1cd8e862e7169a074db3d5fa33f3d step 34). Its HTTPS calls to the server (source archives, artifacts, certificates,
 its upgrade) trust the public roots and kiln's CA, and take a certificate kiln's CA issued only in the server's role,
 the server's own or a front door's: never a capacity holder's or a Slates fleet node's, which serve both sides of their
-own links, for a name it shares with the server (`pki::answers_as_server`, docs/agentic.md W10). Each end says what its own TLS negotiated, as each agent's `link` in
+own links, for a name it shares with the server (`pki::answers_as_server`, docs/agentic.md W10). The server takes an
+agent's certificate only in a runner's role (clientAuth alone): a holder's, a keeper's or a Slates fleet node's is
+refused by the kind kiln recorded as it issued it, and a runner's from before that role held is reissued in it over the
+link, once, then refused from the runner's word that it took the new one (docs/agentic.md W10). Each end says what its own TLS negotiated, as each agent's `link` in
 `GET /api/agents` while it's connected: `server`, the server's end of its connection, and `runner`, the runner's own,
 which it says in the facts it sends as it connects (each a cipher suite and a key exchange group as rustls names them,
 `TLS13_AES_256_GCM_SHA384` and `secp384r1MLKEM1024`, as reach's links say theirs). **No ports beyond the HTTP one are required; UDP is used when reachable.** An agent dials
