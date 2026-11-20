@@ -61,6 +61,96 @@ jobs:
     steps:
       - run: export PATH="$HOME/.cargo/bin:$PATH" && nice -n 10 cargo test --locked -p kiln-ci --lib sched::replay
 
+  # Kiln goal 90, part 01a1ec34599974448569750ac79093b6: kiln builds the Slates it vendors (vendor/slates, at
+  # vendor/MANIFEST.toml's commit) and tests its use of it on every platform it ships, natively. Each lane builds
+  # kiln with it, then runs the tests that drive it through the library: workspace::slates* (kiln's side of the
+  # consumer contract, its fleet, moves and faults), `vendored` (one revision of each vendored crate in Cargo.lock)
+  # and `slates_roles` (kiln's own executable runs the instance's anchor and daemon; no Slates binary runs). The
+  # rust job's whole suite covers Linux x86-64 too; this lane is the focused one every platform shares. GitHub's
+  # ci.yml runs the same on GitHub's runners (its `slates` and `windows-slates` jobs); these run on kiln's own.
+  # Windows x86-64's native lane is GitHub's windows-slates (WinFsp); Windows arm64 is checked by compile (below).
+  # The host lanes ask 32Gi: kiln's library as its tests peaked at 24.8 GiB in one rustc, and the macOS lane asked
+  # 26Gi was stopped in its tests (kiln ci run 01a1f9fb0653, 2026-11-20).
+  slates-linux-x86_64:
+    name: slates (Linux x86-64)
+    runs-on: [baremetal]
+    requires: ["os == linux", "arch == x86_64", "tools has cargo", "tools has git"]
+    resources: { cpu: "4", memory: 32Gi }
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: build kiln with vendor/slates
+        run: export PATH="$HOME/.cargo/bin:$PATH" && nice -n 10 cargo build --locked -p kiln --bin kiln
+      - name: kiln's Slates tests
+        run: export PATH="$HOME/.cargo/bin:$PATH" && nice -n 10 cargo test --locked -p kiln --lib workspace::slates && nice -n 10 cargo test --locked -p kiln --test vendored --test slates_roles
+
+  slates-macos-arm64:
+    name: slates (macOS arm64)
+    runs-on: [baremetal, macos]
+    requires: ["os == macos", "arch == aarch64", "tools has cargo", "tools has git"]
+    resources: { cpu: "4", memory: 32Gi }
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: build kiln with vendor/slates
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && nice -n 10 cargo build --locked -p kiln --bin kiln
+      - name: kiln's Slates tests
+        run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && nice -n 10 cargo test --locked -p kiln --lib workspace::slates && nice -n 10 cargo test --locked -p kiln --test vendored --test slates_roles
+
+  # Linux on arm64, natively: kiln has no Linux arm64 machine, so the lane runs in a linux/arm64 container on an
+  # Apple-silicon runner's Docker (an arm64 Linux kernel in its VM, no emulation; 31-62 GiB there, 2026-11-20). The
+  # target directory stays inside the container: the leg's folder is bind-mounted, and root's files left in it would
+  # outlive the leg.
+  slates-linux-arm64:
+    name: slates (Linux arm64)
+    runs-on: [baremetal, macos]
+    requires: ["os == macos", "arch == aarch64", "executors has docker"]
+    resources: { cpu: "4", memory: 26Gi }
+    timeout-minutes: 150
+    steps:
+      - name: build kiln with vendor/slates, and kiln's Slates tests, in linux/arm64
+        run: |
+          export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+          # A pull that hangs fails the leg in minutes, not at its timeout (one hung at "Unable to find image",
+          # kiln ci run 01a1f9fb0653), so it runs again elsewhere.
+          perl -e 'alarm 600; exec @ARGV' docker pull -q --platform linux/arm64 docker.io/library/rust:1-bookworm
+          docker run --rm --platform linux/arm64 -v "$PWD:/src" -w /src \
+            -e CARGO_TARGET_DIR=/target -e CARGO_BUILD_JOBS=4 -e CARGO_INCREMENTAL=0 \
+            -e CARGO_PROFILE_DEV_DEBUG=line-tables-only -e CARGO_TERM_COLOR=never \
+            docker.io/library/rust:1-bookworm bash -euc '
+              uname -sm
+              git config --global --add safe.directory /src
+              cargo build --locked -p kiln --bin kiln
+              cargo test --locked -p kiln --lib workspace::slates
+              cargo test --locked -p kiln --test vendored --test slates_roles'
+
+  # Windows on arm64, by compile: kiln has no arm64 Windows machine of its own (GitHub's ci.yml runs it natively on
+  # windows-11-arm, its `slates` job). As Slates' own cross-lint lane checks aarch64-pc-windows-msvc (its ci.yml
+  # `cross-lint`), this checks the vendored Slates crates that build without a C toolchain for the target, at kiln's
+  # lock, from Linux; the crates that reach aws-lc-sys or zstd need clang-cl and Windows' SDK, which only a native
+  # lane has. The target is added inside a throwaway container, so the runner's own toolchain is left as it is.
+  slates-windows-arm64-cross:
+    name: slates (Windows arm64, cross check)
+    runs-on: [baremetal, macos]
+    requires: ["os == macos", "arch == aarch64", "executors has docker"]
+    resources: { cpu: "2", memory: 8Gi }
+    timeout-minutes: 60
+    steps:
+      - name: cargo check --target aarch64-pc-windows-msvc, the C-free vendored Slates crates
+        run: |
+          export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+          perl -e 'alarm 600; exec @ARGV' docker pull -q --platform linux/arm64 docker.io/library/rust:1-bookworm
+          docker run --rm --platform linux/arm64 -v "$PWD:/src:ro" -w /src \
+            -e CARGO_TARGET_DIR=/target -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=never \
+            docker.io/library/rust:1-bookworm bash -euc '
+              rustup target add aarch64-pc-windows-msvc
+              cargo check --locked --target aarch64-pc-windows-msvc \
+                -p slates-wire -p slates-mem -p slates-rt -p slates-ipc -p slates-merge -p slates-db -p slates-wire-derive'
+
   ui:
     name: ui typecheck + lint + build
     runs-on: [k8s]

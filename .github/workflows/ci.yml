@@ -113,6 +113,10 @@ jobs:
   build:
     name: ${{ matrix.os }} (clippy, build)
     needs: ui
+    # Bounded: macos-latest's Clippy ran past two hours in run 44784299374 (a 7 GB runner; kiln's crate takes 7 GiB
+    # and more), and while a leg runs, every newer push's run waits in the one pending place and is cancelled by
+    # the next (44790740630 to 44802263763 all were): GitHub's own limit is six hours.
+    timeout-minutes: 90
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
@@ -189,6 +193,8 @@ jobs:
   slates:
     name: ${{ matrix.os }} (Slates build and tests)
     needs: ui
+    # Bounded as the `build` job is.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
