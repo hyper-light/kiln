@@ -738,6 +738,11 @@ run out, and two lines can't take the same one by accident as they could a bit.
   starts, presents it on its link's next connections, and says so (`AgentMsg::RunnerRole`), after
   which the server refuses the one it connected with; a runner that didn't name it keeps the
   dual-usage certificate it was enrolled with until it does.
+  `workspace.hold`: the runner holds a workspace for a session that runs elsewhere, a Kubernetes
+  pod's (`ServerMsg::Workspace`'s `hold` and `release` asks, `crate::workspace::held`; docs/agentic.md
+  W10): its volume made with no mount over the folder there and exported to the folder's owner, the
+  export's path, attachment, uid and gid answered, and questions about that session's folder answered
+  from it; a runner that didn't name it is asked to hold none.
 
 ## Registry
 

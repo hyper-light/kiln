@@ -21,6 +21,7 @@ pub mod change;
 pub mod container;
 pub mod follow;
 pub mod git;
+pub mod held;
 pub mod ignored;
 pub mod measure;
 pub mod place;
@@ -463,6 +464,12 @@ pub enum Ask {
     },
     /// Experiment `experiment` is over: its worktrees go ([`measure::unmeasure`]).
     Unmeasure { experiment: String },
+    /// Hold a workspace here for a session that runs elsewhere, a Kubernetes pod (docs/agentic.md W10): its volume made
+    /// with no mount over its folder here and exported to the folder's owner ([`held::hold`]). Only to a runner that
+    /// named [`crate::proto::feature::WORKSPACE_HOLD`].
+    Hold(held::Hold),
+    /// Let a held workspace go: its export detached, its volume ended by W3's rules ([`held::release`]).
+    Release,
     /// Its repository's branches, tags and latest commits, for Compare's pickers ([`git::refs`]).
     /// Only a runner with [`crate::proto::CAP_WORKSPACE_COMPARE`] is asked.
     Refs,
@@ -643,6 +650,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
         Ask::Refs => Ok(json!({"refs": git::refs(cwd).await?})),
         Ask::Compare { .. } => anyhow::bail!("a compare is answered with its versions (`serve`)"),
+        Ask::Hold(_) | Ask::Release => anyhow::bail!("a held workspace is asked of its holder (`held`), not of an agent here"),
         Ask::Commits { branch, trunk, since_head, since_at, picks } => {
             let log = git::log(cwd, branch.as_deref(), trunk.as_deref(), since_head.as_deref(), since_at).await?;
             let picked = if picks.is_empty() { None } else { Some(git::picked(cwd, branch.as_deref(), &picks).await?) };

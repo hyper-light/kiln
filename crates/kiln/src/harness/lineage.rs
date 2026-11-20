@@ -1239,6 +1239,21 @@ pub fn engine_at(hub: &Hub, target: &str) -> Result<Engine, String> {
     hub.agents.load().get(machine).and_then(|a| a.facts.as_deref().and_then(crate::harness::engine::of)).ok_or_else(|| format!("{} hasn't said yet how it runs sessions", hub.shown(machine)))
 }
 
+/// The container a new conversation on `target` is held in (docs/agentic.md W9): its runner's image where its engine is
+/// `container`, else none. A `container` runner that names no image (its facts say its agents can run in containers only
+/// with one) is refused, never run on its host unasked.
+pub fn container_at(hub: &Hub, target: &str) -> Result<Option<crate::harness::session::InContainer>, String> {
+    if engine_at(hub, target) != Ok(Engine::Container) {
+        return Ok(None);
+    }
+    let Some(machine) = target.strip_prefix("agent:") else { return Ok(None) };
+    let image = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.containers.as_ref().and_then(|c| c.image.clone())));
+    match image {
+        Some(image) => Ok(Some(crate::harness::session::InContainer { image })),
+        None => Err(format!("{} runs its sessions in containers, but names no image for them: set `container_image` under `[agent]` in its kiln configuration", hub.shown(machine))),
+    }
+}
+
 /// What the facts the server has of `target`'s runner say of its Hex node's image class
 /// (`crate::harness::engine::node_images`).
 fn images_at(hub: &Hub, target: &str) -> crate::harness::engine::NodeImages {
@@ -1263,6 +1278,7 @@ fn on_engine(hub: &Hub, targets: Vec<String>, want: Option<Engine>) -> Result<Ve
             Ok(e) if e == want => kept.push(t),
             Ok(Engine::Host) => why.push(format!("{shown} runs its sessions on its host (its engine is host)")),
             Ok(Engine::Microvm) => why.push(format!("{shown} runs its sessions in microVMs (its engine is microvm)")),
+            Ok(Engine::Container) => why.push(format!("{shown} runs its sessions in containers (its engine is container)")),
             Err(w) => why.push(w),
         }
     }
@@ -1270,6 +1286,7 @@ fn on_engine(hub: &Hub, targets: Vec<String>, want: Option<Engine>) -> Result<Ve
         let what = match want {
             Engine::Microvm => "a session that needs a microVM starts only on a runner whose engine is microvm",
             Engine::Host => "a session asked to run as a process on its machine (`isolation` \"none\") starts only on a runner whose engine is host",
+            Engine::Container => "a session asked to run in a container starts only on a runner whose engine is container",
         };
         return Err((StatusCode::CONFLICT, format!("{what}, and none that suits it is: {}", why.join("; "))));
     }
@@ -2331,6 +2348,33 @@ mod tests {
             let why = hub.harness.open_as(&hub, "agent:vm-box", spec, 1, &[]).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
             anyhow::ensure!(why.contains("placed only by kiln's balancer"), "a start naming its machine: {why}");
             anyhow::ensure!(hub.harness.list().is_empty(), "nothing started");
+            Ok(())
+        })
+    }
+
+    /// W9: a runner whose owner set `container` holds new conversations in containers of its image. Given one whose
+    /// agents can run in containers set so, the same with no image said, one set `host`, and the server itself. Expect
+    /// the first's image for a start there, the second refused naming `container_image` rather than run on its host,
+    /// none for the others; and a start asking for a process kept off the container runner, its engine named.
+    #[test]
+    fn w9_a_container_runners_new_conversations_take_its_image_and_a_process_is_kept_off_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let runner = |name: &str, image: Option<&str>, asked: Engine| {
+                let containers = kiln_ci::facts::ContainerFacts { available: true, image: image.map(str::to_owned), ..Default::default() };
+                let mut facts = kiln_ci::facts::RunnerFacts { isolation: Some(kiln_ci::facts::Isolation::default()), containers: Some(containers), ..Default::default() };
+                crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked { engine: Some(asked), version: 1 });
+                crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
+            };
+            hub.put_agent(runner("boxes", Some("ghcr.io/org/agents:1"), Engine::Container));
+            hub.put_agent(runner("unnamed", None, Engine::Container));
+            hub.put_agent(runner("plain", Some("ghcr.io/org/agents:1"), Engine::Host));
+            assert_eq!(engine_at(&hub, "agent:boxes"), Ok(Engine::Container));
+            assert_eq!(container_at(&hub, "agent:boxes"), Ok(Some(crate::harness::session::InContainer { image: "ghcr.io/org/agents:1".to_owned() })));
+            assert!(container_at(&hub, "agent:unnamed").is_err_and(|w| w.contains("container_image")));
+            assert_eq!((container_at(&hub, "agent:plain"), container_at(&hub, "local")), (Ok(None), Ok(None)));
+            let why = on_engine(&hub, vec!["agent:boxes".to_owned()], Some(Engine::Host)).err().map(|e| e.1).unwrap_or_default();
+            assert!(why.contains("runs its sessions in containers (its engine is container)"), "{why}");
             Ok(())
         })
     }

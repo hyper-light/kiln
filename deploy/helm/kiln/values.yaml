@@ -144,6 +144,10 @@ rbac:
   # "write" also lets it sync, as Argo CD's application controller may; "none" keeps kiln to its
   # own namespaces.
   deployments: write
+  # Agents in pods of their own on kiln's Kubernetes engine (docs/agentic.md W10): their claims in the jobs namespace, and
+  # their PersistentVolumes, which belong to no namespace (a ClusterRole: create, get and delete them alone). Off until
+  # declared.
+  agentPods: false
 
 replicaCount: 1   # kiln uses a local sqlite database: run exactly one replica.
 

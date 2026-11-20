@@ -860,7 +860,12 @@ pub mod feature {
     /// connections, and says so ([`super::AgentMsg::RunnerRole`]). Only a runner that named it is reissued one; another
     /// connected with a certificate from before machines' certificates held their role keeps it until it does.
     pub const RUNNER_ROLE: &str = "runner-role";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE];
+    /// This runner holds a workspace for a session that runs elsewhere, a Kubernetes pod's (`crate::workspace::Ask::Hold`
+    /// and `Release`, `crate::workspace::held`; docs/agentic.md W10): its volume made with no mount over its folder here and
+    /// exported to the folder's owner, and the questions about that session's folder answered from it. Only a runner that
+    /// named it is asked to hold one.
+    pub const WORKSPACE_HOLD: &str = "workspace.hold";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

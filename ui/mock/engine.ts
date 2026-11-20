@@ -1,12 +1,13 @@
 /**
  * A runner's engine in the mock, as the server has it (crates/kiln/src/harness/engine.rs; kiln plan
- * 01a1dd2e…, P2.3): how it runs new agent sessions, `host` or `microvm`.
+ * 01a1dd2e…, P2.3; docs/agentic.md W9): how it runs new agent sessions, `host`, `microvm` or `container`.
  *
  *   GET /api/runners/:name/engine   the engine it holds, where that comes from and why, what its owner
  *                                   set, whether it can hold microVMs now and why not, its isolation
  *                                   facts, and its sessions on each engine (`draining`: the other's)
- *   PUT /api/runners/:name/engine   {engine: "host" | "microvm" | null}: set it, or take what was set
- *                                   away (null: what it can do); microvm refused (409) where it can't
+ *   PUT /api/runners/:name/engine   {engine: "host" | "microvm" | "container" | null}: set it, or take
+ *                                   what was set away (null: what it can do); microvm or container
+ *                                   refused (409) where it can't
  *   POST /api/runners/:name/engine/end     its draining sessions ended now (`ended`, their ids)
  *   POST /api/runners/:name/engine/cancel  the setting before its switch put back while any drains
  *
@@ -17,8 +18,29 @@
  */
 import type http from "node:http";
 import type { Agent } from "../src/api/types.ts";
+import type { ContainerFacts } from "../src/api/wire";
 
-type Engine = "host" | "microvm";
+type Engine = "host" | "microvm" | "container";
+
+/** Each runner's container facts (`RunnerFacts.containers`, W9): metal-ryzen-02 runs rootless podman with an image
+ * declared; every other declares no image. */
+const CONTAINERS: Record<string, ContainerFacts> = {
+  "metal-ryzen-02": { available: true, program: "/usr/bin/podman", engine: "podman", endpoint: "local", version: "5.6.2", image: "ghcr.io/acme/agents:1", why_not: null },
+};
+const NO_IMAGE: ContainerFacts = {
+  available: false,
+  program: null,
+  engine: null,
+  endpoint: null,
+  version: null,
+  why_not: "no image is declared for its agents' containers: set `container_image` under `[agent]` in its kiln configuration",
+  missing: "image",
+};
+const containersOf = (name: string): ContainerFacts => CONTAINERS[name] ?? NO_IMAGE;
+const boxes = (name: string) => {
+  const c = containersOf(name);
+  return { usable: c.available, why: c.available ? null : c.why_not };
+};
 interface Ctx {
   json: (res: http.ServerResponse, status: number, body: unknown) => void;
   body: <T>(req: http.IncomingMessage) => Promise<T>;
@@ -50,6 +72,7 @@ function capable(a: Agent | undefined): { usable: boolean; why: string | null } 
 function held(name: string, can: { usable: boolean; why: string | null }): { engine: Engine; from: "server" | "default"; why: string | null } {
   const set = askedOf(name).engine;
   if (set === "microvm" && !can.usable) return { engine: "host", from: "default", why: `its owner set microvm, but it can't hold microVMs now: ${can.why ?? NO_MICROVM}` };
+  if (set === "container" && !boxes(name).usable) return { engine: "host", from: "default", why: `its owner set container, but its agents can't run in containers now: ${boxes(name).why}` };
   if (set) return { engine: set, from: "server", why: null };
   return can.usable ? { engine: "microvm", from: "default", why: null } : { engine: "host", from: "default", why: can.why };
 }
@@ -59,6 +82,7 @@ function overlay(a: Agent) {
   const can = capable(a);
   if (!can || !a.facts) return;
   const h = held(a.name, can);
+  a.facts.containers = containersOf(a.name);
   if (a.facts.isolation) a.facts.isolation.engine = h.engine;
   a.facts.virt.microvm = h.engine === "microvm";
 }
@@ -68,8 +92,10 @@ function view(name: string, ctx: Ctx) {
   const can = capable(a);
   const h = can ? held(name, can) : null;
   const sessions = ctx.sessionsOn(name).filter((s) => s.running && !ended.has(s.id));
-  const on = h ? sessions.filter((s) => s.microvm === (h.engine === "microvm")).length : 0;
-  const draining = h ? sessions.filter((s) => s.microvm !== (h.engine === "microvm")) : [];
+  // The mock's sessions run on a host or in a microVM: on a container runner, every one drains.
+  const engineOf = (s: { microvm: boolean }): Engine => (s.microvm ? "microvm" : "host");
+  const on = h ? sessions.filter((s) => engineOf(s) === h.engine).length : 0;
+  const draining = h ? sessions.filter((s) => engineOf(s) !== h.engine) : [];
   const sw = switched.get(name);
   const facts = a?.facts;
   return {
@@ -80,6 +106,8 @@ function view(name: string, ctx: Ctx) {
     asked: askedOf(name).engine,
     version: askedOf(name).version,
     microvm: can ? { usable: can.usable, why: can.why } : null,
+    container: facts ? boxes(name) : null,
+    containers: facts ? containersOf(name) : null,
     isolation: facts?.isolation ?? null,
     virt: facts ? { microvm: facts.virt.microvm, kvm: facts.virt.kvm, hvf: facts.virt.hvf } : null,
     sessions: on,
@@ -124,13 +152,15 @@ export async function handleEngine(req: http.IncomingMessage, res: http.ServerRe
   if (!a) return (ctx.json(res, 404, { error: `no runner named ${name}` }), true);
   if (method === "GET") return (ctx.json(res, 200, view(name, ctx)), true);
   if (method !== "PUT") return false;
-  const shape = 'expected {"engine": "host"} or {"engine": "microvm"}, or {"engine": null} for what the runner can do';
+  const shape = 'expected {"engine": "host"}, {"engine": "microvm"} or {"engine": "container"}, or {"engine": null} for what the runner can do';
   const b = await ctx.body<Record<string, unknown>>(req);
   const extra = Object.keys(b).find((k) => k !== "engine");
   if (extra) return (ctx.json(res, 400, { error: `${JSON.stringify(extra)} isn't one: ${shape}` }), true);
   if (!("engine" in b)) return (ctx.json(res, 400, { error: shape }), true);
   const e = b.engine;
-  if (e !== null && e !== "host" && e !== "microvm") return (ctx.json(res, 400, { error: `a runner's engine is "host" or "microvm", not ${JSON.stringify(e)}` }), true);
+  if (e !== null && e !== "host" && e !== "microvm" && e !== "container")
+    return (ctx.json(res, 400, { error: `a runner's engine is "host", "microvm" or "container", not ${JSON.stringify(e)}` }), true);
+  if (e === "container" && !boxes(name).usable) return (ctx.json(res, 409, { error: `${a.label ?? name} can't run its sessions in containers: ${boxes(name).why}` }), true);
   if (e === "microvm") {
     const can = capable(a);
     if (!can) return (ctx.json(res, 409, { error: `${a.label ?? name} hasn't said yet whether it can run microVMs: set its engine once it has` }), true);

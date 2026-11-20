@@ -1,11 +1,12 @@
 /** Runners' engines and their microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2.3, P3.2). */
 import type { Res } from "@/lib/data";
 import { request } from "./client";
-import type { IsolationFacts, LiveAccess, LiveChange, LiveMember, LivePortKey, LiveProtocol } from "./wire";
+import type { ContainerFacts, IsolationFacts, LiveAccess, LiveChange, LiveMember, LivePortKey, LiveProtocol, RunnerEngine } from "./wire";
 
 const enc = encodeURIComponent;
 
-export type Engine = "host" | "microvm";
+/** Where a runner's agents run: on its host, each in a microVM, or each in a container on its workspace (docs/agentic.md W9). */
+export type Engine = RunnerEngine;
 
 /**
  * A runner's engine as the server says it (`GET|PUT /api/runners/:name/engine`, crates/kiln/src/harness/engine.rs):
@@ -22,6 +23,10 @@ export interface RunnerEngineView {
   asked: Engine | null;
   version: number;
   microvm: { usable: boolean; why: string | null } | null;
+  /** Whether its agents can run in containers now, and why not (W9); none from a server before containers. */
+  container?: { usable: boolean; why: string | null } | null;
+  /** Its container facts (W9): the engine, the image its agents run in, and what it lacks. */
+  containers?: ContainerFacts | null;
   isolation: IsolationFacts | null;
   virt: { microvm: boolean; kvm: boolean; hvf: boolean } | null;
   sessions: number;

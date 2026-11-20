@@ -8,6 +8,7 @@ import type { ApprovalBrief } from "./ApprovalBrief";
 import type { Capacity } from "./Capacity";
 import type { ExitInfo } from "./ExitInfo";
 import type { HeldGoals } from "./HeldGoals";
+import type { InContainer } from "./InContainer";
 import type { Isolation } from "./Isolation";
 import type { Limit } from "./Limit";
 import type { MovePlan } from "./MovePlan";
@@ -191,6 +192,10 @@ workspace?: Workspace,
  * Its isolation, when it's held in a microVM of its own (as `Spec::isolation`).
  */
 isolation?: Isolation, 
+/**
+ * Its container, when it's held in one of its own (as `Spec::container`).
+ */
+container?: InContainer, 
 /**
  * The environment it runs with (docs/agents.md, "Environments"), as its machine holds it: the version
  * its harness started with. None: its machine's user's. Its runner says it; the server gives it again

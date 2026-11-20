@@ -487,7 +487,7 @@ async fn up_or_started() -> anyhow::Result<()> {
     {
         anyhow::bail!("{} (its log: {})", start_refused(&e), h.log.display());
     }
-    // A fleet node imports its groups (Slates: never make one there), and says its member id, which a move of a volume to
+    // A fleet node imports its groups (Slates: never make one there, but at the fleet's founder), and says its member id, which a move of a volume to
     // it names (K4): its runner's word again, now with the member its daemon serves as since this start.
     if let (Some(joined), Some(source)) = (&joined, super::slates_fleet::source()) {
         match call("member", |i| i.member()).await {
@@ -497,6 +497,14 @@ async fn up_or_started() -> anyhow::Result<()> {
                 }
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't read its member id: no volume moves to it until it does"),
+        }
+        // The fleet's founder (`slates_fleet::founder`, the first runner `[slates_fleet]` lists) bootstraps its root group,
+        // as Slates' fleet asks of one node: until then no node holds a group, so none makes a workspace ("this node has
+        // no consensus group yet"; goal 91's live move, 2026-11-19). Every other node imports it. Found made already (this
+        // node founded or imported it before): nothing.
+        if joined.founds {
+            call("bootstrap", |i| i.ensure_group()).await?;
+            tracing::info!("this runner's Slates founded kiln's Slates fleet's groups, or found them made");
         }
         return Ok(());
     }
@@ -1383,6 +1391,19 @@ pub(crate) async fn policy(m: &Made) -> anyhow::Result<Option<WritePolicy>> {
     call("write policy", move |i| i.write_policy(PolicySubject::Volume(volume))).await
 }
 
+/// Slates' export of workspace `m`'s volume to one client acting as `uid` (docs/agentic.md W10; Slates' A-521,
+/// `Instance::export`): its attachment, which [`detach`] ends with its capability, and the path that capability
+/// authorizes (`/<name>@<attachment>.<token>`, a bearer secret: `Exported`'s `Debug` hides it).
+pub async fn export(m: &Made, uid: u32, read_only: bool) -> anyhow::Result<slates_api::Exported> {
+    let volume = volume_id(&m.volume)?;
+    call("export", move |i| i.export(volume, uid, &slates_api::ExportOptions { read_only, subtree: None })).await
+}
+
+/// Slates' end of attachment `attachment` (an export's, a container's bind): its capability reaches nothing after it.
+pub async fn detach(attachment: u64) -> anyhow::Result<()> {
+    call("detach", move |i| i.detach(attachment)).await
+}
+
 /// What every landing leaves out: git's own directory.
 pub const EXCLUDES: &[&str] = &["/.git"];
 
@@ -1444,8 +1465,10 @@ async fn git_ignored(top: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// The paths `git status --porcelain=v1 -z --ignored=traditional` says it ignores (`!! target/`: a directory git
-/// ignores whole is named once), each a prefix of the volume (`/target`); a rename's or a copy's source, a field of its
-/// own, is no path of its own.
+/// ignores whole is named once), each a prefix of the volume (`/target`), and the untracked files a Mac's NFS client
+/// renamed as they were removed while open (`?? src/.nfs.0000002a.1f2e`, `super::git::silly_renamed`: gone once their
+/// last holder closes them, never written into a person's folder); a rename's or a copy's source, a field of its own, is
+/// no path of its own.
 fn ignored_prefixes(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut fields = text.split('\0').filter(|f| !f.is_empty());
@@ -1455,6 +1478,8 @@ fn ignored_prefixes(text: &str) -> Vec<String> {
             if !path.is_empty() {
                 out.push(format!("/{path}"));
             }
+        } else if let Some(path) = record.strip_prefix("?? ").filter(|p| super::git::silly_renamed(p)) {
+            out.push(format!("/{path}"));
         } else if names_a_source(record) {
             let _ = fields.next();
         }
@@ -2364,6 +2389,9 @@ mod tests {
         let said = "!! target/\0 M src/a.rs\0R  new.rs\0old.rs\0!! src/gen.o\0?? src/n.rs\0 R moved.rs\0!! was.rs\0!! node_modules/\0";
         assert_eq!(ignored_prefixes(said), ["/target", "/src/gen.o", "/node_modules"]);
         assert!(ignored_prefixes("").is_empty());
+        // W9: what a Mac's NFS client renamed as it was removed while open goes into no landing; a name only like it does.
+        let held = "?? src/.nfs.0000002a.1f2e\0?? .nfs.20051025.00ff\0?? .nfs.notone\0!! target/\0";
+        assert_eq!(ignored_prefixes(held), ["/src/.nfs.0000002a.1f2e", "/.nfs.20051025.00ff", "/target"]);
         let m = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), ..Default::default() };
         let request = landing(&m, "/src/kiln", &["/target".to_owned(), "/.git".to_owned()])?;
         assert_eq!(request.filter.exclude, ["/target", "/.git"]);

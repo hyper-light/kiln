@@ -19,6 +19,15 @@ fn is_zero_epoch(n: &u64) -> bool {
     *n == 0
 }
 
+/// A session held in an OCI container of its own on its workspace's Slates volume (docs/agentic.md W9;
+/// `crate::sandbox::container`): the image it runs in, its runner's (`[agent] container_image`). Apart from
+/// [`Isolation`], which is a microVM's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct InContainer {
+    pub image: String,
+}
+
 /// An isolated session's boundary (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 17 and 32), as kiln's T4 isolation
 /// named it: its kind, the image it boots once one is chosen, and its microVM's size where its start
 /// gave one.
@@ -432,6 +441,10 @@ pub struct Spec {
     /// are isolated too. A machine that can't hold it so refuses it, never running it as a process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<Isolation>,
+    /// How it's held in a container of its own, where its runner's engine is `container` (docs/agentic.md W9): set as
+    /// it's placed, from its runner's container facts. A machine whose agents can't run in containers refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<InContainer>,
     /// The text of the Agentfile `isolation`'s image names where it's one of a person's own
     /// (`agentfile:<id>`), as kiln's server read it from their Agentfiles as it started, at its
     /// latest version (`harness::lineage::kept_agentfile`), for its machine to build its microVM
@@ -551,6 +564,7 @@ impl Default for Spec {
             subagent: false,
             workspace: None,
             isolation: None,
+            container: None,
             agentfile: None,
             build_secrets: Vec::new(),
             agentenv: None,
@@ -906,6 +920,10 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub isolation: Option<Isolation>,
+    /// Its container, when it's held in one of its own (as `Spec::container`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub container: Option<InContainer>,
     /// The environment it runs with (docs/agents.md, "Environments"), as its machine holds it: the version
     /// its harness started with. None: its machine's user's. Its runner says it; the server gives it again
     /// to a runner process that announces the session without the one kiln keeps it runs with
@@ -1069,7 +1087,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, agentenv, runs, starts } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, container, agentenv, runs, starts } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -1135,6 +1153,7 @@ impl Info {
             && *launched == o.launched
             && *workspace == o.workspace
             && *isolation == o.isolation
+            && *container == o.container
             && *agentenv == o.agentenv
             && *runs == o.runs
             && *starts == o.starts)
@@ -2692,6 +2711,7 @@ fn begin(id: String, mut spec: Spec, kind: &'static Kind, mut core: Core, sink: 
         launched: Some(spec.launched_level()),
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
+        container: spec.container.clone(),
         agentenv: spec.agentenv.as_ref().map(crate::agentenvs::Brief::of),
         runs: None,
         starts: Vec::new(),
@@ -5301,6 +5321,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 if spec.isolation.is_some() && files.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.microvm()).is_none_or(|v| v.mcp().is_err()) {
                     servers.clear();
                 }
+                // In a container, none: kiln's MCP is reached through this machine's runner's socket, which no container
+                // reaches (docs/agentic.md W9).
+                if spec.container.is_some() {
+                    servers.clear();
+                }
                 adapter.offer_mcp(servers);
                 if let Some(items) = &seed {
                     adapter.seed(items.clone());
@@ -5318,7 +5343,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                 }
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).
-                if blocked.is_none() && !isolated {
+                if blocked.is_none() && !isolated && spec.container.is_none() {
                     kind.prepare(&spec).await;
                 }
                 // Its workspace volume mounted where it says before its harness starts in it: one that moved here with it
@@ -5338,6 +5363,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             Some(vms) => crate::sandbox::isolated::launch(kind, &spec, &s.id, vms.as_ref(), host.as_ref().and_then(|h| h.homes()), host.clone(), &build_secrets, swap_from.take()).await,
                             None => Err(anyhow::anyhow!("{}", crate::sandbox::NO_MICROVM)),
                         }
+                    }
+                    // In a container of its own on its workspace's volume, through the machine's container engine
+                    // (docs/agentic.md W9), its harness the image's, never a process here.
+                    None if spec.container.is_some() => {
+                        let image = spec.container.as_ref().map(|c| c.image.clone()).unwrap_or_default();
+                        crate::sandbox::container::launch(kind, &spec, &image).await
                     }
                     // In the session's group of processes where the machine has them, and marked as
                     // its, and so is everything it starts (`survivors`).
@@ -8718,6 +8749,7 @@ sys.exit(1)
             launched: None,
             workspace: None,
             isolation: None,
+            container: None,
             agentenv: None,
             runs: None,
             starts: Vec::new(),

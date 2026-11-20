@@ -4417,6 +4417,11 @@ impl Registry {
         // conversation that asks for no microVM takes its runner's engine. One is held so only where its machine starts
         // microVMs: one that can't would run it as a process, unasked (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
         spec.isolation = self.isolation_for(hub, target, &spec);
+        // A new conversation that isn't isolated takes its runner's container where its engine is `container` (docs/agentic.md
+        // W9); one taken up stays where its harness keeps it.
+        if spec.isolation.is_none() && spec.container.is_none() && spec.resume.is_none() {
+            spec.container = crate::harness::lineage::container_at(hub, target).map_err(anyhow::Error::msg)?;
+        }
         // The engine setting its boundary is decided under (kiln plan 01a1dd2e…, P2.3), before anything
         // it waits for: its runner refuses it where it's been set again since. One `agents.start`
         // decided keeps the one it was decided under.
@@ -4592,6 +4597,7 @@ impl Registry {
                         launched: spec.launched,
                         workspace: spec.workspace.clone(),
                         isolation: spec.isolation.clone(),
+                        container: spec.container.clone(),
                         agentenv: spec.agentenv.as_ref().map(crate::agentenvs::Brief::of),
                         runs: None,
                         starts: Vec::new(),

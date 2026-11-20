@@ -205,7 +205,9 @@ pub struct Plan {
     pub name: String,
     /// The image it runs.
     pub image: String,
-    /// The command it runs, the harness's.
+    /// Its entrypoint, in place of the image's own: none keeps the image's.
+    pub entrypoint: Option<String>,
+    /// The command it runs: the harness's, or an idle keeper's that the harness is run beside (`sandbox::container`).
     pub command: Vec<String>,
     /// The harness's folder: the same place in the workspace inside the container as on the machine (W3).
     pub workdir: String,
@@ -273,6 +275,9 @@ fn run_args(plan: &Plan, applied: &EngineMount, identity: Vec<String>) -> Vec<St
     args.extend(applied.options.iter().cloned());
     args.extend(identity);
     args.extend(hard_link_options(plan.tested.hard_links));
+    if let Some(entrypoint) = &plan.entrypoint {
+        args.extend(["--entrypoint".to_owned(), entrypoint.clone()]);
+    }
     args.extend(["--workdir".to_owned(), plan.workdir.clone(), plan.image.clone()]);
     args.extend(plan.command.iter().cloned());
     args
@@ -359,6 +364,12 @@ pub async fn end(running: &Running, made: &Made) -> anyhow::Result<()> {
     end_with(&Machine, running, made).await
 }
 
+/// Ends `running` alone, in order: the container, then the bind; the workspace's mount and volume stay, for W3 to take
+/// down when the workspace goes (a container run inside a workspace that outlives it: `sandbox::container`).
+pub async fn release(running: &Running, made: &Made) -> anyhow::Result<()> {
+    release_with(&Machine, running, made).await
+}
+
 /// [`start`] over `steps`.
 async fn start_with(steps: &impl Steps, made: &Made, plan: &Plan) -> Result<Running, Refusal> {
     // The profile first: one kiln can't run a container under is refused before anything is asked.
@@ -388,23 +399,31 @@ async fn start_with(steps: &impl Steps, made: &Made, plan: &Plan) -> Result<Runn
     }
 }
 
-/// [`end`] over `steps`.
-async fn end_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow::Result<()> {
+/// [`release`] over `steps`.
+async fn release_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow::Result<()> {
     // The container first: its engine lets go of the files it held open on the mount. One that won't go keeps the rest.
     steps.remove(&running.program, &running.container).await?;
     // Then the bind; one that won't go ends with its mount anyway (Slates: a bind ends with its source mount).
     if let Err(e) = steps.detach(running.bind).await {
         tracing::warn!(mount = %made.mount, error = %format!("{e:#}"), "an ended container's bind wasn't let go: it ends with its mount");
     }
+    Ok(())
+}
+
+/// [`end`] over `steps`.
+async fn end_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow::Result<()> {
+    release_with(steps, running, made).await?;
     // Then the mount and the volume, as W3 takes a workspace down, nothing kiln started in it running now.
     steps.take_down(made).await
 }
 
-/// What a runner's facts say of agents' containers here ([`ContainerFacts`]): asked as its facts are probed, through
-/// Slates' library alone. Blocking calls (the engine's command line) run on kiln's blocking pool.
-pub async fn facts(workspaces: Option<&Workspaces>) -> ContainerFacts {
+/// What a runner's facts say of agents' containers here ([`ContainerFacts`]), their image the one its administrator
+/// declared (`image`, `[agent] container_image`): asked as its facts are probed, through Slates' library alone. Blocking
+/// calls (the engine's command line) run on kiln's blocking pool.
+pub async fn facts(workspaces: Option<&Workspaces>, image: Option<&str>) -> ContainerFacts {
     let has_workspaces = workspaces.is_some_and(|w| w.available);
-    crate::rt::blocking(move || facts_of(has_workspaces, crate::runner::docker::find, |program| slates_api::container_engine::engine_profile(program)))
+    let image = image.map(str::trim).filter(|i| !i.is_empty()).map(str::to_owned);
+    crate::rt::blocking(move || facts_of(has_workspaces, image, crate::runner::docker::find, |program| slates_api::container_engine::engine_profile(program)))
         .await
         .unwrap_or_else(|e| ContainerFacts { why_not: Some(format!("the container engine couldn't be asked: {e:#}")), missing: Some(ContainerMissing::Engine), ..ContainerFacts::default() })
 }
@@ -419,15 +438,18 @@ pub fn engine_word(engine: Engine) -> &'static str {
 }
 
 /// [`facts`] over its two questions, in the order that asks least: the machine's workspaces first (a container binds its
-/// agent's volume), then the engine (`find`: its command line, when its daemon answers), then Slates' judge of its profile
+/// agent's volume), then the image declared for its agents' containers (`image`), then the engine (`find`: its command line, when its daemon answers), then Slates' judge of its profile
 /// (`profile`), then whether kiln runs a container under that profile's identity rule ([`identity_options`]). Nothing is
 /// asked past the first lack, which is named.
-fn facts_of(has_workspaces: bool, find: impl FnOnce() -> Option<String>, profile: impl FnOnce(&str) -> Result<EngineProfile, EngineFault>) -> ContainerFacts {
+fn facts_of(has_workspaces: bool, image: Option<String>, find: impl FnOnce() -> Option<String>, profile: impl FnOnce(&str) -> Result<EngineProfile, EngineFault>) -> ContainerFacts {
     if !has_workspaces {
         return ContainerFacts { why_not: Some("this machine gives agents no workspaces of their own, which their containers bind".to_owned()), missing: Some(ContainerMissing::Workspaces), ..ContainerFacts::default() };
     }
+    let Some(image) = image else {
+        return ContainerFacts { why_not: Some("no image is declared for its agents' containers: set `container_image` under `[agent]` in its kiln configuration".to_owned()), missing: Some(ContainerMissing::Image), ..ContainerFacts::default() };
+    };
     let Some(program) = find() else {
-        return ContainerFacts { why_not: Some("no container engine answers here: neither docker nor podman, or its daemon is down".to_owned()), missing: Some(ContainerMissing::Engine), ..ContainerFacts::default() };
+        return ContainerFacts { image: Some(image), why_not: Some("no container engine answers here: neither docker nor podman, or its daemon is down".to_owned()), missing: Some(ContainerMissing::Engine), ..ContainerFacts::default() };
     };
     let judged = match profile(&program) {
         Ok(judged) => judged,
@@ -441,10 +463,17 @@ fn facts_of(has_workspaces: bool, find: impl FnOnce() -> Option<String>, profile
                 EngineFault::Untested { endpoint, profile, .. } => (Some(engine_word(profile.engine).to_owned()), Some(endpoint.clone()), Some(profile.server_version.clone())),
                 _ => (None, None, None),
             };
-            return ContainerFacts { available: false, program: Some(program), engine, endpoint, version, why_not: Some(format!("Slates refused this machine's container engine: {fault}")), missing: Some(missing) };
+            return ContainerFacts { available: false, program: Some(program), engine, endpoint, version, image: Some(image), why_not: Some(format!("Slates refused this machine's container engine: {fault}")), missing: Some(missing) };
         }
     };
-    let said = ContainerFacts { program: Some(program), engine: Some(engine_word(judged.profile.engine).to_owned()), endpoint: Some(judged.endpoint.clone()), version: Some(judged.profile.server_version.clone()), ..ContainerFacts::default() };
+    let said = ContainerFacts {
+        program: Some(program),
+        engine: Some(engine_word(judged.profile.engine).to_owned()),
+        endpoint: Some(judged.endpoint.clone()),
+        version: Some(judged.profile.server_version.clone()),
+        image: Some(image),
+        ..ContainerFacts::default()
+    };
     match identity_options(judged.tested.identity) {
         Ok(_) => ContainerFacts { available: true, ..said },
         Err(refused) => ContainerFacts { why_not: Some(refused.to_string()), missing: Some(ContainerMissing::SharedMount), ..said },
@@ -464,6 +493,8 @@ mod tests {
     const MOUNT: &str = "/home/u/.local/share/kiln/agent/workspaces/kiln-a";
     /// Format: the engine's command line.
     const DOCKER: &str = "/usr/local/bin/docker";
+    /// Format: the image declared for agents' containers.
+    const IMAGE: &str = "ghcr.io/org/agents:1";
 
     /// Workspace `kiln-a`, mounted at [`MOUNT`].
     fn made() -> Made {
@@ -490,7 +521,7 @@ mod tests {
 
     /// The plan of an agent's container through `engine`, holding `tested`.
     fn plan(engine: Engine, tested: TestedProfile) -> Plan {
-        Plan { program: DOCKER.to_owned(), engine, tested, name: "kiln-a".to_owned(), image: "kiln/harness".to_owned(), command: vec!["claude".to_owned()], workdir: format!("{MOUNT}/crates") }
+        Plan { program: DOCKER.to_owned(), engine, tested, name: "kiln-a".to_owned(), image: "kiln/harness".to_owned(), entrypoint: None, command: vec!["claude".to_owned()], workdir: format!("{MOUNT}/crates") }
     }
 
     /// Docker Desktop's plan: its share's rules.
@@ -654,6 +685,36 @@ mod tests {
         })
     }
 
+    /// W9. Do: release a container run inside a workspace that outlives it, then one whose engine won't remove it. Expect
+    /// the container, then the bind, and the workspace's mount and volume left for W3; a container that won't go keeps its
+    /// bind.
+    #[test]
+    fn w9_a_released_container_goes_with_its_bind_and_leaves_the_workspace_mounted() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let running = Running { container: "c0ffee".to_owned(), bind: 41, program: DOCKER.to_owned() };
+            let stand = Stand::new();
+            release_with(&stand, &running, &made()).await?;
+            assert_eq!(stand.said(), ["remove c0ffee", "detach 41"]);
+            let stand = Stand { remove: Err("container is busy".to_owned()), ..Stand::new() };
+            assert!(release_with(&stand, &running, &made()).await.is_err());
+            assert_eq!(stand.said(), ["remove c0ffee"]);
+            Ok(())
+        })
+    }
+
+    /// W9. Do: build the engine's run of a plan with an entrypoint of its own. Expect `--entrypoint` before the image, so
+    /// the command after the image is the entrypoint's arguments, and none where the plan keeps the image's.
+    #[test]
+    fn w9_a_plans_own_entrypoint_goes_before_its_image() -> anyhow::Result<()> {
+        let applied = engine_mount(&binding(false), Cli::Docker)?;
+        let keeper = Plan { entrypoint: Some("tail".to_owned()), command: vec!["-f".to_owned(), "/dev/null".to_owned()], ..desktop() };
+        let args = run_args(&keeper, &applied, Vec::new());
+        let tail = ["--entrypoint", "tail", "--workdir", &format!("{MOUNT}/crates"), "kiln/harness", "-f", "/dev/null"].map(str::to_owned);
+        assert!(args.ends_with(&tail), "{args:?}");
+        assert!(!run_args(&desktop(), &applied, Vec::new()).iter().any(|a| a == "--entrypoint"));
+        Ok(())
+    }
+
     /// W9. Do: apply Slates' read-only entry through each engine, then entries kiln can't apply as answered: another type, a
     /// word it doesn't know, a word said twice, no non-recursive bind, both accesses, an access against its `read_only`, and
     /// a path with a comma. Expect each engine's own read-only word, and each other refused typed: never a word dropped.
@@ -705,7 +766,7 @@ mod tests {
     }
 
     /// W9: a runner's facts say whether its agents can run in containers, asking in the order that asks least. Given a
-    /// machine with no workspaces, then no engine, then an engine Slates refuses (by its runtime, by an untested profile,
+    /// machine with no workspaces, then no image declared for its agents' containers, then no engine, then an engine Slates refuses (by its runtime, by an untested profile,
     /// on a platform where nothing is bound into a container), then a rootful Linux engine, then Docker Desktop and
     /// rootless podman. Expect each lack named typed and nothing asked past it; the refused untested profile still naming
     /// its engine; only the last two available.
@@ -713,8 +774,10 @@ mod tests {
     fn w9_a_runners_facts_say_whether_its_agents_can_run_in_containers_and_what_it_lacks() {
         use slates_api::container_engine::ProfileRefusal;
         let asked = std::cell::Cell::new(0_u32);
+        let image = || Some(IMAGE.to_owned());
         let none = facts_of(
             false,
+            image(),
             || {
                 asked.set(asked.get() + 1);
                 None
@@ -725,13 +788,27 @@ mod tests {
             },
         );
         assert_eq!((none.available, none.missing, none.program, asked.get()), (false, Some(ContainerMissing::Workspaces), None, 0), "nothing is asked of a machine without workspaces");
-        let no_engine = facts_of(true, || None, |_: &str| {
+        let no_image = facts_of(
+            true,
+            None,
+            || {
+                asked.set(asked.get() + 1);
+                None
+            },
+            |_: &str| {
+                asked.set(asked.get() + 1);
+                Err(EngineFault::TooLarge)
+            },
+        );
+        assert_eq!((no_image.available, no_image.missing, asked.get()), (false, Some(ContainerMissing::Image), 0), "no engine is looked for where no image is declared");
+        assert!(no_image.why_not.as_deref().is_some_and(|w| w.contains("container_image")), "{:?}", no_image.why_not);
+        let no_engine = facts_of(true, image(), || None, |_: &str| {
             asked.set(asked.get() + 1);
             Err(EngineFault::TooLarge)
         });
-        assert_eq!((no_engine.available, no_engine.missing, asked.get()), (false, Some(ContainerMissing::Engine), 0), "no profile is asked of an engine not found");
+        assert_eq!((no_engine.available, no_engine.missing, no_engine.image.as_deref(), asked.get()), (false, Some(ContainerMissing::Engine), Some(IMAGE), 0), "no profile is asked of an engine not found");
 
-        let refused = |fault: EngineFault| facts_of(true, || Some(DOCKER.to_owned()), move |_: &str| Err(fault));
+        let refused = |fault: EngineFault| facts_of(true, image(), || Some(DOCKER.to_owned()), move |_: &str| Err(fault));
         let by_runtime = refused(EngineFault::Refused(ProfileRefusal::RuntimeUnsupported { runtime: "nerdctl".to_owned() }));
         assert_eq!((by_runtime.available, by_runtime.missing, by_runtime.program.as_deref(), by_runtime.engine), (false, Some(ContainerMissing::Profile), Some(DOCKER), None));
         assert!(by_runtime.why_not.as_deref().is_some_and(|w| w.starts_with("Slates refused this machine's container engine: ")), "{:?}", by_runtime.why_not);
@@ -741,7 +818,7 @@ mod tests {
         let windows = refused(EngineFault::Unsupported { platform: "windows" });
         assert_eq!((windows.available, windows.missing), (false, Some(ContainerMissing::Platform)));
 
-        let with = |profile: EngineProfile| facts_of(true, || Some(DOCKER.to_owned()), move |program: &str| {
+        let with = |profile: EngineProfile| facts_of(true, image(), || Some(DOCKER.to_owned()), move |program: &str| {
             assert_eq!(program, DOCKER, "Slates judges the engine found");
             Ok(profile)
         });
@@ -751,7 +828,7 @@ mod tests {
         let desktop = with(judged(Engine::DockerDesktop, IdentityRule::HostUserThroughShare, HardLinkRule::OtherNamesStaleAfterTheFirstIsRemoved));
         assert_eq!(
             desktop,
-            ContainerFacts { available: true, program: Some(DOCKER.to_owned()), engine: Some("docker-desktop".to_owned()), endpoint: Some("unix:///var/run/docker.sock".to_owned()), version: Some("29.3.1".to_owned()), why_not: None, missing: None }
+            ContainerFacts { available: true, program: Some(DOCKER.to_owned()), engine: Some("docker-desktop".to_owned()), endpoint: Some("unix:///var/run/docker.sock".to_owned()), version: Some("29.3.1".to_owned()), image: Some(IMAGE.to_owned()), why_not: None, missing: None }
         );
         let podman = with(judged(Engine::Podman, IdentityRule::ContainerRootAsMountingUser, HardLinkRule::EveryNameServedAtOnce));
         assert_eq!((podman.available, podman.engine.as_deref()), (true, Some("podman")));

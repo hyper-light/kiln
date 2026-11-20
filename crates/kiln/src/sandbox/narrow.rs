@@ -49,13 +49,15 @@ pub enum Whole {
     Unnamed { what: String, value: String },
     /// Nothing it reads says what it uses: where it looks.
     Untold { what: String },
+    /// A container's run (docs/agentic.md W9): its engine's network is its reach, which kiln doesn't narrow.
+    Container,
 }
 
 impl Whole {
     /// Whether it keeps more than its session uses because kiln couldn't tell what that is: the
     /// widening the session says, as against an image whose destinations are all its run's.
     pub fn is_fallback(&self) -> bool {
-        !matches!(self, Whole::OneUse | Whole::PersonsOwn)
+        !matches!(self, Whole::OneUse | Whole::PersonsOwn | Whole::Container)
     }
 }
 
@@ -68,6 +70,7 @@ impl std::fmt::Display for Whole {
             Whole::Unread { file, error } => write!(f, "{file} couldn't be read: {error}"),
             Whole::Unnamed { what, value } => write!(f, "{what} is {value:?}, which its image names no hosts for"),
             Whole::Untold { what } => write!(f, "nothing says its provider or sign-in ({what})"),
+            Whole::Container => f.write_str("it runs in a container, which reaches what its engine's network does"),
         }
     }
 }
