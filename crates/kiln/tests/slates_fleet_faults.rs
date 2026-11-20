@@ -21,10 +21,11 @@
 //!
 //! It judges what holds, not how fast: no latency is judged. Each flow waits on the fleet's own failover delay as its
 //! nodes report it (`daemon_status`), never a number of its own. Gated by `SLATES_FLEET_FAULTS=1`, since each flow starts
-//! three Slates instances and their anchors; without it each skips, saying so. The flows that signal a daemon (killed,
-//! partitioned, restarted, a move's target cut) run on Linux alone, where a workspace is a FUSE mount: on macOS it's a
+//! three Slates instances and their anchors; without it each skips, saying so. The flows that signal a daemon under its live
+//! mounts (partitioned, restarted, a move's target cut) run on Linux alone, where a workspace is a FUSE mount: on macOS it's a
 //! kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has panicked the Mac (Slates'
-//! record of 2026-10-06). The link faults (A-708) signal no daemon, so they run on macOS too ([`Fault`]); there, as
+//! record of 2026-10-06). The link faults (A-708) signal no daemon, and the killed runner's flow lets every mount under the owner's
+//! runner go before its kill (A-750), so they run on macOS too ([`Fault`]); there, as
 //! everywhere, the lab's end stops its runners and unmounts every Slates mount under its folder before it ends an
 //! instance, and leaves the instances running, saying so, where a mount won't go (as `slates_e2e`'s drives do).
 //!
@@ -77,6 +78,9 @@ enum Fault {
     Signal,
     /// A link through the relay (A-708): every daemon runs on, so any Unix.
     Link,
+    /// A signal to a daemon whose runner has stopped and whose every mount has gone first (A-750): no NFS mount stands
+    /// over it, so any Unix.
+    Unmounted,
 }
 
 /// Why a flow of `fault` skips on this host (`linux`) with the switch `on` or off; none when it runs.
@@ -416,27 +420,6 @@ impl Lab {
         }
     }
 
-    /// Volume `volume`, owned on runner `owner`, made what Slates' own fleet chaos holds to its NoLoss (`live_chaos.rs`
-    /// `create_volume`, `Fleet::share`): live-shipped, so a write is acknowledged once the owner and `f` copies hold it,
-    /// and shared with this test's user on every other runner's node, since a user means something only on its host
-    /// (A-237) and the survivors read it. Kiln's own workspaces are neither (live shipping is the person's to decide;
-    /// kiln shares a volume only with a move's target, K4), so the lab does it, as Slates' tests do.
-    fn hold_to_no_loss(&self, owner: usize, volume: slates_api::VolumeId) -> anyhow::Result<()> {
-        let n = self.node(owner)?;
-        let mut instance = slates_api::Instance::attach(&n.instance).map_err(|e| anyhow::anyhow!("{}: {e}", n.name))?;
-        let uid = nix::unistd::getuid().as_raw();
-        for (i, other) in self.nodes.iter().enumerate().filter(|(i, _)| *i != owner) {
-            let anchor = slates_api::Instance::attach(&other.instance).and_then(|mut o| o.daemon_status()).map_err(|e| anyhow::anyhow!("{}: {e}", other.name))?.anchor;
-            let principal = slates_api::Principal::Uid { host: anchor, uid };
-            let rights = slates_ipc::protocol::Rights { read: true, write: true, admin: true };
-            instance.client().share(volume, principal, rights).map_err(|e| anyhow::anyhow!("share with runner {i}: {e:?}"))?;
-        }
-        let shipped = instance.client().live_ship(volume, true).map_err(|e| anyhow::anyhow!("live-ship: {e:?}"))?;
-        anyhow::ensure!(shipped, "Slates recorded the volume not live-shipped");
-        eprintln!("NO-LOSS SETUP: the volume live-shipped and shared with the other runners' user");
-        Ok(())
-    }
-
     /// The refusal of a move kiln took for agent `id`, as its timeline says it (`harness::session::move_failed`'s notice,
     /// "Couldn't move to …"): the newest, or none.
     fn move_refused_in_timeline(&self, id: &str) -> anyhow::Result<Option<String>> {
@@ -654,23 +637,30 @@ fn read_refusals(lab: &Lab, through: &[usize], volume: slates_api::VolumeId, pat
         .collect()
 }
 
-/// W7, A-580: a runner killed. Do: write acknowledged files into the agent's volume on the first runner; kill its
-/// instance's anchor and daemon at once (the machine's loss); read them back through the others; start the runner again.
-/// Expect every acknowledged file served byte for byte after the fault, and the fleet re-formed once it's back.
+/// W7, A-580, A-750: the owner's runner killed. Do: write acknowledged files into the agent's workspace on the first
+/// runner, which kiln made live-shipped and shared with every other member (A-750, nothing of the lab's); stop its
+/// runner, let every mount under it go, and kill its instance's anchor and daemon at once (the machine's loss); read the
+/// files through the other two alone; start the runner again. Expect every acknowledged file served byte for byte by
+/// the survivors, and the fleet re-formed once it's back. With its mounts gone first no NFS mount stands over the killed
+/// daemon, so it runs on macOS too.
 #[test]
 fn w7_a_killed_runner_loses_no_acknowledged_change_and_the_fleet_reforms() -> anyhow::Result<()> {
-    if !enabled(Fault::Signal) {
+    if !enabled(Fault::Unmounted) {
         return Ok(());
     }
     let mut lab = Lab::start()?;
     let (_agent, volume) = lab.start_agent(0)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "killed")?;
-    lab.signal(0, "KILL")?;
-    no_acknowledged_change_lost(&lab, volume, &acknowledged, "a runner killed")?;
+    no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "read through the other runners before the kill")?;
     let name = lab.node(0)?.name;
     lab.fleet.stop_runner(name);
+    let root = std::fs::canonicalize(lab.fleet.root.path().join(name)).unwrap_or_else(|_| lab.fleet.root.path().join(name));
+    let left = unmount_under(&root);
+    anyhow::ensure!(left.is_empty(), "{name}'s mounts wouldn't go, so its daemon isn't killed beneath them: {left:?}");
+    lab.signal(0, "KILL")?;
+    no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "the owner's runner killed")?;
     lab.start_runner(0)?;
-    lab.until_reformed("after a runner killed")
+    lab.until_reformed("after the owner's runner killed")
 }
 
 /// W7, A-580: a runner partitioned. Do: write acknowledged files on the first runner; stop its instance's anchor and
@@ -776,7 +766,6 @@ fn w7_a708_a_slow_lossy_link_loses_no_acknowledged_change_and_a_move_over_it_end
     lab.relay()?.shape_all(slow);
     eprintln!("FAULT: every link held {SLOW_DELAY:?} ± {SLOW_JITTER:?}, {SLOW_LOSS_PPM} ppm lost");
     let (agent, volume) = lab.start_agent(0)?;
-    lab.hold_to_no_loss(0, volume)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "slow")?;
     lab.crossed_the_relay()?;
     let (from, to) = (lab.node(0)?.machine.clone(), lab.node(1)?.machine.clone());
@@ -803,7 +792,6 @@ fn w7_a708_a_runner_cut_off_while_it_runs_loses_no_acknowledged_change_and_the_f
     }
     let lab = Lab::start_relayed()?;
     let (_agent, volume) = lab.start_agent(0)?;
-    lab.hold_to_no_loss(0, volume)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "cut")?;
     // The control: the survivors serve the files before any fault, so a loss after the cut is the cut's.
     no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "read through the other runners before the cut")?;
@@ -833,6 +821,7 @@ mod checks {
         assert_eq!(skip(Fault::Link, true, true), None);
         assert_eq!(skip(Fault::Signal, true, true), None);
         assert!(skip(Fault::Signal, false, true).is_some_and(|w| w.contains("Linux alone")), "no daemon is signalled under a macOS NFS mount");
+        assert_eq!(skip(Fault::Unmounted, false, true), None, "a daemon whose mounts have gone is signalled on macOS too");
         assert!(skip(Fault::Link, false, false).is_some_and(|w| w.contains(SWITCH)), "off without the switch");
         assert!(skip(Fault::Signal, true, false).is_some_and(|w| w.contains(SWITCH)));
     }

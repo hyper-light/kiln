@@ -68,13 +68,15 @@ pub enum MoveRefused {
     OutsideNeighbourhood,
     /// Slates couldn't place its records in time and thawed it where it was: asking again may move it.
     Unplaced,
+    /// The agent is isolated: its microVM and what its harness keeps there are its machine's (A-750).
+    Isolated,
     /// Anything else Slates said, in its words.
     Slates { said: String },
 }
 
 /// Every kind a move is refused by ([`MoveRefused::kind`]), as a refusal names it (`[kind: x]`): what a mover, or a test of
 /// kiln's Slates fleet under faults (`super::slates_faults`), may take a refusal for.
-pub const KINDS: [&str; 15] = [
+pub const KINDS: [&str; 16] = [
     "not_in_fleet",
     "setting",
     "target_not_serving",
@@ -89,6 +91,7 @@ pub const KINDS: [&str; 15] = [
     "not_a_member",
     "outside_neighbourhood",
     "unplaced",
+    "isolated",
     "slates",
 ];
 
@@ -126,6 +129,7 @@ impl MoveRefused {
             MoveRefused::NotAMember => "not_a_member",
             MoveRefused::OutsideNeighbourhood => "outside_neighbourhood",
             MoveRefused::Unplaced => "unplaced",
+            MoveRefused::Isolated => "isolated",
             MoveRefused::Slates { .. } => "slates",
         }
     }
@@ -152,6 +156,7 @@ impl MoveRefused {
             MoveRefused::NotAMember => "the target isn't a member of its workspace's Slates region".to_owned(),
             MoveRefused::OutsideNeighbourhood => "the target is outside its workspace's Slates neighbourhood".to_owned(),
             MoveRefused::Unplaced => "Slates couldn't place its workspace's records in time and kept it where it was: move it again".to_owned(),
+            MoveRefused::Isolated => crate::sandbox::isolated::NO_MOVE.to_owned(),
             MoveRefused::Slates { said } => format!("Slates refused to move its workspace: {said}"),
         }
     }
@@ -265,6 +270,7 @@ mod tests {
             MoveRefused::NotAMember,
             MoveRefused::OutsideNeighbourhood,
             MoveRefused::Unplaced,
+            MoveRefused::Isolated,
             MoveRefused::Slates { said: String::new() },
         ];
         let named: std::collections::BTreeSet<&str> = every.iter().map(MoveRefused::kind).collect();

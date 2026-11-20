@@ -671,7 +671,15 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     let (id, base) = provision(name, over, in_fleet().await).await?;
     let volume = slates_api::volume_id_text(id);
     let mut failed = anyhow::anyhow!(super::place::NO_POINT);
-    for point in super::place::points(&here()?.root, name) {
+    // A fleet runner's workspace (a captured clone, K5) is the fleet's before anything is written to it (A-750): shared
+    // with every other member's user and live-shipped, so a write it acknowledges is held at f + 1 of them, and any of
+    // them serves it after its owner's loss. A workspace that can't be is let go below, as one that can't be mounted is.
+    let held = if base.is_some() { held_across_fleet(id).await } else { Ok(()) };
+    let points = if held.is_ok() { super::place::points(&here()?.root, name) } else { Vec::new() };
+    if let Err(e) = held {
+        failed = e;
+    }
+    for point in points {
         let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone() };
         // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
         // volume, not this one, and Slates refuses a second mount at it.
@@ -967,6 +975,41 @@ pub(super) async fn share_with(volume: &str, user: super::slates_fleet::NodeUser
     })
     .await?;
     answer.map_err(|e| anyhow::anyhow!("Slates' share: {e:#}"))
+}
+
+/// Volume `id` made kiln's Slates fleet's (A-750; main's rulings of 2026-11-20): shared with every other member's user
+/// (`slates_fleet::users_but`, asked of the server, waiting while a member hasn't said its user, saying so once), then
+/// live-shipped (Slates' `live_ship`, §4.10: each of its publications shipped to its candidates, a write acknowledged
+/// once the owner and `f` of them hold it), which Slates' "no acknowledged change lost" is a promise of.
+async fn held_across_fleet(id: VolumeId) -> anyhow::Result<()> {
+    let source = super::slates_fleet::source().ok_or_else(|| anyhow::anyhow!("this runner isn't in kiln's Slates fleet"))?;
+    let mut said = false;
+    let users = loop {
+        let members = super::slates_fleet::fleet_members(source).await?;
+        match super::slates_fleet::users_but(&members, &source.machine_name) {
+            Ok(users) => break users,
+            Err(silent) => {
+                if !said {
+                    tracing::info!(?silent, "a new workspace waits for every member of kiln's Slates fleet to say its user, to be shared with it");
+                    said = true;
+                }
+                crate::rt::sleep(GROUPS_LOOK).await;
+            }
+        }
+    };
+    let volume = slates_api::volume_id_text(id);
+    for user in users {
+        share_with(&volume, user).await?;
+    }
+    let name = instance();
+    let shipped = crate::rt::blocking(move || -> anyhow::Result<bool> {
+        let mut i = Instance::attach(&name).map_err(|e| anyhow::anyhow!("{e}"))?;
+        i.client().live_ship(id, true).map_err(|e| anyhow::anyhow!("{e:?}"))
+    })
+    .await?
+    .map_err(|e| anyhow::anyhow!("Slates' live-ship: {e:#}"))?;
+    anyhow::ensure!(shipped, "Slates recorded the workspace {volume} not live-shipped");
+    Ok(())
 }
 
 /// The uid this process runs as: the user kiln is to its Slates node (none where a user is no uid).

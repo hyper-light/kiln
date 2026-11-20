@@ -4302,7 +4302,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     let isolated = s.spec.lock().isolation.is_some();
     let mut core = s.core.lock();
     if isolated && !local {
-        let text = format!("Couldn't move to {to}: {} — it goes on here", crate::sandbox::isolated::NO_MOVE);
+        let text = format!("Couldn't move to {to}: {} — it goes on here", crate::workspace::slates_move::MoveRefused::Isolated.reported());
         core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
         core.touch_state();
         return None;

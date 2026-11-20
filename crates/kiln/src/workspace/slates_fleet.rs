@@ -670,6 +670,39 @@ pub async fn ask_bootstrap(source: &Source, member: u64, done: bool) -> anyhow::
     Ok(answer.bootstrap)
 }
 
+/// The users a fleet runner's new workspace is shared with (A-750; main's ruling of 2026-11-20): every other member's, as
+/// `members` says them (`NodeUser`, each node's certificate anchor and the uid its kiln runs as), so whichever members
+/// hold the volume's copies (its f + 1 holders, which Slates chooses and may change) serve it after its owner's loss: a
+/// user means something only on its host (Slates' A-237), and the owner's user is no other host's. `Err` names the
+/// members that haven't said their user yet (their daemon hasn't served): a share made now would leave them out.
+pub fn users_but(members: &Members, own: &str) -> Result<Vec<NodeUser>, Vec<String>> {
+    let others: Vec<&Member> = members.members.iter().filter(|m| m.machine != own).collect();
+    let silent: Vec<String> = others.iter().filter(|m| m.user.is_none()).map(|m| m.machine.clone()).collect();
+    if !silent.is_empty() {
+        return Err(silent);
+    }
+    let mut users: Vec<NodeUser> = others.iter().filter_map(|m| m.user).collect();
+    users.sort_by_key(|u| (u.anchor, u.uid));
+    users.dedup();
+    Ok(users)
+}
+
+/// The fleet's members as the server knows them, each with the user it said (`POST /api/agents/slates-fleet/users`):
+/// what a runner shares a new workspace with ([`users_but`]).
+pub async fn fleet_members(source: &Source) -> anyhow::Result<Members> {
+    use crate::http::client::{Client, Roots};
+    let ask = AskPlace { cert_pem: source.machine.cert_pem.clone(), proof_csr: crate::pki::make_csr_with_key(&source.machine_name, &source.machine.key_pem)? };
+    let http = Client::new(Roots::WebPkiPlusDer(crate::join::pem_der(&source.ca_pem)?), None)?;
+    let url = format!("{}/api/agents/slates-fleet/users", source.server_url.trim_end_matches('/'));
+    let resp = http.post(&url).json(&ask).send().await.with_context(|| format!("reach {url}"))?;
+    if !resp.is_success() {
+        let status = resp.status();
+        let body = resp.bytes(REFUSAL_BYTES).await.unwrap_or_default();
+        anyhow::bail!("the server refused this runner the fleet's members ({status}): {}", String::from_utf8_lossy(&body).trim());
+    }
+    resp.json(ANSWER_BYTES).await.context("kiln's Slates fleet's members")
+}
+
 /// What a runner sends `POST /api/agents/slates-fleet/place`: its machine's proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AskPlace {
@@ -1145,6 +1178,23 @@ mod tests {
         }
         assert!(ask_bootstrap_on(&c, "another.fleet", "bench-c", true, 33, false, 7)?, "a fleet of its own is bootstrapped once too");
         Ok(())
+    }
+
+    /// A-750 (main's ruling of 2026-11-20): a fleet runner's new workspace is shared with every other member's user,
+    /// each once, its own left out; while a member hasn't said its user, it isn't shared yet, naming who.
+    #[test]
+    fn a750_a_workspace_is_shared_with_every_other_members_user() {
+        let user = |anchor: u64| Some(NodeUser { anchor, uid: 501 });
+        let of = |said: &[(&str, Option<NodeUser>)]| Members {
+            fleet: FLEET.to_owned(),
+            members: said.iter().map(|(m, u)| Member { machine: (*m).to_owned(), address: "10.0.0.1:17300".to_owned(), domain: 0, certificate: String::new(), member: Some(1), user: *u }).collect(),
+        };
+        let all = of(&[("bench-a", user(1)), ("bench-b", user(2)), ("bench-c", user(3))]);
+        assert_eq!(users_but(&all, "bench-a"), Ok(vec![NodeUser { anchor: 2, uid: 501 }, NodeUser { anchor: 3, uid: 501 }]), "the others', its own left out");
+        assert_eq!(users_but(&of(&[("bench-a", None), ("bench-b", user(2)), ("bench-c", user(3))]), "bench-a").map(|u| u.len()), Ok(2), "its own user unsaid: no matter");
+        assert_eq!(users_but(&of(&[("bench-a", user(1)), ("bench-b", user(2)), ("bench-c", None)]), "bench-a"), Err(vec!["bench-c".to_owned()]), "a member yet to say its user");
+        assert_eq!(users_but(&of(&[("bench-a", user(1)), ("bench-b", user(2)), ("bench-c", user(2))]), "bench-a").map(|u| u.len()), Ok(1), "one user, once");
+        assert_eq!(users_but(&of(&[("bench-a", user(1))]), "bench-a"), Ok(vec![]), "a fleet of one shares with no one");
     }
 
     /// A-734 (found by use): the fleet is bootstrapped only once its bootstrapper holds every node its manifest names

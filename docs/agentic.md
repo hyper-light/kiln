@@ -501,7 +501,8 @@ turn is over and its harness is down, its runner lets go of the workspace's moun
 move the volume to the target's node (`Instance::move_volume`, Slates' A-291: the head handed over and
 served there, the old copy frozen and then let go), following Slates' answers until the configuration
 names the target; Slates' refusals come back by kind too (`attached`, `already_moving`, `not_plain`,
-`lineage`, `snapshots`, `not_a_member`, `outside_neighbourhood`, `unplaced`), the workspace mounted
+`lineage`, `snapshots`, `not_a_member`, `outside_neighbourhood`, `unplaced`, and since A-750 `isolated`: an isolated
+agent's microVM is its machine's), the workspace mounted
 again and the agent going on where it was. Then the session is handed over; the runner it goes to
 places the volume's mount under its own place for workspaces and mounts it before the harness starts.
 A workspace laid over its machine's folder is refused `not_plain`: its base stays on its machine.
@@ -547,9 +548,10 @@ by kind** (kiln's word on it, once it settles, is the agent working on its targe
 naming a kind W7 lists, `workspace::slates_move::KINDS`, with the agent working where it was: never neither); and **the
 fleet re-forms** (once the fault ends, every listed runner's node is a member again, serving). It is a test of what
 holds, not of how fast: no latency is judged, and every wait is the fleet's own failover delay as its nodes report it.
-The flows that signal a daemon run on Linux alone, where a workspace is a FUSE mount: on macOS it's a kernel NFS mount
-over loopback, and a daemon killed or stopped under a live NFS mount has panicked the Mac (Slates' record of
-2026-10-06). The link faults signal no daemon and run on macOS too; there, as everywhere, the lab's end stops its
+The flows that signal a daemon under its live mounts run on Linux alone, where a workspace is a FUSE mount: on macOS
+it's a kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has panicked the Mac
+(Slates' record of 2026-10-06). The killed runner's flow stops the owner's runner and lets every mount under it go
+before it kills the instance, so it runs on macOS too (A-750), its survivors alone serving the files. The link faults signal no daemon and run on macOS too; there, as everywhere, the lab's end stops its
 runners and unmounts every Slates mount under its folder before it ends an instance, and leaves the instances running,
 saying so, where a mount won't go. Gated by `SLATES_FLEET_FAULTS=1` and skipped, saying so, without it,
 since it starts three instances and their anchors:
@@ -574,10 +576,13 @@ node counts all three members. Both link flows pass on macOS (Mac Studio, 2026-1
 (35.8 s: every acknowledged file served through the survivors while cut and after), and a slow, lossy link (43.3 s: the
 move over it refused by kind `unplaced`, the agent where it was, every acknowledged file served). A move kiln took
 (`agents.move` answered `moving`) and its runner then refused is said in the agent's timeline ("Couldn't move to …
-[kind: …] — it goes on here"), which the flows read as kiln's word; the signalling flows are Linux's. Open (the person's to decide): a kiln workspace isn't live-shipped, so a write Slates
-acknowledged is the owner's alone until its next seal, where Slates' own "no acknowledged change lost" is a live-shipped
-volume's; and a workspace is shared with another runner's user only before a move (K4; Slates' access lists are per
-host, A-237), so a survivor is refused a read of a workspace it was never moved.
+[kind: …] — it goes on here"), which the flows read as kiln's word; the signalling flows are Linux's. Since A-750 (the person's rulings, 2026-11-20) a fleet runner's
+workspace is the fleet's from its making, before anything is written to it: shared with every other member's user (each
+node's certificate anchor and its kiln's uid, asked of the server, `POST /api/agents/slates-fleet/users`; Slates' access
+lists are per host, A-237, so whichever members hold its copies serve it after its owner's loss) and live-shipped
+(Slates' `live_ship`: a write is acknowledged once the owner and `f` of its candidates hold it, the premise of Slates'
+"no acknowledged change lost"). A workspace waits while a member hasn't said its user, and one that can't be shared or
+shipped is let go, as one that can't be mounted is.
 
 Not in it: a captured clone landed after its runner's loss and a moved live clone landed against its capture, which are
 Slates' own fleet tests (its A-583); one link cut while every node runs, which needs a relay between the nodes that

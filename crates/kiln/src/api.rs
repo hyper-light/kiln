@@ -404,6 +404,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "agents", "slates-fleet", "members"]) => return boxed(|| slates_fleet_members(&hub, req)).await,
         (&Method::POST, ["api", "agents", "slates-fleet", "place"]) => return boxed(|| slates_fleet_place(&hub, req)).await,
         (&Method::POST, ["api", "agents", "slates-fleet", "bootstrap"]) => return boxed(|| slates_fleet_bootstrap(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet", "users"]) => return boxed(|| slates_fleet_users(&hub, req)).await,
         (&Method::POST, ["api", "agents", "rekey"]) => return boxed(|| rekey_agent(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
@@ -4682,6 +4683,19 @@ async fn slates_fleet_place(hub: &Hub, req: Request) -> R {
     }
     let place = crate::workspace::slates_fleet::place_of(&hub.cfg.slates_fleet, &name).map_err(|e| err(StatusCode::CONFLICT, e))?;
     Ok(srv::json(StatusCode::OK, &place))
+}
+
+/// `POST /api/agents/slates-fleet/users`: kiln's Slates fleet's members as the server knows them, each with the user it
+/// said (its node's certificate anchor and its kiln's uid), connected or not: what a runner shares a new workspace with,
+/// so whichever members hold its copies serve it after its owner's loss (A-750; main's ruling of 2026-11-20). Proven as
+/// `/place` is; a runner the setting doesn't list is refused.
+async fn slates_fleet_users(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::AskPlace = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    if crate::workspace::slates_fleet::place_of(&hub.cfg.slates_fleet, &name).map_err(|e| err(StatusCode::CONFLICT, e))?.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, format!("[slates_fleet] doesn't list {name}: it has no fleet's members to share with")));
+    }
+    Ok(srv::json(StatusCode::OK, &hub.slates_fleet.members(|_| true)))
 }
 
 /// `POST /api/agents/slates-fleet/bootstrap`: whether the runner that asks makes kiln's Slates fleet's root group now, the

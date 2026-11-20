@@ -136,7 +136,8 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     // (resumed in place, above), never on another machine, nor as a process anywhere (kiln plan
     // 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
     if info.isolation.is_some() {
-        return Err(crate::sandbox::isolated::NO_MOVE.to_owned());
+        // By its W7 kind, as every refusal of a move is (A-750): a mover, and the fleet's fault test, judge it so.
+        return Err(crate::workspace::slates_move::MoveRefused::Isolated.reported());
     }
     // Its workspace volume goes with it by Slates' own move, inside kiln's Slates fleet (docs/agentic.md W7; kiln goal
     // 95101ef3, K4): planned here, moved by its runner once its turn is over, before the session is handed over.
@@ -448,7 +449,7 @@ mod tests {
             let held = Info { id: "vm".into(), kind: "codex".into(), status: Status::Idle, isolation: Some(Isolation::microvm()), ..Info::default() };
             hub.harness.ingest(&Location::Machine("box".into()), "vm", Update::Open { info: Box::new(held), since: None }).await;
             let moved = start(&hub, "vm", "elsewhere", false, None, None).await;
-            anyhow::ensure!(moved.as_ref().is_err_and(|e| e == crate::sandbox::isolated::NO_MOVE), "{moved:?}");
+            anyhow::ensure!(moved.as_ref().is_err_and(|e| e.starts_with(crate::sandbox::isolated::NO_MOVE) && e.ends_with("[kind: isolated]")), "{moved:?}");
             Ok(())
         })
     }
