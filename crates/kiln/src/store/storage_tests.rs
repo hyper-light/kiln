@@ -1,4 +1,12 @@
 //! Bounded real-file fixtures for storage::reserve_rows. No throughput or latency assertion.
+//!
+//! Each runs again in a process of its own (this test binary, that test alone): SQLite's page caches are one group in
+//! a process (libsqlite3-sys builds it with SQLITE_ENABLE_MEMORY_MANAGEMENT, whose shared bound
+//! `crate::memory::owners` counts on), so a fixture's `cache_size` of 8 pages makes its large transaction spill
+//! frames before its commit only while no other connection's pages share its group. Beside the other tests' stores
+//! the shrinking fixture's update spilled none (its WAL empty until the commit) in 10 of 10 targeted parallel runs on
+//! adacachy, 2026-11-20; in a program of its own with four connections writing beside the same update, 12 of 120 updates
+//! spilled none, and none of 80 with SQLite built without that option.
 
 use std::io::Write as _;
 use std::path::{Path,PathBuf};
@@ -26,6 +34,22 @@ struct Growth {
     wal_after_commit:u64,
     shm_growth:u64,
     observed_growth:u64,
+}
+
+/// Set in the process a fixture runs again in, alone.
+const ALONE:&str="KILN_TEST_STORAGE_FIXTURE_ALONE";
+
+/// Whether fixture `test` ran (and passed) in a process of its own just now, its output passed on: true in the test
+/// binary's own process, which then has nothing more to do; false in that process of its own, which runs it.
+fn ran_alone(test: &str) -> anyhow::Result<bool> {
+    if std::env::var_os(ALONE).is_some() { return Ok(false); }
+    let me=format!("{}::{test}",module_path!().split_once("::").map_or("",|(_,path)|path));
+    let out=std::process::Command::new(std::env::current_exe()?).args(["--exact",me.as_str(),"--nocapture","--test-threads=1"]).env(ALONE,"1").output()?;
+    let said=String::from_utf8_lossy(&out.stdout);
+    let _=write!(std::io::stdout().lock(),"{said}");
+    anyhow::ensure!(out.status.success(),"{me} alone ({}): {said}{}",out.status,String::from_utf8_lossy(&out.stderr));
+    anyhow::ensure!(said.contains("1 passed"),"{me} didn't run alone: {said}");
+    Ok(true)
 }
 
 struct WalDb {
@@ -104,6 +128,7 @@ impl WalDb {
 
 #[test]
 fn overflow_payload_and_spilled_wal_fit_reserved_scratch() -> anyhow::Result<()> {
+    if ran_alone("overflow_payload_and_spilled_wal_fit_reserved_scratch")? { return Ok(()); }
     let mut db=WalDb::new(512,"CREATE TABLE messages(id INTEGER PRIMARY KEY,body BLOB NOT NULL); CREATE TABLE baseline(id INTEGER PRIMARY KEY,body BLOB NOT NULL);")?;
     db.connection.execute("INSERT INTO baseline VALUES(1,zeroblob(?1))",[2*1024*1024])?;
     let body=vec![0x5au8;8*1024*1024];
@@ -116,6 +141,7 @@ fn overflow_payload_and_spilled_wal_fit_reserved_scratch() -> anyhow::Result<()>
 
 #[test]
 fn indexed_large_keys_and_many_inserts_fit_actual_schema_reserve() -> anyhow::Result<()> {
+    if ran_alone("indexed_large_keys_and_many_inserts_fit_actual_schema_reserve")? { return Ok(()); }
     let mut db=WalDb::new(4096,"CREATE TABLE messages(id TEXT PRIMARY KEY,body BLOB NOT NULL,sender TEXT NOT NULL); CREATE INDEX messages_sender ON messages(sender); CREATE INDEX messages_body ON messages(body); CREATE TABLE baseline(id INTEGER PRIMARY KEY AUTOINCREMENT,body BLOB NOT NULL);")?;
     db.connection.execute("INSERT INTO baseline(body) VALUES(zeroblob(?1))",[2*1024*1024])?;
     let body=vec![0x43u8;64*1024];let mut originals=Vec::new();
@@ -137,6 +163,7 @@ fn indexed_large_keys_and_many_inserts_fit_actual_schema_reserve() -> anyhow::Re
 
 #[test]
 fn shrinking_old_overflow_body_and_keys_with_secure_delete_fit_prior_bound() -> anyhow::Result<()> {
+    if ran_alone("shrinking_old_overflow_body_and_keys_with_secure_delete_fit_prior_bound")? { return Ok(()); }
     let mut db=WalDb::new(4096,"CREATE TABLE messages(id TEXT PRIMARY KEY,body BLOB NOT NULL,sender TEXT NOT NULL); CREATE INDEX messages_sender ON messages(sender);")?;
     let old_body=vec![0x71u8;1024*1024];let old_key="k".repeat(128*1024);let old_sender="s".repeat(128*1024);
     db.connection.execute("INSERT INTO messages(id,body,sender) VALUES(?1,?2,?3)",params![old_key,old_body,old_sender])?;
