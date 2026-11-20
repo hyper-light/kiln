@@ -115,6 +115,114 @@ function iconsTogether(): Plugin {
   };
 }
 
+/** Whether a module's code is only imports and re-exports (a package's index). */
+function reexportsOnly(code: string | null): boolean {
+  if (!code) return false;
+  const body = code
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "")
+    .replace(/["']use strict["'];?/, "");
+  return body
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .every((s) => /^import\s[\s\S]*\bfrom\s*["'][^"']+["']$/.test(s) || /^export\s*(\*|\{)[\s\S]*$/.test(s));
+}
+
+/**
+ * What pages load first travels in few files (goal 8's requests). Left to itself the build cuts a
+ * chunk for each set of routes that shares a module: 30-odd files every page waited on, and as many
+ * again for Mission control and a conversation. So:
+ * - `shell`: what every signed-in page loads first, the entry's static imports and the app shell's
+ *   (`_app`'s component, which the router splits off but every page asks for with the entry);
+ * - `agents`: what both Mission control and a conversation load first and nothing else loads, on its
+ *   first load or later (another page's, or the shell's lazy parts: the toasts every page shows);
+ * - `requests`: what both of those load first and the requests' toasts every signed-in page shows
+ *   load as it's up, and no other page's first load does.
+ * - `navigation`: what opening a conversation reads first, with its page's code, and only the agents'
+ *   pages load.
+ */
+const GROUPS = ["shell", "agents", "requests", "navigation"] as const;
+function firstLoadsTogether(): Plugin {
+  const groups = new Map<(typeof GROUPS)[number], Set<string>>();
+  return {
+    name: "kiln:first-loads-together",
+    apply: "build",
+    applyToEnvironment: (env) => env.config.consumer === "client",
+    buildEnd() {
+      const ids = [...this.getModuleIds()];
+      // Each route's component, by its file's name (`_app.agents.$id`).
+      const routes = new Map(
+        ids.flatMap(
+          (id) =>
+            /[\\/]src[\\/]routes[\\/](.+)\.tsx\?tsr-split=component$/
+              .exec(id)
+              ?.slice(1)
+              .map((name) => [id, name] as const) ?? [],
+        ),
+      );
+      const named = (name: string) => [...routes].filter(([, n]) => n === name).map(([id]) => id);
+      // And each route's own file (its beforeLoad's imports are that page's).
+      const files = new Map(
+        ids.flatMap(
+          (id) =>
+            /[\\/]src[\\/]routes[\\/](.+)\.tsx$/
+              .exec(id)
+              ?.slice(1)
+              .map((name) => [id, name] as const) ?? [],
+        ),
+      );
+      /**
+       * What `roots` import; with `later`, what they load later too, but neither other pages (the
+       * router's) nor what the routes `later` names load as they're opened.
+       */
+      const closure = (roots: string[], later?: readonly string[]) => {
+        const seen = new Set<string>();
+        const stack = [...roots];
+        while (stack.length) {
+          const id = stack.pop();
+          if (id === undefined || seen.has(id)) continue;
+          const info = this.getModuleInfo(id);
+          // A package's index that only re-exports (radix-ui, lucide-react, the router) names
+          // modules a page may not use: left to the build, which knows which it does.
+          if (info && reexportsOnly(info.code) && !roots.includes(id)) continue;
+          seen.add(id);
+          const opening = later?.includes(files.get(id) ?? "");
+          stack.push(...(info?.importedIds ?? []), ...(later && !opening ? (info?.dynamicallyImportedIds ?? []).filter((d) => !routes.has(d)) : []));
+        }
+        return seen;
+      };
+      const shellRoots = [...ids.filter((id) => this.getModuleInfo(id)?.isEntry), ...named("_app")];
+      const shell = closure(shellRoots);
+      const AGENTS = ["_app.agents.index", "_app.agents.$id"];
+      /** What the shell and every page but `pages` load, first or later. */
+      const besides = (pages: string[]) => closure([...shellRoots, ...[...routes].filter(([, n]) => n !== "_app" && !pages.includes(n)).map(([id]) => id)], pages);
+      const [mission, conversation] = AGENTS.map((n) => closure(named(n)));
+      const notAgents = besides(AGENTS);
+      groups.clear();
+      groups.set("shell", shell);
+      groups.set("agents", new Set([...(mission ?? [])].filter((id) => conversation?.has(id) && !notAgents.has(id))));
+      // The requests waiting on you, which every signed-in page shows as it's up (approval-toasts.tsx):
+      // what both pages load first, and the toasts load, and no other page's first load does.
+      const toasts = closure(ids.filter((id) => /[\\/]src[\\/]views[\\/]harness[\\/]approval-toasts\.tsx$/.test(id)));
+      const firstElsewhere = closure([...routes].filter(([, n]) => n !== "_app" && !AGENTS.includes(n)).map(([id]) => id));
+      groups.set("requests", new Set([...toasts].filter((id) => mission?.has(id) && conversation?.has(id) && !shell.has(id) && !firstElsewhere.has(id))));
+      // What opening a conversation reads first (lib/agent-navigation.ts, its route's beforeLoad's), but
+      // Mission control doesn't, and nothing outside the agents' pages loads.
+      const navigation = closure(ids.filter((id) => /[\\/]src[\\/]lib[\\/]agent-navigation\.ts$/.test(id)));
+      groups.set("navigation", new Set([...navigation].filter((id) => conversation?.has(id) && !mission?.has(id) && !notAgents.has(id))));
+    },
+    outputOptions(options) {
+      if (options.codeSplitting === false) return options;
+      const splitting = typeof options.codeSplitting === "object" ? options.codeSplitting : {};
+      // Not their modules' imports too (the shell's are its own): what other pages use stays where it is.
+      // The sets are made at the build's end, after this is asked.
+      const together = GROUPS.map((name, i) => ({ name, test: (id: string) => groups.get(name)?.has(id) ?? false, priority: GROUPS.length - i, includeDependenciesRecursively: name === "shell" }));
+      return { ...options, codeSplitting: { ...splitting, groups: [...together, ...(splitting.groups ?? [])] } };
+    },
+  };
+}
+
 export default defineConfig({
   // TanStack Start renders pages and server components (React Server Components); React's plugin
   // goes after it.
@@ -123,6 +231,7 @@ export default defineConfig({
     plainGrammars(),
     chunkKeys(),
     iconsTogether(),
+    firstLoadsTogether(),
     entryPreloads(),
     tailwindcss(),
     tanstackStart({ rsc: { enabled: true }, spa: { enabled: true, prerender: { outputPath: "/_shell.html" } } }),

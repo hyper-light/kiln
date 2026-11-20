@@ -10,7 +10,7 @@ import { useRes } from "@/lib/data";
 import { agentLabel, changesetOf, editsOf, runsOf, useSameList } from "./derive";
 import { isBackground } from "./background";
 import { workingNow } from "./tasks";
-import { useReviewWaits } from "@/views/plans/review";
+import { useReviewWaits } from "@/views/plans/review-waits";
 import { Loadable } from "@/components/ui/loading";
 import { Hold } from "@/components/ui/hold";
 import { ChangeBar } from "./change-bar";

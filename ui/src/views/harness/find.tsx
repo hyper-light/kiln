@@ -182,6 +182,7 @@ export function FindBar({
   onClose,
   partial,
   inputRef,
+  autoFocus,
 }: {
   q: string;
   onQ: (q: string) => void;
@@ -194,6 +195,8 @@ export function FindBar({
   /** Only the latest events are loaded (earlier ones aren't searched). */
   partial?: number;
   inputRef: React.RefObject<HTMLInputElement | null>;
+  /** Asked for before the page was whole: the box takes the focus as it shows. */
+  autoFocus?: boolean;
 }) {
   const where = !q.trim() ? "" : total === 0 ? "No matches" : `${index + 1} of ${total}`;
   return (
@@ -201,6 +204,7 @@ export function FindBar({
       <Search size={14} aria-hidden="true" className="hx-find-icon" />
       <input
         ref={inputRef}
+        autoFocus={autoFocus}
         type="text"
         value={q}
         onChange={(e) => onQ(e.target.value)}

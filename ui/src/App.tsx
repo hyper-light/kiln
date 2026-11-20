@@ -10,7 +10,7 @@ import { Toaster } from "@/components/ui/toast";
 import { checkAuth, startAuth, useAuth } from "@/lib/auth";
 import { PrivateBootstrapContext } from "@/lib/private-bootstrap-context";
 import { harnessSessionsRes } from "@/lib/data";
-import { listed } from "@/api/harness";
+import { listed } from "@/api/agents-list";
 import { seedResource } from "@/lib/resource";
 
 /** Sign-in, loaded only when someone isn't signed in. */

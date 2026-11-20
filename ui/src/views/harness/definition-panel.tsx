@@ -5,7 +5,7 @@
  */
 import { agentdefsRes } from "@/api/agentdefs";
 import { useRes } from "@/lib/data";
-import { sessionVariant, Swatch } from "./definitions";
+import { sessionVariant, Swatch } from "./definition-parts";
 import { useEngineOf } from "./engine-of";
 import "./definition.css";
 
