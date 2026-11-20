@@ -3,9 +3,8 @@
  * the API to list, start and stop agents, and a live session store fed by its websocket.
  * Nothing here is specific to one harness: Claude Code, Codex and the rest all speak this.
  */
-import { KINDS_READ, SESSIONS_READ } from "./launch-reads";
-import { fromColumns, isColumns, type Columns } from "./columns";
-import { listAsked, listedAgain } from "./last-words";
+import { KINDS_READ } from "./launch-reads";
+import { call, listAgents } from "./agents-list";
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
 import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
@@ -275,9 +274,6 @@ export interface LandingPlan {
   why_not?: string;
 }
 
-/** Whether an agent is one of the agents kiln lists: a card's helper (`helper`, `agents.about`) is the card's, no row of them. */
-export const listed = (a: AgentInfo) => !a.helper;
-
 /** What a person asks about a piece of code in an agent's conversation (`agents.about`). */
 export interface AboutAsk {
   path: string;
@@ -384,30 +380,9 @@ export interface Spec {
 /** Where agents can have workspaces of their own, by target (`local`, `agent:<name>`). */
 export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
 
-/* ------------------------------------------------------------------ REST */
+export { listed } from "./agents-list";
 
-async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> {
-  const res = await fetch(path, {
-    method,
-    credentials: "same-origin",
-    headers: body === undefined ? headers : { "content-type": "application/json", ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      const j = (await res.json()) as { error?: string };
-      if (j.error) msg = j.error;
-    } catch {
-      /* not json */
-    }
-    // With its status, for what tells one answer from another (a start asked again, refused as there already: starting.ts).
-    throw new ApiError(res.status, msg);
-  }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
-}
+/* ------------------------------------------------------------------ REST */
 
 /** A port an agent's machine listens on (`crate::browser::apps::Listening`). */
 export interface Listening {
@@ -604,17 +579,8 @@ export const harnessApi = {
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
-  /**
-   * The agents, as the list tells them lean and as columns (W21-R02; a server from before answers the list itself).
-   * What was known of their last words is as old as the list before: the rows that show them ask again.
-   */
-  list: (signal?: AbortSignal) => {
-    const since = listAsked();
-    return call<AgentInfo[] | Columns>("GET", SESSIONS_READ, undefined, signal).then((read) => {
-      listedAgain(since);
-      return (isColumns(read) ? fromColumns<AgentInfo>(read) : read).filter(listed);
-    });
-  },
+  /** The agents, as the list tells them (agents-list.ts). */
+  list: listAgents,
   /** One agent, or null when there's none under `id` (yet, or any more). */
   session: (id: string) =>
     call<AgentInfo>("GET", `/api/harness/sessions/${encodeURIComponent(id)}`).catch((e: unknown) => {
