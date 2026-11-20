@@ -63,6 +63,7 @@ was started in (`--permission-mode`, else `default`) and the one a `set_permissi
 """
 import json
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -114,7 +115,9 @@ def where():
             boot = f.read().strip()
     except OSError:
         boot = "-"
-    return "WHERE %s %s" % (os.uname().sysname, boot)
+    # The OS by its kernel's own name, as `uname -s` says it on Unix (Linux, Darwin); `os.uname` is Unix's alone, and
+    # `platform.system` says the same there and Windows on Windows.
+    return "WHERE %s %s" % (platform.system(), boot)
 
 
 def write(name):
