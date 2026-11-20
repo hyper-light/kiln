@@ -27,7 +27,6 @@
 
 use std::path::{Component, Path};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::future::BoxFuture;
 use kiln_seams::sandbox::{Boundary, Holds, Launch, Link, Output, Refusal, Run, Sandbox, Signal};
@@ -135,15 +134,35 @@ fn exec_args(launch: &Launch, container: &str, workdir: &str) -> Vec<String> {
     args
 }
 
+/// A container's release, done once whoever asks first, every other caller waiting until it's done (see
+/// [`ContainerRun`]): a run killed spawns its release, and its end, read next, must not be said before the container is
+/// gone (w-k90-containers' r8: "its containers outlived it").
+#[derive(Debug, Default)]
+pub(crate) struct ReleaseOnce {
+    done: futures::lock::Mutex<bool>,
+}
+
+impl ReleaseOnce {
+    /// Runs `release` unless another caller did, or waits for the caller running it to finish.
+    pub(crate) async fn run<F: std::future::Future<Output = ()>>(&self, release: impl FnOnce() -> F) {
+        let mut done = self.done.lock().await;
+        if !*done {
+            release().await;
+            *done = true;
+        }
+    }
+}
+
 /// The container `running`, its engine volume and its export let go, once: the workspace's mount stays
 /// (`workspace::container::release`).
-async fn release_once(released: &AtomicBool, running: &Running, made: &Made) {
-    if released.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    if let Err(e) = crate::workspace::container::release(running, made).await {
-        tracing::warn!(container = %running.container, mount = %made.mount, error = %format!("{e:#}"), "a container sandbox's run ended, but its container wasn't removed: its volume, its export and the workspace's mount stay with it");
-    }
+async fn release_once(released: &ReleaseOnce, running: &Running, made: &Made) {
+    released
+        .run(|| async {
+            if let Err(e) = crate::workspace::container::release(running, made).await {
+                tracing::warn!(container = %running.container, mount = %made.mount, error = %format!("{e:#}"), "a container sandbox's run ended, but its container wasn't removed: its volume, its export and the workspace's mount stay with it");
+            }
+        })
+        .await;
 }
 
 /// A harness's run in its container: the engine's `exec`, a process of this machine's, and the container it runs in,
@@ -152,7 +171,7 @@ struct ContainerRun {
     exec: ProcRun,
     running: Running,
     made: Made,
-    released: Arc<AtomicBool>,
+    released: Arc<ReleaseOnce>,
 }
 
 impl Run for ContainerRun {
@@ -208,7 +227,7 @@ impl Sandbox for ContainerSandbox {
             for (key, value) in &launch.env {
                 cmd.env(key, value);
             }
-            let released = Arc::new(AtomicBool::new(false));
+            let released = Arc::new(ReleaseOnce::default());
             let exec = match crate::proc::spawn_duplex(cmd) {
                 Ok(exec) => exec,
                 Err(e) => {
@@ -399,6 +418,42 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--env", "ANTHROPIC_API_KEY"]) && !args.iter().any(|a| a.contains("not-a-real-key")), "{args:?}");
         // What it is, a container's sandbox holds: no limit or narrowed egress it would refuse.
         assert!(plan_of(&launch, DOCKER, &judged(), &made(), "kiln-a-1".to_owned(), (501, 20)).is_ok());
+        Ok(())
+    }
+
+    /// W9 (w-k90-containers' r8 on Docker Desktop 29.3.1: "its containers outlived it"). Do: a run killed (its release
+    /// spawned, the engine still removing the container) and then read to its end (the release asked again). Expect the
+    /// second caller back only once the first's release is done: a session never reads as ended while its container is
+    /// still there.
+    #[test]
+    fn w9_a_run_reads_ended_only_once_its_container_is_released() -> anyhow::Result<()> {
+        type Said = Arc<std::sync::Mutex<Vec<&'static str>>>;
+        fn say(said: &Said, word: &'static str) {
+            if let Ok(mut s) = said.lock() {
+                s.push(word);
+            }
+        }
+        let said: Said = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let once = Arc::new(ReleaseOnce::default());
+        let (first, by, second, at_end) = (once.clone(), said.clone(), once, said.clone());
+        crate::rt::block_on(async move {
+            let killed = crate::rt::spawn(async move {
+                first
+                    .run(|| async move {
+                        crate::rt::sleep(std::time::Duration::from_millis(200)).await;
+                        say(&by, "released");
+                    })
+                    .await;
+            });
+            crate::rt::sleep(std::time::Duration::from_millis(20)).await;
+            let twice = at_end.clone();
+            second.run(|| async move { say(&twice, "released twice") }).await;
+            say(&at_end, "ended");
+            let _ = killed.await;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        let said = said.lock().map(|s| s.clone()).unwrap_or_default();
+        assert_eq!(said, ["released", "ended"], "the end was read before the container was released");
         Ok(())
     }
 }
