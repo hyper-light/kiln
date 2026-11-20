@@ -775,6 +775,7 @@ pub async fn join(source: &Source) -> anyhow::Result<Option<Joined>> {
             }
             Some(_) => {}
         }
+        #[allow(clippy::disallowed_methods)] // (c) kiln's directory sends no notification when the fleet fills: asked again
         crate::rt::sleep(AWAIT_FLEET).await;
     };
     let manifest = write_manifest(&source.dir, &identity, &source.machine_name, &members, place.f, place.bind.as_deref())?;

@@ -104,13 +104,21 @@ jobs:
       # once (the library, and the library as its tests) ran the runner's 16 GB out, and GitHub shut
       # the runner down mid-build.
       - name: Build the library's tests
+        if: ${{ !cancelled() }}
         run: cargo test -p kiln --locked --lib --no-run
       - name: Tests
+        if: ${{ !cancelled() }}
         run: cargo test -p kiln --locked
 
   build:
     name: ${{ matrix.os }} (clippy, build)
     needs: ui
+    # Bounded: macos-latest's Clippy ran past two hours in run 44784299374 (a 7 GB runner; kiln's crate takes 7 GiB
+    # and more), and while a leg runs, every newer push's run waits in the one pending place and is cancelled by
+    # the next (44790740630 to 44802263763 all were): GitHub's own limit is six hours.
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
       fail-fast: false
       matrix:
@@ -148,12 +156,87 @@ jobs:
           "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Clippy
+      - id: clippy
+        name: Clippy
         shell: bash
-        run: cargo clippy -p kiln --all-targets --locked -- -D warnings
-      - name: Build
+        run: cargo clippy -p kiln --all-targets --locked -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
+      # The build runs whatever clippy said: a lint is no reason not to know whether kiln builds here.
+      - id: build
+        name: Build
+        if: ${{ !cancelled() }}
         shell: bash
+        run: cargo build -p kiln --locked 2>&1 | tee "$RUNNER_TEMP/build.txt"
+      # A run's logs take a GitHub sign-in to read; its annotations don't. A failed step's first
+      # errors, without cargo's progress, as one annotation (the priority checks' Report, below).
+      - name: Report
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          OUTCOMES: clippy=${{ steps.clippy.outcome }} build=${{ steps.build.outcome }}
+        run: |
+          set +e +o pipefail
+          for said in $OUTCOMES; do
+            step=${said%%=*} outcome=${said#*=}
+            out="$RUNNER_TEMP/$step.txt"
+            if [ "$outcome" = success ] || [ ! -s "$out" ]; then continue; fi
+            text=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Checking|Blocking|Downloaded|Downloading|Updating|Locking) ' | awk '/^(error|warning)/ { f = 1 } f' | head -n 200)
+            echo "::error title=${{ matrix.os }} $step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+          done
+
+  # kiln goal 90, part 01a1ec34: kiln builds the Slates it vendors (vendor/slates at vendor/MANIFEST.toml's commit) and
+  # tests its use of it natively on every platform it ships, each on GitHub's own runner of that platform, apart from
+  # clippy (the `build` job's), so a lint elsewhere never hides whether it builds and drives Slates here. The tests:
+  # workspace::slates* (kiln's side of Slates' consumer contract, its fleet, moves and faults), `vendored` (one
+  # revision of each vendored crate in Cargo.lock) and `slates_roles` (kiln's own executable runs the instance's anchor
+  # and daemon, driven through the library; no Slates binary runs). Windows on x86-64 is the windows-slates job's,
+  # with WinFsp.
+  slates:
+    name: ${{ matrix.os }} (Slates build and tests)
+    needs: ui
+    # Bounded as the `build` job is.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # As the `build` job: aws-lc-sys builds with clang-cl on arm64 Windows, never MSVC's cl.exe.
+      - name: clang-cl for the C kiln links (arm64 Windows)
+        if: ${{ matrix.os == 'windows-11-arm' }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # One at a time: kiln's crate compiled twice at once (the library, and the library as its tests) ran a 16 GB
+      # runner out (the linux job).
+      - name: Build kiln with vendor/slates
         run: cargo build -p kiln --locked
+      - name: kiln's Slates tests (library)
+        run: cargo test -p kiln --locked --lib -- workspace::slates
+      - name: kiln's Slates tests (vendored, slates_roles)
+        run: cargo test -p kiln --locked --test vendored --test slates_roles
 
   # Goal 3 step 1 and goal 8 step 4, on Windows itself (the `build` job only builds there, and the
   # release's Windows binary is cross-built with zig): the compute pool's threads run below normal,
@@ -209,5 +292,97 @@ jobs:
             fi
             level=notice
             if [ "$outcome" != success ]; then level=error; fi
+            echo "::$level title=$step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+          done
+
+  # kiln with the Slates it vendors (vendor/slates), tested on Windows itself (kiln goal 90: part
+  # 01a1ec34599974448569750ac79093b6's Windows half and part 01a1f153aa82776dabb687f9c7c42b4d). The
+  # `build` job only lints and builds there; this one runs the tests that drive Slates through its
+  # library: the bare-metal drive and W6's drift (tests/slates_e2e.rs `bare_metal`: two agents on
+  # WinFsp drives, review, drift, landing by each one's mode) with SLATES_E2E=1, so a runner that
+  # gives no Slates volume fails rather than skips, and the workspace's own tests over Slates.
+  # A Slates mount on Windows is WinFsp's: installed here, pinned, as Slates' own CI installs it
+  # (its .github/workflows/ci.yml, A-206 and A-369), and the stand-in harness runs by the
+  # runner image's Python 3. The results come back as annotations, as the priority checks' do.
+  windows-slates:
+    name: windows (Slates tests)
+    needs: ui
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+      WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-dist
+          path: ui/dist
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The daemon links nothing of WinFsp's: it finds winfsp-x64.dll on the loader's path (the bin/
+      # added here) or where the MSI's registry entry says. A slates drive is a Mount Manager drive
+      # WinFsp's driver makes for an unprivileged daemon (MountUseMountmgrFromFSD, Slates' A-369).
+      # Twenty tries a minute apart ride out a GitHub release-download outage (Slates' run 42471186455).
+      - name: Install WinFsp
+        shell: pwsh
+        timeout-minutes: 45
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi -MaximumRetryCount 20 -RetryIntervalSec 60 -TimeoutSec 120
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name MountUseMountmgrFromFSD -Value 1 -PropertyType DWord -Force | Out-Null
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Python 3 for the stand-in harness
+        run: |
+          python --version || py -3 --version
+      # Each check builds and runs in one cargo call (see the priority checks: the build script runs
+      # again at every call in a fetched checkout). The microVM drive is whp-drive.yml's: this
+      # runner has WHP, so it would boot guests here too.
+      - id: e2e
+        name: The bare-metal drive and drift on WinFsp drives (slates_e2e)
+        timeout-minutes: 90
+        env:
+          SLATES_E2E: "1"
+        run: |
+          cargo test -p kiln --locked --test slates_e2e -- --skip microvm:: --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/e2e.txt"
+      - id: workspace
+        name: The workspace's tests over Slates (kiln's library)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: |
+          cargo test -p kiln --locked --lib -- workspace:: 2>&1 | tee "$RUNNER_TEMP/workspace.txt"
+      - name: Report
+        if: ${{ always() }}
+        env:
+          OUTCOMES: e2e=${{ steps.e2e.outcome }} workspace=${{ steps.workspace.outcome }}
+        run: |
+          set +e +o pipefail
+          for said in $OUTCOMES; do
+            step=${said%%=*} outcome=${said#*=}
+            out="$RUNNER_TEMP/$step.txt"
+            if [ ! -s "$out" ]; then continue; fi
+            plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Blocking|Downloaded|Downloading|Updating|Locking) ')
+            summary=$(printf '%s\n' "$plain" | grep -E '^(test result:|test .* \.\.\. (ok|FAILED|ignored)$|SKIP:|PROVEN:)' | tail -n 60)
+            text=$(printf '%s\n' "$plain" | tail -n 150)
+            if ! printf '%s\n' "$plain" | grep -q -E '^running [0-9]+ tests?$'; then
+              first=$(printf '%s\n' "$plain" | sed -n '/^error/,$p' | head -n 150)
+              if [ -n "$first" ]; then text=$first; fi
+            fi
+            level=notice
+            if [ "$outcome" != success ]; then level=error; fi
+            echo "::notice title=$step results::$(printf '%s\n' "$summary" | sed -e 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
             echo "::$level title=$step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
           done

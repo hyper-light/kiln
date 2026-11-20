@@ -6370,16 +6370,30 @@ async fn harness_workspaces(hub: &Hub) -> Response {
     let mut out = serde_json::Map::new();
     let mut targets = vec!["local".to_owned()];
     targets.extend(hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
-    // Mounted on each machine's host, as an agent there works in one (W2); a volume served to a microVM, which needs no
-    // host mount, is judged as its isolated start is made (`lineage::WorkspaceUse::Served`, W8).
+    // Mounted on each machine's host, as an agent there works in one (W2); and beside it, `served`, a volume served to a
+    // microVM, which needs no host mount, judged as its isolated start is made (`lineage::WorkspaceUse::Served`, W8
+    // piece 4): a Windows host without WinFsp gives an isolated agent one where it gives a host agent none.
+    use crate::harness::lineage::{WorkspaceUse, workspaces_on};
     for t in targets {
-        let v = match crate::harness::lineage::workspaces_on(hub, &t, crate::harness::lineage::WorkspaceUse::Mounted).await {
-            Ok(()) => json!({"available": true}),
-            Err(no) => json!({"available": false, "why_not": no.said, "missing": no.missing}),
-        };
-        out.insert(t, v);
+        let mounted = workspaces_on(hub, &t, WorkspaceUse::Mounted).await;
+        let served = workspaces_on(hub, &t, WorkspaceUse::Served).await;
+        out.insert(t, workspaces_answer(&mounted, &served));
     }
     srv::json(StatusCode::OK, &serde_json::Value::Object(out))
+}
+
+/// One target's answer in `/api/harness/workspaces`: whether it gives a workspace mounted on its host (`available`, and
+/// where not, `why_not` and `missing`), and under `served` the same of a volume served to a microVM (W8 piece 4).
+fn workspaces_answer(mounted: &Result<(), crate::harness::lineage::NoWorkspace>, served: &Result<(), crate::harness::lineage::NoWorkspace>) -> serde_json::Value {
+    let said = |r: &Result<(), crate::harness::lineage::NoWorkspace>| match r {
+        Ok(()) => json!({"available": true}),
+        Err(no) => json!({"available": false, "why_not": no.said, "missing": no.missing}),
+    };
+    let mut v = said(mounted);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("served".to_owned(), said(served));
+    }
+    v
 }
 
 fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
@@ -8777,6 +8791,26 @@ fn back(connected: u64, before: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// W8 piece 4: a runner without a host mount (a Windows host without WinFsp) is said to give a volume served to a
+    /// microVM beside giving none mounted on its host, each with its own why; one that keeps no workspaces gives neither.
+    #[test]
+    #[allow(clippy::indexing_slicing, reason = "a missing key reads as null and fails its assertion")]
+    fn w8_p4_a_runners_workspaces_say_a_served_volume_beside_a_mounted_one() {
+        use crate::harness::lineage::NoWorkspace;
+        use crate::workspace::slates::WorkspaceMissing as Lacks;
+        let no = |missing: Lacks, said: &str| Err(NoWorkspace { missing, said: said.into() });
+        let said = |v: &serde_json::Value, at: &str| v.pointer(at).cloned().unwrap_or_default();
+        let whp = super::workspaces_answer(&no(Lacks::WinFsp, "WinFsp isn't installed (winfsp.dev)"), &Ok(()));
+        assert_eq!(said(&whp, "/available"), false);
+        assert_eq!(said(&whp, "/why_not"), "WinFsp isn't installed (winfsp.dev)");
+        assert_eq!(said(&whp, "/served"), serde_json::json!({"available": true}));
+        let none = super::workspaces_answer(&no(Lacks::Workspaces, "this kiln keeps no workspaces"), &no(Lacks::Workspaces, "this kiln keeps no workspaces"));
+        assert_eq!((said(&none, "/available"), said(&none, "/served/available")), (false.into(), false.into()));
+        assert_eq!(said(&none, "/served/why_not"), "this kiln keeps no workspaces");
+        let both = super::workspaces_answer(&Ok(()), &Ok(()));
+        assert_eq!(both, serde_json::json!({"available": true, "served": {"available": true}}));
+    }
+
     /// What's kiln's to say of an agent's start is never what's asked: an isolated agent's person,
     /// whose volume holds its harness's sign-in (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step
     /// 18), is whoever asks, a forged one replaced, none without a caller.

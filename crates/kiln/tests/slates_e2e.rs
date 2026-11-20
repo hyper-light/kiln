@@ -19,8 +19,8 @@
 //!    (`bare_metal`), its mount is Slates' and the harness works in it: in the host's table as Slates' (NFS on loopback
 //!    on macOS, FUSE on Linux), or on Windows a drive letter whose file system Windows names Slates' (WinFsp keeps no
 //!    table to read: [`slates_mounted_at`]). In a microVM (`microvm`), no host mount: kiln names none, the host's
-//!    table gains no Slates mount of the session's at any look ([`session_mounts`]), and the harness runs in a guest's
-//!    kernel at its project's guest path.
+//!    table gains no Slates mount of the session's at any look ([`session_mounts`]; on Windows no drive letter holds
+//!    Slates' file system), and the harness runs in a guest's kernel at its project's guest path.
 //! 3. **Isolation.** Nothing the harness did is in the project's folder before its landing writes it, byte for byte
 //!    ([`tree`]).
 //! 4. **Landing by the agent's mode** (the contract's draft 3). The agent that asks nothing: kiln answers its own landing
@@ -43,8 +43,9 @@
 //!   process against a kiln MCP server of the test's own (Python 3: `python3` on Unix, `vm_e2e::stub_python` on Windows).
 //! - `bare_metal`: the drive on the runner's host, and drift, on Linux, macOS and Windows; its module doc says what
 //!   differs on each.
-//! - `microvm`: the drive in a Shards microVM of its own, booting the stand-in's Agentfile from kiln's repository at this
-//!   checkout's commit (which must be on GitHub, as `vm_harnesses`' stand-in images' is).
+//! - `microvm`: the drive in a Shards microVM of its own (HVF, KVM or WHP), booting the stand-in's Agentfile from kiln's
+//!   repository at this checkout's commit (which must be on GitHub, as `vm_harnesses`' stand-in images' is); on Windows
+//!   it runs on GitHub's windows-2025, whose image has the hypervisor platform (.github/workflows/whp-drive.yml).
 //!
 //! `SLATES_E2E=1` makes a runner without workspaces a failure rather than a skip; `VM_E2E=1` does so for a runner without
 //! microVMs (tests/vm_e2e/README.md). Each drive owns a Slates instance of its own ([`Instance`]) and ends exactly its
@@ -52,7 +53,7 @@
 //!
 //!   SLATES_E2E=1 cargo test -p kiln --test slates_e2e -- --nocapture --test-threads 1
 
-#![allow(dead_code, reason = "the microVM drive and the stand-in's own checks run on Unix hosts alone here; the checks and the bare-metal drive are every OS's")]
+#![allow(dead_code, reason = "the resync drive and the stand-in's own checks run on Unix hosts alone here; the checks and both engines' drives are every OS's")]
 
 mod common;
 mod vm_e2e;
@@ -157,8 +158,9 @@ pub fn is_slates(m: &Mount) -> bool {
     m.kind == "fuse.slates" || m.source.starts_with("slates:")
 }
 
-/// The host's mounts now: Linux's `/proc/self/mountinfo`, BSD `mount`'s list elsewhere on Unix. None on Windows, which
-/// keeps no table of WinFsp's mounts to read.
+/// The host's mounts now: Linux's `/proc/self/mountinfo`, BSD `mount`'s list elsewhere on Unix. On Windows, which keeps
+/// no table of WinFsp's mounts to read, each drive letter whose file system Windows names Slates' (as kiln's runner
+/// judges a workspace's drive, `kiln::workspace::place::is_mount`), a [`SLATES_DRIVE`] whose source Windows doesn't name.
 pub fn host_mounts() -> anyhow::Result<Vec<Mount>> {
     if cfg!(target_os = "linux") {
         return Ok(mountinfo(&std::fs::read_to_string("/proc/self/mountinfo")?));
@@ -168,17 +170,26 @@ pub fn host_mounts() -> anyhow::Result<Vec<Mount>> {
         anyhow::ensure!(out.status.success(), "mount: {}", String::from_utf8_lossy(&out.stderr));
         return Ok(bsd_mounts(&String::from_utf8_lossy(&out.stdout)));
     }
-    Ok(Vec::new())
+    let drives = ('A'..='Z').map(|letter| format!("{letter}:")).filter(|at| kiln::workspace::place::is_mount(Path::new(at)));
+    Ok(drives.map(|at| Mount { at, kind: SLATES_DRIVE.to_owned(), source: "slates:".to_owned() }).collect())
 }
+
+/// The kind [`host_mounts`] gives a Windows drive letter holding Slates' file system: Windows names no source of one, so
+/// it can't be told whose it is, and every one is taken for the session's ([`session_mounts`]).
+pub const SLATES_DRIVE: &str = "slates (a Windows drive)";
 
 /// The Slates mounts among `mounts` that are a session's whose volume is `made`: under the drive's own folder `dir`
 /// (where its runner keeps its state, and its workspaces with it), or naming the volume or its name in their source,
-/// wherever they are. A mount of the person's own, or of another drive, is neither.
+/// wherever they are. A mount of the person's own, or of another drive, is neither; but a Windows drive holding Slates'
+/// file system ([`SLATES_DRIVE`]) names no source to tell, so it is taken for the session's: a microVM's drive runs on a
+/// Windows host with no Slates drive of anyone's.
 pub fn session_mounts(mounts: &[Mount], dir: &Path, made: &Made) -> Vec<Mount> {
     mounts
         .iter()
         .filter(|m| is_slates(m))
-        .filter(|m| Path::new(&m.at).starts_with(dir) || (!made.volume.is_empty() && m.source.contains(&made.volume)) || (!made.name.is_empty() && m.source.contains(&made.name)))
+        .filter(|m| {
+            m.kind == SLATES_DRIVE || Path::new(&m.at).starts_with(dir) || (!made.volume.is_empty() && m.source.contains(&made.volume)) || (!made.name.is_empty() && m.source.contains(&made.name))
+        })
         .cloned()
         .collect()
 }
@@ -561,8 +572,13 @@ pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), Strin
 
 /// Whether kiln says runner `machine` gives agents workspaces of their own (`GET /api/harness/workspaces`'s answer
 /// `all`), and why not where it doesn't.
-pub fn workspaces_said(all: &Value, machine: &str) -> Result<(), String> {
+pub fn workspaces_said(all: &Value, machine: &str, engine: Engine) -> Result<(), String> {
     let entry = all.get(format!("agent:{machine}")).ok_or_else(|| format!("kiln says nothing of runner {machine}'s workspaces: {all}"))?;
+    // A microVM's volume is served to its guest, never mounted on the host: kiln says that one under `served` (W8 piece 4).
+    let entry = match engine {
+        Engine::BareMetal => entry,
+        Engine::MicroVm => entry.get("served").ok_or_else(|| format!("kiln says nothing of a volume served to runner {machine}'s microVMs: {entry}"))?,
+    };
     if entry.get("available") == Some(&Value::Bool(true)) {
         return Ok(());
     }
@@ -675,10 +691,10 @@ pub fn op(f: &vm_e2e::Fixture, name: &str, input: &Value) -> anyhow::Result<Valu
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Whether the fixture's runner gives agents workspaces of their own: Ok(false) after saying why it skips; an error
-/// where [`REQUIRED`] requires them.
-pub fn workspaces_ready(f: &vm_e2e::Fixture) -> anyhow::Result<bool> {
-    match workspaces_said(&f.get("/api/harness/workspaces")?, &f.machine) {
+/// Whether the fixture's runner gives agents on `engine` workspaces of their own (mounted on its host, or served to
+/// their microVMs): Ok(false) after saying why it skips; an error where [`REQUIRED`] requires them.
+pub fn workspaces_ready(f: &vm_e2e::Fixture, engine: Engine) -> anyhow::Result<bool> {
+    match workspaces_said(&f.get("/api/harness/workspaces")?, &f.machine, engine) {
         Ok(()) => Ok(true),
         Err(why) => {
             let skip = format!("SKIP: runner {} gives agents no Slates volume of their own: {why}", f.machine);
@@ -805,7 +821,10 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     eprintln!("DRIVE: {engine:?}, an agent in mode {}, on {}, instance {}", mode.claude(), f.machine, instance.name);
     let id = vm_e2e::open(f, &spec)?;
     let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?.reporting(landing_reports(&instance.name));
-    let (info, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+    // A start that never reaches its first turn (its workspace refused as Slates came up) says what Slates said.
+    let (info, events) = pace
+        .until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))
+        .map_err(|e| anyhow::anyhow!("{e:#}\n{}", slates_log(dir)))?;
     let lines = vm_e2e::said(&events);
     let what = format!("{engine:?} session {id} ({mode:?})");
     let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}", f.runner_log(), slates_log(dir));
@@ -1019,6 +1038,10 @@ mod checks {
         assert_eq!(found, ["/home/ada/drive/vm-state/workspaces/kiln-01a1", "/elsewhere/x", "/elsewhere/y"]);
         // A made volume with no name or id matches no source by an empty word.
         assert_eq!(session_mounts(&table, Path::new("/nowhere"), &made("", "")).len(), 0);
+        // A Windows drive holding Slates' file system names no source, so it is the session's wherever it is.
+        let windows = [mount("Z:", SLATES_DRIVE, "slates:"), mount("C:", "NTFS", "")];
+        let found: Vec<String> = session_mounts(&windows, Path::new(r"C:\Users\ada\drive"), &m).into_iter().map(|x| x.at).collect();
+        assert_eq!(found, ["Z:"]);
     }
 
     fn process_of(pid: u32, argv: &[&str]) -> HostProc {
@@ -1184,9 +1207,14 @@ mod checks {
     #[test]
     fn g266_kilns_word_on_a_runners_workspaces_says_why_not() {
         let all = json!({"local": {"available": false, "why_not": "this kiln keeps no workspaces"}, "agent:m1": {"available": true}, "agent:m2": {"available": false, "why_not": "Slates isn't installed on this machine"}});
-        assert_eq!(workspaces_said(&all, "m1"), Ok(()));
-        assert_eq!(workspaces_said(&all, "m2"), Err("Slates isn't installed on this machine".to_owned()));
-        assert!(workspaces_said(&all, "m3").is_err_and(|e| e.contains("nothing")));
+        assert_eq!(workspaces_said(&all, "m1", Engine::BareMetal), Ok(()));
+        assert_eq!(workspaces_said(&all, "m2", Engine::BareMetal), Err("Slates isn't installed on this machine".to_owned()));
+        assert!(workspaces_said(&all, "m3", Engine::BareMetal).is_err_and(|e| e.contains("nothing")));
+        // A microVM's volume is the one kiln says is served: a Windows host without WinFsp gives one, none mounted.
+        let whp = json!({"agent:whp": {"available": false, "why_not": "WinFsp isn't installed (winfsp.dev)", "served": {"available": true}}});
+        assert_eq!(workspaces_said(&whp, "whp", Engine::MicroVm), Ok(()));
+        assert_eq!(workspaces_said(&whp, "whp", Engine::BareMetal), Err("WinFsp isn't installed (winfsp.dev)".to_owned()));
+        assert!(workspaces_said(&all, "m1", Engine::MicroVm).is_err_and(|e| e.contains("served")));
     }
 
     #[test]
@@ -1548,7 +1576,7 @@ mod bare_metal {
         let dir = tempfile::tempdir()?;
         let instance = Instance::new(dir.path());
         let f = fixture(dir.path(), &instance)?;
-        if !workspaces_ready(&f)? {
+        if !workspaces_ready(&f, Engine::BareMetal)? {
             return Ok(());
         }
         let dir = canonical(dir.path());
@@ -1567,7 +1595,7 @@ mod bare_metal {
         let dir = tempfile::tempdir()?;
         let instance = Instance::new(dir.path());
         let f = fixture(dir.path(), &instance)?;
-        if !workspaces_ready(&f)? {
+        if !workspaces_ready(&f, Engine::BareMetal)? {
             return Ok(());
         }
         for mode in Mode::ALL {
@@ -1615,10 +1643,11 @@ mod bare_metal {
 
 // =================================================================================================
 // The microVM engine: an agent in a Shards microVM of its own, its volume served to its guest over Slates' own
-// virtio-fs route by a descriptor, no host mount between (kiln carrying Shards, on HVF or KVM). Skipped in the runner's
-// own words until it starts microVMs and gives agents volumes with no Slates binary.
+// virtio-fs route (a descriptor on Unix, a duplicated pipe's handle on Windows), no host mount between (kiln carrying
+// Shards, on HVF, KVM or WHP: docs/agentic.md W8 piece 5). Skipped in the runner's own words until it starts microVMs
+// and gives agents volumes with no Slates binary.
 // =================================================================================================
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod microvm {
     use super::*;
 
@@ -1631,7 +1660,7 @@ mod microvm {
         let instance = Instance::new(dir.path());
         let env = runner_env(dir.path(), &instance)?;
         let f = vm_e2e::up_own(dir.path(), "slatesvm", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
-        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f)? {
+        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f, Engine::MicroVm)? {
             return Ok(());
         }
         let kept = vm_e2e::keep_stub(&f, "claude")?;
@@ -1652,7 +1681,7 @@ mod microvm {
         let instance = Instance::new(dir.path());
         let env = runner_env(dir.path(), &instance)?;
         let f = vm_e2e::up_own(dir.path(), "slatesrs", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
-        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f)? {
+        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f, Engine::MicroVm)? {
             return Ok(());
         }
         let kept = vm_e2e::keep_stub(&f, "claude")?;
