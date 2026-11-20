@@ -1,0 +1,6 @@
+#!/bin/sh
+# What the stand-in does with a message, in its folder: writes pod-wrote.txt, naming the pod it ran in (its hostname), and
+# changes README.md.
+cat >/dev/null
+printf 'written in pod %s\n' "$(cat /etc/hostname)" > pod-wrote.txt
+printf 'the agent was here\n' >> README.md

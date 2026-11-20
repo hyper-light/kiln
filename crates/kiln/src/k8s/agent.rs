@@ -77,6 +77,14 @@ impl AgentPods {
         self.pods.load().get(runner).map(|s| s.home.clone())
     }
 
+    /// Whether session `id`, run at `target` (its `Info::target`), works in a workspace its pod's home holds for it: its
+    /// target an agent pod's runner whose record is that session's. Its review, drift and landing are then its home's
+    /// (`crate::workspace::change::ask_machine`), though the session itself names no workspace of its own.
+    pub fn holds(&self, id: &str, target: &str) -> bool {
+        let runner = crate::harness::wait::machine(target);
+        self.pods.load().get(runner).is_some_and(|s| s.id == id)
+    }
+
     /// Every agent pod's record now, by its pod's name.
     pub fn all(&self) -> Vec<(String, PodSession)> {
         self.pods.load().iter().map(|(n, s)| (n.clone(), s.clone())).collect()
@@ -97,6 +105,11 @@ pub async fn on_features(hub: &Hub, runner: &str) {
         Ok(_) => tracing::info!(pod = runner, session = %id, "an agent pod's session opened on its runner"),
         Err(e) => tracing::warn!(pod = runner, session = %id, error = %format!("{e:#}"), "an agent pod's session didn't open on its runner"),
     }
+}
+
+/// Whether session `info` works in a workspace held at its pod's home ([`AgentPods::holds`]).
+pub fn held_at_home(hub: &Hub, info: &crate::harness::session::Info) -> bool {
+    hub.agent_pods.holds(&info.id, &info.target)
 }
 
 /// The runner that answers questions about the folder of a session on runner `machine`: its home where `machine` is an
@@ -258,6 +271,8 @@ mod tests {
         assert_eq!(pods.enrolling(&token), None, "a token is good once");
         assert_eq!(pods.to_open("kiln-ws-a").map(|(id, s)| (id, s.kind)), Some(("01a1f7".to_owned(), "claude".to_owned())));
         assert!(pods.to_open("kiln-ws-a").is_none(), "its session is opened once");
+        assert!(pods.holds("01a1f7", "agent:kiln-ws-a"), "its session works in the workspace its home holds");
+        assert!(!pods.holds("01a1f8", "agent:kiln-ws-a") && !pods.holds("01a1f7", "agent:studio") && !pods.holds("01a1f7", ""), "no other session, runner or the server");
         assert!(pods.to_open("some-runner").is_none());
         assert_eq!(pods.home_of("kiln-ws-a"), Some("studio".to_owned()));
         assert!(pods.take("kiln-ws-a").is_some() && pods.home_of("kiln-ws-a").is_none());
