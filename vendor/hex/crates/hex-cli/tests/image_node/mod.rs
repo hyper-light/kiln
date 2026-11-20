@@ -51,7 +51,7 @@ pub fn shards_dirs(state: &Path) -> (PathBuf, PathBuf) {
 /// Runs `command` in the node's Shards home and cache to its end, its stdout the test's and its stderr echoed whole as it
 /// ends; one that fails is refused naming its command, its exit and its stderr, so a pull or build says why in its own
 /// words (HVF (a), ROOT's HVF run at c8b4ce6b, whose build named only its command).
-fn in_home(command: &mut Command, home: &Path, cache: &Path) {
+pub fn in_home(command: &mut Command, home: &Path, cache: &Path) {
     let ran = command
         .env("SHARDS_HOME", home)
         .env("SHARDS_CACHE", cache)

@@ -171,7 +171,7 @@ type JoinDoor = (UnixStream, u32);
 type JoinDoor = (UnixStream, u32, std::os::windows::io::OwnedHandle);
 
 /// Whether `handle` is a pipe's (GetFileType): on Windows, a share's that a client serves
-/// (D228), or that another server serves an image's run (D286, api_run.rs `start_shares`),
+/// (D228), or that another server serves an image's run (D287, api_run.rs `start_shares`),
 /// where every other share's is its directory's.
 #[cfg(windows)]
 pub(crate) fn is_pipe(handle: &OwnedFd) -> bool {

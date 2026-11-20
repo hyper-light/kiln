@@ -39,8 +39,9 @@
 //!   D270 slice 4: an OSI artifact of that member's kind for this host's platform, by its manifest digest), at that
 //!   member's path (`/harness/cat` for `image_harness`'s), which HEX-IMG-11 swaps in and out. Unset, HEX-IMG-11 fails
 //!   saying no component is named, as no swap can be held to the contract without one; the other cases run as ever.
-//! - `HEX_IMAGE_NETWORK`: a network shared by runs, made beforehand in the node's Shards home (`shards network create`),
-//!   which HEX-IMG-13 connects the image's harness to (kiln plan P6b.3; Shards' D285); none, and HEX-IMG-13 fails.
+//! - `HEX_IMAGE_NETWORK`: the name of a network this run makes in the node's Shards home, its own (`shards network
+//!   create`, as Shards keeps networks by home), which HEX-IMG-13 connects the image's harness to (kiln plan P6b.3;
+//!   Shards' D285); none, and HEX-IMG-13 fails.
 //!
 //! Run on Linux: build it with `cargo test --release --locked -p hex-cli --test image_real --no-run`, which names the
 //! test binary it built (`target/release/deps/image_real-<hash>`), then start that binary alone in the delegated
@@ -60,6 +61,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -97,8 +99,8 @@ struct ImageBoxes {
     component: Option<conformance::Component>,
     /// A host directory of the run's own, which HEX-IMG-12 plugs in (kiln plan P6b.3).
     plugged: PathBuf,
-    /// A network shared by runs, made beforehand in the node's Shards home (`HEX_IMAGE_NETWORK`), which HEX-IMG-13
-    /// connects to (Shards' D285); none, and HEX-IMG-13 fails.
+    /// A network this run made in the node's Shards home (`HEX_IMAGE_NETWORK`), which HEX-IMG-13 connects to (Shards'
+    /// D285); none, and HEX-IMG-13 fails.
     network: Option<String>,
 }
 
@@ -271,6 +273,20 @@ fn descendants(root: u32) -> Vec<Listed> {
     found
 }
 
+/// Makes network `name` in the node's Shards home, this run's own (`image_node::shards_dirs`), as a person makes one
+/// (`shards network create`; Shards keeps its networks by home, D285), then ends the daemon that left there, so none of
+/// its processes runs beside the node: HEX-IMG-13 connects the image's harness to it (kiln plan P6b.3; AC-T7.4.1).
+fn network_made(shards: &Path, name: &str, state: &Path) {
+    let (home, cache) = image_node::shards_dirs(state);
+    image_node::in_home(
+        Command::new(shards).args(["network", "create", name]),
+        &home,
+        &cache,
+    );
+    image_node::in_home(Command::new(shards).args(["daemon", "stop"]), &home, &cache);
+    eprintln!("IMAGE network {name} made in {home:?}");
+}
+
 /// Goal 54's change 4 (joint plan step 12's item B; AC-T7.4.1): a VM's delete returns once its processes are gone and
 /// their memory returned, never earlier, so kiln's keeper frees no room a VM still holds. Do start an image VM of its
 /// members alone, list the node's descendants before its create and once it runs (its run host and the VM and network
@@ -379,6 +395,9 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
         }
     };
     ShardsImage::new(&image).check().unwrap();
+    if let Some(name) = &network {
+        network_made(&shards, name, &work.join("state"));
+    }
     let node = Node::start(&work, boxes.as_deref());
     let socket = node.socket.clone();
     let node_pid = node.child.id();

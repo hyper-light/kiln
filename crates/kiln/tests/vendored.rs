@@ -354,3 +354,45 @@ fn ac_m1_4_a_product_linked_at_two_commits_fails_the_check() -> anyhow::Result<(
     );
     Ok(())
 }
+
+/// Each `rev` a vendored project's own manifests give `hyper-light/<repo>` (Hex's `[workspace.dependencies]`, which
+/// names Shards' crates by git): the revisions it asks for of a product kiln vendors.
+fn revs_asked(text: &str, repo: &str) -> BTreeSet<String> {
+    let url = format!("https://github.com/{repo}");
+    let mut revs = BTreeSet::new();
+    for line in text.lines() {
+        if !line.contains(&url) {
+            continue;
+        }
+        if let Some(rev) = line.split("rev = \"").nth(1).and_then(|r| r.split('"').next()) {
+            revs.insert(rev.to_owned());
+        }
+    }
+    revs
+}
+
+/// One version of Shards: Hex, vendored here, asks by git for exactly the Shards commit kiln vendors
+/// (vendor/MANIFEST.toml's `[projects.shards]`), which kiln's root `[patch]` serves from vendor/shards. A Hex
+/// pinned to another commit would be built against a Shards it never asked for (the person's ruling, 2026-11-19:
+/// one vendored copy, and every product asks for that version).
+#[test]
+fn ac_m1_4_hex_asks_for_the_shards_commit_kiln_vendors() -> anyhow::Result<()> {
+    let root = root();
+    let manifest = std::fs::read_to_string(root.join("vendor/MANIFEST.toml")).context("vendor/MANIFEST.toml")?.parse::<toml::Table>()?;
+    let Some(commit) = manifest.get("projects").and_then(|p| p.get("shards")).and_then(|s| s.get("commit")).and_then(|c| c.as_str()) else {
+        bail!("vendor/MANIFEST.toml names no [projects.shards] commit")
+    };
+    let hex = std::fs::read_to_string(root.join("vendor/hex/Cargo.toml")).context("vendor/hex/Cargo.toml")?;
+    let asked = revs_asked(&hex, "hyper-light/shards");
+    ensure!(!asked.is_empty(), "vendor/hex/Cargo.toml names no Shards by git: this test no longer reads where Hex pins Shards");
+    ensure!(asked.iter().all(|r| r == commit), "Hex asks for Shards at {asked:?}, kiln vendors {commit}: move them together (scripts/vendor.py shards, then hex)");
+    Ok(())
+}
+
+#[test]
+fn ac_m1_4_a_hex_pinned_to_another_shards_commit_fails_the_check() {
+    let text = "shards-api = { git = \"https://github.com/hyper-light/shards\", rev = \"aaaa\" }\nshards-ipc = { git = \"https://github.com/hyper-light/shards\", rev = \"bbbb\" }\n";
+    let asked = revs_asked(text, "hyper-light/shards");
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(!asked.iter().all(|r| r == "aaaa"));
+}

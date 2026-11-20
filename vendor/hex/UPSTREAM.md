@@ -3,7 +3,7 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `da2ec4602a2282eb76a1a1e59e6e71ae29bd39dc`
+- **Upstream:** https://github.com/hyper-light/hex, commit `b4db7e69c895182ae68500c08ded91200d1228b1`
   (2026-11-19), MIT (`LICENSE`): its branch `cp/t7-p6b3-live`, which takes Shards by git and vendors no copy of its own. Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
   Shards deleted the 16550 at `35e2de91e`; Hex's D261, D262), its Shards image class in a process that links Hex
   (`hex_node::images::ImageRuntime::new`, and `ImageRuntime::leasing`, made with its orchestrator's lessors), a member's
@@ -22,11 +22,9 @@ The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e8
   `hex_api::serve::Servers`; Shards' D286, kiln goal 01a1ec34599974448f6b7663ddb07001); and a running image box's network
   and folders changed in place (`Runtime::change`, `Call::Change` 0x0027, `Refusal::Live`, `BoxInfo::live`; kiln plan
   01a1dd2e…, P6b.3).
-  It takes Shards' crates by git at `460675322` (Shards' v0.8.0 tag, `aa819b058`, with D286's two commits: the Shards
-  ROOT's branch `p/served-shares-on-v0.8.0`, until Shards' main holds them), which kiln's root manifest points at
-  kiln's copy of Shards (`[patch."https://github.com/hyper-light/shards"]`): Shards' main `9e649df34e`, v0.8.0 and its
-  fixes since, with the same served-shares change recorded (vendor/shards/UPSTREAM.md), so Hex's crates build on
-  kiln's Shards; and hyper-raft at `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
+  It takes Shards' crates by git at `7158020b61`, Shards' main and the commit kiln vendors (vendor/MANIFEST.toml), which
+  kiln's root manifest serves from kiln's copy (`[patch."https://github.com/hyper-light/shards"]`); and hyper-raft at
+  `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
   of what kiln touches: docs/shards.md).
 - **How kiln uses it:** `hex-node`, and through it Hex's runtime, client, QUIC wire, scheduler simulation, health
   and GPU telemetry, by name; kiln's root `[patch.crates-io]` points the name here, and `seccompiler` (third-party

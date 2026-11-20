@@ -182,7 +182,7 @@ fn sized(request: &wire::Request) -> wire::Request {
 }
 
 fn pool_of(spec: &ImageSpec, request: &wire::Request) -> Result<Option<Of>, ImageRefusal> {
-    // A run asking its GPU report (D233), or with shares another server serves (D286), is no
+    // A run asking its GPU report (D233), or with shares another server serves (D287), is no
     // pool's: a warm host's VM process frames no report its run names later, and its share
     // process starts before its run's streams come.
     if request.gpu_report.is_some() || !request.served.is_empty() {
@@ -2186,7 +2186,7 @@ mod tests {
         room.balanced();
     }
 
-    /// D286 through D253's pools: a run with a share another server serves gets a host of its
+    /// D287 through D253's pools: a run with a share another server serves gets a host of its
     /// own and starts no warm one, as a warm host's share process starts before its run's
     /// streams come; the same run serving none is pooled as every run is.
     #[test]

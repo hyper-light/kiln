@@ -142,7 +142,7 @@ pub use shards_abi::run::nesting::Ready;
 /// first stdio lanes, its run host's budget has no room for refused typed before its members
 /// start ([`Cause::Capacity`], D252), so that a side that reads no such cause refuses the run as
 /// it is asked, rather than its refusal breaking the channel; 52, the run's shares another server
-/// serves ([`Request::served`], D286): each a stream its orchestrator hands the run host (on Unix
+/// serves ([`Request::served`], D287): each a stream its orchestrator hands the run host (on Unix
 /// on its links socket before the request, `shards_ipc::kind::SERVED_SHARES`; on Windows
 /// duplicated into its process, [`ServedAt::handle`]), put in a share slot of its microVM after
 /// its own shares', so that a side that serves none refuses the run as it is asked, rather than
@@ -667,7 +667,7 @@ pub struct ShareMember {
     pub name: String,
 }
 
-/// A share another server serves, which the guest sees at a path (D286): its stream comes beside
+/// A share another server serves, which the guest sees at a path (D287): its stream comes beside
 /// the request, never in it, and is put in a share slot of the run's microVM after its own shares'
 /// (`shards{n + i}` where the run has n of those), as a direct boot's `--slates-fs-fd` is. The
 /// server answers the guest's FUSE requests, and a DAX window's mappings where the slot has one
@@ -739,7 +739,7 @@ pub struct Request {
     /// The most each member may be given past its image's grants as the run goes (D278), each
     /// member once; empty, nothing past them. Appended in version 39.
     pub egress_ceiling: Vec<MemberCeiling>,
-    /// Its shares another server serves (D286), in the order their streams come; empty for
+    /// Its shares another server serves (D287), in the order their streams come; empty for
     /// none. Appended in version 52.
     pub served: Vec<ServedAt>,
 }
@@ -1281,7 +1281,7 @@ pub enum SaveRefusal {
     /// The run is in no state to save: a save of it under way, or its microVM gone.
     State = 1,
     /// This host's microVMs take no snapshots (`shards_vmm::vm::SNAPSHOTS`), or the run holds
-    /// what no snapshot keeps: a share another server serves ([`Request::served`], D286).
+    /// what no snapshot keeps: a share another server serves ([`Request::served`], D287).
     Unsupported = 2,
     /// It was not made, in the words of what failed: its VM's (what its snapshot cannot keep
     /// whole, its guest not going quiet) or its files' writing.
@@ -1926,7 +1926,7 @@ impl Writer {
             }
         }
     }
-    /// Whom a share is given to as they start (D277), a served share's too (D286): 0 the run's
+    /// Whom a share is given to as they start (D277), a served share's too (D287): 0 the run's
     /// own root alone, 1 every member that runs, 2 those named, each its kind and name.
     fn share_to(&mut self, to: Option<&ShareTo>) -> Result<(), WireError> {
         match to {
@@ -2193,7 +2193,7 @@ impl<'a> Reader<'a> {
             tag => Err(WireError::Tag { what: "a flag", tag }),
         }
     }
-    /// Whom a share is given to as they start, as [`Writer::share_to`] wrote it (D277, D286):
+    /// Whom a share is given to as they start, as [`Writer::share_to`] wrote it (D277, D287):
     /// refused for a named list of none, or one named twice, as the run host would refuse it.
     fn share_to(&mut self) -> Result<Option<ShareTo>, WireError> {
         match self.u8()? {
@@ -2752,7 +2752,7 @@ impl Request {
         if let Some(control) = &self.control {
             w.u8(u8::from(control.stdio));
         }
-        // Its shares another server serves, appended in version 52 (D286): each where the guest
+        // Its shares another server serves, appended in version 52 (D287): each where the guest
         // sees it, its modes, its members as a share's, and its handle's flag and value.
         w.count(self.served.len())?;
         for s in &self.served {
@@ -3008,7 +3008,7 @@ impl Request {
         if let Some(control) = control.as_mut() {
             control.stdio = r.flag()?;
         }
-        // Its shares another server serves, appended in version 52 (D286): each at least its
+        // Its shares another server serves, appended in version 52 (D287): each at least its
         // place's length, its two flags, its members' tag and its handle's flag.
         let n = r.count(4 + 1 + 1 + 1 + 1)?;
         let mut served = Vec::with_capacity(n);
@@ -4107,7 +4107,7 @@ impl Request {
     /// out, what alone may differ between the runs of one microVM; none of a run's secrets is
     /// in it. Everything else is the microVM's: its image, size, command, ports, network,
     /// shares, nesting, credential grants and GPUs; and its shares another server serves
-    /// (D286), each a share slot, less its handle, a value of one run's (no pool hosts such a
+    /// (D287), each a share slot, less its handle, a value of one run's (no pool hosts such a
     /// run today: its streams come with it, after a warm host's share process started).
     pub fn exemplar(&self) -> Request {
         Request {
@@ -6180,7 +6180,7 @@ mod tests {
         );
     }
 
-    /// The run's shares another server serves (version 52, D286), the request's last field. Do:
+    /// The run's shares another server serves (version 52, D287), the request's last field. Do:
     /// carry one with no handle (a Unix stream's), one with a handle's value (a Windows pipe's),
     /// given to every member and to members named, read-only and not to be run from. Expect:
     /// each reads back as written; its exemplar keeps each but its handle. Do: a handle's flag
