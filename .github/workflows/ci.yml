@@ -291,7 +291,8 @@ jobs:
         timeout-minutes: 90
         env:
           SLATES_E2E: "1"
-        run: cargo test -p kiln --locked --test slates_e2e -- --skip microvm:: --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/e2e.txt"
+        run: |
+          cargo test -p kiln --locked --test slates_e2e -- --skip microvm:: --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/e2e.txt"
       - id: workspace
         name: The workspace's tests over Slates (kiln's library)
         if: ${{ !cancelled() }}
