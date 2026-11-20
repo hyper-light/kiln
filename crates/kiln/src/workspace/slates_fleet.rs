@@ -412,8 +412,12 @@ pub async fn discover(server_url: &str, ca_pem: &str, machine_name: &str, machin
 /// them, with fault tolerance `f` (the operator's, K3), and returns its path. This node must be listed, with the
 /// certificate kept here; every node's address is checked again and no two may hold one certificate (Slates refuses
 /// both). Each other node's certificate is kept under [`PEERS`], and a peer no node lists any more is let go. Only
-/// this node's key is named: Slates reads no other's.
-pub fn write_manifest(dir: &Path, identity: &NodeIdentity, machine: &str, members: &Members, f: u32) -> anyhow::Result<PathBuf> {
+/// this node's key is named: Slates reads no other's. `bind`, where a port mapping stands between this node and its
+/// peers, is where this node's own serve sockets bind ([`Place::bind`], A-708); only this node's entry names one.
+pub fn write_manifest(dir: &Path, identity: &NodeIdentity, machine: &str, members: &Members, f: u32, bind: Option<&str>) -> anyhow::Result<PathBuf> {
+    if let Some(bind) = bind {
+        check_bind(bind).with_context(|| format!("{machine}'s node's bind"))?;
+    }
     anyhow::ensure!(members.fleet == identity.fleet, "the server lists the fleet {}, and this node is {}'s", members.fleet, identity.fleet);
     let own = std::fs::read(&identity.certificate).with_context(|| format!("read {}", identity.certificate.display()))?;
     let me = members.members.iter().find(|m| m.machine == machine).ok_or_else(|| anyhow::anyhow!("the server doesn't list {machine}'s node"))?;
@@ -436,7 +440,11 @@ pub fn write_manifest(dir: &Path, identity: &NodeIdentity, machine: &str, member
             kept.insert(file.clone());
             (format!("{PEERS}/{file}"), String::new())
         };
-        nodes.push(serde_json::json!({ "node": member.machine, "address": member.address, "certificate": certificate, "key": key, "domain": member.domain }));
+        let mut node = serde_json::json!({ "node": member.machine, "address": member.address, "certificate": certificate, "key": key, "domain": member.domain });
+        if let (Some(bind), true, Some(entry)) = (bind, member.machine == machine, node.as_object_mut()) {
+            entry.insert("bind".to_owned(), serde_json::Value::from(bind));
+        }
+        nodes.push(node);
     }
     for entry in std::fs::read_dir(&peers).with_context(|| format!("read {}", peers.display()))? {
         let entry = entry?;
@@ -459,11 +467,24 @@ pub struct Place {
     pub fleet: String,
     pub f: u32,
     pub address: String,
+    /// Where the runner's node binds its two serve sockets when a port mapping stands between it and its peers
+    /// (`[slates_fleet.binds]`; Slates' manifest `bind`, A-277; A-708): none binds where it's listed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+}
+
+/// A node's bind as Slates' manifest takes it (A-277): an IPv4 literal and a nonzero base port, since the node's own
+/// sockets bind there and no mapping could name the kernel's choice of port.
+pub fn check_bind(bind: &str) -> anyhow::Result<()> {
+    let at: std::net::SocketAddrV4 = bind.parse().map_err(|_| anyhow::anyhow!("{bind:?} isn't an IPv4 address and a base port (like 0.0.0.0:17300)"))?;
+    anyhow::ensure!(at.port() != 0, "{bind:?} names port 0, which no port mapping could reach");
+    Ok(())
 }
 
 /// The place `[slates_fleet]` gives the machine named `machine`: none when it lists no runner (off) or not that one;
 /// refused, naming what's wrong, when the setting can't make a fleet: a name kiln doesn't give a machine, an address
-/// Slates can't dial, or fewer runners than `2f + 1` (a write commits at `f + 1` of `2f + 1` copies).
+/// Slates can't dial, a bind Slates refuses or for a runner not listed, or fewer runners than `2f + 1` (a write commits
+/// at `f + 1` of `2f + 1` copies).
 pub fn place_of(setting: &crate::config::SlatesFleet, machine: &str) -> Result<Option<Place>, String> {
     if setting.nodes.is_empty() {
         return Ok(None);
@@ -474,11 +495,17 @@ pub fn place_of(setting: &crate::config::SlatesFleet, machine: &str) -> Result<O
         }
         check_address(address).map_err(|e| format!("[slates_fleet.nodes] {name}: {e:#}"))?;
     }
+    for (name, bind) in &setting.binds {
+        if !setting.nodes.contains_key(name) {
+            return Err(format!("[slates_fleet.binds] {name:?} isn't a runner [slates_fleet.nodes] lists"));
+        }
+        check_bind(bind).map_err(|e| format!("[slates_fleet.binds] {name}: {e:#}"))?;
+    }
     let candidates = u64::from(setting.f).saturating_mul(2).saturating_add(1);
     if u64::try_from(setting.nodes.len()).unwrap_or(u64::MAX) < candidates {
         return Err(format!("[slates_fleet] f = {} needs at least {candidates} runners (a write commits at f + 1 of 2f + 1 copies), and {} are listed", setting.f, setting.nodes.len()));
     }
-    Ok(setting.nodes.get(machine).map(|address| Place { fleet: FLEET.to_owned(), f: setting.f, address: address.clone() }))
+    Ok(setting.nodes.get(machine).map(|address| Place { fleet: FLEET.to_owned(), f: setting.f, address: address.clone(), bind: setting.binds.get(machine).cloned() }))
 }
 
 /// [`admit`] under the operator's choice: the word of a runner `setting` lists, for its node at the address listed for
@@ -562,7 +589,7 @@ pub async fn join(source: &Source) -> anyhow::Result<Option<Joined>> {
     let identity = identity(&source.dir, &source.server_url, &source.ca_pem, &source.machine_name, &source.machine, host_of(&place.address)).await?;
     let node = announcement(&identity, &place.address)?;
     let members = discover(&source.server_url, &source.ca_pem, &source.machine_name, &source.machine, &node).await?;
-    let manifest = write_manifest(&source.dir, &identity, &source.machine_name, &members, place.f)?;
+    let manifest = write_manifest(&source.dir, &identity, &source.machine_name, &members, place.f, place.bind.as_deref())?;
     let selection = checked(&manifest, &source.machine_name)?;
     tracing::info!(manifest = %manifest.display(), nodes = members.members.len(), f = place.f, "this runner's Slates joins kiln's Slates fleet");
     Ok(Some(Joined { selection, node }))
@@ -702,7 +729,7 @@ mod tests {
 
     /// The setting that lists `name`'s runner alone, at `address`: a fleet of one, `f` 0.
     fn alone(name: &str, address: &str) -> crate::config::SlatesFleet {
-        crate::config::SlatesFleet { f: 0, nodes: [(name.to_owned(), address.to_owned())].into_iter().collect() }
+        crate::config::SlatesFleet { f: 0, nodes: [(name.to_owned(), address.to_owned())].into_iter().collect(), ..Default::default() }
     }
 
     /// The word `name`'s runner sends for its node at `address`.
@@ -783,7 +810,7 @@ mod tests {
         let a = identities.get("bench-a").ok_or_else(|| anyhow::anyhow!("bench-a"))?.clone();
         let dir = scratch.path().join("bench-a");
         let members = directory.members(|_| true);
-        let path = write_manifest(&dir, &a, "bench-a", &members, 1)?;
+        let path = write_manifest(&dir, &a, "bench-a", &members, 1, None)?;
         assert_eq!(path, dir.join(MANIFEST));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         assert_eq!(manifest.get("name"), Some(&serde_json::json!(FLEET)), "the manifest names its fleet: {manifest}");
@@ -804,12 +831,12 @@ mod tests {
         assert!(dir.join(KEY).exists());
         // A node no longer listed is let go of.
         let fewer = directory.members(|machine| machine != "bench-c");
-        write_manifest(&dir, &a, "bench-a", &fewer, 0)?;
+        write_manifest(&dir, &a, "bench-a", &fewer, 0, None)?;
         assert!(!dir.join(PEERS).join("bench-c.crt.der").exists());
         assert!(dir.join(PEERS).join("bench-b.crt.der").exists());
         // Refused: a list without this node, with another certificate for it, with one certificate twice, or of
         // another fleet.
-        assert!(write_manifest(&dir, &a, "bench-a", &directory.members(|machine| machine != "bench-a"), 1).is_err());
+        assert!(write_manifest(&dir, &a, "bench-a", &directory.members(|machine| machine != "bench-a"), 1, None).is_err());
         let b_certificate = members.members.get(1).map(|m| m.certificate.clone()).ok_or_else(|| anyhow::anyhow!("bench-b"))?;
         let with = |index: usize, certificate: &str| {
             let mut changed = members.clone();
@@ -818,11 +845,11 @@ mod tests {
             }
             changed
         };
-        assert!(write_manifest(&dir, &a, "bench-a", &with(0, &b_certificate), 1).is_err(), "another certificate for this node");
-        assert!(write_manifest(&dir, &a, "bench-a", &with(2, &b_certificate), 1).is_err(), "one certificate twice");
+        assert!(write_manifest(&dir, &a, "bench-a", &with(0, &b_certificate), 1, None).is_err(), "another certificate for this node");
+        assert!(write_manifest(&dir, &a, "bench-a", &with(2, &b_certificate), 1, None).is_err(), "one certificate twice");
         let mut other = members.clone();
         other.fleet = "another.fleet".to_owned();
-        assert!(write_manifest(&dir, &a, "bench-a", &other, 1).is_err(), "another fleet");
+        assert!(write_manifest(&dir, &a, "bench-a", &other, 1, None).is_err(), "another fleet");
         Ok(())
     }
 
@@ -831,6 +858,7 @@ mod tests {
         crate::config::SlatesFleet {
             f,
             nodes: [("bench-a", "10.0.0.1:17300"), ("bench-b", "10.0.0.2:17300"), ("bench-c", "runner-c.lan:17302")].into_iter().map(|(m, a)| (m.to_owned(), a.to_owned())).collect(),
+            ..Default::default()
         }
     }
 
@@ -840,7 +868,7 @@ mod tests {
     #[test]
     fn k3_the_operators_setting_places_the_runners_it_lists_and_no_other() -> anyhow::Result<()> {
         assert_eq!(place_of(&crate::config::SlatesFleet::default(), "bench-a"), Ok(None), "off until declared");
-        assert_eq!(place_of(&chosen(1), "bench-a"), Ok(Some(Place { fleet: FLEET.to_owned(), f: 1, address: "10.0.0.1:17300".to_owned() })));
+        assert_eq!(place_of(&chosen(1), "bench-a"), Ok(Some(Place { fleet: FLEET.to_owned(), f: 1, address: "10.0.0.1:17300".to_owned(), bind: None })));
         assert_eq!(place_of(&chosen(1), "bench-d"), Ok(None));
         assert!(place_of(&chosen(2), "bench-a").is_err_and(|e| e.contains("at least 5")), "f = 2 over three runners");
         let mut ipv6 = chosen(1);
@@ -883,7 +911,7 @@ mod tests {
         let a = identities.get("bench-a").ok_or_else(|| anyhow::anyhow!("bench-a"))?.clone();
         let dir = scratch.path().join("bench-a");
         let place = place_of(&chosen(1), "bench-a").map_err(|e| anyhow::anyhow!(e))?.ok_or_else(|| anyhow::anyhow!("bench-a has no place"))?;
-        let manifest = write_manifest(&dir, &a, "bench-a", &directory.members(|_| true), place.f)?;
+        let manifest = write_manifest(&dir, &a, "bench-a", &directory.members(|_| true), place.f, None)?;
         let selection = checked(&manifest, "bench-a")?;
         assert_eq!(selection.node, "bench-a");
         let read = slates_api::role::check_fleet(&selection).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -891,6 +919,48 @@ mod tests {
         // This node's key replaced by another's: Slates' start would refuse it, and so does the check, first.
         std::fs::copy(scratch.path().join("bench-b").join(KEY), dir.join(KEY))?;
         assert!(checked(&manifest, "bench-a").is_err());
+        Ok(())
+    }
+
+    /// A-708 (W7, the multi-runner test's link faults): a runner `[slates_fleet.binds]` names is placed with its bind,
+    /// and the manifest it writes names that bind on its own entry alone, read by Slates' own reader as its start reads
+    /// it; a bind for a runner not listed, a name, no port, port 0 or IPv6 is refused before any manifest is written.
+    #[test]
+    fn a708_a_runner_behind_a_port_mapping_binds_where_the_setting_says_and_slates_reads_it() -> anyhow::Result<()> {
+        let setting: crate::config::SlatesFleet = toml::from_str(
+            "f = 1\n[nodes]\n\"bench-a\" = \"10.0.0.1:17300\"\n\"bench-b\" = \"10.0.0.2:17300\"\n\"bench-c\" = \"runner-c.lan:17302\"\n[binds]\n\"bench-a\" = \"127.0.0.1:27300\"\n",
+        )?;
+        let place = place_of(&setting, "bench-a").map_err(|e| anyhow::anyhow!(e))?.ok_or_else(|| anyhow::anyhow!("bench-a has no place"))?;
+        assert_eq!(place.bind.as_deref(), Some("127.0.0.1:27300"));
+        let b = place_of(&setting, "bench-b").map_err(|e| anyhow::anyhow!(e))?.ok_or_else(|| anyhow::anyhow!("bench-b has no place"))?;
+        assert_eq!(b.bind, None, "a runner the binds don't name binds where it's listed");
+        assert_eq!(serde_json::to_value(&b)?.get("bind"), None, "a place with no bind says none, as an older runner reads it");
+        for (name, bind, why) in [("bench-d", "127.0.0.1:27300", "a runner not listed"), ("bench-a", "runner-a.lan:27300", "a name"), ("bench-a", "127.0.0.1", "no port"), ("bench-a", "127.0.0.1:0", "port 0"), ("bench-a", "[::1]:27300", "IPv6")] {
+            let mut bad = chosen(1);
+            bad.binds.insert(name.to_owned(), bind.to_owned());
+            assert!(place_of(&bad, "bench-a").is_err_and(|e| e.contains("[slates_fleet.binds]")), "{why}");
+        }
+
+        let scratch = tempfile::tempdir()?;
+        let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
+        let directory = Directory::default();
+        let mut identities = BTreeMap::new();
+        for (name, address) in [("bench-a", "10.0.0.1:17300"), ("bench-b", "10.0.0.2:17300"), ("bench-c", "runner-c.lan:17302")] {
+            let (leaf, identity) = node(&pki, scratch.path(), name, address)?;
+            directory.admit(admit_chosen(&pki, &word(name, &leaf, &identity, address)?, &setting)?);
+            identities.insert(name, identity);
+        }
+        let a = identities.get("bench-a").ok_or_else(|| anyhow::anyhow!("bench-a"))?.clone();
+        let dir = scratch.path().join("bench-a");
+        let members = directory.members(|_| true);
+        assert!(write_manifest(&dir, &a, "bench-a", &members, 1, Some("127.0.0.1:0")).is_err(), "a bind Slates refuses is never written");
+        let manifest = write_manifest(&dir, &a, "bench-a", &members, place.f, place.bind.as_deref())?;
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+        let nodes = written.get("nodes").and_then(serde_json::Value::as_array).ok_or_else(|| anyhow::anyhow!("no nodes in {written}"))?;
+        let binds: Vec<(Option<&str>, Option<&str>)> = nodes.iter().map(|n| (n.get("node").and_then(serde_json::Value::as_str), n.get("bind").and_then(serde_json::Value::as_str))).collect();
+        assert_eq!(binds, vec![(Some("bench-a"), Some("127.0.0.1:27300")), (Some("bench-b"), None), (Some("bench-c"), None)], "this node's bind on its own entry alone");
+        let read = slates_api::role::check_fleet(&checked(&manifest, "bench-a")?).map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(read, slates_api::role::FleetCheck { name: FLEET.to_owned(), f: 1, peers: 2, enrollment_roots: 1 });
         Ok(())
     }
 
@@ -941,6 +1011,7 @@ mod tests {
         let listed = crate::config::SlatesFleet {
             f: 0,
             nodes: [("bench-a", "10.0.0.1:17300"), ("bench-b", "runner-b.lan:17300")].into_iter().map(|(m, a)| (m.to_owned(), a.to_owned())).collect(),
+            ..Default::default()
         };
         for (name, address, host) in [("bench-a", "10.0.0.1:17300", "10.0.0.1"), ("bench-b", "runner-b.lan:17300", "runner-b.lan")] {
             let leaf = machine(&pki, name)?;
