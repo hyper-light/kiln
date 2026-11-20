@@ -40,7 +40,7 @@
 //!
 //! - `checks`: the pure checks, against samples (any OS).
 //! - `stand_in`: the stand-in's words for a project's files, for the mode it runs in and for its own landing, driven as a
-//!   process against a kiln MCP server of the test's own (Unix: python3).
+//!   process against a kiln MCP server of the test's own (Python 3: `python3` on Unix, `vm_e2e::stub_python` on Windows).
 //! - `bare_metal`: the drive on the runner's host, and drift, on Linux, macOS and Windows; its module doc says what
 //!   differs on each.
 //! - `microvm`: the drive in a Shards microVM of its own, booting the stand-in's Agentfile from kiln's repository at this
@@ -1247,9 +1247,10 @@ mod checks {
 }
 
 // =================================================================================================
-// The stand-in's words for a project's files and its own landing, driven as a process (Unix: python3)
+// The stand-in's words for a project's files and its own landing, driven as a process (Unix: python3; Windows: the
+// Python 3 `vm_e2e::stub_python` finds). No Slates mount: every OS runs them.
 // =================================================================================================
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod stand_in {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::process::{Command, Stdio};
@@ -1267,7 +1268,8 @@ mod stand_in {
     /// initialize and given one turn of `prompt` in folder `dir`: what it said, once its turn completed. Its stdin stays
     /// open until then: at its stdin's end a harness stops the turn under way.
     fn one_turn_with(dir: &std::path::Path, prompt: &str, args: &[String]) -> anyhow::Result<Turn> {
-        let mut child = Command::new("python3").arg(crate::vm_e2e::stub_path()).args(["--session-id", "g266"]).args(args).env("VM_STUB_PROTOCOL", "claude").current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let python = python().ok_or_else(|| anyhow::anyhow!("{NO_PYTHON}"))?;
+        let mut child = Command::new(python).arg(crate::vm_e2e::stub_path()).args(["--session-id", "g266"]).args(args).env("VM_STUB_PROTOCOL", "claude").current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
         writeln!(stdin, "{}", json!({"type": "control_request", "request_id": "kiln_1", "request": {"subtype": "initialize"}}))?;
         writeln!(stdin, "{}", json!({"type": "user", "uuid": "m1", "message": {"role": "user", "content": prompt}}))?;
@@ -1354,7 +1356,8 @@ for line in sys.stdin:
             std::fs::write(project.join(name), text)?;
         }
         let env = json!({"FAKE_POLICY": policy, "FAKE_LOG": log.to_string_lossy()});
-        let config = json!({"mcpServers": {"kiln": {"command": "python3", "args": ["-I", fake.to_string_lossy()], "env": env}}});
+        let python = python().ok_or_else(|| anyhow::anyhow!("{NO_PYTHON}"))?;
+        let config = json!({"mcpServers": {"kiln": {"command": python.to_string_lossy(), "args": ["-I", fake.to_string_lossy()], "env": env}}});
         let said = one_turn_with(&project, &crate::prompt("p.txt", mode), &["--mcp-config".to_owned(), config.to_string()])?.said;
         let asked = std::fs::read_to_string(&log).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap_or(Value::Null)).collect();
         Ok((said, asked))
@@ -1372,7 +1375,7 @@ for line in sys.stdin:
     #[test]
     fn g266_the_stand_in_lands_as_itself_and_says_each_outcome_kiln_answers() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let (said, asked) = landing_turn("write", crate::Mode::Bypass)?;
@@ -1408,7 +1411,7 @@ for line in sys.stdin:
     #[test]
     fn g266_the_stand_in_says_the_permission_mode_it_was_started_in() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -1420,16 +1423,33 @@ for line in sys.stdin:
         Ok(())
     }
 
-    fn have_python() -> bool {
-        Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
+    /// The Python 3 the stand-in and the fake kiln run on: `python3` on Unix, the stand-in's `#!` line's; on Windows the
+    /// one `vm_e2e::stub_python` finds (`py -3`, `python` or `python3`), by its own word, as the bare-metal drive's
+    /// `.cmd` shims run the stand-in. None where no Python 3 answers.
+    fn python() -> Option<std::ffi::OsString> {
+        #[cfg(windows)]
+        {
+            crate::vm_e2e::stub_python().ok().map(std::path::PathBuf::into_os_string)
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success()).then(|| "python3".into())
+        }
     }
+
+    fn have_python() -> bool {
+        python().is_some()
+    }
+
+    /// The skip a test says where [`have_python`] finds no Python 3, in this OS's words.
+    const NO_PYTHON: &str = if cfg!(windows) { "SKIP: the stand-in harness needs Python 3 (py -3, python or python3)" } else { "SKIP: the stand-in harness needs python3" };
 
     /// The stand-in writes, appends to and removes its project's files as the words of its turn ask, and says so; and
     /// asks kiln to write its own work to disk only where kiln's MCP server was given it, saying it reached none here.
     #[test]
     fn g266_the_stand_in_changes_its_projects_files_as_its_turn_asks() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -1451,7 +1471,7 @@ for line in sys.stdin:
     #[test]
     fn g266_the_stand_in_makes_no_file_it_was_asked_to_append_to() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
