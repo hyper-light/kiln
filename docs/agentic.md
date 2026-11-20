@@ -871,9 +871,11 @@ part.
   `CONFIG_TLS` (Docker Desktop's has none, as Slates measured on 2026-10-01), through kiln: an agent on the Kubernetes
   engine edits in its pod; its change request shows the edit; a file a person changed in the folder meanwhile shows as
   drift; its landing writes the folder only under its grant; and a pod deleted mid-session leaves no attachment, claim
-  or PersistentVolume behind. Built in this order: the certificate naming the host (built); Slates' export verb (A-521)
-  and kiln's call of it; the PersistentVolume, claim and pod as pure builders, unit-tested as a job's pod is, with the
-  chart's RBAC; the engine and the workspace's home; the end and its reaper; the node certificate's issue; the proof.
+  or PersistentVolume behind. Built in this order: the certificate naming the host (built); Slates' export verb (A-521,
+  vendored since contract 50) and kiln's call of it; the PersistentVolume, claim and pod as pure builders, unit-tested
+  as a job's pod is (built 2026-11-19: `k8s::volume::objects`, from the home's export, `PodExport`, whose `Debug` hides
+  the token; an export a pod can't mount refused typed, `Unbuildable`), with the chart's RBAC (owed with the engine,
+  the first code that makes these objects, so no cluster-wide right is granted before it's used); the engine and the workspace's home; the end and its reaper; the node certificate's issue; the proof.
 
 ## C: From changes to landed
 
