@@ -1335,7 +1335,7 @@ mod tests {
         let here = top.clone();
         let (trusted, _) = crate::rt::block_on(async move { file_modes(&here).await })?;
         assert!(!trusted, "core.fileMode false: git trusts no execute bit");
-        assert_eq!(indexed_executable("100755 e69de29 0\tbin/run sh\0100644 e69de29 0\tlib.rs\0120000 e69de29 0\tlink\0"), ["bin/run sh".to_owned()].into_iter().collect());
+        assert_eq!(indexed_executable("100755 e69de29 0\tbin/run sh\x00100644 e69de29 0\tlib.rs\x00120000 e69de29 0\tlink\x00"), ["bin/run sh".to_owned()].into_iter().collect());
         Ok(())
     }
 
