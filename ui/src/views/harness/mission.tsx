@@ -61,18 +61,20 @@ import { RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
-import { GroupHead, StandCounts, OpenHead, SandboxLine, watchUnseen } from "./definitions";
-import { MicroVmRows } from "./engine-rows";
+import { GroupHead, StandCounts, OpenHead, SandboxLine, watchUnseen } from "./definition-parts";
 import { agentdefsRes } from "@/api/agentdefs";
 import { sandboxesRes } from "@/api/microvms";
 import { KindGlyph } from "./kind-glyph";
 import { agentIn, keepRows, NODE_WORD, nodeAsk, subagentTree, treePaths, type SubagentNode, type SubagentRow } from "./subagent-tree";
 import { PauseButton } from "./subagent-pause";
 import { ENDED, RemoveButton, useRemoving } from "./subagent-remove";
-import { AnswerHere } from "./mission-answer";
 import { TreePath } from "./tree-path";
 import { sessionIntent } from "@/lib/session-prefetch";
 import { listWindow, useWindowed } from "@/lib/list-window";
+
+// What a row shows only once it's opened, or once its question is: loaded then, not with the list (goal 8).
+const MicroVmRows = React.lazy(() => import("./engine-rows").then((m) => ({ default: m.MicroVmRows })));
+const AnswerHere = React.lazy(() => import("./mission-answer").then((m) => ({ default: m.AnswerHere })));
 
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
@@ -548,7 +550,9 @@ const Row = React.memo(function Row({
       {shownAsk && (
         <div className="ms-answer">
           <Slide open={open && shownAsk.id === question?.id} onGone={() => setShownAsk(null)}>
-            <AnswerHere who={who} ap={shownAsk} />
+            <Loadable key={who.id} fallback={<Skeleton className="ms-answer-wait" />}>
+              <AnswerHere who={who} ap={shownAsk} />
+            </Loadable>
           </Slide>
         </div>
       )}
@@ -600,7 +604,9 @@ const MissionTree = React.memo(function MissionTree({ id, list, rowAsk, onClose 
             <span className="df-note">No subagents.</span>
           </li>
         )}
-        <MicroVmRows a={root} list={list} />
+        <Loadable label={`Loading ${agentLabel(root)}'s sandboxes`} fallback={<li className="ms-node df-head" aria-busy="true" />}>
+          <MicroVmRows a={root} list={list} />
+        </Loadable>
       </ul>
     </li>
   );
@@ -697,7 +703,9 @@ const MissionNode = React.memo(function MissionNode({
       {shownAsk && who && (
         <div className="ms-answer">
           <Slide open={asked && shownAsk.id === question?.id} onGone={() => setShownAsk(null)}>
-            <AnswerHere who={who} ap={shownAsk} />
+            <Loadable key={who.id} fallback={<Skeleton className="ms-answer-wait" />}>
+              <AnswerHere who={who} ap={shownAsk} />
+            </Loadable>
           </Slide>
         </div>
       )}
