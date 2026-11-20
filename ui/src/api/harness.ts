@@ -7,10 +7,11 @@ import { KINDS_READ } from "./launch-reads";
 import { call, listAgents } from "./agents-list";
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
-import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
+import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
+import { sessionSocketUrl, storesHere, takeSessionSocket, type EarlySocket } from "./session-socket";
 import type { TerminalSessionInfo } from "./types";
 import { stateAtOpen } from "./session-availability";
 import { heldCommand, heldFrom, publicationReceipt, useHeld, type Held, type PublicationReceipt } from "./held";
@@ -931,11 +932,6 @@ const LINGER_MS = 30_000;
 const KEEP = 8;
 /** Match the server mirror's rolling event window (harness/core.rs and registry.rs). */
 const MAX_EVENTS = 4000;
-/**
- * The browser unpacks gzip itself (every current one does): a session's snapshot comes packed, a
- * long conversation's history in a tenth of the bytes.
- */
-const GUNZIP = typeof DecompressionStream !== "undefined";
 /** A speculative snapshot is stopped while decoding, before allocating its whole expanded text. */
 async function gunzip(data: ArrayBuffer, take: (bytes: number) => boolean, own: (reader: ReadableStreamDefaultReader<Uint8Array> | null) => void): Promise<string> {
   const reader = new Blob([data]).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
@@ -1050,20 +1046,6 @@ export const changesPatched = (was: FileChange[] | null, u: { set?: FileChange[]
   }
   return now;
 };
-
-/** A conversation's window (W21-R02; docs/wire.md, "Windows"): its newest turns and about this many bytes of them at the most. */
-const WINDOW = { recent_turns: "8", event_bytes: "262144" };
-/**
- * The window's first part: the fewest bytes a window is bounded to (history.rs `FLOOR`), its newest events, which are
- * the ones a conversation opens on. The socket's snapshot is that part alone, so a slow link carries a screen's worth
- * before the conversation shows, not the window (kiln-lab bar, 41,000 events: 88 KB packed for the window). The rest
- * of the window follows it on the socket as a message of its own (`earlier`), and joins above what's shown.
- */
-const FIRST_BYTES = 16 * 1024;
-/** The socket's query: a snapshot packed when it can be unpacked here, a state and a changeset as what changed in them, and its events a window. */
-const TAKES = `${GUNZIP ? "?z=gzip&" : "?"}patch=state&patch=changes&window=1&lean=1&${new URLSearchParams(WINDOW)}`;
-/** And the window's first part ahead, asked where nothing of the conversation is shown yet: what's shown already is added to or replaced whole. */
-const TAKES_FIRST = `&first_bytes=${FIRST_BYTES}`;
 
 /** The session socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
 const SESSION_FRAMES = {
@@ -2038,11 +2020,15 @@ export class SessionStore {
     this.frames = 0;
     this.incoming = null;
     let ws: WebSocket;
+    // The socket its page's navigation opened already (session-socket.ts), when it asks for what this would.
+    let early: EarlySocket | undefined;
     try {
       // What's shown already: only what came after it, when the server's copy can say. A window whose rest never came
       // (its socket closed first) is asked for again from its start: what came after it wouldn't bring the rest.
       const after = this.born && this.rev && !this.snap.history?.filling ? `&after=${this.born}.${this.rev}` : "";
-      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}${this.snap.ready ? "" : TAKES_FIRST}${after}`));
+      const url = sessionSocketUrl(this.id, !this.snap.ready, after);
+      early = takeSessionSocket(this.id, url);
+      ws = early?.ws ?? new WebSocket(url);
     } catch {
       this.retry();
       return;
@@ -2105,6 +2091,11 @@ export class SessionStore {
       this.ws = null;
       this.lost();
     };
+    // Taken open: what it said meanwhile, in order, as it would have come.
+    if (early) {
+      if (ws.readyState === WebSocket.OPEN) this.sendAgain(ws);
+      for (const message of early.heard) ws.onmessage?.(message);
+    }
   }
 
   /** A message as it came: at once, unless a packed one before it is still being unpacked. */
@@ -2784,6 +2775,8 @@ export class SessionStore {
 export const beforeWindow = (floor: number | null, held: ReadonlyMap<string, HEvent>, e: HEvent): boolean => floor !== null && e.seq < floor && !held.has(e.id);
 
 const stores = new Map<string, SessionStore>();
+// A page's navigation readies its store itself from here on (session-socket.ts).
+storesHere(readySession);
 let currentMailScope = mailScope();
 onMailScopeChange(() => {
   const next = mailScope();
@@ -2816,6 +2809,25 @@ export function sessionStore(id: string): SessionStore {
   // Acquisition itself is foreground intent: rendering can suspend before ready()/subscribe().
   store.promote();
   return store;
+}
+
+/** Session `id`'s store held until its first snapshot is in, or `signal` says its page was left: what opening its page reads first. */
+export function readySession(id: string, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  const store = sessionStore(id);
+  return new Promise<void>((resolve) => {
+    const release = store.subscribe(() => {});
+    let released = false;
+    const stop = () => {
+      if (released) return;
+      released = true;
+      release();
+      signal?.removeEventListener("abort", stop);
+      resolve();
+    };
+    signal?.addEventListener("abort", stop, { once: true });
+    void store.ready().then(stop, stop);
+  });
 }
 
 export function prefetchSession(id: string, budget: number): SessionPrefetchLease | null {

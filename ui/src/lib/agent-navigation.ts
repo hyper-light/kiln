@@ -1,6 +1,6 @@
 /** W21-R02: actual destination loading shares the view's canonical owners; no speculative data. */
 import { isAuthed } from "@/api/client";
-import { sessionStore } from "@/api/harness";
+import { readySession } from "@/api/harness";
 import { goalsRes } from "@/api/goal-resources";
 import { reviewPlanRes } from "@/api/plan-resources";
 import { harnessSessionsRes } from "./data";
@@ -21,27 +21,9 @@ interface NavigationReads {
   agents(signal?: AbortSignal): Promise<readonly { id: string; held?: { plan?: string | null } | null }[]>;
 }
 
-function prepareSession(id: string, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve();
-  const store = sessionStore(id);
-  return new Promise<void>((resolve) => {
-    const release = store.subscribe(() => {});
-    let released = false;
-    const stop = () => {
-      if (released) return;
-      released = true;
-      release();
-      signal?.removeEventListener("abort", stop);
-      resolve();
-    };
-    signal?.addEventListener("abort", stop, { once: true });
-    void store.ready().then(stop, stop);
-  });
-}
-
 const reads: NavigationReads = {
   code: loadInspectorTab,
-  session: prepareSession,
+  session: readySession,
   goals: (id, signal) => acquireResource(goalsRes(id), signal),
   review: (id, signal) => acquireResource(reviewPlanRes(id), signal),
   held: (id) => resourceData(harnessSessionsRes)?.find((agent) => agent.id === id)?.held?.plan ?? undefined,
