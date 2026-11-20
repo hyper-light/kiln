@@ -541,6 +541,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         join_token: a.token.clone(),
         ephemeral: false,
         dedicated_job: None,
+        dedicated_session: None,
         terminal: true,
         job_terminal: true,
         shell: None,

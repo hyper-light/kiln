@@ -372,6 +372,10 @@ struct AgentArgs {
     /// The job this ephemeral agent was launched for.
     #[arg(long)]
     job: Option<String>,
+    /// The agent session this ephemeral agent was launched for (docs/agentic.md W10: an agent's pod): it holds that one
+    /// session and exits as it ends.
+    #[arg(long)]
+    session: Option<String>,
     #[arg(long)]
     no_terminal: bool,
     /// Take no commands from other runners (reach); this runner can still send them.
@@ -789,6 +793,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 join_token: a.token,
                 ephemeral: a.ephemeral,
                 dedicated_job: a.job,
+                dedicated_session: a.session,
                 terminal: !a.no_terminal && !a.ephemeral,
                 job_terminal: !a.no_terminal,
                 shell: a.shell,
@@ -837,6 +842,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 join_token: token,
                 ephemeral: false,
                 dedicated_job: None,
+                dedicated_session: None,
                 terminal: true,
                 job_terminal: true,
                 shell: a.shell,

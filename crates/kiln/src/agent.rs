@@ -54,6 +54,10 @@ pub struct Opts {
     pub join_token: Option<String>,
     pub ephemeral: bool,
     pub dedicated_job: Option<String>,
+    /// The agent session an ephemeral runner was started for (docs/agentic.md W10: in its pod, `--session`): it holds
+    /// that session's harness, whose workspace its home holds and kubelet mounts, and leaves as it ends
+    /// ([`session_runner_ends`]).
+    pub dedicated_session: Option<String>,
     pub terminal: bool,
     /// Terminals into CI legs (docs/ci.md W17-R01): a runner's follow its terminal switch; the
     /// server's in-process runner's follow `[terminal] enabled`.
@@ -1990,6 +1994,17 @@ const WATCHDOG_SETTLE: Duration = Duration::from_secs(5);
 const HARNESS_GRACE: Duration = Duration::from_secs(600);
 /// How long a relaunch asked of launchd may take before this runner carries on as it is.
 const RELAUNCH_WAIT: Duration = Duration::from_secs(600);
+/// What an ephemeral runner started for one agent session does now (docs/agentic.md W10), from whether it has held its
+/// session (`seen`), holds it still (`holds`), and how long it has waited (`waited`): leave once its session has come and
+/// gone (`Some(Ok)`), give up where it never came within [`EPHEMERAL_JOB_WAIT`] (`Some(Err)`, why), else go on.
+fn session_runner_ends(seen: bool, holds: bool, waited: Duration) -> Option<Result<(), String>> {
+    match (seen, holds) {
+        (true, false) => Some(Ok(())),
+        (false, false) if waited >= EPHEMERAL_JOB_WAIT => Some(Err("the ephemeral runner's agent session didn't come within 15 minutes".to_owned())),
+        _ => None,
+    }
+}
+
 /// An ephemeral runner's wait for its result's receipt, then for a job at all.
 const EPHEMERAL_RECEIPT_WAIT: Duration = Duration::from_secs(30);
 const EPHEMERAL_JOB_WAIT: Duration = Duration::from_secs(900);
@@ -2506,7 +2521,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // stop once it has (W05-R37); the jobs stopped so, whose results say it.
     let mut leases = crate::runner::lease::Leases::default();
     let mut lease_lost: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let harness = (!o.ephemeral && o.terminal).then(|| {
+    // An ephemeral runner holds sessions only where it was started for one (W10): its pod's.
+    let harness = (o.dedicated_session.is_some() || (!o.ephemeral && o.terminal)).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
         // A runner the server's `[slates_fleet]` lists starts its Slates as the fleet's node now (K4): a node holds the
@@ -2723,6 +2739,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Its terminals' shells as last told the scan of agent CLIs (`crate::aisessions`).
     let mut shells_told: Option<u64> = None;
     let mut served_dedicated = false;
+    // Whether the agent session it was started for has come to it (W10, [`session_runner_ends`]).
+    let mut session_seen = false;
     let started = Instant::now();
 
     let hello = |running: Vec<String>| Hello {
@@ -2849,7 +2867,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
         }
-        if o.ephemeral && !served_dedicated && jobs.is_empty() && started.elapsed() >= EPHEMERAL_JOB_WAIT {
+        // An ephemeral runner started for one agent session leaves as it ends, its uplink drained (W10).
+        if o.ephemeral
+            && let Some(id) = &o.dedicated_session
+        {
+            let holds = harness.as_ref().is_some_and(|h| h.get(id).is_some());
+            session_seen |= holds;
+            match session_runner_ends(session_seen, holds, started.elapsed()) {
+                Some(Ok(())) if buffer.is_empty() && up_rx.is_empty() && own_rx.is_empty() => {
+                    tracing::info!(session = %id, "ephemeral runner's agent session ended; exiting");
+                    crate::rt::sleep(Duration::from_millis(500)).await;
+                    return Ok(());
+                }
+                Some(Err(why)) => anyhow::bail!(why),
+                _ => {}
+            }
+        }
+        if o.ephemeral && o.dedicated_session.is_none() && !served_dedicated && jobs.is_empty() && started.elapsed() >= EPHEMERAL_JOB_WAIT {
             anyhow::bail!("ephemeral agent received no job within 15 minutes");
         }
         if draining && jobs.is_empty() && o.ephemeral {
@@ -7211,6 +7245,17 @@ mod tests {
         assert_eq!(crate::runner::custody::certified("promoted-n", 6), crate::runner::custody::Certification::BlueGreen, "certified, it goes on at 6");
     }
     use super::*;
+
+    /// W10: an ephemeral runner started for one agent session (its pod's) leaves once its session has come and gone, goes
+    /// on while it holds it or waits for it, and gives up, saying why, where it never came within the ephemeral wait.
+    #[test]
+    fn w10_a_pods_runner_leaves_as_its_one_session_ends() {
+        let soon = Duration::from_secs(5);
+        assert_eq!(session_runner_ends(false, false, soon), None, "it waits for its session");
+        assert_eq!(session_runner_ends(true, true, EPHEMERAL_JOB_WAIT * 2), None, "it holds its session however long it runs");
+        assert_eq!(session_runner_ends(true, false, soon), Some(Ok(())), "its session came and went");
+        assert!(session_runner_ends(false, false, EPHEMERAL_JOB_WAIT).is_some_and(|r| r.is_err_and(|why| why.contains("didn't come"))));
+    }
 
     /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 (goal 65's finding): a person's volumes outlive
     /// the runner's instances. Written where the runner's host keeps them while it runs as instance A,
