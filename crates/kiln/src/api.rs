@@ -1394,6 +1394,27 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             }
             boxed(|| own_op(&hub, &caller, "agentfiles.restore", body)).await
         }
+        // Environments for agent sessions (`crate::agentenvs`): each operation is its route, each keeping its caller
+        // to their own; a refusal says its code (`own_op`).
+        (&Method::GET, ["api", "agentenvs"]) => boxed(|| own_op(&hub, &caller, "agentenvs.list", json!({}))).await,
+        (&Method::POST, ["api", "agentenvs"]) => {
+            let body = boxed(|| body_value(req)).await?;
+            boxed(|| own_op(&hub, &caller, "agentenvs.create", body)).await
+        }
+        (&Method::GET, ["api", "agentenvs", "machine"]) => boxed(|| own_op(&hub, &caller, "agentenvs.machine", query_value(&q))).await,
+        (&Method::GET, ["api", "agentenvs", id]) => boxed(|| own_op(&hub, &caller, "agentenvs.get", json!({ "id": id }))).await,
+        (&Method::PATCH, ["api", "agentenvs", id]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "agentenvs.update", body)).await
+        }
+        (&Method::DELETE, ["api", "agentenvs", id]) => {
+            let done = boxed(|| own_op(&hub, &caller, "agentenvs.delete", json!({ "id": id }))).await?;
+            Ok(if done.status().is_success() { srv::status(StatusCode::NO_CONTENT) } else { done })
+        }
         // Agent definitions (`crate::agentdefs`): each operation is its route, each keeping its caller to their own.
         (&Method::GET, ["api", "agentdefs"]) => boxed(|| own_op(&hub, &caller, "agentdefs.list", query_value(&q))).await,
         (&Method::POST, ["api", "agentdefs"]) => {
@@ -1604,6 +1625,15 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             boxed(|| own_op(&hub, &caller, name, json!({"agent": id}))).await
         }
         (&Method::POST, ["api", "harness", "sessions", id, "restart"]) => boxed(|| own_op(&hub, &caller, "sessions.restart", json!({"agent": id}))).await,
+        // An environment applied to it (`agentenvs.apply`, docs/agents.md "Environments").
+        (&Method::PUT, ["api", "harness", "sessions", id, "agentenv"]) => {
+            let id = (*id).to_owned();
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() {
+                o.insert("agent".into(), json!(id));
+            }
+            boxed(|| own_op(&hub, &caller, "agentenvs.apply", body)).await
+        }
         // An agent moved to another machine: `agents.move` (kiln plan 01a1dd2e8618733a87f2793aab1322a8 P5.6, S3),
         // 202 as its move goes on after the answer.
         (&Method::POST, ["api", "harness", "agents", id, "move"]) => {
@@ -5701,6 +5731,10 @@ impl AgentsSeen {
         if m.kind == "agentfile" || m.kind == "agentfile_builds" {
             return m.person.as_deref().is_some_and(|owner| crate::agentfiles::hears(&self.caller, owner));
         }
+        // An environment's change, to its owner alone (`crate::agentenvs`).
+        if m.kind == "agentenv" {
+            return m.person.as_deref().is_some_and(|owner| crate::agentenvs::hears(&self.caller, owner));
+        }
         if self.all {
             return true;
         }
@@ -5730,7 +5764,7 @@ impl Narrow {
             "resync" => return true,
             // AgentsSeen has already checked the attention event's person (attention plan 01a199e1b177752e84dad5dc990e6a15),
             // and an Agentfile's owner.
-            "attention" | "agentfile" | "agentfile_builds" => return true,
+            "attention" | "agentfile" | "agentfile_builds" | "agentenv" => return true,
             "inbox" => return m.person.as_deref() == Some(self.person.as_str()),
             _ => {}
         }
@@ -6826,7 +6860,20 @@ async fn programs_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, 
 /// table let through (and the audit trail records): `crate::ops::own`.
 async fn own_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, input: serde_json::Value) -> R {
     let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
-    crate::ops::run_own(cx, name, input).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m))
+    let id = input.get("id").and_then(serde_json::Value::as_str).map(str::to_owned);
+    match crate::ops::run_own(cx, name, input).await {
+        Ok(v) => Ok(srv::json(StatusCode::OK, &v)),
+        // A refusal with a code (`crate::agentenvs::Refusal::said`, docs/agents.md "Environments"): its words and its
+        // code apart, as the page reads them; an environment in use names the sessions that run with it.
+        Err((c, m)) => match crate::agentenvs::typed(&m) {
+            Some((code @ "agentenv_in_use", words)) => {
+                let sessions = id.map(|id| crate::agentenvs::sessions_of(hub, &id)).unwrap_or_default();
+                Ok(srv::json(c, &json!({ "error": words, "code": code, "sessions": sessions })))
+            }
+            Some((code, words)) => Ok(srv::json(c, &json!({ "error": words, "code": code }))),
+            None => Err(err(c, m)),
+        },
+    }
 }
 
 /// The version an agent definition's change is made over, as `If-Match` names it (`"3"`, or `3`): none where it
@@ -6908,6 +6955,10 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     // and so are the secrets its build is given (P4.7).
     spec.agentfile = None;
     spec.build_secrets = Vec::new();
+    // Its environment, its secrets' values opened, is kiln's to resolve from one its person chose (`agents.start`'s
+    // `agentenv`, docs/agents.md "Environments"), never what's asked: a spec that carried one would put what it
+    // likes in its harness's environment unread.
+    spec.agentenv = None;
     // The engine setting its boundary is decided under is kiln's (kiln plan 01a1dd2e…, P2.3).
     spec.engine_version = None;
     // How much its launcher lets it do unasked is kiln's to record, from the mode asked (`Registry::open_as`), never
@@ -8687,6 +8738,20 @@ mod tests {
         let mut spec = forged();
         as_asked(&mut spec, None);
         assert_eq!(spec.opener, None);
+    }
+
+    /// docs/agents.md, "Environments": a session's environment, its secrets' values opened, is kiln's to resolve from
+    /// one its person chose, never what a spec asked for over `POST /api/harness/sessions` carries.
+    #[test]
+    fn a_spec_asked_for_carries_no_environment() {
+        use crate::harness::agentenv::{Base, Resolved, Set};
+        use crate::harness::session::Spec;
+        let forged = || Spec { kind: "claude".into(), agentenv: Some(Resolved { id: "e".into(), name: "n".into(), version: 1, base: Base::User, vars: vec![("K".into(), Set::Value("not-a-real-value".into()))] }), ..Spec::default() };
+        for caller in [Some(crate::authz::Caller::owner()), None] {
+            let mut spec = forged();
+            as_asked(&mut spec, caller.as_ref());
+            assert_eq!(spec.agentenv, None);
+        }
     }
 
     use super::*;

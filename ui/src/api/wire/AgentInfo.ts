@@ -3,6 +3,7 @@
 import type { AgentExperiment } from "./AgentExperiment";
 import type { AgentRuns } from "./AgentRuns";
 import type { AgentStart } from "./AgentStart";
+import type { AgentenvBrief } from "./AgentenvBrief";
 import type { ApprovalBrief } from "./ApprovalBrief";
 import type { Capacity } from "./Capacity";
 import type { ExitInfo } from "./ExitInfo";
@@ -190,6 +191,13 @@ workspace?: Workspace,
  * Its isolation, when it's held in a microVM of its own (as `Spec::isolation`).
  */
 isolation?: Isolation, 
+/**
+ * The environment it runs with (docs/agents.md, "Environments"), as its machine holds it: the version
+ * its harness started with. None: its machine's user's. Its runner says it; the server gives it again
+ * to a runner process that announces the session without the one kiln keeps it runs with
+ * (`crate::agentenvs::resolve::opened`).
+ */
+agentenv?: AgentenvBrief, 
 /**
  * Where its harness runs now (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17): a process of
  * its machine's, by its pid, or its image's member in a microVM of its own, which no host pid

@@ -22,6 +22,9 @@ const kept = new Map<string, { size: number; created_at: number; updated_at: num
   ["OPENAI_API_KEY", { size: 164, created_at: now() - 30 * 86400, updated_at: now() - 30 * 86400, last_used_at: null }],
 ]);
 
+/** The names of the secrets kept: what an environment may give its sessions (agentenvs.ts). */
+export const mySecretNames = (): string[] => [...kept.keys()];
+
 export async function handleMySecrets(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: Ctx): Promise<boolean> {
   const p = url.pathname;
   const m = req.method ?? "GET";

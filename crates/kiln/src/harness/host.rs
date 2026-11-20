@@ -4062,6 +4062,7 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
         launched: Some(spec.launched_level()),
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
+        agentenv: spec.agentenv.as_ref().map(crate::agentenvs::Brief::of),
         runs: None,
         starts: Vec::new(),
     };

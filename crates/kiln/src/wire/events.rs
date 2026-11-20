@@ -189,6 +189,10 @@ pub enum ServerEvent {
     /// One of a person's Agentfiles' builds ahead of its sessions changed (`crate::agentfiles::prebuild`), heard
     /// as [`ServerEvent::Agentfile`] is. After every tagged frame before it; a page from before it doesn't apply it.
     AgentfileBuilds(AgentfileBuildsChange),
+    /// One of a person's environments for agent sessions was kept, changed or deleted, or the sessions that
+    /// run with it changed (`crate::agentenvs`): to its owner's sockets alone. After every tagged frame before
+    /// it; a page from before it doesn't apply it.
+    Agentenv(AgentenvChange),
     /// Something happened to a run or a diff that notification rules hear (`run.failed`,
     /// `mention` ...): the tag is its [`NoticeKind`].
     #[serde(untagged)]
@@ -256,6 +260,21 @@ pub struct AgentfileChange {
     pub id: String,
     pub name: String,
     pub version: i64,
+    /// Deleted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub deleted: bool,
+}
+
+/// An environment for agent sessions that changed, went, or whose sessions changed (`crate::agentenvs`):
+/// whose and which. A page that shows it loads it again (`GET /api/agentenvs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct AgentenvChange {
+    /// `owner`, or `user:<id>`: who hears it.
+    pub owner: String,
+    /// Its id.
+    pub agentenv: String,
     /// Deleted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(test, ts(as = "Option<bool>", optional))]

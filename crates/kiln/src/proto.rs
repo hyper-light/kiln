@@ -840,12 +840,17 @@ pub mod feature {
     /// only between two runners that name it, and refuses the move otherwise (an older runner would hand the session
     /// over without its volume).
     pub const SLATES_MOVE: &str = "workspace.slates.move";
+    /// This runner runs sessions with the environments the server resolves for them (docs/agents.md,
+    /// "Environments": `Spec::agentenv`, `Command::Agentenv`), and says which variables its user has, by
+    /// name, as the server asks ([`super::ServerMsg::UserEnv`]). A runner that didn't name it isn't sent
+    /// one: a start with an environment there is refused, saying so.
+    pub const AGENTENV: &str = "agentenv";
     /// This runner holds a volume given to a running microVM session with its files kept from running
     /// (`Command::Override`'s volume `exec` off: each member's mount of it `noexec`, Shards' D279; kiln plan 01a1dd2e…,
     /// P6b.4); the server sends one only to a runner that names it, and refuses it otherwise (an older runner would
     /// give the volume with its files run).
     pub const VOLUME_EXEC: &str = "sessions.volumes.exec";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, VOLUME_EXEC];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1271,6 +1276,11 @@ pub enum ServerMsg {
     /// [`AgentMsg::Answer`] under `req` (`crate::agentdefs::volumes::Answer`). Only to runners that named
     /// [`feature::VOLUMES`]. Appended last, after `Prebuild`: postcard encodes variants by index.
     Volumes { req: u64, json: String },
+    /// Which variables this runner's user has, by name, and where each is set (JSON
+    /// `crate::harness::agentenv::Ask`; docs/agents.md, "Environments"); answered by
+    /// [`AgentMsg::Answer`] under `req` (`crate::harness::agentenv::Answer`). Only to runners that
+    /// named [`feature::AGENTENV`]. Appended last, after `Volumes`: postcard encodes variants by index.
+    UserEnv { req: u64, json: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2125,8 +2135,9 @@ mod tests {
         // asked for a person, HarnessHistoryFor (80); kiln plan 01a1dd2e… P2.3 a runner's engine, RunnerEngine (81);
         // CP-T3.2 the room a hand-over's spool leaves, AdoptPolicy (82); kiln plan 01a1dd2e… P7.1b a replay, Replay (83);
         // kiln plan 01a1dd2e… P4.5 an Agentfile's build ahead of its sessions, Prebuild (84), and where it is, Prebuilt (73);
-        // kiln plan 01a1dd2e… P6.2 an agent's volumes on a runner, Volumes (85).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (74, 86), "each table has every variant once");
+        // kiln plan 01a1dd2e… P6.2 an agent's volumes on a runner, Volumes (85); docs/agents.md "Environments" a
+        // runner's user's variables, UserEnv (86).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (74, 87), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -2359,6 +2370,7 @@ mod tests {
             ("Replay", ServerMsg::Replay { req: 1, json: "{}".into() }),
             ("Prebuild", ServerMsg::Prebuild { json: "{}".into() }),
             ("Volumes", ServerMsg::Volumes { req: 1, json: "{}".into() }),
+            ("UserEnv", ServerMsg::UserEnv { req: 1, json: "{}".into() }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

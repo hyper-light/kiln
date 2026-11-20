@@ -144,10 +144,15 @@ fn measure(dir: &Path) -> (u64, i64) {
     if !top.is_dir() {
         return (bytes, used);
     }
+    // A mount point under it is never stat'd: a FUSE mount whose server is gone never answers (W06-R01).
+    let mounts: Vec<PathBuf> = crate::os::tree::mounts_under(dir).into_iter().map(|(p, _)| p).collect();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
+            if mounts.contains(&e.path()) {
+                continue;
+            }
             let Ok(m) = e.metadata() else { continue };
             bytes = bytes.saturating_add(disk_bytes(&m));
             used = used.max(mtime(&m));
@@ -292,7 +297,7 @@ fn delete(path: &Path, home: &Path, roots: &[PathBuf], busy: &dyn Fn(&Path) -> b
     let m = std::fs::symlink_metadata(path).ok()?;
     let gone = if m.is_dir() {
         // Go's module cache makes its folders read-only: they're made writable again to be emptied.
-        std::fs::remove_dir_all(path).or_else(|e| if e.kind() == std::io::ErrorKind::PermissionDenied { writable(path).and_then(|()| std::fs::remove_dir_all(path)) } else { Err(e) })
+        crate::os::tree::remove_dir_all(path).or_else(|e| if e.kind() == std::io::ErrorKind::PermissionDenied { writable(path).and_then(|()| crate::os::tree::remove_dir_all(path)) } else { Err(e) })
     } else {
         std::fs::remove_file(path)
     };
@@ -307,6 +312,7 @@ fn delete(path: &Path, home: &Path, roots: &[PathBuf], busy: &dyn Fn(&Path) -> b
 
 /// Gives its owner write on `dir` and every folder under it (its symlinks not followed).
 fn writable(dir: &Path) -> std::io::Result<()> {
+    let mounts: Vec<PathBuf> = crate::os::tree::mounts_under(dir).into_iter().map(|(p, _)| p).collect();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let m = std::fs::symlink_metadata(&d)?;
@@ -321,7 +327,7 @@ fn writable(dir: &Path) -> std::io::Result<()> {
             std::fs::set_permissions(&d, perms)?;
         }
         for e in std::fs::read_dir(&d)?.flatten() {
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
+            if e.file_type().is_ok_and(|t| t.is_dir()) && !mounts.contains(&e.path()) {
                 stack.push(e.path());
             }
         }

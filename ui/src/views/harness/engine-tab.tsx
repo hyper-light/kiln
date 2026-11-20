@@ -1,16 +1,21 @@
 /**
- * An agent's Engine tab, the one tab agent chat gains, for a session in a microVM only (one on bare metal
- * has no sandboxes; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2, P3, P5.1, P5.2): two sections, each
- * folding, each found by a filter with facets and sorted (as Mission control's sessions are):
+ * An agent's Engine tab, for every session whatever its engine (decided by the user, 2026-11-18; kiln
+ * plan 01a1cd8e862e7169a074db3d5fa33f3d, P2, P3, P5.1, P5.2; docs/agents.md, "In the Engine tab"):
+ * its sections, each folding, each found by a filter with facets and sorted (as Mission control's
+ * sessions are):
  *
- *   - Sandboxes: the session's, its own and its kiln subagents', a card each (engine-rows.tsx): its
- *     line and controls, its resources each with its last hour, then its sections (what it is, its
- *     components, network, volumes and directories);
+ *   - Sandboxes, for a session in a microVM only (one on bare metal has none): the session's, its own
+ *     and its kiln subagents', a card each (engine-rows.tsx): its line and controls, its resources each
+ *     with its last hour, then its sections (what it is, its components, network, volumes and
+ *     directories);
+ *   - Environments: the person's named sets of variables a session runs with, a card each
+ *     (engine-envs.tsx): its line, its variables and the sessions running with it, changed in place
+ *     and applied to this session from there. This session's is first, marked;
  *   - Agents: the agents there are, the person's at first (the system's by its facet), a card each:
  *     its line, then its settings and experiments. This session's agent is always first, marked, with
  *     what this session started on.
  *
- * Only the two sections fold: inside them nothing does (no collapsible nested in another).
+ * The sections fold, and so does each environment in its own (asked by the user, 2026-11-19).
  */
 import * as React from "react";
 import { agentdefsRes, enginesOf, type AgentDef } from "@/api/agentdefs";
@@ -23,18 +28,23 @@ import { labelOf, useRes } from "@/lib/data";
 import { DefRow } from "./definitions";
 import { agentLabel } from "./derive";
 import { useEngineOf } from "./engine-of";
+import { Environments } from "./engine-envs";
 import { EngineVm, useSandboxed, WORD } from "./engine-rows";
 import { Fold } from "./fold";
 import { useAgentList } from "./use-agents";
 
 export function EngineTab({ agentId, target }: { agentId: string; target: string }) {
-  // Offered only for a session in a microVM: one on bare metal (a link from before) has no sandboxes.
+  // Its sandboxes only in a microVM: one on bare metal has none.
   const engine = useEngineOf(agentId, target);
-  if (engine !== "microvm") return <p className="in-none">It runs on bare metal: no sandboxes.</p>;
   return (
     <div className="in-secs at">
-      <Loadable label="Loading its sandboxes" fallback={null}>
-        <Vms agentId={agentId} />
+      {engine === "microvm" && (
+        <Loadable label="Loading its sandboxes" fallback={null}>
+          <Vms agentId={agentId} />
+        </Loadable>
+      )}
+      <Loadable label="Loading the environments" fallback={null}>
+        <Environments agentId={agentId} target={target} />
       </Loadable>
       <Loadable label="Loading the agents" fallback={null}>
         <Agents agentId={agentId} />
