@@ -3,8 +3,8 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `84c870b0f05ed46ab7298eb19402e3945aeb8640`
-  (2026-11-18), MIT (`LICENSE`): its branch `p/v080-vendor`, with Shards' v0.8.0 tag vendored. Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
+- **Upstream:** https://github.com/hyper-light/hex, commit `b4db7e69c895182ae68500c08ded91200d1228b1`
+  (2026-11-19), MIT (`LICENSE`): its branch `cp/t7-p6b3-live`, which takes Shards by git and vendors no copy of its own. Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
   Shards deleted the 16550 at `35e2de91e`; Hex's D261, D262), its Shards image class in a process that links Hex
   (`hex_node::images::ImageRuntime::new`, and `ImageRuntime::leasing`, made with its orchestrator's lessors), a member's
   run-time arguments (`ImageMember::args`) and the host folders it sees (`ShardsImage::shares`), a box's host use at
@@ -19,14 +19,17 @@ The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e8
   keeping its final use for its delete, a run's agent-control link (`Runtime::link`), and on Windows a guest's streams
   on two named pipes (Shards' D272); and past it a Shards image VM's shares another server serves (`ShardsImage::served`
   by source, each one's stream asked of the server its orchestrator bound, `ImageRuntime::bind_servers`,
-  `hex_api::serve::Servers`; Shards' D286, kiln goal 01a1ec34599974448f6b7663ddb07001).
-  It pins Shards at `aa819b058` (v0.8.0), kiln's own, with one recorded change of its own to it, Shards' D286's API side
-  (`vendor/patches/shards/0001-shards-api-shards-ipc-an-image-run-takes-shares-another.patch`, which kiln's copy of
-  Shards carries byte for byte, until ROOT lands D286 on Shards' main), and hyper-raft at `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
+  `hex_api::serve::Servers`; Shards' D286, kiln goal 01a1ec34599974448f6b7663ddb07001); and a running image box's network
+  and folders changed in place (`Runtime::change`, `Call::Change` 0x0027, `Refusal::Live`, `BoxInfo::live`; kiln plan
+  01a1dd2e…, P6b.3).
+  It takes Shards' crates by git at `7158020b61`, Shards' main and the commit kiln vendors (vendor/MANIFEST.toml), which
+  kiln's root manifest serves from kiln's copy (`[patch."https://github.com/hyper-light/shards"]`); and hyper-raft at
+  `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
   of what kiln touches: docs/shards.md).
 - **How kiln uses it:** `hex-node`, and through it Hex's runtime, client, QUIC wire, scheduler simulation, health
   and GPU telemetry, by name; kiln's root `[patch.crates-io]` points the name here, and `seccompiler` (third-party
-  code only Hex vendors) at `vendor/seccompiler` here. A runner whose kiln carries Shards holds Hex's image runtime
+  code only Hex vendors) at `vendor/seccompiler` here; its root `[patch."https://github.com/hyper-light/shards"]` points
+  Hex's Shards crates at kiln's own copy (`vendor/shards`), so Hex builds on kiln's Shards. A runner whose kiln carries Shards holds Hex's image runtime
   in its own process, over kiln's carried `shards` (`crate::shards`, `sandbox::hold`), and starts each isolated
   agent's harness as a member of one of its Shards image boxes (`sandbox::hexvm`; the joint plan's step 17;
   docs/isolation.md).
@@ -34,7 +37,7 @@ The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e8
   (`bench/competitive/probes/mntns_default.txt`, `bench/native/guest/records.tsv`, and hex-sim's recorded traces
   `bench/sched/kiln-ci-20261022-20261105.trace` and `bench/sched/huawei-r5-day30.fleet.trace`); its record of what it vendors
   (`vendor/MANIFEST.toml`, `vendor/patches`), which `scripts/vendor.py check` holds kiln's pins to as kiln's copy
-  holds it; and seccompiler. Not its copies of hyper-raft, Shards, cuda-rust and all-smi, which are kiln's; nor its
+  holds it; and seccompiler. Not its copies of hyper-raft, cuda-rust and all-smi, which are kiln's; nor its
   GPU renderer's build inputs and Firecracker's sources, which only Hex's own scripts build; nor its docs,
   benchmarks and CI, which are Hex's.
 
@@ -44,10 +47,8 @@ Each change is recorded in `vendor/patches/hex/`, applied in this order on upstr
 
 | File | Change | Why | Recorded as |
 |---|---|---|---|
-| `vendor/patches/hyper-raft/` | Hex's records of hyper-raft's changes made kiln's. Its hyper-raft and Shards pins have been kiln's own at each re-vendor since Hex `414aa30d` (at this revision `e0613f52` and `aa819b058`), so this change's pin parts dropped out as upstream's own | kiln holds one copy of each project, with one record of its changes, and Hex must build on it: one Shards revision serves Hex and kiln (the joint plan's step 16) | `0001-hex-builds-on-kiln-s-shards-and-hyper-raft.patch` |
+| `vendor/patches/hyper-raft/` | Hex's records of hyper-raft's changes made kiln's. Its hyper-raft pin has been kiln's own at each re-vendor since Hex `414aa30d` (at this revision `e0613f52`), so this change's pin parts dropped out as upstream's own; Hex takes Shards by git, which kiln's root `[patch]` points at kiln's copy | kiln holds one copy of each project, with one record of its changes, and Hex must build on it: one Shards revision serves Hex and kiln (the joint plan's step 16) | `0001-hex-builds-on-kiln-s-shards-and-hyper-raft.patch` |
 | `crates/hex-sim/src/lib.rs`, `crates/hex-gpu/src/nvml.rs`, `crates/hex-gpu/src/adl.rs`, `crates/hex-gpu/src/amd.rs` | the files Hex includes by path (hyper-swim's `coordinates.rs`, cuda-rust's loader, all-smi's AMD readers) named at kiln's copies (`vendor/hyper-raft`, `vendor/cuda-rust`, `vendor/all-smi`) | kiln's copy leaves Hex's own copies of them out | `0002-files-hex-includes-by-path-from-kiln-s-copies.patch` |
-| `vendor/MANIFEST.toml` | its `shards-gpu` entry left out | it names the GPU renderer build Hex's `scripts/shards-gpu/build.sh` makes, which Hex compiles nothing of and kiln's copy holds nothing of; kiln carries no GPU VM process (docs/shards.md) | `0003-no-gpu-renderer-build-of-hex-s-in-kiln-s-copy.patch` |
-| `crates/hex-runtime/Cargo.toml`, `crates/hex-client/Cargo.toml`, `crates/hex-node/Cargo.toml` | their path dependencies on Shards' crates (`shards-abi`, `shards-remote`, `shards-ipc`, `shards-afunix`, `shards-testdir`) named at kiln's copy (`vendor/shards`) | kiln's copy leaves Hex's own copy of Shards out, and a path dependency can't be patched | `0004-hex-s-path-dependencies-on-shards-crates-from-kiln-s-copy.patch` |
 
 The second, third and fourth changes are kiln's layout alone (`Kiln-only:`). The first is offered to Hex as it stands,
 with what it leaves for Hex and kiln to agree on:

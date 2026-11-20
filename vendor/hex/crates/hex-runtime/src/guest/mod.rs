@@ -1614,6 +1614,74 @@ impl Runtime for GuestRuntime {
         }
     }
 
+    /// Kiln plan P5.5b: an image VM's pause, its class's ([`image::ImageClass`]); any other box's refused as the trait
+    /// refuses it, naming its class: a Shards guest's oci box among them, its VM its node's.
+    fn pause(&self, id: &BoxId) -> Result<(), Refusal> {
+        match self.routed(id)? {
+            books::Routed::Retired(record) => Err(record.retired_refusal()?),
+            books::Routed::Image(record) => self.images.pause_image(record),
+            books::Routed::Other(None) => Err(Refusal::NoSuchBox(id.try_clone()?)),
+            books::Routed::Other(Some(record)) => Err(Refusal::Pause {
+                id: id.try_clone()?,
+                op: "pause",
+                cause: hex_api::PauseCause::Class(record.spec.class.class()),
+            }),
+        }
+    }
+
+    /// Kiln plan P5.5b: an image VM's resume, as its pause is routed.
+    fn resume(&self, id: &BoxId) -> Result<(), Refusal> {
+        match self.routed(id)? {
+            books::Routed::Retired(record) => Err(record.retired_refusal()?),
+            books::Routed::Image(record) => self.images.resume_image(record),
+            books::Routed::Other(None) => Err(Refusal::NoSuchBox(id.try_clone()?)),
+            books::Routed::Other(Some(record)) => Err(Refusal::Pause {
+                id: id.try_clone()?,
+                op: "resume",
+                cause: hex_api::PauseCause::Class(record.spec.class.class()),
+            }),
+        }
+    }
+
+    /// Shards' D270 slice 4: an image VM's member given a component, its class's ([`image::ImageClass`]); any other box's
+    /// refused as the trait refuses it, naming its class: a Shards guest's oci box among them, its VM its node's.
+    fn swap(
+        &self,
+        id: &BoxId,
+        at: &str,
+        digest: &str,
+        when: hex_api::SwapWhen,
+    ) -> Result<hex_api::Swapped, Refusal> {
+        let record = self.swappable(id, "swap")?;
+        self.images
+            .swap_image(record, at, image::Change::Swap(digest), when)
+    }
+
+    /// Shards' D270 slice 4: an image VM's member given its image's own component back, as its swap is routed.
+    fn restore(
+        &self,
+        id: &BoxId,
+        at: &str,
+        when: hex_api::SwapWhen,
+    ) -> Result<hex_api::Swapped, Refusal> {
+        let record = self.swappable(id, "restore")?;
+        self.images
+            .swap_image(record, at, image::Change::Restore, when)
+    }
+
+    /// Shards' D270 slice 4: an image VM's components, as its swap is routed.
+    fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
+        let record = self.swappable(id, "components")?;
+        self.images.components_image(record)
+    }
+
+    /// Kiln plan P6b.3: an image VM's network or folders changed as it runs, its class's ([`image::ImageClass`]); any
+    /// other box's refused as the trait refuses it, naming its class.
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        let record = self.changeable(id, change.op())?;
+        self.images.change_image(record, change)
+    }
+
     fn signal(&self, id: &BoxId, signal: Signal) -> Result<(), Refusal> {
         match self.routed(id)? {
             books::Routed::Retired(record) => Err(record.retired_refusal()?),
@@ -2376,6 +2444,47 @@ impl<P: Runtime> Runtime for WithGuest<P> {
 
     fn host_use(&self, id: &BoxId) -> Result<hex_api::HostUse, Refusal> {
         self.holder(id)?.host_use(id)
+    }
+
+    /// The runtime holding the box pauses it (kiln plan P5.5b), as it answers `host_use`: an image VM's its guest
+    /// runtime's class, a process box's its host's, which pauses none.
+    fn pause(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.holder(id)?.pause(id)
+    }
+
+    fn resume(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.holder(id)?.resume(id)
+    }
+
+    /// The runtime holding the box swaps its member's component (Shards' D270 slice 4), as it pauses it: an image VM's
+    /// its guest runtime's class, a process box's its host's, which has none.
+    fn swap(
+        &self,
+        id: &BoxId,
+        at: &str,
+        digest: &str,
+        when: hex_api::SwapWhen,
+    ) -> Result<hex_api::Swapped, Refusal> {
+        self.holder(id)?.swap(id, at, digest, when)
+    }
+
+    fn restore(
+        &self,
+        id: &BoxId,
+        at: &str,
+        when: hex_api::SwapWhen,
+    ) -> Result<hex_api::Swapped, Refusal> {
+        self.holder(id)?.restore(id, at, when)
+    }
+
+    fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
+        self.holder(id)?.components(id)
+    }
+
+    /// The runtime holding the box changes its network or folders as it runs (kiln plan P6b.3), as it swaps its
+    /// components: an image VM's its guest runtime's class, a process box's its host's, which takes none.
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        self.holder(id)?.change(id, change)
     }
 
     fn inspect(&self, id: &BoxId) -> Result<BoxInfo, Refusal> {

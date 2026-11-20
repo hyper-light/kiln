@@ -602,6 +602,7 @@ impl JobBox {
             io_write_bytes: a.write_bytes,
             guest: None,
             started_from: None,
+            paused_ns: None,
         })
     }
 

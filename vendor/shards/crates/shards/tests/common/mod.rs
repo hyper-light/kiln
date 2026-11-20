@@ -305,32 +305,95 @@ pub fn host_refusal(said: &str) -> Option<(shards_vmm::vm::limits::Said, HostVer
         .saturating_add(width())
         .saturating_sub(limits::now_us());
     std::thread::sleep(Duration::from_micros(wait));
-    let kept: Vec<limits::Refusal> = records.iter().flat_map(limits::Limits::refusals).collect();
+    let kept: Vec<limits::Refusal> = records
+        .iter()
+        .flat_map(limits::Limits::refusals)
+        .chain(refusals_logged_here())
+        .collect();
     let verdict = limits::the_hosts(&refused, &kept, width());
     Some((refused, verdict))
+}
+
+/// The refusals the daemons of this test process's homes logged, in D261's words, each with its
+/// moment and whether its guest had run: witnesses its gate reads beside the records, as a warm
+/// VM, restored, keeps none (helpers.rs `vcpu_records_words`: it is granted no records file).
+/// CI 44449878966 (x86_64 musl): `parallel_runs_keep_their_own_stdio`'s warm VM 197598 was
+/// refused before its guest ran, and VM 196663, another test's, after its guest ran 178 µs
+/// later, which only that test's daemon's log held: the gate found no witness, and the test
+/// failed where the other skipped. Each home's `daemon.log`, a directory of this process's or
+/// one beneath it, as a test names its home.
+pub fn refusals_logged_here() -> Vec<shards_vmm::vm::limits::Refusal> {
+    fn logs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name() == "daemon.log" {
+                found.push(path);
+            } else if depth > 0 && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                logs(&path, depth - 1, found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    logs(&shards_testdir::this_process(), 3, &mut found);
+    found
+        .iter()
+        .filter_map(|log| std::fs::read_to_string(log).ok())
+        .flat_map(|log| {
+            shards_vmm::vm::limits::Said::every(&log)
+                .map(|said| said.refusal)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Whether a run that failed, its error `said`, was ended by its VM's host's refusal to enter
 /// it that D261's gate takes for the host's: said SKIP with its evidence ([`host_refused`]), as
 /// boot.rs's tests say theirs. Its VM's refusal is read from its error, or from `home`'s
-/// daemon's log once that log tells its VM's end ([`run_refusal`]), waited for as `home`'s
-/// daemon progresses ([`Patience`]). Anything else, a failure with no refusal of its VM found,
-/// a 125 among them, stays its test's failure (ROOT's ruling of 2026-11-17: the daemon's tests
-/// take boot.rs's gated SKIP).
+/// daemon's log ([`run_refusal`], [`vms_host_refused`]). Anything else, a failure with no
+/// refusal of its VM found, a 125 among them, stays its test's failure (ROOT's ruling of
+/// 2026-11-17: the daemon's tests take boot.rs's gated SKIP).
 pub fn run_host_refused(said: &str, home: &Path) -> bool {
-    let log = || std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default();
-    if shards_vmm::vm::limits::Said::find(said).is_none() {
-        let vms = run_vms(said, &log());
-        if !vms.is_empty() {
-            // A VM that ends refused logs its refusal before its end ([`run_refusal`]).
-            let mut patience = Patience::of(home);
-            while !vms.iter().all(|vm| log().contains(&format!("VM {vm} ended"))) && patience.holds() {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            patience.done();
-        }
+    if shards_vmm::vm::limits::Said::find(said).is_some() {
+        return host_refused(said);
     }
-    host_refused(&run_refusal(said, &log()))
+    let log = std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default();
+    vms_host_refused(&run_vms(said, &log), home)
+}
+
+/// Whether container `id`'s run ended because its VM's host refused to enter it, as D261's gate
+/// takes a refusal for its host's, said as [`run_host_refused`] says a run's: for a container
+/// whose words no client heard (`run -d`) and whose end a later command finds (a `kill` told
+/// "it is not running"). Its VMs are those `home`'s daemon's log says could not serve its run
+/// ([`container_refusal`]). Anything else, a container that ended for another reason, stays its
+/// test's failure (CI 44379986478, x86_64 musl, daemon.rs
+/// `idle_followers_cost_nothing_and_end_with_their_container`: VM 201354's vCPU 3 refused, 0x7,
+/// after its guest ran, and `kill up` failed, its container ended with it).
+pub fn container_host_refused(id: &str, home: &Path) -> bool {
+    let log = std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default();
+    vms_host_refused(&container_vms(id, &log), home)
+}
+
+/// Whether the refusals of VMs `vms` that `home`'s daemon's log holds are their host's by D261's
+/// gate ([`host_refused`]): read once each VM has said its refusal there or its process has gone,
+/// after which it says nothing more, waited for as `home`'s daemon progresses ([`Patience`]). A
+/// warm VM that took a run says its refusal as its machine stops and exits 0 (vm_run.rs: its
+/// client has the status), so its daemon logs no end of it: a wait for `VM N ended` ran to its
+/// patience's refusal (CI 44379986478, x86_64 gnu: VM 306660's refusal logged after its run's
+/// 125). None to read, nothing taken.
+fn vms_host_refused(vms: &[u32], home: &Path) -> bool {
+    let log = || std::fs::read_to_string(home.join("daemon.log")).unwrap_or_default();
+    if !vms.is_empty() {
+        let told = |vm: u32| !refusals_of(&[vm], &log()).is_empty() || !i32::try_from(vm).is_ok_and(alive);
+        let mut patience = Patience::of(home);
+        while !vms.iter().all(|&vm| told(vm)) && patience.holds() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        patience.done();
+    }
+    host_refused(&refusals_of(vms, &log()))
 }
 
 /// The lines that tell of a refused entry of the VM of a run that failed, its error `said`:
@@ -342,7 +405,17 @@ pub fn run_refusal(said: &str, log: &str) -> String {
     if shards_vmm::vm::limits::Said::find(said).is_some() {
         return said.to_string();
     }
-    let vms = run_vms(said, log);
+    refusals_of(&run_vms(said, log), log)
+}
+
+/// The lines that tell of a refused entry of container `id`'s VMs ([`container_vms`]), by their
+/// pids: not another container's VM's that the same `log` holds. None where none does.
+pub fn container_refusal(id: &str, log: &str) -> String {
+    refusals_of(&container_vms(id, log), log)
+}
+
+/// The lines of `log` that tell of a refused entry of one of VMs `vms`, by its pid.
+fn refusals_of(vms: &[u32], log: &str) -> String {
     let of_vm: Vec<&str> = log
         .lines()
         .filter(|line| {
@@ -355,8 +428,7 @@ pub fn run_refusal(said: &str, log: &str) -> String {
 
 /// The VMs a run that failed, its error `said`, was served on, by their pids: one its error
 /// names as ended (`VM N ended`, before it was ready), and one its daemon's `log` says could not
-/// serve a run in the words its error carries (`container ID: its VM N could not serve its run:
-/// WHY`, as its client heard WHY).
+/// serve a run in the words its error carries ([`unserved`], as its client heard WHY).
 fn run_vms(said: &str, log: &str) -> Vec<u32> {
     let named = said.split("VM ").skip(1).filter_map(|rest| {
         let (pid, after) = rest.split_once(' ')?;
@@ -365,15 +437,32 @@ fn run_vms(said: &str, log: &str) -> Vec<u32> {
             .then(|| pid.parse::<u32>().ok())
             .flatten()
     });
-    let unserved = log.lines().filter_map(|line| {
-        let (_, rest) = line.split_once(": its VM ")?;
-        let (pid, why) = rest.split_once(" could not serve its run: ")?;
-        let why = why.trim();
-        (!why.is_empty() && said.contains(why))
-            .then(|| pid.parse::<u32>().ok())
-            .flatten()
-    });
+    let unserved = log
+        .lines()
+        .filter_map(unserved)
+        .filter(|&(_, _, why)| !why.is_empty() && said.contains(why))
+        .map(|(_, vm, _)| vm);
     named.chain(unserved).collect()
+}
+
+/// The VMs container `id` was served on that its daemon's `log` says could not serve its run
+/// ([`unserved`]), by their pids.
+fn container_vms(id: &str, log: &str) -> Vec<u32> {
+    log.lines()
+        .filter_map(unserved)
+        .filter(|&(container, _, _)| container == id)
+        .map(|(_, vm, _)| vm)
+        .collect()
+}
+
+/// A daemon's log line telling that a container's VM could not serve its run (daemon.rs
+/// `UNSERVED`: `container ID: its VM N could not serve its run: WHY`): its container's ID, its
+/// VM's pid and why.
+fn unserved(line: &str) -> Option<(&str, u32, &str)> {
+    let (head, rest) = line.split_once(": its VM ")?;
+    let (_, container) = head.rsplit_once("container ")?;
+    let (vm, why) = rest.split_once(" could not serve its run: ")?;
+    Some((container, vm.parse().ok()?, why.trim()))
 }
 
 /// Whether the daemon here keeps the snapshots it keeps, its templates, warm pools and saves
@@ -3419,9 +3508,9 @@ impl Patience {
         self.wait.account()
     }
 
-    /// The window a stillness of its party is refused over as its looks so far say it: W*, or
-    /// what its looks resolve where that is longer (a counter's tick, a look's own time). None
-    /// while it is not judged.
+    /// The window a stillness of its party is refused over as its looks so far say it: W* and
+    /// its spread, or what its looks resolve where that is longer (a counter's tick, a look's
+    /// own time). None while it is not judged.
     pub fn window(&self) -> Option<Duration> {
         self.wait.judge.stillness().map(|(_, _, window)| window)
     }
@@ -3521,6 +3610,31 @@ pub fn requests_end<E>(
         kind.keep();
     }
     Ok(came)
+}
+
+/// What a rate's drain came to (benches/arrival.rs; D209 Part 11, D261): its ends as
+/// [`requests_end`] gave them, read with whether its span, from its start to its drain's end,
+/// was its host's: every VM entry its host refused in it one D261's gate takes for the host's
+/// (`limits::the_hosts_all`).
+pub enum Drained<E> {
+    /// Every request ended.
+    Came(Vec<E>),
+    /// Its wait was refused in a span its host's: those that came, and its wait's account.
+    /// The rest never ended, on a host that had begun to refuse VM entries, so the rate is
+    /// not shards' measurement, as the rest of it is not (ROOT's ruling (c) of 2026-11-18).
+    HostsSpan(Vec<E>, String),
+    /// Its wait was refused in a span not its host's: those that came, and its wait's
+    /// account, for a failure.
+    Stalled(Vec<E>, String),
+}
+
+/// [`Drained`], of `ends` and whether its span was its host's, `hosts_span`.
+pub fn drained<E>(ends: Result<Vec<E>, (Vec<E>, String)>, hosts_span: bool) -> Drained<E> {
+    match ends {
+        Ok(came) => Drained::Came(came),
+        Err((came, refused)) if hosts_span => Drained::HostsSpan(came, refused),
+        Err((came, refused)) => Drained::Stalled(came, refused),
+    }
 }
 
 /// The least a guest gives back at once: one block of its free lists, which free page
@@ -4053,7 +4167,9 @@ fn run_ending(
             (Err(stall), None) => {
                 let said = wait.refused(&stall);
                 let seen = stuck(child.id(), home.as_deref());
-                let (started, left) = end_run(&mut child, stall.slowest(), leftovers);
+                // Its processes given its kind's window to end in: W* and its spread.
+                let within = stall.slowest().saturating_add(stall.spread());
+                let (started, left) = end_run(&mut child, within, leftovers);
                 take_all(&mut [&mut out, &mut err]);
                 return Err(Ended {
                     said: format!(
@@ -4408,12 +4524,12 @@ impl WaitKind {
         &self.record
     }
 
-    /// Teaches its record what this host kept of it ([`kept_record`]): W*, and R*, C* and the
-    /// count of answers that taught them where it keeps a rating of this host's work's unit
-    /// and CPU model ([`rated_key`]), each as it was kept (`shards_api::Record::merge`); and
-    /// says the ratings it keeps of other keys, as kept, for its keep to write back. Nothing
-    /// where nothing whole is kept, and, for a command's kind, nothing that does not say it is
-    /// of served answers alone ([`SERVED`]).
+    /// Teaches its record what this host kept of it ([`kept_record`]): W* and the quickest
+    /// answer, and R*, C*, the least work and the count of answers that taught them where it
+    /// keeps a rating of this host's work's unit and CPU model ([`rated_key`]), each as it was
+    /// kept (`shards_api::Record::merge`); and says the ratings it keeps of other keys, as
+    /// kept, for its keep to write back. Nothing where nothing whole is kept, and, for a
+    /// command's kind, nothing that does not say it is of served answers alone ([`SERVED`]).
     fn learn_kept(&self) -> Vec<String> {
         let kept = std::fs::read_to_string(&self.file).unwrap_or_default();
         let Some(kept) = kept_record(&kept, self.served_only(), rated_key()) else {
@@ -4421,6 +4537,7 @@ impl WaitKind {
         };
         self.record.merge(shards_api::Seen::Learned {
             slowest: kept.slowest,
+            quickest: kept.quickest,
             rated: kept.rated,
         });
         kept.others
@@ -4497,7 +4614,12 @@ impl WaitKind {
     ) -> std::io::Result<()> {
         static KEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let others = self.learn_kept();
-        let shards_api::Seen::Learned { slowest, rated } = self.record.seen() else {
+        let shards_api::Seen::Learned {
+            slowest,
+            quickest,
+            rated,
+        } = self.record.seen()
+        else {
             return Ok(());
         };
         between();
@@ -4515,14 +4637,15 @@ impl WaitKind {
         } else {
             String::new()
         };
-        let mut kept = format!("{tag}{}", ns(slowest));
+        let mut kept = format!("{tag}{} {}", ns(slowest), ns(quickest));
         if let Some(rated) = rated {
             kept.push_str(&format!(
-                " {RATED} {} {} {} {} {}",
+                " {RATED} {} {} {} {} {} {}",
                 rated_key(),
                 rated.least.work.count(),
                 ns(rated.least.over),
                 rated.most.count(),
+                rated.lightest.count(),
                 rated.answers
             ));
         }
@@ -4542,8 +4665,10 @@ impl WaitKind {
 pub struct Kept {
     /// W*.
     pub slowest: Duration,
-    /// R*, C* and the count of the answers that taught them, where it keeps a rating of this
-    /// host's key ([`rated_key`]).
+    /// The quickest answer, W*'s where the record keeps none (its spread none).
+    pub quickest: Duration,
+    /// R*, C*, the least work and the count of the answers that taught them, where it keeps a
+    /// rating of this host's key ([`rated_key`]).
     pub rated: Option<shards_api::Rated>,
     /// Each rating it keeps of another key, as kept (`rated KEY …`), which this host's keep
     /// writes back beside its own: one cache's records come back to runners of any CPU model
@@ -4552,45 +4677,67 @@ pub struct Kept {
 }
 
 /// A kept record `text` as a host whose ratings are keyed `key` ([`rated_key`]) reads it:
-/// `[served ]W*`, then each rating, `rated KEY R*WORK R*WALL C*WORK ANSWERS`, W* and R*'s
-/// wall in nanoseconds and R*'s and C*'s work in KEY's unit (`shards_api::Work`). Its W* is
-/// read whatever its ratings are, and its R* and C* from its rating of `key` alone: work
-/// counted in another unit or on another CPU model weighs nothing here (cycles are no time,
-/// and their rate is their CPU's: Microsoft Learn's QueryThreadCycleTime). A rating kept
-/// before ratings were keyed (`rated` and its numbers: CPU nanoseconds, or on Windows whole
-/// clock ticks', which refused a party of thirteen ticks past a C* of eleven, CI
-/// 44347282760) is read as none, its R* and C* taught anew; the record's W* stands. None
-/// where nothing whole is kept or a rating is not whole, and, `served` asked, where it does
-/// not say it is of served answers alone ([`SERVED`]).
+/// `[served ]W* QUICKEST`, then each rating, `rated KEY R*WORK R*WALL C*WORK LEAST ANSWERS`,
+/// W*, the quickest answer and R*'s wall in nanoseconds and R*'s, C*'s and the least work in
+/// KEY's unit (`shards_api::Work`): each least after its most, so that the record keeps the
+/// spread its judge's bounds take (D215 amended 2026-11-19). Its W* is read whatever its
+/// ratings are, and its R* and C* from its rating of `key` alone: work counted in another
+/// unit or on another CPU model weighs nothing here (cycles are no time, and their rate is
+/// their CPU's: Microsoft Learn's QueryThreadCycleTime). A record kept before the minima were
+/// (`[served ]W*`, its ratings `rated KEY R*WORK R*WALL C*WORK ANSWERS`), as CI's cache brings
+/// them back from runs before, is read whole, each minimum its maximum: its spreads none, as
+/// its judge took them then. A rating kept before ratings were keyed (`rated` and its numbers:
+/// CPU nanoseconds, or on Windows whole clock ticks', which refused a party of thirteen ticks
+/// past a C* of eleven, CI 44347282760) is read as none, its R* and C* taught anew; the
+/// record's W* stands. None where nothing whole is kept, a least is more than its most, or a
+/// rating is not whole, and, `served` asked, where it does not say it is of served answers
+/// alone ([`SERVED`]).
 pub fn kept_record(text: &str, served: bool, key: &str) -> Option<Kept> {
     let mut words = text.split_whitespace().peekable();
     if served && words.next() != Some(SERVED) {
         return None;
     }
+    let numeric = |word: &&str| word.parse::<u64>().is_ok();
     let number = |word: Option<&str>| word.and_then(|n| n.parse::<u64>().ok());
-    let slowest = Duration::from_nanos(number(words.next())?);
+    let slowest = number(words.next())?;
+    let quickest = number(words.next_if(numeric)).unwrap_or(slowest);
+    if quickest > slowest {
+        return None;
+    }
+    let (slowest, quickest) = (Duration::from_nanos(slowest), Duration::from_nanos(quickest));
     let (mut rated, mut others) = (None, Vec::new());
     while let Some(word) = words.next() {
         if word != RATED {
             return None;
         }
         // A rating kept before ratings were keyed: numbers alone, and the record's last.
-        if words.peek().is_some_and(|next| next.parse::<u64>().is_ok()) {
+        if words.peek().is_some_and(numeric) {
             return Some(Kept {
                 slowest,
+                quickest,
                 rated,
                 others,
             });
         }
         let of = words.next()?;
-        let (work, over, most) = (
-            number(words.next())?,
-            number(words.next())?,
-            number(words.next())?,
-        );
-        let answers = number(words.next()).filter(|&n| n > 0)?;
+        // Its numbers, five, or four where it was kept before the least work was.
+        let mut numbers = [0u64; 5];
+        let mut read = 0usize;
+        while let Some(n) = number(words.next_if(numeric)) {
+            *numbers.get_mut(read)? = n;
+            read += 1;
+        }
+        let [work, over, most, lightest, answers] = match (read, numbers) {
+            (4, [work, over, most, answers, _]) => [work, over, most, most, answers],
+            (5, numbers) => numbers,
+            _ => return None,
+        };
+        if answers == 0 || lightest > most {
+            return None;
+        }
         if of != key {
-            others.push(format!("{RATED} {of} {work} {over} {most} {answers}"));
+            let kept: Vec<String> = numbers.get(..read)?.iter().map(u64::to_string).collect();
+            others.push(format!("{RATED} {of} {}", kept.join(" ")));
         } else if rated.is_none() {
             rated = Some(shards_api::Rated {
                 least: shards_api::Rate {
@@ -4598,12 +4745,14 @@ pub fn kept_record(text: &str, served: bool, key: &str) -> Option<Kept> {
                     over: Duration::from_nanos(over),
                 },
                 most: shards_api::Work::of(most),
+                lightest: shards_api::Work::of(lightest),
                 answers,
             });
         }
     }
     Some(Kept {
         slowest,
+        quickest,
         rated,
         others,
     })
@@ -4634,10 +4783,10 @@ pub fn rated_key() -> &'static str {
 const SERVED: &str = "served";
 
 /// The word before each of a kept record's ratings ([`WaitKind::keep`]): the key of the work
-/// it was counted in ([`rated_key`]), R*, C* and the count of the answers that taught them,
-/// of answers whose work was read through their end alone (`shards_api::Rated`). A record
-/// kept without it has none; one kept before ratings were keyed has none of any key
-/// ([`kept_record`]).
+/// it was counted in ([`rated_key`]), R*, C*, the least work and the count of the answers
+/// that taught them, of answers whose work was read through their end alone
+/// (`shards_api::Rated`). A record kept without it has none; one kept before ratings were
+/// keyed has none of any key ([`kept_record`]).
 const RATED: &str = "rated";
 
 /// Which answers teach a [`WaitKind`].
@@ -6705,15 +6854,25 @@ impl Wait {
     pub fn account(&self) -> String {
         let record = match self.kind.record.seen() {
             shards_api::Seen::Cold => "none yet on this host: its party's liveness alone".to_string(),
-            shards_api::Seen::Learned { slowest, rated: None } => {
-                format!("W* {slowest:?}, no answer's work read through its end")
-            }
             shards_api::Seen::Learned {
                 slowest,
+                quickest,
+                rated: None,
+            } => format!(
+                "W* {slowest:?} and its spread {:?}, no answer's work read through its end",
+                slowest.saturating_sub(quickest)
+            ),
+            shards_api::Seen::Learned {
+                slowest,
+                quickest,
                 rated: Some(rated),
             } => format!(
-                "W* {slowest:?}, R* {} in {:?}, C* {}",
-                rated.least.work, rated.least.over, rated.most
+                "W* {slowest:?} and its spread {:?}, R* {} in {:?}, C* {} and its spread {}",
+                slowest.saturating_sub(quickest),
+                rated.least.work,
+                rated.least.over,
+                rated.most,
+                rated.spread()
             ),
         };
         let kind = if self.kind.line.is_empty() {
@@ -6790,23 +6949,26 @@ impl Wait {
     pub fn refused(&self, stall: &shards_api::Stall) -> String {
         if let (Some(rate), Some(least)) = (stall.rate(), stall.least()) {
             return format!(
-                "{} ran too slowly to be answering: {} in the {:?} it was seen to run unheld, below the least rate any answer of its kind came at on this host (R* {} in {:?}) and more than any such answer took (C* {}), past the slowest such answer ({:?}), {:?} into its wait\n--- its wait\n{}",
+                "{} ran too slowly to be answering: {} in the {:?} it was seen to run unheld, below the least rate any answer of its kind came at on this host (R* {} in {:?}) and more than any such answer took (C* {}) and its spread ({}), past the slowest such answer ({:?}) and its spread ({:?}), {:?} into its wait\n--- its wait\n{}",
                 self.asked,
                 rate.work,
                 rate.over,
                 least.work,
                 least.over,
                 stall.most().unwrap_or_default(),
+                stall.work_spread().unwrap_or_default(),
                 stall.slowest(),
+                stall.spread(),
                 stall.waited(),
                 self.account()
             );
         }
         format!(
-            "{} made no progress for {:?}, past the slowest answer of its kind seen on this host ({:?}), {:?} into its wait\n--- its wait\n{}",
+            "{} made no progress for {:?}, past the slowest answer of its kind seen on this host ({:?}) and its spread ({:?}), {:?} into its wait\n--- its wait\n{}",
             self.asked,
             stall.over(),
             stall.slowest(),
+            stall.spread(),
             stall.waited(),
             self.account()
         )

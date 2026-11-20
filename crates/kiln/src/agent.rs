@@ -4483,6 +4483,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     // The agent volumes this machine's microVMs keep, listed or one cleared (kiln plan 01a1dd2e…, P6.2):
                     // on a task of its own, as a listing walks every volume's files, answered as it ends.
+                    // Which variables this machine's user has, by name (docs/agents.md, "Environments"): on a
+                    // task of its own, as the login shell may be asked.
+                    Carried::Read(FromServer::UserEnv { req, ask }) => {
+                        let up = uplink.0.clone();
+                        drop(crate::rt::spawn(async move {
+                            let json = serde_json::to_string(&crate::harness::agentenv::answer(ask).await).ok();
+                            let _ = up.send(Up::Term(AgentMsg::Answer { req, json })).await;
+                        }));
+                        continue;
+                    }
                     Carried::Read(FromServer::Volumes { req, ask }) => {
                         let up = uplink.0.clone();
                         drop(crate::rt::spawn(async move {
@@ -5698,7 +5708,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     | ServerMsg::RunnerEngine { .. }
                     | ServerMsg::AdoptPolicy { .. }
                     | ServerMsg::Replay { .. }
-                    | ServerMsg::Volumes { .. } => {}
+                    | ServerMsg::Volumes { .. }
+                    | ServerMsg::UserEnv { .. } => {}
                 }
             }
             Ev::Headroom => {

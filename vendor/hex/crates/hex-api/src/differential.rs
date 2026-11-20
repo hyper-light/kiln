@@ -707,6 +707,67 @@ fn kind(r: &Refusal) -> &'static str {
         Refusal::Unconfigured { .. } => "Unconfigured",
         Refusal::Guest { .. } => "Guest",
         Refusal::Volume { .. } => "Volume",
+        // Where a box's pause stands is the contract's, as what a refusal awaits is (kiln plan P5.5b).
+        Refusal::Pause { cause, .. } => match cause {
+            crate::PauseCause::Paused => "Pause(Paused)",
+            crate::PauseCause::Running => "Pause(Running)",
+            crate::PauseCause::NotRunning => "Pause(NotRunning)",
+            crate::PauseCause::Ended => "Pause(Ended)",
+            crate::PauseCause::Class(_) => "Pause(Class)",
+        },
+        // Why a component's swap was refused is the contract's too (Shards' D270 slice 4), Shards' words beside it not.
+        Refusal::Swap { cause, .. } => match cause {
+            crate::SwapCause::Unknown => "Swap(Unknown)",
+            crate::SwapCause::Artifact => "Swap(Artifact)",
+            crate::SwapCause::Kind => "Swap(Kind)",
+            crate::SwapCause::Platform => "Swap(Platform)",
+            crate::SwapCause::Asks => "Swap(Asks)",
+            crate::SwapCause::Device => "Swap(Device)",
+            crate::SwapCause::Running => "Swap(Running)",
+            crate::SwapCause::Failed => "Swap(Failed)",
+            crate::SwapCause::NotRunning => "Swap(NotRunning)",
+            crate::SwapCause::Ended => "Swap(Ended)",
+            crate::SwapCause::Class(_) => "Swap(Class)",
+            crate::SwapCause::Workdir => "Swap(Workdir)",
+            crate::SwapCause::Capacity => "Swap(Capacity)",
+        },
+        // Why a running box's change was refused is the contract's too (kiln plan P6b.3): where it stands, and each of
+        // Shards' causes, its words beside them not.
+        Refusal::Live { cause, .. } => match cause {
+            crate::LiveCause::NotRunning => "Live(NotRunning)",
+            crate::LiveCause::Ended => "Live(Ended)",
+            crate::LiveCause::Class(_) => "Live(Class)",
+            crate::LiveCause::Unsupported => "Live(Unsupported)",
+            crate::LiveCause::Net(net) => match net {
+                crate::NetCause::NoNetwork => "Live(Net(NoNetwork))",
+                crate::NetCause::Widening => "Live(Net(Widening))",
+                crate::NetCause::Bind => "Live(Net(Bind))",
+                crate::NetCause::Unknown => "Live(Net(Unknown))",
+                crate::NetCause::Network => "Live(Net(Network))",
+                crate::NetCause::Image => "Live(Net(Image))",
+                crate::NetCause::Unheld => "Live(Net(Unheld))",
+                crate::NetCause::NoSuchNetwork => "Live(Net(NoSuchNetwork))",
+                crate::NetCause::NameTaken => "Live(Net(NameTaken))",
+                crate::NetCause::Exhausted => "Live(Net(Exhausted))",
+                crate::NetCause::PairedElsewhere => "Live(Net(PairedElsewhere))",
+                crate::NetCause::Ipv6 => "Live(Net(Ipv6))",
+                crate::NetCause::Grant => "Live(Net(Grant))",
+                crate::NetCause::Overlaps => "Live(Net(Overlaps))",
+            },
+            crate::LiveCause::Plug(plug) => match plug {
+                crate::PlugCause::Ask => "Live(Plug(Ask))",
+                crate::PlugCause::Member => "Live(Plug(Member))",
+                crate::PlugCause::Root => "Live(Plug(Root))",
+                crate::PlugCause::Taken => "Live(Plug(Taken))",
+                crate::PlugCause::Source => "Live(Plug(Source))",
+                crate::PlugCause::Device => "Live(Plug(Device))",
+                crate::PlugCause::Unplugged => "Live(Plug(Unplugged))",
+                crate::PlugCause::InUse => "Live(Plug(InUse))",
+                crate::PlugCause::Volume => "Live(Plug(Volume))",
+                crate::PlugCause::Bound => "Live(Plug(Bound))",
+                crate::PlugCause::Clearing => "Live(Plug(Clearing))",
+            },
+        },
     }
 }
 

@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use crate::patience::{Party, Patience, Piece};
 use crate::{
-    Bounds, BoxId, BoxOwner, BoxSpec, BoxState, Class, ClassSpec, CredentialGrant, Destination,
-    DeviceId, DeviceKind, Exit, Grant, GuestTime, LifecycleCause, Member, MemberKind, Mount,
-    Network, OciSpec, Ports, Program, Proto, Refusal, Rootfs, Runtime, Signal, Stdio, Upstream,
-    WARM_ROOM, WarmHeld, WarmPool,
+    Bounds, BoxId, BoxOwner, BoxSpec, BoxState, Class, ClassSpec, ComponentAt, CredentialGrant,
+    Destination, DeviceId, DeviceKind, Exit, Grant, GuestTime, LifecycleCause, Member, MemberKind,
+    Mount, Network, OciSpec, PauseCause, Ports, Program, Proto, Refusal, Rootfs, Runtime, Signal,
+    Stdio, SwapCause, SwapWhen, Upstream, WARM_ROOM, WarmHeld, WarmPool,
 };
+use crate::{ImagePlug, Live, LiveCause, LiveHeld, NetCause, NetworkGrant, PlugCause, Way};
 
 /// What a fixture's program does.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,32 @@ pub trait Fixture {
         // A test with no stderr has nowhere to tell it: the wait's run-out line and census row still say it ran out.
         let _ = writeln!(std::io::stderr().lock(), "{note}");
     }
+    /// A component its node's Shards store holds for a member its Shards image VMs run (Shards' D270 slice 4), which
+    /// HEX-IMG-11 swaps in and out; `None` names none, and HEX-IMG-11 fails on it, as HEX-RT-14 fails on a class that
+    /// states no exec bound: a swap can't be held to the contract without one.
+    fn component(&self) -> Option<Component> {
+        None
+    }
+    /// A host directory its node may plug into its Shards image VMs' members, which HEX-IMG-12 plugs in and out (kiln
+    /// plan P6b.3; Shards' D271); `None` names none, and HEX-IMG-12 fails on it, as HEX-IMG-11 fails without a component.
+    fn plug_source(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    /// A network shared by runs, made beforehand in its node's Shards home, which HEX-IMG-13 connects its VMs' members to
+    /// and takes them off (kiln plan P6b.3; Shards' D285): one is made beforehand, never by a connection. `None` names
+    /// none, and HEX-IMG-13 fails on it.
+    fn network(&self) -> Option<String> {
+        None
+    }
+}
+
+/// A component a fixture's node holds for a member its VMs run ([`Fixture::component`]; Shards' D270 slice 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Component {
+    /// The member's path: `/agents/NAME` or `/harness/NAME`.
+    pub at: String,
+    /// The component's OSI artifact's manifest digest, `sha256:…`.
+    pub digest: String,
 }
 
 /// One part of the contract.
@@ -300,6 +327,26 @@ pub const IMAGE_CASES: &[Case] = &[
         id: "HEX-IMG-9",
         says: "a warm pool of the VMs' image and size is kept once however often it's asked, and listed with no host warm or starting before a box of it starts, until it's let go; a pool it doesn't keep is let go already; a pool whose image isn't pinned by a digest is refused Invalid naming warm pool, kept by none; or, where its node was given no warm room, keeping or letting go of one is refused Unconfigured naming the warm room, and it lists none",
         run: image_pools,
+    },
+    Case {
+        id: "HEX-IMG-10",
+        says: "pause and resume of a VM not yet started are refused Pause(NotRunning), each naming its call, and a resume of a running VM Pause(Running); pause of a running VM is done and inspect shows it Paused, and a second pause is refused Pause(Paused); while paused, two reads of its usage tell its paused time and the same guest time per vCPU, and a signal TERM is refused Pause(Paused) naming signal; resume is done and inspect shows it Running, its usage's paused time no less than the time from its pause's answer to its resume's ask; KILL ends a paused VM, Empty with Signal(9), and its pause and resume are then refused Pause(Ended)",
+        run: image_pause,
+    },
+    Case {
+        id: "HEX-IMG-11",
+        says: "swap, restore and components of a VM not yet started are refused Swap(NotRunning), each naming its call; once it runs it has no component swapped; a swap at a path no member runs at is refused Swap(Unknown), and of a digest its node holds no component of Swap(Artifact); a swap of the fixture's component at its member's next start is answered with it desired and none held, no generation started and nothing let go unread, as components then says it; a swap of it now holds it and starts its member's generation 1; a restore at its next start leaves it held and none desired; a restore now holds none, no component then told, and starts generation 2; while paused a swap is refused Pause(Paused) naming swap and its components are answered; KILL ends it, Empty with Signal(9), and swap, restore and components are then refused Swap(Ended)",
+        run: image_swap,
+    },
+    Case {
+        id: "HEX-IMG-12",
+        says: "change of a VM not yet started is refused Live(NotRunning); once it runs, an egress grant within its ceiling is taken, again done already, and inspect's live says it; one past its ceiling is refused Live(Net(Widening)) and one of port 0 Invalid; a host directory plugged beneath its plug root is taken and said, one outside its roots refused Live(Plug(Root)) and one at its place again Live(Plug(Taken)); while paused, a grant's revoke is refused Pause(Paused); each taken back once, and again refused Live(Net(Unknown)) and Live(Plug(Unplugged)), leaving nothing live; after its end, Live(Ended)",
+        run: image_live,
+    },
+    Case {
+        id: "HEX-IMG-13",
+        says: "a running VM's member is connected to a network shared by runs under its grant named whole, again done already, and inspect's live says it; a connection naming no grant's form is refused Invalid; disconnected, its connection is gone, and a disconnection again refused Live(Net(Unknown))",
+        run: image_networks,
     },
 ];
 
@@ -1283,6 +1330,512 @@ fn image_guest_time(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
     })
 }
 
+/// HEX-IMG-10 (kiln plan 01a1dd2e8618733a87f2793aab1322a8's P5.5b, AC-T7.4.1; docs/design/shards-image-class.md §12): a
+/// Shards image VM pauses and resumes through its runtime, each refused, typed, where it can't be done, its state and its
+/// usage telling it. Its usage is read once as it runs first: a paused run's usage is what its guest last said of it
+/// before its pause (Shards' D267). Its paused time is held from below by what this caller saw, on the one clock it and
+/// its runtime share: its pause answered before `paused` was read here, and its resume asked after `resuming`.
+fn image_pause(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
+    let id = image_made(rt, fx, "image-pause")?;
+    let refused = |op: &'static str, got: Result<(), Refusal>, cause: PauseCause, when: &str| {
+        let want = Refusal::Pause {
+            id: id.clone(),
+            op,
+            cause,
+        };
+        ensure(got.as_ref() == Err(&want), || {
+            format!("{op} {when}: {got:?}, not {want:?}")
+        })
+    };
+    let state = |want: BoxState, when: &str| -> Result<(), String> {
+        let info = rt
+            .inspect(&id)
+            .map_err(|e| format!("inspect {when}: {e}"))?;
+        ensure(info.state == want, || format!("a VM {when}: {info:?}"))
+    };
+    let usage = |when: &str| rt.usage(&id).map_err(|e| format!("usage {when}: {e}"));
+    deleting(rt, &id, || {
+        refused(
+            "pause",
+            rt.pause(&id),
+            PauseCause::NotRunning,
+            "before its start",
+        )?;
+        refused(
+            "resume",
+            rt.resume(&id),
+            PauseCause::NotRunning,
+            "before its start",
+        )?;
+        booted(rt, &id)?;
+        refused(
+            "resume",
+            rt.resume(&id),
+            PauseCause::Running,
+            "of a running VM",
+        )?;
+        usage("as it runs")?;
+        rt.pause(&id).map_err(|e| format!("pause: {e}"))?;
+        let paused = std::time::Instant::now();
+        state(BoxState::Paused, "paused")?;
+        refused("pause", rt.pause(&id), PauseCause::Paused, "of a paused VM")?;
+        let (first, second) = (usage("paused")?, usage("paused")?);
+        ensure(
+            first.paused_ns.is_some() && second.paused_ns.is_some(),
+            || format!("a paused VM's usage tells no paused time: {first:?}"),
+        )?;
+        let (ran, still) = (per_vcpu(first)?, per_vcpu(second)?);
+        ensure(ran == still, || {
+            format!("guest time grew while paused: {ran:?}, then {still:?}")
+        })?;
+        let term = rt.signal(&id, Signal::TERM);
+        let want = Refusal::Pause {
+            id: id.clone(),
+            op: "signal",
+            cause: PauseCause::Paused,
+        };
+        ensure(term.as_ref() == Err(&want), || {
+            format!("TERM to a paused VM: {term:?}, not {want:?}")
+        })?;
+        let resuming = std::time::Instant::now();
+        rt.resume(&id).map_err(|e| format!("resume: {e}"))?;
+        state(BoxState::Running, "resumed")?;
+        let resumed = usage("resumed")?;
+        let least =
+            u64::try_from(resuming.duration_since(paused).as_nanos()).map_err(|e| e.to_string())?;
+        ensure(resumed.paused_ns.is_some_and(|ns| ns >= least), || {
+            format!("a resumed VM's usage, paused {least} ns at least: {resumed:?}")
+        })?;
+        rt.pause(&id)
+            .map_err(|e| format!("pause before its KILL: {e}"))?;
+        stopped(rt, &id)?;
+        let info = exit_of(rt, fx, &id)?;
+        ensure(
+            (info.state, info.exit) == (BoxState::Empty, Some(Exit::Signal(9))),
+            || format!("a paused VM killed: {info:?}"),
+        )?;
+        refused("pause", rt.pause(&id), PauseCause::Ended, "after its end")?;
+        refused("resume", rt.resume(&id), PauseCause::Ended, "after its end")
+    })
+}
+
+/// Whether `got` is box `id`'s `op` refused for its components, `cause` (HEX-IMG-11), whatever words Shards gave.
+fn swap_refused<T: std::fmt::Debug>(
+    got: &Result<T, Refusal>,
+    id: &BoxId,
+    op: &str,
+    cause: SwapCause,
+    when: &str,
+) -> Result<(), String> {
+    let refused = matches!(
+        got,
+        Err(Refusal::Swap { id: of, op: named, cause: why, .. })
+            if of == id && *named == op && *why == cause
+    );
+    ensure(refused, || {
+        format!("{op} {when}: {got:?}, not Swap({cause:?}) naming {op}")
+    })
+}
+
+/// Whether `got` is box `id`'s change `op` refused, `cause` (HEX-IMG-12, HEX-IMG-13), whatever words Shards gave.
+fn live_refused(
+    got: &Result<(), Refusal>,
+    id: &BoxId,
+    op: &str,
+    cause: LiveCause,
+    when: &str,
+) -> Result<(), String> {
+    let refused = matches!(
+        got,
+        Err(Refusal::Live { id: of, op: named, cause: why, .. })
+            if of == id && *named == op && *why == cause
+    );
+    ensure(refused, || {
+        format!("{op} {when}: {got:?}, not Live({cause:?}) naming {op}")
+    })
+}
+
+/// The member a live change is for: the harness the fixture's component is for ([`Fixture::component`]), which its VMs
+/// run; or why the case can't be held without one.
+fn live_member(fx: &dyn Fixture) -> Result<Member, String> {
+    fx.component()
+        .and_then(|c| {
+            c.at.strip_prefix("/harness/").map(|name| Member {
+                kind: MemberKind::Harness,
+                name: name.to_owned(),
+            })
+        })
+        .ok_or_else(|| {
+            "the fixture names no harness its VMs run (Fixture::component's /harness/NAME): a live change needs one"
+                .to_owned()
+        })
+}
+
+/// What box `id`'s run holds as it runs, as inspect says it (none: nothing).
+fn live_held(rt: &dyn Runtime, id: &BoxId, when: &str) -> Result<LiveHeld, String> {
+    Ok(rt
+        .inspect(id)
+        .map_err(|e| format!("inspect {when}: {e}"))?
+        .live
+        .unwrap_or_default())
+}
+
+/// HEX-IMG-12 (kiln plan 01a1dd2e…, P6b.3, AC-T7.4.1; docs/design/shards-image-class.md §14): a Shards image VM's network
+/// and folders change in place through its runtime, given a plug root and a ceiling at its create, each change refused,
+/// typed, where it can't be made, and inspect telling what its run holds. Its member is the fixture's component's harness
+/// ([`Fixture::component`]); the directory it plugs in, the fixture's ([`Fixture::plug_source`]).
+fn image_live(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
+    let member = live_member(fx)?;
+    let source = fx.plug_source().ok_or_else(|| {
+        "the fixture names no host directory to plug in (Fixture::plug_source)".to_owned()
+    })?;
+    let id = id("image-live")?;
+    let _ = rt.delete(&id);
+    let reach = |port: u16| Grant::Egress {
+        member: member.clone(),
+        to: Destination::Name("example.com".to_owned()),
+        ports: Ports {
+            proto: Proto::Tcp,
+            first: port,
+            last: port,
+        },
+    };
+    let mut spec = fx.spec(id.clone(), Bounds::default());
+    let ClassSpec::ShardsImage(image) = &mut spec.class else {
+        return Err("the fixture's spec isn't a Shards image VM".to_owned());
+    };
+    image.plug_roots = vec!["/plugged".to_owned()];
+    image.ceiling = vec![reach(443)];
+    rt.create(spec).map_err(|e| format!("create: {e}"))?;
+    let plug = ImagePlug {
+        source,
+        members: vec![member.clone()],
+        at: "/plugged/data".to_owned(),
+        read_only: true,
+        exec: false,
+    };
+    deleting(rt, &id, || {
+        live_refused(
+            &rt.change(&id, Live::Grant(reach(443))),
+            &id,
+            "grant",
+            LiveCause::NotRunning,
+            "before its start",
+        )?;
+        booted(rt, &id)?;
+        rt.change(&id, Live::Grant(reach(443)))
+            .map_err(|e| format!("a grant within its ceiling: {e}"))?;
+        rt.change(&id, Live::Grant(reach(443)))
+            .map_err(|e| format!("a grant held already: {e}"))?;
+        let held = live_held(rt, &id, "granted")?;
+        ensure(held.grants == vec![reach(443)], || {
+            format!("a VM granted 443 once: {held:?}")
+        })?;
+        live_refused(
+            &rt.change(&id, Live::Grant(reach(80))),
+            &id,
+            "grant",
+            LiveCause::Net(NetCause::Widening),
+            "past its ceiling",
+        )?;
+        let zero = rt.change(&id, Live::Grant(reach(0)));
+        ensure(matches!(zero, Err(Refusal::Invalid { .. })), || {
+            format!("a grant of port 0: {zero:?}, not Invalid")
+        })?;
+        rt.change(&id, Live::Plug(plug.clone()))
+            .map_err(|e| format!("a plug beneath its root: {e}"))?;
+        let outside = ImagePlug {
+            at: "/elsewhere/data".to_owned(),
+            ..plug.clone()
+        };
+        live_refused(
+            &rt.change(&id, Live::Plug(outside)),
+            &id,
+            "plug",
+            LiveCause::Plug(PlugCause::Root),
+            "outside its roots",
+        )?;
+        live_refused(
+            &rt.change(&id, Live::Plug(plug.clone())),
+            &id,
+            "plug",
+            LiveCause::Plug(PlugCause::Taken),
+            "at a place plugged already",
+        )?;
+        let held = live_held(rt, &id, "plugged")?;
+        ensure(held.plugs == vec![plug.clone()], || {
+            format!("a VM plugged: {held:?}")
+        })?;
+        rt.pause(&id).map_err(|e| format!("pause: {e}"))?;
+        let paused = rt.change(&id, Live::Revoke(reach(443)));
+        let want = Refusal::Pause {
+            id: id.clone(),
+            op: "revoke",
+            cause: PauseCause::Paused,
+        };
+        ensure(paused.as_ref() == Err(&want), || {
+            format!("a revoke of a paused VM's grant: {paused:?}, not {want:?}")
+        })?;
+        rt.resume(&id).map_err(|e| format!("resume: {e}"))?;
+        rt.change(&id, Live::Revoke(reach(443)))
+            .map_err(|e| format!("revoke: {e}"))?;
+        live_refused(
+            &rt.change(&id, Live::Revoke(reach(443))),
+            &id,
+            "revoke",
+            LiveCause::Net(NetCause::Unknown),
+            "of a grant it holds no longer",
+        )?;
+        rt.change(
+            &id,
+            Live::Unplug {
+                at: plug.at.clone(),
+            },
+        )
+        .map_err(|e| format!("unplug: {e}"))?;
+        live_refused(
+            &rt.change(
+                &id,
+                Live::Unplug {
+                    at: plug.at.clone(),
+                },
+            ),
+            &id,
+            "unplug",
+            LiveCause::Plug(PlugCause::Unplugged),
+            "of a place plugged no longer",
+        )?;
+        let held = live_held(rt, &id, "given all back")?;
+        ensure(held.is_empty(), || {
+            format!("a VM given all back holds: {held:?}")
+        })?;
+        stopped(rt, &id)?;
+        exit_of(rt, fx, &id)?;
+        live_refused(
+            &rt.change(&id, Live::Grant(reach(443))),
+            &id,
+            "grant",
+            LiveCause::Ended,
+            "after its end",
+        )
+    })
+}
+
+/// HEX-IMG-13 (kiln plan 01a1dd2e…, P6b.3, AC-T7.4.1; docs/design/shards-image-class.md §14; Shards' D285): a running Shards
+/// image VM's member joins a network shared by runs, made beforehand ([`Fixture::network`]), under its grant named whole,
+/// and leaves it, inspect telling what its run holds.
+fn image_networks(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
+    let member = live_member(fx)?;
+    let network = fx.network().ok_or_else(|| {
+        "the fixture names no network shared by runs (Fixture::network)".to_owned()
+    })?;
+    let id = image_made(rt, fx, "image-networks")?;
+    let grant = NetworkGrant {
+        name: "hex-member".to_owned(),
+        peer: "hex-peer".to_owned(),
+        proto: Proto::Tcp,
+        first: 8080,
+        last: 8081,
+        way: Way::Out,
+    };
+    let connect = |grant: NetworkGrant| Live::Connect {
+        member: member.clone(),
+        network: network.clone(),
+        grant,
+    };
+    deleting(rt, &id, || {
+        booted(rt, &id)?;
+        rt.change(&id, connect(grant.clone()))
+            .map_err(|e| format!("connect: {e}"))?;
+        rt.change(&id, connect(grant.clone()))
+            .map_err(|e| format!("a connection held already: {e}"))?;
+        let held = live_held(rt, &id, "connected")?;
+        let joined = held.networks.len() == 1
+            && held
+                .networks
+                .iter()
+                .all(|c| c.member == member && c.network == network && c.grant == grant);
+        ensure(joined, || format!("a VM's member connected once: {held:?}"))?;
+        let own = NetworkGrant {
+            peer: grant.name.clone(),
+            ..grant.clone()
+        };
+        let named = rt.change(&id, connect(own));
+        ensure(matches!(named, Err(Refusal::Invalid { .. })), || {
+            format!("a connection whose peer is its own name: {named:?}, not Invalid")
+        })?;
+        let disconnect = || Live::Disconnect {
+            member: member.clone(),
+            network: network.clone(),
+            grant: grant.clone(),
+        };
+        rt.change(&id, disconnect())
+            .map_err(|e| format!("disconnect: {e}"))?;
+        let held = live_held(rt, &id, "disconnected")?;
+        ensure(held.networks.is_empty(), || {
+            format!("a VM's member disconnected: {held:?}")
+        })?;
+        live_refused(
+            &rt.change(&id, disconnect()),
+            &id,
+            "disconnect",
+            LiveCause::Net(NetCause::Unknown),
+            "of a connection it holds no longer",
+        )
+    })
+}
+
+/// HEX-IMG-11 (Shards' D270 slice 4, AC-T7.4.1; docs/design/shards-image-class.md §13): a Shards image VM's member is
+/// given a component of its node's store and its image's own back through its runtime, at its next start or now, each
+/// refused, typed, where it can't be made, its components telling it. The fixture names the component and its member's
+/// path ([`Fixture::component`]). A swap now starts its member's next generation; what its last said that no caller took
+/// is let go, and how much is the node's to tell, not this case's, as the fixture's member says what it says.
+fn image_swap(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
+    let Component { at, digest } = fx.component().ok_or_else(|| {
+        "the fixture names no component its node holds for a member its VMs run, so no swap can be held to the \
+         contract"
+            .to_owned()
+    })?;
+    let id = image_made(rt, fx, "image-swap")?;
+    let held = |want: &[ComponentAt], when: &str| -> Result<(), String> {
+        let told = rt
+            .components(&id)
+            .map_err(|e| format!("components {when}: {e}"))?;
+        ensure(told == want, || {
+            format!("components {when}: {told:?}, not {want:?}")
+        })
+    };
+    let at_most = |desired: Option<&str>, held: Option<&str>| -> Vec<ComponentAt> {
+        if desired.is_none() && held.is_none() {
+            return Vec::new();
+        }
+        vec![ComponentAt {
+            at: at.clone(),
+            desired: desired.map(str::to_owned),
+            held: held.map(str::to_owned),
+        }]
+    };
+    deleting(rt, &id, || {
+        let before = "before its start";
+        swap_refused(
+            &rt.swap(&id, &at, &digest, SwapWhen::NextStart),
+            &id,
+            "swap",
+            SwapCause::NotRunning,
+            before,
+        )?;
+        swap_refused(
+            &rt.restore(&id, &at, SwapWhen::NextStart),
+            &id,
+            "restore",
+            SwapCause::NotRunning,
+            before,
+        )?;
+        swap_refused(
+            &rt.components(&id),
+            &id,
+            "components",
+            SwapCause::NotRunning,
+            before,
+        )?;
+        booted(rt, &id)?;
+        held(&[], "as it starts")?;
+        swap_refused(
+            &rt.swap(
+                &id,
+                "/harness/hex-conformance-absent",
+                &digest,
+                SwapWhen::NextStart,
+            ),
+            &id,
+            "swap",
+            SwapCause::Unknown,
+            "at a path no member runs at",
+        )?;
+        let none = format!("sha256:{}", "0".repeat(64));
+        swap_refused(
+            &rt.swap(&id, &at, &none, SwapWhen::NextStart),
+            &id,
+            "swap",
+            SwapCause::Artifact,
+            "of a digest its node holds no component of",
+        )?;
+        let next = rt
+            .swap(&id, &at, &digest, SwapWhen::NextStart)
+            .map_err(|e| format!("swap at its next start: {e}"))?;
+        let desired = at_most(Some(&digest), None);
+        ensure(
+            (&next.components, next.started, next.unread) == (&desired, None, 0),
+            || format!("swap at its next start: {next:?}"),
+        )?;
+        held(&desired, "once swapped at its next start")?;
+        let now = rt
+            .swap(&id, &at, &digest, SwapWhen::Now)
+            .map_err(|e| format!("swap now: {e}"))?;
+        let holds = at_most(Some(&digest), Some(&digest));
+        ensure((&now.components, now.started) == (&holds, Some(1)), || {
+            format!("swap now: {now:?}")
+        })?;
+        held(&holds, "once swapped now")?;
+        let back = rt
+            .restore(&id, &at, SwapWhen::NextStart)
+            .map_err(|e| format!("restore at its next start: {e}"))?;
+        let restoring = at_most(None, Some(&digest));
+        ensure(
+            (&back.components, back.started, back.unread) == (&restoring, None, 0),
+            || format!("restore at its next start: {back:?}"),
+        )?;
+        let restored = rt
+            .restore(&id, &at, SwapWhen::Now)
+            .map_err(|e| format!("restore now: {e}"))?;
+        ensure(
+            (&restored.components, restored.started) == (&Vec::new(), Some(2)),
+            || format!("restore now: {restored:?}"),
+        )?;
+        held(&[], "once restored now")?;
+        rt.pause(&id).map_err(|e| format!("pause: {e}"))?;
+        let paused = rt.swap(&id, &at, &digest, SwapWhen::Now);
+        let want = Refusal::Pause {
+            id: id.clone(),
+            op: "swap",
+            cause: PauseCause::Paused,
+        };
+        ensure(paused.as_ref() == Err(&want), || {
+            format!("swap of a paused VM: {paused:?}, not {want:?}")
+        })?;
+        held(&[], "while paused")?;
+        rt.resume(&id).map_err(|e| format!("resume: {e}"))?;
+        stopped(rt, &id)?;
+        let info = exit_of(rt, fx, &id)?;
+        ensure(
+            (info.state, info.exit) == (BoxState::Empty, Some(Exit::Signal(9))),
+            || format!("a VM killed: {info:?}"),
+        )?;
+        let after = "after its end";
+        swap_refused(
+            &rt.swap(&id, &at, &digest, SwapWhen::Now),
+            &id,
+            "swap",
+            SwapCause::Ended,
+            after,
+        )?;
+        swap_refused(
+            &rt.restore(&id, &at, SwapWhen::Now),
+            &id,
+            "restore",
+            SwapCause::Ended,
+            after,
+        )?;
+        swap_refused(
+            &rt.components(&id),
+            &id,
+            "components",
+            SwapCause::Ended,
+            after,
+        )
+    })
+}
+
 fn image_members(rt: &dyn Runtime, fx: &dyn Fixture) -> Result<(), String> {
     let id = image_made(rt, fx, "image-members")?;
     deleting(rt, &id, || {
@@ -2070,6 +2623,30 @@ mod tests {
         }
         fn delete(&self, id: &BoxId) -> Result<(), Refusal> {
             self.sim.delete(id)
+        }
+        fn pause(&self, id: &BoxId) -> Result<(), Refusal> {
+            self.sim.pause(id)
+        }
+        fn resume(&self, id: &BoxId) -> Result<(), Refusal> {
+            self.sim.resume(id)
+        }
+        fn swap(
+            &self,
+            id: &BoxId,
+            at: &str,
+            digest: &str,
+            when: SwapWhen,
+        ) -> Result<crate::Swapped, Refusal> {
+            self.sim.swap(id, at, digest, when)
+        }
+        fn restore(&self, id: &BoxId, at: &str, when: SwapWhen) -> Result<crate::Swapped, Refusal> {
+            self.sim.restore(id, at, when)
+        }
+        fn components(&self, id: &BoxId) -> Result<Vec<ComponentAt>, Refusal> {
+            self.sim.components(id)
+        }
+        fn change(&self, id: &BoxId, change: Live) -> Result<(), Refusal> {
+            self.sim.change(id, change)
         }
     }
 

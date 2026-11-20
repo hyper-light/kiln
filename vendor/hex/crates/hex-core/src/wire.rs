@@ -49,18 +49,22 @@ use std::sync::Mutex;
 use hex_api::{
     Allocation, BackendUnavailable, BackingGrant, BackingKey, BackingOffer, BackingPhase, Bounds,
     BoxId, BoxInfo, BoxOwner, BoxSpec, BoxState, Capacity, CapacityResources, Class, ClassSpec,
-    ConnectFailure, ConnectPhase, ConnectReply, ControlWake, CredentialGrant, Destination,
-    DeviceHolder, DeviceId, DeviceInfo, DeviceKind, DeviceUnavailable, Execution, Exit,
-    GpuEligibility, Grant, GuestEnd, GuestFailure, GuestTime, ImageArch, ImageMember, ImageOs,
-    ImagePlatform, ImageVolume, IoKind, IoRates, Learned, LearnedAwait, LearnedCeiling, LearnedEnd,
-    LearnedHolder, LearnedHolding, LearnedOverhead, LearnedPrior, LearnedRank, LearnedRate,
-    LearnedReservations, LearnedUnacted, LearnedUnread, LearnedUnrecorded, LearnedUse,
-    LearnedWindow, LifecycleCause, MAX_DEVICES, MAX_LEARNED_HOLDINGS, MAX_LEARNED_PRIORS,
-    MAX_RUNTIME_ROUTES, Member, MemberKind, Mount, Network, NodeVmPhase, NodeVmReceipt, OciSpec,
-    PhysicalDevice, PhysicalReport, Ports, Program, Proto, Published, RateHeld, Receiver, Refusal,
-    Rootfs, RouteKey, RouteOffer, RouteReceipt, RuntimeCost, ServedMount, ShardsImage, Signal,
-    StartedFrom, Upstream, Usage, User, VolumeCause, check_credentials, check_grants,
-    check_published, check_sign_ins,
+    ComponentAt, ConnectFailure, ConnectPhase, ConnectReply, ControlWake, CredentialGrant,
+    Destination, DeviceHolder, DeviceId, DeviceInfo, DeviceKind, DeviceUnavailable, Execution,
+    Exit, GpuEligibility, Grant, GuestEnd, GuestFailure, GuestTime, ImageArch, ImageMember,
+    ImageOs, ImagePlatform, ImageShare, ImageVolume, IoKind, IoRates, Learned, LearnedAwait,
+    LearnedCeiling, LearnedEnd, LearnedHolder, LearnedHolding, LearnedOverhead, LearnedPrior,
+    LearnedRank, LearnedRate, LearnedReservations, LearnedUnacted, LearnedUnread,
+    LearnedUnrecorded, LearnedUse, LearnedWindow, LifecycleCause, MAX_DEVICES,
+    MAX_LEARNED_HOLDINGS, MAX_LEARNED_PRIORS, MAX_RUNTIME_ROUTES, Member, MemberKind, Mount,
+    Network, NodeVmPhase, NodeVmReceipt, OciSpec, PauseCause, PhysicalDevice, PhysicalReport,
+    Ports, Program, Proto, Published, RateHeld, Receiver, Refusal, Rootfs, RouteKey, RouteOffer,
+    RouteReceipt, RuntimeCost, ServedMount, ShardsImage, Signal, StartedFrom, SwapCause, SwapWhen,
+    Swapped, Upstream, Usage, User, VolumeCause, check_credentials, check_grants, check_published,
+    check_sign_ins,
+};
+use hex_api::{
+    Connection, ImagePlug, Live, LiveCause, LiveHeld, NetCause, NetworkGrant, PlugCause, Way,
 };
 
 use hex_api::lease::{Lease, LeaseRefused, SignInRefused, SignInTokens, Value};
@@ -98,6 +102,7 @@ pub static IDENTITY: u64 = identity(&[
     include_bytes!("../../hex-api/src/grants.rs"),
     include_bytes!("../../hex-api/src/credentials.rs"),
     include_bytes!("../../hex-api/src/lease.rs"),
+    include_bytes!("../../hex-api/src/live.rs"),
 ]);
 /// The header's length: magic, wire identity, kind and id.
 pub const HEADER_BYTES: usize = 22;
@@ -202,6 +207,14 @@ mod kind {
     pub const START_FOLLOWED: u16 = 0x001f;
     pub const RESERVED: u16 = 0x0020;
     pub const MCP: u16 = 0x0021;
+    pub const PAUSE: u16 = 0x0022;
+    pub const RESUME: u16 = 0x0023;
+    pub const SWAP: u16 = 0x0024;
+    pub const RESTORE: u16 = 0x0025;
+    pub const COMPONENTS: u16 = 0x0026;
+    pub const CHANGE: u16 = 0x0027;
+    pub const SWAPPED: u16 = 0x8018;
+    pub const COMPONENTS_ANSWER: u16 = 0x8019;
 }
 
 /// A message's header, once its wire identity is read as this side's.
@@ -353,6 +366,39 @@ pub enum Call {
         streams: Streams,
         ask: Streams,
     },
+    /// Running Shards image box `id`'s vCPUs held out of its guest (`Runtime::pause`; kiln plan P5.5b, Shards' D267):
+    /// answered [`Answer::Done`] once its VM holds them, its state then `Paused` as inspect says it, or refused by type.
+    /// Appended.
+    Pause(BoxId),
+    /// Paused Shards image box `id`'s vCPUs let run its guest again (`Runtime::resume`; kiln plan P5.5b): answered
+    /// [`Answer::Done`] once its VM lets them go, or refused by type. Appended.
+    Resume(BoxId),
+    /// Running Shards image box `id`'s member at path `at` given the component of manifest digest `digest` its node's
+    /// store holds, at its next start or now (`Runtime::swap`; Shards' D270 slice 4): answered [`Answer::Swapped`], or
+    /// refused by type. Appended.
+    Swap {
+        id: BoxId,
+        at: String,
+        digest: String,
+        when: SwapWhen,
+    },
+    /// Running Shards image box `id`'s member at path `at` given its image's own component back (`Runtime::restore`):
+    /// answered [`Answer::Swapped`], or refused by type. Appended.
+    Restore {
+        id: BoxId,
+        at: String,
+        when: SwapWhen,
+    },
+    /// Shards image box `id`'s members' components (`Runtime::components`): answered [`Answer::Components`], or refused
+    /// by type. Appended.
+    Components(BoxId),
+    /// Running Shards image box `id`'s network or folders changed in place (`Runtime::change`; kiln plan P6b.3,
+    /// docs/design/shards-image-class.md §14): answered [`Answer::Done`] once its run holds it, or refused by type.
+    /// Appended.
+    Change {
+        id: BoxId,
+        change: Live,
+    },
 }
 
 /// Which of a program's standard streams travel with its exec, in this order; the rest are the null
@@ -476,6 +522,10 @@ pub enum Answer {
         sign_in: String,
         key: Option<[u8; 32]>,
     },
+    /// A swap's or a restore's ([`Call::Swap`], [`Call::Restore`]; Shards' D270 slice 4). Appended.
+    Swapped(Swapped),
+    /// A box's components' ([`Call::Components`]). Appended.
+    Components(Vec<ComponentAt>),
 }
 
 /// A peer's connection to the node over QUIC, as the node's own TLS negotiated it (docs/design/hex-quic.md Q12).
@@ -1249,6 +1299,8 @@ pub fn answer(id: u64, answer: &Answer, bound: usize) -> Result<Vec<u8>, Fault> 
             w.option_with(u.guest.as_ref(), put_guest_time)?;
             // Appended after guest time (D253; joint plan step 12): absent, a byte 0.
             w.option(u.started_from, put_started_from);
+            // Appended after how it started (kiln plan P5.5b): its paused time, absent a byte 0.
+            w.option(u.paused_ns, Writer::u64);
         }
         Answer::Boxes { infos, more } => {
             w.header(kind::BOXES, id);
@@ -1345,8 +1397,52 @@ pub fn answer(id: u64, answer: &Answer, bound: usize) -> Result<Vec<u8>, Fault> 
             w.string(sign_in)?;
             w.option(key.as_ref(), |w, key| w.raw(key));
         }
+        // Shards' D270 slice 4: every member's component, the generation a `Now` started, and the bytes it let go
+        // unread.
+        Answer::Swapped(swapped) => {
+            w.header(kind::SWAPPED, id);
+            w.list(&swapped.components, put_component)?;
+            w.option(swapped.started, Writer::u32);
+            w.u64(swapped.unread);
+        }
+        Answer::Components(components) => {
+            w.header(kind::COMPONENTS_ANSWER, id);
+            w.list(components, put_component)?;
+        }
     }
     w.done()
+}
+
+/// A member's component ([`ComponentAt`]; Shards' D270 slice 4): its path, then options of the digest its next start
+/// lays and of the one its current generation runs with.
+fn put_component(w: &mut Writer, component: &ComponentAt) -> Result<(), Fault> {
+    w.string(&component.at)?;
+    w.option_with(component.desired.as_deref(), Writer::string)?;
+    w.option_with(component.held.as_deref(), Writer::string)
+}
+
+fn component(r: &mut Reader<'_>) -> Result<ComponentAt, Fault> {
+    Ok(ComponentAt {
+        at: r.string("a component's path")?,
+        desired: r.option(|r| r.string("a component wanted"))?,
+        held: r.option(|r| r.string("a component held"))?,
+    })
+}
+
+/// When a swap takes its member ([`SwapWhen`]): its tag, by its place there (append-only).
+fn swap_when_tag(when: SwapWhen) -> u8 {
+    match when {
+        SwapWhen::NextStart => 0,
+        SwapWhen::Now => 1,
+    }
+}
+
+fn swap_when(r: &mut Reader<'_>) -> Result<SwapWhen, Fault> {
+    match r.u8()? {
+        0 => Ok(SwapWhen::NextStart),
+        1 => Ok(SwapWhen::Now),
+        t => Err(Fault::value("swap when", format!("variant {t}"))),
+    }
 }
 
 /// A retained refusal's canonical Answer envelope, id zero, without cloning its body.
@@ -1546,6 +1642,24 @@ fn parse_request(
             Request::Call(Call::MemberSignal { id, member, signal })
         }
         kind::START_FOLLOWED => Request::Call(Call::Started(box_id(&mut r).map_err(bad)?)),
+        kind::PAUSE => Request::Call(Call::Pause(box_id(&mut r).map_err(bad)?)),
+        kind::RESUME => Request::Call(Call::Resume(box_id(&mut r).map_err(bad)?)),
+        kind::SWAP => Request::Call(Call::Swap {
+            id: box_id(&mut r).map_err(bad)?,
+            at: r.string("a swap's path").map_err(bad)?,
+            digest: r.string("a swap's digest").map_err(bad)?,
+            when: swap_when(&mut r).map_err(bad)?,
+        }),
+        kind::RESTORE => Request::Call(Call::Restore {
+            id: box_id(&mut r).map_err(bad)?,
+            at: r.string("a restore's path").map_err(bad)?,
+            when: swap_when(&mut r).map_err(bad)?,
+        }),
+        kind::COMPONENTS => Request::Call(Call::Components(box_id(&mut r).map_err(bad)?)),
+        kind::CHANGE => Request::Call(Call::Change {
+            id: box_id(&mut r).map_err(bad)?,
+            change: live(&mut r).map_err(bad)?,
+        }),
         kind::RESERVED => Request::Call(Call::Reserved(hex_api::Reserved {
             keeper: r.u64().map_err(bad)?,
             reserved: resources(&mut r).map_err(bad)?,
@@ -1812,6 +1926,7 @@ pub fn read_answer(msg: &Received<'_>, bound: usize) -> Result<(Header, Answer),
             io_write_bytes: r.u64()?,
             guest: r.option(guest_time)?,
             started_from: r.option(started_from)?,
+            paused_ns: r.option(Reader::u64)?,
         }),
         kind::BOXES => Answer::Boxes {
             more: r.bool("more")?,
@@ -1879,6 +1994,12 @@ pub fn read_answer(msg: &Received<'_>, bound: usize) -> Result<(Header, Answer),
             sign_in: r.string("a revoked sign-in")?,
             key: r.option(|r| r.array::<32>())?,
         },
+        kind::SWAPPED => Answer::Swapped(Swapped {
+            components: r.list(component)?,
+            started: r.option(Reader::u32)?,
+            unread: r.u64()?,
+        }),
+        kind::COMPONENTS_ANSWER => Answer::Components(r.list(component)?),
         kind::GIVEN => {
             let pid = r.u32()?;
             let given = r.u8().and_then(Streams::of)?;
@@ -1980,6 +2101,12 @@ fn request_name(kind: u16) -> &'static str {
         kind::START_FOLLOWED => "a start followed",
         kind::RESERVED => "a keeper's word",
         kind::MCP => "an MCP connection",
+        kind::PAUSE => "a pause",
+        kind::RESUME => "a resume",
+        kind::SWAP => "a swap",
+        kind::RESTORE => "a restore",
+        kind::COMPONENTS => "a components",
+        kind::CHANGE => "a change",
         _ => "a request",
     }
 }
@@ -2051,6 +2178,43 @@ fn put_call(w: &mut Writer, id: u64, call: &Call) -> Result<(), Fault> {
         Call::Started(b) => {
             w.header(kind::START_FOLLOWED, id);
             w.string(b.as_str())
+        }
+        Call::Pause(b) => {
+            w.header(kind::PAUSE, id);
+            w.string(b.as_str())
+        }
+        Call::Resume(b) => {
+            w.header(kind::RESUME, id);
+            w.string(b.as_str())
+        }
+        Call::Swap {
+            id: b,
+            at,
+            digest,
+            when,
+        } => {
+            w.header(kind::SWAP, id);
+            w.string(b.as_str())?;
+            w.string(at)?;
+            w.string(digest)?;
+            w.u8(swap_when_tag(*when));
+            Ok(())
+        }
+        Call::Restore { id: b, at, when } => {
+            w.header(kind::RESTORE, id);
+            w.string(b.as_str())?;
+            w.string(at)?;
+            w.u8(swap_when_tag(*when));
+            Ok(())
+        }
+        Call::Components(b) => {
+            w.header(kind::COMPONENTS, id);
+            w.string(b.as_str())
+        }
+        Call::Change { id: b, change } => {
+            w.header(kind::CHANGE, id);
+            w.string(b.as_str())?;
+            put_live(w, change)
         }
         Call::Reserved(word) => {
             w.header(kind::RESERVED, id);
@@ -3574,11 +3738,12 @@ fn oci(r: &mut Reader<'_>) -> Result<OciSpec, Fault> {
 /// step 12), then its network grants (joint plan step 15), then the members its caller drives, each its member,
 /// its variables, an option of its working directory (joint plan step 17), its run-time arguments (D256, after
 /// the working directory) and whether it asks an MCP bridge (Shards' D254, after its arguments), then its shares (kiln's step 18), each its host directory, where its guest sees it and
-/// whether read-only, and the members it is given to (Shards' D277), as a mount's ([`put_mount`]), then its credential
-/// grants (joint plan step 33, [`put_credentials`]), then its sign-ins ([`put_sign_ins`]), then its volumes (kiln plan
-/// 01a1dd2e…, P6.2), each its name, its bound, where its members see it, its members, each as a grant's member, and
-/// whether read-only, then its shares another server serves (Shards' D286), each its source, where its guest sees it,
-/// whether read-only, and its members, each as a grant's member. Fields a later step adds go after the served shares
+/// whether read-only, and the members it is given to (Shards' D277), as a mount's ([`put_mount`]), and whether its files
+/// may be run from it (Shards' D279, after its members; [`put_share`]), then its credential grants (joint plan step 33,
+/// [`put_credentials`]), then its sign-ins ([`put_sign_ins`]), then its volumes (kiln plan 01a1dd2e…, P6.2), each its
+/// name, its bound, where its members see it, its members, each as a grant's member, and whether read-only, then its
+/// shares another server serves (Shards' D286), each its source, where its guest sees it, whether read-only, and its
+/// members, each as a grant's member. Fields a later step adds go after the served shares
 /// (append-only).
 fn put_shards_image(w: &mut Writer, image: &ShardsImage) -> Result<(), Fault> {
     w.string(&image.image)?;
@@ -3597,7 +3762,7 @@ fn put_shards_image(w: &mut Writer, image: &ShardsImage) -> Result<(), Fault> {
         w.bool(m.mcp);
         Ok(())
     })?;
-    w.list(&image.shares, put_mount)?;
+    w.list(&image.shares, put_share)?;
     put_credentials(w, &image.credentials, &image.grants)?;
     put_sign_ins(w, &image.sign_ins, &image.credentials, &image.grants)?;
     w.list(&image.volumes, |w, v| {
@@ -3613,7 +3778,10 @@ fn put_shards_image(w: &mut Writer, image: &ShardsImage) -> Result<(), Fault> {
         w.string(&s.destination)?;
         w.bool(s.read_only);
         w.list(&s.members, put_member)
-    })
+    })?;
+    // Kiln plan P6b.3: its plug roots and its ceiling, after every older field.
+    w.list(&image.plug_roots, |w, root| w.string(root))?;
+    put_grants(w, &image.ceiling)
 }
 
 fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
@@ -3630,11 +3798,13 @@ fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
                 mcp: r.bool("member mcp")?,
             })
         })?,
-        shares: r.list(|r| mount(r, "share destination"))?,
+        shares: r.list(share)?,
         credentials: Vec::new(),
         sign_ins: Vec::new(),
         volumes: Vec::new(),
         served: Vec::new(),
+        plug_roots: Vec::new(),
+        ceiling: Vec::new(),
     };
     image.credentials = credentials(r, &image.grants)?;
     image.sign_ins = sign_ins(r, &image.credentials, &image.grants)?;
@@ -3657,6 +3827,8 @@ fn shards_image(r: &mut Reader<'_>) -> Result<ShardsImage, Fault> {
             members: r.list(member)?,
         })
     })?;
+    image.plug_roots = r.list(|r| r.string("plug root"))?;
+    image.ceiling = grants(r)?;
     Ok(image)
 }
 
@@ -3867,6 +4039,28 @@ fn put_mount(w: &mut Writer, m: &Mount) -> Result<(), Fault> {
     w.list(&m.members, put_member)
 }
 
+/// A Shards image VM's share ([`ImageShare`]): as a mount's ([`put_mount`]), its member scope among it (Shards' D277),
+/// then whether its files may be run from it (Shards' D279, after its members).
+fn put_share(w: &mut Writer, s: &ImageShare) -> Result<(), Fault> {
+    w.path(&s.source)?;
+    w.string(&s.destination)?;
+    w.bool(s.read_only);
+    w.list(&s.members, put_member)?;
+    w.bool(s.exec);
+    Ok(())
+}
+
+/// [`put_share`]'s.
+fn share(r: &mut Reader<'_>) -> Result<ImageShare, Fault> {
+    Ok(ImageShare {
+        source: r.path()?,
+        destination: r.string("share destination")?,
+        read_only: r.bool("read_only")?,
+        members: r.list(member)?,
+        exec: r.bool("exec")?,
+    })
+}
+
 /// [`put_mount`]'s, `destination` naming where it is seen in a refusal.
 fn mount(r: &mut Reader<'_>, destination: &'static str) -> Result<Mount, Fault> {
     Ok(Mount {
@@ -4065,6 +4259,8 @@ fn put_info(w: &mut Writer, info: &BoxInfo) -> Result<(), Fault> {
         BoxState::Empty => 0,
         BoxState::Running => 1,
         BoxState::Created => 2,
+        // Kiln plan P5.5b: a Shards image VM its owner holds paused, after every older state.
+        BoxState::Paused => 3,
     });
     put_bounds(w, &info.bounds);
     w.bool(info.adopted);
@@ -4091,19 +4287,7 @@ fn put_info(w: &mut Writer, info: &BoxInfo) -> Result<(), Fault> {
     put_grants(w, &info.grants)?;
     check_published(&info.grants, &info.published)
         .map_err(|e| Fault::value("published", e.to_string()))?;
-    w.list(&info.published, |w, published| {
-        w.u32(published.grant);
-        put_address(w, published.at.ip());
-        w.u16(published.at.port());
-        match published.receiver {
-            Receiver::Declared => w.u8(0),
-            Receiver::Named { port } => {
-                w.u8(1);
-                w.u16(port);
-            }
-        }
-        Ok(())
-    })?;
+    w.list(&info.published, put_published)?;
     // Joint plan step 14 (C5): why its node's last resort ended it, after every older field.
     w.option_with(info.last_resort.as_ref(), put_learned_end)?;
     // Joint plan step 12: why its run ended where it failed, in its runtime's words, after every older field.
@@ -4122,6 +4306,8 @@ fn put_info(w: &mut Writer, info: &BoxInfo) -> Result<(), Fault> {
             w.u16(at.port());
         }
     });
+    // Kiln plan P6b.3: what its run took as it runs, after every older field.
+    w.option_with(info.live.as_ref(), put_live_held)?;
     Ok(())
 }
 
@@ -4134,6 +4320,7 @@ fn info(r: &mut Reader<'_>) -> Result<BoxInfo, Fault> {
             0 => BoxState::Empty,
             1 => BoxState::Running,
             2 => BoxState::Created,
+            3 => BoxState::Paused,
             t => return Err(Fault::value("box state", format!("variant {t}"))),
         },
         bounds: bounds(r)?,
@@ -4153,21 +4340,12 @@ fn info(r: &mut Reader<'_>) -> Result<BoxInfo, Fault> {
         })?,
         route: r.option(route_receipt)?,
         grants: grants(r)?,
-        published: r.list(|r| {
-            Ok(Published {
-                grant: r.u32()?,
-                at: SocketAddr::new(address(r)?, r.u16()?),
-                receiver: match r.u8()? {
-                    0 => Receiver::Declared,
-                    1 => Receiver::Named { port: r.u16()? },
-                    t => return Err(Fault::value("published receiver", format!("variant {t}"))),
-                },
-            })
-        })?,
+        published: r.list(published)?,
         last_resort: r.option(learned_end)?,
         ended: r.option(|r| r.string("ended"))?,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     };
     info.credentials = credentials(r, &info.grants)?;
@@ -4178,6 +4356,7 @@ fn info(r: &mut Reader<'_>) -> Result<BoxInfo, Fault> {
             wake: SocketAddr::new(address(r)?, r.u16()?),
         })
     })?;
+    info.live = r.option(live_held)?;
     if info.control.is_none() && info.control_wake.is_some() {
         return Err(Fault::value(
             "control_wake",
@@ -4188,6 +4367,292 @@ fn info(r: &mut Reader<'_>) -> Result<BoxInfo, Fault> {
     check_published(&info.grants, &info.published)
         .map_err(|e| Fault::value("published", e.to_string()))?;
     Ok(info)
+}
+
+/// A publish grant's port as bound ([`Published`]; joint plan step 15, N6): its grant by its place, the host socket,
+/// and its receiver.
+fn put_published(w: &mut Writer, published: &Published) -> Result<(), Fault> {
+    w.u32(published.grant);
+    put_address(w, published.at.ip());
+    w.u16(published.at.port());
+    match published.receiver {
+        Receiver::Declared => w.u8(0),
+        Receiver::Named { port } => {
+            w.u8(1);
+            w.u16(port);
+        }
+    }
+    Ok(())
+}
+
+/// [`put_published`]'s.
+fn published(r: &mut Reader<'_>) -> Result<Published, Fault> {
+    Ok(Published {
+        grant: r.u32()?,
+        at: SocketAddr::new(address(r)?, r.u16()?),
+        receiver: match r.u8()? {
+            0 => Receiver::Declared,
+            1 => Receiver::Named { port: r.u16()? },
+            t => return Err(Fault::value("published receiver", format!("variant {t}"))),
+        },
+    })
+}
+
+/// A running box's change ([`Live`]; kiln plan P6b.3): its tag, by its place in [`Live`] (append-only), then its parts.
+fn put_live(w: &mut Writer, change: &Live) -> Result<(), Fault> {
+    match change {
+        Live::Grant(grant) => {
+            w.u8(0);
+            put_grant(w, grant)
+        }
+        Live::Revoke(grant) => {
+            w.u8(1);
+            put_grant(w, grant)
+        }
+        Live::Connect {
+            member,
+            network,
+            grant,
+        } => {
+            w.u8(2);
+            put_connection_parts(w, member, network, grant)
+        }
+        Live::Disconnect {
+            member,
+            network,
+            grant,
+        } => {
+            w.u8(3);
+            put_connection_parts(w, member, network, grant)
+        }
+        Live::Plug(plug) => {
+            w.u8(4);
+            put_plug(w, plug)
+        }
+        Live::Unplug { at } => {
+            w.u8(5);
+            w.string(at)
+        }
+    }
+}
+
+/// [`put_live`]'s.
+fn live(r: &mut Reader<'_>) -> Result<Live, Fault> {
+    Ok(match r.u8()? {
+        0 => Live::Grant(grant(r)?),
+        1 => Live::Revoke(grant(r)?),
+        2 => {
+            let Connection {
+                member,
+                network,
+                grant,
+            } = connection(r)?;
+            Live::Connect {
+                member,
+                network,
+                grant,
+            }
+        }
+        3 => {
+            let Connection {
+                member,
+                network,
+                grant,
+            } = connection(r)?;
+            Live::Disconnect {
+                member,
+                network,
+                grant,
+            }
+        }
+        4 => Live::Plug(plug(r)?),
+        5 => Live::Unplug {
+            at: r.string("unplug place")?,
+        },
+        t => return Err(Fault::value("change", format!("variant {t}"))),
+    })
+}
+
+/// A member's connection to a network shared by runs (Shards' D285): the member, the network's name, and its grant
+/// whole (its name there, its peer, its protocol and ports, which way).
+fn put_connection_parts(
+    w: &mut Writer,
+    member: &Member,
+    network: &str,
+    grant: &NetworkGrant,
+) -> Result<(), Fault> {
+    put_member(w, member)?;
+    w.string(network)?;
+    w.string(&grant.name)?;
+    w.string(&grant.peer)?;
+    w.u8(proto_tag(grant.proto));
+    w.u16(grant.first);
+    w.u16(grant.last);
+    w.u8(match grant.way {
+        Way::In => 0,
+        Way::Out => 1,
+    });
+    Ok(())
+}
+
+/// [`put_connection_parts`]'s.
+fn connection(r: &mut Reader<'_>) -> Result<Connection, Fault> {
+    Ok(Connection {
+        member: member(r)?,
+        network: r.string("network")?,
+        grant: NetworkGrant {
+            name: r.string("network grant name")?,
+            peer: r.string("network grant peer")?,
+            proto: proto(r)?,
+            first: r.u16()?,
+            last: r.u16()?,
+            way: match r.u8()? {
+                0 => Way::In,
+                1 => Way::Out,
+                t => return Err(Fault::value("network grant way", format!("variant {t}"))),
+            },
+        },
+    })
+}
+
+/// A host directory plugged into a running box's members ([`ImagePlug`]; Shards' D271, D279): its source, its members,
+/// its place, whether read-only, and whether its files may be run.
+fn put_plug(w: &mut Writer, plug: &ImagePlug) -> Result<(), Fault> {
+    w.path(&plug.source)?;
+    w.list(&plug.members, put_member)?;
+    w.string(&plug.at)?;
+    w.bool(plug.read_only);
+    w.bool(plug.exec);
+    Ok(())
+}
+
+/// [`put_plug`]'s.
+fn plug(r: &mut Reader<'_>) -> Result<ImagePlug, Fault> {
+    Ok(ImagePlug {
+        source: r.path()?,
+        members: r.list(member)?,
+        at: r.string("plug place")?,
+        read_only: r.bool("plug read_only")?,
+        exec: r.bool("plug exec")?,
+    })
+}
+
+/// What a running box's run took as it runs ([`LiveHeld`]; kiln plan P6b.3): its grants (as N5's check takes them), their
+/// ports as bound (held to them as a box's are), its members' connections and its plugs, each in its order.
+fn put_live_held(w: &mut Writer, held: &LiveHeld) -> Result<(), Fault> {
+    put_grants(w, &held.grants)?;
+    check_published(&held.grants, &held.published)
+        .map_err(|e| Fault::value("live published", e.to_string()))?;
+    w.list(&held.published, put_published)?;
+    w.list(&held.networks, |w, c| {
+        put_connection_parts(w, &c.member, &c.network, &c.grant)
+    })?;
+    w.list(&held.plugs, put_plug)
+}
+
+/// [`put_live_held`]'s.
+fn live_held(r: &mut Reader<'_>) -> Result<LiveHeld, Fault> {
+    let grants = grants(r)?;
+    let published = r.list(published)?;
+    check_published(&grants, &published)
+        .map_err(|e| Fault::value("live published", e.to_string()))?;
+    Ok(LiveHeld {
+        grants,
+        published,
+        networks: r.list(connection)?,
+        plugs: r.list(plug)?,
+    })
+}
+
+/// Why a running box's change was refused ([`Refusal::Live`]): its tag, by its place in [`LiveCause`] (append-only),
+/// then a class refusal's class, a network cause's or a plug cause's tag by its place in [`NetCause`] or [`PlugCause`].
+fn put_live_cause(w: &mut Writer, cause: LiveCause) {
+    match cause {
+        LiveCause::NotRunning => w.u8(0),
+        LiveCause::Ended => w.u8(1),
+        LiveCause::Class(class) => {
+            w.u8(2);
+            w.u8(class_tag(class));
+        }
+        LiveCause::Unsupported => w.u8(3),
+        LiveCause::Net(net) => {
+            w.u8(4);
+            w.u8(match net {
+                NetCause::NoNetwork => 0,
+                NetCause::Widening => 1,
+                NetCause::Bind => 2,
+                NetCause::Unknown => 3,
+                NetCause::Network => 4,
+                NetCause::Image => 5,
+                NetCause::Unheld => 6,
+                NetCause::NoSuchNetwork => 7,
+                NetCause::NameTaken => 8,
+                NetCause::Exhausted => 9,
+                NetCause::PairedElsewhere => 10,
+                NetCause::Ipv6 => 11,
+                NetCause::Grant => 12,
+                NetCause::Overlaps => 13,
+            });
+        }
+        LiveCause::Plug(plug) => {
+            w.u8(5);
+            w.u8(match plug {
+                PlugCause::Ask => 0,
+                PlugCause::Member => 1,
+                PlugCause::Root => 2,
+                PlugCause::Taken => 3,
+                PlugCause::Source => 4,
+                PlugCause::Device => 5,
+                PlugCause::Unplugged => 6,
+                PlugCause::InUse => 7,
+                PlugCause::Volume => 8,
+                PlugCause::Bound => 9,
+                PlugCause::Clearing => 10,
+            });
+        }
+    }
+}
+
+/// [`put_live_cause`]'s.
+fn live_cause(r: &mut Reader<'_>) -> Result<LiveCause, Fault> {
+    Ok(match r.u8()? {
+        0 => LiveCause::NotRunning,
+        1 => LiveCause::Ended,
+        2 => LiveCause::Class(class(r)?),
+        3 => LiveCause::Unsupported,
+        4 => LiveCause::Net(match r.u8()? {
+            0 => NetCause::NoNetwork,
+            1 => NetCause::Widening,
+            2 => NetCause::Bind,
+            3 => NetCause::Unknown,
+            4 => NetCause::Network,
+            5 => NetCause::Image,
+            6 => NetCause::Unheld,
+            7 => NetCause::NoSuchNetwork,
+            8 => NetCause::NameTaken,
+            9 => NetCause::Exhausted,
+            10 => NetCause::PairedElsewhere,
+            11 => NetCause::Ipv6,
+            12 => NetCause::Grant,
+            13 => NetCause::Overlaps,
+            t => return Err(Fault::value("network cause", format!("variant {t}"))),
+        }),
+        5 => LiveCause::Plug(match r.u8()? {
+            0 => PlugCause::Ask,
+            1 => PlugCause::Member,
+            2 => PlugCause::Root,
+            3 => PlugCause::Taken,
+            4 => PlugCause::Source,
+            5 => PlugCause::Device,
+            6 => PlugCause::Unplugged,
+            7 => PlugCause::InUse,
+            8 => PlugCause::Volume,
+            9 => PlugCause::Bound,
+            10 => PlugCause::Clearing,
+            t => return Err(Fault::value("plug cause", format!("variant {t}"))),
+        }),
+        t => return Err(Fault::value("change cause", format!("variant {t}"))),
+    })
 }
 
 fn put_exit(w: &mut Writer, exit: Exit) {
@@ -4361,7 +4826,99 @@ fn put_plain_refusal(w: &mut Writer, refusal: &Refusal) -> Result<(), Fault> {
             });
             w.string(why)
         }
+        // Kiln plan P5.5b: a call refused for where its box's pause stands, after every older refusal.
+        Refusal::Pause { id, op, cause } => {
+            w.u8(18);
+            w.string(id.as_str())?;
+            w.string(op)?;
+            put_pause_cause(w, *cause);
+            Ok(())
+        }
+        // Shards' D270 slice 4: a call refused for its box's components, after every older refusal.
+        Refusal::Swap { id, op, cause, why } => {
+            w.u8(19);
+            w.string(id.as_str())?;
+            w.string(op)?;
+            put_swap_cause(w, *cause);
+            w.option_with(why.as_deref(), Writer::string)
+        }
+        // Kiln plan P6b.3: a running box's change refused, after every older refusal.
+        Refusal::Live { id, op, cause, why } => {
+            w.u8(20);
+            w.string(id.as_str())?;
+            w.string(op)?;
+            put_live_cause(w, *cause);
+            w.option_with(why.as_deref(), Writer::string)
+        }
     }
+}
+
+/// Why a box's components refused a call ([`Refusal::Swap`]): its tag, by its place in [`SwapCause`] (append-only), then
+/// a class refusal's class.
+fn put_swap_cause(w: &mut Writer, cause: SwapCause) {
+    match cause {
+        SwapCause::Unknown => w.u8(0),
+        SwapCause::Artifact => w.u8(1),
+        SwapCause::Kind => w.u8(2),
+        SwapCause::Platform => w.u8(3),
+        SwapCause::Asks => w.u8(4),
+        SwapCause::Device => w.u8(5),
+        SwapCause::Running => w.u8(6),
+        SwapCause::Failed => w.u8(7),
+        SwapCause::NotRunning => w.u8(8),
+        SwapCause::Ended => w.u8(9),
+        SwapCause::Class(class) => {
+            w.u8(10);
+            w.u8(class_tag(class));
+        }
+        SwapCause::Workdir => w.u8(11),
+        SwapCause::Capacity => w.u8(12),
+    }
+}
+
+fn swap_cause(r: &mut Reader<'_>) -> Result<SwapCause, Fault> {
+    Ok(match r.u8()? {
+        0 => SwapCause::Unknown,
+        1 => SwapCause::Artifact,
+        2 => SwapCause::Kind,
+        3 => SwapCause::Platform,
+        4 => SwapCause::Asks,
+        5 => SwapCause::Device,
+        6 => SwapCause::Running,
+        7 => SwapCause::Failed,
+        8 => SwapCause::NotRunning,
+        9 => SwapCause::Ended,
+        10 => SwapCause::Class(class(r)?),
+        11 => SwapCause::Workdir,
+        12 => SwapCause::Capacity,
+        t => return Err(Fault::value("swap cause", format!("variant {t}"))),
+    })
+}
+
+/// Where a box's pause stands ([`Refusal::Pause`]): its tag, by its place in [`PauseCause`] (append-only), then a class
+/// refusal's class.
+fn put_pause_cause(w: &mut Writer, cause: PauseCause) {
+    match cause {
+        PauseCause::Paused => w.u8(0),
+        PauseCause::Running => w.u8(1),
+        PauseCause::NotRunning => w.u8(2),
+        PauseCause::Ended => w.u8(3),
+        PauseCause::Class(class) => {
+            w.u8(4);
+            w.u8(class_tag(class));
+        }
+    }
+}
+
+fn pause_cause(r: &mut Reader<'_>) -> Result<PauseCause, Fault> {
+    Ok(match r.u8()? {
+        0 => PauseCause::Paused,
+        1 => PauseCause::Running,
+        2 => PauseCause::NotRunning,
+        3 => PauseCause::Ended,
+        4 => PauseCause::Class(class(r)?),
+        t => return Err(Fault::value("pause cause", format!("variant {t}"))),
+    })
 }
 
 /// A Shards guest's failure ([`Refusal::Guest`]): its kind's tag, then its fields, each duration in whole nanoseconds.
@@ -4406,6 +4963,11 @@ fn put_guest_failure(w: &mut Writer, failure: &GuestFailure) -> Result<(), Fault
             w.u8(4);
             w.string(why)
         }
+        // Kiln plan P5.5b: a pause or a resume its VM didn't make, after every older failure.
+        GuestFailure::Pause(why) => {
+            w.u8(5);
+            w.string(why)
+        }
     }
 }
 
@@ -4429,6 +4991,7 @@ fn guest_failure(r: &mut Reader<'_>) -> Result<GuestFailure, Fault> {
         },
         3 => GuestFailure::Rate(r.string("guest rate")?),
         4 => GuestFailure::HostUse(r.string("guest host use")?),
+        5 => GuestFailure::Pause(r.string("guest pause")?),
         t => return Err(Fault::value("guest failure", format!("variant {t}"))),
     })
 }
@@ -4575,6 +5138,23 @@ fn plain_refusal(r: &mut Reader<'_>, tag: u8) -> Result<Refusal, Fault> {
                 t => return Err(Fault::value("volume cause", format!("variant {t}"))),
             },
             why: r.string("refusal reason")?,
+        },
+        18 => Refusal::Pause {
+            id: box_id(r)?,
+            op: name(&r.string("refusal name")?)?,
+            cause: pause_cause(r)?,
+        },
+        19 => Refusal::Swap {
+            id: box_id(r)?,
+            op: name(&r.string("refusal name")?)?,
+            cause: swap_cause(r)?,
+            why: r.option(|r| r.string("swap refusal reason"))?,
+        },
+        20 => Refusal::Live {
+            id: box_id(r)?,
+            op: name(&r.string("refusal name")?)?,
+            cause: live_cause(r)?,
+            why: r.option(|r| r.string("change refusal reason"))?,
         },
         t => return Err(Fault::value("refusal", format!("variant {t}"))),
     })

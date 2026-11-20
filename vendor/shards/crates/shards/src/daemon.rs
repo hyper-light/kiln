@@ -171,7 +171,7 @@ type JoinDoor = (UnixStream, u32);
 type JoinDoor = (UnixStream, u32, std::os::windows::io::OwnedHandle);
 
 /// Whether `handle` is a pipe's (GetFileType): on Windows, a share's that a client serves
-/// (D228), or that another server serves an image's run (D286, api_run.rs `start_shares`),
+/// (D228), or that another server serves an image's run (D287, api_run.rs `start_shares`),
 /// where every other share's is its directory's.
 #[cfg(windows)]
 pub(crate) fn is_pipe(handle: &OwnedFd) -> bool {
@@ -4926,8 +4926,10 @@ impl<D: Disk> Daemon<D> {
     /// no count of tries). One started after the run asked (for it, or a refill since)
     /// that surely did not take it ends the start, said with why, rather than starting VMs
     /// against a failure that may be every VM's. One that may have taken it is followed as
-    /// it is, so no run starts twice. Returns the run, registered, for
-    /// [`follow`](Self::follow), or what its client is told.
+    /// it is, so no run starts twice. One its judge gave up on with nothing said is ended,
+    /// and is either, as what it said before its end tells ([`said_before_its_end`]); a
+    /// joiner's VM, its provider's, is never ended, and may have. Returns the run,
+    /// registered, for [`follow`](Self::follow), or what its client is told.
     #[allow(clippy::too_many_arguments)]
     fn start_run<'s, 'e>(
         &'s self,
@@ -4998,6 +5000,17 @@ impl<D: Disk> Daemon<D> {
             // Only now, so that starting its successor delays no run: on the refiller's
             // thread.
             self.refill_soon(threads, ready.pool.as_ref());
+            let handed = match handed {
+                Err(Untaken::Unanswered(e)) if ready.joined.is_none() => {
+                    log(format!(
+                        "warm VM {} left a run unanswered: {e}; ending it, its answer read to its end",
+                        ready.vm.id()
+                    ));
+                    ready.end();
+                    Err(said_before_its_end(&ready.socket))
+                }
+                handed => handed,
+            };
             match handed {
                 // The warm VM serves the client from here, and ours close. A detached
                 // client waits for the daemon to say whether its command started.
@@ -5017,7 +5030,7 @@ impl<D: Disk> Daemon<D> {
                     }
                 }
                 // What it sent before it ended tells what it did, as for any run.
-                Err(Untaken::Unknown(e)) => {
+                Err(Untaken::Unknown(e) | Untaken::Unanswered(e)) => {
                     log(format!(
                         "warm VM {} may have taken a run: {e}; ending it",
                         ready.vm.id()
@@ -8213,10 +8226,11 @@ impl<D: Disk> Daemon<D> {
                 match &mut stop.killed {
                     Some(teardown) => {
                         let went = teardown.goes_on();
-                        // More work than any teardown took (C*), its command not ended: given
-                        // up whatever its rate (D217, ROOT's ruling of 2026-11-18). Its work
-                        // unread, the bound takes nothing from this look, and says why. A look
-                        // that could not read it gives it up already, saying why.
+                        // More work than any teardown took (C*) and its spread, its command not
+                        // ended: given up whatever its rate (D217, ROOT's ruling of 2026-11-18;
+                        // D215 amended 2026-11-19). Its work unread, the bound takes nothing
+                        // from this look, and says why. A look that could not read it gives it
+                        // up already, saying why.
                         let past = match went {
                             ends::GoesOn::Unread(_) => None,
                             _ => teardown.past(self.ends.most_work()).unwrap_or_else(|why| {
@@ -8241,7 +8255,9 @@ impl<D: Disk> Daemon<D> {
                                     format!("its microVM's teardown could not be read at its look: {unread}")
                                 }
                                 (_, Some((work, most))) => format!(
-                                    "its microVM having run {work} since its SIGKILL, more than any teardown took ({most})"
+                                    "its microVM having run {work} since its SIGKILL, more than any teardown took ({}) and its spread ({})",
+                                    most.most(),
+                                    most.spread()
                                 ),
                                 (_, None) => format!(
                                     "its microVM gone on with nothing of its end for {:?}",
@@ -9259,11 +9275,12 @@ impl<D: Disk> Daemon<D> {
                 leave(&mut state, waiting);
                 return Err(Claim::Failed(format!(
                     "no warm VM of {} was ready in {:?}: none of its refills came ready for {:?}, past \
-                     the slowest start seen ({:?}), for no fault of its template's",
+                     the slowest start seen ({:?}) and its spread ({:?}), for no fault of its template's",
                     key.dir.display(),
                     began.elapsed(),
                     stall.over(),
-                    stall.slowest()
+                    stall.slowest(),
+                    stall.spread()
                 )));
             }
         }
@@ -10093,6 +10110,9 @@ enum Untaken {
     Surely(String),
     /// It may have: only what it sent before it ended can tell.
     Unknown(String),
+    /// Its judge gave up on it with nothing said (D215): which of the others it is, what it
+    /// says before its end tells, once it is ended ([`said_before_its_end`]).
+    Unanswered(String),
 }
 
 /// Gives a join share one volume of a joiner's on its `link`, `payload` its name, mode and
@@ -10125,8 +10145,10 @@ fn give_join_volume(
 /// its copies of the client's descriptors until then: macOS flushes a socket in flight
 /// that no process holds (shards_ipc). A warm VM says TAKEN before it touches the client's
 /// stdio or starts anything (warm.rs, receive), and if it cannot, it does neither: one
-/// that ends without a word never started the run. On Windows each of its shares' streams
-/// (`ends`, D197) follows the request, as a share process hands them to it on Unix.
+/// that ends without a word never started the run. One its judge gives up on before it says
+/// anything is left unanswered, for its caller to end and read to its end
+/// ([`said_before_its_end`]). On Windows each of its shares' streams (`ends`, D197) follows
+/// the request, as a share process hands them to it on Unix.
 fn hand_over(
     vm: &UnixStream,
     judged: &mut health::Judged<'_>,
@@ -10147,7 +10169,8 @@ fn hand_over(
 }
 
 /// Waits for a warm VM sent a run to say it has taken it, while its process goes on
-/// ([`hand_over`]'s judge): its TAKEN teaches the judge's record.
+/// ([`hand_over`]'s judge): its TAKEN teaches the judge's record. One its judge gives up on
+/// has said nothing ([`Untaken::Unanswered`]).
 fn taken(vm: &UnixStream, judged: &mut health::Judged<'_>) -> Result<(), Untaken> {
     match shards_ipc::recv_judged(vm, &mut || judged.judge()) {
         Ok(Some(m)) if m.kind == kind::TAKEN => {
@@ -10166,7 +10189,33 @@ fn taken(vm: &UnixStream, judged: &mut health::Judged<'_>) -> Result<(), Untaken
         Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
             Err(Untaken::Surely(format!("it ended with the run unread: {e}")))
         }
+        // Its judge's refusal (`health::Stalled`), which comes only where a look found no
+        // message whole: nothing had come, as TAKEN, a header alone that a stream takes in one
+        // write or not at all, is a warm VM's first word after its run (warm.rs, receive).
+        Err(e) if e.get_ref().is_some_and(|inner| inner.is::<health::Stalled>()) => {
+            Err(Untaken::Unanswered(e.to_string()))
+        }
         Err(e) => Err(Untaken::Unknown(e.to_string())),
+    }
+}
+
+/// Whether a warm VM its judge gave up on with nothing said ([`Untaken::Unanswered`]), since
+/// ended, took the run: what it said before its end tells. Nothing, and it surely did not
+/// ([`hand_over`]); anything, and it may have. Its socket is read to its end, which no time
+/// bounds: the end is its process's, whose copy is the only one left (launch.rs
+/// `run_reported`; on Unix its spawner's goes as it spawns it, ipc spawner.rs `made`, and the
+/// VM keeps its own from its children, warm.rs `inherited_socket`). A VM whose spawner has
+/// gone is beyond its kill (`shards_ipc::Child::kill`), and ends with the scope its spawner
+/// went with (`shards_ipc::group_ended`), as CI 44563056402's stopped slice ended its refill.
+fn said_before_its_end(vm: &UnixStream) -> Untaken {
+    match shards_ipc::recv(vm) {
+        Ok(None) => Untaken::Surely("it said nothing in its judge's window, then ended".into()),
+        // Its run unread as it ended: Linux resets its peer then ([`taken`]).
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Untaken::Surely(format!(
+            "it said nothing in its judge's window, then ended with the run unread: {e}"
+        )),
+        Ok(Some(m)) => Untaken::Unknown(format!("past its judge's window it said message kind {}", m.kind)),
+        Err(e) => Untaken::Unknown(format!("past its judge's window: {e}")),
     }
 }
 
@@ -10602,9 +10651,10 @@ fn grant(
             };
             followed.look().map_err(|why| match why {
                 shards_api::Unfollowed::Stalled(stall) => format!(
-                    "VM {pid} asked nothing after {sent} messages: it ran nothing for {:?}, past the slowest request seen ({:?}), {:?} into its wait{}",
+                    "VM {pid} asked nothing after {sent} messages: it ran nothing for {:?}, past the slowest request seen ({:?}) and its spread ({:?}), {:?} into its wait{}",
                     stall.over(),
                     stall.slowest(),
+                    stall.spread(),
                     began.elapsed(),
                     stall.account()
                 ),
@@ -10795,21 +10845,25 @@ fn ready(socket: &UnixStream, pid: u32, record: &shards_api::Record) -> Result<(
         };
         followed.look().map_err(|why| match why {
             // A start ends in READY, work no time spent working brings nearer: one that has
-            // done more than any start took (C*) is given up on, whatever its rate (D215).
+            // done more than any start took (C*) and its spread is given up on, whatever its
+            // rate (D215).
             shards_api::Unfollowed::Stalled(stall) => NotReady::Refused(match stall.rate() {
                 Some(rate) => format!(
-                    "VM {pid} was not ready: it ran {} in the {:?} it was seen to run unheld, more than any start took ({}), past the slowest start seen ({:?}), {:?} after it began{}",
+                    "VM {pid} was not ready: it ran {} in the {:?} it was seen to run unheld, more than any start took ({}) and its spread ({}), past the slowest start seen ({:?}) and its spread ({:?}), {:?} after it began{}",
                     rate.work,
                     rate.over,
                     stall.most().unwrap_or_default(),
+                    stall.work_spread().unwrap_or_default(),
                     stall.slowest(),
+                    stall.spread(),
                     into(),
                     stall.account()
                 ),
                 None => format!(
-                    "VM {pid} was not ready: it ran nothing for {:?}, past the slowest start seen ({:?}), {:?} after it began{}",
+                    "VM {pid} was not ready: it ran nothing for {:?}, past the slowest start seen ({:?}) and its spread ({:?}), {:?} after it began{}",
                     stall.over(),
                     stall.slowest(),
+                    stall.spread(),
                     into(),
                     stall.account()
                 ),
@@ -13000,7 +13054,11 @@ mod tests {
             let most = shards_api::Work::of_cpu(Duration::from_millis(1));
             t.daemon.ends.learn_work(most);
             t.daemon.ends.learn_work(most);
-            assert_eq!(t.daemon.ends.most_work(), Some(most));
+            assert_eq!(
+                t.daemon.ends.most_work().map(|kept| (kept.most(), kept.bound())),
+                Some((most, most)),
+                "two teardowns of one work: C* and a spread of none"
+            );
             let id = t.create("spinner");
             let starting = t.start(&id);
             let (mut ready, vm) = t.warm_vm(None);
@@ -13863,12 +13921,20 @@ mod tests {
             let free = t.home.join(s::DIR).join("free");
             // A slot's names beside the lists: the maker's first look is done. Served
             // alone, its lists are as they were opened, and that look could find them half
-            // removed below and make them again as they go (gate e2, under load).
+            // removed below and make them again as they go (gate e2, under load). A slot's,
+            // its number and its part (`0.say`): the lists' directory holds its `taking` lock
+            // from its opening on, which any name but the lists' took for a slot, so the wait
+            // ended before the first look, and the removal below found a list that look was
+            // making again gone (CI 44476277082, macOS: NotFound).
             #[cfg(unix)]
             t.until("no slot was offered", |_| {
-                std::fs::read_dir(t.home.join(s::DIR))
-                    .unwrap()
-                    .any(|e| !matches!(e.unwrap().file_name().to_str(), Some("free" | "free-streams")))
+                std::fs::read_dir(t.home.join(s::DIR)).unwrap().any(|e| {
+                    e.unwrap()
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.split_once('.'))
+                        .is_some_and(|(number, _)| number.parse::<u64>().is_ok())
+                })
             });
             // A slot is an instance of its list's pipe on Windows, named in no file: one a
             // client takes was offered after the maker's first look.
@@ -15972,6 +16038,75 @@ mod tests {
         });
     }
 
+    /// A VM its judge gave up on, silent (D215), is ended, and what it said before its end is
+    /// its answer: nothing, and the run goes to another VM, which serves it; TAKEN, and the run
+    /// is followed with it, as one that may have started it. Red before: the refusal was taken
+    /// for "may have taken it", and the run ended 125 with a VM that had said nothing (CI run
+    /// 44563056402, x86_64-unknown-linux-gnu: a refill its stopped slice was ending).
+    #[test]
+    fn a_handoff_left_unanswered_goes_to_another_vm_once_its_vm_ends_without_a_word() {
+        let t = Test::new("handoff-silent");
+        t.run(|t| {
+            // A kind with no answer yet is waited on its VM's liveness alone: learned, so that
+            // its judge gives up on a VM whose process runs nothing past it.
+            t.daemon
+                .answers
+                .take
+                .teach(Duration::from_millis(20), shards_api::Work::of(1));
+            let id = t.create("silent");
+            let starting = t.start(&id);
+            let (ready, vm) = t.warm_vm(None);
+            let child = ready.vm.clone();
+            starting.warm.send(ready).unwrap();
+            assert_eq!(heard(&vm).0, kind::RUN);
+            // It says nothing, its end open until its process is ended, as a VM's end closes
+            // as its process dies.
+            assert_eq!(child.wait().unwrap(), 128 + shards_ipc::signal::SIGKILL);
+            drop(vm);
+            t.until("the run asked for another VM, or ended", |_| {
+                starting.asked() == 2 || starting.run.is_finished()
+            });
+            assert_eq!(
+                starting.asked(),
+                2,
+                "the run went with the VM that said nothing: {:?}",
+                t.record(&id).map(|r| (r.state, r.exit_code))
+            );
+            // Its answers there before its RUN is: its process runs nothing either, and a
+            // wait on it would be the judge's to give up on too.
+            let (ready, vm) = t.warm_vm(None);
+            say_together(
+                &vm,
+                &[(kind::TAKEN, &[]), (kind::STARTED, &[]), (kind::DONE, &[0])],
+            );
+            starting.warm.send(ready).unwrap();
+            assert_eq!(heard(&vm).0, kind::RUN);
+            joined(starting.run).unwrap();
+            assert_eq!(count_asks(&starting.asks, &starting.asked), 2);
+            let record = t.record(&id).unwrap();
+            assert_eq!((record.state, record.exit_code), (Life::Exited, Some(0)));
+
+            // One that said TAKEN before its end may have started the run: followed, the run
+            // ends with it, as a run whose VM ended before its command started.
+            let id = t.create("spoke");
+            let starting = t.start(&id);
+            let (ready, vm) = t.warm_vm(None);
+            let child = ready.vm.clone();
+            starting.warm.send(ready).unwrap();
+            assert_eq!(heard(&vm).0, kind::RUN);
+            assert_eq!(child.wait().unwrap(), 128 + shards_ipc::signal::SIGKILL);
+            say(&vm, kind::TAKEN, &[]);
+            drop(vm);
+            t.until("the run asked for another VM, or ended", |_| {
+                starting.asked() == 2 || starting.run.is_finished()
+            });
+            assert_eq!(starting.asked(), 1, "the run went on to another VM after TAKEN");
+            joined(starting.run).unwrap();
+            let record = t.record(&id).unwrap();
+            assert_eq!((record.state, record.exit_code), (Life::Created, Some(128)));
+        });
+    }
+
     /// Every VM that waited in its pool before the run asked is tried in turn, however many
     /// ended unseen, where three tries were once all a run had (runs-11); one started after
     /// it asked that surely did not take it ends the run's start, and no other is asked for.
@@ -16939,10 +17074,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             say(&vm, kind::STARTED, &[]);
             assert_eq!(joined(run), Ok(()));
-            assert_eq!(
-                t.t.daemon.answers.held.seen(),
-                Seen::Learned { slowest, rated: None },
-                "its process read within W*"
+            assert!(
+                matches!(t.t.daemon.answers.held.seen(), Seen::Learned { slowest: kept, rated: None, .. } if kept == slowest),
+                "its process read within W*: {:?}",
+                t.t.daemon.answers.held.seen()
             );
             say(&vm, kind::DONE, &[0]);
             until_ended(&t.t.daemon, &id);
@@ -17483,8 +17618,9 @@ mod tests {
             let kept = ends::newest(&t.home.join(ends::RECORD)).unwrap_or_default();
             assert!(
                 kept.lines()
-                    .filter(|l| l.starts_with("helper "))
-                    .eq(["helper 200"]),
+                    .filter_map(|l| l.strip_prefix("helper "))
+                    .map(|l| l.split_whitespace().next())
+                    .eq([Some("200")]),
                 "an end the daemon made was kept as the host's: {kept}"
             );
             // The VM is reaped once its ports are freed (follow.rs), which the wait above
@@ -19541,10 +19677,11 @@ mod tests {
                         }
                         panic!(
                             "its child stalled: it ran nothing for {:?}, {:?} into the wait, past \
-                             the slowest child's {:?} (D215)",
+                             the slowest child's {:?} and its spread {:?} (D215)",
                             stall.over(),
                             stall.waited(),
-                            stall.slowest()
+                            stall.slowest(),
+                            stall.spread()
                         );
                     }
                     std::thread::sleep(Duration::from_millis(1));
@@ -20066,10 +20203,11 @@ mod tests {
     }
 
     /// The exec of `read metrics` its microVM never answers is ended, once the daemon has seen
-    /// a metrics read answered, where the VM process ran nothing for a whole W* past the
-    /// slowest it has seen: told SIGKILL, its end waited for, and the read refused, saying so
-    /// (finding 4 of audit-fix-host-v1: it was waited for with no end, holding its client and
-    /// a daemon thread; D215's judge, which follows a cold kind's microVM while it lives).
+    /// a metrics read answered, where the VM process ran nothing for a whole window, the
+    /// slowest it has seen and its spread (none, of one answer): told SIGKILL, its end waited
+    /// for, and the read refused, saying so (finding 4 of audit-fix-host-v1: it was waited for
+    /// with no end, holding its client and a daemon thread; D215's judge, which follows a cold
+    /// kind's microVM while it lives).
     #[test]
     fn metrics_whose_microvm_runs_nothing_are_ended() {
         let t = Test::new("metrics-stalled");
@@ -20108,7 +20246,7 @@ mod tests {
             let end = ", so its metrics were not read\n";
             assert!(
                 err.starts_with("shards: read metrics: stalled: its microVM ran no CPU in ")
-                    && err.contains(" past the slowest answer seen (50ms), ")
+                    && err.contains(" past the slowest answer seen (50ms) and its spread (0ns), ")
                     && (after == end || (after.starts_with("; its threads: ") && after.ends_with(end))),
                 "{err}"
             );

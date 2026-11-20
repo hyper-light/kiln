@@ -45,7 +45,7 @@
 //!
 //! Explicit inputs only, each by its own variable; a missing one fails by name. Run alone, `--ignored`: on Linux
 //! inside a cgroup delegated to this binary (`HEX_DELEGATED`); with image_real's node inputs (`SHARDS_BIN`, Hex's
-//! `shards`, `scripts/shards-gpu/build.sh`'s at the Shards revision vendor/shards pins, whose run host speaks the image
+//! `shards`, Shards' own release at the revision Hex's Cargo.toml pins, whose run host speaks the image
 //! channel the node's vendored API writes; `SHARDS_KERNEL` and `SHARDS_INIT`, the kernel the run hosts boot and the
 //! init beside it, which Shards takes together, the init that same `shards` build carries (build.sh's
 //! `shards-init`); the node's `HEX_GUEST_*`, `HEX_IMAGE_CPU_MILLI`, `HEX_IMAGE_MEMORY_BYTES`, `HEX_IMAGE_WORK`, a

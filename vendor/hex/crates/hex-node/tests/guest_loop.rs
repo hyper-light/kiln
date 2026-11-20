@@ -11,7 +11,7 @@
 //!
 //! On Windows (native plan step 8, `watch_source`), HEX-SOCK-5's two tests hold through the same pieces: the
 //! guest's control connection joins the node's completion port. Its caller-direct stdio connects through the
-//! stand-in's AF_UNIX Firecracker CONNECT endpoint; only this test fixture bridges that endpoint to TCP.
+//! stand-in's Firecracker CONNECT endpoint on Shards' D272 pipes; only this test fixture bridges that endpoint to TCP.
 #![cfg(any(target_os = "linux", target_os = "macos", windows))]
 #![allow(
     clippy::unwrap_used,
@@ -261,6 +261,7 @@ fn guest_box(id: &BoxId) -> hex_api::BoxInfo {
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     }
 }
@@ -458,31 +459,27 @@ struct LoopGuest {
     mux: Arc<windows_stdio::Mux>,
 }
 
-/// HEX-RT-17's Windows fixture owns an AF_UNIX endpoint like Shards' vsock muxer. The real caller
-/// connects there directly; the node never hosts the fixture's TCP bridge.
+/// HEX-RT-17's Windows fixture serves its stdio port as a Shards VM process serves a vsock port since Shards' D272: a
+/// pair of named pipes for each connection, named by the file at its vsock path (`shards_ipc::VsockListener`), its way
+/// down the fixture's to write and its way up the fixture's to read. The real caller dials it directly, `shards_api`'s
+/// client reading that file and opening the pair; the node never hosts the fixture's TCP bridge.
 #[cfg(windows)]
 mod windows_stdio {
     use super::*;
-    use hex_afunix::{Port, SourceWatch};
-    use shards_afunix::{UnixListener, UnixStream};
-    use std::os::windows::io::{AsSocket, BorrowedSocket};
+    use shards_ipc::{Event, Pipe, VsockConn, VsockListener};
     use std::sync::atomic::AtomicBool;
     use std::thread::JoinHandle;
 
     type Listener = JoinHandle<Vec<JoinHandle<()>>>;
 
-    #[derive(Default)]
-    struct Connections {
-        unix: Vec<UnixStream>,
-        tcp: Vec<TcpStream>,
-        wakes: Vec<Port>,
-    }
-
     pub struct Mux {
         _dir: tempfile::TempDir,
         identity: shards_api::Identity,
         ended: Arc<AtomicBool>,
-        connections: Arc<Mutex<Connections>>,
+        /// Set as the fixture stops: every bridge's read of a caller's way up ends at once.
+        wake: Arc<Event>,
+        /// Each bridge's relay, shut both ways as the fixture stops: a read of the guest's stdout ends.
+        relays: Arc<Mutex<Vec<TcpStream>>>,
         listener: Mutex<Option<Listener>>,
     }
 
@@ -490,30 +487,26 @@ mod windows_stdio {
         pub fn new(stdio: SocketAddr, ended: Arc<AtomicBool>) -> Self {
             let dir = tempfile::Builder::new().prefix("glm-").tempdir().unwrap();
             let vsock = dir.path().join("s");
-            let listener = UnixListener::bind(&vsock).unwrap();
+            let mut listener = VsockListener::bind(&vsock).unwrap();
             let pid = std::process::id();
             let process = hex_runtime::windows::sys::open_process(pid)
                 .unwrap()
                 .unwrap();
             let started = hex_runtime::windows::sys::created(&process).unwrap();
-            let connections = Arc::new(Mutex::new(Connections::default()));
-            let (done, conns) = (Arc::clone(&ended), Arc::clone(&connections));
+            let wake = Arc::new(Event::new().unwrap());
+            let relays = Arc::new(Mutex::new(Vec::new()));
+            let (done, woke, held) = (Arc::clone(&ended), Arc::clone(&wake), Arc::clone(&relays));
             let listener = std::thread::spawn(move || {
                 let mut workers = Vec::new();
                 loop {
-                    let (conn, ()) = listener.accept().unwrap();
+                    let conn = listener.accept().unwrap();
                     if done.load(Ordering::SeqCst) {
                         break;
                     }
-                    let wake = Port::new().unwrap();
-                    {
-                        let mut conns = conns.lock().unwrap();
-                        conns.unix.push(conn.try_clone().unwrap());
-                        conns.wakes.push(wake.clone());
-                    }
-                    let (done, conns) = (Arc::clone(&done), Arc::clone(&conns));
+                    let (done, woke, held) =
+                        (Arc::clone(&done), Arc::clone(&woke), Arc::clone(&held));
                     workers.push(std::thread::spawn(move || {
-                        let result = bridge(conn, stdio, &done, &conns, wake);
+                        let result = bridge(conn, stdio, &done, &held, &woke);
                         if !done.load(Ordering::SeqCst) {
                             result.unwrap();
                         }
@@ -529,7 +522,8 @@ mod windows_stdio {
                     vsock,
                 },
                 ended,
-                connections,
+                wake,
+                relays,
                 listener: Mutex::new(Some(listener)),
             }
         }
@@ -538,26 +532,23 @@ mod windows_stdio {
             self.identity.clone()
         }
 
-        /// Wake accept, close both sides of every bridge, and join all owned threads before removing
-        /// the endpoint's directory. No listener or copy survives its fake guest.
+        /// Wake accept with a dial of its own, end every bridge's reads (the callers' ways up by the wake, the guest's
+        /// stdout by its relay shut both ways), and join all owned threads before removing the endpoint's directory.
+        /// No listener or copy survives its fake guest.
         pub fn stop(&self) {
             let Some(listener) = self.listener.lock().unwrap().take() else {
                 return;
             };
             self.ended.store(true, Ordering::SeqCst);
-            drop(UnixStream::connect(&self.identity.vsock).unwrap());
+            self.wake.set();
+            drop(
+                shards_ipc::vsock_open(&self.identity.vsock, Some(Instant::now() + PATIENCE))
+                    .unwrap(),
+            );
             let workers = listener.join().unwrap();
-            let mut conns = self.connections.lock().unwrap();
-            for wake in conns.wakes.drain(..) {
-                wake.wake().unwrap();
+            for relay in self.relays.lock().unwrap().drain(..) {
+                let _ = relay.shutdown(Shutdown::Both);
             }
-            for conn in conns.unix.drain(..) {
-                let _ = conn.shutdown(Shutdown::Both);
-            }
-            for conn in conns.tcp.drain(..) {
-                let _ = conn.shutdown(Shutdown::Both);
-            }
-            drop(conns);
             for worker in workers {
                 worker.join().unwrap();
             }
@@ -571,172 +562,96 @@ mod windows_stdio {
         }
     }
 
-    /// One worker owns each stdio connection. Its reads/writes never block in Winsock: readiness and
-    /// guest end share this port, so stopping the fixture wakes exactly the wait it owns.
-    struct Ready<'a> {
-        watch: SourceWatch,
-        port: &'a Port,
-        ended: &'a AtomicBool,
+    /// A read of a caller's way up, ended at once where the fixture stops (`wake` set): what it read, 0 at the end of
+    /// its writer.
+    fn read_up(up: &Pipe, buf: &mut [u8], wake: &Event) -> std::io::Result<usize> {
+        up.read_unless(buf, wake)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "the test guest ended")
+        })
     }
 
-    impl Ready<'_> {
-        fn waiting(&self, socket: BorrowedSocket<'_>, write: bool) -> std::io::Result<()> {
-            self.watch.arm(self.port, socket, write)?;
-            let mut done = Vec::new();
-            // Only one operation is waiting in this worker; one completion suffices to read afresh.
-            self.port.wait(&mut done, None, 1)
-        }
-
-        fn check(&self) -> std::io::Result<()> {
-            if self.ended.load(Ordering::SeqCst) {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "the test guest ended",
-                ))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn read<S: Read + AsSocket>(
-            &self,
-            source: &mut S,
-            buf: &mut [u8],
-        ) -> std::io::Result<usize> {
-            loop {
-                self.check()?;
-                match source.read(buf) {
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        self.waiting(source.as_socket(), false)?
-                    }
-                    got => return got,
-                }
-            }
-        }
-
-        fn exact<S: Read + AsSocket>(
-            &self,
-            source: &mut S,
-            mut buf: &mut [u8],
-        ) -> std::io::Result<()> {
+    fn bridge(
+        conn: VsockConn,
+        stdio: SocketAddr,
+        ended: &AtomicBool,
+        relays: &Mutex<Vec<TcpStream>>,
+        wake: &Event,
+    ) -> std::io::Result<()> {
+        let VsockConn { down, up } = conn;
+        let exact = |mut buf: &mut [u8]| -> std::io::Result<()> {
             while !buf.is_empty() {
-                let n = self.read(source, buf)?;
+                let n = read_up(&up, buf, wake)?;
                 if n == 0 {
                     return Err(std::io::ErrorKind::UnexpectedEof.into());
                 }
                 buf = &mut buf[n..];
             }
             Ok(())
-        }
-
-        fn write<S: Write + AsSocket>(
-            &self,
-            target: &mut S,
-            mut buf: &[u8],
-        ) -> std::io::Result<()> {
-            while !buf.is_empty() {
-                self.check()?;
-                match target.write(buf) {
-                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-                    Ok(n) => buf = &buf[n..],
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        self.waiting(target.as_socket(), true)?
-                    }
-                    Err(e) => return Err(e),
-                }
+        };
+        // Firecracker's request is one line and a u32 port, so its grammar bounds the read.
+        let mut line = Vec::new();
+        let longest = "CONNECT ".len() + u32::MAX.to_string().len() + "\n".len();
+        while line.len() < longest {
+            let mut byte = [0];
+            exact(&mut byte)?;
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
             }
+        }
+        if line != format!("CONNECT {}\n", stream::STDIO_PORT).as_bytes() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the test guest accepts CONNECT STDIO_PORT only",
+            ));
+        }
+        let mut relay = TcpStream::connect(stdio)?;
+        {
+            let mut held = relays.lock().unwrap();
+            if ended.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            held.push(relay.try_clone()?);
+        }
+        (&down).write_all(format!("OK {}\n", stream::STDIO_PORT).as_bytes())?;
+        let mut name = [0; stream::NAME_BYTES];
+        exact(&mut name)?;
+        let named = stream::read_name(&name).map_err(std::io::Error::other)?;
+        relay.write_all(&name)?;
+        let mut buf = vec![0; usize::try_from(shards_ipc::VSOCK_QUOTA).unwrap()];
+        // A stdio name fixes this connection's direction. No unused reverse reader is started.
+        if named.stream == stream::Stdio::In {
+            loop {
+                let n = read_up(&up, &mut buf, wake)?;
+                if n == 0 {
+                    break;
+                }
+                relay.write_all(&buf[..n])?;
+            }
+            relay.shutdown(Shutdown::Write)
+        } else {
+            loop {
+                let n = relay.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                (&down).write_all(&buf[..n])?;
+            }
+            // Its way down closed, not disconnected: its reader reads what it holds, then its end.
+            drop(down);
             Ok(())
         }
     }
 
-    fn copy<S: Read + AsSocket, T: Write + AsSocket>(
-        from: &mut S,
-        to: &mut T,
-        read: &Ready<'_>,
-        write: &Ready<'_>,
-        room: usize,
-    ) -> std::io::Result<()> {
-        let mut buf = vec![0; room];
-        loop {
-            let n = read.read(from, &mut buf)?;
-            if n == 0 {
-                return Ok(());
-            }
-            write.write(to, &buf[..n])?;
-        }
+    /// The caller's ends of a connection to the fixture's endpoint, as `shards_api`'s client opens them (D272): its way
+    /// down, read, and its way up, written.
+    fn dialed(vsock: &Path) -> std::io::Result<(Pipe, Pipe)> {
+        let (down, up) = shards_ipc::vsock_open(vsock, Some(Instant::now() + PATIENCE))?;
+        Ok((Pipe::from_handle(down), Pipe::from_handle(up)))
     }
 
-    fn bridge(
-        mut conn: UnixStream,
-        stdio: SocketAddr,
-        ended: &AtomicBool,
-        connections: &Mutex<Connections>,
-        wake: Port,
-    ) -> std::io::Result<()> {
-        conn.set_nonblocking(true)?;
-        let unix = Ready {
-            watch: SourceWatch::new(0)?,
-            port: &wake,
-            ended,
-        };
-        let result = (|| {
-            // Firecracker's request is one line and a u32 port, so its grammar bounds the read.
-            let mut line = Vec::new();
-            let longest = "CONNECT ".len() + u32::MAX.to_string().len() + "\n".len();
-            while line.len() < longest {
-                let mut byte = [0];
-                unix.exact(&mut conn, &mut byte)?;
-                line.push(byte[0]);
-                if byte[0] == b'\n' {
-                    break;
-                }
-            }
-            if line != format!("CONNECT {}\n", stream::STDIO_PORT).as_bytes() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the test guest accepts CONNECT STDIO_PORT only",
-                ));
-            }
-            let mut relay = TcpStream::connect(stdio)?;
-            relay.set_nonblocking(true)?;
-            {
-                let mut conns = connections.lock().unwrap();
-                if ended.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                conns.tcp.push(relay.try_clone()?);
-            }
-            unix.write(&mut conn, format!("OK {}\n", stream::STDIO_PORT).as_bytes())?;
-            let tcp = Ready {
-                watch: SourceWatch::new(1)?,
-                port: &wake,
-                ended,
-            };
-            let result = (|| {
-                let mut name = [0; stream::NAME_BYTES];
-                unix.exact(&mut conn, &mut name)?;
-                let named = stream::read_name(&name).map_err(std::io::Error::other)?;
-                tcp.write(&mut relay, &name)?;
-                // A stdio name fixes this connection's direction. No unused reverse reader is started.
-                if named.stream == stream::Stdio::In {
-                    let room = conn.recv_buffer_size()?;
-                    copy(&mut conn, &mut relay, &unix, &tcp, room)?;
-                    relay.shutdown(Shutdown::Write)
-                } else {
-                    let room = conn.send_buffer_size()?;
-                    copy(&mut relay, &mut conn, &tcp, &unix, room)?;
-                    conn.shutdown(Shutdown::Write)
-                }
-            })();
-            tcp.watch.stop(relay.as_socket());
-            result
-        })();
-        unix.watch.stop(conn.as_socket());
-        result
-    }
-
-    /// HEX-RT-17: the fixture performs Firecracker's handshake, passes both directions and half-close,
-    /// and releases its listener and bridge threads when the fake guest ends.
+    /// HEX-RT-17: the fixture performs Firecracker's handshake over D272's pipes, passes both directions and
+    /// half-close, and releases its listener and bridge threads when the fake guest ends.
     #[test]
     fn hex_rt_17_windows_fixture_connects_stdio_and_ends_its_mux() {
         let relay = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -765,38 +680,39 @@ mod windows_stdio {
             hex_runtime::windows::sys::created(&process).unwrap()
         );
         let dial = |which, id| {
-            let mut conn = UnixStream::connect(&identity.vsock).unwrap();
-            conn.set_read_timeout(Some(PATIENCE)).unwrap();
-            conn.set_write_timeout(Some(PATIENCE)).unwrap();
-            conn.write_all(format!("CONNECT {}\n", stream::STDIO_PORT).as_bytes())
+            let (down, up) = dialed(&identity.vsock).unwrap();
+            (&up)
+                .write_all(format!("CONNECT {}\n", stream::STDIO_PORT).as_bytes())
                 .unwrap();
             let expected = format!("OK {}\n", stream::STDIO_PORT);
             let mut answer = vec![0; expected.len()];
-            conn.read_exact(&mut answer).unwrap();
+            (&down).read_exact(&mut answer).unwrap();
             assert_eq!(answer, expected.as_bytes());
-            conn.write_all(&stream::name(stream::Named {
-                exec: stream::Exec { conn: 1, id },
-                stream: which,
-            }))
-            .unwrap();
-            conn
+            (&up)
+                .write_all(&stream::name(stream::Named {
+                    exec: stream::Exec { conn: 1, id },
+                    stream: which,
+                }))
+                .unwrap();
+            (down, up)
         };
-        let mut stdin = dial(stream::Stdio::In, 1);
-        let mut stdout = dial(stream::Stdio::Out, 1);
-        stdin.write_all(b"round trip\n").unwrap();
-        stdin.shutdown(Shutdown::Write).unwrap();
+        let (stdin_down, stdin_up) = dial(stream::Stdio::In, 1);
+        let (stdout_down, stdout_up) = dial(stream::Stdio::Out, 1);
+        (&stdin_up).write_all(b"round trip\n").unwrap();
+        // Its way up closed: the fixture reads its end, a half-close.
+        drop(stdin_up);
         let mut got = String::new();
-        stdout.read_to_string(&mut got).unwrap();
+        (&stdout_down).read_to_string(&mut got).unwrap();
         assert_eq!(got, "round trip\n");
-        drop((stdin, stdout));
+        drop((stdin_down, stdout_down, stdout_up));
 
         // A live caller stays open in both directions. Ending the guest must still join the mux's
         // blocked copies, and the caller must see EOF without being needed to wake its server.
-        let mut held_input = dial(stream::Stdio::In, 2);
-        let mut held_output = dial(stream::Stdio::Out, 2);
-        held_input.write_all(b"held").unwrap();
+        let (held_in_down, held_in_up) = dial(stream::Stdio::In, 2);
+        let (held_out_down, held_out_up) = dial(stream::Stdio::Out, 2);
+        (&held_in_up).write_all(b"held").unwrap();
         let mut came = [0; b"held".len()];
-        held_output.read_exact(&mut came).unwrap();
+        (&held_out_down).read_exact(&mut came).unwrap();
         assert_eq!(&came, b"held");
         let (tx, rx) = std::sync::mpsc::channel();
         let stopping = std::thread::spawn(move || {
@@ -809,11 +725,11 @@ mod windows_stdio {
             Ok(()),
             "the mux kept a blocked bridge"
         );
-        assert_eq!(held_output.read(&mut came).unwrap(), 0);
-        drop((held_input, held_output));
+        assert_eq!((&held_out_down).read(&mut came).unwrap(), 0);
+        drop((held_in_down, held_in_up, held_out_down, held_out_up));
         let mux = stopping.join().unwrap();
         echo.join().unwrap();
-        assert!(UnixStream::connect(&identity.vsock).is_err());
+        assert!(shards_ipc::vsock_open(&identity.vsock, Some(Instant::now())).is_err());
         drop(mux);
         assert!(!identity.vsock.exists());
     }

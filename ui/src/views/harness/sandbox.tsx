@@ -962,7 +962,7 @@ function Volumes({ d, o, agentId, base }: { d: SandboxDetail; o: LiveOverrides |
                 {h.volume.path}
               </span>
               <span className="sb-mode" data-mode={h.volume.access}>
-                {permsWord(permsOf(h.volume as typeof h.volume & { perms?: VolumePerms }))}
+                {permsWord(permsOf(h.volume))}
               </span>
               <span className="sb-acts">
                 {asking === h.volume.path ? (

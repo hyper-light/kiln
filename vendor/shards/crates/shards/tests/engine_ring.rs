@@ -422,7 +422,12 @@ impl Settle<'_> {
         let (work, cpus) = self.kind;
         let seen = match self.record.seen() {
             Seen::Cold => "its kind not yet seen: followed while its microVM answers".to_string(),
-            Seen::Learned { slowest, .. } => format!("the slowest settle of its kind seen {slowest:?}"),
+            Seen::Learned {
+                slowest, quickest, ..
+            } => format!(
+                "the slowest settle of its kind seen {slowest:?} and its spread {:?}",
+                slowest.saturating_sub(quickest)
+            ),
         };
         format!(
             "{cpus} vCPUs: {work}: {pins} pages pinned, not {}, {:?} into its settle (its work took {:?}); {seen}",
@@ -433,8 +438,8 @@ impl Settle<'_> {
     }
 }
 
-/// A settle refused: no slot freed over a whole W*, the slowest settle of its kind seen,
-/// since its judge's look before.
+/// A settle refused: no slot freed over a whole window, the slowest settle of its kind seen
+/// and its spread, since its judge's look before.
 #[derive(Debug, PartialEq, Eq)]
 struct Stalled {
     /// Pages pinned at the look that refused it, and the count it waits for.
@@ -447,12 +452,13 @@ impl std::fmt::Display for Stalled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} pages pinned, not {}, after {:?}: none released over the last {:?}, the slowest settle of its kind seen {:?}",
+            "{} pages pinned, not {}, after {:?}: none released over the last {:?}, the slowest settle of its kind seen {:?} and its spread {:?}",
             self.now,
             self.want,
             self.stall.waited(),
             self.stall.over(),
-            self.stall.slowest()
+            self.stall.slowest(),
+            self.stall.spread()
         )
     }
 }
@@ -863,6 +869,10 @@ fn a_shrinking_room_lets_an_idle_slot_go_and_a_stream_past_it_goes_plain() {
     await_rings(&home, "the idle slot let go for the room", |r| {
         r.asked > before.asked && r.let_go == r.attached
     });
+    // And down again to what it holds with the slot gone: the slot's ring given back left its
+    // run under the budget by a ring, and the stream below took a ring in that room (CI
+    // 44476277082, x86_64 gnu: attached 5, past 4).
+    budget.hold_to(budget.held(&home));
     // A new stream past the room: no ring attached, its bytes whole all the same.
     let attached = rings(&home).attached;
     let ping = bulk(&home, &["ping", "20"]);

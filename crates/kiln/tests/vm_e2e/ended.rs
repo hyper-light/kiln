@@ -110,9 +110,6 @@ async fn charged(records: &SimRecords, name: BoxName) -> anyhow::Result<Option<C
 
 #[test]
 fn a_box_whose_run_ended_on_its_own_is_deleted() -> anyhow::Result<()> {
-    if !kiln::shards::carried() {
-        return skip("this kiln carries no Shards: ci/shards/pack.sh builds it (docs/shards.md)");
-    }
     let dir = tempfile::tempdir()?;
     let state = dir.path().join("s");
     let held = kiln::shards::write_out(&state)?;

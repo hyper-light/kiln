@@ -1728,6 +1728,7 @@ mod tests {
             guest_ns: vec![1_000, 2_000],
             window: std::time::Duration::from_millis(250),
             charged: hex_api::Charged::ToThread,
+            paused: std::time::Duration::ZERO,
         };
         let ended = BoxRecord {
             exit: Some(hex_api::Exit::Code(0)),

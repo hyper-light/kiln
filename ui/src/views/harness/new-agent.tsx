@@ -3,7 +3,7 @@
  * it. Above the box, the agent page's own line (permissions · model · effort, and the bolt where
  * the model goes faster); in the box's top slot, the agent, its machine, its folder and how many,
  * each opened in place; under the box, More options (name, workspace, the Agentfile its microVM is
- * made from, where its commands run, a shell to run in) and the machine's past sessions, each a
+ * made from, the environment it runs with, where its commands run, a shell to run in) and the machine's past sessions, each a
  * dropdown that opens in place. Start
  * starts it and opens it; several stay here, and the line under the box says so. There is no
  * dialog: every way in that had one fills this in (new-agent-draft.ts).
@@ -15,6 +15,7 @@ import * as React from "react";
 import "./harness.css";
 import "./console.css";
 import { ArrowUp, Check, ChevronDown, CircleAlert, Paperclip } from "lucide-react";
+import { agentenvChoicesRes, type Agentenv } from "@/api/agentenvs";
 import { api } from "@/api/client";
 import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type PastSession, type WorkspacesAvailable } from "@/api/harness";
 import { heldCommand, useHeld } from "@/api/held";
@@ -127,6 +128,8 @@ function useChoices() {
   const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "volume");
   /** The Agentfile each harness's microVM is made from, per project (views/agentfiles/choose.ts); none kept: a process on its machine. */
   const [agentfiles, setAgentfiles] = useLocalStorage<Record<string, string>>("kiln.agents.agentfiles", {});
+  /** The environment it runs with, kept as the Agentfile is (docs/agents.md, "Environments"); none: its machine's user's. */
+  const [agentenv, setAgentenv] = useLocalStorage("kiln.agents.agentenv", "");
   const [dirs, setDirs] = useLocalStorage<Record<string, string[]>>("kiln.agents.recentDirs", {});
   const [picked, setPicked] = React.useState<string | null>(null);
   /** The folder typed or browsed to, on the machine it was for. */
@@ -181,6 +184,8 @@ function useChoices() {
     setWorkspace,
     agentfiles,
     setAgentfiles,
+    agentenv,
+    setAgentenv,
     dirs,
     setDirs,
     picked,
@@ -288,6 +293,12 @@ function useAgentfile(c: Choices, s: Setup) {
   return { choices, project, chosen, why: chosen && s.target ? whyNoMicrovm(s.target, s.machines, s.machine) : null };
 }
 
+/** The environment it runs with, as kept, while it's still one of the person's; else none (its machine's user's). */
+function useAgentenv(c: Choices): { envs: Agentenv[]; chosen: Agentenv | null } {
+  const envs = useRes(agentenvChoicesRes).data;
+  return { envs, chosen: envs.find((e) => e.id === c.agentenv) ?? null };
+}
+
 /** Above the box: the agent page's own line, for the agent to be. */
 function HowLine({ c }: { c: Choices }) {
   const s = useSetup(c);
@@ -336,9 +347,10 @@ function HowLine({ c }: { c: Choices }) {
 }
 
 /** Start. `sending`: several are starting from here: it says so, and a press waits (a second would start more). */
-function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup, agentfile: AgentfileChoice | null) => void }) {
+function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup, agentfile: AgentfileChoice | null, agentenv: Agentenv | null) => void }) {
   const s = useSetup(c);
   const { chosen } = useAgentfile(c, s);
+  const env = useAgentenv(c).chosen;
   const label = c.count > 1 ? `Start ${c.count}` : "Start";
   return (
     <button
@@ -348,9 +360,9 @@ function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (
       disabled={!s.target || s.noHarness}
       {...sendingProps(sending)}
       onClick={() => {
-        if (!sending) run(s, chosen);
+        if (!sending) run(s, chosen, env);
       }}
-      aria-label={`${label}: ${s.kindName} on ${s.machine}${chosen ? `, in a microVM from ${chosen.name}` : ""}`}
+      aria-label={`${label}: ${s.kindName} on ${s.machine}${chosen ? `, in a microVM from ${chosen.name}` : ""}${env ? `, with ${env.name}` : ""}`}
     >
       <ArrowUp size={15} />
       <span>{label}</span>
@@ -413,6 +425,28 @@ function AgentfileRow({ c, s }: { c: Choices; s: Setup }) {
       </div>
       {af.why && <p className="mc-note mc-opt-panel">{af.why}. An agent from an Agentfile starts only on a machine that starts microVMs.</p>}
     </>
+  );
+}
+
+/**
+ * The environment it runs with (docs/agents.md, "Environments"): its machine's user's, or one of the
+ * person's, kept for the next start as the Agentfile is. They're made and changed in an agent's
+ * Engine tab.
+ */
+function AgentenvRow({ c }: { c: Choices }) {
+  const { envs, chosen } = useAgentenv(c);
+  return (
+    <div className="mc-opt">
+      <span className="mc-opt-key">Environment</span>
+      <div className="mc-opt-val">
+        <Pick
+          label="The environment it runs with"
+          value={chosen?.id ?? ""}
+          onChange={c.setAgentenv}
+          options={[{ value: "", label: "Machine environment (default)" }, ...envs.map((e) => ({ value: e.id, label: `${e.name} v${e.version}`, group: "Yours" }))]}
+        />
+      </div>
+    </div>
   );
 }
 
@@ -520,6 +554,7 @@ function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past
         </div>
       </div>
       <AgentfileRow c={c} s={s} />
+      <AgentenvRow c={c} />
       <div className="mc-opt">
         <span className="mc-opt-key">Commands</span>
         <div className="mc-opt-val">
@@ -628,11 +663,13 @@ function Under({
 }) {
   const s = useSetup(c);
   const { chosen } = useAgentfile(c, s);
+  const env = useAgentenv(c).chosen;
   // What More options holds that isn't as it starts out, said while it's closed.
   const summary = [
     c.name.trim() && `“${c.name.trim()}”`,
     s.volume && "Own volume",
     chosen && `microVM: ${chosen.name}`,
+    env && `Environment: ${env.name}`,
     c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${labelOf(c.reach)}`),
   ]
     .filter(Boolean)
@@ -828,7 +865,7 @@ export function NewAgent({
 
   // Start doesn't wait for the server (starting.ts): the agents are listed starting at once, under
   // ids made here, and one opens at once.
-  const run = async (s: Setup, agentfile: AgentfileChoice | null) => {
+  const run = async (s: Setup, agentfile: AgentfileChoice | null, agentenv: Agentenv | null) => {
     if (!s.target) return;
     const body = text.trim();
     // Files go with the first message (those still uploading too: Start doesn't wait for them), so
@@ -849,6 +886,7 @@ export function NewAgent({
       volume: s.volume,
       folder: s.folder,
       agentfile: agentfile?.image,
+      agentenv: agentenv?.id,
     });
     const ids = Array.from({ length: c.count }, () => clientId());
     // One agent: its files are kept for it, and its page sends them once it can take them (and

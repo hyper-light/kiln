@@ -2097,6 +2097,8 @@ impl<D: crate::containers::Disk> Daemon<D> {
             // A signal that could not be sent went nowhere: its run's connection to its VM
             // is gone, which its guest says its end on too, so no end can come from the
             // guest, and its VM is killed at once.
+            // Its end is timed from its signal's sending, as `Ends::heard` takes it.
+            let sent = Instant::now();
             let (phase, deadline, followed, grace) = if linux == 9 {
                 let (wait, teardown) = self.kill_command(&id);
                 (Phase::Killed, wait.and_then(after), teardown, None)
@@ -2116,7 +2118,7 @@ impl<D: crate::containers::Disk> Daemon<D> {
                 phase,
                 deadline,
                 followed,
-                since: Instant::now(),
+                since: sent,
                 grace,
             });
         }
@@ -2159,10 +2161,11 @@ impl<D: crate::containers::Disk> Daemon<D> {
                         }
                         Phase::Killed | Phase::Escalated => {
                             let went = e.followed.goes_on();
-                            // More work than any teardown took (C*), its command not ended:
-                            // given up whatever its rate (D217, ROOT's ruling of 2026-11-18). Its
-                            // work unread, the bound takes nothing from this look, and says why.
-                            // A look that could not read it gives it up already, saying why.
+                            // More work than any teardown took (C*) and its spread, its command
+                            // not ended: given up whatever its rate (D217, ROOT's ruling of
+                            // 2026-11-18; D215 amended 2026-11-19). Its work unread, the bound
+                            // takes nothing from this look, and says why. A look that could not
+                            // read it gives it up already, saying why.
                             let past = match went {
                                 GoesOn::Unread(_) => None,
                                 _ => e.followed.past(self.ends.most_work()).unwrap_or_else(|why| {
@@ -2174,12 +2177,12 @@ impl<D: crate::containers::Disk> Daemon<D> {
                                 }),
                             };
                             if let (GoesOn::Went(look), None) = (&went, past) {
-                                // A look past C* that went on: the bound's red alone makes one
-                                // (`TEARDOWN_WENT_ON`).
+                                // A look past C* and its spread that went on: the bound's red
+                                // alone makes one (`TEARDOWN_WENT_ON`).
                                 #[cfg(test)]
                                 if let (Ok(Some(work)), Some(most)) =
                                     (e.followed.work(), self.ends.most_work())
-                                    && work > most
+                                    && work > most.bound()
                                 {
                                     *lock(&super::TEARDOWN_WENT_ON).entry(e.id.clone()).or_default() += 1;
                                 }
@@ -2205,7 +2208,9 @@ impl<D: crate::containers::Disk> Daemon<D> {
                                             )
                                         }
                                         (_, Some((work, most))) => format!(
-                                            "its microVM having run {work} since its SIGKILL, more than any teardown took ({most})"
+                                            "its microVM having run {work} since its SIGKILL, more than any teardown took ({}) and its spread ({})",
+                                            most.most(),
+                                            most.spread()
                                         ),
                                         (_, None) => format!(
                                             "its microVM gone on with nothing of its end for {:?}",

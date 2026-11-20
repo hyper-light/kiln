@@ -614,8 +614,9 @@ pub enum Change {
     Disconnect { member: Member, network: String, grant: NetworkGrant },
     /// `source` plugged into the members `to` at `at` (absolute, strictly beneath one of its plug
     /// roots: its launch's [`Launch::plug_roots`] and each share's top-level directory), read-only
-    /// where it says, as Shards' `ImageGuest::plug` takes one (D271).
-    Plug { source: PlugSource, to: PlugFor, at: String, read_only: bool },
+    /// where it says, its files run from it only where `exec` (else each member's mount of it is
+    /// `noexec`, Shards' D279), as Shards' `ImageGuest::plug` takes one (D271).
+    Plug { source: PlugSource, to: PlugFor, at: String, read_only: bool, exec: bool },
     /// The folder plugged in at `at`, unplugged.
     Unplug { at: String },
     /// The component at `at`, a member's directory in its image, swapped for `component` (kiln plan 01a1dd2e…, P6c.3;

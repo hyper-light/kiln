@@ -1031,7 +1031,7 @@ pub(crate) struct Host {
     pub(crate) said: Output,
 }
 
-/// `served`'s streams sent on a run host's links socket `links` (D286): `SERVED_SHARES` messages
+/// `served`'s streams sent on a run host's links socket `links` (D287): `SERVED_SHARES` messages
 /// of `shards_ipc::MAX_FDS` descriptors at most and no payload, in order, as its host takes them
 /// before its request.
 #[cfg(unix)]
@@ -1272,7 +1272,7 @@ impl Begun {
     /// Sends the host the run `request` (`CREATE`), its leases' `lessor` (D242) and the
     /// references its grants name set first, and its members whose stdin it asks for named,
     /// for their flows to be made with its start (`take`): none of them can be asked of or
-    /// answered sooner than the request. Its shares another server serves (D286) go first,
+    /// answered sooner than the request. Its shares another server serves (D287) go first,
     /// `served`'s streams in the request's order ([`Begun::hand_served`]).
     pub(super) fn create(
         &self,
@@ -1298,7 +1298,7 @@ impl Begun {
         self.send(wire::to_host::CREATE, request)
     }
 
-    /// `served`, the streams of the run's shares another server serves (D286), handed to its
+    /// `served`, the streams of the run's shares another server serves (D287), handed to its
     /// host before its request, one for each of `request`'s, in its order: on Unix on the host's
     /// links socket (`SERVED_SHARES`, `shards_ipc::MAX_FDS` a message), whose copies its host
     /// holds once sent, this process keeping its own until the run has started (M24: XNU flushes
@@ -6273,7 +6273,7 @@ mod tests {
         assert_eq!(layer_files(&home), [others], "its run host's layer outlived it");
     }
 
-    /// D286: a run's served shares' streams go on its host's links socket in their order,
+    /// D287: a run's served shares' streams go on its host's links socket in their order,
     /// `shards_ipc::MAX_FDS` a message at most and no payload, as its host takes them before
     /// its request. Do: send one more than a message carries. Expect: two `SERVED_SHARES`
     /// messages, the first full, each descriptor the very socket sent in its place (a byte

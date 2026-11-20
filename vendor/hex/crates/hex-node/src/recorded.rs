@@ -1960,6 +1960,7 @@ mod projection_tests {
             ended: None,
             control: None,
             control_wake: None,
+            live: None,
             credentials: Vec::new(),
         }
     }
@@ -3160,6 +3161,47 @@ impl<R: Recover> Runtime for Recorded<R> {
 
     fn host_use(&self, id: &BoxId) -> Result<hex_api::HostUse, Refusal> {
         self.runtime_at(id)?.host_use(id)
+    }
+
+    /// Kiln plan P5.5b: the box's runtime pauses it, an image VM's its class's; its record is unchanged, its claim and
+    /// its room held, as a pause ends no run.
+    fn pause(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.runtime_at(id)?.pause(id)
+    }
+
+    fn resume(&self, id: &BoxId) -> Result<(), Refusal> {
+        self.runtime_at(id)?.resume(id)
+    }
+
+    /// Shards' D270 slice 4: the box's runtime swaps its member's component, an image VM's its class's; its record is
+    /// unchanged, as a member's start again ends no run.
+    fn swap(
+        &self,
+        id: &BoxId,
+        at: &str,
+        digest: &str,
+        when: hex_api::SwapWhen,
+    ) -> Result<hex_api::Swapped, Refusal> {
+        self.runtime_at(id)?.swap(id, at, digest, when)
+    }
+
+    fn restore(
+        &self,
+        id: &BoxId,
+        at: &str,
+        when: hex_api::SwapWhen,
+    ) -> Result<hex_api::Swapped, Refusal> {
+        self.runtime_at(id)?.restore(id, at, when)
+    }
+
+    fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
+        self.runtime_at(id)?.components(id)
+    }
+
+    /// Kiln plan P6b.3: the box's runtime changes its network or folders as it runs, an image VM's its class's; its
+    /// record is unchanged, as a change is its run's alone (docs/design/shards-image-class.md §14).
+    fn change(&self, id: &BoxId, change: hex_api::Live) -> Result<(), Refusal> {
+        self.runtime_at(id)?.change(id, change)
     }
 
     fn list(&self) -> Result<Vec<BoxInfo>, Refusal> {

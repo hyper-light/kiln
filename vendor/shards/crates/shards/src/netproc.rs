@@ -172,10 +172,11 @@ pub fn until_ready(
         if let Some(followed) = follow.as_mut() {
             followed.look().map_err(|why| match why {
                 shards_api::Unfollowed::Stalled(stall) => format!(
-                    "its network process ({}) ran nothing for {:?}, past the slowest answer one has given ({:?}){}",
+                    "its network process ({}) ran nothing for {:?}, past the slowest answer one has given ({:?}) and its spread ({:?}){}",
                     net.pid,
                     stall.over(),
                     stall.slowest(),
+                    stall.spread(),
                     stall.account()
                 ),
                 shards_api::Unfollowed::Process { failure, .. } => {
@@ -1015,12 +1016,19 @@ mod reap_tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    /// The helper end a home's record keeps, in milliseconds: none where it keeps none.
+    /// The helper end a home's record keeps, in milliseconds, its slowest (`helper MS QUICKEST`,
+    /// D217 amended 2026-11-19): none where it keeps none.
     fn kept(home: &Path) -> Option<u64> {
         crate::daemon::ends::newest(&home.join(crate::daemon::ends::RECORD))
             .unwrap_or_default()
             .lines()
-            .find_map(|line| line.strip_prefix("helper ")?.parse().ok())
+            .find_map(|line| {
+                line.strip_prefix("helper ")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
             .filter(|&ms| ms > 0)
     }
 

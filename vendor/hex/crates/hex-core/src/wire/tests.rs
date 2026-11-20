@@ -662,6 +662,7 @@ fn info() -> BoxInfo {
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     }
 }
@@ -850,6 +851,31 @@ fn requests() -> Vec<(u64, Request, usize)> {
             }),
             1,
         ),
+        // Kiln plan P5.5b: an image box's pause and resume, appended.
+        (212, Request::Call(Call::Pause(id("image"))), 0),
+        (213, Request::Call(Call::Resume(id("image"))), 0),
+        // Shards' D270 slice 4: a component swapped in at a member's next start, its image's own back now, and the
+        // box's components, appended.
+        (
+            214,
+            Request::Call(Call::Swap {
+                id: id("image"),
+                at: "/harness/claude".to_owned(),
+                digest: hex_api::sim::SIM_COMPONENT.to_owned(),
+                when: SwapWhen::NextStart,
+            }),
+            0,
+        ),
+        (
+            215,
+            Request::Call(Call::Restore {
+                id: id("image"),
+                at: "/agents/helper".to_owned(),
+                when: SwapWhen::Now,
+            }),
+            0,
+        ),
+        (216, Request::Call(Call::Components(id("image"))), 0),
         // docs/design/credential-grants.md C7: a connection's lessors, and its answers to the node's lease asks.
         (205, Request::Call(Call::Lessors), 0),
         (206, Request::Lessor(Ok(())), 0),
@@ -1114,6 +1140,75 @@ fn refusals() -> Vec<Refusal> {
             why: "this node was given none to lease from".to_owned(),
         },
     ];
+    // Kiln plan P5.5b: a call refused for where its box's pause stands, each cause, a class's naming every class.
+    out.extend(
+        [
+            ("pause", PauseCause::Paused),
+            ("resume", PauseCause::Running),
+            ("pause", PauseCause::NotRunning),
+            ("resume", PauseCause::Ended),
+            ("signal", PauseCause::Paused),
+        ]
+        .into_iter()
+        .chain(
+            [
+                Class::Process,
+                Class::Oci,
+                Class::Firecracker,
+                Class::Shards,
+            ]
+            .map(|class| ("pause", PauseCause::Class(class))),
+        )
+        .map(|(op, cause)| Refusal::Pause {
+            id: id("image"),
+            op,
+            cause,
+        }),
+    );
+    // Shards' D270 slice 4: a call refused for its box's components, each cause, Shards' with its words, a class's
+    // naming every class.
+    out.extend(
+        [
+            SwapCause::Unknown,
+            SwapCause::Artifact,
+            SwapCause::Kind,
+            SwapCause::Platform,
+            SwapCause::Asks,
+            SwapCause::Device,
+            SwapCause::Running,
+            SwapCause::Failed,
+            SwapCause::Workdir,
+            SwapCause::Capacity,
+        ]
+        .map(|cause| Refusal::Swap {
+            id: id("image"),
+            op: "swap",
+            cause,
+            why: Some(format!("{cause:?}, in Shards' words")),
+        }),
+    );
+    out.extend(
+        [
+            ("restore", SwapCause::NotRunning),
+            ("components", SwapCause::Ended),
+        ]
+        .into_iter()
+        .chain(
+            [
+                Class::Process,
+                Class::Oci,
+                Class::Firecracker,
+                Class::Shards,
+            ]
+            .map(|class| ("swap", SwapCause::Class(class))),
+        )
+        .map(|(op, cause)| Refusal::Swap {
+            id: id("image"),
+            op,
+            cause,
+            why: None,
+        }),
+    );
     out.extend(connect_refusals());
     out
 }
@@ -1237,6 +1332,24 @@ fn answers() -> Vec<(u64, Answer)> {
                 io_write_bytes: u64::MAX,
                 guest: Some(GuestTime::PerVcpuNs(vec![0, 1, u64::MAX])),
                 started_from: Some(StartedFrom::Warm),
+                paused_ns: None,
+            }),
+        ),
+        // Kiln plan P5.5b: a Shards image VM's paused time, appended after how it started.
+        (
+            9,
+            Answer::Usage(Usage {
+                guest: Some(GuestTime::PerVcpuNs(vec![7, 7])),
+                started_from: Some(StartedFrom::Booted),
+                paused_ns: Some(u64::MAX),
+                ..Usage::default()
+            }),
+        ),
+        (
+            2,
+            Answer::Info(BoxInfo {
+                state: BoxState::Paused,
+                ..info()
             }),
         ),
         (
@@ -1261,6 +1374,7 @@ fn answers() -> Vec<(u64, Answer)> {
                         ended: None,
                         control: None,
                         control_wake: None,
+                        live: None,
                         credentials: Vec::new(),
                     },
                 ],
@@ -1410,6 +1524,36 @@ fn answers() -> Vec<(u64, Answer)> {
             key: Some([3; 32]),
         },
     ));
+    // Shards' D270 slice 4: a swap's answer, now, its member's generation started and what it let go unread, then one at
+    // a member's next start; and a box's components, none and two.
+    let held = ComponentAt {
+        at: "/harness/claude".to_owned(),
+        desired: Some(hex_api::sim::SIM_COMPONENT.to_owned()),
+        held: Some(hex_api::sim::SIM_COMPONENT.to_owned()),
+    };
+    let wanted = ComponentAt {
+        at: "/agents/helper".to_owned(),
+        desired: None,
+        held: Some(hex_api::sim::SIM_COMPONENT.to_owned()),
+    };
+    out.push((
+        214,
+        Answer::Swapped(Swapped {
+            components: vec![held.clone(), wanted.clone()],
+            started: Some(u32::MAX),
+            unread: u64::MAX,
+        }),
+    ));
+    out.push((
+        215,
+        Answer::Swapped(Swapped {
+            components: Vec::new(),
+            started: None,
+            unread: 0,
+        }),
+    ));
+    out.push((216, Answer::Components(Vec::new())));
+    out.push((216, Answer::Components(vec![held, wanted])));
     out
 }
 
@@ -1981,6 +2125,7 @@ fn the_wire_identity_is_its_definitions_digest_line_endings_aside() {
         "../../hex-api/src/grants.rs",
         "../../hex-api/src/credentials.rs",
         "../../hex-api/src/lease.rs",
+        "../../hex-api/src/live.rs",
     ];
     let mut sources: Vec<Vec<u8>> = paths
         .iter()
@@ -2225,7 +2370,8 @@ fn a_run_is_a_create_and_an_exec_in_one_request() {
 #[test]
 fn unknown_kinds_are_refused() {
     let hello = request(5, &Request::Hello { build: build() }, MAX_MESSAGE).unwrap();
-    for kind in [0u16, 0x0022, 0x7fff, 0x8001, 0x8009, 0xffff] {
+    // 0x0028: the first request kind past every one defined, a running box's change (kiln plan P6b.3) the last.
+    for kind in [0u16, 0x0028, 0x7fff, 0x8001, 0x8009, 0xffff] {
         let mut bytes = hello.clone();
         bytes[12..14].copy_from_slice(&kind.to_le_bytes());
         let got = read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap_err();
@@ -2362,6 +2508,7 @@ fn hostile_values_are_refused_by_name() {
         - NO_CREDENTIALS
         - NO_CONTROL
         - NO_WAKE
+        - NO_LIVE
         - 2
         - 8
         - 6
@@ -2551,7 +2698,7 @@ fn any_info() -> impl Strategy<Value = BoxInfo> {
     (
         any_id(),
         0u8..5,
-        0u8..3,
+        0u8..4,
         any_bounds(),
         any::<bool>(),
         proptest::option::of(any_exit()),
@@ -2575,7 +2722,8 @@ fn any_info() -> impl Strategy<Value = BoxInfo> {
                 state: match state {
                     0 => BoxState::Empty,
                     1 => BoxState::Running,
-                    _ => BoxState::Created,
+                    2 => BoxState::Created,
+                    _ => BoxState::Paused,
                 },
                 bounds,
                 adopted,
@@ -2585,6 +2733,7 @@ fn any_info() -> impl Strategy<Value = BoxInfo> {
                 ended: None,
                 control: None,
                 control_wake: None,
+                live: None,
                 credentials: Vec::new(),
             },
         )
@@ -2661,6 +2810,63 @@ fn any_cause() -> impl Strategy<Value = Refusal> {
             any_text()
         )
             .prop_map(|(cause, why)| Refusal::Volume { cause, why }),
+        (
+            any_id(),
+            proptest::sample::select(&SOME_NAMES[..]),
+            any_pause_cause()
+        )
+            .prop_map(|(id, op, cause)| Refusal::Pause { id, op, cause }),
+        (
+            any_id(),
+            proptest::sample::select(&SOME_NAMES[..]),
+            any_swap_cause(),
+            proptest::option::of(any_text())
+        )
+            .prop_map(|(id, op, cause, why)| Refusal::Swap { id, op, cause, why }),
+    ]
+}
+
+/// Each cause of a refusal for a box's components (Shards' D270 slice 4), a class's naming any class.
+fn any_swap_cause() -> impl Strategy<Value = SwapCause> {
+    prop_oneof![
+        Just(SwapCause::Unknown),
+        Just(SwapCause::Artifact),
+        Just(SwapCause::Kind),
+        Just(SwapCause::Platform),
+        Just(SwapCause::Asks),
+        Just(SwapCause::Device),
+        Just(SwapCause::Running),
+        Just(SwapCause::Failed),
+        Just(SwapCause::NotRunning),
+        Just(SwapCause::Ended),
+        proptest::sample::select(vec![
+            Class::Process,
+            Class::Oci,
+            Class::Firecracker,
+            Class::Shards,
+            Class::ShardsImage
+        ])
+        .prop_map(SwapCause::Class),
+        Just(SwapCause::Workdir),
+        Just(SwapCause::Capacity),
+    ]
+}
+
+/// Each place a box's pause stands (kiln plan P5.5b), a class's naming any class.
+fn any_pause_cause() -> impl Strategy<Value = PauseCause> {
+    prop_oneof![
+        Just(PauseCause::Paused),
+        Just(PauseCause::Running),
+        Just(PauseCause::NotRunning),
+        Just(PauseCause::Ended),
+        proptest::sample::select(vec![
+            Class::Process,
+            Class::Oci,
+            Class::Firecracker,
+            Class::Shards,
+            Class::ShardsImage
+        ])
+        .prop_map(PauseCause::Class),
     ]
 }
 
@@ -2684,6 +2890,7 @@ fn any_guest_failure() -> impl Strategy<Value = GuestFailure> {
         (any::<u32>(), any_text()).prop_map(|(pid, why)| GuestFailure::Gone { pid, why }),
         any_text().prop_map(GuestFailure::Rate),
         any_text().prop_map(GuestFailure::HostUse),
+        any_text().prop_map(GuestFailure::Pause),
     ]
 }
 
@@ -3148,11 +3355,13 @@ fn route_wire_backing_calls_and_all_phases_roundtrip() {
         io_write_bytes: 19,
         guest: None,
         started_from: None,
+        paused_ns: None,
     });
     let bytes = answer(203, &expected, MAX_MESSAGE).unwrap();
     assert_eq!(&bytes[12..14], &0x8005u16.to_le_bytes());
-    // The counters, then guest time's option byte and the microVM's start's, appended (joint plan step 12): none here.
-    assert_eq!(bytes.len(), HEADER_BYTES + size_of::<[u64; 8]>() + 2);
+    // The counters, then guest time's option byte and the microVM's start's, appended (joint plan step 12), and its
+    // paused time's (kiln plan P5.5b): none here.
+    assert_eq!(bytes.len(), HEADER_BYTES + size_of::<[u64; 8]>() + 3);
     assert_eq!(
         read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
         expected
@@ -3769,6 +3978,7 @@ fn route_wire_spec_and_info_inconsistent_route_receipts_refuse() {
         - NO_CREDENTIALS
         - NO_CONTROL
         - NO_WAKE
+        - NO_LIVE
         - route_bytes;
     assert_eq!(bad[route_at], 1);
     assert_eq!(bad[route_at + 1], class_tag(Class::Oci));
@@ -4839,15 +5049,15 @@ fn guest_time_follows_the_usage_counters_by_vcpu_or_what_it_awaits() {
     let per_vcpu = usage(Some(GuestTime::PerVcpuNs(vec![5, 7])));
     let bytes = answer(4, &per_vcpu, MAX_MESSAGE).unwrap();
     assert_eq!(&bytes[counters..counters + 6], &[1, 0, 2, 0, 0, 0]);
-    // Then the microVM's start's option byte (D253): none here.
-    assert_eq!(bytes.len(), counters + 6 + 2 * size_of::<u64>() + 1);
+    // Then the microVM's start's option byte (D253) and its paused time's (kiln plan P5.5b): none here.
+    assert_eq!(bytes.len(), counters + 6 + 2 * size_of::<u64>() + 2);
     assert_eq!(
         read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
         per_vcpu
     );
     let awaits = usage(Some(GuestTime::Awaits(Upstream::GuestCpuTimePerVcpu)));
     let bytes = answer(4, &awaits, MAX_MESSAGE).unwrap();
-    assert_eq!(&bytes[counters..], &[1, 1, 0, 0]);
+    assert_eq!(&bytes[counters..], &[1, 1, 0, 0, 0]);
     assert_eq!(
         read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
         awaits
@@ -4879,12 +5089,13 @@ fn guest_time_follows_the_usage_counters_by_vcpu_or_what_it_awaits() {
     )
     .unwrap();
     let count = u32::try_from(GuestTime::MAX_VCPUS + 1).unwrap();
-    // Its count and the start's option byte after it, written again with a count past the index space.
-    read_past.truncate(read_past.len() - size_of::<u32>() - 1);
+    // Its count, and the start's and the paused time's option bytes after it, written again with a count past the index
+    // space.
+    read_past.truncate(read_past.len() - size_of::<u32>() - 2);
     read_past.extend_from_slice(&count.to_le_bytes());
     read_past.extend(std::iter::repeat_n(
         0,
-        (GuestTime::MAX_VCPUS + 1) * size_of::<u64>() + 1,
+        (GuestTime::MAX_VCPUS + 1) * size_of::<u64>() + 2,
     ));
     assert!(matches!(
         read_answer(&received(&read_past, 0), MAX_MESSAGE),
@@ -5429,6 +5640,8 @@ const NO_CONTROL: usize = 1;
 /// What ends an info whose run told no agent-control endpoint's waker and wake (Shards' D252 amended, image channel
 /// v30): its none tag, after the endpoint's.
 const NO_WAKE: usize = 1;
+/// What ends an info whose run took nothing as it runs (kiln plan P6b.3): its none tag, after its waker's and wake's.
+const NO_LIVE: usize = 1;
 
 /// Joint plan step 14 (AC-T7.4.1, C5): why a node's last resort ended a VM crosses the wire after its info's grants. Do:
 /// encode an info with an end and one with none, cut the second before its end's none tag, and read and write both as
@@ -5448,11 +5661,11 @@ fn w14_an_infos_last_resort_crosses_the_wire_after_its_grants() {
     let plain = info();
     let mut cut = answer(3, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
     assert_eq!(
-        cut[cut.len() - NO_WAKE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END],
+        cut[cut.len() - NO_WAKE - NO_LIVE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END],
         0,
         "no end's tag"
     );
-    cut.truncate(cut.len() - NO_WAKE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END);
+    cut.truncate(cut.len() - NO_WAKE - NO_LIVE - NO_CONTROL - NO_CREDENTIALS - NO_WORDS - NO_END);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -5484,10 +5697,11 @@ fn w12_an_infos_run_words_cross_the_wire_last() {
         Answer::Info(failed.clone())
     );
     assert!(
-        bytes[..bytes.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE].ends_with(words.as_bytes())
+        bytes[..bytes.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_LIVE]
+            .ends_with(words.as_bytes())
     );
     let mut garbled = bytes.clone();
-    let last = garbled.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - 1;
+    let last = garbled.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_LIVE - 1;
     garbled[last] = 0xff;
     assert!(matches!(
         read_answer(&received(&garbled, 0), MAX_MESSAGE),
@@ -5496,11 +5710,11 @@ fn w12_an_infos_run_words_cross_the_wire_last() {
     let plain = info();
     let mut cut = answer(5, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
     assert_eq!(
-        cut[cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - 1],
+        cut[cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_LIVE - 1],
         0,
         "no words' tag ends it, but for its credentials and its agent-control endpoint"
     );
-    cut.truncate(cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_WORDS);
+    cut.truncate(cut.len() - NO_CREDENTIALS - NO_CONTROL - NO_WAKE - NO_LIVE - NO_WORDS);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -5514,11 +5728,12 @@ fn w12_an_infos_run_words_cross_the_wire_last() {
 
 /// Joint plan step 12 (D253; AC-T7.4.1): a usage answer says how a Shards image VM's microVM started, after its guest
 /// time, as an option: tag 1 and its place in `StartedFrom` (Booted 0, Saved 1, Restored 2, Replaced 3, Warm 4); a box
-/// with no Shards image run says none, a byte 0. Do answer each, then one whose tag is 5, then each as JSON. Expect each
-/// read back as written, its tag its last byte; none a 0 last; tag 5 refused as "started from"; the JSON named in
-/// kebab-case and left out where none.
+/// with no Shards image run says none, a byte 0. Its paused time's option byte follows it (kiln plan P5.5b), none here.
+/// Do answer each, then one whose tag is 5, then each as JSON. Expect each read back as written, its tag the byte before
+/// the paused time's 0; none a 0 there; tag 5 refused as "started from"; the JSON named in kebab-case and left out where
+/// none.
 #[test]
-fn w12_a_usages_microvm_start_crosses_the_wire_last() {
+fn w12_a_usages_microvm_start_crosses_the_wire_after_its_guest_time() {
     let usage = |started_from| {
         Answer::Usage(Usage {
             pids: 1,
@@ -5535,21 +5750,25 @@ fn w12_a_usages_microvm_start_crosses_the_wire_last() {
     ] {
         let said = usage(Some(from));
         let bytes = answer(4, &said, MAX_MESSAGE).unwrap();
-        assert_eq!(&bytes[bytes.len() - 2..], &[1, tag], "{from:?}");
+        assert_eq!(&bytes[bytes.len() - 3..], &[1, tag, 0], "{from:?}");
         assert_eq!(
             read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
             said
         );
     }
     let none = answer(4, &usage(None), MAX_MESSAGE).unwrap();
-    assert_eq!(&none[none.len() - 2..], &[0, 0], "no guest time, no start");
+    assert_eq!(
+        &none[none.len() - 3..],
+        &[0, 0, 0],
+        "no guest time, no start, no paused time"
+    );
     assert_eq!(
         read_answer(&received(&none, 0), MAX_MESSAGE).unwrap().1,
         usage(None)
     );
     let mut hostile = answer(4, &usage(Some(StartedFrom::Warm)), MAX_MESSAGE).unwrap();
-    let last = hostile.len() - 1;
-    hostile[last] = 5;
+    let tag = hostile.len() - 2;
+    hostile[tag] = 5;
     assert!(matches!(
         read_answer(&received(&hostile, 0), MAX_MESSAGE),
         Err(Fault::Value {
@@ -5570,6 +5789,57 @@ fn w12_a_usages_microvm_start_crosses_the_wire_last() {
         serde_json::from_value::<Usage>(older).unwrap(),
         Usage::default()
     );
+}
+
+/// Kiln plan P5.5b (AC-T7.4.1): a usage answer says a Shards image VM's paused time last, after how its microVM started,
+/// as an option: tag 1 and its nanoseconds; a box with no VM to pause says none, a byte 0. Do answer a paused time of
+/// u64::MAX and none, then the first with its option's tag 2, then it cut short, then each as JSON. Expect each read
+/// back as written, its nanoseconds its last eight bytes after a 1, none a 0 last; tag 2 refused as an option; the cut
+/// one refused as truncated; the JSON naming `paused_ns` where some and leaving it out where none.
+#[test]
+fn p5_5b_a_usages_paused_time_crosses_the_wire_last() {
+    let usage = |paused_ns| {
+        Answer::Usage(Usage {
+            pids: 1,
+            started_from: Some(StartedFrom::Booted),
+            paused_ns,
+            ..Usage::default()
+        })
+    };
+    let said = usage(Some(u64::MAX));
+    let bytes = answer(4, &said, MAX_MESSAGE).unwrap();
+    let at = bytes.len() - size_of::<u64>() - 1;
+    assert_eq!(bytes[at], 1);
+    assert_eq!(&bytes[at + 1..], &u64::MAX.to_le_bytes());
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        said
+    );
+    let none = answer(4, &usage(None), MAX_MESSAGE).unwrap();
+    assert_eq!(none.last(), Some(&0));
+    assert_eq!(
+        read_answer(&received(&none, 0), MAX_MESSAGE).unwrap().1,
+        usage(None)
+    );
+    let mut hostile = bytes.clone();
+    hostile[at] = 2;
+    assert!(matches!(
+        read_answer(&received(&hostile, 0), MAX_MESSAGE),
+        Err(Fault::Value { what: "option", .. })
+    ));
+    assert!(matches!(
+        read_answer(&received(&bytes[..bytes.len() - 1], 0), MAX_MESSAGE),
+        Err(Fault::Truncated { .. })
+    ));
+    let paused = Usage {
+        paused_ns: Some(7),
+        ..Usage::default()
+    };
+    let json = serde_json::to_value(&paused).unwrap();
+    assert_eq!(json["paused_ns"], 7);
+    assert_eq!(serde_json::from_value::<Usage>(json).unwrap(), paused);
+    let older = serde_json::to_value(Usage::default()).unwrap();
+    assert!(older.get("paused_ns").is_none(), "skipped when none");
 }
 
 /// Joint plan step 14 (AC-T7.4.1), C5: a box's priority band reaches its node. Do send a create of a spec in band 3
@@ -5872,17 +6142,19 @@ fn w12_a_shards_image_vms_shares_cross_the_wire_after_its_members() {
                 name: "claude".to_owned(),
             })],
             shares: vec![
-                Mount {
+                ImageShare {
                     source: PathBuf::from("/var/lib/kiln/homes/ada/.claude"),
                     destination: "/home/agent/.claude".to_owned(),
                     read_only: false,
                     members: Vec::new(),
+                    exec: true,
                 },
-                Mount {
+                ImageShare {
                     source: PathBuf::from("/srv/projects/hex"),
                     destination: "/work/hex".to_owned(),
                     read_only: true,
                     members: Vec::new(),
+                    exec: false,
                 },
             ],
             ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
@@ -5921,11 +6193,12 @@ fn p6_2_a_shards_image_vms_volumes_cross_the_wire_after_its_sign_ins() {
         bounds: Bounds::default(),
         class: ClassSpec::ShardsImage(Box::new(ShardsImage {
             members: vec![hex_api::ImageMember::new(harness.clone())],
-            shares: vec![Mount {
+            shares: vec![ImageShare {
                 source: PathBuf::from("/srv/projects/hex"),
                 destination: "/work/hex".to_owned(),
                 read_only: true,
                 members: Vec::new(),
+                exec: true,
             }],
             volumes: vec![
                 hex_api::ImageVolume {
@@ -6124,7 +6397,7 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
     tail.extend(49152u16.to_le_bytes());
     tail.push(1);
     tail.extend(1455u16.to_le_bytes());
-    tail.extend([0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE]);
+    tail.extend([0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE + NO_LIVE]);
     assert!(bytes.ends_with(&tail));
     let declared = Answer::Info(BoxInfo {
         class: Class::Shards,
@@ -6144,7 +6417,7 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
         older.ends_with(
             &[
                 &[0][..],
-                &[0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE][..]
+                &[0; NO_END + NO_WORDS + NO_CREDENTIALS + NO_CONTROL + NO_WAKE + NO_LIVE][..]
             ]
             .concat()
         )
@@ -6173,7 +6446,8 @@ fn an_inspect_carries_its_grants_and_their_ports_as_bound() {
         - NO_WORDS
         - NO_CREDENTIALS
         - NO_CONTROL
-        - NO_WAKE;
+        - NO_WAKE
+        - NO_LIVE;
     hostile[receiver] = 2;
     assert!(matches!(
         read_answer(&received(&hostile, 0), MAX_MESSAGE),
@@ -6300,11 +6574,12 @@ fn w33_a_shards_image_vms_credential_grants_cross_the_wire_after_its_shares() {
         bounds: Bounds::default(),
         class: ClassSpec::ShardsImage(Box::new(ShardsImage {
             grants: each_way(),
-            shares: vec![Mount {
+            shares: vec![ImageShare {
                 source: PathBuf::from("/srv/projects/hex"),
                 destination: "/work/hex".to_owned(),
                 read_only: true,
                 members: vec![harness()],
+                exec: true,
             }],
             credentials,
             ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
@@ -6329,11 +6604,13 @@ fn w33_a_shards_image_vms_credential_grants_cross_the_wire_after_its_shares() {
     let mut scope = Writer::new(MAX_MESSAGE);
     scope.list(&[harness()], put_member).unwrap();
     let scope = scope.done().unwrap();
-    // After the share's guest path, its read-only flag, then its member scope, then the credentials.
+    // After the share's guest path, its read-only flag, then its member scope, then whether its files may be run
+    // (Shards' D279), then the credentials.
     let flag = bytes.windows(share.len()).position(|w| w == share).unwrap() + share.len();
     assert_eq!(bytes[flag], 1);
     assert_eq!(&bytes[flag + 1..flag + 1 + scope.len()], scope.as_slice());
-    let at = flag + 1 + scope.len();
+    assert_eq!(bytes[flag + 1 + scope.len()], 1);
+    let at = flag + 1 + scope.len() + 1;
     assert_eq!(&bytes[at..at + listed.len()], listed.as_slice());
     let unreached = openai_credential("evil.example");
     let refused = Request::Call(Call::Create(Box::new(spec(unreached.clone()))));
@@ -6375,7 +6652,9 @@ fn w33_an_inspect_carries_its_credential_grants_last() {
     );
     let mut listed = Writer::new(MAX_MESSAGE);
     put_credentials(&mut listed, &credentials, &each_way()).unwrap();
-    assert!(bytes[..bytes.len() - NO_CONTROL - NO_WAKE].ends_with(&listed.done().unwrap()));
+    assert!(
+        bytes[..bytes.len() - NO_CONTROL - NO_WAKE - NO_LIVE].ends_with(&listed.done().unwrap())
+    );
     let unreached = Answer::Info(BoxInfo {
         class: Class::Shards,
         grants: Vec::new(),
@@ -6410,6 +6689,7 @@ fn an_inspect_carries_its_runs_agent_control_endpoint_last() {
             class: Class::Shards,
             control: Some(at.parse().unwrap()),
             control_wake: None,
+            live: None,
             ..info()
         };
         let bytes = answer(99, &Answer::Info(shown.clone()), MAX_MESSAGE).unwrap();
@@ -6418,7 +6698,14 @@ fn an_inspect_carries_its_runs_agent_control_endpoint_last() {
             Answer::Info(shown.clone()),
             "{at}"
         );
-        let tail = [&[1u8][..], &address, &43471u16.to_le_bytes(), &[0u8]].concat();
+        let tail = [
+            &[1u8][..],
+            &address,
+            &43471u16.to_le_bytes(),
+            &[0u8],
+            &[0u8],
+        ]
+        .concat();
         assert!(bytes.ends_with(&tail), "{at}");
         let json = serde_json::to_value(&shown).unwrap();
         assert_eq!(serde_json::from_value::<BoxInfo>(json).unwrap(), shown);
@@ -6437,8 +6724,12 @@ fn an_inspect_carries_its_runs_agent_control_endpoint_last() {
     }
     let plain = info();
     let mut cut = answer(99, &Answer::Info(plain.clone()), MAX_MESSAGE).unwrap();
-    assert_eq!(cut.last(), Some(&0), "no waker's and wake's tag ends it");
-    cut.truncate(cut.len() - NO_WAKE);
+    assert_eq!(
+        cut.last(),
+        Some(&0),
+        "no live changes' tag ends it, after no waker's and wake's"
+    );
+    cut.truncate(cut.len() - NO_WAKE - NO_LIVE);
     assert!(matches!(
         read_answer(&received(&cut, 0), MAX_MESSAGE),
         Err(Fault::Truncated { .. })
@@ -6465,6 +6756,7 @@ fn v30_an_inspect_carries_its_endpoints_waker_and_wake_after_it() {
             class: Class::Shards,
             control: Some(control),
             control_wake: Some(ControlWake { waker, wake }),
+            live: None,
             ..info()
         };
         assert_eq!(shown.control_sockets(), Some([control, waker, wake]));
@@ -6484,6 +6776,7 @@ fn v30_an_inspect_carries_its_endpoints_waker_and_wake_after_it() {
             &waker.port().to_le_bytes(),
             &address(wake),
             &wake.port().to_le_bytes(),
+            &[0u8][..],
         ]
         .concat();
         assert!(bytes.ends_with(&tail), "{control}");
@@ -6497,6 +6790,7 @@ fn v30_an_inspect_carries_its_endpoints_waker_and_wake_after_it() {
             waker: v4(50001),
             wake: v4(50002),
         }),
+        live: None,
         ..info()
     };
     assert_eq!(unbound.control_sockets(), None);
@@ -7210,4 +7504,294 @@ fn q13_a_sealed_message_is_held_to_one_messages_bound() {
         })
     );
     assert_eq!(here.next.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// Shards' D270 slice 4 (AC-T7.4.1): a swap crosses the wire as an appended call, its box, its member's path, its
+/// component's digest and when last, a byte (0 its next start, 1 now); its answer every member's component, the
+/// generation a `Now` started and the bytes it let go unread; its refusal tag 18, the cause's place and Shards' words
+/// as an option. Do write a swap now and read it back, then it with its when byte 2; write a swap's answer and a refusal
+/// and read each back, then the refusal with its cause byte 11. Expect each read back as written, its when the last
+/// byte, 1; when 2 refused as "swap when"; cause 11 refused as "swap cause".
+#[test]
+fn d270_a_swap_its_answer_and_its_refusal_cross_the_wire() {
+    let swap = Request::Call(Call::Swap {
+        id: id("image"),
+        at: "/harness/claude".to_owned(),
+        digest: hex_api::sim::SIM_COMPONENT.to_owned(),
+        when: SwapWhen::Now,
+    });
+    let bytes = request(7, &swap, MAX_MESSAGE).unwrap();
+    assert_eq!(bytes.last(), Some(&1));
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        swap
+    );
+    let mut hostile = bytes.clone();
+    let last = hostile.len() - 1;
+    hostile[last] = 2;
+    assert!(matches!(
+        read_request(&received(&hostile, 0), MAX_MESSAGE).map_err(|bad| bad.fault),
+        Err(Fault::Value {
+            what: "swap when",
+            ..
+        })
+    ));
+    let swapped = Answer::Swapped(Swapped {
+        components: vec![ComponentAt {
+            at: "/harness/claude".to_owned(),
+            desired: None,
+            held: Some(hex_api::sim::SIM_COMPONENT.to_owned()),
+        }],
+        started: Some(3),
+        unread: 4096,
+    });
+    let bytes = answer(7, &swapped, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        swapped
+    );
+    let refused = Answer::Refused(Refusal::Swap {
+        id: id("image"),
+        op: "swap",
+        cause: SwapCause::Asks,
+        why: Some("port 22/tcp is past its member's grants".to_owned()),
+    });
+    let bytes = answer(7, &refused, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        refused
+    );
+    let words = b"port 22/tcp is past its member's grants";
+    // The cause's tag sits before the option of its words: their tag and length.
+    let tag = bytes.len() - words.len() - size_of::<u32>() - 2;
+    assert_eq!(bytes[tag], 4, "Asks, by its place");
+    let mut hostile = bytes.clone();
+    // The first tag past every cause's: Shards' ten, where the box stands, then a member's next start (Workdir 11,
+    // Capacity 12).
+    hostile[tag] = 13;
+    assert!(matches!(
+        read_answer(&received(&hostile, 0), MAX_MESSAGE),
+        Err(Fault::Value {
+            what: "swap cause",
+            ..
+        })
+    ));
+}
+
+/// Kiln plan P6b.3 (AC-T7.4.1; docs/design/shards-image-class.md §14): a running box's change crosses the wire as an
+/// appended call, its box then its change (a tag by its place in `Live`, then its parts); its refusal as tag 20, where the
+/// box stands or Shards' cause by its place, then Shards' words as an option; an inspect's record of what its run took
+/// after every older field; and an image spec's plug roots and ceiling after its served shares. Do write each change and
+/// read it back, then an unplug with its tag 6; write a refusal of each kind of cause and read each back, then one with
+/// its cause byte 6; write an info holding a grant, its port as bound, a connection and a plug, and a spec with roots and
+/// a ceiling, and read each back. Expect each read back as written; tag 6 refused as "change", cause 6 as "change cause".
+#[test]
+fn p6b3_a_change_its_refusal_and_what_a_run_took_cross_the_wire() {
+    let harness = Member {
+        kind: MemberKind::Harness,
+        name: "claude".to_owned(),
+    };
+    let egress = Grant::Egress {
+        member: harness.clone(),
+        to: Destination::Name("api.example.com".to_owned()),
+        ports: Ports {
+            proto: Proto::Tcp,
+            first: 443,
+            last: 443,
+        },
+    };
+    let publish = Grant::Publish {
+        member: harness.clone(),
+        proto: Proto::Tcp,
+        port: 3000,
+        host: "127.0.0.1".parse().unwrap(),
+        host_port: Some(8080),
+    };
+    let grant = NetworkGrant {
+        name: "alice".to_owned(),
+        peer: "bob.team".to_owned(),
+        proto: Proto::Udp,
+        first: 8080,
+        last: 8081,
+        way: Way::In,
+    };
+    let plug = ImagePlug {
+        source: PathBuf::from("/srv/data"),
+        members: vec![harness.clone()],
+        at: "/volumes/data".to_owned(),
+        read_only: true,
+        exec: false,
+    };
+    for change in [
+        Live::Grant(egress.clone()),
+        Live::Revoke(publish.clone()),
+        Live::Connect {
+            member: harness.clone(),
+            network: "team".to_owned(),
+            grant: grant.clone(),
+        },
+        Live::Disconnect {
+            member: harness.clone(),
+            network: "team".to_owned(),
+            grant: grant.clone(),
+        },
+        Live::Plug(plug.clone()),
+        Live::Unplug {
+            at: "/volumes/data".to_owned(),
+        },
+    ] {
+        let call = Request::Call(Call::Change {
+            id: id("image"),
+            change,
+        });
+        let bytes = request(7, &call, MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            call
+        );
+    }
+    // An unplug: its box, then its tag (5, by its place) and its place, last.
+    let unplug = Request::Call(Call::Change {
+        id: id("image"),
+        change: Live::Unplug {
+            at: "/v/d".to_owned(),
+        },
+    });
+    let bytes = request(7, &unplug, MAX_MESSAGE).unwrap();
+    let tag = bytes.len() - "/v/d".len() - size_of::<u32>() - 1;
+    assert_eq!(bytes[tag], 5, "Unplug, by its place");
+    let mut hostile = bytes.clone();
+    hostile[tag] = 6;
+    assert!(matches!(
+        read_request(&received(&hostile, 0), MAX_MESSAGE).map_err(|bad| bad.fault),
+        Err(Fault::Value { what: "change", .. })
+    ));
+    for cause in [
+        LiveCause::NotRunning,
+        LiveCause::Ended,
+        LiveCause::Class(Class::Process),
+        LiveCause::Unsupported,
+        LiveCause::Net(NetCause::Overlaps),
+        LiveCause::Plug(PlugCause::Clearing),
+    ] {
+        let refused = Answer::Refused(Refusal::Live {
+            id: id("image"),
+            op: "grant",
+            cause,
+            why: Some("past its ceiling".to_owned()),
+        });
+        let bytes = answer(7, &refused, MAX_MESSAGE).unwrap();
+        assert_eq!(
+            read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+            refused
+        );
+    }
+    // Its cause's tag (1, Ended), then its words' none tag, last.
+    let refused = Answer::Refused(Refusal::Live {
+        id: id("image"),
+        op: "plug",
+        cause: LiveCause::Ended,
+        why: None,
+    });
+    let bytes = answer(7, &refused, MAX_MESSAGE).unwrap();
+    let tag = bytes.len() - 2;
+    assert_eq!(bytes[tag], 1, "Ended, by its place");
+    let mut hostile = bytes.clone();
+    hostile[tag] = 6;
+    assert!(matches!(
+        read_answer(&received(&hostile, 0), MAX_MESSAGE),
+        Err(Fault::Value {
+            what: "change cause",
+            ..
+        })
+    ));
+    let shown = BoxInfo {
+        class: Class::ShardsImage,
+        live: Some(LiveHeld {
+            grants: vec![publish, egress.clone()],
+            published: vec![Published {
+                grant: 0,
+                at: "127.0.0.1:8080".parse().unwrap(),
+                receiver: Receiver::Named { port: 3000 },
+            }],
+            networks: vec![Connection {
+                member: harness,
+                network: "team".to_owned(),
+                grant,
+            }],
+            plugs: vec![plug],
+        }),
+        ..info()
+    };
+    let bytes = answer(7, &Answer::Info(shown.clone()), MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_answer(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        Answer::Info(shown)
+    );
+    let create = Request::Call(Call::Create(Box::new(BoxSpec {
+        id: id("image-live"),
+        bounds: Bounds::default(),
+        class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+            plug_roots: vec!["/volumes".to_owned()],
+            ceiling: vec![egress],
+            ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
+        })),
+        owner: None,
+        devices: Vec::new(),
+        allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+        route: None,
+        band: 0,
+    })));
+    let bytes = request(9, &create, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        create
+    );
+}
+
+/// Shards' D279 (AC-T7.4.1): whether a share's files may be run from it crosses the wire after its member scope (Shards'
+/// D277), a byte. Do create a VM sharing a project whose files may not be run, read it back, then send it with that byte
+/// 2. Expect it read back whole, its share's byte 0 after a read-only 1 and its scope, none, and the byte 2 refused as
+/// "exec".
+#[test]
+fn d279_a_shares_exec_crosses_the_wire_after_its_member_scope() {
+    let create = Request::Call(Call::Create(Box::new(BoxSpec {
+        id: id("image-noexec"),
+        bounds: Bounds::default(),
+        class: ClassSpec::ShardsImage(Box::new(ShardsImage {
+            shares: vec![ImageShare {
+                source: PathBuf::from("/srv/projects/hex"),
+                destination: "/work/hex".to_owned(),
+                read_only: true,
+                members: Vec::new(),
+                exec: false,
+            }],
+            ..ShardsImage::new(hex_api::sim::SIM_IMAGE)
+        })),
+        owner: None,
+        devices: Vec::new(),
+        allocation: Some(hex_api::sim::sim_vm_allocation().unwrap()),
+        route: None,
+        band: 0,
+    })));
+    let bytes = request(9, &create, MAX_MESSAGE).unwrap();
+    assert_eq!(
+        read_request(&received(&bytes, 0), MAX_MESSAGE).unwrap().1,
+        create
+    );
+    let share = b"/work/hex";
+    let flag = bytes.windows(share.len()).position(|w| w == share).unwrap() + share.len();
+    let mut scope = Writer::new(MAX_MESSAGE);
+    scope.list(&[] as &[Member], put_member).unwrap();
+    let scope = scope.done().unwrap();
+    assert_eq!(bytes[flag], 1);
+    assert_eq!(&bytes[flag + 1..flag + 1 + scope.len()], scope.as_slice());
+    let at = flag + 1 + scope.len();
+    assert_eq!(bytes[at], 0);
+    let mut hostile = bytes.clone();
+    hostile[at] = 2;
+    assert!(matches!(
+        read_request(&received(&hostile, 0), MAX_MESSAGE).map_err(|bad| bad.fault),
+        Err(Fault::Value { what: "exec", .. })
+    ));
 }

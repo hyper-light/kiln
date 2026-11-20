@@ -32,7 +32,8 @@ own = ["UPSTREAM.md"]
 # publishes these behind an -api crate, Hex depends on that by name and this entry goes.
 # At e0613f52: patch Q35 (hyper-quic's `Connection::handshake_progress`) on hyper-raft's branch
 # p/q35-handshake-progress-v1, main-bound (its main fast-forwards to this commit once its consumers' suites pass),
-# the commit Shards' shards-remote takes hyper-quic at (vendor/shards); kiln takes the same as it vendors this Hex.
+# the commit Shards' shards-remote takes hyper-quic at (Shards by git, Cargo.toml); kiln takes the same as it vendors
+# this Hex.
 [projects.hyper-raft]
 kind = "git"
 repository = "https://github.com/hyper-light/hyper-raft"
@@ -105,21 +106,6 @@ take = [
     "src/device/readers/amd_adl/sensors.rs",
 ]
 own = ["UPSTREAM.md"]
-
-# Shards' public API (shards-api: the direct boot D215, launches through a client's native owner D233, GPU
-# selection by exact identity D232, and images booted under shards-init for an orchestrator D231, with D234's
-# nesting grant and its GPUs, D235's plugs, D236's destinations, a member's stdin, and D251/D252's agent-control
-# endpoint, whose controller is shards-remote's), its ABI, IPC, DNS-name, remote-control, AF_UNIX transport,
-# Apple-frameworks (shards-api's on macOS) and test-directory crates, at a Shards main. Every change Hex carried before is upstream (vendor/shards/UPSTREAM.md).
-# shards-remote takes hyper-quic from hyper-raft by git upstream; Hex's workspace and vendor/shards' scaffold patch it
-# to the one vendored copy (vendor/hyper-raft). The take list holds the fixtures the API's tests include.
-[projects.shards]
-kind = "git"
-repository = "https://github.com/hyper-light/shards"
-commit = "aa819b0585649563d7185298db58bda8ac9dd533"
-path = "vendor/shards"
-take = ["LICENSE", "AGENTS.md", "CLAUDE.md", "clippy.toml", "rustfmt.toml", "docs/development-rules.md", "docs/development-evidence.md", "crates/api", "crates/abi", "crates/afunix", "crates/apple", "crates/dns", "crates/durable", "crates/ipc", "crates/judge", "crates/remote", "crates/testdir", "docs/research/measurements/managed-borrowed-nowait/focused.rs", "docs/research/measurements/managed-borrowed-nowait/contract.rs", "docs/research/measurements/borrowed-no-clock/focused.rs", "docs/research/measurements/managed-proc-main/allocation.rs", "docs/research/measurements/managed-proc-main/repro.rs", "docs/research/measurements/managed-proc-main/reader-tests.rs", "docs/research/measurements/api-flakes/spawns.rs", "docs/research/measurements/api-flakes/half-close.rs"]
-own = ["Cargo.toml", "UPSTREAM.md"]
 
 # Firecracker (AWS): the VMM Hex's `firecracker` class launches (crates/hex-runtime/src/firecracker; its
 # PREBOOT_REVISION is this commit). Upstream's VFIO development chain (feature/vfio, in no release yet)

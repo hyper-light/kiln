@@ -1042,6 +1042,7 @@ fn w14_a_capping_nodes_inspect_says_why_its_last_resort_ended_a_vm() {
             ended: None,
             control: None,
             control_wake: None,
+            live: None,
             credentials: Vec::new(),
         })
         .unwrap();
@@ -1346,6 +1347,7 @@ fn w14_a_capping_node_learns_an_image_vm_through_its_run() {
         guest_ns: vec![each_ns; usize::try_from(vcpus).unwrap()],
         window: std::time::Duration::ZERO,
         charged: hex_api::Charged::ToThread,
+        paused: std::time::Duration::ZERO,
     };
     io.host
         .borrow_mut()
@@ -1396,6 +1398,82 @@ fn w14_a_capping_node_learns_an_image_vm_through_its_run() {
         learner.window(&io, &holders(&[vm]), budget, start + WINDOW * 2),
         Err(Refusal::Invalid { why, .. }) if why.contains("vCPU count")
     ));
+}
+
+/// Kiln plan P5.5b (AC-T7.4.1; docs/design/learned-charge.md C1): a span that holds an image VM's pause is no sample of
+/// its use, so its owner's pause keeps the charge and booking its windows made, and the room they hold, for its resume.
+/// Do warm an image VM of 16 vCPUs through SEEDABLE windows in which it runs 8 CPUs; then run as many again in which its
+/// owner holds it paused, its paused time growing, its guest time flat and its VMM alone running 10 milli-CPU; then the
+/// window its resume falls in and two after it, each running 16 CPUs. Expect its charge and booking 8 CPUs through every
+/// paused window, as before them, where those windows taken as samples would have brought both down to its VMM's own; the
+/// window its resume falls in no sample either, so the first after it leaves its charge at 8 CPUs (one reading of 16
+/// among its last SEEDABLE, its p99.9 the second largest); and the second after it a sample again, its charge 16 CPUs.
+#[test]
+fn p5_5b_a_paused_image_vm_keeps_its_charge_and_booking() {
+    let io = Record::default();
+    let vm = image_vm("img-1", 1);
+    let records = std::slice::from_ref(&vm);
+    let vcpus = 16u64;
+    let use_at = |cpu_ns: u64, each_ns: u64, paused: Duration| HostUse {
+        cpu_ns,
+        footprint_bytes: 3 * GIB,
+        resident_bytes: 3 * GIB,
+        guest_ns: vec![each_ns; usize::try_from(vcpus).unwrap()],
+        window: Duration::ZERO,
+        charged: hex_api::Charged::ToThread,
+        paused,
+    };
+    let budget = res(24_000, 64 * GIB);
+    let mut learner = Learner::new(true, res(32_000, 64 * GIB)).unwrap();
+    let start = Instant::now();
+    let (mut cpu, mut each, mut paused, mut window) = (0u64, 0u64, Duration::ZERO, 0u32);
+    let mut run = |learner: &mut Learner, cpu_ns: u64, guest_ns: u64, held: Duration| {
+        cpu += cpu_ns;
+        each += guest_ns;
+        paused += held;
+        io.host
+            .borrow_mut()
+            .insert("img-1".to_owned(), use_at(cpu, each, paused));
+        learner
+            .window(&io, &holders(records), budget, start + WINDOW * window)
+            .unwrap();
+        window += 1;
+    };
+    // Its first reading, its baseline; then 8 CPUs over each 300 ms window, every vCPU half of one.
+    run(&mut learner, 0, 0, Duration::ZERO);
+    let span = u64::try_from(WINDOW.as_nanos()).unwrap();
+    for _ in 0..charge::SEEDABLE {
+        run(&mut learner, 8 * span, span / 2, Duration::ZERO);
+    }
+    let lifetime = learner.vms.get(&Scope::Started(1)).unwrap().lifetime;
+    let cpu_of = |learner: &Learner| {
+        (
+            learner.node.charge(&lifetime).unwrap().cpu_milli,
+            learner.node.booking(&lifetime).unwrap().cpu_milli,
+        )
+    };
+    assert_eq!(learner.node.warmed(&lifetime), Some(true));
+    assert_eq!(cpu_of(&learner), (8_000, 8_000), "warmed at 8 CPUs");
+    // Paused: its VMM's own alone, 10 milli-CPU, its guest time flat, its paused time the whole window.
+    for _ in 0..charge::SEEDABLE {
+        run(&mut learner, span / 100, 0, WINDOW);
+        assert_eq!(cpu_of(&learner), (8_000, 8_000), "a paused window took");
+    }
+    // The window its resume falls in, the rest of its pause in it, then two after it: 16 CPUs each.
+    run(&mut learner, 16 * span, span, WINDOW / 3);
+    assert_eq!(cpu_of(&learner).0, 8_000, "its resume's window took");
+    run(&mut learner, 16 * span, span, Duration::ZERO);
+    assert_eq!(
+        cpu_of(&learner).0,
+        8_000,
+        "one reading of 16 CPUs moved its p99.9"
+    );
+    run(&mut learner, 16 * span, span, Duration::ZERO);
+    assert_eq!(
+        cpu_of(&learner).0,
+        16_000,
+        "the window after its resume is a sample"
+    );
 }
 
 /// Joint plan step 14 (AC-T7.4.1), C1 with no census (ROOT, 2026-11-13; decision 9): a node whose cost carries no VMM
@@ -1474,6 +1552,7 @@ fn w14_an_answer_carries_each_learned_vms_holding_an_image_vms_too() {
             guest_ns: vec![0; 16],
             window: std::time::Duration::ZERO,
             charged: hex_api::Charged::ToThread,
+            paused: std::time::Duration::ZERO,
         },
     );
     let records = vec![vm("vm-1", 1), image_vm("img-1", 2)];
@@ -1601,6 +1680,7 @@ fn unused(io: &Record, name: &str, held: u64) {
             guest_ns: vec![0; 16],
             window: Duration::ZERO,
             charged: hex_api::Charged::ToThread,
+            paused: std::time::Duration::ZERO,
         },
     );
 }
@@ -1809,6 +1889,7 @@ impl hex_api::Runtime for Images {
             guest_ns: Vec::new(),
             window: Duration::ZERO,
             charged: hex_api::Charged::ToThread,
+            paused: std::time::Duration::ZERO,
         })
     }
 }
@@ -1844,6 +1925,7 @@ impl crate::recorded::Recover for Images {
             guest_ns: Vec::new(),
             window: self.node_vm_rate_period(run)?.unwrap_or_default(),
             charged: hex_api::Charged::ToThread,
+            paused: std::time::Duration::ZERO,
         })
     }
     fn node_vm_rate_period(&self, run: hex_api::NodeRun) -> Result<Option<Duration>, Refusal> {
@@ -2440,6 +2522,7 @@ fn w14_d260_an_image_vms_governor_takes_its_share_less_its_vmms_own() {
         guest_ns: vec![each_ns; 16],
         window,
         charged: hex_api::Charged::ToThread,
+        paused: std::time::Duration::ZERO,
     };
     io.host.borrow_mut().insert(
         "img-1".to_owned(),
@@ -3114,6 +3197,7 @@ fn w39_a_node_vms_guest_is_told_its_room_as_an_image_vms_is() {
         guest_ns: vec![each_ns; 16],
         window: Duration::ZERO,
         charged: hex_api::Charged::ToThread,
+        paused: std::time::Duration::ZERO,
     };
     io.host
         .borrow_mut()

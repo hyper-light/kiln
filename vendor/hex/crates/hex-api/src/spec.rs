@@ -345,14 +345,15 @@ pub struct ShardsImage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<ImageMember>,
     /// The host directories its guest sees (Shards' D231 shares, as `shards run -v HOST:AT[:ro]` gives one; kiln's
-    /// step 18: a person's home volumes, and a project at its host path, D235): each a `Mount`, its `source` the host
-    /// directory, absolute on the host its node runs on, its `destination` where the guest sees it, absolute, and
-    /// `read_only` whether the guest may write it. A member gets one where its image's `VOLUME` at that path is for it
-    /// (Shards' D109), or where its member scope names it (`Mount::members`, Shards' D277), and the run's own command
-    /// gets every one. None by default: the guest sees only the shares named here, the image's own grants widening none.
+    /// step 18: a person's home volumes, and a project at its host path, D235): each an [`ImageShare`], its `source` the
+    /// host directory, absolute on the host its node runs on, its `destination` where the guest sees it, absolute,
+    /// `read_only` whether the guest may write it, its member scope, and whether its files may be run from it. A member
+    /// gets one where its image's `VOLUME` at that path is for it (Shards' D109), or where its member scope names it
+    /// (`ImageShare::members`, Shards' D277), and the run's own command gets every one. None by default: the guest sees
+    /// only the shares named here, the image's own grants widening none.
     /// After the members (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub shares: Vec<Mount>,
+    pub shares: Vec<ImageShare>,
     /// Its members' credentials, granted by reference (Shards' D242; joint plan step 33; docs/design/credential-grants.md):
     /// each a credential its orchestrator's store names, never its value, which its member's requests to the hosts its
     /// grant names alone may have filled in at the VM's egress, leased as they first need it ([`crate::lease`]). None by
@@ -376,6 +377,19 @@ pub struct ShardsImage {
     /// guest and that server. None by default. After the volumes (append-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub served: Vec<ServedMount>,
+    /// Where its members may be given a host directory as its run goes (kiln plan P6b.3, docs/design/shards-image-class.md
+    /// §14; Shards' D271 `ImageSpec::plug_roots`): each a top-level directory of its members' view, beside its shares'
+    /// own, beneath which a plug ([`crate::Live::Plug`]) goes, given its members' domains as its run starts and never
+    /// widened after. None by default: a plug goes beneath its shares' own directories alone. After `served`
+    /// (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plug_roots: Vec<String>,
+    /// The most each member may be given past its grants as its run goes (kiln plan P6b.3, §14; Shards' D278
+    /// `ImageSpec::egress_ceiling`): `Egress` and `Host` grants, the person's own policy, never a grant itself; a live
+    /// grant past them and its image's grants is refused (`Widening`). None by default: nothing live past its grants.
+    /// After `plug_roots` (append-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ceiling: Vec<crate::Grant>,
 }
 
 /// A share another server serves a Shards image's guest ([`ShardsImage::served`]; Shards' D286, `shards_api::image::
@@ -488,6 +502,42 @@ fn named_once(field: &str, members: &[crate::Member]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// A host directory a Shards image VM's guest sees ([`ShardsImage::shares`], Shards' `ImageShare`): `source` the host
+/// directory, absolute on the host its node runs on, `destination` where the guest sees it, absolute, `read_only`
+/// whether the guest may write it and `members` its member scope, as a [`Mount`]'s are, and `exec` whether its files
+/// may be run from it (Shards' D279). Its JSON is a `Mount`'s with `exec` beside it, so a record or a request that
+/// names a share as a `Mount` reads as one, its files runnable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageShare {
+    pub source: PathBuf,
+    pub destination: String,
+    pub read_only: bool,
+    /// Its member scope (Shards' D277), as [`Mount::members`] says it: the members given it as they start; none, the
+    /// run's own root alone, a member seeing it only where its image's `VOLUME` there is for it (D109).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<crate::Member>,
+    /// Whether its files may be run from it (Shards' D279): on by default, as every share's were before it; off, each of
+    /// its mounts is `noexec`, the run's own and each member's, so a program or a library there is refused (EACCES)
+    /// while an interpreter elsewhere still reads a script there as data. After `members` (append-only): a record or a
+    /// request that names none is on.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub exec: bool,
+}
+
+impl From<Mount> for ImageShare {
+    /// A mount as a share: its source, place, read-only and member scope, its files runnable, as every share's were
+    /// before D279.
+    fn from(m: Mount) -> Self {
+        Self {
+            source: m.source,
+            destination: m.destination,
+            read_only: m.read_only,
+            members: m.members,
+            exec: true,
+        }
+    }
+}
+
 /// A member of a Shards image its caller drives ([`ShardsImage::members`]): which one, by the kind and name
 /// its Agentfile gives it, the variables it gets over its image's, and the folder it works in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +624,8 @@ impl ShardsImage {
             sign_ins: Vec::new(),
             volumes: Vec::new(),
             served: Vec::new(),
+            plug_roots: Vec::new(),
+            ceiling: Vec::new(),
         }
     }
 
@@ -702,6 +754,30 @@ impl ShardsImage {
                 )));
             }
         }
+        // Its plug roots (kiln plan P6b.3; Shards' D271), each a root Shards takes and each named once.
+        for (at, root) in self.plug_roots.iter().enumerate() {
+            crate::check_plug_root(root, &format!("plug_roots[{at}]"))?;
+            if self.plug_roots.get(..at).unwrap_or_default().contains(root) {
+                return Err(invalid_image(format!(
+                    "plug_roots[{at}] names {root:?} again"
+                )));
+            }
+        }
+        // Its ceiling (kiln plan P6b.3; Shards' D278): egress and host grants alone, each as N5's one check takes a grant,
+        // none named twice; a publish is no reach.
+        if let Some(at) = self
+            .ceiling
+            .iter()
+            .position(|grant| matches!(grant, crate::Grant::Publish { .. }))
+        {
+            return Err(invalid_image(format!(
+                "ceiling[{at}] is a publish: a ceiling holds egress and host grants, the most a member may reach"
+            )));
+        }
+        crate::check_grants(&self.ceiling).map_err(|e| match e {
+            Refusal::Invalid { why, .. } => invalid_image(format!("ceiling: {why}")),
+            other => other,
+        })?;
         // Its credentials, each one that could be filled in exactly as it says over the grants just taken (joint plan
         // step 33, docs/design/credential-grants.md C2).
         crate::check_credentials(&self.credentials, &self.grants)?;
@@ -1722,11 +1798,12 @@ mod tests {
     /// are none; each other refused as Invalid naming the share's field, by its place.
     #[test]
     fn w12_an_image_vms_shares_are_checked_by_field() {
-        let share = |source: &str, destination: &str, read_only: bool| Mount {
+        let share = |source: &str, destination: &str, read_only: bool| ImageShare {
             source: PathBuf::from(source),
             destination: destination.to_owned(),
             read_only,
             members: Vec::new(),
+            exec: true,
         };
         let home = share(
             "/var/lib/kiln/homes/ada/.claude",
@@ -1734,7 +1811,7 @@ mod tests {
             false,
         );
         let project = share("/srv/projects/hex", "/work/hex", true);
-        let with = |shares: Vec<Mount>| ShardsImage {
+        let with = |shares: Vec<ImageShare>| ShardsImage {
             shares,
             ..ShardsImage::new(crate::sim::SIM_IMAGE)
         };
@@ -1745,7 +1822,7 @@ mod tests {
         let none = with(Vec::new());
         none.check().unwrap();
         assert!(serde_json::to_value(&none).unwrap().get("shares").is_none());
-        let refused = |shares: Vec<Mount>| match with(shares).check() {
+        let refused = |shares: Vec<ImageShare>| match with(shares).check() {
             Err(Refusal::Invalid { what, why }) => (what, why),
             other => panic!("not refused as Invalid: {other:?}"),
         };
@@ -1812,11 +1889,12 @@ mod tests {
             )
         };
         let with = |volumes: Vec<ImageVolume>| ShardsImage {
-            shares: vec![Mount {
+            shares: vec![ImageShare {
                 source: PathBuf::from("/srv/projects/hex"),
                 destination: "/work/hex".to_owned(),
                 read_only: false,
                 members: Vec::new(),
+                exec: true,
             }],
             volumes,
             ..ShardsImage::new(crate::sim::SIM_IMAGE)
@@ -1916,11 +1994,12 @@ mod tests {
             ..served("kiln-reference", "/srv/reference", Vec::new())
         };
         let with = |served: Vec<ServedMount>| ShardsImage {
-            shares: vec![Mount {
+            shares: vec![ImageShare {
                 source: PathBuf::from("/srv/projects/hex"),
                 destination: "/work/hex".to_owned(),
                 read_only: false,
                 members: Vec::new(),
+                exec: true,
             }],
             volumes: vec![ImageVolume {
                 name: "kiln-agent-cache".to_owned(),
@@ -1992,13 +2071,14 @@ mod tests {
             kind: crate::MemberKind::Harness,
             name: "codex".to_owned(),
         };
-        let share = |members: Vec<crate::Member>| Mount {
+        let share = |members: Vec<crate::Member>| ImageShare {
             source: PathBuf::from("/srv/projects/hex"),
             destination: "/work/hex".to_owned(),
             read_only: false,
             members,
+            exec: true,
         };
-        let with = |shares: Vec<Mount>| ShardsImage {
+        let with = |shares: Vec<ImageShare>| ShardsImage {
             shares,
             ..ShardsImage::new(crate::sim::SIM_IMAGE)
         };
@@ -2025,7 +2105,12 @@ mod tests {
             }
         }
         let mut container = spec();
-        container.mounts = vec![share(vec![codex])];
+        container.mounts = vec![Mount {
+            source: PathBuf::from("/srv/projects/hex"),
+            destination: "/work/hex".to_owned(),
+            read_only: false,
+            members: vec![codex],
+        }];
         match container.check() {
             Err(Refusal::Invalid {
                 what: "oci spec",
@@ -2033,6 +2118,30 @@ mod tests {
             }) => assert!(why.contains("mounts[0].members"), "{why}"),
             other => panic!("not refused as Invalid: {other:?}"),
         }
+    }
+
+    /// Shards' D279 (AC-T7.4.1): whether a share's files may be run from it is its own, on unless it says so, and a
+    /// record or a request written before it named none reads on. Do read a share whose JSON names no `exec`, then
+    /// write it, then one refusing execution, and read each back. Expect the first on and written without `exec`, as
+    /// before D279, and the second written `"exec": false` and read back off.
+    #[test]
+    fn d279_a_shares_exec_is_on_unless_it_says_so() {
+        let before: ImageShare = serde_json::from_value(serde_json::json!({
+            "source": "/srv/projects/hex",
+            "destination": "/work/hex",
+            "read_only": true,
+        }))
+        .unwrap();
+        assert!(before.exec, "{before:?}");
+        let json = serde_json::to_value(&before).unwrap();
+        assert!(json.get("exec").is_none(), "{json}");
+        let noexec = ImageShare {
+            exec: false,
+            ..before
+        };
+        let json = serde_json::to_value(&noexec).unwrap();
+        assert_eq!(json.get("exec"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(serde_json::from_value::<ImageShare>(json).unwrap(), noexec);
     }
 
     /// The review's B-10 (AC-T7.4.1, joint plan step 12): two shares the guest sees at one place are one share too
@@ -2044,11 +2153,12 @@ mod tests {
     /// same path on another drive. Expect those to pass.
     #[test]
     fn b10_two_shares_at_one_guest_place_spelled_apart_are_refused() {
-        let share = |source: &str, destination: &str, read_only: bool| Mount {
+        let share = |source: &str, destination: &str, read_only: bool| ImageShare {
             source: PathBuf::from(source),
             destination: destination.to_owned(),
             read_only,
             members: Vec::new(),
+            exec: true,
         };
         let with = |first: &str, second: &str| ShardsImage {
             shares: vec![

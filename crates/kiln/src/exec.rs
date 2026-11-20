@@ -180,9 +180,9 @@ impl Exec {
         }
         let result = self.run_inner(&ws).await;
         let t = tmp.clone();
-        let _ = fs(move || std::fs::remove_dir_all(t)).await;
+        let _ = fs(move || crate::os::tree::remove_dir_all(&t)).await;
         let w = ws.clone();
-        if let Err(e) = crate::rt::blocking(move || std::fs::remove_dir_all(w)).await.map_err(|e| std::io::Error::other(e.to_string())).and_then(|r| r)
+        if let Err(e) = crate::rt::blocking(move || crate::os::tree::remove_dir_all(&w)).await.map_err(|e| std::io::Error::other(e.to_string())).and_then(|r| r)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(error = %e, ws = %ws.display(), "workspace cleanup failed");
@@ -343,7 +343,7 @@ impl Exec {
                 Err(e) => {
                     self.up.note(job, 0, &format!("git checkout failed ({e:#}); using server source archive")).await;
                     let w = ws.to_path_buf();
-                    let _ = fs(move || std::fs::remove_dir_all(w)).await;
+                    let _ = fs(move || crate::os::tree::remove_dir_all(&w)).await;
                     let w = ws.to_path_buf();
                     fs(move || std::fs::create_dir_all(w)).await?;
                 }

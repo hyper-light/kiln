@@ -206,6 +206,8 @@ impl ImageGuest for Run {
                 }),
                 guest: Ok(GuestTimes::default()),
             }),
+            // Every run's stats tell its paused time since image channel v33 (D267): a node VM's none.
+            paused: Some(shards_api::image::Paused::default()),
             ..Stats::default()
         })
     }

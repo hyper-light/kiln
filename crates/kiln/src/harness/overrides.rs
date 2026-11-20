@@ -14,7 +14,8 @@
 //!   A volume is every engine's: its folder joins its harness's own allowed folders (each harness's own mechanism,
 //!   [`Taking`]) and its session's scope (what kiln holds its file calls to, `super::hold::verdict`, where a read-only
 //!   volume's changes are refused); in a microVM it's plugged in too, as asked (`kiln_seams::sandbox::Change::Plug`,
-//!   through Hex).
+//!   through Hex), and there alone its files can be kept from running ([`Volume::exec`]: its mount `noexec`, Shards'
+//!   D279). On its machine's host nothing stops its harness running what a folder holds, so that's refused there.
 //! - **Kept, and given again.** The session's state holds them ([`Overrides`], `State::overrides`) with how each place
 //!   took each ([`Took`]); its harness's every start takes them again (a restart, a resume, a restore: [`dirs`] for its
 //!   launch, [`changes`] for its microVM once it runs), for the session's life. Keeping them for an agent's later
@@ -191,6 +192,19 @@ pub struct Volume {
     pub access: Access,
     /// Who sees it: a host session's harness alone.
     pub members: Vec<Member>,
+    /// Whether its files may be run from it: where not, each member's mount of it is `noexec` (Shards' D279), a
+    /// microVM's alone. Said only where off.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
+    pub exec: bool,
+}
+
+fn on() -> bool {
+    true
+}
+
+fn is_on(b: &bool) -> bool {
+    *b
 }
 
 /// What a component of a session is (kiln plan 01a1dd2e…, P6c.3): its image's AGENT, its HARNESS or an MCP server.
@@ -597,6 +611,9 @@ pub fn check(change: &Change, microvm: bool, harness: &str) -> Result<(), String
             if !microvm && v.at != v.path {
                 return Err(format!("a session on its machine's host sees {} at its own path, not {}", v.path, v.at));
             }
+            if !microvm && !v.exec {
+                return Err("Turning execute off is a microVM session's: this session runs on its machine's host (engine host), where nothing stops its harness running what a folder holds. Start it on a runner whose engine is microvm.".to_owned());
+            }
             Ok(())
         }
         Change::Remove(p) => {
@@ -725,7 +742,7 @@ pub fn take(o: &mut Overrides, change: &Change) -> Result<Taken, String> {
         },
         Change::Add(v) => match o.volumes.iter().find(|h| h.volume.path == v.path || h.volume.at == v.at) {
             Some(h) if h.volume == *v => Taken::Same,
-            Some(h) => return Err(format!("{} is given already ({}, at {}): remove it first", h.volume.path, access(h.volume.access), h.volume.at)),
+            Some(h) => return Err(format!("{} is given already ({}{}, at {}): remove it first", h.volume.path, access(h.volume.access), if h.volume.exec { "" } else { ", its files not run" }, h.volume.at)),
             None => {
                 o.volumes.push(HeldVolume { volume: v.clone(), harness: waiting(), scope: waiting(), microvm: None });
                 Taken::Added
@@ -950,7 +967,7 @@ fn network_grant(g: &NetworkGrant) -> kiln_seams::sandbox::NetworkGrant {
 
 fn seam_plug(v: &Volume) -> kiln_seams::sandbox::Change {
     use kiln_seams::sandbox::{PlugFor, PlugSource};
-    kiln_seams::sandbox::Change::Plug { source: PlugSource::Host(v.path.clone()), to: PlugFor::Members(v.members.iter().map(member_of).collect()), at: v.at.clone(), read_only: v.access == Access::Ro }
+    kiln_seams::sandbox::Change::Plug { source: PlugSource::Host(v.path.clone()), to: PlugFor::Members(v.members.iter().map(member_of).collect()), at: v.at.clone(), read_only: v.access == Access::Ro, exec: v.exec }
 }
 
 /// How its microVM took a change it was asked (`Run::change`): now, or refused in its words (one that takes none live,
@@ -1134,7 +1151,33 @@ async fn add(cx: Cx, v: Value) -> Out {
         None => vec![Member::Harness(info.kind.clone())],
         Some(said) => said.iter().map(|m| Member::read(Some(m), &info.kind)).collect::<Result<Vec<_>, _>>().map_err(|e| (StatusCode::BAD_REQUEST, e))?,
     };
-    send(&cx, &info, Change::Add(Volume { path, at, access: i.access, members })).await
+    let exec = exec_of(i.access, i.perms).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if microvm && !exec && !holds_exec(&cx.hub, &info) {
+        return Err((StatusCode::CONFLICT, format!("{}'s machine runs a kiln that can't keep a volume's files from running: upgrade it, or give the volume with execute on", info.name)));
+    }
+    send(&cx, &info, Change::Add(Volume { path, at, access: i.access, members, exec })).await
+}
+
+/// Whether a volume's files may be run from it, as its `perms` say beside its `access`: read can't be off (a mount can't
+/// stop reads), and write is `access`'s `rw`. None said, they may.
+fn exec_of(access: Access, perms: Option<input::Perms>) -> Result<bool, String> {
+    let Some(p) = perms else { return Ok(true) };
+    if !p.read {
+        return Err("A volume always allows reading: a mount can't stop reads.".to_owned());
+    }
+    if p.write != (access == Access::Rw) {
+        return Err(format!("`access` ({}) and `perms.write` ({}) disagree", self::access(access), p.write));
+    }
+    Ok(p.exec)
+}
+
+/// Whether the runner session `info` runs on holds a volume's files kept from running
+/// ([`crate::proto::feature::VOLUME_EXEC`]): its machine's newest runner process names it. A session of the server's own
+/// machine runs in this build.
+fn holds_exec(hub: &crate::hub::Hub, info: &super::session::Info) -> bool {
+    let Some(machine) = info.target.strip_prefix("agent:") else { return true };
+    let inst = hub.instances.load();
+    inst.newest(machine).and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::VOLUME_EXEC))
 }
 
 async fn remove(cx: Cx, v: Value) -> Out {
@@ -1244,7 +1287,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "sessions.volumes.add",
-            summary: "Give a running session a folder of its machine (`path`), `access` ro or rw, in place: it joins its harness's own allowed folders (each harness's way) and the session's scope (kiln holds its file calls there to `access`), and in a microVM session it's plugged into the microVM too, for `members` (else its harness), at `at`: by default beneath its session's volume root (/volumes/<name>); strictly beneath one of the plug roots it declared as it started (state.overrides.roots), else refused. Every engine. Kept on the session and given again whenever its harness starts again; agents_get shows how each took it (state.overrides).",
+            summary: "Give a running session a folder of its machine (`path`), `access` ro or rw, in place: it joins its harness's own allowed folders (each harness's way) and the session's scope (kiln holds its file calls there to `access`), and in a microVM session it's plugged into the microVM too, for `members` (else its harness), at `at`: by default beneath its session's volume root (/volumes/<name>); strictly beneath one of the plug roots it declared as it started (state.overrides.roots), else refused. `perms` {read, write, exec} beside `access`: read can't be off, write is `access`'s rw, and exec false keeps its files from running (each member's mount of it noexec), a microVM session's alone. Every engine. Kept on the session and given again whenever its harness starts again; agents_get shows how each took it (state.overrides).",
             read_only: false,
             destructive: false,
             input: Input::of::<input::Add>(),
@@ -1365,6 +1408,19 @@ pub mod input {
         pub at: Option<String>,
         /// Who sees it: `harness` (the default), `agent:<name>`, `mcp:<name>`.
         pub members: Option<Vec<String>>,
+        /// Its permissions, each its own, beside `access`: read is always on (a mount can't stop reads), write is
+        /// `access`'s `rw`, and execute off keeps its files from running (a microVM session's alone: each member's
+        /// mount of it `noexec`). By default read, as `access` says write, and execute.
+        pub perms: Option<Perms>,
+    }
+
+    /// A volume's permissions as a person picks them: read, write and execute.
+    #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct Perms {
+        pub read: bool,
+        pub write: bool,
+        pub exec: bool,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

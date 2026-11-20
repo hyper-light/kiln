@@ -22,8 +22,8 @@ format = 1
 gate = [
   "cargo clippy --locked --all-targets -- -D warnings",
   "cargo test --locked --no-fail-fast",
-  "cargo-zigbuild clippy --locked --all-targets --target aarch64-apple-darwin -- -D warnings",
-  "cargo-zigbuild clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
+  "KILN_SHARDS=lint cargo-zigbuild clippy --locked --all-targets --target aarch64-apple-darwin -- -D warnings",
+  "KILN_SHARDS=lint cargo-zigbuild clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
   "npm ci --ignore-scripts --prefix ui --no-audit --no-fund",
   "npm run --prefix ui typecheck",
   "npm run --prefix ui lint",
@@ -213,7 +213,7 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "aa819b0585649563d7185298db58bda8ac9dd533"
+commit = "7158020b61d35277e74a6c06da1418dd0794b04e"
 path = "vendor/shards"
 take = [
   ".cargo",
@@ -257,17 +257,16 @@ exclude = [
 own = ["UPSTREAM.md"]
 
 # Hex, the runtime and scheduler kiln's harness microVMs run under (its docs/design; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
-# steps 12 and 16), built on kiln's one Shards and hyper-raft: its upstream pins kiln's Shards and an older hyper-raft,
-# and a recorded change moves that pin to kiln's (vendor/hex/UPSTREAM.md). The pair kiln builds:
-# Hex 414aa30d on Shards d993d83e (and hyper-raft e0613f52), the one Shards revision Hex and kiln both build on. Its
+# steps 12 and 16), built on kiln's one Shards and hyper-raft: it takes Shards' crates by git, which kiln's root
+# [patch] points at kiln's copy (vendor/shards), and pins kiln's hyper-raft (vendor/hex/UPSTREAM.md). Its
 # crates, the four records they include as they build (two probes', and hex-sim's two recorded traces), and the record of what it vendors (its vendor/MANIFEST.toml and
 # vendor/patches, which kiln's pins are checked against) with seccompiler, the third-party code only Hex vendors; less
-# its copies of what kiln vendors itself (hyper-raft, Shards, cuda-rust, all-smi), the GPU renderer and Firecracker
+# its copies of what kiln vendors itself (hyper-raft, cuda-rust, all-smi), the GPU renderer and Firecracker
 # sources only its own scripts build, and its docs, benchmarks and CI, which are Hex's.
 [projects.hex]
 kind = "git"
 repository = "https://github.com/hyper-light/hex"
-commit = "84c870b0f05ed46ab7298eb19402e3945aeb8640"
+commit = "b4db7e69c895182ae68500c08ded91200d1228b1"
 path = "vendor/hex"
 take = [
   "Cargo.toml",
@@ -282,7 +281,7 @@ take = [
   "vendor/patches",
   "vendor/seccompiler",
 ]
-exclude = ["vendor/patches/firecracker", "vendor/patches/shards-gpu"]
+exclude = ["vendor/patches/firecracker"]
 own = ["UPSTREAM.md"]
 
 # Slates, agents' workspaces of their own (docs/agentic.md, W; kiln plan 01a157fdefce75f698e67bc147f47586, CP-T4.1):

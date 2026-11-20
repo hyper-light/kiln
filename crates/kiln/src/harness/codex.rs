@@ -1577,7 +1577,7 @@ impl Codex {
             Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Codex lists for its models")),
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             // A subagent: its turn under way is interrupted, as a person asked.
@@ -5101,7 +5101,7 @@ mod tests {
         let mut core = super::super::core::Core::new();
         core.state.mode = "auto".into();
         assert_eq!(c.policies(&core).2, serde_json::json!({"type": "workspaceWrite"}), "no folder given: as it was");
-        let held = |path: &str, access| HeldVolume { volume: Volume { path: path.into(), at: path.into(), access, members: vec![Member::Harness("codex".into())] }, harness: Took::Nothing { why: String::new() }, scope: Took::Nothing { why: String::new() }, microvm: None };
+        let held = |path: &str, access| HeldVolume { volume: Volume { path: path.into(), at: path.into(), access, members: vec![Member::Harness("codex".into())], exec: true }, harness: Took::Nothing { why: String::new() }, scope: Took::Nothing { why: String::new() }, microvm: None };
         core.state.overrides.volumes = vec![held("/data", Access::Rw), held("/docs", Access::Ro)];
         let (_, sandbox, turn) = c.policies(&core);
         assert_eq!(sandbox, "workspace-write");

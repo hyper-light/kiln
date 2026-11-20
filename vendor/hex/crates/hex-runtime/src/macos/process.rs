@@ -1560,6 +1560,7 @@ impl ProcessBox {
             io_write_bytes: s.written_bytes,
             guest: None,
             started_from: None,
+            paused_ns: None,
         })
     }
 

@@ -626,7 +626,7 @@ fn a_publish_reaching_anyone_but_its_member_is_refused() {
 }
 
 /// The bytes D231's channel writes for a narrowing's destinations kept and its members' reach of them (shards-api's
-/// `Request::encode`, vendor/shards/crates/api/src/image/wire.rs: `keep`'s tag, count and each destination as a u32
+/// `Request::encode`, shards-api's crates/api/src/image/wire.rs: `keep`'s tag, count and each destination as a u32
 /// length and its text; the members' tag and count, then each one's kind, name, count and destinations alike): a model
 /// apart from the program's, counted from the strings themselves.
 fn written(narrowing: &Narrowing) -> usize {

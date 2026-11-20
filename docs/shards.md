@@ -11,22 +11,18 @@ kiln vendors Shards (`vendor/shards`) and Hex (`vendor/hex`) as it vendors every
 each at one revision, with kiln's recorded changes, and one copy of each project in kiln's tree.
 
 - **Shards** is pinned at a revision of its `main` (`vendor/MANIFEST.toml`; `vendor/shards/UPSTREAM.md`).
-- **Hex** is pinned at its `main`, which builds on kiln's Shards and hyper-raft revisions itself, with kiln's
-  records of hyper-raft's changes and kiln's layout as recorded changes (`vendor/hex/UPSTREAM.md`). kiln's copy holds Hex's
-  `vendor/MANIFEST.toml` and `vendor/patches`, so `scripts/vendor.py check` holds Hex's pins to kiln's as kiln's
-  copy has them: one Shards revision serves Hex and kiln. Hex is at its branch `p/v080-vendor` (`84c870b0f`: its Shards image class
-  in a process that links Hex, `ImageRuntime::new` and `::leasing`, a member's run-time arguments, the host folders it
-  sees, a box's host use at its end, a member's MCP bridge, `Runtime::mcp`, and a member's own signals,
-  `Runtime::signal_member`, and since Shards v0.8.0's landing a share's member scope, its own class and its scheduler's
-  admission, warm pools, agents' volumes, a member's exec, a run's kept final use and its agent-control link), and Shards
-  at the revision it pins (`aa819b058`, its v0.8.0 tag), where Hex makes no change of its own to
-  Shards. The two move together: `scripts/vendor.py shards <commit>` at Hex's new pin, then
-  `scripts/vendor.py hex <commit>`; and hyper-raft with them where Hex's pin of it moves (`e0613f52` since Shards'
-  agent-control link reads the negotiated idle timeout of hyper-quic's patch Q34 and a handshake's progress, Q35),
-  each product that holds a pin of it (Quiver) moved to kiln's by a recorded change, and Hex's own pin of it kiln's.
-  Shards names hyper-quic by its git revision, which kiln's root manifest points at its copy
-  (`[patch."https://github.com/hyper-light/hyper-raft"]`); Hex names Shards' crates by path into its own copy, which
-  a kiln-only change points at kiln's (`vendor/hex/UPSTREAM.md`).
+- **Hex** is pinned at a commit of its own, with kiln's records of hyper-raft's changes and kiln's layout as
+  recorded changes (`vendor/hex/UPSTREAM.md`, which says what Hex holds at that commit). Hex vendors no Shards: it
+  names Shards' crates by git at one revision (its root manifest's `[workspace.dependencies]`), which kiln's root
+  manifest points at kiln's own copy (`[patch."https://github.com/hyper-light/shards"]`), so one Shards revision
+  serves Hex and kiln, at one version: Hex asks for exactly the commit kiln vendors (`7158020b61`, Shards' main),
+  and `crates/kiln/tests/vendored.rs` fails the gate where they differ. kiln's copy holds Hex's `vendor/MANIFEST.toml` and `vendor/patches`,
+  so `scripts/vendor.py check` holds Hex's pins of what it does vendor to kiln's. The two move together:
+  `scripts/vendor.py shards <commit>` at Hex's new Shards revision, then `scripts/vendor.py hex <commit>`; and
+  hyper-raft with them where Hex's pin of it moves (`e0613f52` since Shards' agent-control link reads the negotiated
+  idle timeout of hyper-quic's patch Q34 and a handshake's progress, Q35), each product that holds a pin of it
+  (Quiver) moved to kiln's by a recorded change, and Hex's own pin of it kiln's. Shards names hyper-quic by its git
+  revision, which kiln's root manifest points at its copy (`[patch."https://github.com/hyper-light/hyper-raft"]`).
 - **hyper-raft** gains Hex's one change Hex's code calls (`Endpoint::negotiated`, the suite and group a QUIC
   connection negotiated), and Quiver, which records kiln's changes to hyper-raft, records it too
   (`vendor/hyper-raft/UPSTREAM.md`, `vendor/quiver/UPSTREAM.md`).
@@ -48,12 +44,18 @@ Shards writes out its own (Shards' D36, D182):
 | `shards-vm` | the VM process: one per microVM, on macOS in App Sandbox with the hypervisor entitlement |
 | `shards-net` | the network process: one per networked microVM, on macOS in App Sandbox with the network's client and server |
 
-- **Built** by `ci/shards/pack.sh` from `vendor/shards`, for the platform kiln is built for, into
-  `target/shards-carried/<target>/` (or `KILN_SHARDS_DIR`), with Shards' own toolchain file (its Rust, its
-  musl targets) and the zig it pins for its guests' C (`scripts/install-zig` installs it where none is on
-  `PATH`). On Linux the VM and network processes are static (musl), as Shards builds its own.
-- **Embedded** by `crates/kiln/build.rs` (`cfg(kiln_shards)`) when all three are there. Without them kiln builds
-  without Shards, and a release build says so; `crate::shards::write_out` refuses, saying so.
+- **Built** by kiln's own build: `crates/kiln/build.rs` runs `ci/shards/pack.sh` from `vendor/shards` for the
+  platform kiln is built for (its output in `OUT_DIR`, its cargo target directory `target/shards` beside kiln's, so a
+  build where `vendor/shards` hasn't changed takes its last), with Shards' own toolchain file (its Rust, its musl
+  targets) and the zig it pins for its guests' C (`scripts/install-zig` installs it where none is on `PATH`); on
+  Windows, Git for Windows' bash runs it where none is on `PATH`. On Linux the VM and network processes are static
+  (musl), as Shards builds its own. A target whose Shards is built only on its own platform (Windows' MSVC build,
+  which the release's Linux job cross-builds kiln beside) takes it from the folder `KILN_SHARDS_DIR` names, made
+  there by the same script (`.kiln/release.yaml`'s `shards-windows`).
+- **Embedded**, always: kiln is one binary with its microVM engine in it. A build that can't carry Shards fails,
+  saying why; no kiln is built without it. The one exception is a lint, asked by name (`KILN_SHARDS=lint`, kiln's
+  gate's clippy through zig for macOS and Windows from Linux): it checks kiln's code against empty stand-ins, and
+  the binary it makes refuses to start.
 - **Written out** by `crate::shards::write_out` into `<base>/shards/<id>/`: named by what's carried and, on a
   Mac, by who signs it; written whole (beside its place, each file synced and signed, its ready mark last,
   then renamed into place), so no process runs half a folder or another build's. A process holds the folder
@@ -100,6 +102,4 @@ the check itself never ended.
   with n, p50, p90, p99 and max.
 
 Owed: the smoke and the measurements on macOS (HVF), Linux (KVM) and Windows (WHP), run by the plan's
-coordinator, their numbers recorded here and in Shards' D237; kiln's release pipelines packing Shards for
-each platform they ship (`ci/release/build.sh` cross-builds macOS and Windows on Linux, where Shards' guests
-and a Mac's signing don't build), so releases carry no Shards yet; Hex's own tests at kiln's revision.
+coordinator, their numbers recorded here and in Shards' D237; Hex's own tests at kiln's revision.

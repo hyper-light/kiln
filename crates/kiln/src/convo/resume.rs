@@ -135,8 +135,9 @@ pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown
         format!("This conversation went on from {from_shown} (where it worked in {from_cwd}), which is gone, to {to_shown} (it works in {goes_on_in} now). It was kept on the kiln server.")
     };
     let carry = carry(store, id, kind, own.as_deref(), &events, &note, in_place)?;
-    // What starts it there: its settings as last chosen. Its environment was its machine's, and
-    // stays there (the machine it goes to runs it with its own).
+    // What starts it there: its settings as last chosen. Its environment, where its person chose one, is kiln's
+    // to open again for it (`registry::resume_on`, docs/agents.md "Environments"); else it's the machine's it goes
+    // to, as it was the machine's it ran on.
     let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
     let spec = Spec {
         kind: kind.id.to_owned(),
