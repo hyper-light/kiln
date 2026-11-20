@@ -249,7 +249,7 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
     // The agent wrote, in its pod, into its home's volume; the folder is as it was.
     let last_plan = std::cell::RefCell::new(String::new());
     let wrote = until(
-        "the agent's file in its volume, by its landing's plan",
+        "the agent's files in its volume, by its landing's plan (one created, one replaced)",
         || {
             let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})));
             last_plan.replace(match &plan {
@@ -257,7 +257,9 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
                 Err(e) => format!("{e:#}"),
             });
             let plan = plan?;
-            Ok(plan.to_string().contains("pod-wrote.txt").then_some(plan))
+            // A plan says what it would do by action, counted (the file it creates and the one it replaces).
+            let count = |action: &str| plan.pointer("/plan/summary/by_action").and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("action").and_then(Value::as_str) == Some(action))).and_then(|x| x.get("count")).and_then(Value::as_u64).unwrap_or(0);
+            Ok((count("create") >= 1 && count("replace") >= 1).then_some(plan))
         },
         || {
             let ws = fleet.call("POST", "/api/ops/agents.workspace", Some(&json!({"agent": id}))).map(|w| w.to_string()).unwrap_or_else(|e| format!("{e:#}"));
