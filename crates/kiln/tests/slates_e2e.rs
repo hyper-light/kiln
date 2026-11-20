@@ -1712,21 +1712,23 @@ mod microvm {
 }
 
 // =================================================================================================
-// The container engine (docs/agentic.md W9, Slates' A-520): an agent in a container of its own on its volume, mounted on
-// the runner's host and bound into the container by Slates, never copied. Skipped in the runner's own words where its
-// facts say its agents can't run in containers.
+// The container engine (docs/agentic.md W9, Slates' A-520): an agent in a container of its own on its volume, which the
+// engine itself mounts from Slates' NFS export of it, never a copy. Skipped in the runner's own words where its facts say
+// its agents can't run in containers.
 // =================================================================================================
 #[cfg(unix)]
 mod container {
     //! A-520's fifth piece, by use: a runner whose owner set its engine to `container` runs each agent's harness in a
-    //! container of the image its administrator declared (`[agent] container_image`), on the agent's Slates volume
-    //! mounted on the host and bound into the container by Slates' `bind_into_container`. What each drive reads:
+    //! container of the image its administrator declared (`[agent] container_image`), on the agent's Slates volume,
+    //! which the engine mounts itself as a volume of its own made from Slates' NFS export of it (Ada's ruling,
+    //! 2026-11-20). What each drive reads:
     //!
     //! 1. **In a container.** The runner's facts say its agents can run in containers and name the image; on a Mac its
-    //!    harness says a Linux kernel (Docker Desktop's VM), and on every host the engine runs a container whose only bind
-    //!    of the workspace has the volume's host mount as its source, at the same path ([`bound_from`]).
+    //!    harness says a Linux kernel (Docker Desktop's VM), and on every host the engine runs one container whose mount
+    //!    at the workspace's path is a volume of the engine's own, `type=nfs`, its device an export of the agent's Slates
+    //!    volume ([`mounted_from`]), its capability never shown.
     //! 2. **On its volume, never a copy.** The harness works at the host mount's own path; its three edits are seen
-    //!    through the host's mount before any landing, and the project's folder holds none of them.
+    //!    through the host's own mount of the same volume before any landing, and the project's folder holds none of them.
     //! 3. **Review, landing, drift (W3, W4, W6), unchanged.** Its change request holds exactly its changes; a person's
     //!    landing (`agents.land`) writes them at once where its mode asks nothing and only on approval where it asks; a
     //!    file the person changed on disk after the agent changed it is drift, and no landing writes over the person's
@@ -1741,6 +1743,9 @@ mod container {
 
     /// The switch that makes a runner whose agents can't run in containers a failure rather than a skip.
     const REQUIRED: &str = "CONTAINER_E2E";
+
+    /// How long a runner's first facts may take to come (its engine's profile is asked of the engine as they're probed).
+    const FACTS_WITHIN: Duration = Duration::from_secs(120);
 
     /// The stand-in image's base: Python 3 and `tail` (the keeper's), pinned by its index digest.
     const BASE: &str = "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90";
@@ -1785,6 +1790,11 @@ mod container {
         std::fs::write(&config, format!("[agent]\ncontainer_image = {}\n", toml::Value::String(image.to_owned())))?;
         env.push(("KILN_CONFIG", config.to_string_lossy().into_owned()));
         let f = vm_e2e::up_own(dir, "slatesct", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
+        // Its facts come once probed, its engine's profile asked of Slates among them: waited for, never judged unsaid.
+        let until = Instant::now() + FACTS_WITHIN;
+        while containers_of(&f.get("/api/agents")?, &f.machine).is_null() && Instant::now() < until {
+            std::thread::sleep(LOOK_EVERY);
+        }
         if !workspaces_ready(&f)? {
             return Ok(None);
         }
@@ -1809,10 +1819,11 @@ mod container {
         runner.and_then(|r| r.pointer("/facts/containers")).cloned().unwrap_or(Value::Null)
     }
 
-    /// The running containers the engine binds `mount` into, each by its id: (id, the bind's source, its destination,
-    /// whether it's writable), from the engine's own record (`docker inspect`).
-    fn bound_from(docker: &Path, mount: &str) -> anyhow::Result<Vec<(String, String, String, bool)>> {
-        let ids = std::process::Command::new(docker).args(["ps", "--quiet", "--no-trunc", "--filter", &format!("volume={mount}")]).output()?;
+    /// The running containers whose mount at `mount` is a volume of the engine's own: (container id, the volume, its
+    /// driver's `type`, the export it names by the volume's name, as `/<name>@<attachment>`, its token cut, whether the
+    /// mount is writable), from the engine's own records (`docker inspect`, `docker volume inspect`).
+    fn mounted_from(docker: &Path, mount: &str) -> anyhow::Result<Vec<(String, String, String, String, bool)>> {
+        let ids = std::process::Command::new(docker).args(["ps", "--quiet", "--no-trunc"]).output()?;
         anyhow::ensure!(ids.status.success(), "docker ps: {}", String::from_utf8_lossy(&ids.stderr));
         let mut found = Vec::new();
         for id in String::from_utf8_lossy(&ids.stdout).split_whitespace() {
@@ -1821,10 +1832,18 @@ mod container {
             let mounts: Value = serde_json::from_slice(&out.stdout)?;
             for m in mounts.as_array().into_iter().flatten() {
                 let word = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
-                if word("Destination") == mount {
-                    anyhow::ensure!(word("Type") == "bind", "container {id} has {mount} as a {} mount, not a bind: {m}", word("Type"));
-                    found.push((id.to_owned(), word("Source"), word("Destination"), m.get("RW") == Some(&Value::Bool(true))));
+                if word("Destination") != mount {
+                    continue;
                 }
+                anyhow::ensure!(word("Type") == "volume", "container {id} has {mount} as a {} mount, not a volume of the engine's own", word("Type"));
+                let name = word("Name");
+                let out = std::process::Command::new(docker).args(["volume", "inspect", "--format", "{{json .Options}}", &name]).output()?;
+                anyhow::ensure!(out.status.success(), "docker volume inspect {name}: {}", String::from_utf8_lossy(&out.stderr));
+                let options: Value = serde_json::from_slice(&out.stdout)?;
+                let opt = |k: &str| options.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+                let device = opt("device");
+                let named = device.trim_start_matches(':').rsplit_once('.').map_or_else(String::new, |(named, _token)| named.to_owned());
+                found.push((id.to_owned(), name, opt("type"), named, m.get("RW") == Some(&Value::Bool(true))));
             }
         }
         Ok(found)
@@ -1863,13 +1882,14 @@ mod container {
         if cfg!(target_os = "macos") {
             anyhow::ensure!(kernel == "Linux", "{what}: its harness ran on {kernel}, the Mac's own kernel, not in a container");
         }
-        let bound = bound_from(docker, &mount)?;
-        let [(container, source, _, writable)] = bound.as_slice() else { return Err(fail(format!("the engine runs {} containers binding {mount}, not one: {bound:?}", bound.len()))) };
-        anyhow::ensure!(*source == mount && *writable, "{what}: container {container} binds {source} (writable: {writable}), not its volume's mount {mount} for writing");
+        let mounted = mounted_from(docker, &mount)?;
+        let [(container, engine_volume, kind, export, writable)] = mounted.as_slice() else { return Err(fail(format!("the engine runs {} containers on a volume at {mount}, not one: {mounted:?}", mounted.len()))) };
+        let named = format!("/{}@", made.name);
+        anyhow::ensure!(kind == "nfs" && export.starts_with(&named) && *writable, "{what}: container {container} runs on engine volume {engine_volume} ({kind}, {export}, writable: {writable}), not an NFS export of its volume {} for writing", made.name);
         let seen: BTreeMap<String, Option<Vec<u8>>> = [probe.as_str(), APPENDED.0, REMOVED.0].iter().map(|n| ((*n).to_owned(), std::fs::read(at.join(n)).ok())).collect();
         anyhow::ensure!(seen == expected(&probe), "{what}: the host's mount of its volume holds {seen:?}, not its harness's changes");
         anyhow::ensure!(tree(&project.path())? == before, "{what}: the project's folder changed before any landing: {:?}", changes(&before, &tree(&project.path())?));
-        eprintln!("PROVEN: {what}: its harness on {kernel} at {said_cwd}, in container {container} binding Slates' mount {mount} of volume {}; its three edits seen through the host's mount, its folder untouched", made.volume);
+        eprintln!("PROVEN: {what}: its harness on {kernel} at {said_cwd}, in container {container} on engine volume {engine_volume} (nfs, Slates' export {export}.<token> of volume {}); its three edits seen through the host's own mount, its folder untouched", made.volume);
         // 3: review, then the person's landing by its mode.
         let changed = op("agents.change", &json!({"agent": id, "title": "A-520 container end to end"}))?;
         let branch = changed.pointer("/change_request/branch").and_then(Value::as_str).ok_or_else(|| fail(format!("its change request names no branch: {changed}")))?.to_owned();
@@ -1894,9 +1914,12 @@ mod container {
         // 4: its end.
         pace.stop(f, &id)?;
         mount_gone(&at).map_err(|e| fail(format!("{e:#}")))?;
-        let left = bound_from(docker, &mount)?;
+        let left = mounted_from(docker, &mount)?;
         anyhow::ensure!(left.is_empty(), "{what}: its containers outlived it: {left:?}");
-        eprintln!("PROVEN: {what}: ended, its container gone and its mount out of the host's table");
+        let volumes = std::process::Command::new(docker).args(["volume", "ls", "--quiet"]).output()?;
+        let kept: Vec<String> = String::from_utf8_lossy(&volumes.stdout).lines().filter(|v| v.starts_with(&made.name)).map(str::to_owned).collect();
+        anyhow::ensure!(kept.is_empty(), "{what}: its engine volumes outlived it: {kept:?}");
+        eprintln!("PROVEN: {what}: ended, its container and engine volume gone and its mount out of the host's table");
         Ok(())
     }
 

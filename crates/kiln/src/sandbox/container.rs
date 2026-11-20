@@ -1,7 +1,7 @@
 //! The container sandbox (docs/agentic.md W9; Slates' A-520): the seam's `Boundary::Container`, a harness run in an OCI
 //! container of its own on its agent's workspace, through the machine's own container engine (`runner::docker::find`:
-//! `docker`, else `podman`), the workspace's Slates volume bound into it from the machine's mount, never copied
-//! ([`crate::workspace::container`]).
+//! `docker`, else `podman`), the workspace's Slates volume mounted by the engine from Slates' NFS export of it, never
+//! copied ([`crate::workspace::container`]).
 //!
 //! **One workspace, one sandbox.** A [`ContainerSandbox`] serves the workspace it was made for (W3's [`Made`], mounted
 //! already) through the engine whose profile Slates judged before the workspace was made (`container_engine::
@@ -9,15 +9,16 @@
 //! sees at the same path, so nothing is translated.
 //!
 //! **A keeper, and the harness beside it.** The container runs an idle keeper (`tail -f /dev/null` as its entrypoint, the
-//! image's own set aside) started by `workspace::container::start` (Slates' bind, its source checked just before the
-//! engine binds it, the run), and the harness runs in it through the engine's `exec -i`, whose stdio are this machine's
+//! image's own set aside) started by `workspace::container::start` (Slates' export to the folder's owner, the engine's
+//! volume over it, the run), and the harness runs in it through the engine's `exec -i`, whose stdio are the machine's
 //! pipes, so its structured session is the one a process on the host speaks. Its environment reaches the container by
 //! name alone (`--env NAME`, the value in the engine's command line's own environment), never on a command line another
-//! user could read. The container's identity and git's settings are the profile's (`--user`, `core.createObject`), set
-//! as it starts, which an `exec` inherits.
+//! user could read. The container runs as the folder's owner (`--user`), the one identity the export serves, which an
+//! `exec` inherits.
 //!
-//! **Its end.** As the harness ends, or is killed, the container is removed and then its bind let go
-//! (`workspace::container::release`): the workspace's mount and volume stay, for W3 to take down when the workspace goes.
+//! **Its end.** As the harness ends, or is killed, the container is removed, then its engine volume, then the export
+//! detached (`workspace::container::release`): the workspace's mount and volume stay, for W3 to take down when the
+//! workspace goes.
 //!
 //! **What it holds.** Nothing of the seam's limits yet: a launch asking a memory or process limit, a share other than an
 //! even one, egress short of any host, a folder shared beside its own, a credential filled in at its egress, or anything
@@ -85,9 +86,9 @@ fn inside(folder: &str, mount: &str) -> bool {
     folder.is_absolute() && !folder.components().any(|c| matches!(c, Component::ParentDir)) && folder.starts_with(mount)
 }
 
-/// The keeper container's plan for `launch` in workspace `made` through `program` under `judged`, named `name`, or why
-/// it's refused (see the module's notes).
-fn plan_of(launch: &Launch, program: &str, judged: &EngineProfile, made: &Made, name: String) -> Result<Plan, Refusal> {
+/// The keeper container's plan for `launch` in workspace `made` through `program` under `judged`, named `name`, run as
+/// `user` (the uid and gid that own its folder), or why it's refused (see the module's notes).
+fn plan_of(launch: &Launch, program: &str, judged: &EngineProfile, made: &Made, name: String, user: (u32, u32)) -> Result<Plan, Refusal> {
     HOLDS.check(launch)?;
     let image = match &launch.boundary {
         Boundary::Container { image } => image.trim(),
@@ -112,12 +113,12 @@ fn plan_of(launch: &Launch, program: &str, judged: &EngineProfile, made: &Made, 
     Ok(Plan {
         program: program.to_owned(),
         engine: judged.profile.engine,
-        tested: judged.tested.clone(),
         name,
         image: image.to_owned(),
         entrypoint: Some(KEEPER.to_owned()),
         command: KEEPER_ARGS.map(str::to_owned).to_vec(),
         workdir: folder.clone(),
+        user,
     })
 }
 
@@ -134,13 +135,14 @@ fn exec_args(launch: &Launch, container: &str, workdir: &str) -> Vec<String> {
     args
 }
 
-/// The container `running` and its bind let go, once: the workspace's mount stays (`workspace::container::release`).
+/// The container `running`, its engine volume and its export let go, once: the workspace's mount stays
+/// (`workspace::container::release`).
 async fn release_once(released: &AtomicBool, running: &Running, made: &Made) {
     if released.swap(true, Ordering::AcqRel) {
         return;
     }
     if let Err(e) = crate::workspace::container::release(running, made).await {
-        tracing::warn!(container = %running.container, mount = %made.mount, error = %format!("{e:#}"), "a container sandbox's run ended, but its container wasn't removed: its bind and the workspace's mount stay with it");
+        tracing::warn!(container = %running.container, mount = %made.mount, error = %format!("{e:#}"), "a container sandbox's run ended, but its container wasn't removed: its volume, its export and the workspace's mount stay with it");
     }
 }
 
@@ -198,7 +200,8 @@ impl Sandbox for ContainerSandbox {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
         Box::pin(async move {
             let name = format!("{}-{}", self.made.name, crate::util::now_ms());
-            let plan = plan_of(&launch, &self.program, &self.judged, &self.made, name)?;
+            let user = crate::workspace::held::owner(std::path::Path::new(&self.made.mount)).map_err(|e| Refusal::Failed(format!("its folder's owner couldn't be read: {e:#}")))?;
+            let plan = plan_of(&launch, &self.program, &self.judged, &self.made, name, user)?;
             let running = crate::workspace::container::start(&self.made, &plan).await.map_err(|refused| Refusal::Failed(refused.to_string()))?;
             let mut cmd = std::process::Command::new(&self.program);
             cmd.args(exec_args(&launch, &running.container, &plan.workdir));
@@ -315,24 +318,24 @@ mod tests {
     }
 
     /// W9. Do: plan a harness's launch in a container on its workspace, then build its engine's exec. Expect the keeper
-    /// container at the launch's own folder in the workspace, the image's entrypoint set aside for the keeper's, the
-    /// profile's rules carried; and the harness exec'd there with its arguments, its environment named on the command line
+    /// container at the launch's own folder in the workspace, the image's entrypoint set aside for the keeper's, run as
+    /// its folder's owner; and the harness exec'd there with its arguments, its environment named on the command line
     /// and never its values.
     #[test]
     fn w9_a_harness_runs_beside_a_keeper_in_its_container_its_environment_named_never_valued() -> anyhow::Result<()> {
         let launch = launch("ghcr.io/kiln/harness-claude:1");
-        let plan = plan_of(&launch, DOCKER, &judged(), &made(), "kiln-a-1".to_owned())?;
+        let plan = plan_of(&launch, DOCKER, &judged(), &made(), "kiln-a-1".to_owned(), (501, 20))?;
         assert_eq!(
             plan,
             Plan {
                 program: DOCKER.to_owned(),
                 engine: Engine::DockerDesktop,
-                tested: judged().tested,
                 name: "kiln-a-1".to_owned(),
                 image: "ghcr.io/kiln/harness-claude:1".to_owned(),
                 entrypoint: Some("tail".to_owned()),
                 command: vec!["-f".to_owned(), "/dev/null".to_owned()],
                 workdir: format!("{MOUNT}/crates"),
+                user: (501, 20),
             }
         );
         let args = exec_args(&launch, "c0ffee", &plan.workdir);
@@ -340,7 +343,7 @@ mod tests {
         assert_eq!(args, expected);
         assert!(!args.iter().any(|a| a.contains("sk-not-on-a-command-line") || a.contains("dumb")), "a value reached the command line: {args:?}");
         // The workspace's own root is a folder of it too.
-        assert!(plan_of(&Launch { folder: Some(MOUNT.to_owned()), ..launch }, DOCKER, &judged(), &made(), "kiln-a-2".to_owned()).is_ok());
+        assert!(plan_of(&Launch { folder: Some(MOUNT.to_owned()), ..launch }, DOCKER, &judged(), &made(), "kiln-a-2".to_owned(), (501, 20)).is_ok());
         Ok(())
     }
 
@@ -349,7 +352,7 @@ mod tests {
     /// can't be named, and each of the seam's limits it holds none of. Expect each refused, typed, before any engine is asked.
     #[test]
     fn w9_a_container_sandbox_refuses_what_it_cant_hold_before_anything_is_asked() {
-        let refused = |l: Launch| plan_of(&l, DOCKER, &judged(), &made(), "kiln-a-1".to_owned()).err();
+        let refused = |l: Launch| plan_of(&l, DOCKER, &judged(), &made(), "kiln-a-1".to_owned(), (501, 20)).err();
         let unsupported = |r: Option<Refusal>| matches!(r, Some(Refusal::Unsupported(_)));
         let invalid = |r: Option<Refusal>, of: &str| matches!(r, Some(Refusal::Invalid { what, .. }) if what == of);
         assert!(unsupported(refused(Launch { boundary: Boundary::Host, ..launch("i") })));
@@ -395,7 +398,7 @@ mod tests {
         let args = exec_args(&signed, "c0ffee", MOUNT);
         assert!(args.windows(2).any(|w| w == ["--env", "ANTHROPIC_API_KEY"]) && !args.iter().any(|a| a.contains("not-a-real-key")), "{args:?}");
         // What it is, a container's sandbox holds: no limit or narrowed egress it would refuse.
-        assert!(plan_of(&launch, DOCKER, &judged(), &made(), "kiln-a-1".to_owned()).is_ok());
+        assert!(plan_of(&launch, DOCKER, &judged(), &made(), "kiln-a-1".to_owned(), (501, 20)).is_ok());
         Ok(())
     }
 }
