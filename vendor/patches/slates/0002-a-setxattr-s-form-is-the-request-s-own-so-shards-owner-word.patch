@@ -1,0 +1,158 @@
+Subject: a SETXATTR's form is the request's own, so Shards' owner word sized before INIT was answered is taken (slates A-741)
+Why: kiln's macOS microVM g266 drive refused a run's every write EACCES, intermittently: Linux sizes a SETXATTR by the form it holds at the call and holds it until INIT's reply, so Shards' init's owner word comes short on a connection that kept the extended form; slates main e0c06750 (be465b23) reads each request's own form; carried until kiln re-vendors at or past it
+
+diff --git a/crates/bridge-fuse/src/abi.rs b/crates/bridge-fuse/src/abi.rs
+index 4d8a769811f19077ea5354e2ae476ebd751a320a..10a07a193dce2308a36c301987597856f5d3d9a8 100644
+--- a/crates/bridge-fuse/src/abi.rs
++++ b/crates/bridge-fuse/src/abi.rs
+@@ -236,6 +236,35 @@ pub const COMPAT_SETXATTR_IN_BYTES: usize = 2 * size_of::<u32>();
+ /// filesystem's `posix_acl_update_mode` clears the bit itself.
+ pub const SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
+ 
++/// The bytes of `fuse_setxattr_in` before its name in `body`, a `SETXATTR`'s body, and the setter's flags it carries, on
++/// a connection whose `INIT` kept [`flags::SETXATTR_EXT`] where `negotiated` (A-378): decided by the request itself,
++/// since a connection that kept the extended form still sends some requests in the short one (A-741). Linux sizes a
++/// `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c` `fuse_setxattr`:
++/// `fc->setxattr_ext ? sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE`) and holds it until `INIT`'s reply is in
++/// (`fs/fuse/dev.c` `fuse_block_alloc`), so a call made before that reply arrived travels short. The two forms differ in
++/// their second 8 bytes: the extended form's setter's flags (only [`SETXATTR_ACL_KILL_SGID`] is defined) and a zero
++/// pad; the short form's first bytes of the name, which begins with its namespace (`user.`, `trusted.`, `security.`,
++/// `system.`), never a flag word and a zero word. So the extended form is read where those bytes are a known setter's
++/// flag and a zero pad, and the short form otherwise, a body too short to hold the extended head included. Without
++/// `negotiated`, the short form alone, as the kernel sends nothing else then.
++pub fn setxattr_head(body: &[u8], negotiated: bool) -> (usize, u32) {
++  if !negotiated {
++    return (COMPAT_SETXATTR_IN_BYTES, 0);
++  }
++  let word = |at: usize| {
++    body
++      .get(at..at.saturating_add(size_of::<u32>()))
++      .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
++      .map(u32::from_le_bytes)
++  };
++  let setter_at = COMPAT_SETXATTR_IN_BYTES;
++  let pad_at = setter_at.saturating_add(size_of::<u32>());
++  match (word(setter_at), word(pad_at)) {
++    (Some(setter), Some(0)) if setter & !SETXATTR_ACL_KILL_SGID == 0 => (SETXATTR_IN_BYTES, setter),
++    _ => (COMPAT_SETXATTR_IN_BYTES, 0),
++  }
++}
++
+ /// The `fuse_open_out.open_flags` slates sets on an `OPEN`, `OPENDIR` or `CREATE` reply (`<linux/fuse.h>`; a kernel
+ /// that does not know one ignores it).
+ pub mod open {
+diff --git a/crates/bridge-fuse/src/bridge.rs b/crates/bridge-fuse/src/bridge.rs
+index ad0d276ed507ff2939ad01db610598808c8f1ed9..143ddd113f6f23c0d594015bba38af9c5abb712e 100644
+--- a/crates/bridge-fuse/src/bridge.rs
++++ b/crates/bridge-fuse/src/bridge.rs
+@@ -1885,7 +1885,8 @@ fn serve_getxattr(
+ }
+ 
+ /// `SETXATTR`: `fuse_setxattr_in` is the value's size and the `setxattr(2)` flags, and on a connection whose kernel
+-/// sends the extended form (`FUSE_SETXATTR_EXT`, a guest's route, A-378) the setter's flags and a pad; then the name,
++/// sends the extended form (`FUSE_SETXATTR_EXT`, a guest's route, A-378) the setter's flags and a pad, each request's
++/// form read from the request ([`crate::abi::setxattr_head`], A-741); then the name,
+ /// then the value. Only a name in a namespace the transport reaches is stored; any other is `EOPNOTSUPP`, what a
+ /// filesystem without that namespace answers. A POSIX ACL is checked as Linux checks one and kept with its named owners
+ /// turned through the bridge's view (A-302), and the seam keeps the file's mode with an access ACL (A-314); an access
+@@ -1902,15 +1903,14 @@ fn serve_setxattr(
+   else {
+     return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
+   };
+-  let (head, setter_flags) = if bridge.setxattr_ext() {
+-    match body_u32(req.body, crate::abi::COMPAT_SETXATTR_IN_BYTES) {
+-      Some(setter_flags) => (crate::abi::SETXATTR_IN_BYTES, setter_flags),
+-      None => return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
+-    }
+-  } else {
+-    (crate::abi::COMPAT_SETXATTR_IN_BYTES, 0)
+-  };
++  // The form each request carries: a connection that kept the extended one still sends the short one for a call made
++  // before its INIT was answered (A-741).
++  let (head, setter_flags) = crate::abi::setxattr_head(req.body, bridge.setxattr_ext());
+   let rest = req.body.get(head..).unwrap_or_default();
++  if !rest.contains(&0) {
++    // No name ends within the body: no request the kernel sends.
++    return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
++  }
+   let Some(name) = reached_attribute(rest, bridge.attribute_namespaces()) else {
+     return write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out);
+   };
+diff --git a/crates/bridge-fuse/src/shards_fs.rs b/crates/bridge-fuse/src/shards_fs.rs
+index a7ff459fd0b506ca69ed063967ef6bff1d74669a..9b25e559014171dbde578195471eabf5b8570afb 100644
+--- a/crates/bridge-fuse/src/shards_fs.rs
++++ b/crates/bridge-fuse/src/shards_fs.rs
+@@ -24,7 +24,7 @@ use std::io;
+ 
+ use slates_bridge_core::{Bridge, OpContext};
+ 
+-use crate::abi::{COMPAT_SETXATTR_IN_BYTES, OUT_HEADER_LEN, Opcode, SETXATTR_IN_BYTES};
++use crate::abi::{OUT_HEADER_LEN, Opcode};
+ use crate::bridge::{EINVAL, EIO, EPERM, FUSE_ROOT_ID, dispatch, reply_error, takes_reply};
+ use crate::init::{MAX_WRITE, max_pages};
+ use crate::reply::ReplyHeader;
+@@ -226,19 +226,17 @@ impl OwnerWord {
+ /// `FUSE_SETXATTR_EXT` (`extended`, A-378), the setter's flags and a pad, then the name and its NUL, then the value: read
+ /// in the form the stream's guest sends, as the dispatch reads every other `SETXATTR` (A-587; read in the short form
+ /// alone, a guest whose kernel kept the extended one never had its word taken, so its run was shown its share owned by
+-/// the host and refused its writes `EACCES`). The flags (`XATTR_CREATE`, `XATTR_REPLACE`) and the setter's flags are
++/// the host and refused its writes `EACCES`), each request's own form decided by its bytes, since a guest's init sets
++/// the word as it mounts, often before its kernel took `INIT`'s reply, and so in the short form ([`crate::abi::setxattr_head`],
++/// A-741). The flags (`XATTR_CREATE`, `XATTR_REPLACE`) and the setter's flags are
+ /// ignored, as Shards' server ignores them, since the word names no attribute a file keeps. The value may end in NULs,
+ /// which are dropped.
+ pub fn owner_word(request: &[u8], extended: bool) -> Option<OwnerWord> {
+-  let head = if extended {
+-    SETXATTR_IN_BYTES
+-  } else {
+-    COMPAT_SETXATTR_IN_BYTES
+-  };
+   let parsed = Request::parse(request).ok()?;
+   if parsed.opcode != Some(Opcode::SetXattr) {
+     return None;
+   }
++  let (head, _setter) = crate::abi::setxattr_head(parsed.body, extended);
+   let rest = parsed.body.get(head..)?;
+   let end = rest.iter().position(|b| *b == 0)?;
+   if rest.get(..end)? != OWNER_WORD {
+@@ -599,6 +597,40 @@ mod tests {
+     );
+   }
+ 
++  /// A-741 (kiln goal 90: kiln's macOS microVM drive refused a run's every write `EACCES`, intermittently). Linux sizes a
++  /// `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c` `fuse_setxattr`:
++  /// `fc->setxattr_ext ? sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE`) and then waits for `INIT`'s reply before sending
++  /// it (`fs/fuse/dev.c` `fuse_block_alloc`), so a call made before that reply arrived (Shards' init names the run's
++  /// owner as it mounts) travels in the short form on a connection that kept the extended one. Do: read the owner word
++  /// `200000:200000` in the short form, the bytes the drive's guest sent (recorded 2026-11-20), as a stream that kept
++  /// the extended form reads it; and the same word in the extended form with each setter's flag. Expect the run's owner
++  /// named each time: read in the extended form alone, the short one's name began 8 bytes in, and the word fell to the
++  /// dispatch (`EOPNOTSUPP`), so the run was shown its share owned by the host.
++  #[test]
++  fn a741_an_owner_word_sized_before_init_was_answered_is_taken_on_a_stream_that_kept_the_extended_form()
++   {
++    let named = Some(OwnerWord::Named {
++      unique: 4,
++      uid: 200_000,
++      gid: 200_000,
++    });
++    let root = (4, FUSE_ROOT_ID);
++    let short = setxattr(root, (0, 0), None, OWNER_WORD, b"200000:200000");
++    assert_eq!(
++      owner_word(&short, true),
++      named,
++      "the short form, on a stream that kept the extended one"
++    );
++    for setter in [0, crate::abi::SETXATTR_ACL_KILL_SGID] {
++      let extended = setxattr(root, (0, 0), Some(setter), OWNER_WORD, b"200000:200000");
++      assert_eq!(
++        owner_word(&extended, true),
++        named,
++        "the extended form, setter's flags {setter:#x}"
++      );
++    }
++  }
++
+   /// A-587. Do: read Shards' owner word `1000:1001` in the short form (`FUSE_COMPAT_SETXATTR_IN_SIZE`: the value's size
+   /// and the flags) as a stream that kept no `FUSE_SETXATTR_EXT` reads it: from the guest's root on the share's root,
+   /// from another caller, and on another node; and a `SETXATTR` of another name in that form. Expect the run's owner
