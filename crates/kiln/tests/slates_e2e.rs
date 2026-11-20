@@ -211,15 +211,46 @@ pub fn slates_mounted_at(at: &Path) -> anyhow::Result<bool> {
     Ok(host_mounts()?.iter().any(|m| is_slates(m) && Path::new(&m.at) == at))
 }
 
-/// Unmounts the mount at `at`, as its user may: `umount` (and forced, where that's refused) on macOS, `fusermount3 -u`
-/// (and lazily, where that's refused) on Linux. Whether it went is read from the table after, not from these.
-fn unmount(at: &str) {
-    let tries: Vec<Vec<&str>> = if cfg!(target_os = "linux") { vec![vec!["fusermount3", "-u"], vec!["fusermount3", "-u", "-z"]] } else { vec![vec!["umount"], vec!["umount", "-f"]] };
-    for t in &tries {
-        let Some((program, args)) = t.split_first() else { continue };
-        if std::process::Command::new(program).args(args).arg(at).output().is_ok_and(|o| o.status.success()) {
-            return;
+/// How long a plain unmount may take before the mount is let go of instead: a hard NFS mount over a server that no
+/// longer answers never answers an unmount that waits on it.
+const UNMOUNT_WITHIN: Duration = Duration::from_secs(10);
+
+/// Unmounts the mount at `at` through Slates' library, as its user may, with no daemon and no privilege (A-507): its
+/// plain unmount, and where that's refused or doesn't answer within [`UNMOUNT_WITHIN`], its letting go of a busy mount
+/// (`unmount_busy`: forced on macOS, detached on Linux). What each refused, in words; whether it went is read from the
+/// table after. Windows keeps no such mount under a drive's folder (a workspace's drive is its daemon's own).
+fn unmount(at: &str) -> Vec<String> {
+    #[cfg(not(windows))]
+    {
+        let mut said = Vec::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let point = at.to_owned();
+        std::thread::spawn(move || {
+            let _ = tx.send(slates_api::mount::unmount(&point));
+        });
+        match rx.recv_timeout(UNMOUNT_WITHIN) {
+            Ok(Ok(())) => return said,
+            Ok(Err(refused)) => said.push(format!("unmount refused: {refused} ({refused:?})")),
+            Err(_) => said.push(format!("unmount didn't answer in {} s", UNMOUNT_WITHIN.as_secs())),
         }
+        // A forced unmount of a hard NFS mount whose server has gone can wait in the kernel too (Studio-4, 2026-11-20:
+        // 18 minutes, no answer): bounded alike, and said, never a hung drive.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let point = at.to_owned();
+        std::thread::spawn(move || {
+            let _ = tx.send(slates_api::mount::unmount_busy(&point));
+        });
+        match rx.recv_timeout(UNMOUNT_WITHIN) {
+            Ok(Ok(how)) => said.push(format!("let go: {how:?}")),
+            Ok(Err(refused)) => said.push(format!("unmount_busy refused: {refused} ({refused:?})")),
+            Err(_) => said.push(format!("unmount_busy didn't answer in {} s", UNMOUNT_WITHIN.as_secs())),
+        }
+        said
+    }
+    #[cfg(windows)]
+    {
+        let _ = at;
+        Vec::new()
     }
 }
 
@@ -229,10 +260,72 @@ pub fn unmount_under(dir: &Path) -> Vec<Mount> {
     let ours = |all: Vec<Mount>| -> Vec<Mount> { all.into_iter().filter(|m| is_slates(m) && Path::new(&m.at).starts_with(dir)).collect() };
     let unread = |e: anyhow::Error| vec![Mount { at: format!("(the mount table couldn't be read: {e:#})"), kind: String::new(), source: String::new() }];
     match host_mounts() {
-        Ok(all) => ours(all).iter().for_each(|m| unmount(&m.at)),
+        Ok(all) => ours(all).iter().for_each(|m| {
+            let said = unmount(&m.at);
+            if !said.is_empty() {
+                eprintln!("UNMOUNT {}: {said:?}", m.at);
+            }
+        }),
         Err(e) => return unread(e),
     }
     host_mounts().map(ours).unwrap_or_else(unread)
+}
+
+/// The pid of the test process that owns drive instance `name` (`kilne2e<pid>x<nanos>`, [`Instance::new`]).
+pub fn owner_of(name: &str) -> Option<u32> {
+    name.strip_prefix("kilne2e")?.split_once('x')?.0.parse().ok()
+}
+
+/// The drive instance an anchor's log names (`slates anchor: instance <name> up`), the first it says.
+pub fn instance_in_log(text: &str) -> Option<String> {
+    text.lines().find_map(|l| l.strip_prefix("slates anchor: instance ")?.split_once(' ').map(|(name, _)| name.to_owned())).filter(|n| n.starts_with("kilne2e"))
+}
+
+/// The Slates mounts a killed drive left, each with its instance: a Slates mount at `<folder>/<runner>-state/workspaces/
+/// <name>` (a drive's runner's workspaces) whose state folder's anchor log names a drive instance ([`instance_in_log`])
+/// whose owning test process is gone ([`owner_of`]). A live drive's, and anything not a drive's, is never one.
+pub fn leftovers() -> anyhow::Result<Vec<(String, String)>> {
+    let mut found = Vec::new();
+    for m in host_mounts()?.into_iter().filter(is_slates) {
+        let state = Path::new(&m.at).parent().filter(|w| w.file_name().is_some_and(|n| n == "workspaces")).and_then(Path::parent);
+        let Some(state) = state.filter(|s| s.file_name().is_some_and(|n| n.to_string_lossy().ends_with("-state"))) else { continue };
+        let Some(name) = std::fs::read_to_string(state.join("slates-anchor.log")).ok().as_deref().and_then(instance_in_log) else { continue };
+        if owner_of(&name).is_some_and(|pid| !kiln::os::pid_alive(pid)) {
+            found.push((m.at.clone(), name));
+        }
+    }
+    Ok(found)
+}
+
+/// Takes down what killed drives left ([`leftovers`]), as a drive's own end does: each mount through Slates' library
+/// ([`unmount`]: a bind into a container ends with its mount, and so does each attachment of it), then each of their
+/// instances once none of its mounts stays ([`end_instance`]); an instance whose mount stays is left running beneath it,
+/// never ended under a live NFS mount. What stayed, in words.
+pub fn sweep_leftovers() -> Vec<String> {
+    let found = match leftovers() {
+        Ok(found) => found,
+        Err(e) => return vec![format!("the mount table couldn't be read: {e:#}")],
+    };
+    let mut stayed = Vec::new();
+    let mut words = Vec::new();
+    for (at, name) in &found {
+        let said = unmount(at);
+        eprintln!("SWEPT {at} of {name}: {}", if said.is_empty() { "unmounted".to_owned() } else { format!("{said:?}") });
+        words.push((at.clone(), said));
+    }
+    let left = leftovers().unwrap_or_default();
+    let mut names: Vec<&String> = found.iter().map(|(_, n)| n).collect();
+    names.dedup();
+    for name in names {
+        let still: Vec<&String> = left.iter().filter(|(_, n)| n == name).map(|(at, _)| at).collect();
+        if still.is_empty() {
+            end_instance(name);
+        } else {
+            let said: Vec<&(String, Vec<String>)> = words.iter().filter(|(at, _)| still.contains(&at)).collect();
+            stayed.push(format!("instance {name} left running beneath its mounts, which wouldn't go: {said:?}"));
+        }
+    }
+    stayed
 }
 
 // =================================================================================================
@@ -983,6 +1076,32 @@ fn mount_gone(at: &Path) -> anyhow::Result<()> {
 // =================================================================================================
 mod checks {
     use super::*;
+
+    /// A drive instance's name carries its owner's pid, and its anchor's log names it. Do: read both from samples, and
+    /// from names and logs that aren't a drive's. Expect the drive's pid and name, and none from the others.
+    #[test]
+    fn a_drive_instance_names_its_owner_and_its_anchor_log_names_it() {
+        assert_eq!(owner_of("kilne2e20807x18e9cf967b697470"), Some(20807));
+        assert_eq!(owner_of("kilntest20807"), None);
+        assert_eq!(owner_of("kilne2ex1"), None);
+        let log = "slates anchor: a start's busiest thread ...\nslates anchor: instance kilne2e23950x18e9d003cdc461e0 up; daemon pid 24121; 2 shards\n";
+        assert_eq!(instance_in_log(log).as_deref(), Some("kilne2e23950x18e9d003cdc461e0"));
+        assert_eq!(instance_in_log("slates anchor: instance kilntest1 up; daemon pid 2\n"), None);
+    }
+
+    /// A drive killed outright leaves its mounts behind (its process gone, its `Instance` never dropped), and a hard NFS
+    /// mount over a server that went never gives up. Do: take down what killed drives left on this machine, as every
+    /// drive does before it starts. Expect none of their mounts left (main, 2026-11-20: "a run never leaves a mount
+    /// behind"; Slates' library unmount, never root).
+    #[test]
+    fn what_a_killed_drive_left_is_taken_down_and_no_mount_of_it_stays() -> anyhow::Result<()> {
+        let before = leftovers()?;
+        eprintln!("LEFTOVERS: {before:?}");
+        let stayed = sweep_leftovers();
+        let after = leftovers()?;
+        anyhow::ensure!(stayed.is_empty() && after.is_empty(), "killed drives' mounts stayed: {after:?} ({stayed:?})");
+        Ok(())
+    }
 
     #[test]
     fn g266_linux_mountinfo_names_each_mounts_place_type_and_source() {
@@ -1821,7 +1940,7 @@ mod container {
         while containers_of(&f.get("/api/agents")?, &f.machine).is_null() && Instant::now() < until {
             std::thread::sleep(LOOK_EVERY);
         }
-        if !workspaces_ready(&f)? {
+        if !workspaces_ready(&f, Engine::BareMetal)? {
             return Ok(None);
         }
         let facts = containers_of(&f.get("/api/agents")?, &f.machine);
