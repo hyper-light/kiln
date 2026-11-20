@@ -743,10 +743,14 @@ its agents can run in containers (`RunnerFacts.containers`, `workspace::containe
 asking in the order that asks least: its workspaces, its engine (`runner::docker::find`), Slates' judge of its profile
 (`engine_profile`), then whether kiln runs a container under that profile's identity rule; what it lacks is typed
 (`ContainerMissing`: `workspaces`, `engine`, `profile`, `shared_mount`, `platform`) and said in Slates' words where Slates
-refused. Owed, in order, each a piece: a runner's `container` engine beside `host` and `microvm` (`harness::engine`:
-held from those facts, placement and drain) and its launch through the seam's
-`Boundary::Container`, an implementation over the machine's engine (`sandbox::container`) on `workspace::container`:
-its image, and its harness's structured session over the container's stdio; a workspace mounted shared for a rootful
+refused. Built (2026-11-19, 5b-i): the seam's `Boundary::Container` over the machine's engine (`sandbox::container`),
+one sandbox per workspace: an idle keeper container started by `workspace::container::start` at the launch's own folder in
+the workspace (refused outside it), the harness run beside it through the engine's `exec -i`, whose stdio are the
+machine's pipes, its environment named on the command line and never valued; as the harness ends or is killed, the
+container and its bind go (`workspace::container::release`) and the workspace stays for W3; it holds none of the seam's
+limits and forwards no signal, each refused typed. Owed, in order, each a piece: a runner's `container` engine beside
+`host` and `microvm` (`harness::engine`: held from those facts, placement and drain, its sessions marked apart from a
+microVM's `isolation`) launching through `sandbox::container`, and the image it runs; a workspace mounted shared for a rootful
 Linux engine (until then refused, `NeedsSharedMount`); whether a bind keeps the mount's `nosuid` and `nodev` without
 the container's rules (a setuid file and a device node made through one container's bind, used through another's),
 measured; the `.nfs.*` names on a Mac; Windows' measurement and its route; and the goal's proof, a

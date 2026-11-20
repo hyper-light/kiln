@@ -205,7 +205,9 @@ pub struct Plan {
     pub name: String,
     /// The image it runs.
     pub image: String,
-    /// The command it runs, the harness's.
+    /// Its entrypoint, in place of the image's own: none keeps the image's.
+    pub entrypoint: Option<String>,
+    /// The command it runs: the harness's, or an idle keeper's that the harness is run beside (`sandbox::container`).
     pub command: Vec<String>,
     /// The harness's folder: the same place in the workspace inside the container as on the machine (W3).
     pub workdir: String,
@@ -273,6 +275,9 @@ fn run_args(plan: &Plan, applied: &EngineMount, identity: Vec<String>) -> Vec<St
     args.extend(applied.options.iter().cloned());
     args.extend(identity);
     args.extend(hard_link_options(plan.tested.hard_links));
+    if let Some(entrypoint) = &plan.entrypoint {
+        args.extend(["--entrypoint".to_owned(), entrypoint.clone()]);
+    }
     args.extend(["--workdir".to_owned(), plan.workdir.clone(), plan.image.clone()]);
     args.extend(plan.command.iter().cloned());
     args
@@ -359,6 +364,12 @@ pub async fn end(running: &Running, made: &Made) -> anyhow::Result<()> {
     end_with(&Machine, running, made).await
 }
 
+/// Ends `running` alone, in order: the container, then the bind; the workspace's mount and volume stay, for W3 to take
+/// down when the workspace goes (a container run inside a workspace that outlives it: `sandbox::container`).
+pub async fn release(running: &Running, made: &Made) -> anyhow::Result<()> {
+    release_with(&Machine, running, made).await
+}
+
 /// [`start`] over `steps`.
 async fn start_with(steps: &impl Steps, made: &Made, plan: &Plan) -> Result<Running, Refusal> {
     // The profile first: one kiln can't run a container under is refused before anything is asked.
@@ -388,14 +399,20 @@ async fn start_with(steps: &impl Steps, made: &Made, plan: &Plan) -> Result<Runn
     }
 }
 
-/// [`end`] over `steps`.
-async fn end_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow::Result<()> {
+/// [`release`] over `steps`.
+async fn release_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow::Result<()> {
     // The container first: its engine lets go of the files it held open on the mount. One that won't go keeps the rest.
     steps.remove(&running.program, &running.container).await?;
     // Then the bind; one that won't go ends with its mount anyway (Slates: a bind ends with its source mount).
     if let Err(e) = steps.detach(running.bind).await {
         tracing::warn!(mount = %made.mount, error = %format!("{e:#}"), "an ended container's bind wasn't let go: it ends with its mount");
     }
+    Ok(())
+}
+
+/// [`end`] over `steps`.
+async fn end_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow::Result<()> {
+    release_with(steps, running, made).await?;
     // Then the mount and the volume, as W3 takes a workspace down, nothing kiln started in it running now.
     steps.take_down(made).await
 }
@@ -490,7 +507,7 @@ mod tests {
 
     /// The plan of an agent's container through `engine`, holding `tested`.
     fn plan(engine: Engine, tested: TestedProfile) -> Plan {
-        Plan { program: DOCKER.to_owned(), engine, tested, name: "kiln-a".to_owned(), image: "kiln/harness".to_owned(), command: vec!["claude".to_owned()], workdir: format!("{MOUNT}/crates") }
+        Plan { program: DOCKER.to_owned(), engine, tested, name: "kiln-a".to_owned(), image: "kiln/harness".to_owned(), entrypoint: None, command: vec!["claude".to_owned()], workdir: format!("{MOUNT}/crates") }
     }
 
     /// Docker Desktop's plan: its share's rules.
@@ -652,6 +669,36 @@ mod tests {
             assert_eq!(stand.said(), ["remove c0ffee"], "a container that won't go keeps its bind and its mount");
             Ok(())
         })
+    }
+
+    /// W9. Do: release a container run inside a workspace that outlives it, then one whose engine won't remove it. Expect
+    /// the container, then the bind, and the workspace's mount and volume left for W3; a container that won't go keeps its
+    /// bind.
+    #[test]
+    fn w9_a_released_container_goes_with_its_bind_and_leaves_the_workspace_mounted() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let running = Running { container: "c0ffee".to_owned(), bind: 41, program: DOCKER.to_owned() };
+            let stand = Stand::new();
+            release_with(&stand, &running, &made()).await?;
+            assert_eq!(stand.said(), ["remove c0ffee", "detach 41"]);
+            let stand = Stand { remove: Err("container is busy".to_owned()), ..Stand::new() };
+            assert!(release_with(&stand, &running, &made()).await.is_err());
+            assert_eq!(stand.said(), ["remove c0ffee"]);
+            Ok(())
+        })
+    }
+
+    /// W9. Do: build the engine's run of a plan with an entrypoint of its own. Expect `--entrypoint` before the image, so
+    /// the command after the image is the entrypoint's arguments, and none where the plan keeps the image's.
+    #[test]
+    fn w9_a_plans_own_entrypoint_goes_before_its_image() -> anyhow::Result<()> {
+        let applied = engine_mount(&binding(false), Cli::Docker)?;
+        let keeper = Plan { entrypoint: Some("tail".to_owned()), command: vec!["-f".to_owned(), "/dev/null".to_owned()], ..desktop() };
+        let args = run_args(&keeper, &applied, Vec::new());
+        let tail = ["--entrypoint", "tail", "--workdir", &format!("{MOUNT}/crates"), "kiln/harness", "-f", "/dev/null"].map(str::to_owned);
+        assert!(args.ends_with(&tail), "{args:?}");
+        assert!(!run_args(&desktop(), &applied, Vec::new()).iter().any(|a| a == "--entrypoint"));
+        Ok(())
     }
 
     /// W9. Do: apply Slates' read-only entry through each engine, then entries kiln can't apply as answered: another type, a
