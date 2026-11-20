@@ -181,6 +181,18 @@ pub fn given(g: IdentityGiven, state_dir: &Path, label: &str) -> anyhow::Result<
     Ok(())
 }
 
+/// [`given`]'s certificate kept without its check that an agent's slot holds that agent's identity
+/// (1fc2e3824): runner::signed's tests hold a leg's identity under an agent's slot, so that no test
+/// holds a leg's key, which would make this process undumpable while this module's own test looks.
+#[cfg(test)]
+pub(crate) fn given_as_is(g: IdentityGiven, state_dir: &Path, label: &str) -> anyhow::Result<()> {
+    let slot = slot(&g.kind, g.of.as_deref(), g.epoch);
+    let pem = g.cert_pem.ok_or_else(|| anyhow::anyhow!("no certificate for {slot}"))?;
+    let path = cert_written(state_dir, label, &slot, &pem)?;
+    anyhow::ensure!(keep_cert(&slot, Given { uri: g.uri, under: g.delegation }, pem, path), "no key held for {slot}");
+    Ok(())
+}
+
 /// [`given`] on the blocking pool, off the caller's shard: the certificate's file is written and waited for on the
 /// disk there, as the runner's loop waits for it (goal 9, plan 01a1a87b2cec step 3: it was, on that loop's shard).
 pub async fn given_off(g: IdentityGiven, state_dir: PathBuf, label: String) -> anyhow::Result<()> {
