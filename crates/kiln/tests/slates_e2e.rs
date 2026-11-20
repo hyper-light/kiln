@@ -914,7 +914,10 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     eprintln!("DRIVE: {engine:?}, an agent in mode {}, on {}, instance {}", mode.claude(), f.machine, instance.name);
     let id = vm_e2e::open(f, &spec)?;
     let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?.reporting(landing_reports(&instance.name));
-    let (info, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+    // A start that never reaches its first turn (its workspace refused as Slates came up) says what Slates said.
+    let (info, events) = pace
+        .until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))
+        .map_err(|e| anyhow::anyhow!("{e:#}\n{}", slates_log(dir)))?;
     let lines = vm_e2e::said(&events);
     let what = format!("{engine:?} session {id} ({mode:?})");
     let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}", f.runner_log(), slates_log(dir));
