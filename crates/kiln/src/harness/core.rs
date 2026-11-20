@@ -123,6 +123,14 @@ pub fn origin_of(client_id: &str) -> &'static str {
     }
 }
 
+impl Core {
+    /// Who a sent message is from ([`origin_of`]), the opening prompt of an agent another agent
+    /// started being that agent's.
+    pub fn origin_of(&self, client_id: &str) -> &'static str {
+        if self.agent_opening.as_deref() == Some(client_id) { "agent" } else { origin_of(client_id) }
+    }
+}
+
 /// Words that end by asking something (their last line ends with a question mark).
 fn asks_you(text: &str) -> bool {
     text.trim_end().trim_end_matches(['*', '_', '`', ')', '"']).ends_with('?')
@@ -685,6 +693,9 @@ pub struct Core {
     /// already, it may), as its host keeps it (`super::limit`). None (a core of no machine's): it
     /// may.
     pub room: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// The id of its opening prompt when an agent started it (`Spec::parent`): that agent's words,
+    /// not a person's, whatever its harness says back (`Core::origin_of`).
+    pub agent_opening: Option<String>,
 }
 
 impl Default for Core {
@@ -816,6 +827,7 @@ impl Core {
             harness: None,
             limit_ask: None,
             room: None,
+            agent_opening: None,
         }
     }
 
@@ -1863,6 +1875,11 @@ mod tests {
         assert_eq!(origin_of(&format!("{KEEP_ID}1")), "kiln");
         assert_eq!(origin_of(&super::super::queued::from_agent("01a1d07d0bff71179835e1526868a53a")), "agent");
         assert_eq!(origin_of("01a1d0b4c3f5"), "human");
+        let mut core = Core::new();
+        assert_eq!(core.origin_of("opening"), "human");
+        core.agent_opening = Some("opening".into());
+        assert_eq!(core.origin_of("opening"), "agent");
+        assert_eq!(core.origin_of("01a1d0b4c3f5"), "human");
     }
 
     #[test]

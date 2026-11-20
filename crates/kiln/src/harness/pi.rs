@@ -594,7 +594,7 @@ impl Pi {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
         core.note_sent(&m.id, &m.text);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(core.origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
     }
 
     fn prompt(&mut self, core: &mut Core, m: QueueItem) {
