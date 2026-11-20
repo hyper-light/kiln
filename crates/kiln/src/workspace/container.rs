@@ -475,7 +475,7 @@ async fn end_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow:
 pub async fn facts(workspaces: Option<&Workspaces>, image: Option<&str>) -> ContainerFacts {
     let has_workspaces = workspaces.is_some_and(|w| w.available);
     let image = image.map(str::trim).filter(|i| !i.is_empty()).map(str::to_owned);
-    crate::rt::blocking(move || facts_of(has_workspaces, image, crate::runner::docker::find, |program| slates_api::container_engine::engine_profile(program), shared_granted))
+    crate::rt::blocking(move || facts_of(has_workspaces, image, crate::runner::docker::find, slates_api::container_engine::engine_profile, shared_granted))
         .await
         .unwrap_or_else(|e| ContainerFacts { why_not: Some(format!("the container engine couldn't be asked: {e:#}")), missing: Some(ContainerMissing::Engine), ..ContainerFacts::default() })
 }
@@ -857,6 +857,7 @@ mod tests {
     /// rootless podman. Expect each lack named typed and nothing asked past it; the refused untested profile still naming
     /// its engine; only the last two available.
     #[test]
+    #[allow(clippy::result_large_err, reason = "the stand-ins answer as Slates' engine_profile does, with its EngineFault")]
     fn w9_a_runners_facts_say_whether_its_agents_can_run_in_containers_and_what_it_lacks() {
         use slates_api::container_engine::ProfileRefusal;
         let asked = std::cell::Cell::new(0_u32);
