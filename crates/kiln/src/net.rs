@@ -957,8 +957,9 @@ type ServerDriver = Driver<Kiln, Spares, ServerBook>;
 type AgentDriver = Driver<Kiln, Spares, AgentBook>;
 
 enum AnyDriver {
-    Server(ServerDriver),
-    Agent(AgentDriver),
+    // Both boxed: each driver is kilobytes, and a server's book outgrew an agent's (clippy's `large_enum_variant`).
+    Server(Box<ServerDriver>),
+    Agent(Box<AgentDriver>),
 }
 
 macro_rules! with_driver {
@@ -993,13 +994,13 @@ fn build(spec: &Spec, leaf: &Leaf) -> anyhow::Result<AnyDriver> {
         let ep = Endpoint::<Kiln, _, _>::new(cfg, budget, book, now)
             .map_err(|r| anyhow::anyhow!("endpoint: {r}"))?;
         let d = Driver::bind(ep, spec.bind, io).map_err(|e| anyhow::anyhow!("bind {}: {e}", spec.bind))?;
-        Ok(AnyDriver::Server(d))
+        Ok(AnyDriver::Server(Box::new(d)))
     } else {
         let cfg = Config { tls, role: Role::Agent, limits: limits(false), congestion: Default::default() };
         let ep = Endpoint::<Kiln, _, _>::new(cfg, budget, AgentBook, now)
             .map_err(|r| anyhow::anyhow!("endpoint: {r}"))?;
         let d = Driver::bind(ep, spec.bind, io).map_err(|e| anyhow::anyhow!("bind {}: {e}", spec.bind))?;
-        Ok(AnyDriver::Agent(d))
+        Ok(AnyDriver::Agent(Box::new(d)))
     }
 }
 
