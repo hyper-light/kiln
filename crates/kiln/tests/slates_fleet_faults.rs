@@ -18,11 +18,12 @@
 //! three Slates instances and their anchors; without it each skips, saying so. Linux alone, where a workspace is a FUSE
 //! mount: on macOS it's a kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has
 //! panicked the Mac (Slates' record of 2026-10-06), so the macOS flows wait until a runner lets its workspace mounts go
-//! before a fault.
+//! before a fault. The test builds on every Unix, so a change that breaks it is seen where it is made; off Linux each
+//! flow skips, saying why, whatever the switch says.
 //!
 //!   SLATES_FLEET_FAULTS=1 cargo test -p kiln --test slates_fleet_faults -- --nocapture --test-threads 1
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 mod vm_e2e;
@@ -51,6 +52,10 @@ const LOOK: Duration = Duration::from_millis(250);
 
 /// Whether the flows run here; a skip says why.
 fn enabled() -> bool {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipped: kiln's Slates fleet is faulted on Linux alone (a daemon stopped under a macOS workspace's NFS mount has panicked the Mac)");
+        return false;
+    }
     if std::env::var_os(SWITCH).is_some_and(|v| v == "1") {
         return true;
     }
@@ -103,8 +108,8 @@ impl Lab {
         }
         let listed: String = nodes.iter().map(|n| format!("\"{}\" = \"{}\"\n", n.machine, n.address)).collect();
         let extra = format!("[slates_fleet]\nf = 1\n[slates_fleet.nodes]\n{listed}");
-        let mut fleet = common::Fleet::with(move |_| extra.clone())?;
-        fleet.start_server()?;
+        // `Fleet::with` starts the server itself.
+        let fleet = common::Fleet::with(move |_| extra.clone())?;
         let project = fleet.root.path().join("project");
         make_project(&project)?;
         let mut lab = Lab { fleet, nodes, project };
@@ -127,7 +132,8 @@ impl Lab {
         };
         let dir = self.fleet.root.path().join(format!("{name}-stub"));
         let mut env = vm_e2e::stub_host_env(&dir)?;
-        env.extend([("KILN_SLATES_INSTANCE", instance), ("KILN_SLATES_DIRECT", "1".to_owned()), ("KILN_SLATES", String::new())]);
+        // Its own machine id (what `common::machine` keys it by): three runners on one host are three machines.
+        env.extend([("KILN_MACHINE_ID", name.to_owned()), ("KILN_SLATES_INSTANCE", instance), ("KILN_SLATES_DIRECT", "1".to_owned()), ("KILN_SLATES", String::new())]);
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.fleet.start_runner_with(name, &env)
     }
@@ -174,7 +180,8 @@ impl Lab {
         let on = self.node(i)?.machine.clone();
         let spec = json!({"kind": "claude", "on": on, "cwd": self.project, "prompt": "wait", "workspace": {"kind": "volume"}});
         let started = self.fleet.call("POST", "/api/ops/agents.start", Some(&spec))?;
-        let id = ["/id", "/session/id", "/agent/id", "/agent"]
+        // `agents.start` answers `{"agents": [brief], "parent"}` (harness/ops.rs `start_ask`).
+        let id = ["/agents/0/id"]
             .iter()
             .find_map(|p| started.pointer(p).and_then(Value::as_str))
             .ok_or_else(|| anyhow::anyhow!("kiln named no session for the agent it started: {started}"))?
@@ -182,7 +189,7 @@ impl Lab {
         let began = Instant::now();
         loop {
             let info = self.agent(&id)?;
-            if let Some(volume) = info.pointer("/workspace/made/volume").and_then(Value::as_str).filter(|v| !v.trim().is_empty()) {
+            if let Some(volume) = info.pointer("/info/workspace/made/volume").and_then(Value::as_str).filter(|v| !v.trim().is_empty()) {
                 return Ok((id, volume_id(volume)?));
             }
             anyhow::ensure!(began.elapsed() < WITHIN, "agent {id}'s workspace was never made: {info}");
@@ -198,7 +205,8 @@ impl Lab {
     /// Where agent `id` works now, by kiln's word: its runner's machine key.
     fn runs_on(&self, id: &str) -> anyhow::Result<Option<String>> {
         let info = self.agent(id)?;
-        Ok(["/on", "/runner", "/machine", "/session/on"].iter().find_map(|p| info.pointer(p).and_then(Value::as_str)).map(str::to_owned))
+        // `agents.get` answers `{"agent": brief, "info", ...}`; the brief's `machine` is its target's machine key.
+        Ok(info.pointer("/agent/machine").and_then(Value::as_str).map(str::to_owned))
     }
 
     /// Every process of runner `i`'s instance (its anchor and its daemon): those whose command line names it.
