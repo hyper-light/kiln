@@ -898,7 +898,10 @@ part.
   PersistentVolume as they go); the pod's runner (built 2026-11-20, the person's decision: one code path, a runner's
   sessions, workspace, reporting and teardown reused): `kiln agent --ephemeral --session <id>` holds that one agent
   session's harness, which no other ephemeral runner does, and leaves once it has come and gone, its uplink drained, or
-  gives up where it never came within the ephemeral wait (`agent::session_runner_ends`); the home's part (built 2026-11-20:
+  gives up where it never came within the ephemeral wait (`agent::session_runner_ends`); and the pod itself (built 2026-11-20,
+  `k8s::volume::agent_pod`): the harness's image running that runner, copied in by the init container a job's pod has,
+  enrolling with a one-time token, the workspace's claim mounted at the folder's own path and worked in there, run as the
+  folder's owner, no deadline; the home's part (built 2026-11-20:
   `workspace::held`, the `hold` and `release` asks of a runner that names `workspace.hold`: its volume made with no
   mount, its write policy from the agent's grant, exported to the folder's owner through `Instance::export`, the path,
   attachment, uid and gid answered, and every question about the pod's folder answered from the holding, as an isolated
