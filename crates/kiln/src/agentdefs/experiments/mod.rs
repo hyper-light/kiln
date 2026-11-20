@@ -343,6 +343,7 @@ fn shown(v: &Row) -> String {
     }
     match d.engine {
         Engine::Host => "the host".to_owned(),
+        Engine::Container => "a container".to_owned(),
         Engine::Microvm => format!("{} with {} vCPU and {} MiB", d.agentfile.as_deref().unwrap_or("its Agentfile"), d.cpus.unwrap_or_default(), d.memory.unwrap_or_default() / super::MIB),
     }
 }
@@ -487,7 +488,8 @@ async fn deployment(hub: &Hub, d: &AgentDef, ask: &VariantAsk, which: &str) -> R
     s.model = model.clone().or(s.model);
     match engine {
         // What's given of a microVM is refused by the check, as a host's session has none.
-        Engine::Host => (s.engine, s.agentfile, s.cpus, s.memory) = (Some(Engine::Host), ask.agentfile.clone(), ask.cpus, ask.memory),
+        // A definition asks `host` or `microvm` alone; a container is its runner's engine, nothing of a microVM given.
+        Engine::Host | Engine::Container => (s.engine, s.agentfile, s.cpus, s.memory) = (Some(engine), ask.agentfile.clone(), ask.cpus, ask.memory),
         Engine::Microvm => {
             s.engine = None;
             s.agentfile = ask.agentfile.as_deref().map(str::trim).map(str::to_owned).or_else(|| d.settings.microvm_agentfile());
@@ -854,7 +856,7 @@ pub async fn set_state(hub: &Hub, who: &Who, def: &str, id: &str, to: Move) -> R
 fn promotion(s: &Settings, v: &Variant) -> Patch {
     let mut p = Patch::default();
     match v.engine {
-        Engine::Host => (p.engine, p.agentfile, p.cpus, p.memory) = (Some(Some(Engine::Host)), Some(None), Some(None), Some(None)),
+        Engine::Host | Engine::Container => (p.engine, p.agentfile, p.cpus, p.memory) = (Some(Some(v.engine)), Some(None), Some(None), Some(None)),
         Engine::Microvm => {
             p.engine = Some(None);
             if v.agentfile != s.agentfile_in_use() {

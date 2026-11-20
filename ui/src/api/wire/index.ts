@@ -135,6 +135,7 @@ export type { HeldLines } from "./HeldLines";
 export type { HookInfo } from "./HookInfo";
 export type { HostSample } from "./HostSample";
 export type { Hunk } from "./Hunk";
+export type { InContainer } from "./InContainer";
 export type { InStack } from "./InStack";
 export type { InboxAnswer } from "./InboxAnswer";
 export type { IncidentBrief } from "./IncidentBrief";

@@ -504,7 +504,7 @@ mod tests {
             let f = super::checked(None, Ok(HostCheck::Unusable { backend: Some(Backend::Kvm), why }));
             assert!(!f.available && f.hypervisor.is_none() && f.why_not.as_deref().is_some_and(|w| w.contains(says)), "{f:?}");
             let runner = RunnerFacts { isolation: Some(f.clone()), ..RunnerFacts::default() };
-            let h = held(Asked::default(), &capable(&runner));
+            let h = held(Asked::default(), &capable(&runner), &crate::harness::engine::containers(&runner));
             assert_eq!((h.engine, h.why.as_deref()), (Engine::Host, f.why_not.as_deref()));
         }
         let intel = super::checked(None, Ok(HostCheck::Unusable { backend: None, why: Unusable::Unsupported { os: "macos".into(), arch: "x86_64".into() } }));
