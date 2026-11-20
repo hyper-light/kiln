@@ -570,7 +570,11 @@ its library (`ensure_group`) and says it's done. It's never asked again, so a fo
 doesn't recover one). A fleet of one is
 bootstrapped the same way. A workspace asked of a node that hasn't imported the groups yet waits for them
 (`workspace::slates::call_grouped`) rather than failing its agent. Each flow proves one fleet before its fault: every
-node counts all three members. Open (the person's to decide): a kiln workspace isn't live-shipped, so a write Slates
+node counts all three members. Both link flows pass on macOS (Mac Studio, 2026-11-20): a runner cut off while it runs
+(35.8 s: every acknowledged file served through the survivors while cut and after), and a slow, lossy link (43.3 s: the
+move over it refused by kind `unplaced`, the agent where it was, every acknowledged file served). A move kiln took
+(`agents.move` answered `moving`) and its runner then refused is said in the agent's timeline ("Couldn't move to …
+[kind: …] — it goes on here"), which the flows read as kiln's word; the signalling flows are Linux's. Open (the person's to decide): a kiln workspace isn't live-shipped, so a write Slates
 acknowledged is the owner's alone until its next seal, where Slates' own "no acknowledged change lost" is a live-shipped
 volume's; and a workspace is shared with another runner's user only before a move (K4; Slates' access lists are per
 host, A-237), so a survivor is refused a read of a workspace it was never moved.

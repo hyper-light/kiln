@@ -437,6 +437,23 @@ impl Lab {
         Ok(())
     }
 
+    /// The refusal of a move kiln took for agent `id`, as its timeline says it (`harness::session::move_failed`'s notice,
+    /// "Couldn't move to …"): the newest, or none.
+    fn move_refused_in_timeline(&self, id: &str) -> anyhow::Result<Option<String>> {
+        let events = self.fleet.call("GET", &format!("/api/harness/sessions/{id}/events?limit=1000"), None)?;
+        fn said(v: &Value, out: &mut Option<String>) {
+            match v {
+                Value::String(t) if t.starts_with("Couldn't move to ") => *out = Some(t.clone()),
+                Value::Array(a) => a.iter().for_each(|x| said(x, out)),
+                Value::Object(o) => o.values().for_each(|x| said(x, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        said(&events, &mut out);
+        Ok(out)
+    }
+
     /// kiln's word on agent `id` (`agents.get`).
     fn agent(&self, id: &str) -> anyhow::Result<Value> {
         self.fleet.call("POST", "/api/ops/agents.get", Some(&json!({"agent": id})))
@@ -728,7 +745,10 @@ fn move_settles(lab: &Lab, agent: &str, from: &str, to: &str, refused: Option<&s
     let outcome = loop {
         lab.reroot();
         let runs_on = lab.runs_on(agent)?;
-        let said = MoveSaid { from, to, runs_on: runs_on.as_deref(), refused };
+        // A move kiln took (`agents.move` answered `moving`) and its runner then refused says so in the agent's timeline
+        // ("Couldn't move to …: … [kind: …] — it goes on here", `harness::session::move_failed`): kiln's word too.
+        let in_timeline = if refused.is_none() { lab.move_refused_in_timeline(agent)? } else { None };
+        let said = MoveSaid { from, to, runs_on: runs_on.as_deref(), refused: refused.or(in_timeline.as_deref()) };
         match slates_faults::judge_move(&said) {
             Ok(outcome) => break outcome,
             Err(why) => anyhow::ensure!(began.elapsed() < WITHIN, "the move settled on no verdict W7 allows: {why:?}\nkiln's word on the agent: {}\n{}", lab.agent(agent).map_or_else(|e| format!("{e:#}"), |v| v.to_string()), lab.slates_story()),
