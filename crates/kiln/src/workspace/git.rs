@@ -19,6 +19,23 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(180);
 /// Paths given to one `update-index`, well under any system's argument limit.
 const PATHS_PER_CALL: usize = 200;
 
+/// Format: the name a Mac's NFS client gives a file removed while something still holds it open (its silly rename:
+/// Apple's NFS client, `NFS_SILLYNAME_FORMAT` `.nfs.%08x.%04x`, a counter and the low 16 bits of the process's id, in
+/// `kext/nfs_vnops.c`), as a pathspec git leaves out of what it adds: the file is gone once its last holder closes it,
+/// so it's never the agent's work (docs/agentic.md W9: a container's engine holds what it touched past the container).
+pub const SILLY_RENAMED: &str = ":(exclude,glob)**/.nfs.????????.????";
+
+/// Whether `path`'s last part is a name a Mac's NFS client gave a file removed while it was open ([`SILLY_RENAMED`]):
+/// `.nfs.` then eight lowercase hexadecimal digits, a dot, and four.
+pub fn silly_renamed(path: &str) -> bool {
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    match name.strip_prefix(".nfs.").and_then(|rest| rest.split_once('.')) {
+        Some((count, pid)) => hex(count, 8) && hex(pid, 4),
+        None => false,
+    }
+}
+
 /// A folder's repository, as git sees it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Facts {
@@ -224,7 +241,7 @@ pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, 
         None => {
             let mut c = git(top);
             with_index(&mut c);
-            c.args(["add", "-A"]);
+            c.args(["add", "-A", "--", ".", SILLY_RENAMED]);
             run(c, GIT_TIMEOUT).await?;
         }
         Some(paths) => {
@@ -871,7 +888,7 @@ async fn now_tree(top: &Path, head: Option<&str>) -> anyhow::Result<String> {
     };
     run(c, GIT_TIMEOUT).await?;
     let mut c = git(top);
-    c.env("GIT_INDEX_FILE", &scratch.0).args(["add", "-A"]);
+    c.env("GIT_INDEX_FILE", &scratch.0).args(["add", "-A", "--", ".", SILLY_RENAMED]);
     run(c, GIT_TIMEOUT).await?;
     let mut c = git(top);
     c.env("GIT_INDEX_FILE", &scratch.0).arg("write-tree");
@@ -1279,6 +1296,31 @@ mod tests {
             "git init -q -b main && git config user.name Ada && git config user.email ada@example.com && git config commit.gpgsign false && git config tag.gpgsign false && echo a > a && echo b > b && mkdir -p src && echo s > src/s.rs && printf 'target/\\n*.log\\n' > .gitignore && git add . && git commit -qm init && git remote add origin git@github.com:acme/app.git",
         )?;
         Ok(d)
+    }
+
+    /// W9: a Mac's NFS client renames a file removed while something holds it open (`.nfs.%08x.%04x`), and a container's
+    /// engine holds what it touched past the container. Do: tell such names from names like them, then take the tree of
+    /// a working tree holding the agent's file beside two of them (at the top and in a folder) and one only like them, as
+    /// `git add -A` would. Expect the silly-renamed files left out and every other name taken.
+    #[test]
+    fn w9_a_file_the_nfs_client_renamed_as_it_was_removed_is_never_the_agents_work() -> anyhow::Result<()> {
+        for name in [".nfs.0000002a.1f2e", "src/.nfs.20051025.00ff", "a/b/.nfs.deadbeef.0001/"] {
+            assert!(silly_renamed(name), "{name}");
+        }
+        for name in [".nfs.0000002A.1f2e", ".nfs.2a.1f2e", ".nfs.0000002a.1f2e.x", ".nfs0000002a", "nfs.0000002a.1f2e", ".nfs.0000002a.1f2", "src/.nfs.0000002a", ".nfs.0000002g.1f2e"] {
+            assert!(!silly_renamed(name), "{name}");
+        }
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "echo work > src/work.rs && echo held > .nfs.0000002a.1f2e && echo held > src/.nfs.20051025.00ff && echo mine > .nfs.notone")?;
+        let here = top.clone();
+        let head = out(&top, &["rev-parse", "HEAD"])?;
+        let tree = crate::rt::block_on(async move { now_tree(&here, Some(&head)).await })?;
+        let listed = out(&top, &["ls-tree", "-r", "--name-only", tree.as_str()])?;
+        let mut names: Vec<&str> = listed.lines().collect();
+        names.sort_unstable();
+        assert_eq!(names, [".gitignore", ".nfs.notone", "a", "b", "src/s.rs", "src/work.rs"]);
+        Ok(())
     }
 
     #[test]

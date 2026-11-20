@@ -721,7 +721,10 @@ On each platform:
   share holds every file a container touched open past the container's life, so a delete inside leaves the NFS client's
   silly-renamed `.nfs.*` entry in the volume, which blocks an `rmdir` and the plain unmount (the end's forced unmount
   lets go of it, W3), and which must never land in the person's folder or go up in a change request: kiln leaves the NFS
-  client's silly-rename names out of both (owed).
+  client's silly-rename names out of both (built 2026-11-20: Apple's NFS client names such a file `.nfs.%08x.%04x`, a
+  counter and the low 16 bits of the process's id, `kext/nfs_vnops.c`; `workspace::git::silly_renamed` tells the name
+  exactly, a commit's `git add -A` leaves it out by pathspec, `SILLY_RENAMED`, and a landing's excludes take each one git
+  sees untracked).
 - **Windows.** A Windows container can't bind a workspace: Slates ruled it out by a run (its G-mount step 4, 2026-10-26,
   CI's Windows runner, run 40257213499): Docker's engine is a service in a logon session of its own, and each logon
   session has its own drive letters (Microsoft Learn, "Services and Redirected Drives"), so it never sees the WinFsp

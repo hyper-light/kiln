@@ -1452,8 +1452,10 @@ async fn git_ignored(top: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// The paths `git status --porcelain=v1 -z --ignored=traditional` says it ignores (`!! target/`: a directory git
-/// ignores whole is named once), each a prefix of the volume (`/target`); a rename's or a copy's source, a field of its
-/// own, is no path of its own.
+/// ignores whole is named once), each a prefix of the volume (`/target`), and the untracked files a Mac's NFS client
+/// renamed as they were removed while open (`?? src/.nfs.0000002a.1f2e`, `super::git::silly_renamed`: gone once their
+/// last holder closes them, never written into a person's folder); a rename's or a copy's source, a field of its own, is
+/// no path of its own.
 fn ignored_prefixes(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut fields = text.split('\0').filter(|f| !f.is_empty());
@@ -1463,6 +1465,8 @@ fn ignored_prefixes(text: &str) -> Vec<String> {
             if !path.is_empty() {
                 out.push(format!("/{path}"));
             }
+        } else if let Some(path) = record.strip_prefix("?? ").filter(|p| super::git::silly_renamed(p)) {
+            out.push(format!("/{path}"));
         } else if names_a_source(record) {
             let _ = fields.next();
         }
@@ -2372,6 +2376,9 @@ mod tests {
         let said = "!! target/\0 M src/a.rs\0R  new.rs\0old.rs\0!! src/gen.o\0?? src/n.rs\0 R moved.rs\0!! was.rs\0!! node_modules/\0";
         assert_eq!(ignored_prefixes(said), ["/target", "/src/gen.o", "/node_modules"]);
         assert!(ignored_prefixes("").is_empty());
+        // W9: what a Mac's NFS client renamed as it was removed while open goes into no landing; a name only like it does.
+        let held = "?? src/.nfs.0000002a.1f2e\0?? .nfs.20051025.00ff\0?? .nfs.notone\0!! target/\0";
+        assert_eq!(ignored_prefixes(held), ["/src/.nfs.0000002a.1f2e", "/.nfs.20051025.00ff", "/target"]);
         let m = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), ..Default::default() };
         let request = landing(&m, "/src/kiln", &["/target".to_owned(), "/.git".to_owned()])?;
         assert_eq!(request.filter.exclude, ["/target", "/.git"]);
