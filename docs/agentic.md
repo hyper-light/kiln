@@ -522,6 +522,17 @@ written into its volume before each fault, each one Slates acknowledged. Each fl
 - **a link lost mid-move**: an agent's move (`agents.move`) to the second runner, whose node is stopped once the move
   has begun and let go on after the failover delay.
 
+Two more flows fault the links themselves (A-708), with Slates' own fault relay (`vendor/slates/crates/cli/tests/support/
+relay.rs`, A-277) between the nodes: each runner is listed at a block of ports the relay holds and its node binds a block
+of its own, which `[slates_fleet.binds]` names and kiln writes into the node's own manifest entry as Slates' `bind`, so
+every datagram between two nodes crosses the relay and meets its path's rule, every draw from one printed seed
+(`SLATES_CHAOS_SEED` replays it). The relay attributes a node's record links by its daemon's pid, told again whenever
+that daemon is another process; each flow first checks its record links crossed the relay (A-330's check):
+- **a slow, lossy link**: every path holds each datagram 40 ms ± 10 ms (so they reorder) and loses 1 % while files are
+  written and the agent is moved to the second runner;
+- **a runner cut off while it runs**: every path into and out of the volume's node cut past the failover delay, its
+  processes running on (the partition a stopped process can't make), the files read through the other two, then healed.
+
 Every flow ends with the same three verdicts, each from what an agent or a person can see, judged by pure code that
 runs on every host (`workspace::slates_faults`): **no acknowledged change lost** (every file Slates acknowledged before
 the fault is served after it byte for byte, by whichever node serves the volume then); **the move completes or refuses
@@ -552,7 +563,9 @@ stream kiln asks of its instance and hands Shards through Hex (Shards' D286, Hex
 path in its guest. Its change request is built from the volume's own changes (`workspace::review`: Slates'
 landing entries, each file read from the volume and checked against its BLAKE3, and a file whose owner's execute bit
 alone changed (all git keeps of a mode: git's `ce_permissions`) read there and checked against the folder's copy, whose
-bytes its landing keeps; A-287), and its landing
+bytes its landing keeps; A-287; where the repository's `core.fileMode` is false git trusts no execute bit, so none
+is committed: a written file keeps its index's mode, a new one is `100644`, and a mode change is one git can't see,
+kiln goal 90), and its landing
 is the same Slates landing as a mounted workspace's, leaving out what git ignores as a mounted one does: read from
 the volume itself (its own `.gitignore` files, the repository's excludes and the person's, over what the landing
 writes: each ignored file, or the shallowest directory git ignores above it), never from the runner's own folder,

@@ -271,7 +271,7 @@ mod tests {
     }
 
     fn fleet() -> crate::config::SlatesFleet {
-        crate::config::SlatesFleet { f: 1, nodes: [("bench-a", "10.0.0.1:17300"), ("bench-b", "10.0.0.2:17300"), ("bench-c", "10.0.0.3:17300")].into_iter().map(|(m, a)| (m.to_owned(), a.to_owned())).collect() }
+        crate::config::SlatesFleet { f: 1, nodes: [("bench-a", "10.0.0.1:17300"), ("bench-b", "10.0.0.2:17300"), ("bench-c", "10.0.0.3:17300")].into_iter().map(|(m, a)| (m.to_owned(), a.to_owned())).collect(), ..Default::default() }
     }
 
     fn members(serving: &[(&str, Option<u64>)]) -> Members {
