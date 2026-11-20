@@ -85,7 +85,7 @@ fn shards_carried() -> Result<(), String> {
     let exe = if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") { ".exe" } else { "" };
     // A lint of a target whose Shards isn't built here (kiln's gate's clippy through zig for macOS and Windows, from
     // Linux): asked by name, it checks kiln's code against empty stand-ins, and the binary it makes refuses to run
-    // (src/bin/kiln.rs, `cfg(kiln_lint)`), so no lint build is ever a kiln.
+    // (src/entry.rs's `main`, `cfg(kiln_lint)`), so no lint build is ever a kiln.
     if std::env::var("KILN_SHARDS").is_ok_and(|v| v == "lint") {
         let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default()).join("shards-lint");
         std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
