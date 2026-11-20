@@ -100,6 +100,96 @@ pub fn home_of(hub: &Hub, machine: &str) -> Option<String> {
     hub.agent_pods.home_of(machine)
 }
 
+/// How long a home may take to make and export a pod's workspace: a volume made and exported, on a loaded machine.
+const HOLD_WAIT: Duration = Duration::from_secs(120);
+
+/// A home's answer to a hold (`crate::workspace::held::hold`): the export's path and attachment, and the folder's owner
+/// and folder.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct Held {
+    path: String,
+    uid: u32,
+    gid: u32,
+    folder: String,
+}
+
+/// The host and base port `address` (`[slates_fleet.nodes]`'s `host:port`, an IPv6 host in brackets) names.
+pub fn host_and_port(address: &str) -> anyhow::Result<(String, u16)> {
+    let (host, port) = address.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("{address:?} names no port"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    anyhow::ensure!(!host.is_empty(), "{address:?} names no host");
+    Ok((host.to_owned(), port.parse().map_err(|_| anyhow::anyhow!("{address:?}'s port isn't one"))?))
+}
+
+/// The name of session `id`'s pod, its claim and its PersistentVolume: `kiln-agent-` and the session id's last letters
+/// and digits, lowercase, a DNS label.
+pub fn pod_name(id: &str) -> String {
+    let tail: String = id.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect();
+    let tail = tail.get(tail.len().saturating_sub(40)..).unwrap_or(&tail);
+    format!("kiln-agent-{tail}")
+}
+
+impl super::K8s {
+    /// Starts session `id` (`spec`) in an agent's pod of its own (docs/agentic.md W10), its workspace held by its home
+    /// `home`: the home makes and exports the workspace (`workspace.hold`), the PersistentVolume and its claim are made
+    /// from the export at the address `[slates_fleet.nodes]` lists for the home, and the pod is made with a one-time token
+    /// for its runner, which is given the session as it comes ([`on_features`]). What it made is taken down again where a
+    /// later step fails. The pod's name.
+    pub async fn start_agent(&self, hub: &Hub, id: &str, spec: Spec, home: &str) -> anyhow::Result<String> {
+        let image = self.cfg.agents_image.clone().filter(|i| !i.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("the server names no image for agents' pods: set `agents_image` under `[kubernetes]`"))?;
+        let address = hub.cfg.slates_fleet.nodes.get(home).ok_or_else(|| anyhow::anyhow!("{} isn't in kiln's Slates fleet (`[slates_fleet.nodes]`), so it serves no export for a pod", hub.shown(home)))?;
+        let (host, port) = host_and_port(address)?;
+        let cwd = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
+        let hold = crate::workspace::Ask::Hold(crate::workspace::held::Hold { cwd, level: Some(spec.launched_level()), read_only: false });
+        let json = serde_json::to_string(&hold)?;
+        let session = id.to_owned();
+        let answer: serde_json::Value = hub
+            .ask_speaking(home, crate::proto::feature::WORKSPACE_HOLD, HOLD_WAIT, move |req| crate::proto::ServerMsg::Workspace { req, session, json })
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("{}'s kiln holds no workspace for a pod: upgrade it (System → Updates)", hub.shown(home)))?
+            .unwrap_or(serde_json::Value::Null);
+        if let Some(e) = answer.get("error").and_then(serde_json::Value::as_str) {
+            anyhow::bail!("{} didn't hold the pod's workspace: {e}", hub.shown(home));
+        }
+        let held: Held = serde_json::from_value(answer)?;
+        let name = pod_name(id);
+        let made: anyhow::Result<String> = async {
+            let export = super::volume::PodExport { host, port, path: held.path, read_only: false, uid: held.uid, gid: held.gid, folder: held.folder };
+            let objects = super::volume::objects(&name, &self.cfg.namespace, id, &export).map_err(anyhow::Error::new)?;
+            super::volume::make(&self.api, &objects).await?;
+            let until = Instant::now() + token_ttl(&self.cfg);
+            let token = hub.agent_pods.issue(&name, PodSession { id: id.to_owned(), spec, home: home.to_owned(), opened: false }, until);
+            let server_url = self.cfg.server_url.clone().unwrap_or_else(|| hub.cfg.server.public_url.clone());
+            let server_quic = self.cfg.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone());
+            let pod = super::volume::agent_pod(&self.cfg, id, &name, &image, &token, (&server_url, &server_quic), &objects);
+            if let Err(e) = self.api.create_pod(&pod).await {
+                hub.agent_pods.take(&name);
+                if let Err(gone) = super::volume::unmake(&self.api, &name).await {
+                    tracing::warn!(pod = %name, error = %format!("{gone:#}"), "a refused agent pod's claim and PersistentVolume stayed");
+                }
+                return Err(e);
+            }
+            Ok(name)
+        }
+        .await;
+        if made.is_err() {
+            release(hub, home, id).await;
+        }
+        made
+    }
+}
+
+/// Asks home `home` to let session `id`'s held workspace go (its export detached, its volume ended); one that can't is
+/// said, the volume ending with its instance's own rules.
+pub async fn release(hub: &Hub, home: &str, id: &str) {
+    let Ok(json) = serde_json::to_string(&crate::workspace::Ask::Release) else { return };
+    let session = id.to_owned();
+    let asked: anyhow::Result<Option<Option<serde_json::Value>>> = hub.ask_speaking(home, crate::proto::feature::WORKSPACE_HOLD, HOLD_WAIT, move |req| crate::proto::ServerMsg::Workspace { req, session, json }).await;
+    if let Err(e) = asked {
+        tracing::warn!(home, session = id, error = %format!("{e:#}"), "a pod's held workspace wasn't let go at its home");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +209,13 @@ mod tests {
         assert!(pods.to_open("some-runner").is_none());
         assert_eq!(pods.home_of("kiln-ws-a"), Some("studio".to_owned()));
         assert!(pods.take("kiln-ws-a").is_some() && pods.home_of("kiln-ws-a").is_none());
+        assert_eq!(host_and_port("10.0.0.1:17300").ok(), Some(("10.0.0.1".to_owned(), 17300)));
+        assert_eq!(host_and_port("[fd7a::1]:17300").ok(), Some(("fd7a::1".to_owned(), 17300)));
+        assert_eq!(host_and_port("runner-a.lan:17302").ok(), Some(("runner-a.lan".to_owned(), 17302)));
+        assert!(host_and_port("runner-a.lan").is_err() && host_and_port(":17300").is_err() && host_and_port("h:x").is_err());
+        let name = pod_name("01A1F7FF-6874e8a4691fe653779c97");
+        assert_eq!(name, "kiln-agent-01a1f7ff6874e8a4691fe653779c97");
+        assert!(name.len() <= 63 && pod_name(&"9".repeat(200)).len() <= 63);
         let late = pods.issue("kiln-ws-b", PodSession { id: "01a1f8".to_owned(), spec: Spec::default(), home: "studio".to_owned(), opened: false }, Instant::now());
         assert_eq!(pods.enrolling(&late), None, "a token past its time is refused");
     }

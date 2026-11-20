@@ -908,7 +908,10 @@ part.
   folder's owner, no deadline; and the server's record of each agent pod (built 2026-11-20, `k8s::agent`): its runner enrolls with a
   one-time token bound to its pod's name and is named for its pod, is given the session it was made for once it names its
   features, under the session's own id, and every question about that session's folder (review, drift, landing) goes to
-  its home by that id, never to the pod; the home's part (built 2026-11-20:
+  its home by that id, never to the pod; and the start (built 2026-11-20, `K8s::start_agent`): the
+  home asked to hold the workspace (a runner that names `workspace.hold`), the PersistentVolume and claim made from its
+  export at the address `[slates_fleet.nodes]` lists for it, and the pod made in `[kubernetes] agents_image` with its
+  runner's one-time token; what it made taken down again where a later step fails, the home's hold let go; the home's part (built 2026-11-20:
   `workspace::held`, the `hold` and `release` asks of a runner that names `workspace.hold`: its volume made with no
   mount, its write policy from the agent's grant, exported to the folder's owner through `Instance::export`, the path,
   attachment, uid and gid answered, and every question about the pod's folder answered from the holding, as an isolated
