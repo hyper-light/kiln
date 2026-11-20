@@ -1335,6 +1335,7 @@ mod tests {
                 server,
                 dial_deadline: Duration::from_secs(10),
                 revoked_keys: Vec::new(),
+                revoked_serials: Vec::new(),
             };
             // Each end's events in the order they came, from one queue: the fan's control loop alone (runner-fan).
             let in_order = |spec: crate::net::Spec| -> anyhow::Result<(crate::net::NetHandle, crate::memory::queue::Receiver<crate::wire::fan::Routed>)> {
@@ -1397,7 +1398,7 @@ mod tests {
             // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan).
             let (fan, _events) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
             let _server = crate::net::start_with(
-                crate::net::Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() },
+                crate::net::Spec { bind: addr, ca_der: pki.ca_der.clone(), leaf: pki.server_leaf(&[])?, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new(), revoked_serials: Vec::new() },
                 crate::net::OUT_BYTES,
                 Box::new(fan),
             )?;

@@ -620,6 +620,9 @@ pub struct Hub {
     /// by (a runner process from before its certificate for the id): what that process signs and
     /// checks its custody words as, until it restarts with its certificate for the id.
     pub(crate) peer_certs: crate::rcu::Rcu<crate::util::FastMap<PeerId, String>>,
+    /// Each runner's link that connected with a certificate from before machines' certificates held their role, owed a
+    /// reissue in the runner's role while it lasts (docs/agentic.md W10, `crate::identities::on_features`).
+    pub(crate) role_owed: crate::rcu::Rcu<crate::util::FastMap<PeerId, crate::identities::RoleOwed>>,
     /// The CI engine's dispatcher (docs/ci.md W05): its runs, legs and their messages.
     pub ci: crate::ci::dispatch::Handle,
     /// Each connected runner process's machine, by its link (read on every message a runner sends:
@@ -946,6 +949,7 @@ impl Hub {
             machine_names: Default::default(),
             said_machine: Default::default(),
             peer_certs: Default::default(),
+            role_owed: Default::default(),
             ci: crate::ci::dispatch::Handle::default(),
             peers: Default::default(),
             pending_peers: Default::default(),
@@ -3042,8 +3046,13 @@ impl Hub {
     /// holds of them is a pointer (goal 9, plan 01a1a87b2cec step 5; `Hub::on_net_labeled`).
     async fn on_net_at(self: &Arc<Self>, ev: NetEvent, piece: Option<crate::wire::payload::Piece>, arrived: &mut Option<Arrived>) -> anyhow::Result<()> {
         match ev {
-            NetEvent::Connected { peer, name, binding, secured } => {
+            NetEvent::Connected { peer, name, binding, secured, dual_usage } => {
                 self.tunnels.connected(peer, binding);
+                // A runner's certificate from before machines' certificates held their role: reissued in that role over
+                // this link once it says it takes one (docs/agentic.md W10).
+                if let Some(dual_usage) = dual_usage {
+                    self.role_owed.update(|m| m.insert(peer, crate::identities::RoleOwed { dual_usage: dual_usage.clone(), given: None }));
+                }
                 // A runner connecting again comes back under the peer id it joined with; what the server's end of this
                 // connection negotiated is kept with it (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 34).
                 let secured = secured.map(crate::net::Secured::said);
@@ -3065,6 +3074,7 @@ impl Hub {
                 self.pending_peers.update(|m| m.remove(&peer));
                 self.said_machine.update(|m| m.remove(&peer));
                 self.peer_certs.update(|m| m.remove(&peer));
+                self.role_owed.update(|m| m.remove(&peer));
                 let name = self.peers.update(|m| m.remove(&peer));
                 self.relays.lost(peer);
                 crate::api::boxed(|| self.handovers_lost(peer)).await;
@@ -3739,6 +3749,9 @@ impl Hub {
                 self.instances.update(|i| i.set_features(peer, names.clone()));
                 // One that takes its engine is told what its owner set (`crate::harness::engine`).
                 crate::harness::engine::on_features(self, &agent, peer, &names).await;
+                // One that takes a certificate in the runner's role, on a link made with one from before it, is reissued
+                // one (docs/agentic.md W10).
+                crate::api::boxed(|| crate::identities::on_features(self, &agent, peer, &names)).await;
                 // One that takes it is told the room a hand-over's spool leaves there: a session
                 // moved to it from another machine is taken over (CP-T3.2).
                 crate::harness::mail_transfer::on_features(self, &agent, peer, &names).await;
@@ -3799,6 +3812,9 @@ impl Hub {
             }
             // Where a build of an Agentfile asked ahead of its sessions is (kiln plan 01a1dd2e… P4.5).
             AgentMsg::Prebuilt { json } => crate::api::boxed(|| crate::agentfiles::prebuild::heard(self, &agent, &json)).await,
+            // It took the certificate its link was reissued in the runner's role: the one it connected with is superseded
+            // (docs/agentic.md W10).
+            AgentMsg::RunnerRole { serial } => crate::api::boxed(|| crate::identities::runner_role_said(self, &agent, peer, &serial)).await,
             // Hand-overs between a machine's runner processes (`crate::handovers`).
             AgentMsg::HarnessMailTransfer { json } => crate::api::boxed(|| crate::harness::mail_transfer::heard(self, peer, json)).await,
             AgentMsg::HarnessHandOver { session, offset, data, done } => crate::api::boxed(|| self.handover_piece(&agent, peer, session, offset, data, done)).await,
@@ -7088,7 +7104,7 @@ pub(crate) mod tests {
         let pki = Arc::new(pki);
         // What comes in, taken by none: the fan's control loop alone, its queue kept (runner-fan: `net::start` went).
         let (fan, _events) = crate::wire::fan::Fan::with(crate::wire::fan::InOrder, 1, crate::net::EVENTS_BYTES);
-        let net = crate::net::start_with(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new() }, crate::net::OUT_BYTES, Box::new(fan))?;
+        let net = crate::net::start_with(crate::net::Spec { bind: "127.0.0.1:0".parse()?, ca_der: pki.ca_der.clone(), leaf, server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: Vec::new(), revoked_serials: Vec::new() }, crate::net::OUT_BYTES, Box::new(fan))?;
         let logs = Logs::new(dir.join("logs"), 1 << 20);
         let bus = if persisted { crate::bus::QuiverBus::open_server(&cfg.bus, &cfg.bus.data_in(&cfg.server.data_dir), Arc::clone(&clock))? } else { crate::bus::QuiverBus::open(&cfg.bus, Arc::clone(&clock))? };
         Hub::new_with_bus(clock, Arc::new(cfg), store, logs, net, pki, "test-admin-token".into(), "test-join-token".into(), Shutdown::new(), bus)
@@ -7876,7 +7892,7 @@ pub(crate) mod tests {
         }
         /// fedora's connection coming up as process 1, the server's end of it `secured`, and its Hello.
         async fn connect(hub: &Arc<Hub>, secured: crate::net::Secured) -> anyhow::Result<()> {
-            hub.on_net(NetEvent::Connected { peer: 1, name: Some("fedora".into()), binding: None, secured: Some(secured) }).await?;
+            hub.on_net(NetEvent::Connected { peer: 1, name: Some("fedora".into()), binding: None, secured: Some(secured), dual_usage: None }).await?;
             hear(hub, 1, proto::LANE_CONTROL, &AgentMsg::Hello(hello_of("fedora"))).await
         }
         crate::rt::block_on(async {
