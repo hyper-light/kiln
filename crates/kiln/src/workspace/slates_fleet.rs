@@ -471,6 +471,17 @@ pub struct Place {
     /// (`[slates_fleet.binds]`; Slates' manifest `bind`, A-277; A-708): none binds where it's listed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
+    /// Whether this runner's node founds the fleet's consensus groups ([`founder`]): Slates' fleet holds none until one
+    /// node bootstraps its root, and every other node imports it. An older server's answer says nothing: none founds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub founds: bool,
+}
+
+/// The runner whose node founds the fleet's consensus groups: the first `[slates_fleet.nodes]` lists (by name, as the
+/// table orders them), one and the same at every runner's start. Slates' fleet holds no group, so takes no volume, until
+/// one node bootstraps its root ("bootstrap, then use"), and a group made at two nodes would found two fleets.
+pub fn founder(setting: &crate::config::SlatesFleet) -> Option<&str> {
+    setting.nodes.keys().next().map(String::as_str)
 }
 
 /// A node's bind as Slates' manifest takes it (A-277): an IPv4 literal and a nonzero base port, since the node's own
@@ -505,7 +516,7 @@ pub fn place_of(setting: &crate::config::SlatesFleet, machine: &str) -> Result<O
     if u64::try_from(setting.nodes.len()).unwrap_or(u64::MAX) < candidates {
         return Err(format!("[slates_fleet] f = {} needs at least {candidates} runners (a write commits at f + 1 of 2f + 1 copies), and {} are listed", setting.f, setting.nodes.len()));
     }
-    Ok(setting.nodes.get(machine).map(|address| Place { fleet: FLEET.to_owned(), f: setting.f, address: address.clone(), bind: setting.binds.get(machine).cloned() }))
+    Ok(setting.nodes.get(machine).map(|address| Place { fleet: FLEET.to_owned(), f: setting.f, address: address.clone(), bind: setting.binds.get(machine).cloned(), founds: founder(setting) == Some(machine) }))
 }
 
 /// [`admit`] under the operator's choice: the word of a runner `setting` lists, for its node at the address listed for
@@ -578,6 +589,8 @@ pub fn checked(manifest: &Path, machine: &str) -> anyhow::Result<slates_api::rol
 pub struct Joined {
     pub selection: slates_api::role::FleetSelection,
     pub node: NodeAnnouncement,
+    /// Its node founds the fleet's consensus groups ([`Place::founds`]).
+    pub founds: bool,
 }
 
 /// A runner's start (module docs): what its machine's instance joins the fleet with, when the operator chose it; none
@@ -592,7 +605,7 @@ pub async fn join(source: &Source) -> anyhow::Result<Option<Joined>> {
     let manifest = write_manifest(&source.dir, &identity, &source.machine_name, &members, place.f, place.bind.as_deref())?;
     let selection = checked(&manifest, &source.machine_name)?;
     tracing::info!(manifest = %manifest.display(), nodes = members.members.len(), f = place.f, "this runner's Slates joins kiln's Slates fleet");
-    Ok(Some(Joined { selection, node }))
+    Ok(Some(Joined { selection, node, founds: place.founds }))
 }
 
 /// The runner's word said again with the member id its daemon serves as since this start (K4): a daemon started again
@@ -868,7 +881,7 @@ mod tests {
     #[test]
     fn k3_the_operators_setting_places_the_runners_it_lists_and_no_other() -> anyhow::Result<()> {
         assert_eq!(place_of(&crate::config::SlatesFleet::default(), "bench-a"), Ok(None), "off until declared");
-        assert_eq!(place_of(&chosen(1), "bench-a"), Ok(Some(Place { fleet: FLEET.to_owned(), f: 1, address: "10.0.0.1:17300".to_owned(), bind: None })));
+        assert_eq!(place_of(&chosen(1), "bench-a"), Ok(Some(Place { fleet: FLEET.to_owned(), f: 1, address: "10.0.0.1:17300".to_owned(), bind: None, founds: true })));
         assert_eq!(place_of(&chosen(1), "bench-d"), Ok(None));
         assert!(place_of(&chosen(2), "bench-a").is_err_and(|e| e.contains("at least 5")), "f = 2 over three runners");
         let mut ipv6 = chosen(1);
@@ -877,6 +890,24 @@ mod tests {
         let mut named = chosen(1);
         named.nodes.insert("Bench D".to_owned(), "10.0.0.4:17300".to_owned());
         assert!(place_of(&named, "bench-a").is_err());
+        Ok(())
+    }
+
+    /// K3, goal 91's live move: Slates' fleet holds no consensus group, so no runner of it makes a workspace ("this node
+    /// has no consensus group yet"), until one node bootstraps its root; kiln names exactly one runner to, the first the
+    /// setting lists, at every start alike. An older server's answer, saying nothing, has none found.
+    #[test]
+    fn k3_one_listed_runner_founds_the_fleets_groups_and_no_other() -> anyhow::Result<()> {
+        let setting = chosen(1);
+        let founds = |machine: &str| place_of(&setting, machine).ok().flatten().map(|p| p.founds);
+        assert_eq!((founds("bench-a"), founds("bench-b"), founds("bench-c")), (Some(true), Some(false), Some(false)));
+        let mut later = chosen(1);
+        later.nodes.insert("bench-0".to_owned(), "10.0.0.9:17300".to_owned());
+        assert_eq!(place_of(&later, "bench-0").ok().flatten().map(|p| p.founds), Some(true), "the first listed, by name");
+        assert_eq!(place_of(&later, "bench-a").ok().flatten().map(|p| p.founds), Some(false));
+        let older: Place = serde_json::from_str(r#"{"fleet":"slates.kiln","f":1,"address":"10.0.0.1:17300"}"#)?;
+        assert!(!older.founds);
+        assert!(!serde_json::to_string(&Place { founds: false, ..older })?.contains("founds"), "said only where it founds");
         Ok(())
     }
 

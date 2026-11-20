@@ -483,7 +483,11 @@ others', writes the manifest, has Slates' own reader read it (`slates_api::role:
 refuses what the instance's start would), and starts its instance as the fleet's node
 (`StartSpec.fleet`). A runner not listed starts its instance alone, as before; one listed that can't
 join starts none until it can. A listed runner starts its instance as it starts (a node holds the
-fleet's copies only while its daemon runs), and says its node's member id once it serves.
+fleet's copies only while its daemon runs), and says its node's member id once it serves. One listed
+runner founds the fleet's consensus groups (its place says `founds`: the first the setting lists, the
+same at every start), bootstrapping the root once its node serves; every other imports it. Until one
+did, no fleet runner made a workspace ("this node has no consensus group yet": goal 91's live move,
+2026-11-19, seen on three runners of one Mac).
 
 Its fourth: an agent moves with its workspace volume (Move to…, `harness::relocate`;
 `workspace::slates_move`). The server plans it: both runners in `[slates_fleet]`, the target's node
