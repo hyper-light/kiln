@@ -179,7 +179,11 @@ jobs:
             step=${said%%=*} outcome=${said#*=}
             out="$RUNNER_TEMP/$step.txt"
             if [ "$outcome" = success ] || [ ! -s "$out" ]; then continue; fi
-            text=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Checking|Blocking|Downloaded|Downloading|Updating|Locking) ' | awk '/^(error|warning)/ { f = 1 } f' | head -n 200)
+            clean=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Checking|Blocking|Downloaded|Downloading|Updating|Locking) ')
+            # The errors alone first: vendored crates' warnings filled the annotation's 4 KiB before the error that
+            # failed the step (run 44825381107's Windows legs). Whatever said error or warning when nothing said error.
+            text=$(printf '%s\n' "$clean" | awk '/^error/ { f = 1; print; next } /^[A-Za-z]/ { f = 0 } f' | head -n 200)
+            [ -n "$text" ] || text=$(printf '%s\n' "$clean" | awk '/^(error|warning)/ { f = 1 } f' | head -n 200)
             echo "::error title=${{ matrix.os }} $step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
           done
 
