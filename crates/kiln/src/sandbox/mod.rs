@@ -22,8 +22,8 @@
 //! - [`windows_path`]: a Windows folder's place, judged from its text as Windows judges it, on any host: what an
 //!   isolated session's harness on a Windows machine is told of its folders (docs/agentic.md W8, piece 2).
 
-#[cfg(test)]
 pub mod container;
+#[cfg(test)]
 pub mod fake;
 pub mod held;
 pub mod hexvm;

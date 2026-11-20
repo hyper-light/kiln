@@ -1110,6 +1110,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             join_token: None,
             ephemeral: false,
             dedicated_job: None,
+            dedicated_session: None,
             terminal: true,
             job_terminal: true,
             shell: None,

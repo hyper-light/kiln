@@ -665,6 +665,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             join_token: None,
             ephemeral: false,
             dedicated_job: None,
+            dedicated_session: None,
             terminal: false, // the server already offers the "local" terminal
             job_terminal: cfg.terminal.enabled,
             shell: cfg.terminal.shell.clone(),

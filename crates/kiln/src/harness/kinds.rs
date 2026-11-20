@@ -257,6 +257,22 @@ impl Kind {
     /// zone the session was given, its environment's `machine` and `value` variables, and what kiln
     /// fixes for the harness.
     pub fn elsewhere(&self, spec: &Spec) -> anyhow::Result<Elsewhere> {
+        self.elsewhere_with(spec, false)
+    }
+
+    /// [`Kind::elsewhere`]'s harness in a container of its own (docs/agentic.md W9), where its environment's secrets are
+    /// granted by name and given to it as it starts, scoped to its run: a container has no egress kiln fills a credential
+    /// in at, so a secret its person's environment names (`secrets.mine`, opened by the server for this session alone) is
+    /// handed to its harness's own environment there, as a process on the host is given it, and never baked into an image;
+    /// the container's engine is told each by name, its value in its own command line's environment alone
+    /// (`sandbox::container`). A grant is the environment's: taken out of it, or the secret deleted, the next start has
+    /// none.
+    pub fn in_container(&self, spec: &Spec) -> anyhow::Result<Elsewhere> {
+        self.elsewhere_with(spec, true)
+    }
+
+    /// [`Kind::elsewhere`], its environment's secrets refused (a microVM's) or given (`secrets`: a container's).
+    fn elsewhere_with(&self, spec: &Spec, secrets: bool) -> anyhow::Result<Elsewhere> {
         let all = match self.protocol {
             Protocol::Terminal => anyhow::bail!("{} has no structured mode; run it in a terminal ({})", self.name, self.program),
             Protocol::ClaudeStreamJson => {
@@ -270,7 +286,7 @@ impl Kind {
         };
         let base = self.base_args();
         let args = all.strip_prefix(base.as_slice()).ok_or_else(|| anyhow::anyhow!("kiln starts {} with {all:?}, not past its image's command ({base:?})", self.name))?.to_vec();
-        if let Some(names) = spec.agentenv.as_ref().map(super::agentenv::secrets).filter(|n| !n.is_empty()) {
+        if let Some(names) = spec.agentenv.as_ref().map(super::agentenv::secrets).filter(|n| !secrets && !n.is_empty()) {
             anyhow::bail!("{}: a secret goes into a microVM by name alone, never its value; refused: {}", super::agentenv::SECRET_IN_MICROVM, names.join(", "));
         }
         let mut env: Vec<(String, String)> = spec.env.iter().filter(|(k, _)| locale_or_zone(k)).cloned().collect();
@@ -1808,6 +1824,22 @@ mod tests {
         assert_eq!(get("GOOSE_PROVIDER"), ["groq"]);
         assert!(get("TZ").is_empty() && get("NOT_LOCALE").is_empty());
         assert_eq!(get(fixed), ["1"]);
+        Ok(())
+    }
+
+    /// W9: in a container, a harness signs in by a secret its person's environment grants it by name, given as it
+    /// starts: the same environment a microVM refuses gives a container's harness its secret and its value, beside its
+    /// other variables, and a microVM's launch still refuses it.
+    #[test]
+    fn w9_a_harness_in_a_container_is_given_its_environments_secret_by_name_at_its_start() -> anyhow::Result<()> {
+        use super::super::agentenv::{Base, Set};
+        let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no claude"))?;
+        let env = agentenv(Base::User, vec![("REGION", Set::Value("us-west-2".into())), ("ANTHROPIC_API_KEY", Set::Secret("not-a-real-key".into()))]);
+        let spec = Spec { kind: "claude".into(), agentenv: Some(env), ..Spec::default() };
+        let run = claude.in_container(&spec)?;
+        let get = |k: &str| run.env.iter().filter(|(n, _)| n == k).map(|(_, v)| v.as_str()).collect::<Vec<_>>();
+        assert_eq!((get("ANTHROPIC_API_KEY"), get("REGION")), (vec!["not-a-real-key"], vec!["us-west-2"]));
+        assert!(claude.elsewhere(&spec).is_err_and(|e| format!("{e:#}").contains(super::super::agentenv::SECRET_IN_MICROVM)), "a microVM still refuses it");
         Ok(())
     }
 

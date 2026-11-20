@@ -34,6 +34,13 @@ pub trait Servers: Send + Sync {
     /// order, before any of its run starts. Refused, typed: `Invalid` where this server serves no `share.source`,
     /// naming it; `Exhausted` where it holds its most streams; `Os` where making one failed, in its words.
     fn stream(&self, id: &BoxId, share: &ServedMount) -> Result<Stream, Refusal>;
+
+    /// [`stream`](Self::stream), and beside it, where this server gives one, the share's resync channel (Shards' D288;
+    /// slates' A-316): the end over which a successor of the server, should it die, hands the share a fresh stream, so
+    /// that the share outlives its server. Unix's alone; by default none, the stream alone.
+    fn stream_resyncing(&self, id: &BoxId, share: &ServedMount) -> Result<(Stream, Option<Stream>), Refusal> {
+        Ok((self.stream(id, share)?, None))
+    }
 }
 
 /// The refusal of a box naming a share another server serves, on a node given no server of them ([`Servers`]): its
