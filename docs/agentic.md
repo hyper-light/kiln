@@ -888,8 +888,11 @@ part.
   or PersistentVolume behind. Built in this order: the certificate naming the host (built); Slates' export verb (A-521,
   vendored since contract 50) and kiln's call of it; the PersistentVolume, claim and pod as pure builders, unit-tested
   as a job's pod is (built 2026-11-19: `k8s::volume::objects`, from the home's export, `PodExport`, whose `Debug` hides
-  the token; an export a pod can't mount refused typed, `Unbuildable`), with the chart's RBAC (owed with the engine,
-  the first code that makes these objects, so no cluster-wide right is granted before it's used); the home's part (built 2026-11-20:
+  the token; an export a pod can't mount refused typed, `Unbuildable`), with the chart's RBAC (built 2026-11-20: `rbac.agentPods`,
+  off until declared, grants the claims' create and delete in the jobs namespace and a ClusterRole for
+  PersistentVolumes' create, get and delete alone; `k8s::volume::{make, unmake}` over kiln's client, the
+  PersistentVolume before its claim, a refused claim's PersistentVolume taken back down, the claim before its
+  PersistentVolume as they go); the home's part (built 2026-11-20:
   `workspace::held`, the `hold` and `release` asks of a runner that names `workspace.hold`: its volume made with no
   mount, its write policy from the agent's grant, exported to the folder's owner through `Instance::export`, the path,
   attachment, uid and gid answered, and every question about the pod's folder answered from the holding, as an isolated

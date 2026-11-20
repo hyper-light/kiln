@@ -22,7 +22,12 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
+    {{- if .Values.rbac.agentPods }}
+    # An agent's pod's workspace (docs/agentic.md W10): its claim, made and taken down with it.
+    verbs: [get, create, delete]
+    {{- else }}
     verbs: [get]
+    {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -80,6 +85,37 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "kiln.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if .Values.rbac.agentPods }}
+---
+# Agents' pods (docs/agentic.md W10): each pod's workspace is a PersistentVolume kubelet mounts from its home runner's
+# Slates export, made and deleted with its pod. PersistentVolumes belong to no namespace, so this is a ClusterRole, and
+# only these verbs on them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kiln.fullname" . }}-agent-volumes
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [create, get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kiln.fullname" . }}-agent-volumes
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kiln.fullname" . }}-agent-volumes
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kiln.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- if ne (.Values.rbac.deployments | default "none") "none" }}
 ---
 # Deployments (docs/cd.md): read every object to compare what runs with git; with "write", also

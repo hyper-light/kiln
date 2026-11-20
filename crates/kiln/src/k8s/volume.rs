@@ -177,6 +177,54 @@ pub fn objects(name: &str, namespace: &str, agent: &str, export: &PodExport) -> 
     Ok(Objects { volume, claim, pod_volume, mount, security })
 }
 
+/// The cluster's calls a pod's workspace takes ([`make`], [`unmake`]): kiln's own client (`crate::kubeapi::KubeApi`), or
+/// a stand-in, so the order is kiln's and is tested.
+pub(crate) trait Cluster {
+    async fn create_volume(&self, v: &PersistentVolume) -> anyhow::Result<()>;
+    async fn create_claim(&self, c: &PersistentVolumeClaim) -> anyhow::Result<()>;
+    async fn delete_claim(&self, name: &str) -> anyhow::Result<()>;
+    async fn delete_volume(&self, name: &str) -> anyhow::Result<()>;
+}
+
+impl Cluster for crate::kubeapi::KubeApi {
+    async fn create_volume(&self, v: &PersistentVolume) -> anyhow::Result<()> {
+        self.create_persistent_volume(v).await
+    }
+    async fn create_claim(&self, c: &PersistentVolumeClaim) -> anyhow::Result<()> {
+        crate::kubeapi::KubeApi::create_claim(self, c).await
+    }
+    async fn delete_claim(&self, name: &str) -> anyhow::Result<()> {
+        crate::kubeapi::KubeApi::delete_claim(self, name).await
+    }
+    async fn delete_volume(&self, name: &str) -> anyhow::Result<()> {
+        self.delete_persistent_volume(name).await
+    }
+}
+
+/// Makes a pod's workspace in the cluster: the PersistentVolume first, reserved for its claim, then the claim, which binds
+/// it by name. A claim the cluster refuses takes its PersistentVolume back down: nothing of a refused workspace is left.
+pub async fn make(cluster: &impl Cluster, objects: &Objects) -> anyhow::Result<()> {
+    cluster.create_volume(&objects.volume).await?;
+    if let Err(e) = cluster.create_claim(&objects.claim).await {
+        if let Some(name) = objects.volume.metadata.name.as_deref()
+            && let Err(gone) = cluster.delete_volume(name).await
+        {
+            tracing::warn!(volume = name, error = %format!("{gone:#}"), "a refused pod workspace's PersistentVolume stayed");
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Takes a pod's workspace `name` down, once its pod is gone: the claim, then the PersistentVolume (kubelet keeps a
+/// claim's volume while a pod uses it). Each is asked, the PersistentVolume too where the claim wasn't taken down; one
+/// already gone is no error. The first that failed is said.
+pub async fn unmake(cluster: &impl Cluster, name: &str) -> anyhow::Result<()> {
+    let claim = cluster.delete_claim(name).await;
+    let volume = cluster.delete_volume(name).await;
+    claim.and(volume)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -225,6 +273,69 @@ mod tests {
         let read = objects("kiln-ws-a", "kiln-jobs", "01a1f7", &PodExport { read_only: true, ..export() })?;
         assert_eq!((read.mount.read_only, read.pod_volume.persistent_volume_claim.and_then(|c| c.read_only)), (Some(true), Some(true)));
         Ok(())
+    }
+
+    /// The cluster as a stand-in takes it: each call said in order, and the claim's creation and deletion answering as
+    /// asked.
+    struct Stand {
+        said: std::sync::Mutex<Vec<String>>,
+        claim: Result<(), String>,
+        unclaim: Result<(), String>,
+    }
+
+    impl Stand {
+        fn new(claim: Result<(), String>, unclaim: Result<(), String>) -> Self {
+            Stand { said: std::sync::Mutex::new(Vec::new()), claim, unclaim }
+        }
+        fn say(&self, what: String) {
+            self.said.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(what);
+        }
+        fn said(&self) -> Vec<String> {
+            self.said.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        }
+    }
+
+    impl Cluster for Stand {
+        async fn create_volume(&self, v: &PersistentVolume) -> anyhow::Result<()> {
+            self.say(format!("create volume {}", v.metadata.name.clone().unwrap_or_default()));
+            Ok(())
+        }
+        async fn create_claim(&self, c: &PersistentVolumeClaim) -> anyhow::Result<()> {
+            self.say(format!("create claim {}", c.metadata.name.clone().unwrap_or_default()));
+            self.claim.clone().map_err(anyhow::Error::msg)
+        }
+        async fn delete_claim(&self, name: &str) -> anyhow::Result<()> {
+            self.say(format!("delete claim {name}"));
+            self.unclaim.clone().map_err(anyhow::Error::msg)
+        }
+        async fn delete_volume(&self, name: &str) -> anyhow::Result<()> {
+            self.say(format!("delete volume {name}"));
+            Ok(())
+        }
+    }
+
+    /// W10. Do: make a pod's workspace in a cluster that takes it, then in one that refuses its claim; take it down, then
+    /// take it down where the claim's deletion fails. Expect the PersistentVolume before the claim, and a refused claim's
+    /// PersistentVolume taken back down; the claim before the PersistentVolume as it goes, the PersistentVolume asked to
+    /// go even where the claim's deletion failed, that failure said.
+    #[test]
+    fn w10_a_pods_workspace_is_made_volume_then_claim_and_taken_down_claim_then_volume() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let built = objects("kiln-ws-a", "kiln-jobs", "01a1f7", &export())?;
+            let taken = Stand::new(Ok(()), Ok(()));
+            make(&taken, &built).await?;
+            assert_eq!(taken.said(), ["create volume kiln-ws-a", "create claim kiln-ws-a"]);
+            let refused = Stand::new(Err("exceeded quota".to_owned()), Ok(()));
+            assert!(make(&refused, &built).await.is_err_and(|e| e.to_string().contains("exceeded quota")));
+            assert_eq!(refused.said(), ["create volume kiln-ws-a", "create claim kiln-ws-a", "delete volume kiln-ws-a"]);
+            let down = Stand::new(Ok(()), Ok(()));
+            unmake(&down, "kiln-ws-a").await?;
+            assert_eq!(down.said(), ["delete claim kiln-ws-a", "delete volume kiln-ws-a"]);
+            let stuck = Stand::new(Ok(()), Err("forbidden".to_owned()));
+            assert!(unmake(&stuck, "kiln-ws-a").await.is_err_and(|e| e.to_string().contains("forbidden")));
+            assert_eq!(stuck.said(), ["delete claim kiln-ws-a", "delete volume kiln-ws-a"]);
+            Ok(())
+        })
     }
 
     /// W10. Do: build a pod's workspace over exports it can't be made from (no host, port 0, a relative path, a path a mount

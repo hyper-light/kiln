@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim, Pod};
 use serde::Deserialize;
 
 use crate::http::client::{Client, Identity, Method, Roots};
@@ -300,6 +300,37 @@ impl KubeApi {
         });
         let (code, resp) = self.call_as(Method::Patch, &path, Some(serde_json::to_vec(&patch)?), "application/strategic-merge-patch+json", "application/json").await?;
         if (200..300).contains(&code) { Ok(()) } else { Err(Self::api_error(code, &resp)) }
+    }
+
+    /// Where a cluster's PersistentVolumes are: they belong to no namespace.
+    const VOLUMES_PATH: &'static str = "/api/v1/persistentvolumes";
+
+    fn claims_path(&self) -> String {
+        format!("/api/v1/namespaces/{}/persistentvolumeclaims", encode(&self.namespace))
+    }
+
+    /// Creates PersistentVolume `v` (docs/agentic.md W10: an agent's pod's workspace, `k8s::volume`).
+    pub async fn create_persistent_volume(&self, v: &PersistentVolume) -> anyhow::Result<()> {
+        let (code, resp) = self.call(Method::Post, Self::VOLUMES_PATH, Some(serde_json::to_vec(v)?)).await?;
+        if (200..300).contains(&code) { Ok(()) } else { Err(Self::api_error(code, &resp)) }
+    }
+
+    /// Deletes PersistentVolume `name`; one already gone is not an error.
+    pub async fn delete_persistent_volume(&self, name: &str) -> anyhow::Result<()> {
+        let (code, resp) = self.call(Method::Delete, &format!("{}/{}", Self::VOLUMES_PATH, encode(name)), None).await?;
+        if (200..300).contains(&code) || code == 404 { Ok(()) } else { Err(Self::api_error(code, &resp)) }
+    }
+
+    /// Creates PersistentVolumeClaim `c` in the jobs namespace.
+    pub async fn create_claim(&self, c: &PersistentVolumeClaim) -> anyhow::Result<()> {
+        let (code, resp) = self.call(Method::Post, &self.claims_path(), Some(serde_json::to_vec(c)?)).await?;
+        if (200..300).contains(&code) { Ok(()) } else { Err(Self::api_error(code, &resp)) }
+    }
+
+    /// Deletes PersistentVolumeClaim `name` in the jobs namespace; one already gone is not an error.
+    pub async fn delete_claim(&self, name: &str) -> anyhow::Result<()> {
+        let (code, resp) = self.call(Method::Delete, &format!("{}/{}", self.claims_path(), encode(name)), None).await?;
+        if (200..300).contains(&code) || code == 404 { Ok(()) } else { Err(Self::api_error(code, &resp)) }
     }
 
     /// Delete a pod in the background (its containers stop on their grace period). A pod that is
