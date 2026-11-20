@@ -1,22 +1,41 @@
 /**
- * The Engine tab's Environments (docs/agents.md, "Environments"; decided by the user, 2026-11-18).
- * At the top, this session's environment: one dropdown, the machine environment its default; a
- * change restarts the session, so it's confirmed first. Below, the person's environments as the
- * tab's other sections list theirs (a filter with facets, a sort, a card each): a variable a line,
- * its name with where it comes from beside it and its value at the right (a secret by name only).
- * A new one, or a change, is made in place on its card.
+ * The Engine tab's Environments (docs/agents.md, "Environments", "Scopes, stacks, and applied on its
+ * own", "In the Engine tab"; decided by the user, 2026-11-18 and 2026-11-19). At the top, this
+ * session's stack, top first: reordered by dragging a row or with its up and down buttons, one taken
+ * out with ×, the change saved with ✓ and asked again, as it restarts the session; the machine
+ * environment where it has none. Below, the person's environments as the tab's other sections list
+ * theirs (a filter with facets, a sort, a card each), and a row of scope chips that finds them, starting
+ * from this session's own. A card is its variables a line each (a secret by name only), its scope as
+ * chips beside its "Apply on its own" switch, and the sessions running with it; it's changed in place,
+ * and its Apply puts it on top of this session's stack.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, Check, ChevronRight, Plus, X } from "lucide-react";
-import { agentenvOf, agentenvsApi, agentenvsRes, machineVarsRes, relist, type Agentenv, type AgentenvFrom, type MachineVar } from "@/api/agentenvs";
-import type { AgentInfo } from "@/api/harness";
+import { ArrowDown, ArrowUp, Check, ChevronRight, GripVertical, Plus, X } from "lucide-react";
+import {
+  agentenvOf,
+  agentenvsApi,
+  agentenvsRes,
+  machineVarsRes,
+  relist,
+  sessionEnvRes,
+  type Agentenv,
+  type AgentenvChip,
+  type AgentenvFacts,
+  type AgentenvFrom,
+  type AgentenvScopeKey,
+  type AgentenvSession,
+  type AgentenvStackEntry,
+  type MachineVar,
+} from "@/api/agentenvs";
+import { agentdefsRes } from "@/api/agentdefs";
+import { harnessApi, type AgentInfo, type KindInfo } from "@/api/harness";
 import { mySecretsRes } from "@/api/secrets";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Loadable } from "@/components/ui/loading";
 import { FilterBar, SelectField } from "@/components/ui/misc";
 import { Segmented } from "@/components/ui/tabs";
-import { labelOf, useRes } from "@/lib/data";
+import { agentsRes, harnessSessionsRes, labelOf, useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { setData } from "@/lib/resource";
 import { Link } from "@/lib/router";
@@ -24,18 +43,24 @@ import {
   BASE_WORD,
   blankVar,
   changeOf,
+  chipsOf,
   draftOf,
   ENV_ORDER,
   ENV_SORTS,
   envFacets,
   envWords,
   facetsFor,
-  mineOf,
+  filterShows,
   moved,
+  movedTo,
   problemOf,
   askOf,
+  sameChip,
+  SCOPE_KEYS,
   shows,
   SOURCE_WORD,
+  suggestionsFor,
+  withChip,
   type Draft,
   type DraftVar,
   type EnvSort,
@@ -45,7 +70,6 @@ import { agentLabel } from "./derive";
 import { Fold, useFold } from "./fold";
 import { STANDS } from "./list-tools";
 import { standOf } from "./mission-rows";
-import { useAgentList } from "./use-agents";
 import "./definition.css";
 import "./sandbox.css";
 import "./figure/figure.css";
@@ -56,21 +80,28 @@ const STAND_WORD = new Map(STANDS.map((x) => [x.id, x.label]));
 
 const machineOf = (target: string) => labelOf(target.replace(/^agent:/, ""));
 
-/** The person's environments, found and sorted, a card each: a new one first, then the machine's user's, then this session's, marked. */
+/** The person's environments, found and sorted, a card each: a new one first, then this session's stack's, marked, then the others its filter shows. */
 export function Environments({ agentId, target }: { agentId: string; target: string }) {
   const envs = useRes(agentenvsRes).data;
-  const list = useAgentList();
+  const session = useRes(sessionEnvRes(agentId)).data;
+  // Every page's list of them, kept live by their events: what its runner holds changes as it starts again.
+  const list = useRes(harnessSessionsRes).data;
   const me = list.find((a) => a.id === agentId);
-  const mine = mineOf(envs, agentId, agentenvOf(me));
   const facets = React.useMemo(() => envFacets(agentId), [agentId]);
   const [q, setQ] = React.useState("");
   const [chosen, setChosen] = React.useState<Chosen>({});
   const [sort, setSort] = React.useState<EnvSort>("newest");
-  const shown = envs.filter((e) => e !== mine && shows(e, envWords(e), q, chosen, facets)).sort(ENV_ORDER[sort]);
-  const at = { agentId, target, name: me ? agentLabel(me) : "this session" };
+  // The scope chips that find them: this session's own until changed (none: every one).
+  const [filter, setFilter] = React.useState<AgentenvChip[] | null>(null);
+  const chips = filter ?? chipsOf(session.facts);
+  const mine = session.stack.flatMap((x) => envs.find((e) => e.id === x.id) ?? []);
+  const shown = envs.filter((e) => !mine.includes(e) && filterShows(e.scope, chips) && shows(e, envWords(e), q, chosen, facets)).sort(ENV_ORDER[sort]);
+  const at: At = { agentId, target, name: me ? agentLabel(me) : "this session", stack: session.stack, facts: session.facts };
+  // What its runner holds differs from its stack: it takes the stack as its harness next starts.
+  const held = me ? (agentenvOf(me)?.id ?? "") : null;
   return (
-    <Fold id="engine-environments" title="Environments" count={`${shown.length + (mine ? 1 : 0)} of ${envs.length}`}>
-      <Choose at={at} envs={envs} mine={mine} />
+    <Fold id="engine-environments" title="Environments" count={`${shown.length + mine.length} of ${envs.length}`}>
+      <Stack at={at} pending={held !== null && held !== session.stack.map((x) => x.id).join("+")} />
       <FilterBar className="at-bar">
         <FacetBox
           label="Filter environments"
@@ -83,13 +114,29 @@ export function Environments({ agentId, target }: { agentId: string; target: str
         />
         <SelectField label="Sort environments" hideLabel value={sort} onChange={(v) => setSort(v as EnvSort)} options={ENV_SORTS} />
       </FilterBar>
+      <div className="ev-filter">
+        <Chips chips={chips} label="Scope filter" facts={session.facts} onChips={setFilter}>
+          {chips.length > 0 && (
+            <button type="button" className="ms-link" onClick={() => setFilter([])}>
+              Show all
+            </button>
+          )}
+          {filter !== null && (
+            <button type="button" className="ms-link" onClick={() => setFilter(null)}>
+              This session
+            </button>
+          )}
+        </Chips>
+      </div>
       <ul className="ms-list" data-list="envs-tab" aria-label="Environments">
         <NewEnv at={at} />
-        {mine && <EnvCard e={mine} at={at} list={list} here />}
+        {mine.map((e) => (
+          <EnvCard key={e.id} e={e} at={at} list={list} here />
+        ))}
         {shown.map((e) => (
           <EnvCard key={e.id} e={e} at={at} list={list} />
         ))}
-        {envs.length > 0 && !mine && shown.length === 0 && (
+        {envs.length > 0 && mine.length === 0 && shown.length === 0 && (
           <li className="ms-node df-body">
             <span className="df-note">No matches.</span>
           </li>
@@ -99,19 +146,29 @@ export function Environments({ agentId, target }: { agentId: string; target: str
   );
 }
 
-/** Which session the section is of: its id, its machine, its name. */
-type At = { agentId: string; target: string; name: string };
+/** Which session the section is of: its id, its machine, its name, its stack and what it is as scopes see it. */
+type At = { agentId: string; target: string; name: string; stack: AgentenvStackEntry[]; facts: AgentenvFacts };
 
-/* ------------------------------------------------ this session's */
+/* ------------------------------------------------ this session's stack */
 
-/** Session `at` on environment `e` (null: the machine's): shown at once, the session restarted; a refusal says why. */
-function apply(at: At, e: Agentenv | null, why: (w: string | null) => void): Promise<unknown> {
-  setData<Agentenv[]>(agentenvsRes.key, (l) =>
-    l.map((x) => ({ ...x, sessions: x.id === e?.id ? [...x.sessions.filter((s) => s !== at.agentId), at.agentId] : x.sessions.filter((s) => s !== at.agentId) })),
-  );
+/**
+ * What a stack sends (`agentenvs.apply`, top first): its rows, bar those at its foot that joined on
+ * their own, which join again on their own (one moved above one given by name is given by name).
+ */
+const namedOf = (rows: readonly AgentenvStackEntry[]) => {
+  let end = rows.length;
+  while (end > 0 && rows[end - 1]!.auto) end -= 1;
+  return rows.slice(0, end).map((x) => x.id);
+};
+
+/** Session `at` on stack `ids`, top first: the session restarted, its stack as the server answers; a refusal says why. */
+function apply(at: At, ids: string[], why: (w: string | null) => void): Promise<unknown> {
   why(null);
-  return agentenvsApi.apply(at.agentId, e?.id ?? null).then(
-    () => relist(),
+  return agentenvsApi.apply(at.agentId, ids).then(
+    (done) => {
+      setData<AgentenvSession>(sessionEnvRes(at.agentId).key, (s) => ({ ...s, stack: done.stack }));
+      relist();
+    },
     (err: unknown) => {
       relist();
       why(errorMessage(err));
@@ -119,45 +176,110 @@ function apply(at: At, e: Agentenv | null, why: (w: string | null) => void): Pro
   );
 }
 
-/** This session's environment: the machine's (the default) or one of the person's. A change restarts the session, so it's confirmed first. */
-function Choose({ at, envs, mine }: { at: At; envs: readonly Agentenv[]; mine: Agentenv | undefined }) {
-  const [want, setWant] = React.useState<string | null>(null);
+const idsOf = (rows: readonly AgentenvStackEntry[]) => rows.map((x) => x.id).join("+");
+
+/**
+ * This session's stack, top first: a row each, its name and "auto" where it joined on its own, dragged
+ * by its handle or moved with up and down, taken out with ×. Changes wait for ✓ (× puts them back),
+ * then are asked again, as they restart the session.
+ */
+function Stack({ at, pending }: { at: At; pending: boolean }) {
+  const [want, setWant] = React.useState<AgentenvStackEntry[] | null>(null);
+  const [asking, setAsking] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [why, setWhy] = React.useState<string | null>(null);
-  const now = mine?.id ?? "";
-  const picked = want === null ? undefined : (envs.find((e) => e.id === want) ?? null);
+  const [drag, setDrag] = React.useState<{ from: number; to: number } | null>(null);
+  const rowsRef = React.useRef<HTMLOListElement>(null);
+  const staged = want ?? at.stack;
+  const rows = drag ? movedTo(staged, drag.from, drag.to) : staged;
+  const changed = want !== null && idsOf(want) !== idsOf(at.stack);
+  const stage = (next: AgentenvStackEntry[]) => {
+    setWant(idsOf(next) === idsOf(at.stack) ? null : next);
+    setAsking(false);
+  };
+  // The row under the pointer, by the rows' middles: where the one dragged goes.
+  const indexAt = (y: number) => {
+    const items = [...(rowsRef.current?.children ?? [])];
+    const i = items.findIndex((r) => y < r.getBoundingClientRect().top + r.getBoundingClientRect().height / 2);
+    return i < 0 ? items.length - 1 : i;
+  };
   return (
-    <div className="ev-choose">
-      <SelectField
-        label="This session's environment"
-        value={want ?? now}
-        onChange={(v) => setWant(v === now ? null : v)}
-        options={[{ value: "", label: "Machine environment (default)" }, ...envs.map((e) => ({ value: e.id, label: e.name }))]}
-      />
-      {picked !== undefined && (
-        <span className="ms-confirm ev-confirm" role="group" aria-label="Restart this session?">
-          <span>Restart this session with {picked ? picked.name : "the machine environment"}?</span>
-          <button
-            type="button"
-            className="ms-go"
-            disabled={busy}
-            aria-busy={busy || undefined}
-            aria-label={`Restart with ${picked ? picked.name : "the machine environment"}`}
-            onClick={() => {
-              setBusy(true);
-              void apply(at, picked, setWhy).finally(() => {
-                setBusy(false);
-                setWant(null);
-              });
-            }}
-          >
+    <div className="ev-stack">
+      <ol ref={rowsRef} className="ev-srows" aria-label="This session's environments">
+        {rows.length === 0 && (
+          <li className="ev-srow" data-default="">
+            Machine environment <span className="sb-dim">(default)</span>
+          </li>
+        )}
+        {rows.map((r, i) => (
+          <li key={r.id} className="ev-srow" data-dragging={drag?.to === i ? "" : undefined}>
+            <span
+              className="ev-grip"
+              aria-hidden="true"
+              onPointerDown={(p) => {
+                p.currentTarget.setPointerCapture(p.pointerId);
+                setDrag({ from: i, to: i });
+              }}
+              onPointerMove={(p) => drag && setDrag({ ...drag, to: indexAt(p.clientY) })}
+              onPointerUp={() => {
+                if (drag) stage(movedTo(staged, drag.from, drag.to));
+                setDrag(null);
+              }}
+              onPointerCancel={() => setDrag(null)}
+            >
+              <GripVertical size={14} />
+            </span>
+            <span className="ev-sname">{r.name}</span>
+            {r.auto && <span className="ev-badge">auto</span>}
+            <span className="ev-sacts">
+              <button type="button" className="ms-go" aria-label={`Move ${r.name} up`} title="Up" disabled={i === 0} onClick={() => stage(moved(staged, i, -1))}>
+                <ArrowUp size={14} />
+              </button>
+              <button type="button" className="ms-go" aria-label={`Move ${r.name} down`} title="Down" disabled={i === rows.length - 1} onClick={() => stage(moved(staged, i, 1))}>
+                <ArrowDown size={14} />
+              </button>
+              <button
+                type="button"
+                className="ms-go"
+                aria-label={`Take ${r.name} out`}
+                title={r.auto ? "Joins on its own" : "Take out"}
+                disabled={r.auto}
+                onClick={() => stage(staged.filter((x) => x.id !== r.id))}
+              >
+                <X size={14} />
+              </button>
+            </span>
+          </li>
+        ))}
+      </ol>
+      {changed && !asking && (
+        <span className="sb-form-acts">
+          <button type="button" className="fig-round" data-size="sm" data-tone="accent" aria-label="Save this session's environments" title="Save" onClick={() => setAsking(true)}>
             <Check size={15} />
           </button>
-          <button type="button" className="ms-go" aria-label="Cancel" onClick={() => setWant(null)}>
+          <button type="button" className="fig-round" data-size="sm" data-tone="cancel" aria-label="Discard changes to this session's environments" title="Discard" onClick={() => stage(at.stack)}>
             <X size={15} />
           </button>
         </span>
       )}
+      {changed && asking && (
+        <Ask
+          label="Restart this session?"
+          words="Restart this session with these?"
+          yes="Restart with these"
+          busy={busy}
+          onYes={() => {
+            setBusy(true);
+            void apply(at, namedOf(staged), setWhy).finally(() => {
+              setBusy(false);
+              setWant(null);
+              setAsking(false);
+            });
+          }}
+          onNo={() => setAsking(false)}
+        />
+      )}
+      {pending && !changed && <span className="sb-dim ev-pending">Takes these at its next start</span>}
       {why && (
         <span className="sb-why" role="alert">
           {why}
@@ -167,13 +289,161 @@ function Choose({ at, envs, mine }: { at: At; envs: readonly Agentenv[]; mine: A
   );
 }
 
+/** Asked again in place: its words, ✓ and ×. */
+function Ask({ label, words, yes, busy, onYes, onNo }: { label: string; words: string; yes: string; busy: boolean; onYes: () => void; onNo: () => void }) {
+  return (
+    <span className="ms-confirm ev-confirm" role="group" aria-label={label}>
+      <span>{words}</span>
+      <button type="button" className="ms-go" disabled={busy} aria-busy={busy || undefined} aria-label={yes} onClick={onYes}>
+        <Check size={15} />
+      </button>
+      <button type="button" className="ms-go" aria-label="Cancel" onClick={onNo}>
+        <X size={15} />
+      </button>
+    </span>
+  );
+}
+
+/* ------------------------------------------------ scope chips */
+
+/** Each harness the machines run, once, with what it offers (its models, modes and efforts), for a chip's suggestions. */
+const kindsRes: Res<KindInfo[]> = {
+  key: "agentenvs/kinds",
+  fetch: () =>
+    harnessApi.kindsAll().then(
+      (byTarget) => [
+        ...new Map(
+          Object.values(byTarget)
+            .flat()
+            .map((k) => [k.id, k]),
+        ).values(),
+      ],
+      (): KindInfo[] => [],
+    ),
+};
+
+/** A chip in words: `os: linux`, a machine by its label. */
+const chipWord = (c: AgentenvChip) => `${c.key}: ${c.key === "machine" ? labelOf(c.value) : c.value}`;
+
+/** Chips, each taken away with its ×, and one added with +: its key from a menu, then its value, suggested from what kiln knows. What goes after them follows in their line. */
+function Chips({
+  chips,
+  label,
+  facts,
+  onChips,
+  empty,
+  children,
+}: {
+  chips: AgentenvChip[];
+  label: string;
+  facts: AgentenvFacts;
+  onChips: (c: AgentenvChip[]) => void;
+  empty?: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <span className="ev-tags" role="list" aria-label={label}>
+      {chips.length === 0 && empty && <span className="ev-empty">{empty}</span>}
+      {chips.map((c) => (
+        <span role="listitem" key={`${c.key}:${c.value}`} className="ev-tag">
+          {chipWord(c)}
+          <button type="button" className="ev-tag-x" aria-label={`Remove ${chipWord(c)}`} onClick={() => onChips(chips.filter((x) => !sameChip(x, c)))}>
+            <X size={10} />
+          </button>
+        </span>
+      ))}
+      <AddChip label={label} facts={facts} onAdd={(c) => onChips(withChip(chips, c))} />
+      {children}
+    </span>
+  );
+}
+
+/** + opens a key's menu and a value's field in place; Enter or leaving it adds the chip, Escape doesn't. */
+function AddChip({ label, facts, onAdd }: { label: string; facts: AgentenvFacts; onAdd: (c: AgentenvChip) => void }) {
+  const [chip, setChip] = React.useState<AgentenvChip | null>(null);
+  const valueRef = React.useRef<HTMLInputElement>(null);
+  // The key's menu is focused as it opens, not again as the value's typed.
+  const opened = React.useCallback((el: HTMLSelectElement | null) => el?.focus(), []);
+  const list = React.useId();
+  if (chip === null)
+    return (
+      <button type="button" className="ev-tag ev-tag-add" aria-label={`Add to ${label}`} onClick={() => setChip({ key: "os", value: "" })}>
+        <Plus size={10} />
+        add
+      </button>
+    );
+  const done = (save: boolean) => {
+    const value = chip.value.trim();
+    setChip(null);
+    if (save && value) onAdd({ key: chip.key, value });
+  };
+  return (
+    <span
+      className="ev-chipin"
+      onBlur={(b) => {
+        if (!b.currentTarget.contains(b.relatedTarget)) done(true);
+      }}
+      onKeyDown={(k) => {
+        if (k.key === "Enter") done(true);
+        if (k.key === "Escape") done(false);
+      }}
+    >
+      <select
+        ref={opened}
+        className="ev-tag ev-chipkey"
+        value={chip.key}
+        aria-label={`${label}: key`}
+        onChange={(x) => {
+          setChip({ key: x.target.value as AgentenvScopeKey, value: "" });
+          valueRef.current?.focus();
+        }}
+      >
+        {SCOPE_KEYS.map((k) => (
+          <option key={k} value={k}>
+            {k}
+          </option>
+        ))}
+      </select>
+      <input
+        ref={valueRef}
+        className="ev-tag ev-tag-in"
+        value={chip.value}
+        placeholder="value"
+        aria-label={`${label}: ${chip.key}`}
+        list={list}
+        spellCheck={false}
+        onChange={(x) => setChip({ ...chip, value: x.target.value })}
+      />
+      <Loadable fallback={null}>
+        <Suggestions id={list} k={chip.key} facts={facts} />
+      </Loadable>
+    </span>
+  );
+}
+
+/** What key `k`'s value can be: the machines, harnesses and agent definitions kiln knows, and this session's own. */
+function Suggestions({ id, k, facts }: { id: string; k: AgentenvScopeKey; facts: AgentenvFacts }) {
+  const known = { machines: useRes(agentsRes).data, harnesses: useRes(kindsRes).data, agents: useRes(agentdefsRes).data };
+  const values = [...new Set([...(facts[k] ? [facts[k]] : []), ...suggestionsFor(k, known)])];
+  return (
+    <datalist id={id}>
+      {values.map((v) => (
+        <option key={v} value={v}>
+          {k === "machine" ? labelOf(v) : v}
+        </option>
+      ))}
+    </datalist>
+  );
+}
+
 /* ------------------------------------------------ a card */
 
 function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly AgentInfo[]; here?: boolean }) {
   // Each folds to its head: closed as it starts, then as the person last left it (its own key: what a
   // build that opened them all at first kept doesn't open it).
   const [open, setOpen] = useFold(`engine-env-open.${e.id}`, false);
-  const [asking, setAsking] = React.useState(false);
+  const [asking, setAsking] = React.useState<"delete" | "apply" | null>(null);
+  const [busy, setBusy] = React.useState(false);
   const [why, setWhy] = React.useState<string | null>(null);
   const sessions = e.sessions.map((id) => list.find((a) => a.id === id) ?? { id, name: id, target: "" });
   return (
@@ -220,6 +490,16 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
                   onSave={(d) => change(e, { description: d || null }, setWhy)}
                 />
               </li>
+              <GroupHead label="Scope" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.scope.length}</span>} />
+              <li className="ms-node df-body ev-chiprow" data-depth={2}>
+                <Chips chips={e.scope} label={`${e.name}'s scope`} facts={at.facts} empty="Everywhere" onChips={(scope) => change(e, { scope }, setWhy)} />
+                <label className="ev-auto">
+                  Apply on its own
+                  <button type="button" role="switch" aria-checked={e.auto} aria-label={`Apply ${e.name} on its own`} className="hx-switch" onClick={() => change(e, { auto: !e.auto }, setWhy)}>
+                    <span />
+                  </button>
+                </label>
+              </li>
               <GroupHead label="Variables" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.vars.length}</span>} />
               <EnvForm key={`${e.id}:${e.version}`} e={e} at={at} />
               <GroupHead label="Sessions" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.sessions.length}</span>} />
@@ -252,7 +532,12 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
                   </table>
                 )}
                 <span className="ev-acts">
-                  <Button size="xs" variant="danger" onClick={() => setAsking(true)}>
+                  {at.stack[0]?.id !== e.id && (
+                    <Button size="xs" variant="secondary" aria-label={`Apply ${e.name} to this session`} onClick={() => setAsking("apply")}>
+                      Apply
+                    </Button>
+                  )}
+                  <Button size="xs" variant="danger" onClick={() => setAsking("delete")}>
                     Delete
                   </Button>
                 </span>
@@ -262,7 +547,25 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
                   </span>
                 )}
               </li>
-              {asking && <DeleteAsk e={e} why={setWhy} onDone={() => setAsking(false)} />}
+              {asking === "delete" && <DeleteAsk e={e} why={setWhy} onDone={() => setAsking(null)} />}
+              {asking === "apply" && (
+                <li className="ms-node df-ask ev-ask" data-depth={2}>
+                  <Ask
+                    label={`Apply ${e.name}?`}
+                    words={`Restart this session with ${e.name} on top?`}
+                    yes={`Restart with ${e.name} on top`}
+                    busy={busy}
+                    onYes={() => {
+                      setBusy(true);
+                      void apply(at, [e.id, ...namedOf(at.stack).filter((x) => x !== e.id)], setWhy).finally(() => {
+                        setBusy(false);
+                        setAsking(null);
+                      });
+                    }}
+                    onNo={() => setAsking(null)}
+                  />
+                </li>
+              )}
             </>
           </ul>
         </li>
@@ -275,11 +578,14 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
 const Here = () => <span className="ev-here" role="img" aria-label="This session runs with it" title="This session runs with it" />;
 
 /** `e` changed as `patch` says, shown at once and saved over the version shown; a refusal puts it back and says why. */
-function change(e: Agentenv, patch: Partial<Pick<Agentenv, "name" | "tags">> & { description?: string | null }, why: (w: string | null) => void) {
+function change(e: Agentenv, patch: Partial<Pick<Agentenv, "name" | "tags" | "scope" | "auto">> & { description?: string | null }, why: (w: string | null) => void) {
   setData<Agentenv[]>(agentenvsRes.key, (l) => l.map((x) => (x.id === e.id ? { ...x, ...patch, description: patch.description === null ? undefined : (patch.description ?? x.description) } : x)));
   why(null);
   agentenvsApi.update(e.id, { version: e.version, ...patch }).then(
-    (saved) => setData<Agentenv[]>(agentenvsRes.key, (l) => l.map((x) => (x.id === saved.id ? saved : x))),
+    (saved) => {
+      setData<Agentenv[]>(agentenvsRes.key, (l) => l.map((x) => (x.id === saved.id ? saved : x)));
+      if (patch.scope || patch.auto !== undefined) relist();
+    },
     (err: unknown) => {
       relist();
       why(errorMessage(err));

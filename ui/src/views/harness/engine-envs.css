@@ -85,11 +85,115 @@
 .ev-vacts {
   margin-left: auto;
 }
-/* This session's environment, chosen above the list; a change asks first, as it restarts the session. */
-.ev-choose {
+/* This session's stack, above the list, top first: a row each (its handle, its name and badge, its moves at
+   the right); a change waits for ✓, then asks first, as it restarts the session. */
+.ev-stack {
   display: grid;
+  gap: 10px;
+  padding: 4px 0 14px;
+}
+.ev-srows {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid #25272c;
+}
+.ev-srow {
+  display: flex;
+  align-items: center;
   gap: 8px;
-  padding: 4px 0 12px;
+  min-height: 34px;
+  border-bottom: 1px solid #25272c;
+  font-size: 13px;
+}
+.ev-srow[data-default] {
+  padding-left: 8px;
+}
+.ev-srow[data-dragging] {
+  background: #15161b;
+}
+.ev-grip {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 32px;
+  color: #6b6e78;
+  cursor: grab;
+  touch-action: none;
+}
+.ev-srow[data-dragging] .ev-grip {
+  cursor: grabbing;
+}
+.ev-sname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Joined on its own: a badge right beside its name. */
+.ev-badge {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid #39344a;
+  border-radius: 999px;
+  color: #bab0e3;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 15px;
+}
+.ev-sacts {
+  display: flex;
+  margin-left: auto;
+}
+.ev-sacts > .ms-go:disabled {
+  color: #45474e;
+}
+.ev-pending {
+  font-size: 12px;
+}
+/* Scope chips: the filter's under the facets (its Show all in their line), a card's in its Scope section with its
+   switch at the right of their first line. */
+.ms-node.df-body.ev-chiprow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+}
+.ev-filter {
+  padding: 0 0 12px;
+}
+.ev-filter .ms-link {
+  margin-left: 4px;
+  font-size: 12px;
+}
+.ev-empty {
+  color: #97999f;
+  font-size: 12px;
+}
+/* Its "Apply on its own" switch: at the row's right edge, its words before it, centred on the chips' first line. */
+.ev-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: -1px;
+  color: #a9acb6;
+  font-size: 12px;
+  white-space: nowrap;
+}
+/* A chip being added: its key's menu, then its value. */
+.ev-chipin {
+  display: inline-flex;
+  gap: 4px;
+}
+select.ev-chipkey {
+  field-sizing: content;
+  appearance: none;
+  padding-right: 18px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%239a9ca4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")
+    right 6px center / 10px no-repeat;
+  color: #e6e7eb;
+  cursor: pointer;
 }
 .ev-src {
   font-size: 12px;
@@ -161,6 +265,10 @@
 .ev-tag-add:hover,
 .ev-tag-add:focus-visible {
   color: #d4d6dc;
+}
+/* A value's suggestions open as it's typed in: no arrow drawn in the chip. */
+input.ev-tag-in::-webkit-calendar-picker-indicator {
+  display: none !important;
 }
 input.ev-tag-in {
   width: 9ch;
@@ -246,7 +354,8 @@ input.ev-inline-in {
 .ev-form .sb-in:focus,
 .ev-form .sb-in:focus-visible,
 input.ev-inline-in:focus,
-input.ev-tag-in:focus {
+input.ev-tag-in:focus,
+select.ev-chipkey:focus {
   outline: none;
   border-color: #bab0e3;
 }
