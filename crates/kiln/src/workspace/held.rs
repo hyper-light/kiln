@@ -71,7 +71,7 @@ pub fn find(id: &str) -> Option<(PathBuf, Workspace)> {
 
 /// The uid and gid that own `folder`: who a pod's export serves, and whom the pod runs as.
 #[cfg(unix)]
-fn owner(folder: &Path) -> anyhow::Result<(u32, u32)> {
+pub(crate) fn owner(folder: &Path) -> anyhow::Result<(u32, u32)> {
     use std::os::unix::fs::MetadataExt as _;
     let m = std::fs::metadata(folder)?;
     Ok((m.uid(), m.gid()))
@@ -79,7 +79,7 @@ fn owner(folder: &Path) -> anyhow::Result<(u32, u32)> {
 
 /// No Windows folder is held for a pod: Slates' network export serves Unix hosts alone.
 #[cfg(not(unix))]
-fn owner(_folder: &Path) -> anyhow::Result<(u32, u32)> {
+pub(crate) fn owner(_folder: &Path) -> anyhow::Result<(u32, u32)> {
     anyhow::bail!("a pod's workspace is held on a Unix machine alone: Slates serves no network export on Windows")
 }
 
