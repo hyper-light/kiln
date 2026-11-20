@@ -132,7 +132,7 @@ async fn gone(volume: &str) -> anyhow::Result<bool> {
 async fn workspace(name: &str, top: &str) -> anyhow::Result<Made> {
     let (id, base) = super::slates::provision(name, Path::new(top), true).await?;
     anyhow::ensure!(base.is_some(), "a fleet runner's workspace {name} made no captured base");
-    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base })
+    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base, shared: false })
 }
 
 /// A review's changes as `path=bytes`, `path gone` or as Debug, in order.

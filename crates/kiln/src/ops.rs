@@ -558,6 +558,21 @@ mod tests {
         }
     }
 
+    /// W10 (docs/agentic.md; red on adacachy's live cluster, k8s_agent_live, 2026-11-20: `unknown variant `pod``). Do: give
+    /// `agents.start` each isolation it holds an agent in, and one it doesn't. Expect `none`, `microvm` and `pod` (a pod of
+    /// its own on the Kubernetes engine) taken, and an unknown one refused at `/isolation`.
+    #[test]
+    fn w10_agents_start_takes_an_agent_in_a_pod_of_its_own() -> anyhow::Result<()> {
+        let input = input_of("agents.start").ok_or_else(|| anyhow::anyhow!("no agents.start"))?;
+        for isolation in ["none", "microvm", "pod"] {
+            let ask = json!({"kind": "claude", "on": "studio", "cwd": "/w", "isolation": isolation});
+            assert!(input.fits(&ask).is_ok(), "isolation {isolation} refused: {:?}", input.fits(&ask).err().map(|m| m.said("agents.start")));
+        }
+        let refused = input.fits(&json!({"kind": "claude", "isolation": "jail"})).err().map(|m| m.path);
+        assert_eq!(refused.as_deref(), Some("/isolation"));
+        Ok(())
+    }
+
     /// An agent's own goal stack and change request need no id: left out, `agent` is the agent
     /// calling. One it names stays; a person's input, and other operations', are as they came.
     #[test]
