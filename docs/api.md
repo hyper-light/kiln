@@ -480,34 +480,50 @@ too (`agentenvs.*`: `POST /api/ops/<name>`, kiln's MCP tools `agentenvs_*`, code
 | Method | Path | |
 |---|---|---|
 | GET | `/api/agentenvs` | `{ agentenvs: Agentenv[] }`: yours, by name (`agentenvs.list`) |
-| POST | `/api/agentenvs` | `{ name, description?, base, vars }` → `Agentenv`, version 1 (`agentenvs.create`) |
+| POST | `/api/agentenvs` | `{ name, description?, base, vars, tags?, scope?, auto? }` → `Agentenv`, version 1 (`agentenvs.create`); with `auto`, it joins the stacks of your sessions its scope matches at once (below) |
 | GET | `/api/agentenvs/machine?target=` | `{ vars: { name, sources }[] }`: the variables a machine you may start agents on (`local`, the server) has for its user, by name and where each is set, never a value (`agentenvs.machine`); 409 where its runner doesn't say (an older kiln), 502 while it's away |
 | GET | `/api/agentenvs/<id>` | `Agentenv` (`agentenvs.get`) |
-| PATCH | `/api/agentenvs/<id>` | `{ version, name?, description?, base?, vars? }` → `Agentenv`, one version up (`agentenvs.update`); `description: null` takes it out |
+| PATCH | `/api/agentenvs/<id>` | `{ version, name?, description?, base?, vars?, tags?, scope?, auto? }` → `Agentenv`, one version up (`agentenvs.update`); `description: null` takes it out; a change of its `scope` or `auto` has it join and leave the stacks of your sessions on its own (below) |
 | DELETE | `/api/agentenvs/<id>` | 204 (`agentenvs.delete`) |
-| PUT | `/api/harness/sessions/<agent>/agentenv` | `{ agentenv: id \| null, restart?: true }` → `{ agent, agentenv: { id, name, version } \| null, restarted }` (`agentenvs.apply`): an agent you may steer runs with it from now on (null: its machine's user's environment), its harness started again on its conversation unless `restart` is false. 409 while its machine is away, its environment as it was |
+| GET | `/api/harness/sessions/<agent>/agentenv` | `{ facts: Facts, stack: StackEntry[], matching: id[] }` (`agentenvs.session`): an agent you can see as scopes see it, its stack top first, and the ids of your environments whose scope matches it |
+| PUT | `/api/harness/sessions/<agent>/agentenv` | `{ agentenvs: id[], restart?: true }` → `{ agent, stack: StackEntry[], restarted }` (`agentenvs.apply`): an agent you may steer is given those by name from now on, top first (each one of yours, or one its stack holds already, once), its person's applied on their own whose scope matches it under them (`auto`; one named is given by name from then on), its harness started again on its conversation unless `restart` is false; `[]`: those applied on their own alone, over its machine's user's environment. 409 while its machine is away, its stack as it was |
 
-`POST /api/harness/agents` (`agents.start`) takes `agentenv?: id`, the environment the agents it starts run with
-(one of the person's an agent acts for, for an agent's start); left out, an agent's agents run with its own, as a
-session a person branches from another runs with that one's, kept for it as for a start;
-`POST /api/harness/sessions` carries none (a `spec.agentenv` asked for is dropped: kiln opens one from one its
-person chose). `AgentInfo` says `agentenv?: { id, name, version }`, the environment a session's harness started
-with, as its machine says it. Each change of one, and of the sessions running with it, is an
-`{type: "agentenv", owner, agentenv /* its id */, deleted?}` event on `/api/events`, to its owner alone.
+`POST /api/harness/agents` (`agents.start`) takes `agentenvs?: id[]`, the stack the agents it starts run with, top
+first (the person's own; for an agent's start, those of the person it acts for); left out, an agent's agents run with
+those its own was given by name, as a session a person branches from another runs with that one's whole stack, kept
+for it as for a start; `[]` names none. Under those, the person's environments with `auto` on whose scope matches
+what each agent is as it starts join on their own, more chips first, then by name (one with a `secret` variable never
+in a microVM, nor any on a runner whose kiln runs none). `POST /api/harness/sessions` carries none (a `spec.agentenv`
+asked for is dropped: kiln opens one from those its person chose). `AgentInfo` says `agentenv?: { id, name,
+version }`, the stack a session's harness started with opened as one, as its machine says it: its ids top first
+joined by `+`, its names by ` + `, version 0 (one alone: its id, name and version). Each change of one, and of the
+sessions running with it, is an `{type: "agentenv", owner, agentenv /* its id */, deleted?}` event on `/api/events`,
+to its owner alone.
 
 ```ts
 interface Var { name; from: "machine" | "value" | "secret" | "unset"; of?: string /* machine: the machine's variable, when not its own name */;
   value?: string /* value */; secret?: string /* secret: one of your secrets, by name */ }
+type ScopeKey = "machine" | "os" | "arch" | "harness" | "agent" | "model" | "permission" | "effort";
+interface Chip { key: ScopeKey; value: string /* permission, effort: "<harness>:<value>" */ }
 interface Agentenv { id; owner /* "owner" | "user:<id>" */; name; description?; base: "user" | "clean"; vars: Var[] /* in order: a later one of a name wins */;
-  version; created_at; updated_at; sessions: string[] /* the agents running with it */ }
+  tags: string[]; scope: Chip[] /* none: everywhere */; auto: boolean /* joins its owner's sessions its scope matches on its own */;
+  version; created_at; updated_at; sessions: string[] /* the agents whose stacks hold it */ }
+interface Facts { machine /* "local": the server */; os /* linux | macos | windows */; arch /* amd64 | arm64 */; harness; agent?;
+  model; permission /* "<harness>:<mode>" */; effort? /* "<harness>:<effort>" */ }
+interface StackEntry { id; name; version /* its version now */; auto: boolean /* joined on its own */ }
 ```
+
+A scope's chips of one key are any of them, of different keys all of them, none every session; a key whose fact a
+session hasn't (`agent`, `effort`) fails that key (`crates/kiln/src/agentenvs/testdata/scope-cases.json`, which the
+server and the UI both match by).
 
 A refusal is `{ error, code }`, its words the page's to show, where it has a code: `agentenv_unknown` (404: none
 of yours has that id), `agentenv_name_taken` (409), `agentenv_stale` (409: `version` isn't its current one),
-`agentenv_in_use` (409, with `sessions`: the ids of those running with it), `agentenv_secret_missing` (400: a secret it names
+`agentenv_in_use` (409, with `sessions`: the ids of those whose stacks hold it), `agentenv_secret_missing` (400: a secret it names
 that you hold none of, by name, as it's kept or as a session starts), `agentenv_secret_in_microvm` (409: its
 `secret` variables, by name, for a session in a microVM), `agentenv_bad_var` (400: a variable's name, or what its
-`from` takes). A start or an apply on a runner whose kiln runs no session with an environment is refused, 409,
+`from` takes; a scope's chip: its key, an empty value, a `permission` or `effort` value without its harness; an id
+named twice in a stack). A start or an apply on a runner whose kiln runs no session with an environment is refused, 409,
 without a code; so is moving or resuming one that runs with an environment to such a runner.
 
 The server keeps which environment each session runs with and opens it again (its newest version, its secrets
