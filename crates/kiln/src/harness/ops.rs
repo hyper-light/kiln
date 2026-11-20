@@ -2467,7 +2467,7 @@ for line in sys.stdin:
             let core = s.core.lock();
             !core.meta.version.is_empty() && core.state.status == crate::harness::model::Status::Running
         });
-        let cpu = || hub.harness.local.get(id).and_then(|s| *s.pid.lock()).and_then(|pid| crate::os::metrics::cpu_us_of(&[pid]));
+        let cpu = || hub.harness.local.get(id).and_then(|s| *s.pid.lock()).and_then(at_work);
         let mut waits = kiln_ci::place::keeper::Waits::default();
         waits.said(0);
         let (mut moved, mut spent) = (None, cpu());
@@ -2498,19 +2498,53 @@ for line in sys.stdin:
                     }
                     () = committed.notified().fuse() => break,
                     () = async move { match still { Some(s) => s.await, None => std::future::pending().await } }.fuse() => {
+                        // Its turn ended in the window: it owes kiln nothing now, and what's awaited is kiln's
+                        // move (the registry's relay of that end, say), which the wait follows by liveness
+                        // alone. Refused for its CPU time, a turn ended 41 ms in whose end the relay hadn't
+                        // yet carried (goals::ops' keyed-control test, a full parallel run on adacachy,
+                        // 2026-11-20).
+                        if !owes() {
+                            continue;
+                        }
                         let now = cpu();
-                        if now.is_some() && now != spent {
+                        if now.is_some_and(|(time, busy)| busy || spent.is_none_or(|(was, _)| was != time)) {
                             spent = now;
                             waits.heard(ms());
                             continue;
                         }
                         let state = hub.harness.info(id).map(|i| format!("{:?}", i.status)).unwrap_or_else(|| "gone".into());
                         let last = moved.map_or_else(|| "hasn't moved since the wait began".to_owned(), |at| format!("last moved {at} ms into the wait and hasn't since"));
-                        anyhow::bail!("{what}: its source {last}, a whole window of the slowest gap between moves seen in this run ({} ms), its CPU time {now:?} µs as it was at the window's start; its state {state}", waits.slowest().unwrap_or(0));
+                        anyhow::bail!("{what}: its source {last}, a whole window of the slowest gap between moves seen in this run ({} ms), its time on and waiting for a CPU and whether it runs or waits on its disk {now:?} as at the window's start; its state {state}", waits.slowest().unwrap_or(0));
                     }
                 }
             }
         }
+    }
+
+    /// Whether source process `pid` moved as the machine sees it, for [`until`]'s still window: its threads' time on a
+    /// CPU and waiting in a run queue for one, in ns, and whether one runs or waits on its disk now (Linux's
+    /// `/proc/<pid>/task/*/schedstat` and `stat`). `/proc/<pid>/stat`'s CPU time (`os::metrics::cpu_us_of`) moves in
+    /// clock ticks, 10 ms each, and a turn of the recording program costs less than one: the wait refused live sources
+    /// still at one tick, Running with their turn under way, as a loaded machine held them in its run queue or in an
+    /// fsync (goals::ops' keyed-control test, 3 of 10 targeted runs on adacachy, 2026-11-20). Elsewhere, the CPU time
+    /// as `cpu_us_of` reads it (macOS's in its own fine units).
+    #[cfg(target_os = "linux")]
+    fn at_work(pid: u32) -> Option<(u64, bool)> {
+        let mut seen: Option<(u64, bool)> = None;
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()?.flatten() {
+            let Ok(sched) = std::fs::read_to_string(task.path().join("schedstat")) else { continue };
+            let time = sched.split_whitespace().take(2).filter_map(|v| v.parse::<u64>().ok()).fold(0u64, u64::saturating_add);
+            let stat = std::fs::read_to_string(task.path().join("stat")).unwrap_or_default();
+            let busy = stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()).is_some_and(|state| matches!(state, 'R' | 'D'));
+            let (was, any) = seen.unwrap_or((0, false));
+            seen = Some((was.saturating_add(time), any || busy));
+        }
+        seen
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn at_work(pid: u32) -> Option<(u64, bool)> {
+        crate::os::metrics::cpu_us_of(&[pid]).map(|us| (us, false))
     }
 
     pub(crate) async fn source_ready(hub: &Hub, id: &str) -> anyhow::Result<()> {
