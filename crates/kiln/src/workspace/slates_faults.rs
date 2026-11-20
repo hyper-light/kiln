@@ -94,7 +94,7 @@ mod tests {
     use super::*;
 
     fn member(machine: &str, member: Option<u64>) -> Member {
-        Member { machine: machine.to_owned(), address: "127.0.0.1:17300".to_owned(), domain: 1, certificate: String::new(), member }
+        Member { machine: machine.to_owned(), address: "127.0.0.1:17300".to_owned(), domain: 1, certificate: String::new(), member, user: None }
     }
 
     /// A-580. Do: judge a move kiln answered with the agent on its target; one refused by a kind with the agent on its

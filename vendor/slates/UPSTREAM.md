@@ -10,7 +10,7 @@ written against (`workspace::slates::CONTRACT`, 48 at this revision): a re-vendo
 `w1_kiln_speaks_the_contract_it_was_written_against`.
 
 - **Upstream:** https://github.com/hyper-light/slates, branch `main`, commit
-  `de1031f1de2baacee89d32d54084ba2e3ccc7c4c` (2026-11-18), MIT (`LICENSE`).
+  `38ed3dfd8e69921c46861de3487e7c1de5fc1d51` (2026-11-18), MIT (`LICENSE`).
 - **What is here:** upstream's tree, at upstream's paths: its crates (`crates/*`), its root manifest, its toolchain,
   lint and format settings with the budgets its own checks read (`clippy.toml`, `rustfmt.toml`,
   `rust-toolchain.toml`, `unsafe-budget.toml`, `ratchets.toml`), its `xtask`, its agents' skills (`skills/`, which its
@@ -44,6 +44,7 @@ branch, and Slates' agent is told of it; a vendoring change alone (the first bel
 | File | Change | Why | Recorded as |
 |---|---|---|---|
 | `Cargo.toml` | each of hyper-raft's crates taken by path from kiln's copy (`../hyper-raft/crates/hyper-*`), not from `vendor/hyper-raft/*`; the root's `[patch.crates-io]` points aws-lc-rs at kiln's copy (`../aws-lc-rs/aws-lc-rs`) and leaves aws-lc-sys crates.io's | kiln holds one copy of each: two linked copies of hyper-raft fail CP-M1's one-revision test, and Slates' own copies (its `vendor/`) aren't here. A path dependency can't be patched, so the paths change | `0001-its-crates-on-kiln-s-one-hyper-raft-and-aws-lc-rs.patch` |
+| `crates/bridge-fuse/src/abi.rs`, `bridge.rs`, `shards_fs.rs` | a `SETXATTR`'s form read from each request (`abi::setxattr_head`), for the bridge's dispatch and Shards' owner word alike: the extended head only where its second 8 bytes are a known setter's flag and a zero pad (upstream's A-741, slates main `e0c06750`) | kiln's macOS microVM g266 drive refused a run's every write `EACCES`, intermittently: Linux sizes a `SETXATTR` by the form it holds at the call and holds it until INIT's reply (`fuse_setxattr`, `fuse_block_alloc`), so Shards' init's owner word comes in the short form on a connection that kept the extended one, and was missed. Folds away when kiln takes Slates at or past `e0c06750` | `0002-a-setxattr-s-form-is-the-request-s-own-so-shards-owner-word.patch` |
 
 ## Taking a newer upstream
 

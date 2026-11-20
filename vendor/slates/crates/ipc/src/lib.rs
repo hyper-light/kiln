@@ -59,8 +59,12 @@ pub mod park;
 #[cfg(target_os = "linux")]
 pub mod peer;
 pub mod protocol;
+// The wire form of a host's refusal code, pinned (A-539).
+#[cfg(test)]
+mod os_code_vectors;
 pub mod region;
 pub mod rendezvous;
+pub mod room;
 pub mod seal;
 // The stand-in seal this crate's own tests rendezvous under (A-187), one file shared with the integration tests, which
 // name this crate as `slates_ipc`; so do the module tests, through the alias.

@@ -4,4 +4,4 @@
 /**
  * Why a run keeps every destination its image grants.
  */
-export type AgentWhole = "one_use" | "persons_own" | "no_home" | { "unread": { file: string, error: string, } } | { "unnamed": { what: string, value: string, } } | { "untold": { what: string, } };
+export type AgentWhole = "one_use" | "persons_own" | "no_home" | { "unread": { file: string, error: string, } } | { "unnamed": { what: string, value: string, } } | { "untold": { what: string, } } | "container";

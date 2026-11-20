@@ -100,8 +100,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let join = crate::util::load_or_create_token(&cfg.data("join.token"))?;
 
     let quic_bind: SocketAddr = cfg.server.quic_addr.parse().with_context(|| format!("quic_addr {}", cfg.server.quic_addr))?;
-    // Revoked keys are refused from the first handshake on (W27-R01).
-    let revoked_keys = crate::identities::revoked_keys(&store).await?;
+    // Revoked keys are refused from the first handshake on (W27-R01), and so are a holder's, a keeper's and a Slates fleet
+    // node's, never a runner's, and a runner's certificate superseded in its role (docs/agentic.md W10).
+    let refused = crate::identities::link_refusals(&store).await?;
     // What runners send, fanned out to the hub's loops on the net thread: a session's updates to the loop on the shard
     // that owns its copy, the rest to its control loop (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`).
     // The hub loops' queues hold a share of what the server may hold, measured again as runners come and go and as
@@ -109,7 +110,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let (fan, net_events) = crate::wire::fan::Fan::new(crate::wire::fan::shards(), crate::memory::room::share());
     crate::memory::room::follow(fan.room());
     let net = crate::net::start_with(
-        crate::net::Spec { bind: quic_bind, ca_der: pki.ca_der.clone(), leaf: leaf.clone(), server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys },
+        crate::net::Spec { bind: quic_bind, ca_der: pki.ca_der.clone(), leaf: leaf.clone(), server: true, dial_deadline: crate::net::DIAL_DEADLINE, revoked_keys: refused.keys, revoked_serials: refused.serials },
         crate::net::OUT_BYTES,
         Box::new(fan),
     )?;
@@ -664,6 +665,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             join_token: None,
             ephemeral: false,
             dedicated_job: None,
+            dedicated_session: None,
             terminal: false, // the server already offers the "local" terminal
             job_terminal: cfg.terminal.enabled,
             shell: cfg.terminal.shell.clone(),

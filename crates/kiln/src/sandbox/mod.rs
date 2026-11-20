@@ -22,6 +22,7 @@
 //! - [`windows_path`]: a Windows folder's place, judged from its text as Windows judges it, on any host: what an
 //!   isolated session's harness on a Windows machine is told of its folders (docs/agentic.md W8, piece 2).
 
+pub mod container;
 #[cfg(test)]
 pub mod fake;
 pub mod held;
@@ -503,7 +504,7 @@ mod tests {
             let f = super::checked(None, Ok(HostCheck::Unusable { backend: Some(Backend::Kvm), why }));
             assert!(!f.available && f.hypervisor.is_none() && f.why_not.as_deref().is_some_and(|w| w.contains(says)), "{f:?}");
             let runner = RunnerFacts { isolation: Some(f.clone()), ..RunnerFacts::default() };
-            let h = held(Asked::default(), &capable(&runner));
+            let h = held(Asked::default(), &capable(&runner), &crate::harness::engine::containers(&runner));
             assert_eq!((h.engine, h.why.as_deref()), (Engine::Host, f.why_not.as_deref()));
         }
         let intel = super::checked(None, Ok(HostCheck::Unusable { backend: None, why: Unusable::Unsupported { os: "macos".into(), arch: "x86_64".into() } }));

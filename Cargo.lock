@@ -2507,6 +2507,7 @@ dependencies = [
  "shards-api",
  "shards-image",
  "slates-api",
+ "slates-ipc",
  "socket2",
  "str0m",
  "sysinfo",

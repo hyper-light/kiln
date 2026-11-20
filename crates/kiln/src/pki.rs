@@ -44,6 +44,8 @@ pub const MAX_TLS_DAYS: i64 = 398;
 /// usage: the two marks that tell a front door, the server's entrance on a runner, from every other certificate this CA
 /// issues ([`answers_as_server`]). Both since the first front door (be7bce8e8, 2026-10-17).
 const FRONT_DOOR_ORGANIZATION: &str = "kiln front door";
+/// Format: the organization a Kubernetes node's `tlshd` certificate carries (docs/agentic.md W10), the mark of its role.
+pub const KUBERNETES_NODE_ORGANIZATION: &str = "kiln kubernetes node";
 
 pub struct Pki {
     dir: PathBuf,
@@ -132,6 +134,43 @@ pub fn answers_as_server(der: &[u8]) -> bool {
     });
     let front_door = serves_alone && cert.subject().iter_organization().any(|o| o.as_str().is_ok_and(|o| o == FRONT_DOOR_ORGANIZATION));
     names_the_server || front_door
+}
+
+/// What a certificate this CA issued is to kiln's link's server side (docs/agentic.md W10), by its extended key usages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkRole {
+    /// clientAuth alone: a runner's, as every machine's certificate is since ba0ecd654 (2026-10-17, `machine_params`).
+    Runner,
+    /// serverAuth and clientAuth: a capacity holder's, a keeper's or a Slates fleet node's, each serving both sides of
+    /// its own links, or a runner's issued before ba0ecd654, the one kind no record holds (kiln records every
+    /// certificate it issues since 2026-10-26, W27-R01).
+    BothSides,
+    /// No usage a runner presents: serverAuth alone (a front door's), none named (any usage), or unreadable.
+    Neither,
+}
+
+/// What the DER certificate `der` is to kiln's link ([`LinkRole`]).
+pub fn link_role(der: &[u8]) -> LinkRole {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else { return LinkRole::Neither };
+    match cert.extended_key_usage() {
+        Ok(Some(eku)) if eku.value.client_auth && !eku.value.server_auth && !eku.value.any => LinkRole::Runner,
+        Ok(Some(eku)) if eku.value.client_auth && eku.value.server_auth => LinkRole::BothSides,
+        _ => LinkRole::Neither,
+    }
+}
+
+/// The certificate a runner takes up from its server in the runner's role (W10's reissue over its link, the server's
+/// [`Pki::sign_runner_role`]) in place of its `current` one: for the same key and the same name, issued by the CA it
+/// trusts (`ca_der`), clientAuth alone; refused otherwise, so a server that sent another can't change who the runner
+/// is. The runner's leaf with it.
+pub fn take_runner_role(current: &Leaf, ca_der: &[u8], cert_pem: &str) -> anyhow::Result<Leaf> {
+    let der = pem_to_der(cert_pem)?;
+    anyhow::ensure!(verify_issued(ca_der, &der), "the certificate wasn't issued by the CA this runner trusts");
+    anyhow::ensure!(link_role(&der) == LinkRole::Runner, "the certificate isn't in the runner's role (clientAuth alone)");
+    anyhow::ensure!(cert_matches_key(cert_pem, &current.key_pem), "the certificate is for another key than this runner's");
+    let taken = Leaf { cert_pem: cert_pem.to_owned(), key_pem: current.key_pem.clone() };
+    anyhow::ensure!(leaf_name(&taken).is_some() && leaf_name(&taken) == leaf_name(current), "the certificate names another runner than this one");
+    Ok(taken)
 }
 
 /// A machine's certificate (a runner, a runner process beside it, the server's in-process agent):
@@ -507,6 +546,38 @@ impl Pki {
         Ok(signed.der().to_vec())
     }
 
+    /// Sign a Kubernetes node's CSR (PEM) for its `tlshd` (docs/agentic.md W10): the client certificate the node's NFS
+    /// client presents as it mounts a pod's workspace from a home's Slates export over RPC-with-TLS, which takes a client
+    /// whose certificate chains to kiln's CA. For its key, made on the node, named `node` as its operator wrote it and
+    /// never the server's own name, clientAuth alone, its organization [`KUBERNETES_NODE_ORGANIZATION`], valid as a
+    /// machine's is, its serial its own. Its kind is recorded and its key refused on kiln's link, as every other
+    /// certificate kiln issues that isn't a runner's is (`crate::identities`). PEM.
+    pub fn sign_kubernetes_node(&self, csr_pem: &str, node: &str) -> anyhow::Result<String> {
+        let name = sanitize_name(node);
+        anyhow::ensure!(!name.is_empty(), "a node's name is a DNS name, and {node:?} isn't");
+        anyhow::ensure!(!reserved(&name), "{SERVER_NAME} is the server's own identity; a node can't be named so");
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse the node's CSR")?;
+        let mut params = machine_params(name, LEAF_DAYS)?;
+        params.distinguished_name.push(DnType::OrganizationName, KUBERNETES_NODE_ORGANIZATION);
+        params.serial_number = Some(random_serial());
+        Ok(CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&self.issuer).context("sign the node's CSR")?.pem())
+    }
+
+    /// A runner's certificate in the runner's role (clientAuth alone, docs/agentic.md W10) for the key and the name of
+    /// `dual_usage`, a certificate this CA issued it before machines' certificates held their role (ba0ecd654,
+    /// [`LinkRole::BothSides`]), which its link has just proven it holds: the handshake was made with that key, so no CSR
+    /// is asked. A serial of its own. PEM.
+    pub fn sign_runner_role(&self, dual_usage: &[u8]) -> anyhow::Result<String> {
+        anyhow::ensure!(self.issued(dual_usage), "that certificate was not issued by this server");
+        anyhow::ensure!(link_role(dual_usage) == LinkRole::BothSides, "that certificate isn't one serving both sides");
+        let name = cert_dns_name(dual_usage).ok_or_else(|| anyhow::anyhow!("that certificate names no machine"))?;
+        let (_, cert) = x509_parser::parse_x509_certificate(dual_usage).map_err(|e| anyhow::anyhow!("parse certificate: {e}"))?;
+        let key = rcgen::SubjectPublicKeyInfo::from_der(cert.public_key().raw).context("the certificate's key")?;
+        let mut params = machine_params(name, LEAF_DAYS)?;
+        params.serial_number = Some(random_serial());
+        Ok(params.signed_by(&key, &self.issuer).context("sign the runner's certificate")?.pem())
+    }
+
     /// A machine known by its name moving to its machine id (docs/machines.md): the same proof as
     /// [`Self::sign_instance`], and a certificate for the same key named `to`. Returns the name it
     /// had and the new certificate.
@@ -620,6 +691,16 @@ impl Pki {
     /// Whether this CA issued (signed) the DER certificate `der`.
     pub fn issued(&self, der: &[u8]) -> bool {
         verify_issued(&self.ca_der, der)
+    }
+
+    /// A runner's certificate as kiln issued one before machines' certificates held their role (ba0ecd654,
+    /// 2026-10-17: `machine_params`): serverAuth and clientAuth, its name alone, its serial left to rcgen; a test's
+    /// stand-in for a runner enrolled then, its key made here.
+    #[cfg(test)]
+    pub fn issue_dual_usage_runner(&self, name: &str) -> anyhow::Result<Leaf> {
+        let key = KeyPair::generate()?;
+        let cert = leaf_params(vec![sanitize_name(name)], LEAF_DAYS)?.signed_by(&key, &self.issuer)?;
+        Ok(Leaf { cert_pem: cert.pem(), key_pem: key.serialize_pem() })
     }
 
     /// Issue a full leaf (key generated here). Used for the server's own in-process local agent.

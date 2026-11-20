@@ -362,6 +362,11 @@ pub enum AgentMsg {
     /// [`feature::PREBUILD`]. Appended last, after `HarnessMailTransfer`: postcard encodes variants
     /// by index.
     Prebuilt { json: String },
+    /// This runner took the certificate [`ServerMsg::RunnerRole`] gave it in the runner's role (`serial`, hex): kept where it
+    /// reads its certificate as it starts, and presented on its link's next connections, so the one it connected with is
+    /// superseded (docs/agentic.md W10). Only to a server that named [`feature::RUNNER_ROLE`]. Appended last, after
+    /// `Prebuilt`: postcard encodes variants by index.
+    RunnerRole { serial: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -850,7 +855,17 @@ pub mod feature {
     /// P6b.4); the server sends one only to a runner that names it, and refuses it otherwise (an older runner would
     /// give the volume with its files run).
     pub const VOLUME_EXEC: &str = "sessions.volumes.exec";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC];
+    /// This runner takes the certificate the server reissues it in the runner's role ([`super::ServerMsg::RunnerRole`],
+    /// docs/agentic.md W10): it keeps it where it reads its certificate as it starts, presents it on its link's next
+    /// connections, and says so ([`super::AgentMsg::RunnerRole`]). Only a runner that named it is reissued one; another
+    /// connected with a certificate from before machines' certificates held their role keeps it until it does.
+    pub const RUNNER_ROLE: &str = "runner-role";
+    /// This runner holds a workspace for a session that runs elsewhere, a Kubernetes pod's (`crate::workspace::Ask::Hold`
+    /// and `Release`, `crate::workspace::held`; docs/agentic.md W10): its volume made with no mount over its folder here and
+    /// exported to the folder's owner, and the questions about that session's folder answered from it. Only a runner that
+    /// named it is asked to hold one.
+    pub const WORKSPACE_HOLD: &str = "workspace.hold";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -1281,6 +1296,12 @@ pub enum ServerMsg {
     /// [`AgentMsg::Answer`] under `req` (`crate::harness::agentenv::Answer`). Only to runners that
     /// named [`feature::AGENTENV`]. Appended last, after `Volumes`: postcard encodes variants by index.
     UserEnv { req: u64, json: String },
+    /// A certificate in the runner's role (clientAuth alone, PEM) for this runner's key and name, reissued over its link in
+    /// place of the one it connected with, which kiln's CA issued before machines' certificates held their role and which
+    /// serves both sides (docs/agentic.md W10). The runner checks it ([`crate::pki::take_runner_role`]), keeps it, presents
+    /// it from its link's next connection on, and says so ([`AgentMsg::RunnerRole`]). Only to runners that named
+    /// [`feature::RUNNER_ROLE`]. Appended last, after `UserEnv`: postcard encodes variants by index.
+    RunnerRole { cert_pem: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2136,8 +2157,9 @@ mod tests {
         // CP-T3.2 the room a hand-over's spool leaves, AdoptPolicy (82); kiln plan 01a1dd2e… P7.1b a replay, Replay (83);
         // kiln plan 01a1dd2e… P4.5 an Agentfile's build ahead of its sessions, Prebuild (84), and where it is, Prebuilt (73);
         // kiln plan 01a1dd2e… P6.2 an agent's volumes on a runner, Volumes (85); docs/agents.md "Environments" a
-        // runner's user's variables, UserEnv (86).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (74, 87), "each table has every variant once");
+        // runner's user's variables, UserEnv (86); docs/agentic.md W10 a runner's certificate reissued in its role and its
+        // word it took it, RunnerRole (87 and 74).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (75, 88), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -2345,6 +2367,7 @@ mod tests {
             ("SkillFile", AgentMsg::SkillFile { req: 1, sha256: "00".into(), offset: 0, data: vec![1], done: true }),
             ("HarnessMailTransfer", AgentMsg::HarnessMailTransfer { json: "{}".into() }),
             ("Prebuilt", AgentMsg::Prebuilt { json: "{}".into() }),
+            ("RunnerRole", AgentMsg::RunnerRole { serial: "00".into() }),
         ];
         let mut last = 63u8;
         for (name, m) in agent {
@@ -2371,6 +2394,7 @@ mod tests {
             ("Prebuild", ServerMsg::Prebuild { json: "{}".into() }),
             ("Volumes", ServerMsg::Volumes { req: 1, json: "{}".into() }),
             ("UserEnv", ServerMsg::UserEnv { req: 1, json: "{}".into() }),
+            ("RunnerRole", ServerMsg::RunnerRole { cert_pem: String::new() }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

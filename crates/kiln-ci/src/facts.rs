@@ -51,6 +51,11 @@ pub struct RunnerFacts {
     #[cfg_attr(feature = "ts", ts(optional))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isolation: Option<Isolation>,
+    /// Whether it can run agents in containers of their own on their workspaces' Slates volumes, through which
+    /// engine, and why not (docs/agentic.md W9; Slates' A-520). Absent from a runner from before it.
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containers: Option<ContainerFacts>,
     /// What W24's work needs to know of the machine (docs/ci.md W24, `RunnerFacts.work`).
     pub work: Option<WorkFacts>,
     /// The machine itself: a hash of the id its OS keeps for it (W13-R01). The server keeps it with
@@ -291,8 +296,9 @@ pub enum NodeImageClass {
     Unlisted { why: String },
 }
 
-/// How a runner runs new agent sessions (kiln plan 01a1dd2e…, P2.3): as processes on its host, or
-/// each in a Shards microVM of its own, through Hex.
+/// How a runner runs new agent sessions (kiln plan 01a1dd2e…, P2.3): as processes on its host, each in a
+/// Shards microVM of its own, through Hex, or each in a container of its own on its workspace's Slates volume
+/// (docs/agentic.md W9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(rename = "RunnerEngine"))]
@@ -302,6 +308,9 @@ pub enum Engine {
     Host,
     /// A Shards microVM of its own, through Hex.
     Microvm,
+    /// An OCI container of its own, through the machine's container engine, its workspace's Slates volume bound into it
+    /// (docs/agentic.md W9; [`ContainerFacts`]). Only ever its owner's choice: never what a runner holds by default.
+    Container,
 }
 
 impl Engine {
@@ -310,6 +319,7 @@ impl Engine {
         match self {
             Engine::Host => "host",
             Engine::Microvm => "microvm",
+            Engine::Container => "container",
         }
     }
 }
@@ -367,6 +377,56 @@ pub enum WorkspaceMissing {
     Facts,
     /// A name for what it lacks: a runner from before kiln typed it said it in words alone (`why_not`).
     Unnamed,
+}
+
+/// Agents' containers on a machine (docs/agentic.md W9; Slates' A-520): each agent in a container of its own, its
+/// workspace's Slates volume bound into it from the machine's mount. Its runner asks its engine through Slates' library
+/// (`container_engine::engine_profile`), which judges the engine's profile, never kiln.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct ContainerFacts {
+    /// Agents here can run in containers: it has workspaces, a container engine answers, Slates holds evidence for its
+    /// profile, and kiln can run a container under that profile.
+    pub available: bool,
+    /// The engine's command line, by its full path (`docker`, else `podman`).
+    pub program: Option<String>,
+    /// The engine Slates' profile names: `docker-desktop`, `docker-engine` or `podman`.
+    pub engine: Option<String>,
+    /// The endpoint its command line reaches, as it names it (`local` for podman's own).
+    pub endpoint: Option<String>,
+    /// The engine's version, as it states it.
+    pub version: Option<String>,
+    /// The image its agents run in, as its administrator declared it (`[agent] container_image`).
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Why agents here can't run in containers, in words (Slates' own where Slates refused).
+    pub why_not: Option<String>,
+    /// What this machine lacks to run agents in containers, typed (`why_not` says it in words).
+    #[cfg_attr(feature = "ts", ts(optional))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing: Option<ContainerMissing>,
+}
+
+/// What a machine lacks to run agents in containers ([`ContainerFacts::missing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerMissing {
+    /// Workspaces of its own (a container binds its agent's volume: [`Workspaces::missing`] says what that lacks).
+    Workspaces,
+    /// A container engine that answers: `docker` or `podman` on the PATH, its daemon up.
+    Engine,
+    /// An engine whose profile Slates holds evidence for (Slates refused it, or its engine didn't answer Slates).
+    Profile,
+    /// Its workspaces mounted shared with other users, as a rootful Linux engine's containers need: kiln doesn't mount
+    /// them so yet.
+    SharedMount,
+    /// A platform where a host mount is bound into a container at all (Windows: Slates asks no engine there).
+    Platform,
+    /// An image for its agents' containers, declared by its administrator (`[agent] container_image`).
+    Image,
 }
 
 /// The kiln a runner runs, and where kiln's source is on its machine.

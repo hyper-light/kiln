@@ -403,6 +403,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "agents", "slates-fleet"]) => return boxed(|| enroll_slates_node(&hub, req)).await,
         (&Method::POST, ["api", "agents", "slates-fleet", "members"]) => return boxed(|| slates_fleet_members(&hub, req)).await,
         (&Method::POST, ["api", "agents", "slates-fleet", "place"]) => return boxed(|| slates_fleet_place(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet", "bootstrap"]) => return boxed(|| slates_fleet_bootstrap(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet", "users"]) => return boxed(|| slates_fleet_users(&hub, req)).await,
         (&Method::POST, ["api", "agents", "rekey"]) => return boxed(|| rekey_agent(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
@@ -1039,6 +1041,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             Ok(srv::json(StatusCode::OK, &json!({ "unsigned": unsigned })))
         })
         .await,
+        (&Method::POST, ["api", "kubernetes", "node-certificates"]) => {
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| kubernetes_node_certificate(&hub, req, &by)).await
+        }
         (&Method::POST, ["api", "identities", "revoke"]) => {
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| identity_revoke(&hub, req, &by)).await
@@ -4288,6 +4294,31 @@ struct RevokeReq {
     reason: String,
 }
 
+/// What a cluster's operator asks for a node's `tlshd` certificate (`POST /api/kubernetes/node-certificates`).
+#[derive(serde::Deserialize)]
+struct NodeCertificateAsk {
+    /// The node's name.
+    node: String,
+    /// A CSR (PEM) for a key made on the node, which never leaves it.
+    csr: String,
+}
+
+/// `POST /api/kubernetes/node-certificates` `{node, csr}` (docs/agentic.md W10): a Kubernetes node's client certificate
+/// for its `tlshd`, issued to the cluster's operator by someone who manages settings, with kiln's CA to trust
+/// (`x509.truststore`): recorded first (W27-R01), its key refused on kiln's link, and audited. The operator installs both
+/// on the node, its key `0600`, as `user_allow_other` is: never a privilege kiln holds.
+async fn kubernetes_node_certificate(hub: &Hub, req: Request, by: &str) -> R {
+    let ask: NodeCertificateAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let cert = hub.pki.sign_kubernetes_node(&ask.csr, &ask.node).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let name = crate::pki::sanitize_name(&ask.node);
+    crate::identities::record(&hub.store, crate::identities::KUBERNETES_NODE, &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if let Ok(der) = crate::pki::der_of(&cert) {
+        crate::identities::refuse_on_link(hub, crate::identities::KUBERNETES_NODE, &name, &der).await;
+    }
+    hub.store.audit(by.to_owned(), "kubernetes.node_certificate".into(), name.clone()).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "node": name, "certificate": cert, "ca": hub.pki.ca_pem })))
+}
+
 /// `POST /api/identities/revoke` `{serial | key | subject, reason}`: revoked from now on, refused
 /// at once by the TLS directory (W27-R01).
 async fn identity_revoke(hub: &Hub, req: Request, by: &str) -> R {
@@ -4443,8 +4474,10 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
     // executor's, whatever it asks to be.
     let pod = if persistent { None } else { hub.executor_tokens.update(|t| t.remove(&r.token)).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
+    // An agent's pod (docs/agentic.md W10): its runner is the pod's name, whatever it asks to be.
+    let agent_pod = if persistent || pod.is_some() { None } else { hub.agent_pods.enrolling(&r.token) };
     // A job pod's token, refused once its time is up (none is swept away for it: goal 9, plan 01a1a87b2cec step 5).
-    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some_and(|(_, exp)| exp > std::time::Instant::now()));
+    let ephemeral = pod.is_some() || agent_pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some_and(|(_, exp)| exp > std::time::Instant::now()));
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
@@ -4455,7 +4488,7 @@ async fn enroll(hub: &Hub, req: Request) -> R {
             hub.pod_executors.update(|p| p.insert(pod_name.clone(), executor.clone()));
             pod_name.clone()
         }
-        None => crate::pki::sanitize_name(&r.name),
+        None => agent_pod.clone().unwrap_or_else(|| crate::pki::sanitize_name(&r.name)),
     };
     // A machine enrolling with the join token, or an outpost, is named as a joining one is: known
     // by its machine id when it sent one, shown by the name it asked for unless another machine
@@ -4588,6 +4621,8 @@ async fn enroll_capacity(hub: &Hub, req: Request) -> R {
     let leaf = enrolled.chain.first().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "no certificate was issued".to_owned()))?;
     let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(leaf) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::identities::record(&hub.store, "holder", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Never a runner's on kiln's link (docs/agentic.md W10).
+    crate::identities::refuse_on_link(hub, "holder", &name, &der).await;
     hub.store.audit(name.clone(), "agent.capacity".into(), String::new()).await;
     tracing::info!(agent = %name, "issued a capacity holder's certificate");
     Ok(srv::json(StatusCode::OK, &enrolled))
@@ -4609,6 +4644,8 @@ async fn enroll_slates_node(hub: &Hub, req: Request) -> R {
     // Every certificate kiln issues is recorded first (W27-R01).
     let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(&issued.certificate) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::identities::record(&hub.store, "slates-node", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Never a runner's on kiln's link (docs/agentic.md W10).
+    crate::identities::refuse_on_link(hub, "slates-node", &name, &der).await;
     hub.store.audit(name.clone(), "agent.slates_fleet".into(), String::new()).await;
     tracing::info!(agent = %name, domain = issued.domain, "issued a Slates fleet node's certificate");
     Ok(srv::json(StatusCode::OK, &issued))
@@ -4650,6 +4687,39 @@ async fn slates_fleet_place(hub: &Hub, req: Request) -> R {
     Ok(srv::json(StatusCode::OK, &place))
 }
 
+/// `POST /api/agents/slates-fleet/users`: kiln's Slates fleet's members as the server knows them, each with the user it
+/// said (its node's certificate anchor and its kiln's uid), connected or not: what a runner shares a new workspace with,
+/// so whichever members hold its copies serve it after its owner's loss (A-750; main's ruling of 2026-11-20). Proven as
+/// `/place` is; a runner the setting doesn't list is refused.
+async fn slates_fleet_users(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::AskPlace = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    if crate::workspace::slates_fleet::place_of(&hub.cfg.slates_fleet, &name).map_err(|e| err(StatusCode::CONFLICT, e))?.is_none() {
+        return Err(err(StatusCode::FORBIDDEN, format!("[slates_fleet] doesn't list {name}: it has no fleet's members to share with")));
+    }
+    Ok(srv::json(StatusCode::OK, &hub.slates_fleet.members(|_| true)))
+}
+
+/// `POST /api/agents/slates-fleet/bootstrap`: whether the runner that asks makes kiln's Slates fleet's root group now, the
+/// fleet's one-time bootstrap (A-734; main's ruling of 2026-11-20): its founder alone (`Place::founds`), once, until it
+/// says it's done (`crate::workspace::slates_fleet::ask_bootstrap_on`). Proven
+/// as `/place` is; a runner the setting doesn't list is refused.
+async fn slates_fleet_bootstrap(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::AskBootstrap = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let Some(place) = crate::workspace::slates_fleet::place_of(&hub.cfg.slates_fleet, &name).map_err(|e| err(StatusCode::CONFLICT, e))? else {
+        return Err(err(StatusCode::FORBIDDEN, format!("[slates_fleet] doesn't list {name}: it bootstraps no fleet")));
+    };
+    let (member, done) = (ask.member, ask.done);
+    let now = crate::util::now_ms();
+    let bootstrap = hub
+        .store
+        .call(move |c| crate::workspace::slates_fleet::ask_bootstrap_on(c, &place.fleet, &name, place.founds, member, done, now))
+        .await
+        .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &crate::workspace::slates_fleet::Bootstrapper { bootstrap }))
+}
+
 /// `POST /api/capacity/keeper`: a capacity keeper's certificate from kiln's CA, for its request
 /// (`crate::capacity::issue_keeper`; Hex's capacity-view.md; HEX-CV-2K; kiln plan
 /// 01a1cd8e862e7169a074db3d5fa33f3d, step 13): named as its request asks, its `chain.pem` and
@@ -4663,6 +4733,8 @@ async fn issue_keeper(hub: &Hub, req: Request) -> R {
     let leaf = issued.chain.first().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "no certificate was issued".to_owned()))?;
     let der = ::hex::decode(leaf).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::identities::record(&hub.store, "keeper", &issued.name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Never a runner's on kiln's link (docs/agentic.md W10).
+    crate::identities::refuse_on_link(hub, "keeper", &issued.name, &der).await;
     hub.store.audit(issued.name.clone(), "capacity.keeper".into(), String::new()).await;
     tracing::info!(keeper = %issued.name, "issued a capacity keeper's certificate");
     Ok(srv::json(StatusCode::OK, &issued))
@@ -6300,16 +6372,30 @@ async fn harness_workspaces(hub: &Hub) -> Response {
     let mut out = serde_json::Map::new();
     let mut targets = vec!["local".to_owned()];
     targets.extend(hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
-    // Mounted on each machine's host, as an agent there works in one (W2); a volume served to a microVM, which needs no
-    // host mount, is judged as its isolated start is made (`lineage::WorkspaceUse::Served`, W8).
+    // Mounted on each machine's host, as an agent there works in one (W2); and beside it, `served`, a volume served to a
+    // microVM, which needs no host mount, judged as its isolated start is made (`lineage::WorkspaceUse::Served`, W8
+    // piece 4): a Windows host without WinFsp gives an isolated agent one where it gives a host agent none.
+    use crate::harness::lineage::{WorkspaceUse, workspaces_on};
     for t in targets {
-        let v = match crate::harness::lineage::workspaces_on(hub, &t, crate::harness::lineage::WorkspaceUse::Mounted).await {
-            Ok(()) => json!({"available": true}),
-            Err(no) => json!({"available": false, "why_not": no.said, "missing": no.missing}),
-        };
-        out.insert(t, v);
+        let mounted = workspaces_on(hub, &t, WorkspaceUse::Mounted).await;
+        let served = workspaces_on(hub, &t, WorkspaceUse::Served).await;
+        out.insert(t, workspaces_answer(&mounted, &served));
     }
     srv::json(StatusCode::OK, &serde_json::Value::Object(out))
+}
+
+/// One target's answer in `/api/harness/workspaces`: whether it gives a workspace mounted on its host (`available`, and
+/// where not, `why_not` and `missing`), and under `served` the same of a volume served to a microVM (W8 piece 4).
+fn workspaces_answer(mounted: &Result<(), crate::harness::lineage::NoWorkspace>, served: &Result<(), crate::harness::lineage::NoWorkspace>) -> serde_json::Value {
+    let said = |r: &Result<(), crate::harness::lineage::NoWorkspace>| match r {
+        Ok(()) => json!({"available": true}),
+        Err(no) => json!({"available": false, "why_not": no.said, "missing": no.missing}),
+    };
+    let mut v = said(mounted);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("served".to_owned(), said(served));
+    }
+    v
 }
 
 fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
@@ -8707,6 +8793,24 @@ fn back(connected: u64, before: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// W8 piece 4: a runner without a host mount (a Windows host without WinFsp) is said to give a volume served to a
+    /// microVM beside giving none mounted on its host, each with its own why; one that keeps no workspaces gives neither.
+    #[test]
+    fn w8_p4_a_runners_workspaces_say_a_served_volume_beside_a_mounted_one() {
+        use crate::harness::lineage::NoWorkspace;
+        use crate::workspace::slates::WorkspaceMissing as Lacks;
+        let no = |missing: Lacks, said: &str| Err(NoWorkspace { missing, said: said.into() });
+        let whp = super::workspaces_answer(&no(Lacks::WinFsp, "WinFsp isn't installed (winfsp.dev)"), &Ok(()));
+        assert_eq!(whp["available"], false);
+        assert_eq!(whp["why_not"], "WinFsp isn't installed (winfsp.dev)");
+        assert_eq!(whp["served"], serde_json::json!({"available": true}));
+        let none = super::workspaces_answer(&no(Lacks::Workspaces, "this kiln keeps no workspaces"), &no(Lacks::Workspaces, "this kiln keeps no workspaces"));
+        assert_eq!((none["available"].clone(), none["served"]["available"].clone()), (false.into(), false.into()));
+        assert_eq!(none["served"]["why_not"], "this kiln keeps no workspaces");
+        let both = super::workspaces_answer(&Ok(()), &Ok(()));
+        assert_eq!(both, serde_json::json!({"available": true, "served": {"available": true}}));
+    }
+
     /// What's kiln's to say of an agent's start is never what's asked: an isolated agent's person,
     /// whose volume holds its harness's sign-in (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step
     /// 18), is whoever asks, a forged one replaced, none without a caller.

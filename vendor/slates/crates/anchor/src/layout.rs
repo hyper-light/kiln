@@ -10,10 +10,12 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// and merge records carry the submit's completion key (A-255), 8 the submitting work beside it, and a completion record
 /// a green's successor adopted carries that work too (A-288), 9 the audit ring removed, whose records the op log and the
 /// snapshots held (A-265), 10 the audit's crossing durable: a partition's snapshot carries the records it owes the
-/// control partition and the control partition's marks of what each delivered (A-265, 2026-11-18). An older segment is
-/// refused, never misread.
+/// control partition and the control partition's marks of what each delivered (A-265, 2026-11-18), 11 a recorded reply's
+/// host code typed by its numbering: a completion record keeps its reply's bytes, whose errno fields a Windows daemon of
+/// layout 10 filled with Win32 error codes, now an errno alone beside an appended Win32 variant (A-539, 2026-11-19). An
+/// older segment is refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 10;
+pub const LAYOUT_VERSION: u32 = 11;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
@@ -149,6 +151,14 @@ pub const SUP_LOOKED: usize = 216;
 /// operator) can wait for the anchor's own verdict first. Zero in a block an older anchor wrote.
 /// Format: the byte offset inside the supervision block, the word after the looked word.
 pub const SUP_RECOVERED: usize = 224;
+/// The anchor's **lapse bound** word (A-574): the age, in nanoseconds, past which the anchor takes its daemon's beat for
+/// lapsed and kills it (A-467: the liveness window plus the anchor's own measured lateness p99, within the watchdog's
+/// ceiling), written by the anchor's observation loop whenever it moves. The daemon reads it as the anchor's part of its
+/// failover detection (`slates_cluster::failover::supervision`): a stuck daemon is found by its own watchdog, which then
+/// withholds the beat, and is killed once that beat is this old. Zero in a block no anchor wrote: a daemon run alone,
+/// which its own watchdog ends, or one under an older anchor.
+/// Format: the byte offset inside the supervision block, the word after the recovered word.
+pub const SUP_LAPSE_BOUND: usize = 232;
 /// The node's **client session secret** published word: `1` once a daemon has published the secret after it, `0` before
 /// (a fresh segment, or one an older anchor wrote). The secret is made by the first daemon under this anchor and adopted
 /// by every daemon after it, so a client's session key (`slates_server::session_key`), which only it and the daemon

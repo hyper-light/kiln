@@ -19,8 +19,8 @@
 //!    (`bare_metal`), its mount is Slates' and the harness works in it: in the host's table as Slates' (NFS on loopback
 //!    on macOS, FUSE on Linux), or on Windows a drive letter whose file system Windows names Slates' (WinFsp keeps no
 //!    table to read: [`slates_mounted_at`]). In a microVM (`microvm`), no host mount: kiln names none, the host's
-//!    table gains no Slates mount of the session's at any look ([`session_mounts`]), and the harness runs in a guest's
-//!    kernel at its project's guest path.
+//!    table gains no Slates mount of the session's at any look ([`session_mounts`]; on Windows no drive letter holds
+//!    Slates' file system), and the harness runs in a guest's kernel at its project's guest path.
 //! 3. **Isolation.** Nothing the harness did is in the project's folder before its landing writes it, byte for byte
 //!    ([`tree`]).
 //! 4. **Landing by the agent's mode** (the contract's draft 3). The agent that asks nothing: kiln answers its own landing
@@ -40,11 +40,12 @@
 //!
 //! - `checks`: the pure checks, against samples (any OS).
 //! - `stand_in`: the stand-in's words for a project's files, for the mode it runs in and for its own landing, driven as a
-//!   process against a kiln MCP server of the test's own (Unix: python3).
+//!   process against a kiln MCP server of the test's own (Python 3: `python3` on Unix, `vm_e2e::stub_python` on Windows).
 //! - `bare_metal`: the drive on the runner's host, and drift, on Linux, macOS and Windows; its module doc says what
 //!   differs on each.
-//! - `microvm`: the drive in a Shards microVM of its own, booting the stand-in's Agentfile from kiln's repository at this
-//!   checkout's commit (which must be on GitHub, as `vm_harnesses`' stand-in images' is).
+//! - `microvm`: the drive in a Shards microVM of its own (HVF, KVM or WHP), booting the stand-in's Agentfile from kiln's
+//!   repository at this checkout's commit (which must be on GitHub, as `vm_harnesses`' stand-in images' is); on Windows
+//!   it runs on GitHub's windows-2025, whose image has the hypervisor platform (.github/workflows/whp-drive.yml).
 //!
 //! `SLATES_E2E=1` makes a runner without workspaces a failure rather than a skip; `VM_E2E=1` does so for a runner without
 //! microVMs (tests/vm_e2e/README.md). Each drive owns a Slates instance of its own ([`Instance`]) and ends exactly its
@@ -52,7 +53,7 @@
 //!
 //!   SLATES_E2E=1 cargo test -p kiln --test slates_e2e -- --nocapture --test-threads 1
 
-#![allow(dead_code, reason = "the microVM drive and the stand-in's own checks run on Unix hosts alone here; the checks and the bare-metal drive are every OS's")]
+#![allow(dead_code, reason = "the resync drive and the stand-in's own checks run on Unix hosts alone here; the checks and both engines' drives are every OS's")]
 
 mod common;
 mod vm_e2e;
@@ -157,8 +158,9 @@ pub fn is_slates(m: &Mount) -> bool {
     m.kind == "fuse.slates" || m.source.starts_with("slates:")
 }
 
-/// The host's mounts now: Linux's `/proc/self/mountinfo`, BSD `mount`'s list elsewhere on Unix. None on Windows, which
-/// keeps no table of WinFsp's mounts to read.
+/// The host's mounts now: Linux's `/proc/self/mountinfo`, BSD `mount`'s list elsewhere on Unix. On Windows, which keeps
+/// no table of WinFsp's mounts to read, each drive letter whose file system Windows names Slates' (as kiln's runner
+/// judges a workspace's drive, `kiln::workspace::place::is_mount`), a [`SLATES_DRIVE`] whose source Windows doesn't name.
 pub fn host_mounts() -> anyhow::Result<Vec<Mount>> {
     if cfg!(target_os = "linux") {
         return Ok(mountinfo(&std::fs::read_to_string("/proc/self/mountinfo")?));
@@ -168,17 +170,26 @@ pub fn host_mounts() -> anyhow::Result<Vec<Mount>> {
         anyhow::ensure!(out.status.success(), "mount: {}", String::from_utf8_lossy(&out.stderr));
         return Ok(bsd_mounts(&String::from_utf8_lossy(&out.stdout)));
     }
-    Ok(Vec::new())
+    let drives = ('A'..='Z').map(|letter| format!("{letter}:")).filter(|at| kiln::workspace::place::is_mount(Path::new(at)));
+    Ok(drives.map(|at| Mount { at, kind: SLATES_DRIVE.to_owned(), source: "slates:".to_owned() }).collect())
 }
+
+/// The kind [`host_mounts`] gives a Windows drive letter holding Slates' file system: Windows names no source of one, so
+/// it can't be told whose it is, and every one is taken for the session's ([`session_mounts`]).
+pub const SLATES_DRIVE: &str = "slates (a Windows drive)";
 
 /// The Slates mounts among `mounts` that are a session's whose volume is `made`: under the drive's own folder `dir`
 /// (where its runner keeps its state, and its workspaces with it), or naming the volume or its name in their source,
-/// wherever they are. A mount of the person's own, or of another drive, is neither.
+/// wherever they are. A mount of the person's own, or of another drive, is neither; but a Windows drive holding Slates'
+/// file system ([`SLATES_DRIVE`]) names no source to tell, so it is taken for the session's: a microVM's drive runs on a
+/// Windows host with no Slates drive of anyone's.
 pub fn session_mounts(mounts: &[Mount], dir: &Path, made: &Made) -> Vec<Mount> {
     mounts
         .iter()
         .filter(|m| is_slates(m))
-        .filter(|m| Path::new(&m.at).starts_with(dir) || (!made.volume.is_empty() && m.source.contains(&made.volume)) || (!made.name.is_empty() && m.source.contains(&made.name)))
+        .filter(|m| {
+            m.kind == SLATES_DRIVE || Path::new(&m.at).starts_with(dir) || (!made.volume.is_empty() && m.source.contains(&made.volume)) || (!made.name.is_empty() && m.source.contains(&made.name))
+        })
         .cloned()
         .collect()
 }
@@ -561,8 +572,13 @@ pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), Strin
 
 /// Whether kiln says runner `machine` gives agents workspaces of their own (`GET /api/harness/workspaces`'s answer
 /// `all`), and why not where it doesn't.
-pub fn workspaces_said(all: &Value, machine: &str) -> Result<(), String> {
+pub fn workspaces_said(all: &Value, machine: &str, engine: Engine) -> Result<(), String> {
     let entry = all.get(format!("agent:{machine}")).ok_or_else(|| format!("kiln says nothing of runner {machine}'s workspaces: {all}"))?;
+    // A microVM's volume is served to its guest, never mounted on the host: kiln says that one under `served` (W8 piece 4).
+    let entry = match engine {
+        Engine::BareMetal => entry,
+        Engine::MicroVm => entry.get("served").ok_or_else(|| format!("kiln says nothing of a volume served to runner {machine}'s microVMs: {entry}"))?,
+    };
     if entry.get("available") == Some(&Value::Bool(true)) {
         return Ok(());
     }
@@ -675,10 +691,10 @@ pub fn op(f: &vm_e2e::Fixture, name: &str, input: &Value) -> anyhow::Result<Valu
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Whether the fixture's runner gives agents workspaces of their own: Ok(false) after saying why it skips; an error
-/// where [`REQUIRED`] requires them.
-pub fn workspaces_ready(f: &vm_e2e::Fixture) -> anyhow::Result<bool> {
-    match workspaces_said(&f.get("/api/harness/workspaces")?, &f.machine) {
+/// Whether the fixture's runner gives agents on `engine` workspaces of their own (mounted on its host, or served to
+/// their microVMs): Ok(false) after saying why it skips; an error where [`REQUIRED`] requires them.
+pub fn workspaces_ready(f: &vm_e2e::Fixture, engine: Engine) -> anyhow::Result<bool> {
+    match workspaces_said(&f.get("/api/harness/workspaces")?, &f.machine, engine) {
         Ok(()) => Ok(true),
         Err(why) => {
             let skip = format!("SKIP: runner {} gives agents no Slates volume of their own: {why}", f.machine);
@@ -1019,6 +1035,10 @@ mod checks {
         assert_eq!(found, ["/home/ada/drive/vm-state/workspaces/kiln-01a1", "/elsewhere/x", "/elsewhere/y"]);
         // A made volume with no name or id matches no source by an empty word.
         assert_eq!(session_mounts(&table, Path::new("/nowhere"), &made("", "")).len(), 0);
+        // A Windows drive holding Slates' file system names no source, so it is the session's wherever it is.
+        let windows = [mount("Z:", SLATES_DRIVE, "slates:"), mount("C:", "NTFS", "")];
+        let found: Vec<String> = session_mounts(&windows, Path::new(r"C:\Users\ada\drive"), &m).into_iter().map(|x| x.at).collect();
+        assert_eq!(found, ["Z:"]);
     }
 
     fn process_of(pid: u32, argv: &[&str]) -> HostProc {
@@ -1184,9 +1204,14 @@ mod checks {
     #[test]
     fn g266_kilns_word_on_a_runners_workspaces_says_why_not() {
         let all = json!({"local": {"available": false, "why_not": "this kiln keeps no workspaces"}, "agent:m1": {"available": true}, "agent:m2": {"available": false, "why_not": "Slates isn't installed on this machine"}});
-        assert_eq!(workspaces_said(&all, "m1"), Ok(()));
-        assert_eq!(workspaces_said(&all, "m2"), Err("Slates isn't installed on this machine".to_owned()));
-        assert!(workspaces_said(&all, "m3").is_err_and(|e| e.contains("nothing")));
+        assert_eq!(workspaces_said(&all, "m1", Engine::BareMetal), Ok(()));
+        assert_eq!(workspaces_said(&all, "m2", Engine::BareMetal), Err("Slates isn't installed on this machine".to_owned()));
+        assert!(workspaces_said(&all, "m3", Engine::BareMetal).is_err_and(|e| e.contains("nothing")));
+        // A microVM's volume is the one kiln says is served: a Windows host without WinFsp gives one, none mounted.
+        let whp = json!({"agent:whp": {"available": false, "why_not": "WinFsp isn't installed (winfsp.dev)", "served": {"available": true}}});
+        assert_eq!(workspaces_said(&whp, "whp", Engine::MicroVm), Ok(()));
+        assert_eq!(workspaces_said(&whp, "whp", Engine::BareMetal), Err("WinFsp isn't installed (winfsp.dev)".to_owned()));
+        assert!(workspaces_said(&all, "m1", Engine::MicroVm).is_err_and(|e| e.contains("served")));
     }
 
     #[test]
@@ -1247,9 +1272,10 @@ mod checks {
 }
 
 // =================================================================================================
-// The stand-in's words for a project's files and its own landing, driven as a process (Unix: python3)
+// The stand-in's words for a project's files and its own landing, driven as a process (Unix: python3; Windows: the
+// Python 3 `vm_e2e::stub_python` finds). No Slates mount: every OS runs them.
 // =================================================================================================
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod stand_in {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::process::{Command, Stdio};
@@ -1267,7 +1293,8 @@ mod stand_in {
     /// initialize and given one turn of `prompt` in folder `dir`: what it said, once its turn completed. Its stdin stays
     /// open until then: at its stdin's end a harness stops the turn under way.
     fn one_turn_with(dir: &std::path::Path, prompt: &str, args: &[String]) -> anyhow::Result<Turn> {
-        let mut child = Command::new("python3").arg(crate::vm_e2e::stub_path()).args(["--session-id", "g266"]).args(args).env("VM_STUB_PROTOCOL", "claude").current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let python = python().ok_or_else(|| anyhow::anyhow!("{NO_PYTHON}"))?;
+        let mut child = Command::new(python).arg(crate::vm_e2e::stub_path()).args(["--session-id", "g266"]).args(args).env("VM_STUB_PROTOCOL", "claude").current_dir(dir).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
         writeln!(stdin, "{}", json!({"type": "control_request", "request_id": "kiln_1", "request": {"subtype": "initialize"}}))?;
         writeln!(stdin, "{}", json!({"type": "user", "uuid": "m1", "message": {"role": "user", "content": prompt}}))?;
@@ -1354,7 +1381,8 @@ for line in sys.stdin:
             std::fs::write(project.join(name), text)?;
         }
         let env = json!({"FAKE_POLICY": policy, "FAKE_LOG": log.to_string_lossy()});
-        let config = json!({"mcpServers": {"kiln": {"command": "python3", "args": ["-I", fake.to_string_lossy()], "env": env}}});
+        let python = python().ok_or_else(|| anyhow::anyhow!("{NO_PYTHON}"))?;
+        let config = json!({"mcpServers": {"kiln": {"command": python.to_string_lossy(), "args": ["-I", fake.to_string_lossy()], "env": env}}});
         let said = one_turn_with(&project, &crate::prompt("p.txt", mode), &["--mcp-config".to_owned(), config.to_string()])?.said;
         let asked = std::fs::read_to_string(&log).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap_or(Value::Null)).collect();
         Ok((said, asked))
@@ -1372,7 +1400,7 @@ for line in sys.stdin:
     #[test]
     fn g266_the_stand_in_lands_as_itself_and_says_each_outcome_kiln_answers() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let (said, asked) = landing_turn("write", crate::Mode::Bypass)?;
@@ -1408,7 +1436,7 @@ for line in sys.stdin:
     #[test]
     fn g266_the_stand_in_says_the_permission_mode_it_was_started_in() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -1420,16 +1448,33 @@ for line in sys.stdin:
         Ok(())
     }
 
-    fn have_python() -> bool {
-        Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
+    /// The Python 3 the stand-in and the fake kiln run on: `python3` on Unix, the stand-in's `#!` line's; on Windows the
+    /// one `vm_e2e::stub_python` finds (`py -3`, `python` or `python3`), by its own word, as the bare-metal drive's
+    /// `.cmd` shims run the stand-in. None where no Python 3 answers.
+    fn python() -> Option<std::ffi::OsString> {
+        #[cfg(windows)]
+        {
+            crate::vm_e2e::stub_python().ok().map(std::path::PathBuf::into_os_string)
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success()).then(|| "python3".into())
+        }
     }
+
+    fn have_python() -> bool {
+        python().is_some()
+    }
+
+    /// The skip a test says where [`have_python`] finds no Python 3, in this OS's words.
+    const NO_PYTHON: &str = if cfg!(windows) { "SKIP: the stand-in harness needs Python 3 (py -3, python or python3)" } else { "SKIP: the stand-in harness needs python3" };
 
     /// The stand-in writes, appends to and removes its project's files as the words of its turn ask, and says so; and
     /// asks kiln to write its own work to disk only where kiln's MCP server was given it, saying it reached none here.
     #[test]
     fn g266_the_stand_in_changes_its_projects_files_as_its_turn_asks() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -1451,7 +1496,7 @@ for line in sys.stdin:
     #[test]
     fn g266_the_stand_in_makes_no_file_it_was_asked_to_append_to() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -1528,7 +1573,7 @@ mod bare_metal {
         let dir = tempfile::tempdir()?;
         let instance = Instance::new(dir.path());
         let f = fixture(dir.path(), &instance)?;
-        if !workspaces_ready(&f)? {
+        if !workspaces_ready(&f, Engine::BareMetal)? {
             return Ok(());
         }
         let dir = canonical(dir.path());
@@ -1547,7 +1592,7 @@ mod bare_metal {
         let dir = tempfile::tempdir()?;
         let instance = Instance::new(dir.path());
         let f = fixture(dir.path(), &instance)?;
-        if !workspaces_ready(&f)? {
+        if !workspaces_ready(&f, Engine::BareMetal)? {
             return Ok(());
         }
         for mode in Mode::ALL {
@@ -1595,10 +1640,11 @@ mod bare_metal {
 
 // =================================================================================================
 // The microVM engine: an agent in a Shards microVM of its own, its volume served to its guest over Slates' own
-// virtio-fs route by a descriptor, no host mount between (kiln carrying Shards, on HVF or KVM). Skipped in the runner's
-// own words until it starts microVMs and gives agents volumes with no Slates binary.
+// virtio-fs route (a descriptor on Unix, a duplicated pipe's handle on Windows), no host mount between (kiln carrying
+// Shards, on HVF, KVM or WHP: docs/agentic.md W8 piece 5). Skipped in the runner's own words until it starts microVMs
+// and gives agents volumes with no Slates binary.
 // =================================================================================================
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod microvm {
     use super::*;
 
@@ -1611,12 +1657,82 @@ mod microvm {
         let instance = Instance::new(dir.path());
         let env = runner_env(dir.path(), &instance)?;
         let f = vm_e2e::up_own(dir.path(), "slatesvm", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
-        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f)? {
+        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f, Engine::MicroVm)? {
             return Ok(());
         }
         let kept = vm_e2e::keep_stub(&f, "claude")?;
         let image = format!("agentfile:{}", kept.id);
         let dir = canonical(dir.path());
         drive(&Drive { f: &f, dir: &dir, instance: &instance, engine: Engine::MicroVm, image: Some(image.as_str()) })
+    }
+
+    /// Kiln goal 90 (Shards' D288, Slates' A-316/A-339): an agent's share outlives its Slates daemon. Its microVM writes
+    /// a file in its volume; the instance's daemon is killed (its anchor's restarts it) and the agent's next turn writes
+    /// another there: done only where the share's device took the stream the successor handed it on the resync channel
+    /// kiln passed beside the share's stream, the share otherwise ended with the daemon (`WRITE_FAIL`). Unix: Windows'
+    /// channel names a handle Shards' device takes none of yet.
+    #[cfg(unix)]
+    #[test]
+    fn g90_an_agents_share_outlives_its_slates_daemon() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let instance = Instance::new(dir.path());
+        let env = runner_env(dir.path(), &instance)?;
+        let f = vm_e2e::up_own(dir.path(), "slatesrs", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
+        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f, Engine::MicroVm)? {
+            return Ok(());
+        }
+        let kept = vm_e2e::keep_stub(&f, "claude")?;
+        let dir = canonical(dir.path());
+        let project = Project::new(&dir.join("resync"))?;
+        let spec = json!({
+            "kind": "claude", "mode": Mode::Bypass.claude(), "cwd": project.dir, "prompt": "WRITE=before-death.txt do the task",
+            "workspace": {"kind": "volume"}, "isolation": {"kind": "microvm", "image": format!("agentfile:{}", kept.id)},
+        });
+        let id = vm_e2e::open(&f, &spec)?;
+        let mut pace = vm_e2e::Pace::default().reporting(landing_reports(&instance.name));
+        let fail = |e: String| anyhow::anyhow!("{e}\n{}\n{}", f.runner_log(), slates_log(&dir));
+        let (_, events) = pace.until(&f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+        let lines = vm_e2e::said(&events);
+        anyhow::ensure!(lines.iter().any(|l| l == "WROTE before-death.txt"), "{}", fail(format!("its first write: {lines:?}")));
+        let killed = kill_daemon(&instance.name).map_err(|e| fail(format!("{e:#}")))?;
+        let successor = successor_of(&instance.name, killed).map_err(|e| fail(format!("{e:#}")))?;
+        eprintln!("KILLED: Slates daemon {killed} of instance {}; its successor is {successor}", instance.name);
+        let client = format!("after-{}", nonce());
+        vm_e2e::command(&f, &id, &json!({"type": "send", "id": client, "text": "WRITE=after-death.txt do the task", "mode": "queue"}))?;
+        let (_, events) = pace.until(&f, &id, vm_e2e::Asked::Message(&client), "its turn after its daemon's death", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, &client), vm_e2e::STUB_DONE))?;
+        let lines = vm_e2e::said_after(&events, &client);
+        anyhow::ensure!(lines.iter().any(|l| l == "WROTE after-death.txt"), "{}", fail(format!("its share ended with its daemon: {lines:?}")));
+        eprintln!("PROVEN: session {id}: its share wrote on after its Slates daemon {killed} was killed, served by {successor}");
+        pace.stop(&f, &id)
+    }
+
+    /// Instance `name`'s daemon (`--instance NAME … daemon`, never its anchor), killed outright (SIGKILL): its pid.
+    #[cfg(unix)]
+    fn kill_daemon(name: &str) -> anyhow::Result<u32> {
+        let daemons = daemons_of(name)?;
+        let [pid] = daemons.as_slice() else { anyhow::bail!("instance {name} runs daemons {daemons:?}, not one") };
+        let killed = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status()?;
+        anyhow::ensure!(killed.success(), "kill -KILL {pid}: {killed}");
+        Ok(*pid)
+    }
+
+    /// The daemon instance `name`'s anchor starts after `killed`: waited for as long as an anchor's restart may take.
+    #[cfg(unix)]
+    fn successor_of(name: &str, killed: u32) -> anyhow::Result<u32> {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(pid) = daemons_of(name)?.into_iter().find(|&p| p != killed) {
+                return Ok(pid);
+            }
+            anyhow::ensure!(std::time::Instant::now() < until, "instance {name}'s anchor started no daemon after {killed} in 60 s");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// The pids of instance `name`'s daemons.
+    #[cfg(unix)]
+    fn daemons_of(name: &str) -> anyhow::Result<Vec<u32>> {
+        let procs = vm_e2e::host_processes()?;
+        Ok(of_instance(&procs, name).into_iter().filter(|p| p.argv.iter().any(|a| a == "daemon")).map(|p| p.pid).collect())
     }
 }

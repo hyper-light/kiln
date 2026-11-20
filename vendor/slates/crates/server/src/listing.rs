@@ -182,11 +182,9 @@ fn work_paths(state: &ShardState, work: &crate::state::WorkState) -> Vec<(String
     }
   }
   // Its files: the base's it did not change and its own (`crate::work_files`).
-  let files = work
-    .files
-    .sizes(crate::merge_service::work_base(state, work))
+  let files = crate::merge_service::with_work_base(state, work, |base| work.files.sizes(base))
     .into_iter()
-    .map(|(path, len)| (path.to_owned(), EntryKind::File, len));
+    .map(|(path, len)| (path, EntryKind::File, len));
   files
     .chain(dirs.into_iter().map(|path| (path, EntryKind::Dir, 0)))
     .chain(
@@ -205,7 +203,7 @@ fn green_entries(
   at: ReadAt,
 ) -> Result<Vec<DirEntry>, Refusal> {
   let engine = state.greens.get(&green).ok_or(Refusal::NotFound)?;
-  let version = crate::merge_service::green_version(state, engine, green, at)?;
+  let version = crate::merge_service::green_version(state, &engine, green, at)?;
   let base = engine.base_at(version);
   let paths = base
     .files

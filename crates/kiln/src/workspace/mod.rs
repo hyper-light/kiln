@@ -21,6 +21,7 @@ pub mod change;
 pub mod container;
 pub mod follow;
 pub mod git;
+pub mod held;
 pub mod ignored;
 pub mod measure;
 pub mod place;
@@ -34,6 +35,8 @@ pub mod slates_move;
 mod bare_metal_tests;
 #[cfg(test)]
 mod captured_tests;
+#[cfg(test)]
+mod container_live_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -281,7 +284,14 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     // An isolated session's volume is served to its microVM by Slates itself, never mounted here (kiln goal
     // 01a1ec34599974448f6b7663ddb07001; `sandbox::isolated::served_project`): its harness works in the folder's own place
     // in its guest, and nothing of the volume is in this machine's mount table.
-    let made = if spec.isolation.is_some() { slates::make_unmounted(&name, &over).await? } else { slates::make(&name, &over).await? };
+    // A container session's under a rootful Linux engine is mounted shared with the machine's other users, which its
+    // engine's daemon needs to bind it and its container's ids reach it as (W9, `container::needs_shared`).
+    let made = if spec.isolation.is_some() {
+        slates::make_unmounted(&name, &over).await?
+    } else {
+        let shared = spec.container.is_some() && container::workspace_shared().await;
+        slates::make_as(&name, &over, shared).await?
+    };
     // Its landings follow how much its launcher let its agent do (the person's rule, 2026-11-18; W6), as kiln, the
     // launcher, sets the volume's write policy; no agent can raise it. Where kiln can't set one, Slates' unset policy
     // holds: its landings ask, and kiln's own `agents.land` judges each by the agent's granted mode.
@@ -424,7 +434,9 @@ fn record_places(spec: &crate::harness::session::Spec) -> Option<(String, String
 /// (`slates::remove`).
 pub async fn release(spec: &crate::harness::session::Spec) {
     let Some(m) = spec.workspace.as_ref().and_then(|w| w.made.clone()) else { return };
-    if let Err(e) = slates::remove(&m).await {
+    // A container's workspace: what its engine's file sharing still holds once the container has gone is let go of (W9).
+    let removed = if spec.container.is_some() { slates::remove_after_container(&m).await } else { slates::remove(&m).await };
+    if let Err(e) = removed {
         tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "an ended agent's workspace stayed");
     }
 }
@@ -463,6 +475,12 @@ pub enum Ask {
     },
     /// Experiment `experiment` is over: its worktrees go ([`measure::unmeasure`]).
     Unmeasure { experiment: String },
+    /// Hold a workspace here for a session that runs elsewhere, a Kubernetes pod (docs/agentic.md W10): its volume made
+    /// with no mount over its folder here and exported to the folder's owner ([`held::hold`]). Only to a runner that
+    /// named [`crate::proto::feature::WORKSPACE_HOLD`].
+    Hold(held::Hold),
+    /// Let a held workspace go: its export detached, its volume ended by W3's rules ([`held::release`]).
+    Release,
     /// Its repository's branches, tags and latest commits, for Compare's pickers ([`git::refs`]).
     /// Only a runner with [`crate::proto::CAP_WORKSPACE_COMPARE`] is asked.
     Refs,
@@ -643,6 +661,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
         Ask::Cite { looks } => Ok(json!({"looks": crate::research::check::local(cwd, looks).await})),
         Ask::Refs => Ok(json!({"refs": git::refs(cwd).await?})),
         Ask::Compare { .. } => anyhow::bail!("a compare is answered with its versions (`serve`)"),
+        Ask::Hold(_) | Ask::Release => anyhow::bail!("a held workspace is asked of its holder (`held`), not of an agent here"),
         Ask::Commits { branch, trunk, since_head, since_at, picks } => {
             let log = git::log(cwd, branch.as_deref(), trunk.as_deref(), since_head.as_deref(), since_at).await?;
             let picked = if picks.is_empty() { None } else { Some(git::picked(cwd, branch.as_deref(), &picks).await?) };

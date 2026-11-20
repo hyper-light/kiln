@@ -29,6 +29,11 @@ pub struct Declared {
     /// to 4096, kiln's default of 64 when unset): finished, paused and ended ones don't count.
     /// What's set for it on the server's Runners page wins over it (`crate::harness::limit`).
     pub max_agent_sessions: Option<usize>,
+    /// The image its agents run in where its engine is `container` (`container_image = "ghcr.io/org/agents:1"`;
+    /// docs/agentic.md W9): an OCI image with each harness its agents use on its `PATH`, and `tail`. None: its agents
+    /// run in no container, and its facts say so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_image: Option<String>,
 }
 
 impl Declared {
@@ -383,6 +388,7 @@ pub async fn gather(work_dir: &Path, declared: &Declared, looked: bool) -> Runne
     }
     f.kiln = Some(crate::updates::kiln_facts().await);
     f.workspaces = Some(crate::workspace::slates::facts().await);
+    f.containers = Some(crate::workspace::container::facts(f.workspaces.as_ref(), declared.container_image.as_deref()).await);
     f.probed_at = crate::util::now_unix();
     // A tool a run here couldn't find, found now: work that needs it is offered again (S6).
     let path = crate::harness::kinds::search_path();

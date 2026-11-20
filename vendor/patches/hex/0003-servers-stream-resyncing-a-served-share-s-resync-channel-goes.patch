@@ -1,0 +1,47 @@
+Subject: Servers::stream_resyncing: a served share's resync channel goes to Shards' image boot (Shards D288)
+Why: kiln goal 90: kiln's SlatesVolumes hands Shards the resync end Slates gives, so a daemon restart never ends a VM's share
+
+diff --git a/crates/hex-api/src/serve.rs b/crates/hex-api/src/serve.rs
+index b2a5354c9c70b955b96136047ea71bd1055aeddb..69e8c864a232c8b51539248ff15b925ded888ecc 100644
+--- a/crates/hex-api/src/serve.rs
++++ b/crates/hex-api/src/serve.rs
+@@ -34,6 +34,13 @@ pub trait Servers: Send + Sync {
+     /// order, before any of its run starts. Refused, typed: `Invalid` where this server serves no `share.source`,
+     /// naming it; `Exhausted` where it holds its most streams; `Os` where making one failed, in its words.
+     fn stream(&self, id: &BoxId, share: &ServedMount) -> Result<Stream, Refusal>;
++
++    /// [`stream`](Self::stream), and beside it, where this server gives one, the share's resync channel (Shards' D288;
++    /// slates' A-316): the end over which a successor of the server, should it die, hands the share a fresh stream, so
++    /// that the share outlives its server. Unix's alone; by default none, the stream alone.
++    fn stream_resyncing(&self, id: &BoxId, share: &ServedMount) -> Result<(Stream, Option<Stream>), Refusal> {
++        Ok((self.stream(id, share)?, None))
++    }
+ }
+ 
+ /// The refusal of a box naming a share another server serves, on a node given no server of them ([`Servers`]): its
+diff --git a/crates/hex-runtime/src/guest/served.rs b/crates/hex-runtime/src/guest/served.rs
+index 03dbfeedd76053f16db61c46b52ac67f8aa4c968..4fdbec763c903f56a250d5c078fa8468f26cdcac 100644
+--- a/crates/hex-runtime/src/guest/served.rs
++++ b/crates/hex-runtime/src/guest/served.rs
+@@ -37,7 +37,8 @@ impl ImageClass {
+     /// node's server now, for this boot alone, in its spec's order; at its place, read-only as asked, its files run from
+     /// it as every share's of the class are (D279), and given to the members it names as they start (D277). The streams
+     /// go with the boot's spec, whose run host is handed its own copies with the run's request; this process's go as
+-    /// the boot answers. The first a server refuses refuses the start, before any effect.
++    /// the boot answers, the share's resync channel with it where its server gives one (Shards' D288). The first a server
++    /// refuses refuses the start, before any effect.
+     pub(super) fn served(
+         &self,
+         id: &BoxId,
+@@ -58,9 +59,10 @@ impl ImageClass {
+                 bound: image.served.len(),
+             })?;
+         for share in &image.served {
+-            let stream = servers.stream(id, share)?;
++            let (stream, resync) = servers.stream_resyncing(id, share)?;
+             lowered.push(ServedShare {
+                 stream: ServedStream::new(stream),
++                resync: resync.map(ServedStream::new),
+                 at: share.destination.clone(),
+                 read_only: share.read_only,
+                 exec: true,

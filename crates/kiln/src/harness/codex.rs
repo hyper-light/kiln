@@ -2130,7 +2130,7 @@ impl Codex {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
         core.note_sent(&m.id, &m.text);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(core.origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.touch_state();
     }
 
@@ -4090,7 +4090,9 @@ impl Codex {
                     Some(Body::User { reply_to, .. }) => (counted, named, reply_to.clone()),
                     _ => (counted, named, None),
                 };
-                core.upsert(&key, parent.clone(), Body::User { text, images, client_id: client, origin: Some("human".into()), attachments, reply_to });
+                // Whose it is: as kiln sent it, else a person's (typed into Codex itself).
+                let origin = client.as_deref().map_or("human", |c| core.origin_of(c));
+                core.upsert(&key, parent.clone(), Body::User { text, images, client_id: client, origin: Some(origin.into()), attachments, reply_to });
             }
             "agentMessage" => {
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -5109,6 +5111,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_opening_prompt_an_agent_started_it_with_stays_that_agents_when_codex_says_it_back() {
+        let mut c = Codex::new(None, None, None, false);
+        let mut core = Core::new();
+        core.agent_opening = Some("opening".into());
+        for id in ["opening", "person"] {
+            core.upsert(id, None, Body::User { text: id.into(), images: 0, client_id: Some(id.into()), origin: Some(core.origin_of(id).into()), attachments: Vec::new(), reply_to: None });
+            core.state.delivery.insert(id.into(), Delivery::Sent);
+            c.item(&mut core, &json!({"id": format!("native-{id}"), "type": "userMessage", "clientId": id, "content": [{"type": "text", "text": id}]}), true);
+        }
+        let origin = |id: &str| match core.get(id).map(|e| &e.body) {
+            Some(Body::User { origin, .. }) => origin.clone(),
+            _ => None,
+        };
+        assert_eq!(origin("opening").as_deref(), Some("agent"));
+        assert_eq!(origin("person").as_deref(), Some("human"));
+    }
 
     #[test]
     fn native_user_input_dequeue_returns_credit_but_rpc_ack_and_unidentified_items_do_not() -> anyhow::Result<()> {

@@ -141,7 +141,14 @@ pub const INSTANCE: &str = "kiln";
 /// refusal, Slates' words naming the remedy (`missing_of`), and builds 45's `MountFault::Busy`, which carries the holders
 /// the kernel's own tables show (`MountHolders`, Slates' A-537), as it builds every unmount refusal. It needs none of the
 /// rest: an S3 base's names (46, Mantle's).
-pub const CONTRACT: u32 = 48;
+///
+/// 50 since kiln took Slates at 38ed3dfd8 (from 48; Slates' A-587, kiln's W8). kiln takes the revision for A-587: a
+/// Shards guest's owner word is read in the SETXATTR form the guest's INIT kept, so an isolated agent's run, a user other
+/// than the host's in its microVM, writes the volume Slates serves it, where the guest's kernel refused its create
+/// `EACCES` (main's macOS microVM drive, r134). It uses neither 49, a host refusal's code carrying its numbering
+/// (`HostFault::Base` names an `OsCode`; kiln matches only `HostFault::Target`), nor 50, a volume exported to one client
+/// (`Instance::export`, for kiln's Kubernetes engine, W10).
+pub const CONTRACT: u32 = 50;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -331,6 +338,65 @@ where
     answer.map_err(|e| anyhow::anyhow!("Slates' {verb}: {e}"))
 }
 
+/// [`call`] for a verb that needs the fleet's consensus groups (a volume or base made): on a node of kiln's Slates fleet
+/// that hasn't imported them yet (Slates' `NoGroup`: "on a fleet node, wait for it to import the groups"), asked again
+/// until it has, saying so once (A-734: a node that joins as the fleet forms may be asked for a workspace before its
+/// groups arrive). Anywhere else, and any other answer, as [`call`] answers.
+pub(crate) async fn call_grouped<R, F>(verb: &'static str, f: F) -> anyhow::Result<R>
+where
+    R: Send + 'static,
+    F: Fn(&mut Instance) -> Result<R, slates_api::Error> + Clone + Send + 'static,
+{
+    let mut said = false;
+    loop {
+        let name = instance();
+        let once = f.clone();
+        let answer = crate::rt::blocking(move || Instance::attach(&name).and_then(|mut i| once(&mut i))).await?;
+        match answer {
+            Err(slates_api::Error::Unusable(slates_api::Unusable::NoGroup)) if super::slates_fleet::source().is_some() => {
+                if !said {
+                    tracing::info!(verb, "this runner's Slates node hasn't imported kiln's Slates fleet's groups yet: it waits for them");
+                    said = true;
+                }
+                crate::rt::sleep(GROUPS_LOOK).await;
+            }
+            other => return other.map_err(|e| anyhow::anyhow!("Slates' {verb}: {e}")),
+        }
+    }
+}
+
+/// The fleet's one-time bootstrap where the server names this runner its bootstrapper (A-734): once its node holds every
+/// node of its manifest (`listed`) alive with its probe mesh up (`slates_fleet::meshed`; the root group made before is
+/// the bootstrapper's alone, and the others never import it), Slates makes the group through its library, and the
+/// server is told it's done. Where the server names another, nothing.
+async fn bootstrap_if_named(source: &super::slates_fleet::Source, listed: usize, member: u64) -> anyhow::Result<()> {
+    if !super::slates_fleet::ask_bootstrap(source, member, false).await? {
+        return Ok(());
+    }
+    let mut said = false;
+    loop {
+        let f = call("status", |i| i.daemon_status()).await?.fleet;
+        if super::slates_fleet::meshed(f.members.len(), listed, f.peers_in_contact, f.peers_unmeshed) {
+            break;
+        }
+        if !said {
+            tracing::info!(held = f.members.len(), listed, "this runner bootstraps kiln's Slates fleet once its node holds every node in contact: it waits");
+            said = true;
+        }
+        crate::rt::sleep(GROUPS_LOOK).await;
+    }
+    call("bootstrap", |i| i.ensure_group()).await?;
+    super::slates_fleet::ask_bootstrap(source, member, true).await?;
+    tracing::info!(member, "this runner made kiln's Slates fleet's root group, the fleet's one-time bootstrap");
+    Ok(())
+}
+
+/// How long a runner waits before asking again about a bootstrap it couldn't settle.
+const BOOTSTRAP_AGAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a fleet node waiting for its groups ([`call_grouped`]) asks again.
+const GROUPS_LOOK: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The instance answers.
 async fn up() -> bool {
     let name = instance();
@@ -480,13 +546,31 @@ async fn up_or_started() -> anyhow::Result<()> {
     {
         anyhow::bail!("{} (its log: {})", start_refused(&e), h.log.display());
     }
-    // A fleet node imports its groups (Slates: never make one there), and says its member id, which a move of a volume to
-    // it names (K4): its runner's word again, now with the member its daemon serves as since this start.
+    // A fleet node says its member id, which a move of a volume to it names (K4): its runner's word again, now with the
+    // member its daemon serves as since this start. The fleet's founder makes its groups, once (A-734); every other node
+    // imports them (Slates: never make one there).
     if let (Some(joined), Some(source)) = (&joined, super::slates_fleet::source()) {
-        match call("member", |i| i.member()).await {
-            Ok(member) => {
-                if let Err(e) = super::slates_fleet::report_member(source, &joined.node, member).await {
+        match call("member", |i| i.daemon_status()).await {
+            Ok(report) => {
+                // With its member, the user kiln acts as on this node, which a volume moved here is shared with.
+                let user = own_uid().map(|uid| super::slates_fleet::NodeUser { anchor: report.anchor, uid });
+                if let Err(e) = super::slates_fleet::report_member(source, &joined.node, report.fleet.host, user).await {
                     tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't say its member id: no volume moves to it until it does");
+                }
+                // The fleet's one-time bootstrap (A-734), the founder's alone (`slates_fleet::founder`, the first runner
+                // `[slates_fleet]` lists): the server records it before it's made and never names it again, so a founder
+                // started again with a fresh member (its anchor's memory lost) never founds a second root group, which
+                // Slates warns a bootstrap run again does. Asked until it's settled: a start that found its instance up
+                // never comes back here, so a failed ask isn't left to the next start.
+                let mut said = false;
+                while joined.founds
+                    && let Err(e) = bootstrap_if_named(source, joined.nodes, report.fleet.host).await
+                {
+                    if !said {
+                        tracing::warn!(error = %format!("{e:#}"), "this runner couldn't settle kiln's Slates fleet's bootstrap: it asks again");
+                        said = true;
+                    }
+                    crate::rt::sleep(BOOTSTRAP_AGAIN).await;
                 }
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't read its member id: no volume moves to it until it does"),
@@ -539,6 +623,12 @@ pub struct Made {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(skip))]
     pub base: Option<Base>,
+    /// Mounted shared with the machine's other users (Slates' `MountOptions::shared`: FUSE's `allow_other` on Linux), for
+    /// an agent's container under a rootful Linux engine, whose ids reach the volume as the host's own (W9,
+    /// `super::container`); mounted so again whenever its mount is made again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(skip))]
+    pub shared: bool,
 }
 
 /// What a workspace's volume is a clone of (K5): its folder's captured base, an overlay of the folder whose whole tree
@@ -583,12 +673,26 @@ fn hex_bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
 /// it's a clone of its folder's captured base, a plain volume Slates moves with its agent (K5, [`provision`]); elsewhere an
 /// overlay laid over the folder, which reads nothing of it until it's used.
 pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
+    make_as(name, over, false).await
+}
+
+/// [`make`], its mount shared with the machine's other users where `shared` (an agent's container under a rootful Linux
+/// engine, W9: [`Made::shared`]).
+pub async fn make_as(name: &str, over: &Path, shared: bool) -> anyhow::Result<Made> {
     ensure_up().await?;
     let (id, base) = provision(name, over, in_fleet().await).await?;
     let volume = slates_api::volume_id_text(id);
     let mut failed = anyhow::anyhow!(super::place::NO_POINT);
-    for point in super::place::points(&here()?.root, name) {
-        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone() };
+    // A fleet runner's workspace (a captured clone, K5) is the fleet's before anything is written to it (A-750): shared
+    // with every other member's user and live-shipped, so a write it acknowledges is held at f + 1 of them, and any of
+    // them serves it after its owner's loss. A workspace that can't be is let go below, as one that can't be mounted is.
+    let held = if base.is_some() { held_across_fleet(id).await } else { Ok(()) };
+    let points = if held.is_ok() { super::place::points(&here()?.root, name) } else { Vec::new() };
+    if let Err(e) = held {
+        failed = e;
+    }
+    for point in points {
+        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone(), shared };
         // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
         // volume, not this one, and Slates refuses a second mount at it.
         match mount_typed(&m).await {
@@ -626,8 +730,8 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
 pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
     let spec = VolumeSpec::overlay(name, over, volume_max());
-    let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
-    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None })
+    let id = call_grouped("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None, shared: false })
 }
 
 /// A workspace's volume `name` over folder `over`, unmounted (K5): with `captured`, a clone of the folder's captured base
@@ -637,13 +741,13 @@ pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
 pub(super) async fn provision(name: &str, over: &Path, captured: bool) -> anyhow::Result<(VolumeId, Option<Base>)> {
     if !captured {
         let spec = VolumeSpec::overlay(name, over, volume_max());
-        let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+        let id = call_grouped("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
         return Ok((id, None));
     }
     let _held = bases_held().lock().await;
     let base = base_for(over).await?;
     let spec = VolumeSpec::clone_of(name, volume_id(&base.volume)?, slates_api::SnapshotId { value: base.snapshot });
-    match call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await {
+    match call_grouped("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await {
         Ok(id) => Ok((id, Some(base))),
         Err(e) => {
             // The base may have gone meanwhile (its last clone, moved to another runner, ended there): the next start
@@ -726,7 +830,7 @@ const CAPTURE_TRIES: u32 = 3;
 async fn capture(over: &Path) -> anyhow::Result<Base> {
     let name = format!("kiln-base-{}", crate::util::random_token().chars().filter(char::is_ascii_alphanumeric).take(16).collect::<String>().to_ascii_lowercase());
     let spec = VolumeSpec::overlay(&name, over, volume_max());
-    let id = call("base create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+    let id = call_grouped("base create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
     let mut captured = call("base capture", move |i| Ok(i.capture_base(id))).await;
     for _ in 1..CAPTURE_TRIES {
         let Ok(Err(slates_api::Error::Retry { pause_ns, .. })) = &captured else { break };
@@ -870,6 +974,68 @@ pub(super) async fn ask_move(volume: &str, member: u64) -> anyhow::Result<Result
     call("move", move |i| Ok(i.move_volume(id, member))).await
 }
 
+/// Volume `volume` shared with `user` with every right (Slates' `share`, §4.13): the target's kiln before a move, since
+/// the volume's owner is this host's user and the target's kiln is another host's (`slates_fleet::NodeUser`).
+pub(super) async fn share_with(volume: &str, user: super::slates_fleet::NodeUser) -> anyhow::Result<()> {
+    let id = volume_id(volume)?;
+    let principal = slates_api::Principal::Uid { host: user.anchor, uid: user.uid };
+    let rights = slates_ipc::protocol::Rights { read: true, write: true, admin: true };
+    let name = instance();
+    let answer = crate::rt::blocking(move || -> anyhow::Result<()> {
+        let mut i = Instance::attach(&name).map_err(|e| anyhow::anyhow!("{e}"))?;
+        i.client().share(id, principal, rights).map_err(|e| anyhow::anyhow!("{e:?}"))
+    })
+    .await?;
+    answer.map_err(|e| anyhow::anyhow!("Slates' share: {e:#}"))
+}
+
+/// Volume `id` made kiln's Slates fleet's (A-750; main's rulings of 2026-11-20): shared with every other member's user
+/// (`slates_fleet::users_but`, asked of the server, waiting while a member hasn't said its user, saying so once), then
+/// live-shipped (Slates' `live_ship`, §4.10: each of its publications shipped to its candidates, a write acknowledged
+/// once the owner and `f` of them hold it), which Slates' "no acknowledged change lost" is a promise of.
+async fn held_across_fleet(id: VolumeId) -> anyhow::Result<()> {
+    let source = super::slates_fleet::source().ok_or_else(|| anyhow::anyhow!("this runner isn't in kiln's Slates fleet"))?;
+    let mut said = false;
+    let users = loop {
+        let members = super::slates_fleet::fleet_members(source).await?;
+        match super::slates_fleet::users_but(&members, &source.machine_name) {
+            Ok(users) => break users,
+            Err(silent) => {
+                if !said {
+                    tracing::info!(?silent, "a new workspace waits for every member of kiln's Slates fleet to say its user, to be shared with it");
+                    said = true;
+                }
+                crate::rt::sleep(GROUPS_LOOK).await;
+            }
+        }
+    };
+    let volume = slates_api::volume_id_text(id);
+    for user in users {
+        share_with(&volume, user).await?;
+    }
+    let name = instance();
+    let shipped = crate::rt::blocking(move || -> anyhow::Result<bool> {
+        let mut i = Instance::attach(&name).map_err(|e| anyhow::anyhow!("{e}"))?;
+        i.client().live_ship(id, true).map_err(|e| anyhow::anyhow!("{e:?}"))
+    })
+    .await?
+    .map_err(|e| anyhow::anyhow!("Slates' live-ship: {e:#}"))?;
+    anyhow::ensure!(shipped, "Slates recorded the workspace {volume} not live-shipped");
+    Ok(())
+}
+
+/// The uid this process runs as: the user kiln is to its Slates node (none where a user is no uid).
+fn own_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(nix::unistd::getuid().as_raw())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// A pause between two asks of a move, of a mount of a volume that just moved here, of a capture, or of a destroy's end.
 #[allow(clippy::disallowed_methods)] // (c) Slates' own derived pause between two asks: no notification of the end
 pub(super) async fn pause_for_move(pause: Duration) {
@@ -916,11 +1082,18 @@ async fn mount_typed(m: &Made) -> anyhow::Result<Result<(), slates_api::Error>> 
     super::place::ready(&dir)?;
     let volume = volume_id(&m.volume)?;
     let path = m.mount.clone();
-    if let Err(refused) = call("mount", move |i| Ok(i.mount(volume, &path, &slates_api::MountOptions::default()))).await? {
+    let options = mount_options(m);
+    if let Err(refused) = call("mount", move |i| Ok(i.mount(volume, &path, &options))).await? {
         return Ok(Err(refused));
     }
     anyhow::ensure!(is_mount(&dir), "Slates said it mounted {} at {}, but nothing is mounted there", m.name, m.mount);
     Ok(Ok(()))
+}
+
+/// The options workspace `m` is mounted with: shared with the machine's other users where it's to be (W9, [`Made::shared`]),
+/// else Slates' own defaults.
+fn mount_options(m: &Made) -> slates_api::MountOptions {
+    slates_api::MountOptions { shared: m.shared, ..slates_api::MountOptions::default() }
 }
 
 /// Whether a mount refused at a drive letter (`refused`, Slates' typed refusal) leaves the next free letter worth trying:
@@ -1042,6 +1215,31 @@ pub async fn remove(m: &Made) -> anyhow::Result<()> {
         release_base(base, volume_id(&m.volume)?).await;
     }
     Ok(())
+}
+
+/// Takes the workspace of an agent that ran in a container down (docs/agentic.md W9), once its container and its bind have
+/// gone: W3's [`remove`], and where its mount stays only because something still holds it ([`lets_go_after_container`]),
+/// that mount let go of (Slates' `mount::unmount_busy`: forced off on macOS, detached on Linux) and its volume taken down
+/// after it. What holds it then is the engine's own file sharing, not a person's process: a Mac's Docker Desktop holds
+/// every file a container touched open past the container's life (its VM's virtio-fs share of `/Users` over the NFS
+/// mount), so its plain unmount is refused busy, even once the container is gone (measured 2026-11-20, Docker Desktop
+/// 29.3.1, `workspace::container_live_tests`: held by `com.apple.Virtualization.VirtualMachine`).
+pub async fn remove_after_container(m: &Made) -> anyhow::Result<()> {
+    match remove(m).await {
+        Err(e) if lets_go_after_container(&e) => {
+            let path = m.mount.clone();
+            let let_go = crate::rt::blocking(move || slates_api::mount::unmount_busy(&path)).await?.map_err(|fault| anyhow::anyhow!("Slates' let-go of {}: {fault}", m.mount))?;
+            tracing::info!(mount = %m.mount, how = ?let_go, "an ended container's workspace, still held by its engine's file sharing, is let go of");
+            remove(m).await
+        }
+        done => done,
+    }
+}
+
+/// Whether a container's workspace whose [`remove`] failed with `e` is let go of ([`remove_after_container`]): its mount
+/// stays only as it's busy, held by what its engine shares; every other refusal keeps its volume, as W3's do.
+pub fn lets_go_after_container(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<MountStays>().is_some_and(|s| matches!(s.held, Held::Busy { .. }))
 }
 
 /// A workspace's volume kept because its mount is still in the kernel's table after kiln's one unmount: destroying the
@@ -1376,6 +1574,19 @@ pub(crate) async fn policy(m: &Made) -> anyhow::Result<Option<WritePolicy>> {
     call("write policy", move |i| i.write_policy(PolicySubject::Volume(volume))).await
 }
 
+/// Slates' export of workspace `m`'s volume to one client acting as `uid` (docs/agentic.md W10; Slates' A-521,
+/// `Instance::export`): its attachment, which [`detach`] ends with its capability, and the path that capability
+/// authorizes (`/<name>@<attachment>.<token>`, a bearer secret: `Exported`'s `Debug` hides it).
+pub async fn export(m: &Made, uid: u32, read_only: bool) -> anyhow::Result<slates_api::Exported> {
+    let volume = volume_id(&m.volume)?;
+    call("export", move |i| i.export(volume, uid, &slates_api::ExportOptions { read_only, subtree: None })).await
+}
+
+/// Slates' end of attachment `attachment` (an export's, a container's bind): its capability reaches nothing after it.
+pub async fn detach(attachment: u64) -> anyhow::Result<()> {
+    call("detach", move |i| i.detach(attachment)).await
+}
+
 /// What every landing leaves out: git's own directory.
 pub const EXCLUDES: &[&str] = &["/.git"];
 
@@ -1437,8 +1648,10 @@ async fn git_ignored(top: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// The paths `git status --porcelain=v1 -z --ignored=traditional` says it ignores (`!! target/`: a directory git
-/// ignores whole is named once), each a prefix of the volume (`/target`); a rename's or a copy's source, a field of its
-/// own, is no path of its own.
+/// ignores whole is named once), each a prefix of the volume (`/target`), and the untracked files a Mac's NFS client
+/// renamed as they were removed while open (`?? src/.nfs.0000002a.1f2e`, `super::git::silly_renamed`: gone once their
+/// last holder closes them, never written into a person's folder); a rename's or a copy's source, a field of its own, is
+/// no path of its own.
 fn ignored_prefixes(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut fields = text.split('\0').filter(|f| !f.is_empty());
@@ -1448,6 +1661,8 @@ fn ignored_prefixes(text: &str) -> Vec<String> {
             if !path.is_empty() {
                 out.push(format!("/{path}"));
             }
+        } else if let Some(path) = record.strip_prefix("?? ").filter(|p| super::git::silly_renamed(p)) {
+            out.push(format!("/{path}"));
         } else if names_a_source(record) {
             let _ = fields.next();
         }
@@ -2269,7 +2484,7 @@ mod tests {
     /// A captured clone's record, as a fleet runner makes one (K5).
     fn captured() -> Made {
         let base = Some(Base { volume: "00017f80ff10abcdef1234567890ffff".into(), snapshot: 7 });
-        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base }
+        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base, shared: false }
     }
 
     /// A-503 (kiln goal 95101ef32ffb8b099942fe076619c310): a captured clone that moved here with its agent is placed under
@@ -2322,7 +2537,7 @@ mod tests {
     fn k5_a_workspace_record_from_before_reads_and_writes_as_it_did() -> anyhow::Result<()> {
         let before = json!({"volume": "00017f80ff10abcdef123456789abcde", "name": "kiln-a", "mount": "/w/kiln-a"});
         let read: Made = serde_json::from_value(before.clone())?;
-        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None });
+        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None, shared: false });
         assert_eq!(serde_json::to_value(&read)?, before);
         let clone = captured();
         let mut written = serde_json::to_value(&clone)?;
@@ -2352,11 +2567,27 @@ mod tests {
     /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (W6): a landing leaves out each path git ignores, once per directory
     /// git ignores whole, a rename's source (in either status column) no path of its own; and `.git`; the library's
     /// request carries every one of them.
+    /// W9: a container's workspace whose mount stays only as it's busy (its engine's file sharing holds it once the
+    /// container has gone: Docker Desktop's VM, measured 2026-11-20) is let go of; one the OS still lists after an unmount
+    /// that answered done, one whose unmount was refused, and any other failure keep their volume, as W3's do.
+    #[test]
+    fn w9_a_containers_busy_workspace_mount_is_let_go_of_and_no_other() {
+        let stays = |held: Held| anyhow::Error::new(MountStays { mount: "/w/kiln-a".to_owned(), held });
+        assert!(lets_go_after_container(&stays(Held::Busy { holders: Ok(vec!["20401 com.apple.Virtualization.VirtualMachine".to_owned()]) })));
+        assert!(lets_go_after_container(&stays(Held::Busy { holders: Ok(Vec::new()) })));
+        assert!(!lets_go_after_container(&stays(Held::StillListed)));
+        assert!(!lets_go_after_container(&stays(Held::Refused { refusal: "no".to_owned(), lsof: "nothing".to_owned() })));
+        assert!(!lets_go_after_container(&anyhow::anyhow!("Slates' volume destroy: refused")));
+    }
+
     #[test]
     fn w6_a_landing_leaves_out_what_git_ignores_and_git_itself() -> anyhow::Result<()> {
         let said = "!! target/\0 M src/a.rs\0R  new.rs\0old.rs\0!! src/gen.o\0?? src/n.rs\0 R moved.rs\0!! was.rs\0!! node_modules/\0";
         assert_eq!(ignored_prefixes(said), ["/target", "/src/gen.o", "/node_modules"]);
         assert!(ignored_prefixes("").is_empty());
+        // W9: what a Mac's NFS client renamed as it was removed while open goes into no landing; a name only like it does.
+        let held = "?? src/.nfs.0000002a.1f2e\0?? .nfs.20051025.00ff\0?? .nfs.notone\0!! target/\0";
+        assert_eq!(ignored_prefixes(held), ["/src/.nfs.0000002a.1f2e", "/.nfs.20051025.00ff", "/target"]);
         let m = Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), ..Default::default() };
         let request = landing(&m, "/src/kiln", &["/target".to_owned(), "/.git".to_owned()])?;
         assert_eq!(request.filter.exclude, ["/target", "/.git"]);

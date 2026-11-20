@@ -19,6 +19,23 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(180);
 /// Paths given to one `update-index`, well under any system's argument limit.
 const PATHS_PER_CALL: usize = 200;
 
+/// Format: the name a Mac's NFS client gives a file removed while something still holds it open (its silly rename:
+/// Apple's NFS client, `NFS_SILLYNAME_FORMAT` `.nfs.%08x.%04x`, a counter and the low 16 bits of the process's id, in
+/// `kext/nfs_vnops.c`), as a pathspec git leaves out of what it adds: the file is gone once its last holder closes it,
+/// so it's never the agent's work (docs/agentic.md W9: a container's engine holds what it touched past the container).
+pub const SILLY_RENAMED: &str = ":(exclude,glob)**/.nfs.????????.????";
+
+/// Whether `path`'s last part is a name a Mac's NFS client gave a file removed while it was open ([`SILLY_RENAMED`]):
+/// `.nfs.` then eight lowercase hexadecimal digits, a dot, and four.
+pub fn silly_renamed(path: &str) -> bool {
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    match name.strip_prefix(".nfs.").and_then(|rest| rest.split_once('.')) {
+        Some((count, pid)) => hex(count, 8) && hex(pid, 4),
+        None => false,
+    }
+}
+
 /// A folder's repository, as git sees it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Facts {
@@ -224,7 +241,7 @@ pub async fn commit(top: &Path, parent: Option<&str>, paths: Option<&[String]>, 
         None => {
             let mut c = git(top);
             with_index(&mut c);
-            c.args(["add", "-A"]);
+            c.args(["add", "-A", "--", ".", SILLY_RENAMED]);
             run(c, GIT_TIMEOUT).await?;
         }
         Some(paths) => {
@@ -368,6 +385,25 @@ pub async fn tracked(top: &Path) -> anyhow::Result<std::collections::HashSet<Str
     let mut c = git(top);
     c.args(["ls-files", "-z"]);
     Ok(run(c, GIT_TIMEOUT).await?.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect())
+}
+
+/// Whether git trusts the executable bit of repository `top`'s working tree (`core.fileMode`, true unless set false;
+/// git-config(1)), and the paths its index holds executable (`100755`). With the bit untrusted git takes no file's mode
+/// from its working tree: a file it tracks keeps the mode its index holds, and one it adds is `100644` (git's
+/// `ce_mode_from_stat`, read-cache.h, under `trust_executable_bit`), so a review made with no working tree
+/// (`super::review`) commits a file's mode as git would.
+pub async fn file_modes(top: &Path) -> anyhow::Result<(bool, std::collections::HashSet<String>)> {
+    let mut c = git(top);
+    c.args(["config", "--bool", "--get", "core.fileMode"]);
+    let trusted = ask(c).await.is_none_or(|v| v != "false");
+    let mut c = git(top);
+    c.args(["ls-files", "-s", "-z"]);
+    Ok((trusted, indexed_executable(&run(c, GIT_TIMEOUT).await?)))
+}
+
+/// The paths `git ls-files -s -z` lists executable (`100755 <object> <stage>\t<path>`, each ended by a NUL).
+fn indexed_executable(listed: &str) -> std::collections::HashSet<String> {
+    listed.split('\0').filter_map(|record| record.split_once('\t')).filter(|(meta, _)| meta.starts_with("100755 ")).map(|(_, path)| path.to_owned()).collect()
 }
 
 /// What repository `top`'s ignore rules beneath its folders' own `.gitignore` files are (gitignore(5)): its
@@ -852,7 +888,7 @@ async fn now_tree(top: &Path, head: Option<&str>) -> anyhow::Result<String> {
     };
     run(c, GIT_TIMEOUT).await?;
     let mut c = git(top);
-    c.env("GIT_INDEX_FILE", &scratch.0).args(["add", "-A"]);
+    c.env("GIT_INDEX_FILE", &scratch.0).args(["add", "-A", "--", ".", SILLY_RENAMED]);
     run(c, GIT_TIMEOUT).await?;
     let mut c = git(top);
     c.env("GIT_INDEX_FILE", &scratch.0).arg("write-tree");
@@ -1262,6 +1298,31 @@ mod tests {
         Ok(d)
     }
 
+    /// W9: a Mac's NFS client renames a file removed while something holds it open (`.nfs.%08x.%04x`), and a container's
+    /// engine holds what it touched past the container. Do: tell such names from names like them, then take the tree of
+    /// a working tree holding the agent's file beside two of them (at the top and in a folder) and one only like them, as
+    /// `git add -A` would. Expect the silly-renamed files left out and every other name taken.
+    #[test]
+    fn w9_a_file_the_nfs_client_renamed_as_it_was_removed_is_never_the_agents_work() -> anyhow::Result<()> {
+        for name in [".nfs.0000002a.1f2e", "src/.nfs.20051025.00ff", "a/b/.nfs.deadbeef.0001/"] {
+            assert!(silly_renamed(name), "{name}");
+        }
+        for name in [".nfs.0000002A.1f2e", ".nfs.2a.1f2e", ".nfs.0000002a.1f2e.x", ".nfs0000002a", "nfs.0000002a.1f2e", ".nfs.0000002a.1f2", "src/.nfs.0000002a", ".nfs.0000002g.1f2e"] {
+            assert!(!silly_renamed(name), "{name}");
+        }
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "echo work > src/work.rs && echo held > .nfs.0000002a.1f2e && echo held > src/.nfs.20051025.00ff && echo mine > .nfs.notone")?;
+        let here = top.clone();
+        let head = out(&top, &["rev-parse", "HEAD"])?;
+        let tree = crate::rt::block_on(async move { now_tree(&here, Some(&head)).await })?;
+        let listed = out(&top, &["ls-tree", "-r", "--name-only", tree.as_str()])?;
+        let mut names: Vec<&str> = listed.lines().collect();
+        names.sort_unstable();
+        assert_eq!(names, [".gitignore", ".nfs.notone", "a", "b", "src/s.rs", "src/work.rs"]);
+        Ok(())
+    }
+
     #[test]
     fn a_commit_takes_only_the_agent_s_files_and_leaves_the_folder_as_it_was() -> anyhow::Result<()> {
         let d = repo()?;
@@ -1297,6 +1358,26 @@ mod tests {
         })?;
         assert_eq!(status_before, out(&top, &["status", "--porcelain"])?, "the folder's index and working tree are as they were");
         assert_eq!(out(&top, &["log", "--format=%s", "-1"])?, "init", "the branch didn't move");
+        Ok(())
+    }
+
+    /// Goal 90 (kiln's review reads `core.fileMode`): a repository trusts its working tree's executable bit unless
+    /// `core.fileMode` is false, and its index's executable paths are those it holds `100755`, whatever the working
+    /// tree's bits.
+    #[test]
+    fn g90_file_modes_reads_core_filemode_and_the_indexs_executable_paths() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "git update-index --chmod=+x b && git commit -qm 'b executable' && chmod +x a")?;
+        let here = top.clone();
+        let (trusted, executable) = crate::rt::block_on(async move { file_modes(&here).await })?;
+        assert!(trusted, "core.fileMode unset or true: git trusts the bit");
+        assert_eq!(executable, ["b".to_owned()].into_iter().collect(), "the index's 100755 alone, not a's working-tree bit");
+        sh(&top, "git config core.fileMode false")?;
+        let here = top.clone();
+        let (trusted, _) = crate::rt::block_on(async move { file_modes(&here).await })?;
+        assert!(!trusted, "core.fileMode false: git trusts no execute bit");
+        assert_eq!(indexed_executable("100755 e69de29 0\tbin/run sh\x00100644 e69de29 0\tlib.rs\x00120000 e69de29 0\tlink\x00"), ["bin/run sh".to_owned()].into_iter().collect());
         Ok(())
     }
 

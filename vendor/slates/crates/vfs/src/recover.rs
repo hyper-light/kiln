@@ -100,9 +100,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// earlier version would find no directory to rebuild there, so it refuses this one.
 /// 32 (A-532, 2026-11-19) each snapshot carries the orphans it froze, the files the head held with no name left when it
 /// was taken, so a clone of it made after a restart keeps their orphan records too.
+/// 33 (A-578, 2026-11-19) the image and every delta carry the volume's live inode counter beside its reserved ceiling,
+/// so a successor names to every mount it took over the numbers the dead daemon may have issued after its last
+/// publication; a reader of an earlier version has no such counter, so it refuses this one.
 /// Format: the image layout version, bumped with any change to the types below, to what they may hold, or to the held
 /// replicas' image they carry.
-pub const IMAGE_VERSION: u16 = 32;
+pub const IMAGE_VERSION: u16 = 33;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -132,6 +135,8 @@ pub enum PolicyImage {
   Exact,
   /// Normalization- and case-insensitive.
   Fold,
+  /// Case-insensitive by Windows' upcase table (A-576). Appended, so every image made before reads as it did.
+  Upcase,
 }
 
 /// The quota parameters in an image (§4.4 [`Quota`]). A dynamic quota's live pressure source is
@@ -499,8 +504,12 @@ pub struct VolumeImage {
   pub policy: PolicyImage,
   /// The head epoch.
   pub epoch: u64,
-  /// The next inode counter to hand out.
+  /// The reserved ceiling (A-150): the counter a successor hands out from, past every number the volume could hand out
+  /// before its next publication.
   pub next_counter: u64,
+  /// The volume's live counter when the image was taken (A-578): every number it had issued is below it, and a number
+  /// from it up to `next_counter` may have been handed to a client after it, which a successor never had.
+  pub live_counter: u64,
   /// The origin epoch, for a clone; `None` for a scratch volume.
   pub origin_epoch: Option<u64>,
   /// The quota parameters.
@@ -1463,6 +1472,7 @@ const fn policy_image(policy: NameEquivalence) -> PolicyImage {
   match policy {
     NameEquivalence::Exact => PolicyImage::Exact,
     NameEquivalence::Fold => PolicyImage::Fold,
+    NameEquivalence::Upcase => PolicyImage::Upcase,
   }
 }
 
@@ -1495,12 +1505,43 @@ impl Volume {
     store: &Store,
     host: Option<&mut dyn crate::host::HostFs>,
   ) -> Result<VolumeImage, VfsError> {
+    self.image_with(store, host, false)
+  }
+
+  /// This volume's image standing alone (A-577): as [`Volume::to_image`], but a clone's head is captured whole, every
+  /// inode it reaches included, with no origin epoch and nothing shared by number. Recovery restores what a clone shares
+  /// with its origin snapshot from the origin beside it; a live log's successor holds no origin, so a live log's whole
+  /// records are this. For a volume that is no clone it is [`Volume::to_image`]'s exactly.
+  pub fn to_standalone_image(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+  ) -> Result<VolumeImage, VfsError> {
+    self.image_with(store, host, true)
+  }
+
+  /// [`Volume::to_image`], or with `standalone` [`Volume::to_standalone_image`].
+  fn image_with(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+    standalone: bool,
+  ) -> Result<VolumeImage, VfsError> {
     let base = match (&self.base, host) {
       (Some(plane), Some(host)) => Some(plane.image(host)?),
       (Some(_), None) => return Err(VfsError::RecoveryIncomplete),
       (None, _) => None,
     };
-    let (inodes, origin_shared) = self.capture_head(store)?;
+    let (inodes, origin_shared) = if standalone {
+      (self.capture_tree(store, self.inode_root)?, Vec::new())
+    } else {
+      self.capture_head(store)?
+    };
+    let origin_epoch = if standalone {
+      None
+    } else {
+      self.origin_epoch.map(|e| e.0)
+    };
     let snapshots = self.capture_snapshots(store)?;
     let root_no = store
       .dirs
@@ -1516,7 +1557,9 @@ impl Volume {
       // The reserved ceiling, not the live counter (A-150): a successor starts past every number handed out before the
       // next publication.
       next_counter: self.recorded_counter(store),
-      origin_epoch: self.origin_epoch.map(|e| e.0),
+      // And the live counter beside it (A-578): the numbers between the two are what a successor never had.
+      live_counter: self.next_counter,
+      origin_epoch,
       quota: quota_image(&self.quota),
       root_no: root_no.0,
       last_snapshot: self.last_snapshot.map(snap_ref),
@@ -1574,8 +1617,10 @@ impl Volume {
     self.prefix.encode(fields);
     policy_image(self.policy).encode(fields);
     self.epoch.0.encode(fields);
-    // The reserved ceiling, as `to_image` records it (A-150): this stream is the checkpoint the daemon writes.
+    // The reserved ceiling, as `to_image` records it (A-150): this stream is the checkpoint the daemon writes. Then the
+    // live counter beside it (A-578).
     self.recorded_counter(store).encode(fields);
+    self.next_counter.encode(fields);
     self.origin_epoch.map(|e| e.0).encode(fields);
     quota_image(&self.quota).encode(fields);
     root_no.0.encode(fields);
@@ -2288,6 +2333,7 @@ pub(crate) const fn policy_from_image(policy: PolicyImage) -> NameEquivalence {
   match policy {
     PolicyImage::Exact => NameEquivalence::Exact,
     PolicyImage::Fold => NameEquivalence::Fold,
+    PolicyImage::Upcase => NameEquivalence::Upcase,
   }
 }
 
@@ -2413,12 +2459,17 @@ impl Volume {
     let quota = quota_from_image(image.quota)?;
     let epoch = Epoch(image.epoch);
     let root_no = InodeNo(image.root_no);
+    // A live counter past the reserved ceiling names numbers the volume could never have handed out: a malformed image.
+    if image.live_counter > image.next_counter {
+      return Err(VfsError::RecoveryIncomplete);
+    }
     let seed = VolumeSeed {
       prefix: image.prefix,
       root_no,
       policy,
       epoch,
       next_counter: image.next_counter,
+      unrecorded_counters: image.live_counter..image.next_counter,
       origin_epoch: image.origin_epoch.map(Epoch),
       quota,
     };
@@ -2668,7 +2719,7 @@ impl Volume {
     self.epoch = saved.0;
     self.root = saved.1;
     self.inode_root = saved.2;
-    outcome?;
+    let live_entries = outcome?;
     let orphans = snapshot_orphans(store, inode_root, &snap.orphans)?;
 
     // Place the snapshot at the exact slot and generation it had before the crash: a `SnapshotId`
@@ -2693,6 +2744,9 @@ impl Volume {
         // (A-541): what a clone of it made after the restart starts counting from.
         live_inodes: u64::try_from(snap.inodes.len().saturating_add(snap.shared.len()))
           .unwrap_or(u64::MAX),
+        // And its tree's live entries, from its own directories' images and the head's directories it shares
+        // (`rebuild_snapshot_tree`, A-549), so the image's layout does not change either.
+        live_entries,
         seq: snap.seq,
         identity: None,
         orphans,
@@ -2769,12 +2823,17 @@ impl Volume {
           .ok_or(VfsError::RecoveryIncomplete)?;
         Ok((source_root, kind_image(store.inodes.get(handle)?.kind)))
       }
+      // The head's table, rebuilt first, holds every number the head holds. For a clone that includes the records it
+      // still shares with its origin, which its image carries by number alone (`origin_shared`, A-64), so they have no
+      // image among the head's own; a snapshot of the clone that holds one shares it with the head all the same. So the
+      // entry resolves through the table, as an origin's does, and its kind is the inode's (A-561).
       SharedSource::Head => {
-        let image = refs
-          .head_images
-          .get(&entry.number)
+        let handle = trie::get(&store.tries, refs.head_inode_root, InodeNo(entry.number))
           .ok_or(VfsError::RecoveryIncomplete)?;
-        Ok((refs.head_inode_root, image.kind))
+        Ok((
+          refs.head_inode_root,
+          kind_image(store.inodes.get(handle)?.kind),
+        ))
       }
       SharedSource::Snapshot { at } => {
         let image = refs
@@ -2789,8 +2848,8 @@ impl Volume {
 
   /// Rebuilds a snapshot's tree into the volume's current (snapshot) roots, sharing with the head
   /// every file or symlink the snapshot holds unchanged (an identical image) instead of rebuilding a
-  /// private copy — the §4.2 CoW-sharing efficiency. Returns the inode numbers shared with the head,
-  /// which the caller excludes from the snapshot's deadlist so a drop never frees the head's copy.
+  /// private copy — the §4.2 CoW-sharing efficiency. Returns the live entries the tree holds (A-549), which its record
+  /// keeps for a clone made of it after the restart.
   fn rebuild_snapshot_tree(
     &mut self,
     store: &mut Store,
@@ -2799,7 +2858,7 @@ impl Volume {
     root_no: InodeNo,
     epoch: Epoch,
     refs: &SharingRefs,
-  ) -> Result<(), VfsError> {
+  ) -> Result<u64, VfsError> {
     // `snap.shared` names the files and symlinks the snapshot does not carry itself because an
     // identical version is already in the rebuilt store: the head still holds it (share the head's
     // inode) or an earlier snapshot captured it (share that snapshot's inode — the earlier snapshot
@@ -2851,7 +2910,21 @@ impl Volume {
         store.inodes.get_mut(handle)?.born = epoch;
       }
     }
-    Ok(())
+    // The tree's entries (§4.2's namespace dimension, A-549), by the rule the live count keeps: each name its own
+    // directories' images carry that names a child, and each live entry of a directory it shares with the head, whose
+    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which the caller sets the head's count
+    // back over.
+    let mut entries = snap
+      .inodes
+      .iter()
+      .map(named_entries)
+      .fold(0, u64::saturating_add);
+    for number in &held {
+      let node = *dirs.get(number).ok_or(VfsError::RecoveryIncomplete)?;
+      let live = store.dirs.get(node)?.live_len(&store.blocks);
+      entries = entries.saturating_add(u64::try_from(live).unwrap_or(u64::MAX));
+    }
+    Ok(entries)
   }
 
   /// The head's node of a directory a snapshot shares with the head (A-395), stamped with every block of its entries at
@@ -3605,6 +3678,16 @@ fn restore_identity(inode: &mut Inode, image_inode: &InodeImage) {
   inode.attrs = attrs_from_image(&image_inode.attrs);
   inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
   inode.windows = crate::inode::WindowsAttributes::from_image(image_inode.windows, inode.kind);
+}
+
+/// The live entries a directory's image carries (§4.2's namespace dimension, A-549): its names that name a child, since
+/// one that names none is a whiteout, which the live count never holds ([`child_for`]). None for any other inode.
+fn named_entries(image_inode: &InodeImage) -> u64 {
+  let BodyImage::Directory { entries, .. } = &image_inode.body else {
+    return 0;
+  };
+  let named = entries.iter().filter(|entry| entry.child.is_some()).count();
+  u64::try_from(named).unwrap_or(u64::MAX)
 }
 
 fn child_for(

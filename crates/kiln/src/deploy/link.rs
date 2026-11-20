@@ -24,6 +24,17 @@ const LEEWAY_SECS: i64 = 60;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+/// What a link trusts the linked server under: the CA its integration names (`ca`), the operator's, alone, under which
+/// a certificate answers only in a kiln server's role, the server's own or a front door's (`crate::pki::answers_as_server`;
+/// docs/agentic.md W10), since that CA signs its runners' fleet nodes' and holders' certificates too, for names the server
+/// may share; else the public roots.
+pub(crate) fn roots(ca: Option<String>) -> Roots {
+    match ca {
+        Some(pem) => Roots::KilnServerPem(pem.into_bytes()),
+        None => Roots::WebPki,
+    }
+}
+
 /// What this server says of itself to the servers linked to it: where it is, and the issuer its
 /// statements are signed by.
 pub fn about(hub: &Hub) -> Value {
@@ -93,11 +104,7 @@ impl Link {
         let field = |k: &str| i.config.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
         let base = field("url").ok_or_else(|| format!("{name} has no url"))?.trim_end_matches('/').to_owned();
         let token = crate::ci::integrations::token(hub, &i).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("{name} has no token stored"))?;
-        let client = match field("ca") {
-            Some(pem) => Client::new(Roots::Pem(pem.into_bytes()), None),
-            None => Client::public(),
-        }
-        .map_err(|e| format!("{e:#}"))?;
+        let client = Client::new(roots(field("ca")), None).map_err(|e| format!("{e:#}"))?;
         Ok(Self { client, base, token, name: name.to_owned(), issuer: field("issuer").map(|s| s.trim_end_matches('/').to_owned()) })
     }
 

@@ -29,6 +29,10 @@ pub struct VolumeMove {
     pub member: u64,
     /// The target runner's machine.
     pub to: String,
+    /// The Slates user the target's kiln acts as on its node, which the source shares the volume with before the move
+    /// (`slates_fleet::NodeUser`): none from a target that didn't say it, whose kiln then can't mount what moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<super::slates_fleet::NodeUser>,
 }
 
 /// Why an agent's volume doesn't move with it, by kind: kiln's plan's refusals and Slates' typed answers to the move
@@ -64,13 +68,15 @@ pub enum MoveRefused {
     OutsideNeighbourhood,
     /// Slates couldn't place its records in time and thawed it where it was: asking again may move it.
     Unplaced,
+    /// The agent is isolated: its microVM and what its harness keeps there are its machine's (A-750).
+    Isolated,
     /// Anything else Slates said, in its words.
     Slates { said: String },
 }
 
 /// Every kind a move is refused by ([`MoveRefused::kind`]), as a refusal names it (`[kind: x]`): what a mover, or a test of
 /// kiln's Slates fleet under faults (`super::slates_faults`), may take a refusal for.
-pub const KINDS: [&str; 15] = [
+pub const KINDS: [&str; 16] = [
     "not_in_fleet",
     "setting",
     "target_not_serving",
@@ -85,6 +91,7 @@ pub const KINDS: [&str; 15] = [
     "not_a_member",
     "outside_neighbourhood",
     "unplaced",
+    "isolated",
     "slates",
 ];
 
@@ -122,6 +129,7 @@ impl MoveRefused {
             MoveRefused::NotAMember => "not_a_member",
             MoveRefused::OutsideNeighbourhood => "outside_neighbourhood",
             MoveRefused::Unplaced => "unplaced",
+            MoveRefused::Isolated => "isolated",
             MoveRefused::Slates { .. } => "slates",
         }
     }
@@ -148,6 +156,7 @@ impl MoveRefused {
             MoveRefused::NotAMember => "the target isn't a member of its workspace's Slates region".to_owned(),
             MoveRefused::OutsideNeighbourhood => "the target is outside its workspace's Slates neighbourhood".to_owned(),
             MoveRefused::Unplaced => "Slates couldn't place its workspace's records in time and kept it where it was: move it again".to_owned(),
+            MoveRefused::Isolated => crate::sandbox::isolated::NO_MOVE.to_owned(),
             MoveRefused::Slates { said } => format!("Slates refused to move its workspace: {said}"),
         }
     }
@@ -166,8 +175,9 @@ pub fn plan(setting: &crate::config::SlatesFleet, members: &Members, from: &str,
             Err(said) => return Err(MoveRefused::Setting { said }),
         }
     }
-    let member = members.members.iter().find(|m| m.machine == to).and_then(|m| m.member).ok_or_else(|| MoveRefused::TargetNotServing { machine: to.to_owned() })?;
-    Ok(VolumeMove { volume: made.volume.clone(), member, to: to.to_owned() })
+    let target = members.members.iter().find(|m| m.machine == to);
+    let member = target.and_then(|m| m.member).ok_or_else(|| MoveRefused::TargetNotServing { machine: to.to_owned() })?;
+    Ok(VolumeMove { volume: made.volume.clone(), member, to: to.to_owned(), user: target.and_then(|m| m.user) })
 }
 
 /// The first pause before asking a move under way again: a move whose head is placed already switches at once.
@@ -209,6 +219,11 @@ pub fn step(answer: &Result<slates_api::MoveProgress, slates_api::Error>, to: u6
 /// unplaced move thaws within its failover bound and says so), so no clock of kiln's ends it. Refused: the workspace
 /// is mounted again where it was, and the refusal comes back by kind.
 pub async fn move_out(m: &Made, to: &VolumeMove) -> Result<(), MoveRefused> {
+    // The target's kiln is given every right on the volume first: its owner is this host's user, whom no other node's
+    // kiln is (`slates_fleet::NodeUser`).
+    if let Some(user) = to.user {
+        super::slates::share_with(&m.volume, user).await.map_err(|e| MoveRefused::Slates { said: format!("{e:#}") })?;
+    }
     super::slates::unmount_for_move(m).await.map_err(|e| MoveRefused::Slates { said: format!("{e:#}") })?;
     let mut pause = ASK_FIRST;
     let refused = loop {
@@ -255,6 +270,7 @@ mod tests {
             MoveRefused::NotAMember,
             MoveRefused::OutsideNeighbourhood,
             MoveRefused::Unplaced,
+            MoveRefused::Isolated,
             MoveRefused::Slates { said: String::new() },
         ];
         let named: std::collections::BTreeSet<&str> = every.iter().map(MoveRefused::kind).collect();
@@ -277,7 +293,7 @@ mod tests {
     fn members(serving: &[(&str, Option<u64>)]) -> Members {
         Members {
             fleet: crate::workspace::slates_fleet::FLEET.to_owned(),
-            members: serving.iter().map(|(machine, member)| Member { machine: (*machine).to_owned(), address: "10.0.0.9:17300".into(), domain: 1, certificate: String::new(), member: *member }).collect(),
+            members: serving.iter().map(|(machine, member)| Member { machine: (*machine).to_owned(), address: "10.0.0.9:17300".into(), domain: 1, certificate: String::new(), member: *member, user: None }).collect(),
         }
     }
 
@@ -328,13 +344,18 @@ mod tests {
     #[test]
     fn k4_the_plan_moves_a_workspace_only_inside_the_fleet_to_a_serving_node() {
         let serving = members(&[("bench-a", Some(11)), ("bench-b", Some(22))]);
-        assert_eq!(plan(&fleet(), &serving, "bench-a", "bench-b", &made(), &[]), Ok(VolumeMove { volume: made().volume, member: 22, to: "bench-b".into() }));
+        assert_eq!(plan(&fleet(), &serving, "bench-a", "bench-b", &made(), &[]), Ok(VolumeMove { volume: made().volume, member: 22, to: "bench-b".into(), user: None }));
         assert_eq!(plan(&fleet(), &serving, "bench-a", "bench-c", &made(), &[]), Err(MoveRefused::TargetNotServing { machine: "bench-c".into() }));
         assert_eq!(plan(&fleet(), &members(&[("bench-b", None)]), "bench-a", "bench-b", &made(), &[]), Err(MoveRefused::TargetNotServing { machine: "bench-b".into() }));
         assert_eq!(plan(&fleet(), &serving, "bench-a", "bench-d", &made(), &[]), Err(MoveRefused::NotInFleet { machine: "bench-d".into() }));
         assert_eq!(plan(&fleet(), &serving, "bench-d", "bench-b", &made(), &[]), Err(MoveRefused::NotInFleet { machine: "bench-d".into() }));
         assert_eq!(plan(&crate::config::SlatesFleet::default(), &serving, "bench-a", "bench-b", &made(), &[]), Err(MoveRefused::NotInFleet { machine: "bench-a".into() }), "no fleet declared");
         assert_eq!(plan(&fleet(), &serving, "bench-a", "bench-b", &made(), &["other".into()]), Err(MoveRefused::Shared { with: vec!["other".into()] }));
+        // The target's user, as its runner said it, goes with the move: what the source shares the volume with.
+        let user = crate::workspace::slates_fleet::NodeUser { anchor: 7, uid: 501 };
+        let mut said = members(&[("bench-a", Some(11)), ("bench-b", Some(22))]);
+        said.members.iter_mut().filter(|m| m.machine == "bench-b").for_each(|m| m.user = Some(user));
+        assert_eq!(plan(&fleet(), &said, "bench-a", "bench-b", &made(), &[]).map(|v| v.user), Ok(Some(user)));
         let mut too_few = fleet();
         too_few.f = 2;
         assert!(matches!(plan(&too_few, &serving, "bench-a", "bench-b", &made(), &[]), Err(MoveRefused::Setting { .. })));

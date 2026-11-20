@@ -54,6 +54,10 @@ pub struct Opts {
     pub join_token: Option<String>,
     pub ephemeral: bool,
     pub dedicated_job: Option<String>,
+    /// The agent session an ephemeral runner was started for (docs/agentic.md W10: in its pod, `--session`): it holds
+    /// that session's harness, whose workspace its home holds and kubelet mounts, and leaves as it ends
+    /// ([`session_runner_ends`]).
+    pub dedicated_session: Option<String>,
     pub terminal: bool,
     /// Terminals into CI legs (docs/ci.md W17-R01): a runner's follow its terminal switch; the
     /// server's in-process runner's follow `[terminal] enabled`.
@@ -294,6 +298,18 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
         }
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
+}
+
+/// Where this runner process reads its certificate as it starts ([`credentials`]): the machine's, or its own as a runner
+/// process beside the machine's usual one; none for one given its credentials (a job's pod, a test).
+fn own_cert_path(o: &Opts) -> Option<PathBuf> {
+    if o.credentials.is_some() {
+        return None;
+    }
+    Some(match &o.instance {
+        Some(id) => crate::upgrade::instance_dir(&o.state_dir, id).join("agent.pem"),
+        None => o.state_dir.join("agent.pem"),
+    })
 }
 
 /// A runner process beside the machine's usual one: the machine's key with this instance's own
@@ -1978,6 +1994,17 @@ const WATCHDOG_SETTLE: Duration = Duration::from_secs(5);
 const HARNESS_GRACE: Duration = Duration::from_secs(600);
 /// How long a relaunch asked of launchd may take before this runner carries on as it is.
 const RELAUNCH_WAIT: Duration = Duration::from_secs(600);
+/// What an ephemeral runner started for one agent session does now (docs/agentic.md W10), from whether it has held its
+/// session (`seen`), holds it still (`holds`), and how long it has waited (`waited`): leave once its session has come and
+/// gone (`Some(Ok)`), give up where it never came within [`EPHEMERAL_JOB_WAIT`] (`Some(Err)`, why), else go on.
+fn session_runner_ends(seen: bool, holds: bool, waited: Duration) -> Option<Result<(), String>> {
+    match (seen, holds) {
+        (true, false) => Some(Ok(())),
+        (false, false) if waited >= EPHEMERAL_JOB_WAIT => Some(Err("the ephemeral runner's agent session didn't come within 15 minutes".to_owned())),
+        _ => None,
+    }
+}
+
 /// An ephemeral runner's wait for its result's receipt, then for a job at all.
 const EPHEMERAL_RECEIPT_WAIT: Duration = Duration::from_secs(30);
 const EPHEMERAL_JOB_WAIT: Duration = Duration::from_secs(900);
@@ -2081,7 +2108,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // frames to the loop on the shard that owns the session (`loops::session_loop`), the rest to this loop, the runner's
     // order kept across them by the fan's watermark (`crate::wire::fan`, read by the server's heads: `peek_server`).
     let (fan, crate::wire::fan::Loops { queues, marks }) = crate::wire::fan::Fan::with(crate::wire::fan::Server, crate::wire::fan::shards(), net::EVENTS_BYTES);
-    let net = net::start_with(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new() }, net::OUT_BYTES, Box::new(fan))?;
+    // The CA its link trusts: what a certificate the server reissues it in the runner's role must be issued by (W10).
+    let link_ca = ca.clone();
+    let net = net::start_with(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE, revoked_keys: Vec::new(), revoked_serials: Vec::new() }, net::OUT_BYTES, Box::new(fan))?;
     let mut queues = queues.into_iter();
     let events = queues.next().ok_or_else(|| anyhow::anyhow!("the runner's fan made no control loop"))?;
     let session_queues: Vec<crate::memory::queue::Receiver<crate::wire::fan::Routed>> = queues.collect();
@@ -2492,7 +2521,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // stop once it has (W05-R37); the jobs stopped so, whose results say it.
     let mut leases = crate::runner::lease::Leases::default();
     let mut lease_lost: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let harness = (!o.ephemeral && o.terminal).then(|| {
+    // An ephemeral runner holds sessions only where it was started for one (W10): its pod's.
+    let harness = (o.dedicated_session.is_some() || (!o.ephemeral && o.terminal)).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
         // A runner the server's `[slates_fleet]` lists starts its Slates as the fleet's node now (K4): a node holds the
@@ -2709,6 +2739,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // Its terminals' shells as last told the scan of agent CLIs (`crate::aisessions`).
     let mut shells_told: Option<u64> = None;
     let mut served_dedicated = false;
+    // Whether the agent session it was started for has come to it (W10, [`session_runner_ends`]).
+    let mut session_seen = false;
     let started = Instant::now();
 
     let hello = |running: Vec<String>| Hello {
@@ -2835,7 +2867,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
         }
-        if o.ephemeral && !served_dedicated && jobs.is_empty() && started.elapsed() >= EPHEMERAL_JOB_WAIT {
+        // An ephemeral runner started for one agent session leaves as it ends, its uplink drained (W10).
+        if o.ephemeral
+            && let Some(id) = &o.dedicated_session
+        {
+            let holds = harness.as_ref().is_some_and(|h| h.get(id).is_some());
+            session_seen |= holds;
+            match session_runner_ends(session_seen, holds, started.elapsed()) {
+                Some(Ok(())) if buffer.is_empty() && up_rx.is_empty() && own_rx.is_empty() => {
+                    tracing::info!(session = %id, "ephemeral runner's agent session ended; exiting");
+                    crate::rt::sleep(Duration::from_millis(500)).await;
+                    return Ok(());
+                }
+                Some(Err(why)) => anyhow::bail!(why),
+                _ => {}
+            }
+        }
+        if o.ephemeral && o.dedicated_session.is_none() && !served_dedicated && jobs.is_empty() && started.elapsed() >= EPHEMERAL_JOB_WAIT {
             anyhow::bail!("ephemeral agent received no job within 15 minutes");
         }
         if draining && jobs.is_empty() && o.ephemeral {
@@ -5189,6 +5237,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     // An Agentfile to build ahead of its sessions, in the microVMs' store they boot from (kiln plan 01a1dd2e…
                     // P4.5).
                     ServerMsg::Prebuild { json } => crate::agentfiles::prebuild::told(&json, own.clone(), harness.as_ref().and_then(|h| h.microvm())),
+                    // Its certificate reissued in the runner's role over this link (docs/agentic.md W10): checked against its
+                    // own (its key, its name, its CA), kept where it reads its certificate as it starts, presented from the
+                    // link's next connection on, and said taken; anything short of that leaves it with the one it has.
+                    ServerMsg::RunnerRole { cert_pem } => match crate::pki::take_runner_role(&machine_leaf, &link_ca, &cert_pem) {
+                        Ok(taken) => {
+                            let kept = own_cert_path(&o).map_or(Ok(()), |path| crate::util::write_secret(&path, taken.cert_pem.as_bytes(), 0o644));
+                            match kept.map_err(|e| e.to_string()) {
+                                Ok(()) => match net.renew_leaf(taken.clone()).await {
+                                    Ok(()) => {
+                                        let serial = crate::pki::fingerprints(&taken.cert_pem).map(|f| f.serial).unwrap_or_default();
+                                        own.0.send(Up::Term(AgentMsg::RunnerRole { serial })).await.ok();
+                                        tracing::info!("took the certificate the server reissued in the runner's role");
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "the link didn't take up the certificate reissued in the runner's role"),
+                                },
+                                Err(e) => tracing::warn!(error = %e, "couldn't keep the certificate reissued in the runner's role"),
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %format!("{e:#}"), "refused the certificate the server sent in the runner's role"),
+                    },
                     // Another runner's room, for this runner's owner to choose where to probe by
                     // (docs/needs.md E5, AUDIT O1).
                     ServerMsg::Offers { json } => {
@@ -7177,6 +7245,17 @@ mod tests {
         assert_eq!(crate::runner::custody::certified("promoted-n", 6), crate::runner::custody::Certification::BlueGreen, "certified, it goes on at 6");
     }
     use super::*;
+
+    /// W10: an ephemeral runner started for one agent session (its pod's) leaves once its session has come and gone, goes
+    /// on while it holds it or waits for it, and gives up, saying why, where it never came within the ephemeral wait.
+    #[test]
+    fn w10_a_pods_runner_leaves_as_its_one_session_ends() {
+        let soon = Duration::from_secs(5);
+        assert_eq!(session_runner_ends(false, false, soon), None, "it waits for its session");
+        assert_eq!(session_runner_ends(true, true, EPHEMERAL_JOB_WAIT * 2), None, "it holds its session however long it runs");
+        assert_eq!(session_runner_ends(true, false, soon), Some(Ok(())), "its session came and went");
+        assert!(session_runner_ends(false, false, EPHEMERAL_JOB_WAIT).is_some_and(|r| r.is_err_and(|why| why.contains("didn't come"))));
+    }
 
     /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 (goal 65's finding): a person's volumes outlive
     /// the runner's instances. Written where the runner's host keeps them while it runs as instance A,

@@ -379,7 +379,8 @@ export interface Spec {
 }
 
 /** Where agents can have workspaces of their own, by target (`local`, `agent:<name>`). */
-export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string }>;
+/** Per target: a workspace mounted on its host, and under `served` a volume served to its microVMs (W8 piece 4). */
+export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string; served?: { available: boolean; why_not?: string } }>;
 
 export { listed } from "./agents-list";
 

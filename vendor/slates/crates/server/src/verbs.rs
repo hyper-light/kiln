@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use slates_base::OsHost;
+use slates_base::{BaseHost, OsHost};
 use slates_db::Op;
 use slates_db::catalog::{
   AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer,
@@ -414,9 +414,14 @@ fn home_redirect(
 /// Route bootstrap to the sole shard that drives consensus. The bounded call owns its reply
 /// registration through cancellation; an unavailable shard cannot produce a successful bootstrap. Each call (the
 /// operation on the control shard, then its publication on every other) is waited for in its target's own time
-/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is refused `Overloaded` after a
-/// window with no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the
-/// wall second while the bootstrap went on).
+/// (`xshard::call_in_shard_time`): a starved shard's answer is heard, and a wedged one is given up after a window with
+/// no progress (R3 class A; before, a control shard given a fifth of a core for 1.5 s was refused at the wall second
+/// while the bootstrap went on). `Overloaded` answers only an operation that has not run: one whose task this shard
+/// could not spawn, or whose control shard refused it or was given up before it ran. A control shard wedged past the
+/// window may still run the operation when its poll ends; each of the three (`serve_consensus_control`) meets a second
+/// run as the first's outcome (a bootstrap already authorized, a recovery's receipt for its digest, a plan is a read),
+/// so the resend the refusal invites takes effect once. Once the operation ran, its answer says so
+/// ([`published_or_pending`], A-566).
 fn consensus_on_control(
   state: &ShardState,
   client_index: u32,
@@ -447,25 +452,7 @@ fn consensus_on_control(
         reply @ (ReplyBody::Acknowledged | ReplyBody::RecoveryStarted { .. }),
         publication,
         shards,
-      )) => {
-        let mut reply = reply;
-        for shard in shards.into_iter().filter(|shard| *shard != control) {
-          let publication = publication.clone();
-          if crate::xshard::call_in_shard_time(
-            origin,
-            shard,
-            move |state| publication.apply(state),
-            crate::daemon::LIVENESS_BUDGET_NS,
-          )
-          .await
-          .is_none()
-          {
-            reply = refused(Refusal::Overloaded { shard });
-            break;
-          }
-        }
-        reply
-      }
+      )) => published_or_pending(origin, control, reply, (publication, shards)).await,
       Some((reply, _, _)) => reply,
       None => refused(Refusal::Overloaded { shard: control }),
     };
@@ -477,6 +464,38 @@ fn consensus_on_control(
   // Freshly admitted on the current shard; no await can retire its slot before detach.
   let _ = slates_rt::futures::detach(task);
   Served::Forwarded
+}
+
+/// The answer of a consensus operation that ran on the control shard, `reply`, once its `publication` has gone to every
+/// other shard of `shards` (§4.8): `reply` when each applied it, each waited for in its own time
+/// (`xshard::call_in_shard_time`). When one did not, `DurabilityPending`, with how long it waited since the operation's
+/// answer: the operation ran and stands on the control shard but is not yet where its answer waits for it, and that is
+/// the request's recorded outcome, so a resend under its id meets it and the operation runs again only under a new id,
+/// whose run publishes again. Until A-566 this was `Overloaded`, which says the operation did not start: left
+/// unrecorded since A-563, its resend ran the operation a second time.
+async fn published_or_pending(
+  origin: u16,
+  control: u16,
+  reply: ReplyBody,
+  (publication, shards): (crate::consensus::Publication, Vec<u16>),
+) -> ReplyBody {
+  let answered_ns = slates_machine::clock::monotonic_ns();
+  for shard in shards.into_iter().filter(|shard| *shard != control) {
+    let publication = publication.clone();
+    if crate::xshard::call_in_shard_time(
+      origin,
+      shard,
+      move |state| publication.apply(state),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .is_none()
+    {
+      let held_ns = slates_machine::clock::monotonic_ns().saturating_sub(answered_ns);
+      return refused(Refusal::DurabilityPending { held_ns });
+    }
+  }
+  reply
 }
 
 /// Routes an operator's `PromoteRegion` to the **control shard**, where the root group is driven (§4.8, D-14 —
@@ -868,8 +887,9 @@ fn is_forwardable_write(body: &RequestBody) -> bool {
 /// - Anything else is refused `Unsupported`.
 ///
 /// `control` is the shard this serve loop runs on (the `xshard` origin). Each call to the owner shard is waited for in
-/// that shard's own time (`xshard::call_in_shard_time`, R3 class A): before, a peer's read of a volume whose owner shard
-/// was given a fifth of a core for 1.5 s was answered `NotFound` at the wall second.
+/// that shard's own time ([`call_owner`], R3 class A): before, a peer's read of a volume whose owner shard was given a
+/// fifth of a core for 1.5 s was answered `NotFound` at the wall second. A shard whose state refuses the verb answers by
+/// the refusal's kind ([`refusal_of_access`]), never `NotFound`, which says the volume does not exist (A-564).
 pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) -> Vec<u8> {
   let Ok(ForwardedRequest {
     principal,
@@ -887,8 +907,8 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   let requester = principal.clone();
   if let RequestBody::PromoteRegion { region } = body {
     return encode_body(
-      &crate::state::with_state(|s| propose_region_promotion(s, region))
-        .unwrap_or_else(|| refused(Refusal::NotFound)),
+      &crate::state::try_with_state(|s| propose_region_promotion(s, region))
+        .unwrap_or_else(|access| refusal_of_access(&access, control)),
     );
   }
   let Some(volume) = volume_of(&body) else {
@@ -904,44 +924,85 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     return encode_body(&refused(Refusal::HomedElsewhere { region }));
   }
   let owner = owner_of(volume);
-  let Some(shard) = crate::state::with_state(|s| shard_of_partition(s, owner)).flatten() else {
-    return encode_body(&refused(Refusal::NotFound));
+  let shard = match crate::state::try_with_state(|s| shard_of_partition(s, owner)) {
+    Ok(Some(shard)) => shard,
+    // No shard of this node holds the partition the id names: no such volume here.
+    Ok(None) => return encode_body(&refused(Refusal::NotFound)),
+    Err(access) => return encode_body(&refusal_of_access(&access, control)),
   };
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
   let reply = if is_forwardable_read(&body) {
-    crate::xshard::call_in_shard_time(
-      control,
-      shard,
-      move |s| serve_forwarded_read(s, &principal, body, volume),
-      crate::daemon::LIVENESS_BUDGET_NS,
-    )
+    match call_owner(control, shard, move |s| {
+      serve_forwarded_read(s, &principal, body, volume)
+    })
     .await
+    {
+      Ok(reply) | Err(reply) => reply,
+    }
   } else if is_forwardable_write(&body) {
-    let forwarded = crate::xshard::call_in_shard_time(
-      control,
-      shard,
-      move |s| {
-        // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
-        if let Some(refusal) = forwarded_before_made(s, volume) {
-          return (Some(refusal), None);
-        }
-        if let Some(up_to) = ack_up_to {
-          prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
-        }
-        // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
-        let reply = run_forwarded(s, origin_host, id, 0, &principal, body, None);
-        (reply, s.told_owed.take())
-      },
-      crate::daemon::LIVENESS_BUDGET_NS,
-    )
+    let forwarded = call_owner(control, shard, move |s| {
+      // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
+      if let Some(refusal) = forwarded_before_made(s, volume) {
+        return (Some(refusal), None);
+      }
+      if let Some(up_to) = ack_up_to {
+        prune_forwarded(s, origin_host, id.client, up_to, &ack_owed);
+      }
+      // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
+      let reply = run_forwarded(s, origin_host, id, 0, &principal, body, None);
+      (reply, s.told_owed.take())
+    })
     .await;
-    answer_forwarded_write(forwarded, (control, shard), origin_host, id).await
+    match forwarded {
+      Ok(forwarded) => answer_forwarded_write(forwarded, (control, shard), origin_host, id).await,
+      Err(refusal) => refusal,
+    }
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
-    Some(crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await)
+    crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// The refusal for a shard whose state refused a borrow (`state::try_with_state`), by what refused it (A-564). Fenced
+/// by a failed consensus publication, or closed by the retention check that such a failure makes refuse every borrow:
+/// `ConsensusRecoveryUnavailable`, the refusal a failed publication answers (`consensus_recovery::recover`), since the
+/// shard serves nothing until the operator recovers it. No state, or a borrow already held on its thread: `Overloaded`
+/// for `shard`, since the borrow's work did not run. Never `NotFound`, which says a volume does not exist: until A-564 a
+/// verb forwarded to a fenced owner was answered so, and a volume that exists read as absent.
+fn refusal_of_access(access: &crate::state::StateAccess, shard: u16) -> ReplyBody {
+  match access {
+    crate::state::StateAccess::Fenced | crate::state::StateAccess::Retention(_) => {
+      refused(Refusal::ConsensusRecoveryUnavailable)
+    }
+    crate::state::StateAccess::Absent | crate::state::StateAccess::Borrowed => {
+      refused(Refusal::Overloaded { shard })
+    }
+  }
+}
+
+/// Runs `work` on a forwarded verb's owner `shard` and waits for it in that shard's own time
+/// ([`crate::xshard::within_shard_time`], up to the liveness budget of its CPU): its answer, or the refusal that says
+/// why there is none (A-564). A call that was not sent, or whose owner was given up before it answered, answers
+/// `Overloaded` for `shard`, not started; an owner whose state refused it answers by what refused it
+/// ([`refusal_of_access`]). Until A-564 every one of these was `None` (`xshard::call_in_shard_time`), which the forward
+/// answered `NotFound`.
+async fn call_owner<T: Send + 'static>(
+  control: u16,
+  shard: u16,
+  work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
+) -> Result<T, ReplyBody> {
+  let Ok(call) = crate::xshard::call_on(control, shard, move || {
+    Some(crate::state::try_with_state(work))
+  }) else {
+    return Err(refused(Refusal::Overloaded { shard }));
+  };
+  match crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS).await {
+    Some(Ok(answer)) => Ok(answer),
+    Some(Err(access)) => Err(refusal_of_access(&access, shard)),
+    None => Err(refused(Refusal::Overloaded { shard })),
+  }
 }
 
 /// A read forwarded from another node, on its volume's owner shard: refused while this node owns the volume by its own
@@ -982,13 +1043,13 @@ fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<Rep
 /// The answer to a forwarded write once its verb has run on the owner `shard`: its reply after the mounts its change owes
 /// are told, or, when the verb deferred its acceptance to a fleet commit, the completion that commit records.
 async fn answer_forwarded_write(
-  forwarded: Option<(Option<ReplyBody>, Option<crate::told::Owed>)>,
+  forwarded: (Option<ReplyBody>, Option<crate::told::Owed>),
   (control, shard): (u16, u16),
   origin_host: u64,
   id: RequestId,
-) -> Option<ReplyBody> {
+) -> ReplyBody {
   match forwarded {
-    Some((Some(reply), owed)) => {
+    (Some(reply), owed) => {
       // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
       // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
       if let Some(owed) = owed {
@@ -1000,12 +1061,11 @@ async fn answer_forwarded_write(
         )
         .await;
       }
-      Some(reply)
+      reply
     }
     // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
     // completion record the commit writes, within the same liveness budget.
-    Some((None, _)) => await_deferred_completion(control, shard, origin_host, id).await,
-    None => None,
+    (None, _) => await_deferred_completion(control, shard, origin_host, id).await,
   }
 }
 
@@ -1038,15 +1098,15 @@ fn forward_redirect(volume: VolumeId) -> Option<u64> {
 
 /// A forwarded `Forbidden` as [`not_shared_with`] when the requester has no rights on `volume` at all, judged on its
 /// owner `shard`, where the record is ([`rights_of`]). A requester that holds rights was refused for something a share
-/// cannot fix (a forward naming another host's attachment), so its `Forbidden` stands. Every other reply as it is; no
-/// reply at all is `NotFound`.
+/// cannot fix (a forward naming another host's attachment), so its `Forbidden` stands. Every other reply as it is.
+/// Until A-564 no reply at all was answered `NotFound` here; the owner's refusal is now typed where it is met
+/// ([`call_owner`]).
 async fn named_if_unshared(
-  reply: Option<ReplyBody>,
+  reply: ReplyBody,
   (control, shard): (u16, u16),
   volume: VolumeId,
   requester: Principal,
 ) -> ReplyBody {
-  let reply = reply.unwrap_or_else(|| refused(Refusal::NotFound));
   if !matches!(
     reply,
     ReplyBody::Refused {
@@ -1099,42 +1159,41 @@ fn not_shared_with(reply: ReplyBody, requester: &Principal) -> ReplyBody {
 /// liveness budget the exchange runs under. Past the budget the request is refused **retryable**
 /// (`Overloaded` names the owner shard): the acceptance still waits on the owner, and the origin's
 /// retry meets the completion record once the version commits — never a success the quorum has
-/// not committed.
+/// not committed. An owner whose state refuses the poll answers by what refused it ([`call_owner`], A-564).
 async fn await_deferred_completion(
   control: u16,
   shard: u16,
   origin_host: u64,
   id: RequestId,
-) -> Option<ReplyBody> {
+) -> ReplyBody {
   let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
   loop {
     // Off a shard no poll can be timed: the reply is given up, as at its deadline.
-    slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
+    if slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
       .await
-      .ok()?;
-    let recorded = crate::xshard::call_in_shard_time(
-      control,
-      shard,
-      move |s| match s
+      .is_err()
+    {
+      return refused(Refusal::Overloaded { shard });
+    }
+    let recorded = call_owner(control, shard, move |s| {
+      match s
         .db
         .partition()
         .completion(origin_host, id.client, id.sequence)
       {
         Seen::Completed(bytes) => Some(bytes),
         Seen::Acknowledged | Seen::New | Seen::Awaiting { .. } => None,
-      },
-      crate::daemon::LIVENESS_BUDGET_NS,
-    )
+      }
+    })
     .await;
     match recorded {
-      Some(Some(bytes)) => {
-        return Some(
-          ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest)),
-        );
+      Ok(Some(bytes)) => {
+        return ReplyBody::from_bytes(&bytes)
+          .unwrap_or_else(|_| refused(Refusal::DuplicateRequest));
       }
-      Some(None) if slates_rt::futures::now_ns() < deadline => {}
-      Some(None) => return Some(refused(Refusal::Overloaded { shard })),
-      None => return None,
+      Ok(None) if slates_rt::futures::now_ns() < deadline => {}
+      Ok(None) => return refused(Refusal::Overloaded { shard }),
+      Err(refusal) => return refusal,
     }
   }
 }
@@ -1878,24 +1937,27 @@ fn route_after(
   None
 }
 
-/// Holds a verb on a volume this node owns but has not materialized while its materialization is pending, polled at
-/// the heartbeat, for at most one liveness budget. The client waits for such a verb while its daemon lives
-/// (`defers_reply`), and the refusal that follows meets the materialized volume on the client's retry. Answered at
-/// once before 2026-10-07: a client that retried without a pause was refused 2.8 million times in 400 s while the
-/// successor restored a volume. Ends early once the materialization is no longer pending, done or dropped.
+/// Holds a verb on a volume this node owns but has not materialized until that materialization ends: made, given up
+/// (past the failover SLO's worth of attempts without progress, `fleet::materialize_pending`) or its volume tombstoned,
+/// each of which removes its pending entry and wakes the verbs waiting on it
+/// (`state::PendingMaterializations::remove`, A-548). The client waits for such a verb while its daemon lives
+/// (`defers_reply`), and the refusal that follows meets the materialized volume on the client's retry. No timer: until
+/// A-548 the wait looked at the map each heartbeat and gave up at one liveness window, so a materialization slower
+/// than that sent its client a refusal, and a retry, every second for nothing. Answered at once before 2026-10-07: a
+/// client that retried without a pause was refused 2.8 million times in 400 s while the successor restored a volume.
+/// Ends at once for a volume no longer pending, and at the shard's stop (its state out of reach).
 async fn await_materialization(object: ObjectId) {
-  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
-  while crate::state::with_state(|state| state.pending_materializations.contains_key(&object))
-    .unwrap_or(false)
-    && slates_rt::futures::now_ns() < deadline
-  {
-    if slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
-      .await
-      .is_err()
-    {
-      return;
+  std::future::poll_fn(|cx| {
+    match crate::state::with_state_counted(|state| {
+      state
+        .pending_materializations
+        .wait_for_end(object, cx.waker())
+    }) {
+      Some(false) => std::task::Poll::Pending,
+      Some(true) | None => std::task::Poll::Ready(()),
     }
-  }
+  })
+  .await;
 }
 
 /// The status count of a request for a work no member owns, sent to its green's owner by the work's catalog record this
@@ -2506,6 +2568,13 @@ pub fn serve(
   }
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    // A repository and every green of its lineage live on the partition its name hashes to (§4.17.1, A-575).
+    RequestBody::CreateRepository { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    RequestBody::CreateBranch { repository, .. }
+    | RequestBody::BindBranch { repository, .. }
+    | RequestBody::RetireBranch { repository, .. } => {
+      Some(owner_of_name(repository, state.shards.len()))
+    }
     // A work lives on the shard that serves its creation, its client's own (A-400): its edits and its submits are read
     // and answered there with no hop, and its name is held at the partition it hashes to, by an alias when that is
     // another (A-236).
@@ -2788,7 +2857,10 @@ type ReplicatedWait = (DbVolumeId, u64);
 /// its tombstone placed at `f + 1` (`live_ship::tombstone_target`). A destroy never waits on the live log: it publishes
 /// no content to make durable, and its teardown refuses whatever waits on the log `NotFound`, which had told a client
 /// its successful destroy had not happened; and answered before its tombstone was placed, an owner lost at once left a
-/// takeover that served the volume again (2026-11-06, `crates/cli/tests/live_chaos.rs`).
+/// takeover that served the volume again (2026-11-06, `crates/cli/tests/live_chaos.rs`). A clone waits on its own log,
+/// not its origin's (A-577): the verb's volume is the origin, which the clone did not change, while a live clone's whole
+/// image is its own log's first entry, which its publication just appended; answered before it, a clone was lost to one
+/// owner loss at `f = 1` with the client told it existed.
 fn replicated_waits(
   state: &ShardState,
   volume: Option<DbVolumeId>,
@@ -2806,6 +2878,10 @@ fn replicated_waits(
   if label != 1 || matches!(reply, ReplyBody::Refused { .. }) {
     return (None, None);
   }
+  let volume = match reply {
+    ReplyBody::Cloned { id } => to_db_volume(*id),
+    _ => volume,
+  };
   let live = crate::live_ship::durable_target(state, volume).map(|target| (volume, target));
   (live, None)
 }
@@ -2904,7 +2980,8 @@ const OVERLOADED_UNRECORDED: &str = "verb.overloaded_unrecorded";
 /// unserved until it is rebuilt, A-533). Such a reply is never a completion (§4.9 RIFL): recorded, it was what every
 /// resend under the id met for good (GAPS, "The many-client load test from 10,000 to 100,000 clients";
 /// `docs/bugs/2026-11-17-an-overloaded-verb-was-recorded-as-its-completion.md`). Until A-533 an `Unpublished` a verb
-/// answered was recorded, so a resend met it for good where the protocol promises the verb runs again.
+/// answered was recorded, so a resend met it for good where the protocol promises the verb runs again. Judged where a
+/// verb answers ([`recorded_unless_deferred`]) and where a deferred reply is written ([`retry_deferred`], A-563).
 fn not_started(reply: &ReplyBody) -> bool {
   matches!(
     reply,
@@ -3113,7 +3190,9 @@ fn send_forward(
       let mut elsewhere = None;
       let mut remember_first = None;
       let mut carried = None;
-      let reply = crate::state::with_state(|s| {
+      // An owner whose state refuses the verb answers by what refused it, never `NotFound` for a volume that exists
+      // (A-564).
+      let reply = crate::state::try_with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
         // A mount of a volume this node lost to a successor is refused by its kind here, where the loss is known
         // (A-334's sibling), its completion keyed as every same-node forward's is.
@@ -3148,7 +3227,7 @@ fn send_forward(
         carried = Some(take_carried(s, request));
         reply
       })
-      .unwrap_or_else(|| Some(refused(Refusal::NotFound)));
+      .unwrap_or_else(|access| Some(refusal_of_access(&access, owner)));
       if let Some((region, volume, control, request_bytes)) = elsewhere {
         // An attach of a volume this node lost is remembered with its client, on the client's shard where its slot is,
         // and sent from there once it is, so the client's reap reaches the successor (A-222's rule; A-334's sibling).
@@ -3426,7 +3505,8 @@ pub fn ask_room_for_kept_forwards(state: &mut ShardState) -> bool {
 }
 
 /// A listing is a scatter-gather over every shard: each answers with what it owns; the origin
-/// merges when the last part arrives.
+/// merges when the last part arrives. A part whose shard's state refused it comes home unserved and makes the listing
+/// refused ([`settle_unserved`], A-557).
 fn scatter_list(
   state: &mut ShardState,
   client_index: u32,
@@ -3452,10 +3532,9 @@ fn scatter_list(
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part =
-          crate::state::with_state(|s| list_part(s, &principal, after)).unwrap_or_default();
+        let part = crate::state::with_state(|s| list_part(s, &principal, after));
         crate::xshard::send_reply_home(origin, move || {
-          gather(request, part);
+          gather(request, shard, part);
         });
       }),
       None,
@@ -3469,7 +3548,7 @@ fn scatter_list(
 
 /// The caller's grants are a scatter-gather like a listing: a grant record is written on the shard that
 /// presented its landing (the volume's owner), so every shard answers with the grants it holds for the
-/// principal and the origin merges when the last part arrives.
+/// principal and the origin merges when the last part arrives. An unserved part refuses them, as a listing's does.
 fn scatter_grants(
   state: &mut ShardState,
   client_index: u32,
@@ -3495,10 +3574,9 @@ fn scatter_grants(
     let principal = principal.clone();
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after))
-          .unwrap_or_default();
+        let part = crate::state::with_state(|s| crate::landing::grants_part(s, &principal, after));
         crate::xshard::send_reply_home(origin, move || {
-          gather_grants(request, part);
+          gather_grants(request, shard, part);
         });
       }),
       None,
@@ -3510,8 +3588,17 @@ fn scatter_grants(
   Served::Forwarded
 }
 
-/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page.
-fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary>) {
+/// Folds one shard's part of a `grants` page into the scatter and, on the last part, delivers the merged page; a part
+/// `shard` did not serve is settled refused ([`settle_unserved`]).
+fn gather_grants(
+  request: u64,
+  shard: u16,
+  part: Option<PagePart<slates_ipc::protocol::GrantSummary>>,
+) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::Grants, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.grant_scatters.get_mut(&request)?;
     entry.2.push(part);
@@ -3533,7 +3620,8 @@ fn gather_grants(request: u64, part: PagePart<slates_ipc::protocol::GrantSummary
 }
 
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
-/// the origin assembles the daemon's view (§4.14 `slates.status`).
+/// the origin assembles the daemon's view (§4.14 `slates.status`). An unserved report refuses the status, as a
+/// listing's part does.
 fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Served {
   let others: Vec<u16> = state
     .shards
@@ -3554,7 +3642,7 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
       Box::pin(async move {
         let part = crate::state::with_state(shard_report);
         crate::xshard::send_reply_home(origin, move || {
-          gather_status(request, part);
+          gather_status(request, shard, part);
         });
       }),
       None,
@@ -3641,10 +3729,10 @@ fn send_part(
   }
 }
 
-/// Settles a part that could not be sent to `shard`: an acknowledgement's release is counted ([`release_part_back`]);
-/// a listing's, grants' or status' part marks its scatter refused and counts down. When that was the scatter's last
-/// part, the entry goes and the scatter's answer is returned, `Overloaded` for the first refused shard, counted, with
-/// its client slot and whether it is paged.
+/// Settles a part that could not be sent to `shard`, or that `shard` did not serve ([`settle_unserved`]): an
+/// acknowledgement's release is counted ([`release_part_back`]); a listing's, grants' or status' part marks its scatter
+/// refused and counts down. When that was the scatter's last part, the entry goes and the scatter's answer is returned,
+/// `Overloaded` for the first refused shard, counted, with its client slot and whether it is paged.
 fn settle_refused(
   state: &mut ShardState,
   kind: ScatterKind,
@@ -3664,6 +3752,28 @@ fn settle_refused(
   let client_index = done?;
   state.scatter_refusals.remove(&request);
   Some((client_index, part_unsent(state, first), paged))
+}
+
+/// Format: the count of read scatters' parts that came home unserved (A-557): their shard's state refused the borrow
+/// (fenced by a failed consensus publication, a retention refusal, no state installed, a nested borrow), so the
+/// scatter was answered `Overloaded` for that shard ([`settle_unserved`]). It tells such an answer from one whose part
+/// met a full control channel, which answers the same.
+const SCATTER_PART_UNSERVED: &str = "scatter.part_unserved";
+
+/// Settles a listing's, grants' or status' part that `shard` did not serve, its state refusing the borrow, as a part
+/// that could not be sent ([`settle_refused`]), counted ([`SCATTER_PART_UNSERVED`]); delivers the scatter's refusal when
+/// that was its last part. Settled in its own borrow, and delivered after it: `deliver` borrows the state itself. A
+/// scatter is answered whole or refused naming a shard whose part it lacks, never as if whole without that part
+/// (§4.8 "Lookup": an enumeration is a scatter-gather over owners). Before A-557 the part tasks sent a refused borrow
+/// home as an empty part, so a listing, the grants or a status was answered without that shard's volumes, grants or
+/// report (`docs/bugs/2026-11-19-a-read-scatter-answered-whole-without-a-shards-part.md`).
+fn settle_unserved(kind: ScatterKind, request: u64, shard: u16) {
+  if let Some(Some((client_index, reply, paged))) = crate::state::with_state_counted(|s| {
+    s.count(SCATTER_PART_UNSERVED, 1);
+    settle_refused(s, kind, request, shard)
+  }) {
+    crate::state::deliver(client_index, request, reply, paged);
+  }
 }
 
 /// Format: the count of scatters left unanswered because a shard they needed was gone, its daemon stopping
@@ -3708,7 +3818,7 @@ fn count_down<T>(
 }
 
 /// The answer a scatter gives when its part for `shard` could not be sent, the shard's control channel full past a
-/// wait for room: the typed `Overloaded`, counted by its name.
+/// wait for room, or came home unserved ([`settle_unserved`]): the typed `Overloaded`, counted by its name.
 fn part_unsent(state: &mut ShardState, shard: u16) -> ReplyBody {
   let refusal = Refusal::Overloaded { shard };
   state.count(refusal_name(&refusal), 1);
@@ -3802,11 +3912,16 @@ fn release_part_back(state: &mut ShardState, request: u64, part: &ReplyBody) {
   }
 }
 
-/// Gathers one shard's part of a status; the last part delivers the whole.
-fn gather_status(request: u64, part: Option<ShardReport>) {
+/// Gathers one shard's part of a status; the last part delivers the whole. A report `shard` did not serve is settled
+/// refused ([`settle_unserved`]): before A-557 it was skipped, and the status answered without that shard.
+fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::Status, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.status_scatters.get_mut(&request)?;
-    entry.2.extend(part);
+    entry.2.push(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
       let refused_for = s.scatter_refusals.remove(&request);
@@ -4374,8 +4489,13 @@ fn seal_report(state: &ShardState, recipient_id: Vec<u8>) -> slates_ipc::protoco
   }
 }
 
-/// One shard's part of a listing arrives at the origin; the last part completes the reply.
-fn gather(request: u64, part: ListPart) {
+/// One shard's part of a listing arrives at the origin; the last part completes the reply. A part `shard` did not serve
+/// is settled refused ([`settle_unserved`]).
+fn gather(request: u64, shard: u16, part: Option<ListPart>) {
+  let Some(part) = part else {
+    settle_unserved(ScatterKind::List, request, shard);
+    return;
+  };
   let done = crate::state::with_state(|s| {
     let entry = s.scatters.get_mut(&request)?;
     entry.2.push(part);
@@ -4412,7 +4532,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::Archived => "archived",
     Refusal::InvalidName => "invalid_name",
     Refusal::PolicyMismatch => "policy_mismatch",
-    Refusal::BaseUnavailable { .. } => "base_unavailable",
+    Refusal::BaseUnavailable { .. } | Refusal::BaseUnavailableWin32 { .. } => "base_unavailable",
     Refusal::DuplicateRequest => "duplicate_request",
     Refusal::BarrierIncomplete { .. } => "barrier_incomplete",
     Refusal::Unsupported { .. } => "unsupported",
@@ -4487,6 +4607,8 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
     body,
     RequestBody::Create { .. }
       | RequestBody::CreateGreen { .. }
+      | RequestBody::CreateRepository { .. }
+      | RequestBody::CreateBranch { .. }
       | RequestBody::CreateWork { .. }
       | RequestBody::Clone { .. }
       | RequestBody::Snapshot { .. }
@@ -4924,6 +5046,32 @@ fn dispatch_inner(
       size,
       require_locked,
     } => crate::image::import_verb(state, principal, archive, name, (size, require_locked)),
+    RequestBody::CreateRepository {
+      name,
+      tool,
+      format,
+      default_branch,
+      green,
+    } => crate::repository::create_repository(
+      state,
+      principal,
+      (&name, tool, format, &default_branch),
+      green,
+    ),
+    RequestBody::CreateBranch {
+      repository,
+      name,
+      from,
+      version,
+    } => crate::repository::create_branch(state, principal, (&repository, &name, &from), version),
+    RequestBody::BindBranch {
+      repository,
+      name,
+      green,
+    } => crate::repository::bind_branch(state, principal, (&repository, &name), green),
+    RequestBody::RetireBranch { repository, name } => {
+      crate::repository::retire_branch(state, principal, (&repository, &name))
+    }
     RequestBody::Checkout {
       green,
       base,
@@ -6176,7 +6324,7 @@ pub(crate) struct Credits {
 /// credits.
 pub(crate) struct Admitted {
   pub(crate) volume: Volume,
-  pub(crate) host: Option<OsHost>,
+  pub(crate) host: Option<BaseHost>,
   pub(crate) credits: Credits,
 }
 
@@ -6391,7 +6539,7 @@ pub(crate) fn publish_created_volume(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   volume: Volume,
-  host: Option<OsHost>,
+  host: Option<BaseHost>,
   credits: (
     Option<slates_mem::budget::Reservation>,
     Option<slates_mem::budget::VersionCredit>,
@@ -6809,19 +6957,8 @@ fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) -> Refusal 
       path: path.to_owned(),
       used_as: slates_ipc::protocol::OwnMountUse::Base,
     },
-    slates_vfs::host::HostError::Unavailable(code) => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: code,
-    },
-    // A Win32 code as its own number (A-527; typing it is the wire's own piece, GAPS).
-    slates_vfs::host::HostError::Win32(code) => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: i32::try_from(code).unwrap_or(i32::MAX),
-    },
-    _ => Refusal::BaseUnavailable {
-      path: path.to_owned(),
-      errno: 0,
-    },
+    // The code in the variant of its numbering (A-539).
+    other => crate::error::base_unavailable(path.to_owned(), other.code()),
   }
 }
 
@@ -6835,12 +6972,13 @@ fn clone_base_host(
   state: &ShardState,
   origin: Handle<VolumeSlot>,
   record: &VolumeRecord,
-) -> Result<Option<OsHost>, Refusal> {
+) -> Result<Option<BaseHost>, Refusal> {
   let BaseRecord::Path { path } = &record.base else {
     return Ok(None);
   };
   let slot = state.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
-  let Some(host) = slot.host.as_ref() else {
+  // A base the catalog records by its path is a host directory, read through a directory host.
+  let Some(host) = slot.host.as_ref().and_then(BaseHost::as_disk) else {
     return Err(Refusal::BaseUnavailable {
       path: path.clone(),
       errno: 0,
@@ -6848,7 +6986,7 @@ fn clone_base_host(
   };
   host
     .try_clone_dirs()
-    .map(Some)
+    .map(|host| Some(BaseHost::Disk(host)))
     .map_err(|error| base_open_refusal(path, error))
 }
 
@@ -6857,7 +6995,7 @@ fn open_base(
   state: &mut ShardState,
   path: &str,
   config: VolumeConfig,
-) -> Result<(Volume, Option<OsHost>), Box<ReplyBody>> {
+) -> Result<(Volume, Option<BaseHost>), Box<ReplyBody>> {
   let (mut host, root) = OsHost::open_root(std::path::Path::new(path))
     .map_err(|e| Box::new(refused(base_open_refusal(path, e))))?;
   let facts = host.facts(root).map_err(|_| {
@@ -6876,7 +7014,7 @@ fn open_base(
     },
   )
   .map_err(|e| Box::new(refused(refusal_of_vfs(&e))))?;
-  Ok((volume, Some(host)))
+  Ok((volume, Some(BaseHost::Disk(host))))
 }
 
 /// A snapshot of `volume` (§4.4 `snapshot`). A guest's DAX windows need nothing of it: each maps its file's backing, an
@@ -8064,28 +8202,28 @@ fn edit(
   let Some(w) = state.works.get(&work_id) else {
     return refused(Refusal::NotFound);
   };
-  let base = crate::work_files::Base {
-    green: state.greens.get(&w.green),
-    fetched: state.work_home.fetched.as_ref(),
-    version: w.base_version,
-  };
   // A file the work has not changed is the green's at its base; with the green gone it cannot be read (§4.16
-  // failure matrix: the work's submit answers the same).
-  let Ok(old) = w.files.get(base, path) else {
+  // failure matrix: the work's submit answers the same). The journal operations this edit records are built before
+  // anything changes so its charge is exact, by the one builder the work log's replay uses too (`crate::work_log`,
+  // A-207); and the work is charged for what the edit adds before it changes anything (`crate::work_charge`): the file
+  // it now holds (copied from the base when it had not changed it), less what the splice deletes, and the journal's ops.
+  // The base is read while its green is lent (`crate::greens`), and what comes out of it is owned.
+  let read = crate::merge_service::with_work_base(state, w, |base| {
+    w.files.get(base, path).map(|old| {
+      let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      let ops = crate::work_log::edit_ops(path, old.as_deref(), (at, delete_len, inserted));
+      let (spliced, removed) =
+        w.files
+          .splice_delta(path, old.as_deref(), (at, delete_len, bytes.len()));
+      (ops, spliced, removed)
+    })
+  });
+  let Ok((ops, spliced, removed)) = read else {
     return refused(Refusal::UnknownBase {
       green: to_wire_volume(w.green),
       version: w.base_version,
     });
   };
-  // The journal operations this edit records, built before anything changes so its charge is exact, by the one
-  // builder the work log's replay uses too (`crate::work_log`, A-207).
-  let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-  let ops = crate::work_log::edit_ops(path, old.as_deref(), (at, delete_len, inserted));
-  // The work is charged for what the edit adds before it changes anything (`crate::work_charge`): the file it now
-  // holds (copied from the base when it had not changed it), less what the splice deletes, and the journal's ops.
-  let (spliced, removed) =
-    w.files
-      .splice_delta(path, old.as_deref(), (at, delete_len, bytes.len()));
   let added = crate::work_charge::journal_footprint(&ops).saturating_add(spliced);
   let entry = crate::work_log::WorkLogEntry::Edit {
     path: path.to_owned(),
@@ -8100,20 +8238,22 @@ fn edit(
   let Some(w) = works.get_mut(&work_id) else {
     return refused(Refusal::NotFound);
   };
-  let base = crate::work_files::Base {
-    green: greens.get(&w.green),
-    fetched: home.fetched.as_ref(),
-    version: w.base_version,
-  };
   // The base was read above on this single-threaded shard, so it still is; a refusal here gives the charge back.
-  if crate::work_log::apply_edit(
-    (&mut w.files, &mut w.journal),
-    base,
-    (path, at, delete_len, bytes),
-    ops,
-  )
-  .is_err()
-  {
+  let applied = {
+    let lent = greens.get(&w.green);
+    let base = crate::work_files::Base {
+      green: lent.as_deref(),
+      fetched: home.fetched.as_ref(),
+      version: w.base_version,
+    };
+    crate::work_log::apply_edit(
+      (&mut w.files, &mut w.journal),
+      base,
+      (path, at, delete_len, bytes),
+      ops,
+    )
+  };
+  if applied.is_err() {
     let green = to_wire_volume(w.green);
     let version = w.base_version;
     crate::work_charge::shrink(state, work_id, added);
@@ -8252,13 +8392,10 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     },
   };
   // The work is charged for what the declaration adds before it changes anything (`crate::work_charge`): a moved
-  // file it now holds, a removal it records, the operation itself.
-  let base = crate::work_files::Base {
-    green: state.greens.get(&w.green),
-    fetched: state.work_home.fetched.as_ref(),
-    version: w.base_version,
-  };
-  let Ok((moved, removed)) = w.files.declare_delta(base, &volume_op) else {
+  // file it now holds, a removal it records, the operation itself. The base is read while its green is lent.
+  let delta =
+    crate::merge_service::with_work_base(state, w, |base| w.files.declare_delta(base, &volume_op));
+  let Ok((moved, removed)) = delta else {
     return refused(Refusal::UnknownBase {
       green: to_wire_volume(w.green),
       version: w.base_version,
@@ -8275,12 +8412,16 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
   let Some(w) = works.get_mut(&work_id) else {
     return refused(Refusal::NotFound);
   };
-  let base = crate::work_files::Base {
-    green: greens.get(&w.green),
-    fetched: home.fetched.as_ref(),
-    version: w.base_version,
+  let applied = {
+    let lent = greens.get(&w.green);
+    let base = crate::work_files::Base {
+      green: lent.as_deref(),
+      fetched: home.fetched.as_ref(),
+      version: w.base_version,
+    };
+    crate::work_log::apply_declare((&mut w.files, &mut w.journal), base, volume_op)
   };
-  if crate::work_log::apply_declare((&mut w.files, &mut w.journal), base, volume_op).is_err() {
+  if applied.is_err() {
     let green = to_wire_volume(w.green);
     let version = w.base_version;
     crate::work_charge::shrink(state, work_id, added);
@@ -8431,7 +8572,7 @@ fn build_increment(
   // whole base cloned every path's name on every submit.
   let base = engine.base_for(base_version, &sealed.journal);
   let files_base = crate::work_files::Base {
-    green: Some(engine),
+    green: Some(&*engine),
     fetched: None,
     version: base_version,
   };
@@ -9183,16 +9324,15 @@ fn judge_submission(
   }
   // Charge superseded values before the verdict. Incoming bytes do not bound the retained
   // history: unlink carries none and a short overwrite retains the complete previous file.
-  let Some(engine) = state.greens.get(&green_id) else {
-    return refused(Refusal::NotFound);
-  };
   // The change index grows with the version too (A-264), charged with the history it indexes.
-  let secured = u64::try_from(
+  let Some(reserved) = state.greens.get(&green_id).map(|engine| {
     engine
       .history_reservation(&inc)
-      .saturating_add(engine.changes_reservation(&inc)),
-  )
-  .unwrap_or(u64::MAX);
+      .saturating_add(engine.changes_reservation(&inc))
+  }) else {
+    return refused(Refusal::NotFound);
+  };
+  let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
   // An accepted work is reset to its green at the new version, where it holds nothing of its own
   // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
@@ -9209,7 +9349,7 @@ fn judge_submission(
   }
   let verdict_start = state.clock.monotonic_ns();
   let (outcome, applied) = {
-    let Some(engine) = state.greens.get_mut(&green_id) else {
+    let Some(mut engine) = state.greens.get_mut(&green_id) else {
       return refused(Refusal::NotFound);
     };
     engine.submit_resolved(&inc)
@@ -9329,7 +9469,7 @@ fn record_accepted(
       state
         .greens
         .get_mut(&green)
-        .map(slates_merge::engine::Green::head_identity)
+        .map(|mut engine| engine.head_identity())
     })
     .flatten();
   let record = Op::GreenAdvanced {
@@ -9351,7 +9491,7 @@ fn record_accepted(
     .map_err(|e| refusal_of_db(&e))?;
   // The version's provenance (A-321), once its entry is durable: what the version's answers and its merge record read,
   // and what a checkpoint keeps when it folds the entry.
-  if let (Some(signature), Some(engine)) = (
+  if let (Some(signature), Some(mut engine)) = (
     crate::signed_work::to_entry(verification),
     state.greens.get_mut(&green),
   ) {
@@ -9405,7 +9545,7 @@ fn reset_accepted_work(state: &mut ShardState, work_id: DbVolumeId, version: u64
 /// is judged again) and counts it as an eviction, then settles to what remains.
 fn settle_after_conflict(state: &mut ShardState, green_id: DbVolumeId, increment: &[u8; 32]) {
   if crate::merge_service::settle_green_retention(state, green_id).is_err() {
-    if let Some(engine) = state.greens.get_mut(&green_id) {
+    if let Some(mut engine) = state.greens.get_mut(&green_id) {
       engine.forget_rejected(increment);
     }
     let _ = crate::merge_service::settle_green_retention(state, green_id);
@@ -9448,7 +9588,7 @@ fn map_rebase(
     Ok(built) => built,
     Err(refusal) => return RebaseAnswer::Reply(refused(refusal)),
   };
-  let Some(engine) = state.greens.get_mut(&green_id) else {
+  let Some(mut engine) = state.greens.get_mut(&green_id) else {
     return RebaseAnswer::Reply(refused(Refusal::NotFound));
   };
   match engine.rebase(&inc) {
@@ -9583,8 +9723,11 @@ pub(crate) fn owner_admit(
 ) -> Result<crate::work_home::Admitted, Refusal> {
   let record =
     crate::merge_service::require_green(state, principal, to_wire_volume(green), "create_work")?;
-  let engine = state.greens.get(&record.id).ok_or(Refusal::NotFound)?;
-  let base = engine.head();
+  let base = state
+    .greens
+    .get(&record.id)
+    .map(|engine| engine.head())
+    .ok_or(Refusal::NotFound)?;
   owner_record(
     state,
     &Op::WorkFloorSet {
@@ -9659,7 +9802,7 @@ pub(crate) fn owner_sizes(
     engine
       .file_lens_at(version)
       .into_iter()
-      .map(|(path, len)| (path.to_owned(), u64::try_from(len).unwrap_or(u64::MAX)))
+      .map(|(path, len)| (path, u64::try_from(len).unwrap_or(u64::MAX)))
       .collect(),
   );
   fetched
@@ -9837,7 +9980,8 @@ pub(crate) const ALIAS_STEP_UNTAKEN: &str = "names.alias_step_untaken";
 /// Makes a clone whose name hashes to `name_partition`, another partition (A-236, `slates_db::alias::CLONE_STEPS`):
 /// the alias reserved at the name's partition, the clone made here beside its origin with its completion record, and
 /// the alias confirmed (or released, when the clone could not be made) before the reply. The reply is deferred to a
-/// task of this shard, so a retry meanwhile joins it.
+/// task of this shard, so a retry meanwhile joins it; a live clone's completion and reply wait for its first whole
+/// entry durable on `f` candidates as well (A-577).
 fn clone_named_elsewhere(
   state: &mut ShardState,
   principal: &Principal,
@@ -9878,13 +10022,15 @@ fn clone_named_elsewhere(
         reason: "the name's shard did not answer its reservation".to_owned(),
       })
     });
+    // The clone made and committed, its request kept in flight while its alias settles (a retry joins it); a live clone's
+    // completion waits too, for its first whole entry durable on `f` candidates (A-577).
     let made = crate::state::with_state(|s| {
-      crate::image::complete(s, request, |s| match &reserved {
+      crate::image::commit_in_flight(s, request, id, |s| match &reserved {
         Err(refusal) => refused(refusal.clone()),
         Ok(()) => clone_as(s, &principal, (volume, snapshot, &name), id),
       })
     });
-    let Some((reply, route)) = made else {
+    let Some((reply, target)) = made else {
       return;
     };
     if reserved.is_ok() {
@@ -9904,7 +10050,9 @@ fn clone_named_elsewhere(
         let _ = crate::state::with_state(|s| s.count(ALIAS_STEP_UNTAKEN, 1));
       }
     }
-    let _ = crate::state::with_state(|s| crate::image::deliver(s, reply, route));
+    // Answered after its alias, as every clone is: at once, or held for the clone's durability (A-577).
+    let _ =
+      crate::state::with_state(|s| crate::image::answer_in_flight(s, request, id, (reply, target)));
   })
 }
 
@@ -10005,20 +10153,26 @@ pub(crate) fn admit_clone(
   };
   // Take the clone's version slots *before* cloning (§4.2: reserve all credits or none before publishing), so a refusal
   // allocates nothing and does not leave the origin's `clone_refs` bumped. A clone shares its origin's versions until
-  // it diverges. A bounded clone reserves its whole allowance — a create's fair share, but never below the count it
-  // inherits from the origin (equal to the origin's live count at clone time) — as the sacred claim that backs full
-  // divergence of the inherited inodes. A dynamic clone holds slots for the inodes it inherits only, from the
-  // unpromised capacity, and grows its hold as it makes more (A-342). If the slab cannot back them, the clone is refused.
-  let inherited = match state.volumes.get(handle) {
-    Ok(slot) => slot.volume.inode_usage().0,
-    Err(_) => {
-      return Err(Box::new(give_back(
-        state,
-        reservation,
-        None,
-        None,
-        Refusal::NotFound,
-      )));
+  // it diverges. A bounded clone reserves its whole allowance — a create's fair share, but never below the inodes it
+  // inherits — as the sacred claim that backs full divergence of the inherited inodes. A dynamic clone holds slots for
+  // the inodes it inherits only, from the unpromised capacity, and grows its hold as it makes more (A-342). If the slab
+  // cannot back them, the clone is refused. The inodes it inherits are its snapshot's tree's, the count the clone starts
+  // from (A-541), never the origin's head's now, which has made and removed files since (A-549); a stale snapshot is
+  // refused here, before any slot is taken, as the clone would refuse it.
+  let inherited = state
+    .volumes
+    .get(handle)
+    .map_err(|_| Refusal::NotFound)
+    .and_then(|slot| {
+      slot
+        .volume
+        .snapshot_inodes(core_snapshot(snapshot))
+        .map_err(|error| refusal_of_vfs(&error))
+    });
+  let inherited = match inherited {
+    Ok(inodes) => inodes,
+    Err(refusal) => {
+      return Err(Box::new(give_back(state, reservation, None, None, refusal)));
     }
   };
   let clone_allowance = inode_allowance(state, size).max(inherited);
@@ -10142,6 +10296,12 @@ pub(crate) fn admit_clone(
   // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
   let allowed = volume_core.set_inode_allowance(clone_allowance);
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
+  // And its namespace dimension (§4.2), as a create's admission and a restart's set it: a create's share, but never
+  // below the entries the clone holds, which are its snapshot's (A-549). It reserves nothing, so it is set from the
+  // clone's own count. Before A-572 a clone carried no entry allowance until a restart set one.
+  let entries = entry_allowance(size).max(volume_core.entry_usage().0);
+  let entries_allowed = volume_core.set_entry_allowance(entries);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, entries_allowed);
   // A dynamic clone's slots become its version hold, returned with it at teardown, never a reserved credit (A-342).
   let version_credit = match version_credit {
     Some(credit) if dynamic => {
@@ -10218,25 +10378,41 @@ pub(crate) fn publish_clone_as(
   new_record.access = Vec::new();
   new_record.lease = None;
   new_record.created_ns = now;
-  // A clone of a captured base holds its whole tree and reads no base directory (A-291).
-  if state
+  // A clone is a new object (A-577): its head register starts at the creation head, naming no content, as a new
+  // volume's does, so the record plane ships it at once and the fleet knows the clone. Copied from its origin, its head
+  // named the origin's snapshot at the origin's sequence, none of the clone's, and nothing of it shipped until its own
+  // first seal: at `f > 0` a live clone's log could never answer, and a takeover never found it. Nor was the clone
+  // taken over, and nothing of its log has shipped: its own shipper records its holders.
+  new_record.head = DbSnapshotId::default();
+  new_record.epoch = 0;
+  new_record.taken_over = None;
+  new_record.policy.live_holders = None;
+  // A clone of a captured base holds its whole tree and reads no base directory (A-291), and is born with its capture's
+  // record, naming no head yet (A-544): a successor that adopts a head no record is for refuses its landing by kind.
+  let captured = state
     .db
     .partition()
-    .is_captured(record.id, to_db_snapshot(snapshot))
-  {
+    .is_captured(record.id, to_db_snapshot(snapshot));
+  if captured {
     new_record.base = BaseRecord::Scratch;
   }
+  let born_with = captured.then(|| Op::CaptureCarried {
+    volume: id,
+    carried: crate::carry::creation_record(),
+    mark: None,
+  });
   let ops = [
-    Op::VolumeCreated { record: new_record },
-    Op::LineageAdded {
+    Some(Op::VolumeCreated { record: new_record }),
+    Some(Op::LineageAdded {
       edge: LineageEdge {
         child: id,
         origin_volume: record.id,
         origin_snapshot: to_db_snapshot(snapshot),
       },
-    },
+    }),
+    born_with,
   ];
-  for op in &ops {
+  for op in ops.iter().flatten() {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       discard_clone(state, origin, snapshot, admitted);
       return Err(refusal_of_db(&e));
@@ -11802,6 +11978,11 @@ fn resize(
   // settle the byte reservation the same way.
   // Never refused: `new_allowance` is at least the live count, the setter's one refusal. Counted all the same.
   let allowed = slot.volume.set_inode_allowance(new_allowance);
+  // The entry allowance moves with the policy as the inode allowance does (§4.2), never below the entries the volume
+  // holds, as a create's admission derives it and a restart floors it. It reserves nothing. Before A-572 a resize left
+  // it at the share of the size the volume was made with.
+  let entries = entry_allowance(size).max(slot.volume.entry_usage().0);
+  let entries_allowed = slot.volume.set_entry_allowance(entries);
   slot.version_credit = settle_resized_credit(
     &mut state.store.versions,
     &slot.volume,
@@ -11820,6 +12001,7 @@ fn resize(
     }
   }
   count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, entries_allowed);
   let now = state.clock.monotonic_ns();
   if let Err(e) = state.db.mutate(
     &mut state.segment,
@@ -11939,7 +12121,7 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     crate::live_ship::forget(state, *id);
   }
   let partition = state.db.partition();
-  state.greens.retain(|id, _| partition.volume(*id).is_some());
+  state.greens.retain(|id| partition.volume(*id).is_some());
   let mut released = 0u64;
   state.works.retain(|id, work| {
     let keep = partition.volume(*id).is_some();
@@ -12081,13 +12263,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
   any || releasing
 }
 
-/// Derived: a destroy whose completion record was refused is tried again the shard's window after `now` (A-455's
-/// window over the scheduler overrun this shard measured): no sooner than a pass of the refusing condition could
-/// change, and kept by the deadline keeper, never a tick (A-536).
+/// Derived: a destroy whose completion record was refused is tried again the retry window after `now`
+/// (`deadlines::retry_window_ns`, A-455's window over the scheduler overrun this shard measured): no sooner than a pass
+/// of the refusing condition could change, and kept by the deadline keeper, never a tick (A-536).
 fn retry_destroy_at_window(state: &mut ShardState, now: u64) {
-  let at = now.saturating_add(crate::watchdog::watch_window_ns(
-    slates_rt::futures::scheduler_overrun_ns(),
-  ));
+  let at = now.saturating_add(crate::deadlines::retry_window_ns());
   state.destroy_retry_at = Some(state.destroy_retry_at.map_or(at, |due| due.min(at)));
   crate::deadlines::noted(state, at);
 }
@@ -12745,7 +12925,9 @@ fn newest_placed_seal<'a>(
 
 /// The window an owner loss would lose of `record`'s volume now (AC-8.3), on this host's monotonic clock:
 /// - zero for a live-shipped volume in a fleet, whose writes are durable on its holders before they are answered
-///   (A-200);
+///   (A-200), once its log holds the volume where a takeover finds it: a log begun here, a new live clone's or a volume
+///   just made live, holds nothing until it answers at a whole entry, and its window is the rules below until then
+///   (A-577, `live_ship::holds_nothing_yet`);
 /// - zero for a volume that is exactly its head snapshot when that snapshot is `placed`, the newest seal on `f + 1`
 ///   hosts;
 /// - otherwise the age of `placed`, the edits after which live on the owner alone;
@@ -12760,7 +12942,10 @@ fn at_risk_ns(
   unchanged_since_head: bool,
   placed: Option<&SnapshotRecord>,
 ) -> Option<u64> {
-  if record.policy.live_shipped && state.fleet.configuration().quorum.f > 0 {
+  if record.policy.live_shipped
+    && state.fleet.configuration().quorum.f > 0
+    && !crate::live_ship::holds_nothing_yet(state, record.id)
+  {
     return Some(0);
   }
   // The shard's clock is the host's monotonic clock (`HostClock`), read here without borrowing it mutably.
@@ -13186,6 +13371,10 @@ pub(crate) struct TakenOver<'a> {
   /// The takeover itself, kept in the volume's record (AC-8.3, A-325): the epoch the head was placed under, `sequence`,
   /// and whether the volume is rebuilt from its live log.
   pub takeover: slates_db::catalog::TakeoverRecord,
+  /// Whether this node adopts the volume by a planned move (A-291): its old owner froze it and made its live log durable
+  /// at the head it handed over, so a tree rebuilt from that log is exactly that head (A-565). `false` for a takeover
+  /// after an owner's loss, whose log may have run past its newest seal.
+  pub moved: bool,
 }
 
 /// Counter: a stale copy this node relinquished to a takeover that named it again (A-362, [`relinquish_superseded`]).
@@ -13527,7 +13716,7 @@ pub(crate) fn finish_making(
   region: Vec<u64>,
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
-  let from_live_log = taken.takeover.from_live_log;
+  let (from_live_log, moved) = (taken.takeover.from_live_log, taken.moved);
   let Some(making) = state.making_volumes.remove(&id) else {
     return Err(Box::new(refused(Refusal::NotFound)));
   };
@@ -13644,13 +13833,14 @@ pub(crate) fn finish_making(
       return Err(Box::new(refused(refusal_of_db(&e))));
     }
   }
-  // What a move carried of the volume's capture comes with its catalog (A-503): the snapshot just sealed is its mark
-  // when it holds the head the capture was carried against (a move's adoption, or a takeover before the new owner wrote,
-  // since the archive's identity is the tree's). A takeover that rebuilt a later head holds none, nor one rebuilt from a
-  // live log, whose tree may have run past the seal it names, so its landings are refused rather than judged from a
-  // tree that is not the moved one.
+  // What a captured clone's head carried of its capture comes with its catalog (A-503, A-544): the snapshot just sealed is
+  // its mark when it holds the head the record was carried against (a move's adoption, or a takeover before the new owner
+  // wrote, since the archive's identity is the tree's). A takeover that rebuilt a later head holds none, nor one rebuilt
+  // from a live log after an owner's loss, whose tree may have run past the seal it names, so its landings are refused
+  // rather than judged from a tree that is not the head. A move's rebuild from the log is the head (A-565): its old owner
+  // froze the volume and made the log durable at the head it handed over before the move was reported.
   if let Some(carried) = catalog.carried.clone() {
-    let moved_head = head.manifest == Some(carried.head) && !from_live_log;
+    let moved_head = head.manifest == Some(carried.head) && (!from_live_log || moved);
     let mark = moved_head.then_some(to_db_snapshot(snapshot));
     let op = Op::CaptureAdopted {
       volume: id,
@@ -14246,10 +14436,10 @@ fn refused_before_dispatch(
   match body {
     RequestBody::Create {
       base: Some(path), ..
-    } if path.len() > longest_recordable_base() => Some(Refusal::BaseUnavailable {
-      path: path.clone(),
-      errno: PATH_TOO_LONG_ERRNO,
-    }),
+    } if path.len() > longest_recordable_base() => Some(crate::error::base_unavailable(
+      path.clone(),
+      Some(PATH_TOO_LONG),
+    )),
     _ => None,
   }
 }
@@ -14266,13 +14456,16 @@ const PLATFORM_PATH_BYTES: usize = 4_095;
 #[cfg(windows)]
 const PLATFORM_PATH_BYTES: usize = 32_767 * 3;
 
-/// Format: the errno a base path past [`longest_recordable_base`] is refused with: `ENAMETOOLONG`, the host's own answer
-/// to a path past its maximum (the MSVC runtime's value on Windows, `<errno.h>`).
+/// Format: the code a base path past [`longest_recordable_base`] is refused with, the host's own answer to a path past
+/// its maximum, typed by its numbering (A-539): `ENAMETOOLONG`, an errno.
 #[cfg(unix)]
-const PATH_TOO_LONG_ERRNO: i32 = rustix::io::Errno::NAMETOOLONG.raw_os_error();
-/// Format: see the Unix arm.
+const PATH_TOO_LONG: slates_vfs::host::OsCode =
+  slates_vfs::host::OsCode::Errno(rustix::io::Errno::NAMETOOLONG.raw_os_error());
+/// Format: see the Unix arm; Windows' own answer, `ERROR_FILENAME_EXCED_RANGE`, a Win32 error code. Before A-539 it was
+/// the MSVC runtime's `ENAMETOOLONG` (38, `<errno.h>`), a number no Windows call answers, in an errno's place.
 #[cfg(windows)]
-const PATH_TOO_LONG_ERRNO: i32 = 38;
+const PATH_TOO_LONG: slates_vfs::host::OsCode =
+  slates_vfs::host::OsCode::Win32(windows_sys::Win32::Foundation::ERROR_FILENAME_EXCED_RANGE);
 
 /// Format: the longest reason a recovery cause records ([`RecoveryCause`]'s `reason`), in bytes. A reason is the
 /// daemon's own text, never a caller's: a fixed phrase and a typed error's display (a host refusal and its errno, a
@@ -14353,7 +14546,7 @@ fn longest_listable_name() -> usize {
 /// page leaves a summary's name ([`longest_listable_name`], A-263) and what a status leaves its name beside its other
 /// fields at their widest ([`longest_statused_name`], A-267). A create refuses a longer name `InvalidName` before
 /// anything is made. Read once: it is a function of the wire's shapes and the reply chunk alone.
-fn longest_name() -> usize {
+pub(crate) fn longest_name() -> usize {
   static LONGEST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
   *LONGEST.get_or_init(|| longest_listable_name().min(longest_statused_name()))
 }
@@ -15147,7 +15340,10 @@ fn expire_leases_at(state: &mut ShardState, now: u64) -> usize {
 
 /// Deferred replies first: a reply back from another shard (recorded as a completion here,
 /// the client's shard) or one whose completion ring was full and may have room now. A reply written is a client's loop
-/// I/O, which `serve_round` stamps for the closed loop (`ShardState::loop_io`, A-326).
+/// I/O, which `serve_round` stamps for the closed loop (`ShardState::loop_io`, A-326). A reply that says its request was
+/// not started ([`not_started`]) is never recorded here, as a verb's own is not ([`recorded_unless_deferred`]), so a
+/// resend under its id runs it (A-563). Until A-563 a read scatter's `Overloaded`, a part not sent or not served, came
+/// this way and was recorded, so every resend under the id met it for good.
 fn retry_deferred(state: &mut ShardState) -> bool {
   let mut any = false;
   let deferred = std::mem::take(&mut state.deferred);
@@ -15173,6 +15369,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
         .partition()
         .completion(origin, id.client, id.sequence)
       {
+        Seen::New if not_started(&reply) => unrecorded_not_started(state, reply),
         Seen::New => record_completion(state, origin, id, reply),
         _ => reply,
       }
@@ -15726,7 +15923,12 @@ async fn rebuild_records(
       Role::Green { .. } => 1,
       Role::Work { .. } => 2,
     };
-    (pass, lineage_depth(state, record.id))
+    // A repository's members in the order they joined, so a branch's source is rebuilt before it (A-575).
+    (
+      pass,
+      lineage_depth(state, record.id),
+      member_rank(state, record.id),
+    )
   });
   slices.unit_done().await;
   for record in &records {
@@ -15831,7 +16033,19 @@ async fn rebuild_record(
       // lived in memory, so a version appended before the restart and not yet committed at `f + 1` was never shipped
       // again (the bug record of 2026-11-07). Re-enqueued, each is placed from the current configuration; a holder that
       // already holds a version acknowledges it again at no cost.
-      for version in rebuild_green_sliced(state, record, slices).await {
+      // A repository's member is rebuilt the way it joined, in the order it joined (A-575); a lone green from its own
+      // origin and chain.
+      let member = state
+        .db
+        .partition()
+        .repositories()
+        .member(record.id)
+        .cloned();
+      let versions = match member {
+        Some(member) => rebuild_member_sliced(state, record, &member, slices).await,
+        None => rebuild_green_sliced(state, record, slices).await,
+      };
+      for version in versions {
         crate::merge_service::enqueue_recovered_record(state, record.id, version);
         slices.unit_done().await;
       }
@@ -16081,6 +16295,193 @@ async fn rebuild_green_sliced(
   install_green(state, record, replayed)
 }
 
+/// A green's place in its lineage's join order (A-575): 0 for a green no lineage holds.
+pub(crate) fn member_rank(state: &ShardState, id: DbVolumeId) -> usize {
+  let repositories = state.db.partition().repositories();
+  repositories
+    .member(id)
+    .and_then(|member| {
+      repositories
+        .members_of(member.repository)
+        .position(|joined| joined.green == id)
+    })
+    .unwrap_or(0)
+}
+
+/// Rebuilds lineage member `record` in a recovery's slices, the way it joined (§4.17.1 item 4, A-575): a root from its own
+/// origin and chain, into a new lineage; a branch by branching its source again at the version it was made at, then
+/// replaying its own checkpoint and chain over that. Members are rebuilt in the order they joined (`member_rank`), so a
+/// branch's source stands before it; a branch whose source is not here (fenced, or refused at that version) is fenced
+/// `SourceUnavailable`, never served as something else. The engine a branch's replay holds holds its lineage's arenas,
+/// so it goes back to its lineage whatever the replay finds.
+async fn rebuild_member_sliced(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  member: &slates_db::catalog::MemberRecord,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Vec<crate::merge_service::ReplayedVersion> {
+  let slates_db::catalog::MemberOrigin::Branch { from, version } = member.origin else {
+    let (replayed, load_steps) = replay_green_sliced(state, record.id, slices).await;
+    if load_steps > 0 {
+      state.count(GREEN_ORIGIN_LOAD_STEPS, load_steps);
+    }
+    return install_member_root(state, record, member, replayed);
+  };
+  let Some(seeded) = begin_member_branch(state, record, (from, version)) else {
+    return Vec::new();
+  };
+  let (replayed, engine) = replay_member_sliced(state, record.id, seeded, slices).await;
+  finish_member_branch(state, record, replayed, engine)
+}
+
+/// [`rebuild_member_sliced`] in one call, for the tests, as [`rebuild_green`] is [`rebuild_green_sliced`]'s.
+#[cfg(test)]
+pub(crate) fn rebuild_member(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+) -> Vec<crate::merge_service::ReplayedVersion> {
+  let Some(member) = state
+    .db
+    .partition()
+    .repositories()
+    .member(record.id)
+    .cloned()
+  else {
+    return rebuild_green(state, record);
+  };
+  let slates_db::catalog::MemberOrigin::Branch { from, version } = member.origin else {
+    let replayed = replay_green(state, record.id);
+    return install_member_root(state, record, &member, replayed);
+  };
+  let Some(seeded) = begin_member_branch(state, record, (from, version)) else {
+    return Vec::new();
+  };
+  let mut replay = match GreenReplay::seeded(state, record.id, seeded) {
+    Ok(replay) => replay,
+    Err((fence, engine)) => return finish_member_branch(state, record, Err(fence), Some(engine)),
+  };
+  let stepped = loop {
+    match replay.step(state) {
+      Ok(true) => break Ok(()),
+      Ok(false) => {}
+      Err(fence) => break Err(fence),
+    }
+  };
+  let (replayed, engine) = match stepped {
+    Ok(()) => match replay.finish(state) {
+      Ok((engine, versions)) => (Ok(versions), Some(Box::new(engine))),
+      Err(fence) => (Err(fence), None),
+    },
+    Err(fence) => (Err(fence), replay.into_engine()),
+  };
+  finish_member_branch(state, record, replayed, engine)
+}
+
+/// A lineage's root, its replay done: the engine founds the lineage and its retention is settled, or the root is
+/// fenced with why (a second root of one lineage is never served beside the first).
+fn install_member_root(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  member: &slates_db::catalog::MemberRecord,
+  replayed: Result<ReplayedGreen, crate::merge_service::GreenFence>,
+) -> Vec<crate::merge_service::ReplayedVersion> {
+  use crate::merge_service::GreenFence;
+  let (green, versions) = match replayed {
+    Ok(rebuilt) => rebuilt,
+    Err(fence) => {
+      fence_green(state, record, fence);
+      return Vec::new();
+    }
+  };
+  if state
+    .greens
+    .found(member.repository, record.id, green)
+    .is_err()
+  {
+    fence_green(state, record, GreenFence::SourceUnavailable);
+    return Vec::new();
+  }
+  settle_installed(state, record, versions)
+}
+
+/// A branch member's source branched again at `version` and the new member's engine taken out for its own replay; the
+/// member fenced `SourceUnavailable` when its source is not here at that version.
+fn begin_member_branch(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  (from, version): (DbVolumeId, u64),
+) -> Option<slates_merge::engine::Green> {
+  let seeded = state
+    .greens
+    .branch(&from, version, record.id)
+    .and_then(|()| state.greens.take(&record.id));
+  match seeded {
+    Ok(seeded) => Some(seeded),
+    Err(_) => {
+      fence_green(
+        state,
+        record,
+        crate::merge_service::GreenFence::SourceUnavailable,
+      );
+      None
+    }
+  }
+}
+
+/// A branch member's replay done: its engine back in its lineage first, the arenas with it, then its retention settled,
+/// or the member fenced with why.
+fn finish_member_branch(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  replayed: Result<Vec<crate::merge_service::ReplayedVersion>, crate::merge_service::GreenFence>,
+  engine: Option<Box<slates_merge::engine::Green>>,
+) -> Vec<crate::merge_service::ReplayedVersion> {
+  match engine.map(|engine| state.greens.put_back(&record.id, *engine)) {
+    Some(Ok(())) => {}
+    _ => state.count(MEMBER_ENGINE_LOST, 1),
+  }
+  match replayed {
+    Ok(versions) => settle_installed(state, record, versions),
+    Err(fence) => {
+      fence_green(state, record, fence);
+      Vec::new()
+    }
+  }
+}
+
+/// Counter: a lineage member's engine its replay could not give back to its lineage, which then serves none of its
+/// members (every lend refused, never a wrong answer): zero in every correct use. Format: a counter name in the daemon's
+/// status report.
+const MEMBER_ENGINE_LOST: &str = "repository.member_engine_lost";
+
+/// Replays lineage member `id`'s own checkpoint and chain over `seeded` in a recovery's slices: the versions it rebuilt
+/// or the fence, and the engine, to go back to its lineage either way (`None` only if the replay never held one).
+async fn replay_member_sliced(
+  state: &ShardState,
+  id: DbVolumeId,
+  seeded: slates_merge::engine::Green,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> (
+  Result<Vec<crate::merge_service::ReplayedVersion>, crate::merge_service::GreenFence>,
+  Option<Box<slates_merge::engine::Green>>,
+) {
+  let mut replay = match GreenReplay::seeded(state, id, seeded) {
+    Ok(replay) => replay,
+    Err((fence, engine)) => return (Err(fence), Some(engine)),
+  };
+  loop {
+    match replay.step(state) {
+      Ok(true) => break,
+      Ok(false) => slices.unit_done().await,
+      Err(fence) => return (Err(fence), replay.into_engine()),
+    }
+  }
+  match replay.finish(state) {
+    Ok((engine, versions)) => (Ok(versions), Some(Box::new(engine))),
+    Err(fence) => (Err(fence), None),
+  }
+}
+
 /// Counted at a recovery for each share of a green's origin seeded into its rebuilt engine (`GreenReplay`'s load): more
 /// than one for a green shows its origin was seeded in shares, a recovery's unit each, not in one poll.
 /// Format: a counter name in the daemon's status report.
@@ -16101,6 +16502,16 @@ fn install_green(
     }
   };
   state.greens.insert(record.id, green);
+  settle_installed(state, record, replayed)
+}
+
+/// The retention a green installed by its recovery holds, charged (`install_green`, and a lineage member's rebuild): the
+/// versions its replay rebuilt, each owed to its holders again; or the green fenced when the budget cannot hold it.
+fn settle_installed(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  replayed: Vec<crate::merge_service::ReplayedVersion>,
+) -> Vec<crate::merge_service::ReplayedVersion> {
   // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
   // remaining histories hold, ahead of new claims (§4.2 recovery order). The works are rebuilt after their greens,
   // at the bases their logs restore (A-207), so no work's base is in the floor here; the fold still never passes one.
@@ -16222,6 +16633,35 @@ impl GreenReplay {
       phase,
       load_steps: 0,
     })
+  }
+
+  /// The replay of lineage member `id`'s own checkpoint and chain over `seeded`, its engine as its branch made it again
+  /// (A-575): the engine handed back with the fence when the replay cannot begin.
+  fn seeded(
+    state: &ShardState,
+    id: DbVolumeId,
+    seeded: slates_merge::engine::Green,
+  ) -> Result<
+    GreenReplay,
+    (
+      crate::merge_service::GreenFence,
+      Box<slates_merge::engine::Green>,
+    ),
+  > {
+    Ok(GreenReplay {
+      id,
+      phase: chain_phase_or_back(state, id, seeded)?,
+      load_steps: 0,
+    })
+  }
+
+  /// The engine the replay holds once its chain's replay has begun: what a lineage member's refused replay gives back
+  /// to its lineage (A-575).
+  fn into_engine(self) -> Option<Box<slates_merge::engine::Green>> {
+    match self.phase {
+      GreenReplayPhase::Chain { green, .. } => Some(green),
+      GreenReplayPhase::Origin(_) | GreenReplayPhase::Decode(_) | GreenReplayPhase::Load(_) => None,
+    }
   }
 
   /// One unit: a piece of the held origin's walk, a share of the recorded origin decoded, a share of the origin seeded,
@@ -16386,18 +16826,36 @@ fn chain_phase(
   id: DbVolumeId,
   seeded: Option<slates_merge::engine::Green>,
 ) -> Result<GreenReplayPhase, crate::merge_service::GreenFence> {
+  chain_phase_or_back(state, id, seeded.unwrap_or_default()).map_err(|(fence, _)| fence)
+}
+
+/// [`chain_phase`] over `seeded`, the engine handed back with the fence when the replay cannot begin: what a lineage
+/// member's rebuild needs, since its engine holds its lineage's arenas and goes back to its lineage whatever the replay
+/// finds (A-575).
+fn chain_phase_or_back(
+  state: &ShardState,
+  id: DbVolumeId,
+  seeded: slates_merge::engine::Green,
+) -> Result<
+  GreenReplayPhase,
+  (
+    crate::merge_service::GreenFence,
+    Box<slates_merge::engine::Green>,
+  ),
+> {
   use crate::merge_service::GreenFence;
-  // The engine seeded from the origin (the empty engine for a green with no origin), restored at its checkpoint if it
-  // has one, as `Green::restore` does in one call.
-  let seeded = seeded.unwrap_or_default();
+  // The engine seeded from the origin (the empty engine for a green with no origin, the branched one for a lineage's
+  // branch), restored at its checkpoint if it has one, as `Green::restore` does in one call.
   let partition = state.db.partition();
   let adopted = partition.green_adoption(id).is_some();
   let (mut green, held, head_check) = match partition.green_checkpoint(id) {
     Some((held, bytes)) => {
-      let checkpoint = slates_merge::checkpoint::Checkpoint::decode(bytes)
+      let Some(checkpoint) = slates_merge::checkpoint::Checkpoint::decode(bytes)
         .ok()
         .filter(|checkpoint| checkpoint.version == held)
-        .ok_or(GreenFence::CheckpointCorrupt)?;
+      else {
+        return Err((GreenFence::CheckpointCorrupt, Box::new(seeded)));
+      };
       (
         seeded.with_checkpoint(&checkpoint),
         held,
@@ -16412,7 +16870,10 @@ fn chain_phase(
   if head_check
     .is_some_and(|(version, identity)| version == held && identity != green.head_identity())
   {
-    return Err(GreenFence::IdentityDiverged { version: held });
+    return Err((
+      GreenFence::IdentityDiverged { version: held },
+      Box::new(green),
+    ));
   }
   // Version 0's merge record, as its owner enqueued it, when no checkpoint stands for it; `replay_chain_entry` keeps
   // the rest. An adopted green's version 0 is its departed owner's, placed before its takeover (A-333).
@@ -16458,7 +16919,10 @@ fn fence_green(
   record: &VolumeRecord,
   fence: crate::merge_service::GreenFence,
 ) {
-  state.greens.remove(&record.id);
+  // A lineage member is retired from its lineage, its release queued (A-575); a lone engine is dropped.
+  if !crate::repository::retire_member(state, record.id) {
+    state.greens.remove(&record.id);
+  }
   crate::merge_service::release_green_retention(state, record.id);
   state.fenced_greens.insert(record.id, fence);
   state.count(GREEN_FENCED, 1);
@@ -16645,20 +17109,21 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
     });
     return;
   }
-  let Some(engine) = state.greens.get(&green) else {
-    return;
-  };
   // A work comes back from its log (A-207; D-18): its base, what it holds of its own and its journal, replayed over its
   // green through the verbs' own change path. It was rebuilt as a fresh clone of the head, so its acknowledged edits
-  // read back as the green's bytes and its next submit was accepted without them.
-  let created_at = match record.policy.role {
-    Role::Work { base_version, .. } => base_version,
-    _ => engine.head(),
+  // read back as the green's bytes and its next submit was accepted without them. The green is lent for the replay.
+  let replayed = {
+    let Some(engine) = state.greens.get(&green) else {
+      return;
+    };
+    let created_at = match record.policy.role {
+      Role::Work { base_version, .. } => base_version,
+      _ => engine.head(),
+    };
+    let entries = state.db.partition().work_log(record.id);
+    crate::work_log::replay(Some(&*engine), created_at, entries)
   };
-  let entries = state.db.partition().work_log(record.id);
-  let Ok((base_version, files, journal)) =
-    crate::work_log::replay(Some(engine), created_at, entries)
-  else {
+  let Ok((base_version, files, journal)) = replayed else {
     state.count(WORK_REBUILD_REFUSED, 1);
     return;
   };
@@ -16701,7 +17166,7 @@ pub(crate) fn owner_replay(
   entries: &[Vec<u8>],
 ) -> Option<(u64, crate::work_files::WorkFiles, Vec<VolumeOp>)> {
   let engine = state.greens.get(&green)?;
-  crate::work_log::replay(Some(engine), created_at, entries).ok()
+  crate::work_log::replay(Some(&*engine), created_at, entries).ok()
 }
 
 /// The works this shard recovered whose green lives on another partition and whose replay's outcome is not installed
@@ -17961,7 +18426,7 @@ fn build_recovered_volume(
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
   size: SizeClass,
-) -> Result<(Volume, Option<OsHost>, u16), RecoveryCause> {
+) -> Result<(Volume, Option<BaseHost>, u16), RecoveryCause> {
   let image = image.ok_or(RecoveryCause::NoImage)?;
   let quota = quota_for(size);
   let journal = journal_floor_bytes(state);
@@ -18031,7 +18496,11 @@ fn build_recovered_volume(
       )),
     });
   }
-  Ok((volume, opened.map(|(host, _)| host), image.prefix))
+  Ok((
+    volume,
+    opened.map(|(host, _)| BaseHost::Disk(host)),
+    image.prefix,
+  ))
 }
 
 /// A recovered volume's resources that do not fit this process, named by `reason`.
@@ -18299,7 +18768,7 @@ fn replay_one(
           .with_host(host)
           .write(&mut state.store, inode, record.offset, &record.bytes)
       }
-      None => Err(slates_vfs::VfsError::BaseUnavailable(0)),
+      None => Err(slates_vfs::VfsError::BaseUnavailable(None)),
     }
   } else {
     slot
@@ -20291,14 +20760,14 @@ mod tests {
       let before = state
         .greens
         .get_mut(&green)
-        .map(|g| (g.head(), g.head_identity()));
+        .map(|mut g| (g.head(), g.head_identity()));
       let record = state.db.partition().volume(green).cloned().unwrap();
       super::rebuild_green(state, &record);
       assert_eq!(
         state
           .greens
           .get_mut(&green)
-          .map(|g| (g.head(), g.head_identity())),
+          .map(|mut g| (g.head(), g.head_identity())),
         before,
         "the healthy replay reproduces the acknowledged head exactly"
       );
@@ -20446,14 +20915,14 @@ mod tests {
       let before = state
         .greens
         .get_mut(&green)
-        .map(|g| (g.head(), g.head_identity()));
+        .map(|mut g| (g.head(), g.head_identity()));
       let record = state.db.partition().volume(green).cloned().unwrap();
       super::rebuild_green(state, &record);
       assert_eq!(
         state
           .greens
           .get_mut(&green)
-          .map(|g| (g.head(), g.head_identity())),
+          .map(|mut g| (g.head(), g.head_identity())),
         before,
         "the replay from the checkpoint reproduces the acknowledged head exactly"
       );
@@ -20556,6 +21025,7 @@ mod tests {
       catalog_sequence: 0,
       sequence: takeover.head_sequence,
       takeover,
+      moved: false,
     };
     super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
   }
@@ -20792,6 +21262,329 @@ mod tests {
           assert!(!state.by_id.contains_key(&locked), "nothing was published");
         }
       }
+    });
+  }
+
+  /// A-544. Do: capture a volume's snapshot as a base and clone it, after cloning it once before the capture. Expect the
+  /// clone of the captured base born with its capture's record, naming no head (so a successor that adopts a head no
+  /// record is for refuses its landing by kind), shipped in its catalog; and the clone of the snapshot no capture named
+  /// born with none.
+  #[test]
+  fn a544_a_clone_of_a_captured_base_is_born_with_its_capture_record() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::Created { id: origin } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "a544-origin".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the origin was created")
+      };
+      let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Snapshot { volume: origin },
+      ) else {
+        panic!("the origin was snapshotted")
+      };
+      let clone = |state: &mut crate::state::ShardState, name: &str| {
+        let reply = super::dispatch(
+          state,
+          1,
+          &owner,
+          super::RequestBody::Clone {
+            volume: origin,
+            snapshot,
+            name: name.to_owned(),
+          },
+        );
+        let super::ReplyBody::Cloned { id } = reply else {
+          panic!("the clone was made: {reply:?}")
+        };
+        super::to_db_volume(id)
+      };
+      let plain = clone(state, "a544-plain");
+      let captured_op = super::Op::BaseCaptured {
+        volume: super::to_db_volume(origin),
+        snapshot: super::to_db_snapshot(snapshot),
+      };
+      state
+        .db
+        .mutate(&mut state.segment, &captured_op, 0)
+        .unwrap();
+      let captured = clone(state, "a544-captured");
+      let born = crate::carry::creation_record();
+      assert_eq!(state.db.partition().carried(captured), Some((&born, None)));
+      let record = state.db.partition().volume(captured).cloned().unwrap();
+      let carried = state
+        .db
+        .partition()
+        .carried(captured)
+        .map(|(carried, _)| carried);
+      assert_eq!(
+        crate::catalog::CatalogValue::of(&record, carried).carried,
+        Some(born),
+        "the catalog ships the record"
+      );
+      assert_eq!(state.db.partition().carried(plain), None);
+    });
+  }
+
+  /// [`take_over_at`] with the adopted head naming `manifest`, as a sealed head names its archive's identity.
+  fn take_over_named(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+    manifest: [u8; 32],
+  ) -> Result<(), Box<super::ReplyBody>> {
+    take_over_named_as(state, id, (catalog, archive), manifest, (false, false))
+  }
+
+  /// [`take_over_named`] made as `(from_live_log, moved)` says: from a live log or a placed seal, by a planned move's
+  /// adoption or a takeover after an owner's loss.
+  fn take_over_named_as(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    (catalog, archive): (&crate::catalog::CatalogValue, &slates_archive::Archive),
+    manifest: [u8; 32],
+    (from_live_log, moved): (bool, bool),
+  ) -> Result<(), Box<super::ReplyBody>> {
+    let head = crate::head::HeadValue {
+      manifest: Some(manifest),
+      content_holders: Vec::new(),
+      sealing: None,
+    };
+    let taken = super::TakenOver {
+      head: &head,
+      catalog,
+      catalog_sequence: 0,
+      sequence: 1,
+      takeover: slates_db::catalog::TakeoverRecord {
+        epoch: 1,
+        head_sequence: 1,
+        from_live_log,
+        past_tolerance: None,
+      },
+      moved,
+    };
+    super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
+  }
+
+  /// A-565. Do: materialize a live-shipped captured clone from its live log, its catalog carrying the record for the head
+  /// it adopts: once as a planned move's adoption, once as a takeover after its owner's loss. Expect: the moved one judged
+  /// against its capture (the snapshot it materialized is its mark, the carried paths as its old owner recorded them),
+  /// and the taken-over one refused by kind, never landed as a volume with no capture. A move's old owner froze the
+  /// volume and made its log durable at the head it handed over, so the rebuilt tree is that head; a takeover's log may
+  /// have run past its newest seal. Before A-565 both were refused: every tree rebuilt from a live log held no mark.
+  #[test]
+  fn a565_a_moved_live_clone_rebuilt_from_its_log_is_marked_and_a_taken_over_one_is_not() {
+    crate::daemon::audit_on_shard(|state| {
+      let chunk = slates_archive::Archive::raw_chunk(b"LIVE".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: chunk.identity,
+          chunk_offset: 0,
+        }],
+        vec![chunk],
+      );
+      let head = [0x5e; 32];
+      let carried = slates_vfs::captured::CarriedCapture {
+        entries: vec![slates_vfs::captured::CarriedPath {
+          path: "/made.rs".to_owned(),
+          state: slates_vfs::captured::CapturedState::Absent,
+        }],
+      };
+      let live_clone = |name: &str| crate::catalog::CatalogValue {
+        carried: Some(slates_db::catalog::CarriedRecord {
+          head,
+          entries: slates_wire::Wire::to_bytes(&carried),
+        }),
+        live_shipped: true,
+        ..takeover_catalog(name, 1 << 20)
+      };
+      let moved = slates_db::catalog::VolumeId { bytes: [0xa5; 16] };
+      let catalog = live_clone("a565-moved");
+      take_over_named_as(state, moved, (&catalog, &archive), head, (true, true)).unwrap();
+      match crate::landing::capture_of(state, moved) {
+        Ok(Some(slates_vfs::captured::CaptureBase::Carried { carried: got, .. })) => {
+          assert_eq!(got, carried, "the moved clone lands against its capture")
+        }
+        other => panic!("the move's new owner holds no mark for the head it rebuilt: {other:?}"),
+      }
+      let taken = slates_db::catalog::VolumeId { bytes: [0xa6; 16] };
+      let catalog = live_clone("a565-taken");
+      take_over_named_as(state, taken, (&catalog, &archive), head, (true, false)).unwrap();
+      assert!(
+        matches!(
+          crate::landing::capture_of(state, taken),
+          Err(Refusal::Unsupported { .. })
+        ),
+        "a takeover's rebuild from a live log that may have run past its seal is refused by kind"
+      );
+    });
+  }
+
+  /// A-577 (`docs/bugs/2026-11-19-a-live-clone-is-answered-before-any-of-it-is-durable.md`, written failing and parked
+  /// with A-565). Do: on a shard, make a volume, ship it live, snapshot it and clone the snapshot (the clone is
+  /// live-shipped as its origin is), give the clone's log the state it holds before any of it reaches a holder (`f = 1`,
+  /// its first whole entry owed), and ask what the Clone's reply waits for. Expect the clone's first whole entry, position
+  /// 0: a verb on a live volume answers once what it published is durable on `f` candidates (A-200). Before, the reply
+  /// waited on the verb's own volume, the origin, whose log the Clone did not change, so a Clone answered while nothing of
+  /// the clone was held anywhere else; its owner lost then, the successor found no log and no seal of it.
+  #[test]
+  fn a_live_clone_is_answered_only_once_its_first_whole_entry_is_durable() {
+    let (waits, clone) = crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let super::ReplyBody::Created { id: origin } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Create {
+          name: "live-origin".to_owned(),
+          size: super::SizeClass::Dynamic { max: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      ) else {
+        panic!("the origin was created")
+      };
+      let shipped = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::LiveShip {
+          volume: origin,
+          live_shipped: true,
+        },
+      );
+      let super::ReplyBody::LiveShippingSet { live_shipped: true } = shipped else {
+        panic!("the origin ships live: {shipped:?}")
+      };
+      let super::ReplyBody::Snapshotted { id: snapshot, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Snapshot { volume: origin },
+      ) else {
+        panic!("the origin was snapshotted")
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Clone {
+          volume: origin,
+          snapshot,
+          name: "live-clone".to_owned(),
+        },
+      );
+      let super::ReplyBody::Cloned { id: clone } = reply else {
+        panic!("the clone was made: {reply:?}")
+      };
+      let clone = super::to_db_volume(clone);
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        slates_db::register::HostId(local.0.wrapping_add(1)),
+        slates_db::register::HostId(local.0.wrapping_add(2)),
+      ];
+      crate::live_ship::owe_first_whole(state, clone, &holders);
+      let (live, _) = super::replicated_waits(state, Some(super::to_db_volume(origin)), 1, &reply);
+      (live, clone)
+    });
+    assert_eq!(
+      waits,
+      Some((clone, 0)),
+      "the Clone's reply waits for the clone's first whole entry"
+    );
+  }
+
+  /// A-544. Do: take over a captured clone whose owner died, its catalog carrying the record for the head the takeover
+  /// adopts; and another whose catalog carries only the record it was born with (no head of it was ever placed with its
+  /// record), and step its carry as the seal walk does. Expect: the first judged against its capture on the successor,
+  /// the carried paths as its owner recorded them, and free to move on with them; the second refused by kind, never
+  /// landed as a volume with no capture, its carry refused (no mark to carry from, counted) and a move of it waiting
+  /// until it is refused `Unplaced`, as A-503's move of a capture it could not carry waited.
+  #[test]
+  fn a544_a_taken_over_captured_clone_lands_against_its_record_or_is_refused_by_kind() {
+    crate::daemon::audit_on_shard(|state| {
+      let chunk = slates_archive::Archive::raw_chunk(b"CAPT".to_vec());
+      let archive = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: 4,
+          chunk: chunk.identity,
+          chunk_offset: 0,
+        }],
+        vec![chunk],
+      );
+      let head = [0x3c; 32];
+      let carried = slates_vfs::captured::CarriedCapture {
+        entries: vec![slates_vfs::captured::CarriedPath {
+          path: "/gone.rs".to_owned(),
+          state: slates_vfs::captured::CapturedState::Absent,
+        }],
+      };
+      let record = slates_db::catalog::CarriedRecord {
+        head,
+        entries: slates_wire::Wire::to_bytes(&carried),
+      };
+      let id = slates_db::catalog::VolumeId { bytes: [0x91; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        carried: Some(record),
+        ..takeover_catalog("a544-carried", 1 << 20)
+      };
+      take_over_named(state, id, &catalog, &archive, head).unwrap();
+      match crate::landing::capture_of(state, id) {
+        Ok(Some(slates_vfs::captured::CaptureBase::Carried { carried: got, .. })) => {
+          assert_eq!(got, carried)
+        }
+        other => panic!("the successor holds no capture to land against: {other:?}"),
+      }
+      assert!(
+        crate::carry::carries_its_head(state, id),
+        "a successor that marked its adopted head moves the clone on with its record"
+      );
+      let born = slates_db::catalog::VolumeId { bytes: [0x92; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        carried: Some(crate::carry::creation_record()),
+        ..takeover_catalog("a544-born", 1 << 20)
+      };
+      take_over_named(state, born, &catalog, &archive, head).unwrap();
+      assert!(
+        matches!(
+          crate::landing::capture_of(state, born),
+          Err(Refusal::Unsupported { .. })
+        ),
+        "a captured clone with no record for its head is refused by kind, never landed as a volume with no capture"
+      );
+      crate::carry::step(state, born);
+      assert_eq!(
+        state.refusals.get(crate::carry::CARRY_REFUSED),
+        Some(&1),
+        "a successor with no mark cannot carry the capture for its head, and counts it"
+      );
+      assert!(
+        !crate::carry::carries_its_head(state, born),
+        "a move of a clone whose head carries no record waits to be refused"
+      );
     });
   }
 
@@ -22083,6 +22876,519 @@ mod tests {
     );
   }
 
+  /// Shape: the id of the client the read-scatter test seats on the shard it asks from, beside the audit daemon's own,
+  /// which seat none.
+  const ASKING: u32 = 31;
+
+  /// The principal the read-scatter test asks as.
+  fn scatter_asker() -> Principal {
+    Principal::Uid {
+      host: HostId(0),
+      uid: 0,
+    }
+  }
+
+  /// Seats client [`ASKING`] on `state`'s shard as an admission does, over a region made here in the shard's geometry:
+  /// its seat's index, and the client's own mapping of the region, which the test reads its replies from.
+  fn seat_asking(state: &mut crate::state::ShardState) -> (u32, slates_ipc::ClientRegion) {
+    static REGIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let name = format!(
+      "slates-cr-scatter-{}-{}",
+      std::process::id(),
+      REGIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut region =
+      slates_ipc::ClientRegion::create(&name, ASKING, state.shard, state.config.region).unwrap();
+    #[cfg(target_os = "macos")]
+    region.unlink_name().unwrap();
+    #[cfg(unix)]
+    let client = region.open_again().unwrap();
+    #[cfg(windows)]
+    let client = {
+      let (handoff, len) = region.handoff().unwrap();
+      slates_ipc::ClientRegion::open(&handoff, len).unwrap()
+    };
+    let seat = state
+      .clients
+      .insert(crate::state::ClientSlot {
+        status_pages: crate::status_pages::StatusPages::default(),
+        end: slates_ipc::DaemonEnd::new(region),
+        principal: scatter_asker(),
+        client_id: ASKING,
+        pid: 0,
+        retiring: false,
+        watch: None,
+        proven: true,
+        control: None,
+        revoked: false,
+        consumer_policy: None,
+        owner_route: None,
+        read_ahead: None,
+        read_ahead_pending: 0,
+        remote_volumes: Vec::new(),
+        maps_sent: std::collections::BTreeSet::new(),
+      })
+      .unwrap();
+    (seat.index(), client)
+  }
+
+  /// What a client seated on the second shard of a two-shard daemon whose control shard is fenced is answered, by
+  /// request sequence, for a listing (1), its grants (2) and the daemon's status (3), each waited for within the
+  /// observation budget; the fenced shard; and the asking shard's count of parts that came home unserved.
+  fn asked_past_a_fenced_shard() -> (
+    Option<u16>,
+    std::collections::BTreeMap<u32, ReplyBody>,
+    Option<u64>,
+  ) {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    daemon.inject_consensus_failure().unwrap();
+    let (fenced, region, all_sent) = crate::daemon::observe_at(&daemon, 1, |state| {
+      let (seat, region) = seat_asking(state);
+      let asked = |sequence| {
+        slates_wire::request::RequestId {
+          client: ASKING,
+          sequence,
+        }
+        .word()
+      };
+      // Each is answered later, through `deliver`, once its last part is home.
+      let sent = [
+        super::scatter_list(state, seat, asked(1), scatter_asker(), None),
+        super::scatter_grants(state, seat, asked(2), scatter_asker(), None),
+        super::scatter_status(state, seat, asked(3)),
+      ];
+      let all_sent = sent
+        .iter()
+        .all(|served| matches!(served, super::Served::Forwarded));
+      (state.shards.first().copied(), region, all_sent)
+    });
+    assert!(all_sent, "each scatter sent its part to the fenced shard");
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let answers = answers_by_sequence(&mut end, 3);
+    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
+      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
+    });
+    daemon.stop();
+    (fenced, answers, unserved)
+  }
+
+  /// The next `count` answers the seated client's ring holds, by request sequence, each waited for within the
+  /// observation budget; fewer when one does not come.
+  fn answers_by_sequence(
+    end: &mut slates_ipc::ClientEnd,
+    count: usize,
+  ) -> std::collections::BTreeMap<u32, ReplyBody> {
+    let mut answers = std::collections::BTreeMap::new();
+    while answers.len() < count {
+      match end.wait(Some(crate::daemon::OBSERVE_BUDGET_NS)) {
+        Ok(reply) => {
+          let body: ReplyBody =
+            slates_ipc::protocol::unpack(end.region(), reply.kind, &reply.payload).unwrap();
+          answers.insert(
+            slates_wire::request::RequestId::from_word(reply.request).sequence,
+            body,
+          );
+        }
+        Err(error) => {
+          eprintln!("no further answer: {error}");
+          break;
+        }
+      }
+    }
+    answers
+  }
+
+  /// A-557 (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`'s sibling; §4.8 "Lookup": an
+  /// enumeration is a scatter-gather over owners; §4.14 `slates.status`). Do: on a two-shard daemon, fence the control
+  /// shard as a failed consensus publication does, so every borrow of its state is refused; from a client seated on the
+  /// other shard, list the volumes, ask for the grants and ask for the daemon's status. Expect: each answered
+  /// `Overloaded { shard }` naming the fenced shard, and each part counted unserved where it was asked. Before, the
+  /// fenced shard's part came home as an empty one and each was answered as if whole: a listing without that shard's
+  /// volumes, grants without its grants, a status without its report.
+  #[test]
+  fn a_read_scatter_whose_part_its_shard_refused_is_refused_naming_that_shard() {
+    let (fenced, answers, unserved) = asked_past_a_fenced_shard();
+    let fenced = fenced.expect("the daemon has a control shard");
+    for (verb, sequence) in [("list", 1u32), ("grants", 2), ("status", 3)] {
+      let answer = answers.get(&sequence);
+      assert!(
+        matches!(
+          answer,
+          Some(ReplyBody::Refused {
+            refusal: Refusal::Overloaded { shard }
+          }) if *shard == fenced
+        ),
+        "{verb} with the control shard {fenced} fenced: {answer:?}"
+      );
+    }
+    assert_eq!(
+      unserved,
+      Some(3),
+      "each scatter's part came home unserved, counted where it was asked"
+    );
+  }
+
+  /// The two read scatters the resend test sends, by request sequence: a listing (1) and the caller's grants (2).
+  fn read_scatters() -> [(u32, super::RequestBody); 2] {
+    [
+      (1, super::RequestBody::List { after: None }),
+      (2, super::RequestBody::Grants { after: None }),
+    ]
+  }
+
+  /// Serves `body` from the client seated at `seat` under `sequence`, as the shard serves a request its ring hands over
+  /// (`serve`): its answer when it was answered at once, `None` when it went out to be answered later (a scatter).
+  fn served_as_from_the_ring(
+    state: &mut crate::state::ShardState,
+    seat: u32,
+    (sequence, body): &(u32, super::RequestBody),
+  ) -> Option<ReplyBody> {
+    use slates_vfs::clock::Clock as _;
+    let generation = state.clients.generation_at(seat).unwrap();
+    let handle = slates_mem::Handle::from_raw(seat, generation);
+    let word = slates_wire::request::RequestId {
+      client: ASKING,
+      sequence: *sequence,
+    }
+    .word();
+    let slot = slates_ipc::protocol::pack(
+      state.clients.get_mut(handle).unwrap().end.region_mut(),
+      slates_ipc::protocol::Direction::Request,
+      u64::from(*sequence),
+      word,
+      body,
+    )
+    .unwrap();
+    let request = super::Request {
+      request: slot.request,
+      kind: slot.kind,
+      payload: slot.payload,
+    };
+    let now = state.clock.monotonic_ns();
+    match super::serve(state, handle, &request, now) {
+      super::Served::Reply(reply) => Some(reply),
+      super::Served::Forwarded => None,
+    }
+  }
+
+  /// What the resend test saw ([`resent_past_a_fenced_shard`]), each by request sequence.
+  struct Resent {
+    /// The fenced control shard.
+    fenced: Option<u16>,
+    /// Each scatter's first answer.
+    first: std::collections::BTreeMap<u32, ReplyBody>,
+    /// A resend answered at once, as from the request's completion record, with that answer.
+    at_once: std::collections::BTreeMap<u32, ReplyBody>,
+    /// A resend's answer that came back later, its scatter run again.
+    again: std::collections::BTreeMap<u32, ReplyBody>,
+    /// The asking shard's count of parts that came home unserved.
+    unserved: Option<u64>,
+  }
+
+  /// On a two-shard daemon whose control shard is fenced, a client seated on the other shard sends each read scatter
+  /// ([`read_scatters`]), reads both answers, then sends each again under its own id, as a client resends a request
+  /// refused `Overloaded` (`slates_client::Client::begin_again`).
+  fn resent_past_a_fenced_shard() -> Resent {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    daemon.inject_consensus_failure().unwrap();
+    let (fenced, seat, region, sent_at_once) = crate::daemon::observe_at(&daemon, 1, |state| {
+      let (seat, region) = seat_asking(state);
+      let sent_at_once = read_scatters()
+        .iter()
+        .filter_map(|asked| served_as_from_the_ring(state, seat, asked))
+        .count();
+      (state.shards.first().copied(), seat, region, sent_at_once)
+    });
+    assert_eq!(sent_at_once, 0, "each scatter went out to the fenced shard");
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let first = answers_by_sequence(&mut end, read_scatters().len());
+    let at_once: std::collections::BTreeMap<u32, ReplyBody> =
+      crate::daemon::observe_at(&daemon, 1, move |state| {
+        read_scatters()
+          .iter()
+          .filter_map(|asked| {
+            served_as_from_the_ring(state, seat, asked).map(|reply| (asked.0, reply))
+          })
+          .collect()
+      });
+    let owed = read_scatters().len().saturating_sub(at_once.len());
+    let again = answers_by_sequence(&mut end, owed);
+    let unserved = crate::daemon::observe_at(&daemon, 1, |state| {
+      state.refusals.get(super::SCATTER_PART_UNSERVED).copied()
+    });
+    daemon.stop();
+    Resent {
+      fenced,
+      first,
+      at_once,
+      again,
+      unserved,
+    }
+  }
+
+  /// A-563 (A-557's sibling; §4.9 "Status (2026-11-17, an `Overloaded` verb is never its own completion)": `Overloaded`
+  /// says the request was not started, so a resend under its id runs it). Do: on a two-shard daemon whose control shard
+  /// is fenced, list the volumes and ask for the grants from a client seated on the other shard, each served as its
+  /// ring hands it over; once both are answered, send each again under its own id. Expect: each answered `Overloaded`
+  /// naming the fenced shard both times, and each resend run again (its part sent and counted unserved a second time),
+  /// never answered from a record. Before, the deferred reply's path recorded the refusal as the request's completion,
+  /// so every resend under the id met it for good.
+  #[test]
+  fn a_resend_of_a_read_scatter_refused_overloaded_runs_it_again() {
+    let seen = resent_past_a_fenced_shard();
+    let fenced = seen.fenced.expect("the daemon has a control shard");
+    let refused_for_the_fence = |answer: Option<&ReplyBody>| {
+      matches!(
+        answer,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::Overloaded { shard }
+        }) if *shard == fenced
+      )
+    };
+    for (verb, sequence) in [("list", 1u32), ("grants", 2)] {
+      let (first, at_once, again) = (
+        seen.first.get(&sequence),
+        seen.at_once.get(&sequence),
+        seen.again.get(&sequence),
+      );
+      assert!(
+        refused_for_the_fence(first),
+        "{verb}'s first answer: {first:?}"
+      );
+      assert_eq!(at_once, None, "{verb}'s resend was answered from a record");
+      assert!(refused_for_the_fence(again), "{verb}'s resend: {again:?}");
+    }
+    assert_eq!(
+      seen.unserved,
+      Some(4),
+      "each send and each resend ran its scatter"
+    );
+  }
+
+  /// Fences the shard of `partition` as a failed consensus publication fences the control shard
+  /// (`Daemon::inject_consensus_failure`): every later borrow of its state is refused. The borrow that sets the fence is
+  /// refused at its own retention check, which names the fence it set.
+  fn fence_shard(daemon: &crate::daemon::Daemon, partition: usize) {
+    let fenced = daemon
+      .observation(
+        daemon.shards().get(partition).copied(),
+        crate::daemon::OBSERVE_BUDGET_NS,
+        |state| {
+          state.consensus_failure = Some(slates_anchor::AnchorError::Layout {
+            reason: "test support: a shard fenced as a failed consensus publication fences one",
+          });
+        },
+      )
+      .unwrap()
+      .wait();
+    assert!(
+      matches!(
+        fenced,
+        Err(crate::observe::ObserveError::State(
+          crate::state::StateAccess::Retention(_)
+        ))
+      ),
+      "the shard was fenced: {fenced:?}"
+    );
+  }
+
+  /// The root group's identity on the control shard now.
+  fn root_group(daemon: &crate::daemon::Daemon) -> Option<[u8; 32]> {
+    crate::daemon::observe_first(daemon, |state| {
+      state.root_group.as_ref().map(|group| group.id)
+    })
+  }
+
+  /// The answer to one request of the seated client: the one it was given at once, or else the next on its ring.
+  fn answer_of(end: &mut slates_ipc::ClientEnd, at_once: Option<ReplyBody>) -> Option<ReplyBody> {
+    at_once.or_else(|| answers_by_sequence(end, 1).into_values().next())
+  }
+
+  /// What the Recover test saw ([`recovered_past_a_fenced_shard`]).
+  struct Recovered {
+    /// The Recover's answer.
+    first: Option<ReplyBody>,
+    /// Its resend's answer, under the same id.
+    resent: Option<ReplyBody>,
+    /// The root group's identity before the Recover, after its answer, and after its resend's.
+    groups: [Option<[u8; 32]>; 3],
+  }
+
+  /// On a three-shard daemon whose third shard is fenced, a client seated on the second recovers the root group as its
+  /// first voter from a reviewed plan, then sends the same Recover again under its id, as a client resends a request
+  /// whose answer said it was not started.
+  fn recovered_past_a_fenced_shard() -> Recovered {
+    let daemon = crate::daemon::audit_daemon_of(3);
+    let (digest, proof) = crate::daemon::observe_first(&daemon, |state| {
+      let reviewed = crate::consensus_recovery::plan(state, true, None).unwrap();
+      let proof = crate::consensus_recovery::recovery_proof(&state.issuer_secret, &reviewed.digest);
+      (reviewed.digest, proof)
+    });
+    let before = root_group(&daemon);
+    fence_shard(&daemon, 2);
+    let recover = (
+      1,
+      super::RequestBody::Recover {
+        root: true,
+        target: None,
+        plan: digest,
+        proof,
+      },
+    );
+    let sent = recover.clone();
+    let (seat, region, at_once) = crate::daemon::observe_at(&daemon, 1, move |state| {
+      let (seat, region) = seat_asking(state);
+      let at_once = served_as_from_the_ring(state, seat, &sent);
+      (seat, region, at_once)
+    });
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let first = answer_of(&mut end, at_once);
+    let after_first = root_group(&daemon);
+    let at_once = crate::daemon::observe_at(&daemon, 1, move |state| {
+      served_as_from_the_ring(state, seat, &recover)
+    });
+    let resent = answer_of(&mut end, at_once);
+    let after_resend = root_group(&daemon);
+    daemon.stop();
+    Recovered {
+      first,
+      resent,
+      groups: [before, after_first, after_resend],
+    }
+  }
+
+  /// A-566 (§4.8 explicit quorum-loss recovery; §4.9: `Overloaded` says a request was not started, so a resend under its
+  /// id runs it). Do: on a three-shard daemon whose third shard is fenced, so the control shard's publication of a
+  /// consensus operation to it is refused, recover the root group from a client seated on the second shard; then send
+  /// the same Recover again under its id. Expect: the answer says the recovery ran (`DurabilityPending`), the resend
+  /// meets that answer, and the root group was replaced once. Before, the answer was `Overloaded` naming the fenced
+  /// shard though the recovery had run, so since A-563 its resend ran the operation again.
+  #[test]
+  fn a_recover_answered_after_it_ran_says_so_and_its_resend_takes_effect_once() {
+    let seen = recovered_past_a_fenced_shard();
+    assert!(
+      matches!(
+        seen.first,
+        Some(ReplyBody::Refused {
+          refusal: Refusal::DurabilityPending { .. }
+        })
+      ),
+      "the Recover ran, and its answer says so: {:?}",
+      seen.first
+    );
+    assert_eq!(
+      seen.resent, seen.first,
+      "the resend under its id meets the Recover's answer"
+    );
+    let [before, after_first, after_resend] = seen.groups;
+    assert_ne!(before, after_first, "the Recover replaced the root group");
+    assert_eq!(
+      after_first, after_resend,
+      "once: the resend replaced it no further"
+    );
+  }
+
+  /// Shape: the peer a forwarded verb comes from in the fenced-owner test, a host of the fleet other than this daemon's.
+  const PEER: HostId = HostId(77);
+
+  /// The answer to `body` forwarded from another node ([`PEER`]), served on the daemon's control shard as its fleet
+  /// transport serves one (`serve_forward`), waited for within the observation budget.
+  fn served_as_forwarded(
+    daemon: &crate::daemon::Daemon,
+    body: super::RequestBody,
+  ) -> Option<ReplyBody> {
+    let (sent, received) = std::sync::mpsc::channel();
+    let forwarded = super::encode_body(&super::ForwardedRequest {
+      principal: scatter_asker(),
+      body,
+      request: slates_wire::request::RequestId {
+        client: ASKING,
+        sequence: 1,
+      }
+      .word(),
+      ack_up_to: None,
+      ack_owed: Vec::new(),
+    });
+    let spawned = crate::daemon::observe_first(daemon, move |state| {
+      let control = state.shard;
+      slates_rt::futures::spawn(async move {
+        let reply = super::serve_forward(control, PEER, &forwarded).await;
+        let _unheard = sent.send(reply);
+      })
+      .and_then(slates_rt::futures::detach)
+      .is_ok()
+    });
+    assert!(
+      spawned,
+      "the forward's task was spawned on the control shard"
+    );
+    let bytes = received
+      .recv_timeout(std::time::Duration::from_nanos(
+        crate::daemon::OBSERVE_BUDGET_NS,
+      ))
+      .ok()?;
+    super::decode_body::<ReplyBody>(&bytes).ok()
+  }
+
+  /// What the fenced-owner test was answered for a volume whose owner shard is fenced: asked by a client on another
+  /// shard of the same node, and forwarded from another node.
+  struct AskedOfAFencedOwner {
+    /// The answer to the client seated on the control shard.
+    same_node: Option<ReplyBody>,
+    /// The answer to the verb forwarded from [`PEER`].
+    another_node: Option<ReplyBody>,
+  }
+
+  /// On a two-shard daemon, makes a volume the second shard owns, fences that shard, then asks for the volume's status
+  /// from a client seated on the control shard and as a verb forwarded from another node.
+  fn asked_of_a_fenced_owner() -> AskedOfAFencedOwner {
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let volume = crate::daemon::observe_at(&daemon, 1, |state| {
+      let name = owned_name(state, "fenced-owner");
+      plain_volume(state, &scatter_asker(), &name)
+    });
+    fence_shard(&daemon, 1);
+    let status = (1, super::RequestBody::Status { volume });
+    let (region, at_once) = crate::daemon::observe_first(&daemon, move |state| {
+      let (seat, region) = seat_asking(state);
+      (region, served_as_from_the_ring(state, seat, &status))
+    });
+    let mut end = slates_ipc::ClientEnd::new(region);
+    let same_node = answer_of(&mut end, at_once);
+    let another_node = served_as_forwarded(&daemon, super::RequestBody::Status { volume });
+    daemon.stop();
+    AskedOfAFencedOwner {
+      same_node,
+      another_node,
+    }
+  }
+
+  /// A-564 (§4.8 "Lookup": the answer comes from the current owner and is authoritative). Do: on a two-shard daemon,
+  /// make a volume the second shard owns and fence that shard as a failed consensus publication does; ask for the
+  /// volume's status from a client on the control shard, and as a verb forwarded from another node. Expect: both are
+  /// refused `ConsensusRecoveryUnavailable`, the refusal a failed publication answers, and neither `NotFound`. Before,
+  /// both forwards took the fenced owner's refused borrow for no volume and answered `NotFound`, so a volume that
+  /// exists read as absent.
+  #[test]
+  fn a_verb_for_a_volume_whose_owner_is_fenced_is_refused_by_the_fence_never_not_found() {
+    let seen = asked_of_a_fenced_owner();
+    for (asked, answer) in [
+      ("on the same node", &seen.same_node),
+      ("from another node", &seen.another_node),
+    ] {
+      assert!(
+        matches!(
+          answer,
+          Some(ReplyBody::Refused {
+            refusal: Refusal::ConsensusRecoveryUnavailable
+          })
+        ),
+        "a volume whose owner is fenced, asked {asked}: {answer:?}"
+      );
+    }
+  }
+
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
   /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves
   /// locally — the fast path, taken before any map lookup.
@@ -22549,4 +23855,463 @@ fn nfs_quantile(state: &ShardState, times: NfsTimes, ppm: u64) -> Option<u64> {
     NfsTimes::Forwarded => &state.nfs_service.forwarded,
   };
   (histogram.count() > 0).then(|| histogram.quantile(ppm))
+}
+
+/// A-549: a clone's admission sizes its version slots and its allowance by the inodes its snapshot's tree holds, not by
+/// what its origin holds at the clone (A-541's sibling). A-572: it admits the clone's namespace dimension too, an entry
+/// allowance never below the entries its snapshot holds.
+#[cfg(test)]
+mod clone_admission_tests {
+  use super::{
+    NamePolicy, ReplyBody, RequestBody, ShardState, SizeClass, VOLUME_ALLOWANCE_REFUSED, dispatch,
+    entry_allowance, inode_allowance, to_db_volume,
+  };
+
+  /// Format: the uid of the volumes' owner, who may snapshot and clone them.
+  const OWNER_UID: u32 = 1234;
+  /// Shape: a bounded origin's quota: small, so its fair share of inodes is a few hundred at most.
+  const BOUNDED_BYTES: u64 = 1 << 16;
+  /// Shape: a dynamic origin's maximum.
+  const DYNAMIC_BYTES: u64 = 1 << 20;
+  /// Shape: the inodes past its fair share the bounded origin holds at its snapshot.
+  const PAST_FAIR: u64 = 8;
+  /// Shape: the files the dynamic origin holds at its snapshot.
+  const DYNAMIC_FILES: u64 = 12;
+  /// Shape: the files the small origin of the entry test holds at its snapshot.
+  const FEW_FILES: u64 = 3;
+  /// Format: a file's mode.
+  const FILE_MODE: u32 = 0o644;
+
+  pub(super) fn owner() -> slates_db::catalog::Principal {
+    slates_db::catalog::Principal::Uid {
+      host: slates_db::register::HostId(0),
+      uid: OWNER_UID,
+    }
+  }
+
+  /// Makes a volume named `name` of `size` for [`owner`]; its id.
+  pub(super) fn made(
+    state: &mut ShardState,
+    name: &str,
+    size: SizeClass,
+  ) -> slates_ipc::protocol::VolumeId {
+    let reply = dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::Create {
+        name: name.to_owned(),
+        size,
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let ReplyBody::Created { id } = reply else {
+      panic!("the volume {name} was made: {reply:?}")
+    };
+    id
+  }
+
+  /// Runs `change` on `volume`'s core with the shard's store.
+  pub(super) fn on_core<T>(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    change: impl FnOnce(&mut slates_vfs::Volume, &mut slates_vfs::volume::Store) -> T,
+  ) -> T {
+    let handle = *state.by_id.get(&to_db_volume(volume)).unwrap();
+    let ShardState { store, volumes, .. } = &mut *state;
+    let slot = volumes.get_mut(handle).unwrap();
+    change(&mut slot.volume, store)
+  }
+
+  /// Makes `count` empty files named `prefix-n` in `volume`'s root.
+  fn make_files(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    prefix: &str,
+    count: u64,
+  ) {
+    on_core(state, volume, |core, store| {
+      let root = core.root_inode(store).unwrap();
+      for n in 0..count {
+        core
+          .create_file_no(store, root, &format!("{prefix}-{n}"), FILE_MODE)
+          .unwrap();
+      }
+    });
+  }
+
+  /// Removes the files `prefix-0` to `prefix-(count - 1)` from `volume`'s root.
+  fn remove_files(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    prefix: &str,
+    count: u64,
+  ) {
+    on_core(state, volume, |core, store| {
+      let root = core.root_inode(store).unwrap();
+      for n in 0..count {
+        core
+          .unlink_no(store, root, &format!("{prefix}-{n}"))
+          .unwrap();
+      }
+    });
+  }
+
+  /// Snapshots `volume`, then clones the snapshot as `name`: the snapshot's live-inode count (its origin's at the
+  /// snapshot) and the clone's id.
+  fn snapshot_then_clone(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    removed: (&str, u64),
+    name: &str,
+  ) -> (u64, slates_ipc::protocol::VolumeId) {
+    let at_snapshot = on_core(state, volume, |core, _| core.inode_usage().0);
+    let reply = dispatch(state, 1, &owner(), RequestBody::Snapshot { volume });
+    let ReplyBody::Snapshotted { id: snapshot, .. } = reply else {
+      panic!("the origin was snapshotted: {reply:?}")
+    };
+    remove_files(state, volume, removed.0, removed.1);
+    let reply = dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::Clone {
+        volume,
+        snapshot,
+        name: name.to_owned(),
+      },
+    );
+    let ReplyBody::Cloned { id } = reply else {
+      panic!("the clone {name} was made: {reply:?}")
+    };
+    (at_snapshot, id)
+  }
+
+  /// A-549. Do: make a bounded origin whose inode allowance is above its fair share (as a restart floors a volume's at
+  /// the inodes it recovered on a machine whose share is smaller, or an admission floors a clone's at the inodes it
+  /// inherited), fill it past that share, snapshot it, remove files until it holds fewer than the share, and clone the
+  /// snapshot. Expect the clone's allowance to be what its tree holds (more than the share), at least its count, and no
+  /// allowance refused. Before A-549 the admission sized it by the origin's count at the clone, under the share, so the
+  /// allowance was the share, below the clone's count: refused, counted, and the clone ran with no inode cap.
+  #[test]
+  fn a_bounded_clone_is_admitted_by_the_inodes_its_snapshot_holds() {
+    let (fair, at_snapshot, (count, allowance), refused) = crate::daemon::audit_on_shard(|state| {
+      let size = SizeClass::Bounded {
+        limit: BOUNDED_BYTES,
+      };
+      let fair = inode_allowance(state, size);
+      assert!(
+        fair >= 2,
+        "a share of at least two inodes leaves a file to remove: {fair}"
+      );
+      let origin = made(state, "floored", size);
+      on_core(state, origin, |core, _| {
+        core.set_inode_allowance(fair + PAST_FAIR).unwrap();
+      });
+      // The root and the files: the share and `PAST_FAIR` inodes past it, all the raised allowance admits.
+      make_files(state, origin, "f", fair + PAST_FAIR - 1);
+      // One file more than the inodes past the share: the origin then holds one fewer than its share.
+      let (at_snapshot, clone) =
+        snapshot_then_clone(state, origin, ("f", PAST_FAIR + 1), "floored-clone");
+      let usage = on_core(state, clone, |core, _| core.inode_usage());
+      let refused = state
+        .refusals
+        .get(VOLUME_ALLOWANCE_REFUSED)
+        .copied()
+        .unwrap_or(0);
+      (fair, at_snapshot, usage, refused)
+    });
+    assert_eq!(
+      at_snapshot,
+      fair + PAST_FAIR,
+      "the origin held its share and more at its snapshot"
+    );
+    assert_eq!(count, at_snapshot, "the clone counts its snapshot's inodes");
+    assert_eq!(
+      allowance, at_snapshot,
+      "the clone's allowance is what its snapshot holds, above the share"
+    );
+    assert_eq!(refused, 0, "no allowance was refused");
+  }
+
+  /// A-549. Do: make a dynamic origin, fill it, snapshot it, remove most of its files, and clone the snapshot. Expect the
+  /// clone's version hold to be the inodes it holds, its snapshot's. Before A-549 the admission held slots for the
+  /// origin's count at the clone, fewer than the clone holds.
+  #[test]
+  fn a_dynamic_clone_holds_a_version_slot_for_each_inode_its_snapshot_holds() {
+    let (at_snapshot, count, hold) = crate::daemon::audit_on_shard(|state| {
+      let origin = made(state, "dynamic", SizeClass::Dynamic { max: DYNAMIC_BYTES });
+      make_files(state, origin, "f", DYNAMIC_FILES);
+      let (at_snapshot, clone) =
+        snapshot_then_clone(state, origin, ("f", DYNAMIC_FILES - 1), "dynamic-clone");
+      let (count, hold) = on_core(state, clone, |core, _| {
+        (core.inode_usage().0, core.version_hold())
+      });
+      (at_snapshot, count, hold)
+    });
+    assert_eq!(count, at_snapshot, "the clone counts its snapshot's inodes");
+    assert_eq!(
+      hold, count,
+      "the clone holds a version slot for each inode it holds"
+    );
+  }
+
+  /// Links `count` more names `prefix-n` to the file `target` in `volume`'s root.
+  pub(super) fn link_names(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+    target: slates_vfs::ids::InodeNo,
+    (prefix, count): (&str, u64),
+  ) {
+    on_core(state, volume, |core, store| {
+      let root = core.root_inode(store).unwrap();
+      for n in 0..count {
+        core
+          .link_no(store, root, &format!("{prefix}-{n}"), target)
+          .unwrap();
+      }
+    });
+  }
+
+  /// The entries a walk of `volume`'s namespace from its root reaches, then its entry count and its allowance.
+  pub(super) fn entries_of(
+    state: &mut ShardState,
+    volume: slates_ipc::protocol::VolumeId,
+  ) -> (u64, u64, u64) {
+    on_core(state, volume, |core, store| {
+      let mut walked = 0;
+      let mut directories = vec![core.root_inode(store).unwrap()];
+      while let Some(directory) = directories.pop() {
+        for row in core.readdir_no(store, directory).unwrap() {
+          walked += 1;
+          if row.kind == slates_vfs::inode::Kind::Dir {
+            directories.push(row.inode);
+          }
+        }
+      }
+      let (count, allowance) = core.entry_usage();
+      (walked, count, allowance)
+    })
+  }
+
+  /// A-572 (A-549's sweep). Do: make a bounded origin holding a file, raise its entry allowance past its share (as a
+  /// restart floors one at the entries it recovered) and link the file until its names pass the share by
+  /// [`PAST_FAIR`], snapshot it, remove names until it holds fewer than the share, and clone the snapshot; and clone a
+  /// snapshot of a second origin holding a few files. Expect each clone's entry allowance to be the share, or its
+  /// snapshot's entries where those are more, its entry count the entries a walk of its namespace reaches, and no
+  /// allowance refused. Before A-572 a clone was admitted with no entry allowance (`u64::MAX`) until a restart set one.
+  #[test]
+  fn a_clone_is_admitted_with_an_entry_allowance_never_below_its_snapshots_entries() {
+    let (share, floored, few, refused) = crate::daemon::audit_on_shard(|state| {
+      let size = SizeClass::Bounded {
+        limit: BOUNDED_BYTES,
+      };
+      let share = entry_allowance(size);
+      let named = made(state, "named", size);
+      let file = on_core(state, named, |core, store| {
+        let root = core.root_inode(store).unwrap();
+        core.create_file_no(store, root, "f", FILE_MODE).unwrap()
+      });
+      on_core(state, named, |core, _| {
+        core.set_entry_allowance(share + PAST_FAIR).unwrap();
+      });
+      // The file's own name and its links: the share and `PAST_FAIR` names past it, all the raised allowance admits.
+      link_names(state, named, file, ("l", share + PAST_FAIR - 1));
+      // One name more than those past the share: the origin then holds one fewer than its share.
+      let (_, floored) = snapshot_then_clone(state, named, ("l", PAST_FAIR + 1), "named-clone");
+      let floored = entries_of(state, floored);
+      let few_origin = made(state, "few", size);
+      make_files(state, few_origin, "f", FEW_FILES);
+      let (_, few) = snapshot_then_clone(state, few_origin, ("f", 1), "few-clone");
+      let few = entries_of(state, few);
+      let refused = state
+        .refusals
+        .get(VOLUME_ALLOWANCE_REFUSED)
+        .copied()
+        .unwrap_or(0);
+      (share, floored, few, refused)
+    });
+    let (walked, count, allowance) = floored;
+    assert_eq!(
+      count, walked,
+      "the floored clone counts the entries its namespace holds"
+    );
+    assert_eq!(
+      walked,
+      share + PAST_FAIR,
+      "the floored clone holds its snapshot's names, past the share"
+    );
+    assert_eq!(
+      allowance, walked,
+      "the floored clone's entry allowance is the entries its snapshot holds, above the share"
+    );
+    let (walked, count, allowance) = few;
+    assert_eq!(
+      count, walked,
+      "the small clone counts the entries its namespace holds"
+    );
+    assert_eq!(
+      allowance, share,
+      "the small clone's entry allowance is a create's share"
+    );
+    assert_eq!(refused, 0, "no allowance was refused");
+  }
+}
+
+#[cfg(test)]
+mod materialization_wait_tests {
+  use super::await_materialization;
+  use crate::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
+  use slates_db::register::ObjectId;
+
+  /// Shape: the volume whose materialization the held verb waits for; any id works, nothing reads its catalog.
+  const PENDING: ObjectId = ObjectId([7; 16]);
+  /// Shape: how long the test thread waits before it looks: past the bound the wait had until A-548 (one liveness
+  /// window) by half a window.
+  const PAST_THE_OLD_BOUND_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 2;
+
+  /// A-548 (R3's class C; §4.8 "Promotion and takeover"): a verb held for its volume's materialization waits for the
+  /// materialization's end, however long it takes, and is let go at that end. Do: on an audit daemon's shard, mark a
+  /// volume pending materialization and spawn a task that waits as such a verb does; wait past the old bound (one
+  /// liveness window) and half a window more; then end the materialization (its pending entry removed, as a made, a
+  /// given-up or a tombstoned volume's is). Expect: the task still waiting past the old bound, and done once the
+  /// materialization ended. Before, the wait looked at the heartbeat and gave up at one window, so its verb was refused
+  /// while the materialization still ran, and its client sent round to retry.
+  #[test]
+  // The test thread waits past the old bound; no runtime wheel serves this thread (D-9 allows a test).
+  #[allow(clippy::disallowed_methods)]
+  fn a_verb_held_for_a_materialization_waits_for_its_end_past_any_fixed_bound() {
+    let daemon = crate::daemon::audit_daemon();
+    let (done, done_seen) = std::sync::mpsc::channel();
+    crate::daemon::observe_first(&daemon, move |state| {
+      state.pending_materializations.insert(
+        PENDING,
+        crate::state::PendingVolume::adopted(
+          crate::head::HeadValue {
+            manifest: None,
+            content_holders: Vec::new(),
+            sealing: None,
+          },
+          None,
+          Vec::new(),
+        ),
+      );
+      let held = slates_rt::futures::spawn(async move {
+        await_materialization(PENDING).await;
+        let _ = done.send(());
+      })
+      .unwrap();
+      slates_rt::futures::detach(held).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_nanos(PAST_THE_OLD_BOUND_NS));
+    let waited_past_the_old_bound = done_seen.try_recv().is_err();
+    crate::daemon::observe_first(&daemon, |state| {
+      state.pending_materializations.remove(&PENDING);
+    });
+    let let_go_at_the_end = done_seen
+      .recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .is_ok();
+    daemon.stop();
+    assert!(
+      waited_past_the_old_bound,
+      "the held verb was let go while its materialization was still pending"
+    );
+    assert!(
+      let_go_at_the_end,
+      "the held verb is let go once its materialization ends"
+    );
+  }
+}
+
+/// A-572: a resize moves a volume's entry allowance with its new policy, as it moves its inode allowance, never below the
+/// entries the volume holds.
+#[cfg(test)]
+mod resize_admission_tests {
+  use super::clone_admission_tests::{entries_of, link_names, made, on_core, owner};
+  use super::{
+    ReplyBody, RequestBody, ShardState, SizeClass, VOLUME_ALLOWANCE_REFUSED, dispatch,
+    entry_allowance,
+  };
+
+  /// Shape: the policies the volume is made with, resized up to and resized down to: their entry shares grow with their
+  /// quotas, and the smallest's is below the names the volume holds.
+  const MADE_BYTES: u64 = 1 << 16;
+  const LARGER_BYTES: u64 = 1 << 20;
+  const SMALLER_BYTES: u64 = 1 << 12;
+  /// Shape: the names past the smallest policy's share the volume holds.
+  const PAST_SMALLER: u64 = 8;
+  /// Format: a file's mode.
+  const FILE_MODE: u32 = 0o644;
+
+  /// Resizes `volume` to `size`, which must be accepted.
+  fn resized(state: &mut ShardState, volume: slates_ipc::protocol::VolumeId, size: SizeClass) {
+    let reply = dispatch(state, 1, &owner(), RequestBody::Resize { volume, size });
+    assert!(
+      matches!(reply, ReplyBody::Resized),
+      "the resize to {size:?} was accepted: {reply:?}"
+    );
+  }
+
+  /// A-572 (A-549's sweep). Do: make a bounded volume holding a file and names linked to it past the share of the
+  /// smallest policy below, resize it up to a larger policy, then down to the smallest. Expect its entry allowance to be
+  /// the larger policy's share after the resize up, and after the resize down the smallest's share floored at the
+  /// entries the volume holds, which a walk of its namespace counts; no allowance refused. Before A-572 a resize left the
+  /// entry allowance at the share of the policy the volume was made with.
+  #[test]
+  fn a_resize_moves_the_entry_allowance_with_the_policy_never_below_the_entries_held() {
+    let (up, down, refused) = crate::daemon::audit_on_shard(|state| {
+      let volume = made(state, "resized", SizeClass::Bounded { limit: MADE_BYTES });
+      let file = on_core(state, volume, |core, store| {
+        let root = core.root_inode(store).unwrap();
+        core.create_file_no(store, root, "f", FILE_MODE).unwrap()
+      });
+      let smaller = SizeClass::Bounded {
+        limit: SMALLER_BYTES,
+      };
+      link_names(
+        state,
+        volume,
+        file,
+        ("l", entry_allowance(smaller) + PAST_SMALLER),
+      );
+      let larger = SizeClass::Bounded {
+        limit: LARGER_BYTES,
+      };
+      resized(state, volume, larger);
+      let up = (entry_allowance(larger), entries_of(state, volume));
+      resized(state, volume, smaller);
+      let down = (entry_allowance(smaller), entries_of(state, volume));
+      let refused = state
+        .refusals
+        .get(VOLUME_ALLOWANCE_REFUSED)
+        .copied()
+        .unwrap_or(0);
+      (up, down, refused)
+    });
+    let (share, (walked, count, allowance)) = up;
+    assert_eq!(
+      count, walked,
+      "the count is the entries the namespace holds"
+    );
+    assert_eq!(
+      allowance, share,
+      "a resize up moves the entry allowance to the larger policy's share"
+    );
+    let (share, (walked, count, allowance)) = down;
+    assert_eq!(
+      count, walked,
+      "the count is still the entries the namespace holds"
+    );
+    assert!(
+      walked > share,
+      "the volume holds more names than the smaller policy's share: {walked} against {share}"
+    );
+    assert_eq!(
+      allowance, walked,
+      "a resize down floors the entry allowance at the entries the volume holds"
+    );
+    assert_eq!(refused, 0, "no allowance was refused");
+  }
 }

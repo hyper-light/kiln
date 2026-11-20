@@ -1505,6 +1505,8 @@ pub mod input {
     pub enum AgentsStartIsolation {
         None,
         Microvm,
+        /// A pod of its own on kiln's Kubernetes engine (docs/agentic.md W10), its workspace held by the runner `on` names.
+        Pod,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1535,8 +1537,9 @@ pub mod input {
         /// saying why), or `folder`, its folder itself. Started in another agent's folder on that
         /// agent's machine, it works in that agent's volume.
         pub workspace: Option<AgentsStartWorkspace>,
-        /// How it's held: `none`, a process on its machine (the default), or `microvm`, a microVM of
-        /// its own, on a machine that starts them. An isolated agent's agents are isolated too. An
+        /// How it's held: `none`, a process on its machine (the default); `microvm`, a microVM of
+        /// its own, on a machine that starts them; or `pod`, a pod of its own on the server's Kubernetes
+        /// engine, working in the Slates volume of the runner `on` names (its home), which holds it. An isolated agent's agents are isolated too. An
         /// isolated agent's `on` sizes its microVM (`cpus=2,mem=4g`: its vCPUs and memory, else its
         /// parent's), which kiln's balancer asks and holds for it from its start to its end; its
         /// commands are refused, never run on a bare host.

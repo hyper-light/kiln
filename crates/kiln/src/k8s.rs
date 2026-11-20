@@ -20,6 +20,9 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use crate::kubeapi::KubeApi;
 
+pub mod agent;
+pub mod volume;
+
 use crate::config::Kubernetes as KCfg;
 use crate::hub::Hub;
 use crate::store::{Job, Run, Status};
@@ -264,8 +267,20 @@ impl K8s {
                 }
             }
             pending_since.retain(|n, _| seen.contains(n));
+            // Agents' pods (docs/agentic.md W10): each whose session ended, or that can't start, reaped with its claim,
+            // its PersistentVolume and its home's hold.
+            match list_agent_pods(&self.api).await {
+                Ok(pods) => self.reap_agents(&hub, &pods, &mut pending_since).await,
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "agents' pods weren't listed: reaped next time"),
+            }
         }
     }
+}
+
+/// kiln's agents' pods in its jobs namespace now (`k8s::volume::AGENT_POD`), by name.
+async fn list_agent_pods(api: &KubeApi) -> anyhow::Result<HashMap<String, Pod>> {
+    let pods = api.list_pods(&format!("{MANAGED},app.kubernetes.io/name={}", volume::AGENT_POD)).await?;
+    Ok(pods.into_iter().filter_map(|p| p.metadata.name.clone().map(|n| (n, p))).collect())
 }
 
 /// The toolchains' caches a job pod keeps under the cache claim (`[kubernetes] cache_pvc`), shared
@@ -774,10 +789,13 @@ mod tests {
                 compared.push(format!("{file}:{}", p.spec_id));
             }
         }
-        // ci.yaml's rust, ui and vendor; sim's nightly; stress's pods; e2e's pod jobs.
-        for want in ["ci.yaml:rust", "ci.yaml:ui", "ci.yaml:vendor", "sim.yaml:nightly", "stress.yaml:pods", "e2e.yaml:rust", "e2e.yaml:fanout-pods", "e2e.yaml:gate"] {
+        // ci.yaml's ui and vendor; sim's nightly; stress's pods; e2e's pod jobs.
+        for want in ["ci.yaml:ui", "ci.yaml:vendor", "sim.yaml:nightly", "stress.yaml:pods", "e2e.yaml:rust", "e2e.yaml:fanout-pods", "e2e.yaml:gate"] {
             assert!(compared.iter().any(|c| c == want), "{want} not compared: {compared:?}");
         }
+        // ci.yaml's rust runs on a bare-metal Linux runner since aa98b33d6 (its library's tests compile past what a pod
+        // can ask): no pod of a k8s pool's is made for it.
+        assert!(!compared.iter().any(|c| c == "ci.yaml:rust"), "ci.yaml:rust is on a k8s pool again: {compared:?}");
         Ok(())
     }
 
