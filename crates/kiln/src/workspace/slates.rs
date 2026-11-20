@@ -1198,6 +1198,31 @@ pub async fn remove(m: &Made) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Takes the workspace of an agent that ran in a container down (docs/agentic.md W9), once its container and its bind have
+/// gone: W3's [`remove`], and where its mount stays only because something still holds it ([`lets_go_after_container`]),
+/// that mount let go of (Slates' `mount::unmount_busy`: forced off on macOS, detached on Linux) and its volume taken down
+/// after it. What holds it then is the engine's own file sharing, not a person's process: a Mac's Docker Desktop holds
+/// every file a container touched open past the container's life (its VM's virtio-fs share of `/Users` over the NFS
+/// mount), so its plain unmount is refused busy, even once the container is gone (measured 2026-11-20, Docker Desktop
+/// 29.3.1, `workspace::container_live_tests`: held by `com.apple.Virtualization.VirtualMachine`).
+pub async fn remove_after_container(m: &Made) -> anyhow::Result<()> {
+    match remove(m).await {
+        Err(e) if lets_go_after_container(&e) => {
+            let path = m.mount.clone();
+            let let_go = crate::rt::blocking(move || slates_api::mount::unmount_busy(&path)).await?.map_err(|fault| anyhow::anyhow!("Slates' let-go of {}: {fault}", m.mount))?;
+            tracing::info!(mount = %m.mount, how = ?let_go, "an ended container's workspace, still held by its engine's file sharing, is let go of");
+            remove(m).await
+        }
+        done => done,
+    }
+}
+
+/// Whether a container's workspace whose [`remove`] failed with `e` is let go of ([`remove_after_container`]): its mount
+/// stays only as it's busy, held by what its engine shares; every other refusal keeps its volume, as W3's do.
+pub fn lets_go_after_container(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<MountStays>().is_some_and(|s| matches!(s.held, Held::Busy { .. }))
+}
+
 /// A workspace's volume kept because its mount is still in the kernel's table after kiln's one unmount: destroying the
 /// volume then would leave a mount with nothing behind it. What holds it, by kind ([`Held`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2523,6 +2548,19 @@ mod tests {
     /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (W6): a landing leaves out each path git ignores, once per directory
     /// git ignores whole, a rename's source (in either status column) no path of its own; and `.git`; the library's
     /// request carries every one of them.
+    /// W9: a container's workspace whose mount stays only as it's busy (its engine's file sharing holds it once the
+    /// container has gone: Docker Desktop's VM, measured 2026-11-20) is let go of; one the OS still lists after an unmount
+    /// that answered done, one whose unmount was refused, and any other failure keep their volume, as W3's do.
+    #[test]
+    fn w9_a_containers_busy_workspace_mount_is_let_go_of_and_no_other() {
+        let stays = |held: Held| anyhow::Error::new(MountStays { mount: "/w/kiln-a".to_owned(), held });
+        assert!(lets_go_after_container(&stays(Held::Busy { holders: Ok(vec!["20401 com.apple.Virtualization.VirtualMachine".to_owned()]) })));
+        assert!(lets_go_after_container(&stays(Held::Busy { holders: Ok(Vec::new()) })));
+        assert!(!lets_go_after_container(&stays(Held::StillListed)));
+        assert!(!lets_go_after_container(&stays(Held::Refused { refusal: "no".to_owned(), lsof: "nothing".to_owned() })));
+        assert!(!lets_go_after_container(&anyhow::anyhow!("Slates' volume destroy: refused")));
+    }
+
     #[test]
     fn w6_a_landing_leaves_out_what_git_ignores_and_git_itself() -> anyhow::Result<()> {
         let said = "!! target/\0 M src/a.rs\0R  new.rs\0old.rs\0!! src/gen.o\0?? src/n.rs\0 R moved.rs\0!! was.rs\0!! node_modules/\0";

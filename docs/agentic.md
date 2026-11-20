@@ -816,7 +816,10 @@ is the machine's). A harness signs in in its container by a secret its person's 
 2026-11-20, the person's decision: never an image's own): the person's own secret (`secrets.mine`), opened by the server
 for that session alone, is given to its harness as it starts (`Kind::in_container`), named on the engine's command line
 and valued only in that command line's own environment, gone with the container; a grant taken out of the environment, or
-the secret deleted, gives the next start none. Owed, in order, each a piece: a workspace mounted shared for a rootful
+the secret deleted, gives the next start none. Once a container and its bind have gone its workspace is let go of where its mount stays only as
+it's busy (built 2026-11-20, `slates::remove_after_container`, measured live: Docker Desktop 29.3.1's VM holds the files a
+container touched past its life, so the mount's plain unmount is refused busy even with the container gone), its volume
+taken down after; any other refusal keeps its volume, as W3's do. Owed, in order, each a piece: a workspace mounted shared for a rootful
 Linux engine (until then refused, `NeedsSharedMount`); whether a bind keeps the mount's `nosuid` and `nodev` without
 the container's rules (a setuid file and a device node made through one container's bind, used through another's),
 measured; the `.nfs.*` names on a Mac; Windows' measurement and its route; and the goal's proof, a
