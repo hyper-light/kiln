@@ -3172,6 +3172,15 @@ enum Done {
 
 /// Longest a run of the harness's CLI may take.
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a session waits for its run's exit once its run was told to end, before it reads as ended: a process's ends
+/// as it's killed; a container's only once the container, its engine volume and its export are let go
+/// (`sandbox::container`), which an engine may take seconds over (Docker Desktop: w-k90-containers' r49, its container
+/// still listed after the session read ended), and a session must never read ended while its container is still there
+/// (docs/agentic.md W9).
+fn ended_within(container: bool) -> Duration {
+    if container { Duration::from_secs(60) } else { Duration::from_secs(5) }
+}
 /// Most of a run's output handed back.
 const RUN_OUTPUT_MAX: usize = 32 * 1024;
 /// Largest file a read hands back.
@@ -5834,7 +5843,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 // It can't be handed over: stopped, so the next image starts it again
                                 // (its conversation goes on) without two of it running.
                                 p.terminate(Duration::from_secs(2));
-                                let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                                let within = ended_within(s.spec.lock().container.is_some());
+                                let _ = crate::rt::timeout(within, &mut p.exit).await;
                                 *s.pid.lock() = None;
                                 keep_ran_in(&s, &files, kept_in.as_deref()).await;
                                 s.ended_run(None, p.boundary());
@@ -5910,6 +5920,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             })
                             .await;
                             p.terminate(Duration::from_secs(3));
+                            // A container's run ends only once its container is let go: read ended after that.
+                            if s.spec.lock().container.is_some() {
+                                let _ = crate::rt::timeout(ended_within(true), &mut p.exit).await;
+                            }
                             *s.pid.lock() = None;
                             keep_ran_in(&s, &files, kept_in.as_deref()).await;
                             s.ended_run(None, p.boundary());
@@ -5998,12 +6012,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     if rewind_to.is_some() {
                         p.terminate(Duration::from_secs(2));
-                        let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        let within = ended_within(s.spec.lock().container.is_some());
+                        let _ = crate::rt::timeout(within, &mut p.exit).await;
                         break;
                     }
                     if forcing {
                         p.terminate(Duration::from_secs(2));
-                        let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        let within = ended_within(s.spec.lock().container.is_some());
+                        let _ = crate::rt::timeout(within, &mut p.exit).await;
                         ending = true;
                         break;
                     }
@@ -6057,7 +6073,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         p.stdin.close();
                         if crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await.is_err() {
                             p.terminate(Duration::from_secs(2));
-                            let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                            let within = ended_within(s.spec.lock().container.is_some());
+                            let _ = crate::rt::timeout(within, &mut p.exit).await;
                         }
                         ending = true;
                         break;
@@ -6521,6 +6538,17 @@ mod in_microvm_alone_tests {
 #[cfg(test)]
 mod tests {
     use crate::util::Must as _;
+
+    /// W9 (w-k90-containers' r49: a session read ended while its container was still listed). Do: compare how long a
+    /// container session waits for its run's exit with what its container's release may take at most (its engine
+    /// volume's removal tried `VOLUME_RM_TRIES` times, `VOLUME_RM_PAUSE_LIVE` apart, beside the container's own removal).
+    /// Expect the wait the longer by a margin, and a process's wait as before.
+    #[test]
+    fn w9_a_container_session_waits_out_its_containers_release_before_it_reads_ended() {
+        let release = crate::workspace::container::VOLUME_RM_PAUSE_LIVE * crate::workspace::container::VOLUME_RM_TRIES;
+        assert!(ended_within(true) >= release * 4 + Duration::from_secs(20), "{:?} vs {release:?}", ended_within(true));
+        assert_eq!(ended_within(false), Duration::from_secs(5));
+    }
 
     /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 (goal 65's finding): what a microVM's run keeps
     /// beside its person's volume names the Agentfile its conversation ran in, at its version, and its
