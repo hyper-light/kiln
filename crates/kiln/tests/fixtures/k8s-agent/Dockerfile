@@ -4,7 +4,8 @@
 #   docker build -t k90-close-agent:live <that folder>
 # archlinux: the C library of the Arch-family host kiln is built on, so the host's build runs in it.
 FROM archlinux:base
-RUN pacman -Sy --noconfirm --needed python git && pacman -Scc --noconfirm
+# A full upgrade, as Arch asks (a partial one meets its packages' splits: openssl-3, 2026), the image's own files overwritten.
+RUN pacman -Syu --noconfirm --needed --overwrite '*' python git && pacman -Scc --noconfirm
 COPY kiln /usr/local/bin/kiln
 COPY fake-claude /opt/fake-claude/claude
 COPY claude act /usr/local/bin/
