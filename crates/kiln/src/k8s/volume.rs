@@ -179,11 +179,11 @@ pub fn objects(name: &str, namespace: &str, agent: &str, export: &PodExport) -> 
 
 /// The cluster's calls a pod's workspace takes ([`make`], [`unmake`]): kiln's own client (`crate::kubeapi::KubeApi`), or
 /// a stand-in, so the order is kiln's and is tested.
-pub(crate) trait Cluster {
-    async fn create_volume(&self, v: &PersistentVolume) -> anyhow::Result<()>;
-    async fn create_claim(&self, c: &PersistentVolumeClaim) -> anyhow::Result<()>;
-    async fn delete_claim(&self, name: &str) -> anyhow::Result<()>;
-    async fn delete_volume(&self, name: &str) -> anyhow::Result<()>;
+pub trait Cluster {
+    fn create_volume(&self, v: &PersistentVolume) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn create_claim(&self, c: &PersistentVolumeClaim) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn delete_claim(&self, name: &str) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn delete_volume(&self, name: &str) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 }
 
 impl Cluster for crate::kubeapi::KubeApi {
