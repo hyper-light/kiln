@@ -193,8 +193,10 @@ jobs:
   slates:
     name: ${{ matrix.os }} (Slates build and tests)
     needs: ui
-    # Bounded as the `build` job is.
-    timeout-minutes: 120
+    # Bounded, at what the lanes take: in run 44807509237 (a82ce7ede) windows-11-arm built kiln in 62 min and ran
+    # the library's Slates tests green in 52, then was stopped 5 min into the integration tests at 120; macos-latest
+    # built in 98 min and was stopped in the library's tests.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -228,6 +230,15 @@ jobs:
           (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # GitHub's Linux images leave ~14 GB free on /, less than kiln's target takes: in run 44807509237 both Linux
+      # lanes lost their runner ~23 min into the build (exit 143). The image's unused SDKs make room; the VM is
+      # GitHub's and thrown away after the job.
+      - name: Room on disk (Linux)
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # One at a time: kiln's crate compiled twice at once (the library, and the library as its tests) ran a 16 GB
       # runner out (the linux job).
