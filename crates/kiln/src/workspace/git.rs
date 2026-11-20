@@ -370,6 +370,25 @@ pub async fn tracked(top: &Path) -> anyhow::Result<std::collections::HashSet<Str
     Ok(run(c, GIT_TIMEOUT).await?.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect())
 }
 
+/// Whether git trusts the executable bit of repository `top`'s working tree (`core.fileMode`, true unless set false;
+/// git-config(1)), and the paths its index holds executable (`100755`). With the bit untrusted git takes no file's mode
+/// from its working tree: a file it tracks keeps the mode its index holds, and one it adds is `100644` (git's
+/// `ce_mode_from_stat`, read-cache.h, under `trust_executable_bit`), so a review made with no working tree
+/// (`super::review`) commits a file's mode as git would.
+pub async fn file_modes(top: &Path) -> anyhow::Result<(bool, std::collections::HashSet<String>)> {
+    let mut c = git(top);
+    c.args(["config", "--bool", "--get", "core.fileMode"]);
+    let trusted = ask(c).await.is_none_or(|v| v != "false");
+    let mut c = git(top);
+    c.args(["ls-files", "-s", "-z"]);
+    Ok((trusted, indexed_executable(&run(c, GIT_TIMEOUT).await?)))
+}
+
+/// The paths `git ls-files -s -z` lists executable (`100755 <object> <stage>\t<path>`, each ended by a NUL).
+fn indexed_executable(listed: &str) -> std::collections::HashSet<String> {
+    listed.split('\0').filter_map(|record| record.split_once('\t')).filter(|(meta, _)| meta.starts_with("100755 ")).map(|(_, path)| path.to_owned()).collect()
+}
+
 /// What repository `top`'s ignore rules beneath its folders' own `.gitignore` files are (gitignore(5)): its
 /// `info/exclude`, the user's excludes file (`core.excludesFile`, else git's own default,
 /// `$XDG_CONFIG_HOME/git/ignore` or `~/.config/git/ignore`), each one's bytes where it has one, and whether names match
@@ -1297,6 +1316,26 @@ mod tests {
         })?;
         assert_eq!(status_before, out(&top, &["status", "--porcelain"])?, "the folder's index and working tree are as they were");
         assert_eq!(out(&top, &["log", "--format=%s", "-1"])?, "init", "the branch didn't move");
+        Ok(())
+    }
+
+    /// Goal 90 (kiln's review reads `core.fileMode`): a repository trusts its working tree's executable bit unless
+    /// `core.fileMode` is false, and its index's executable paths are those it holds `100755`, whatever the working
+    /// tree's bits.
+    #[test]
+    fn g90_file_modes_reads_core_filemode_and_the_indexs_executable_paths() -> anyhow::Result<()> {
+        let d = repo()?;
+        let top = d.path().to_path_buf();
+        sh(&top, "git update-index --chmod=+x b && git commit -qm 'b executable' && chmod +x a")?;
+        let here = top.clone();
+        let (trusted, executable) = crate::rt::block_on(async move { file_modes(&here).await })?;
+        assert!(trusted, "core.fileMode unset or true: git trusts the bit");
+        assert_eq!(executable, ["b".to_owned()].into_iter().collect(), "the index's 100755 alone, not a's working-tree bit");
+        sh(&top, "git config core.fileMode false")?;
+        let here = top.clone();
+        let (trusted, _) = crate::rt::block_on(async move { file_modes(&here).await })?;
+        assert!(!trusted, "core.fileMode false: git trusts no execute bit");
+        assert_eq!(indexed_executable("100755 e69de29 0\tbin/run sh\0100644 e69de29 0\tlib.rs\0120000 e69de29 0\tlink\0"), ["bin/run sh".to_owned()].into_iter().collect());
         Ok(())
     }
 
